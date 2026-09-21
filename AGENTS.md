@@ -144,9 +144,9 @@ The `no-silent-mutations` test (`apps/web/src/lib/__tests__/no-silent-mutations.
 6. **Edge cases** — empty arrays, nil inputs, concurrent access
 
 ### CI Integration
-- The inherited Breeze workflows have been removed at the user's request; CloudCom replacement CI is pending.
+- The inherited Breeze workflows have been removed at the user's request; CloudCom CI and a controlled upstream-release updater are implemented; see the CI guide for current coverage and deployment boundaries.
 - Follow `docs/cloudcom-ci.md`: validate our changes and affected interfaces against a pinned released upstream baseline.
-- Do not restore the upstream full pipeline during merges or claim automated coverage while replacement checks are absent.
+- Do not restore the upstream full pipeline during merges or claim automated coverage beyond the actual implemented checks.
 - Application tests remain available; inherited workflow-file contracts need adaptation for the replacement pipeline.
 
 ### Running Tests Locally

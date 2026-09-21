@@ -1,23 +1,29 @@
-# CloudCom CI transition
+# CloudCom CI and upstream updates
 
-At the user's request, all 17 inherited Breeze workflow definitions were removed. The 12 active workflows were disabled through GitHub; the other five were already disabled. Cancellation was requested for the remaining inherited CI run. Historical workflow records may remain visible in Actions.
+CloudCom owns two workflows: cloudcom-ci.yml and cloudcom-upstream.yml. The 17 inherited Breeze workflows remain retired. Reusable source tests and scripts remain available, but their existence is not evidence that they run in CloudCom CI.
 
-CloudCom automation is temporarily paused. There is no replacement required CI gate yet, and this change does not establish release or deployment readiness. The existing CloudCom-owned Linux runner remains registered for future workflows. No LanternOps-owned runner was registered in the fork. The production server is unchanged.
+## Validation
 
-## Replacement design
+CloudCom CI runs on pull requests to main, pushes to main, and manual dispatch. It uses disposable GitHub-hosted workers; the existing CloudCom-owned worker is retained but is not required by these workflows. Production is not a PR runner.
 
-Use published Breeze releases as pinned baselines. The initial v0.115.0 tag resolves to commit 42427328a4efa002b018de0c87fd11c8d35f3719; the fork base dc724dbed1782e4336cffa07a3e0314c60087a67 adds only documentation.
+The baseline in .github/cloudcom-baseline.json records the released upstream repository, tag and exact commit. CI verifies the published release, tag resolution and ancestry, then compares the cumulative fork tree against that baseline. This validates retained customizations after an upstream update without replaying the complete upstream development/release pipeline.
 
-Build CloudCom workflows around our cumulative customizations and the interfaces and dependencies they affect. Select relevant lint, type checks, unit and integration regressions, builds, and candidate application acceptance. New upstream releases do not automatically trigger the entire upstream development/release pipeline. Broaden checks when our changes affect authentication, tenant isolation, schemas, shared dependencies or agent protocols. Unknown paths need explicit impact assessment.
+The initial fork changes are infrastructure and deployment configuration. Their checks cover environment/Compose parity, signed image consumers, generated systemd units, updater behavior, delta classification, workflow security/syntax and redacted secret detection. Secret detection also runs for documentation changes. CloudCom checks is the aggregate result; it requires the baseline and secret checks to succeed and rejects failed/cancelled applicable jobs.
 
-Restore secret detection and appropriate security checks in the replacement pipeline. Newly disclosed vulnerabilities need scheduled monitoring independently of code changes. Continue requiring approval for all external contributors. Never run untrusted PR code on the production server.
+Web changes select web tests and a build; native agent changes select Linux Go race tests. These are initial component checks, not complete cross-platform or deployment acceptance. API/schema/authentication and shared-dependency changes currently fail as unsupported until their relevant integration, tenant-isolation and compatibility checks are added. Other unmapped components likewise fail rather than silently pass. Add coverage in the same PR that introduces a new customization. Existing workflow-file contract tests describe retired automation and must be adapted before being used as replacement tests.
 
-The existing Lightsail installation remains the production and application-testing destination. Deployment and acceptance must protect its running database and services. Unchanged upstream agents retain their upstream signatures and provenance.
+Security dependency/SAST monitoring and full candidate image/upgrade acceptance are separate readiness work; the current secret/workflow checks do not claim to replace them. CI does not publish or deploy images.
 
-## Retained source and upstream updates
+## Release updates
 
-Application tests, reusable action implementations and scripts remain in source for selective reuse. Some inherited workflow contract tests directly read the removed YAML files; those contracts describe the retired pipeline and must be adapted or retired when the replacement checks are implemented. A broad legacy test command is not expected to pass unchanged during this transition. Do not treat those missing-file failures as application regressions or silently skip application tests.
+The upstream workflow checks published stable LanternOps/breeze releases weekly on Monday at 10:23 UTC and can be run manually from the default branch. Schedules become active only after this workflow is on the default branch. GitHub Actions must be permitted to create PRs; default workflow permissions stay read-only and the updater grants only its job the required write permissions.
 
-The inherited definitions remain recoverable from Git history at 6169b89cf148dbf5e4d90df11a769bca6e7ad7e5. Pre-removal uncommitted repairs were also saved locally. Future upstream merges may reintroduce workflow files: review that directory explicitly and preserve the CloudCom-owned automation policy. Do not re-enable inherited workflows as a side effect of an upstream update.
+When a new release is available, it verifies the old pinned tag still matches, imports the new release on a separate integration branch and updates the baseline. It preserves the complete CloudCom workflow directory, excluding upstream additions. It aborts unresolved non-workflow conflicts for manual resolution. It opens a draft PR and explicitly dispatches CloudCom CI because PRs created by GITHUB_TOKEN do not trigger normal PR workflows. Retries do not overwrite an existing branch.
 
-Branding, version naming and production deployment are unchanged. See [upstream maintenance](cloudcom-upstream-maintenance.md) for the customization register.
+Review release notes, changed dependencies and every retained customization, then verify checks for the exact final commit before merging. No automatic merge, server pull, reset or deployment occurs. Branch protection should require CloudCom checks. Updated release code is not executed inside the privileged updater job.
+
+## Server preparation and deployment boundary
+
+Prepare the fork in a separate directory from the live installation. The existing Lightsail server remains the production and application-testing destination. Before cutover, validate candidate images and configuration, signed inventories and agent provenance, database upgrade compatibility, and backup/recovery. CI success alone is not deployment acceptance.
+
+Branding and version naming remain unchanged. Preserve upstream licenses, package identities and agent signatures. See [upstream maintenance](cloudcom-upstream-maintenance.md) for customization records.
