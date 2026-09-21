@@ -103,12 +103,79 @@ function Get-CloudComRustDeskState {
         }
     }
     if (!$configOk) { $issues.Add('configuration_drift') }
+    if (Test-Path -LiteralPath $exe) {
+        $quiet = Get-CloudComRustDeskQuietState $exe
+        if ($quiet.Shortcuts.Count -or $quiet.TrayProcesses.Count) { $issues.Add('quiet_mode_drift') }
+    }
     if (!(Test-CloudComPrivatePath $directory) -or !(Test-CloudComPrivatePath $credential)) { $issues.Add('credential_missing_or_unprotected') }
     else {
         try { $null = (Get-Content -LiteralPath $credential -Raw).Trim() | ConvertTo-SecureString }
         catch { $issues.Add('credential_unreadable') }
     }
     return [pscustomobject]@{ Exe=$exe; Directory=$directory; Credential=$credential; Version=$version; Service=$service; Issues=@($issues.ToArray()); Healthy=($issues.Count -eq 0) }
+}
+
+# Stock OSS hide-tray is a built-in custom-client setting, not a TOML option.
+# Suppress only vendor shortcuts and the separate tray process; never the server,
+# service, main application or active-session connection manager.
+function Test-CloudComNoReparsePath {
+    param([string]$Path)
+    $current = [IO.Path]::GetFullPath($Path)
+    while ($current) {
+        if (Test-Path -LiteralPath $current) {
+            if ((Get-Item -Force -LiteralPath $current).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+        }
+        $current = Split-Path -Parent $current
+    }
+    return $true
+}
+
+function Test-CloudComRustDeskTrayProcess {
+    param($Process, [string]$Exe)
+    return $Process.ExecutablePath -ieq $Exe -and $Process.CommandLine -match ('(?i)^"?' + [regex]::Escape($Exe) + '"?\s+--tray\s*$')
+}
+
+function Get-CloudComRustDeskQuietState {
+    param([string]$Exe)
+    $programs = [Environment]::GetFolderPath('CommonPrograms')
+    $candidates = @(
+        @{Path=(Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'RustDesk.lnk'); Arguments=''},
+        @{Path=(Join-Path $programs 'RustDesk\RustDesk.lnk'); Arguments=''},
+        @{Path=(Join-Path $programs 'RustDesk\Uninstall RustDesk.lnk'); Arguments='--uninstall'},
+        @{Path=(Join-Path ([Environment]::GetFolderPath('CommonStartup')) 'RustDesk Tray.lnk'); Arguments='--tray'}
+    )
+    $shortcuts = @()
+    $shell = $null
+    try {
+        foreach ($candidate in $candidates) {
+            if (!(Test-Path -LiteralPath $candidate.Path)) { continue }
+            if (!(Test-CloudComNoReparsePath $candidate.Path)) { throw 'Shortcut path is redirected; manual review required.' }
+            if (!$shell) { $shell = New-Object -ComObject WScript.Shell }
+            $link = $shell.CreateShortcut($candidate.Path)
+            try {
+                if ($link.TargetPath -ine $Exe -or $link.Arguments.Trim() -ine $candidate.Arguments) { throw 'Unexpected shortcut target; manual review required.' }
+                $shortcuts += $candidate.Path
+            } finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($link) }
+        }
+    } finally { if ($shell) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell) } }
+    $processes = @(Get-CimInstance Win32_Process -Filter "Name='rustdesk.exe'" | Where-Object { Test-CloudComRustDeskTrayProcess $_ $Exe })
+    return [pscustomobject]@{Shortcuts=@($shortcuts); TrayProcesses=@($processes)}
+}
+
+function Set-CloudComRustDeskQuietMode {
+    param([string]$Exe)
+    $quiet = Get-CloudComRustDeskQuietState $Exe
+    foreach ($path in $quiet.Shortcuts) {
+        # Only explicit, validated .lnk files; no recursive folder removal.
+        if (!(Test-CloudComNoReparsePath $path)) { throw 'Shortcut path changed; manual review required.' }
+        Remove-Item -LiteralPath $path -Force
+    }
+    foreach ($process in $quiet.TrayProcesses) {
+        $current = Get-CimInstance Win32_Process -Filter ('ProcessId=' + [int]$process.ProcessId)
+        if ($current -and $current.CreationDate -eq $process.CreationDate -and (Test-CloudComRustDeskTrayProcess $current $Exe)) {
+            Stop-Process -Id $current.ProcessId -Force -ErrorAction Stop
+        }
+    }
 }
 
 function Invoke-CloudComRustDesk {

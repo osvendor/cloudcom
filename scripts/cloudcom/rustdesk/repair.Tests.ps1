@@ -28,6 +28,7 @@ Describe 'RustDesk desired-state repair mutation boundaries' {
         Mock Test-Path { $LiteralPath -in @('test-exe','test-credential') }
         Mock Test-CloudComPrivatePath { $true }
         Mock Set-CloudComPrivateDirectory {}
+        Mock Set-CloudComRustDeskQuietMode {}
         Mock Set-Content {}
         Mock Remove-Item {}
         Mock Set-Service {}
@@ -65,6 +66,14 @@ Describe 'RustDesk desired-state repair mutation boundaries' {
         { & $script:repair @script:arguments } | Should -Throw
         Should -Invoke Set-Content -Times 0
         Should -Invoke Invoke-CloudComRustDesk -Times 0
+    }
+    It 'quiet drift applies the quiet profile without resetting credentials or restarting the service' {
+        $script:first.Issues=@('quiet_mode_drift')
+        Mock Get-Service { [pscustomobject]@{Status='Running'} }
+        & $script:repair @script:arguments
+        Should -Invoke Set-CloudComRustDeskQuietMode -Times 1
+        Should -Invoke Invoke-CloudComRustDesk -Times 0
+        Should -Invoke Restart-Service -Times 0
     }
     It 'interrupted provisioning refuses another mutation' {
         $script:first.Issues=@('provisioning_requires_review')
@@ -138,5 +147,47 @@ Describe 'Private staging tree trust boundaries' {
     }
     It 'accepts a trusted private chain rooted in ProgramData' {
         Test-CloudComPrivatePath $script:leafPath | Should -BeTrue
+    }
+}
+
+Describe 'Quiet mode process boundaries' {
+    It 'selects only the exact installed tray process' {
+        $exe='C:\Program Files\RustDesk\rustdesk.exe'
+        $p=[pscustomobject]@{ExecutablePath=$exe;CommandLine=('"'+$exe+'" --tray')}
+        Test-CloudComRustDeskTrayProcess $p $exe | Should -BeTrue
+        foreach($arg in @('--service','--server','--cm','--tray --server','')) {
+            $p.CommandLine='"'+$exe+'" '+$arg
+            Test-CloudComRustDeskTrayProcess $p $exe | Should -BeFalse
+        }
+        $p.CommandLine='"'+$exe+'" --tray';$p.ExecutablePath='C:\Other\rustdesk.exe'
+        Test-CloudComRustDeskTrayProcess $p $exe | Should -BeFalse
+    }
+    It 'refuses redirected shortcut paths' {
+        Mock Test-Path { $true }
+        Mock Get-Item { [pscustomobject]@{Attributes=[IO.FileAttributes]::ReparsePoint} }
+        Test-CloudComNoReparsePath (Join-Path $TestDrive 'RustDesk.lnk') | Should -BeFalse
+    }
+}
+
+Describe 'Quiet mode termination safety' {
+    BeforeAll {
+        if (!(Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+            function Get-CimInstance { param($ClassName,$Filter) throw 'Unmocked CIM query' }
+        }
+    }
+    BeforeEach {
+        $script:tray=[pscustomobject]@{ExecutablePath='C:\Program Files\RustDesk\rustdesk.exe';CommandLine='"C:\Program Files\RustDesk\rustdesk.exe" --tray';ProcessId=42;CreationDate='original'}
+        Mock Get-CloudComRustDeskQuietState { [pscustomobject]@{Shortcuts=@();TrayProcesses=@($script:tray)} }
+        Mock Stop-Process {}
+    }
+    It 'does not terminate a PID reused by the service' {
+        Mock Get-CimInstance { [pscustomobject]@{ExecutablePath=$script:tray.ExecutablePath;CommandLine='"C:\Program Files\RustDesk\rustdesk.exe" --service';ProcessId=42;CreationDate='new'} }
+        Set-CloudComRustDeskQuietMode $script:tray.ExecutablePath
+        Should -Invoke Stop-Process -Times 0
+    }
+    It 'terminates only the revalidated tray instance' {
+        Mock Get-CimInstance { $script:tray }
+        Set-CloudComRustDeskQuietMode $script:tray.ExecutablePath
+        Should -Invoke Stop-Process -Times 1 -ParameterFilter { $Id -eq 42 }
     }
 }

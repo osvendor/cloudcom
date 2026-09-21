@@ -111,6 +111,7 @@ try {
     if ($changed) { Restart-Service -Name RustDesk -Force }
     elseif ((Get-Service -Name RustDesk).Status -ne 'Running') { Start-Service -Name RustDesk }
     Start-Sleep -Seconds 3
+    Set-CloudComRustDeskQuietMode $state.Exe
     $after = Get-CloudComRustDeskState $ConfigurationPath $RendezvousServer $RelayServer $PublicKey $PinnedVersion
     $remainingIssues = @($after.Issues | Where-Object { !($provisioning -and $_ -eq 'provisioning_requires_review') })
     if ($remainingIssues.Count -gt 0) { throw 'RustDesk remains noncompliant; see read-only probe for details.' }
