@@ -421,7 +421,7 @@ x-api-env: &api-env
 
 services:
   binaries-init:
-    image: ghcr.io/lanternops/breeze/binaries@${BREEZE_BINARIES_IMAGE_DIGEST:?Set BREEZE_BINARIES_IMAGE_DIGEST to the release image digest}
+    image: ${BREEZE_BINARIES_IMAGE_PREFIX:-ghcr.io/lanternops/breeze}/binaries@${BREEZE_BINARIES_IMAGE_DIGEST:?Set BREEZE_BINARIES_IMAGE_DIGEST to the release image digest}
     pull_policy: always
     container_name: breeze-binaries-init
     volumes:
@@ -470,7 +470,7 @@ services:
         ipv4_address: ${BREEZE_CLOUDFLARED_IP:-172.30.0.10}
 
   api:
-    image: ghcr.io/lanternops/breeze/api@${BREEZE_API_IMAGE_DIGEST:?Set BREEZE_API_IMAGE_DIGEST to the release image digest}
+    image: ${BREEZE_IMAGE_PREFIX:-ghcr.io/lanternops/breeze}/api@${BREEZE_API_IMAGE_DIGEST:?Set BREEZE_API_IMAGE_DIGEST to the release image digest}
     platform: linux/amd64
     container_name: breeze-api
     restart: unless-stopped
@@ -528,7 +528,7 @@ services:
   # Mirrors the api service's own volumes/secrets/depends_on shape above (this
   # stack has no local postgres service — DATABASE_URL points at a managed one).
   worker:
-    image: ghcr.io/lanternops/breeze/api@${BREEZE_API_IMAGE_DIGEST:?Set BREEZE_API_IMAGE_DIGEST to the release image digest}
+    image: ${BREEZE_IMAGE_PREFIX:-ghcr.io/lanternops/breeze}/api@${BREEZE_API_IMAGE_DIGEST:?Set BREEZE_API_IMAGE_DIGEST to the release image digest}
     platform: linux/amd64
     container_name: breeze-worker
     restart: unless-stopped
@@ -566,7 +566,7 @@ services:
       - breeze
 
   web:
-    image: ghcr.io/lanternops/breeze/web@${BREEZE_WEB_IMAGE_DIGEST:?Set BREEZE_WEB_IMAGE_DIGEST to the release image digest}
+    image: ${BREEZE_IMAGE_PREFIX:-ghcr.io/lanternops/breeze}/web@${BREEZE_WEB_IMAGE_DIGEST:?Set BREEZE_WEB_IMAGE_DIGEST to the release image digest}
     platform: linux/amd64
     container_name: breeze-web
     restart: unless-stopped
@@ -590,7 +590,7 @@ services:
       - breeze
 
   portal:
-    image: ghcr.io/lanternops/breeze/portal@${BREEZE_PORTAL_IMAGE_DIGEST:?Set BREEZE_PORTAL_IMAGE_DIGEST to the release image digest}
+    image: ${BREEZE_IMAGE_PREFIX:-ghcr.io/lanternops/breeze}/portal@${BREEZE_PORTAL_IMAGE_DIGEST:?Set BREEZE_PORTAL_IMAGE_DIGEST to the release image digest}
     platform: linux/amd64
     container_name: breeze-portal
     restart: unless-stopped

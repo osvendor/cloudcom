@@ -210,14 +210,19 @@ require_digest_ref REDIS_IMAGE_REF
 require_digest_ref COTURN_IMAGE_REF
 require_digest_ref BILLING_IMAGE_REF
 
-release_repository="lanternops/breeze"
+release_repository="${BREEZE_RELEASE_REPOSITORY:-lanternops/breeze}"
+if [[ ! "$release_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+  echo "[deploy] BREEZE_RELEASE_REPOSITORY must be owner/repository" >&2
+  exit 1
+fi
 release_version="${BREEZE_VERSION#v}"
 if [[ ! "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
   echo "[deploy] BREEZE_VERSION must be an exact semantic version" >&2
   exit 1
 fi
 release_tag="v${release_version}"
-release_image_base="ghcr.io/lanternops/breeze"
+release_image_base="${BREEZE_IMAGE_PREFIX:-ghcr.io/lanternops/breeze}"
+release_binaries_base="${BREEZE_BINARIES_IMAGE_PREFIX:-ghcr.io/lanternops/breeze}"
 release_manifest_dir="$(mktemp -d)"
 trap 'rm -rf "$release_manifest_dir"' EXIT
 release_download_base="https://github.com/${release_repository}/releases/download/${release_tag}"
@@ -240,7 +245,7 @@ node "${REPO_ROOT}/scripts/release/release-image-manifest.mjs" verify \
   --require-image "api=${release_image_base}/api@${BREEZE_API_IMAGE_DIGEST}" \
   --require-image "web=${release_image_base}/web@${BREEZE_WEB_IMAGE_DIGEST}" \
   --require-image "portal=${release_image_base}/portal@${BREEZE_PORTAL_IMAGE_DIGEST}" \
-  --require-image "binaries=${release_image_base}/binaries@${BREEZE_BINARIES_IMAGE_DIGEST}"
+  --require-image "binaries=${release_binaries_base}/binaries@${BREEZE_BINARIES_IMAGE_DIGEST}"
 
 COMPOSE_ARGS=(-f "${COMPOSE_FILE}")
 if [[ "${ENABLE_MONITORING}" == "true" ]]; then
@@ -413,7 +418,7 @@ echo "[deploy] Running database migrations"
 echo "[deploy] Deploying application stack"
 compose up -d --remove-orphans
 
-expected_api_ref="ghcr.io/lanternops/breeze/api@${BREEZE_API_IMAGE_DIGEST}"
+expected_api_ref="${release_image_base}/api@${BREEZE_API_IMAGE_DIGEST}"
 pool_uniform=0
 api_container_count=0
 api_digest_mismatch=0

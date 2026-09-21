@@ -36,7 +36,7 @@
 #
 # Inputs (env):
 #   GUIDED_SMOKE_VERSION             image tag the installer will use (default 0.112.0-ci-smoke).
-#                                    ghcr.io/lanternops/breeze/{api,web,portal}:<tag> must
+#                                    <GUIDED_SMOKE_IMAGE_PREFIX>/{api,web,portal}:<tag> must
 #                                    exist locally (CI builds them from this checkout).
 #                                    The numeric core MUST stay at or above
 #                                    guided-setup.sh's SIGNED_IMAGE_INVENTORY_MIN_VERSION —
@@ -45,6 +45,7 @@
 #                                    at/above that floor. The below-floor skip
 #                                    path is covered without Docker by
 #                                    scripts/check-guided-setup-signed-image-floor.sh.
+#   GUIDED_SMOKE_IMAGE_PREFIX        locally built app images (default ghcr.io/lanternops/breeze)
 #   GUIDED_SMOKE_BINARIES_IMAGE_REF  agent binaries image (default ghcr.io/lanternops/breeze/binaries:latest)
 #   GUIDED_SMOKE_WORK_DIR            installer work dir (default $HOME/breeze-guided-smoke)
 #   GUIDED_SMOKE_TUNNEL_PORT         local port for the tunnel simulation (default 8443)
@@ -56,6 +57,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 WORK_DIR="${GUIDED_SMOKE_WORK_DIR:-${HOME}/breeze-guided-smoke}"
 VERSION="${GUIDED_SMOKE_VERSION:-0.112.0-ci-smoke}"
+IMAGE_PREFIX="${GUIDED_SMOKE_IMAGE_PREFIX:-ghcr.io/lanternops/breeze}"
+IMAGE_PREFIX="${IMAGE_PREFIX%/}"
 BINARIES_IMAGE_REF="${GUIDED_SMOKE_BINARIES_IMAGE_REF:-ghcr.io/lanternops/breeze/binaries:latest}"
 TUNNEL_PORT="${GUIDED_SMOKE_TUNNEL_PORT:-8443}"
 # api/web/portal are built locally under a synthetic tag (no registry pull
@@ -228,8 +231,8 @@ require socat
 sudo -n true 2>/dev/null || fail "passwordless sudo is required (the installer installs a systemd unit)"
 docker compose version >/dev/null 2>&1 || fail "docker compose v2 is required"
 for image in api web portal; do
-  docker image inspect "ghcr.io/lanternops/breeze/${image}:${VERSION}" >/dev/null 2>&1 \
-    || fail "ghcr.io/lanternops/breeze/${image}:${VERSION} is not present locally — build it first"
+  docker image inspect "${IMAGE_PREFIX}/${image}:${VERSION}" >/dev/null 2>&1 \
+    || fail "${IMAGE_PREFIX}/${image}:${VERSION} is not present locally — build it first"
 done
 # Unlike api/web/portal (built from this checkout under the synthetic
 # ci-smoke tag above), the binaries image is a real, published, digest-pinned
@@ -264,7 +267,7 @@ for i in $(seq 1 30); do
   sleep 1
 done
 for image in api web portal; do
-  docker tag "ghcr.io/lanternops/breeze/${image}:${VERSION}" "${SMOKE_REGISTRY_REPO_PREFIX}/${image}:${VERSION}"
+  docker tag "${IMAGE_PREFIX}/${image}:${VERSION}" "${SMOKE_REGISTRY_REPO_PREFIX}/${image}:${VERSION}"
   docker push "${SMOKE_REGISTRY_REPO_PREFIX}/${image}:${VERSION}" >/dev/null \
     || fail "could not push ${SMOKE_REGISTRY_REPO_PREFIX}/${image}:${VERSION} to the local registry"
 done

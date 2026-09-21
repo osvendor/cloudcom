@@ -97,6 +97,7 @@ const ROOT_ALLOWLIST: Record<string, string> = {
 // overlay (see scripts/prod/deploy.sh's ENABLE_MONITORING), never by
 // deploy/docker-compose.prod.yml itself (#4362).
 const PROD_ALLOWLIST: Record<string, string> = {
+  BREEZE_RELEASE_REPOSITORY: 'consumed by scripts/prod/deploy.sh to fetch and verify the signed image inventory before starting containers',
   GRAFANA_ADMIN_PASSWORD: 'consumed by docker-compose.monitoring.yml, not deploy/docker-compose.prod.yml',
   POSTGRES_EXPORTER_DSN: 'consumed by docker-compose.monitoring.yml, not deploy/docker-compose.prod.yml',
 };

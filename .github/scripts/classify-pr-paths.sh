@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Reads changed-file paths on stdin (one per line) and prints eleven lines in
+# Reads changed-file paths on stdin (one per line) and prints boolean lines in
 # GITHUB_OUTPUT form: `code`, `docs`, `agent`, `app`, the six area flags
-# `api`, `web`, `portal`, `addins`, `m365`, `rust`, then `topology_browser` —
+# `api`, `web`, `portal`, `addins`, `m365`, `rust`, then `topology_browser` and
+# `endpoint` (all native endpoint checks; distinct from the narrow QEMU flag) —
 # each `true|false`.
 #
 # A documentation path is docs/**, apps/docs/**, or a *.md / *.mdx file
@@ -116,6 +117,7 @@ addins=false
 m365=false
 rust=false
 topology_browser=false
+endpoint=false
 seen=false
 all_areas() {
   api=true; web=true; portal=true; addins=true; m365=true; rust=true
@@ -126,6 +128,14 @@ while IFS= read -r path; do
   case "${path}" in
     docs/*|apps/docs/*|*.md|*.mdx) docs=true; continue ;;
     *) code=true ;;
+  esac
+  # Native endpoint checks are unnecessary for isolated server/UI changes.
+  # Agent-facing API contracts still exercise them. Shared or unknown paths
+  # deliberately run the full endpoint suite (including upstream merges).
+  case "${path}" in
+    apps/web/public/scripts/*|apps/api/src/routes/agent*|apps/api/src/services/agent*|apps/api/src/services/binar*|apps/api/src/services/remote*|apps/api/src/services/terminal*|apps/api/src/services/releaseArtifact*|apps/api/src/middleware/agent*) endpoint=true ;;
+    apps/api/*|apps/web/*|apps/portal/*|apps/m365-graph-read-executor/*|apps/m365-graph-actions-executor/*|apps/m365-communications-executor/*) : ;;
+    *) endpoint=true ;;
   esac
   # Area (first match wins). In a case pattern `*` also matches '/', so the
   # root-only globals below are anchored by their leading literal.
@@ -197,6 +207,7 @@ if [[ "${seen}" != "true" ]]; then
   app=true
   all_areas
   topology_browser=true
+  endpoint=true
 fi
 
 echo "code=${code}"
@@ -210,3 +221,4 @@ echo "addins=${addins}"
 echo "m365=${m365}"
 echo "rust=${rust}"
 echo "topology_browser=${topology_browser}"
+echo "endpoint=${endpoint}"

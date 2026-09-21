@@ -144,11 +144,10 @@ The `no-silent-mutations` test (`apps/web/src/lib/__tests__/no-silent-mutations.
 6. **Edge cases** — empty arrays, nil inputs, concurrent access
 
 ### CI Integration
-- All tests run automatically in CI (`.github/workflows/ci.yml`)
-- `test-api`, `test-web`, `test-agent` are **required** jobs on PRs
-- New test files are auto-discovered — no CI config changes needed
-- Go coverage is uploaded as artifact; no threshold enforced yet
-- Integration tests run in `smoke-test` job with `continue-on-error: true`
+- The inherited Breeze workflows have been removed at the user's request; CloudCom CI and a controlled upstream-release updater are implemented; see the CI guide for current coverage and deployment boundaries.
+- Follow `docs/cloudcom-ci.md`: validate our changes and affected interfaces against a pinned released upstream baseline.
+- Do not restore the upstream full pipeline during merges or claim automated coverage beyond the actual implemented checks.
+- Application tests remain available; inherited workflow-file contracts need adaptation for the replacement pipeline.
 
 ### Running Tests Locally
 ```bash
@@ -170,7 +169,21 @@ cd e2e-tests && pnpm test
 
 ---
 
-## Codex Delegation
+## CloudCom Fork Maintenance
+
+Read `docs/cloudcom-upstream-maintenance.md` before changing fork behavior or integrating upstream updates. Update its change register in the same PR as each CloudCom customization, including affected files, compatibility boundaries, tests, and migration/recovery implications. Distinguish planned work from implemented and verified work. Never treat a conflict-free merge or previous CI results as proof that a new upstream integration is safe.
+
+## CloudCom Codex Delegation Policy
+
+This policy governs Codex delegation for this project and takes precedence over the older `Codex Delegation` section below wherever they conflict. The primary Codex agent is the coordinator: it owns task scope, decisions, integration, and the final result.
+
+- Delegate narrow, routine UI or documentation work to `gpt-5.6-luna` at low reasoning effort.
+- Delegate ordinary, bounded implementation work to `gpt-5.6-terra` at medium reasoning effort.
+- Keep architecture, security, client/tenant isolation, migrations, and final critical review with the primary agent.
+- Give delegated agents only the context and files needed for their bounded task. Prefer scripts and CI for deterministic, repeatable work.
+- Do not change global settings as part of project delegation. Do not claim token or cost savings without measurements.
+
+## Legacy Codex Delegation Notes
 
 This project uses OpenAI Codex CLI for task delegation. Claude orchestrates complex work while Codex handles isolated tasks.
 

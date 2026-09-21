@@ -87,10 +87,10 @@ if [[ "$1" == "load" ]]; then
   [[ "$2" == "--input" && -f "$3" ]] || exit 1
   [[ -z "$LOAD_FAILURE" || "$3" != */"$LOAD_FAILURE".tar ]] || exit 1
 elif [[ "$1 $2" == "image inspect" ]]; then
-  [[ "\${@: -1}" == ghcr.io/lanternops/breeze/*:ci-smoke-123 ]] || exit 1
+  [[ "\${@: -1}" == ghcr.io/example/cloudcom/*:ci-smoke-123 ]] || exit 1
   echo "$TEST_REVISION"
 elif [[ "$1" == "tag" ]]; then
-  [[ "$2" == ghcr.io/lanternops/breeze/*:ci-smoke-123 && "$3" == ghcr.io/lanternops/breeze/*:0.112.0-ci-smoke-123 ]] || exit 1
+  [[ "$2" == ghcr.io/example/cloudcom/*:ci-smoke-123 && "$3" == ghcr.io/example/cloudcom/*:0.112.0-ci-smoke-123 ]] || exit 1
   echo "$3" >> "$TAG_LOG"
 else
   exit 1
@@ -102,7 +102,7 @@ fi
         encoding: 'utf8',
         env: {
           ...process.env, PATH: `${dir}:${process.env.PATH}`, IMAGE_ARCHIVE_DIR: dir,
-          CI_IMAGE_VERSION: 'ci-smoke-123', GUIDED_IMAGE_VERSION: '0.112.0-ci-smoke-123',
+          CI_IMAGE_REPOSITORY: 'Example/CloudCom', CI_IMAGE_VERSION: 'ci-smoke-123', GUIDED_IMAGE_VERSION: '0.112.0-ci-smoke-123',
           CI_IMAGE_REVISION: 'current-sha', TAG_LOG: join(dir, 'tags'),
           TEST_REVISION: revision, LOAD_FAILURE: loadFailure, GITHUB_ENV: envFile,
         },
@@ -114,11 +114,12 @@ fi
         // guided-setup.sh rejects a non-semver BREEZE_VERSION and version-floors
         // the signed-inventory check, so the guided tag must be semver-shaped.
         assert.ok(output.includes('GUIDED_SMOKE_VERSION=0.112.0-ci-smoke-123\n'));
+        assert.ok(output.includes('GUIDED_SMOKE_IMAGE_PREFIX=ghcr.io/example/cloudcom\n'));
         assert.match(output, /GUIDED_SMOKE_VERSION=\d+\.\d+\.\d+/u);
         const tagged = readFileSync(join(dir, 'tags'), 'utf8').trim().split('\n').sort();
-        assert.deepEqual(tagged, ['api', 'portal', 'web'].map((app) => `ghcr.io/lanternops/breeze/${app}:0.112.0-ci-smoke-123`));
+        assert.deepEqual(tagged, ['api', 'portal', 'web'].map((app) => `ghcr.io/example/cloudcom/${app}:0.112.0-ci-smoke-123`));
         for (const app of ['api', 'web', 'portal']) {
-          assert.ok(output.includes(`BREEZE_${app.toUpperCase()}_IMAGE_REF=ghcr.io/lanternops/breeze/${app}:ci-smoke-123\n`));
+          assert.ok(output.includes(`BREEZE_${app.toUpperCase()}_IMAGE_REF=ghcr.io/example/cloudcom/${app}:ci-smoke-123\n`));
         }
       }
     } finally {
@@ -140,7 +141,7 @@ for (const result of ['failure', 'cancelled', 'skipped', '']) {
           ...process.env, ...passing, IS_PR: isPr, CODE_CHANGED: 'true', DOCS_CHANGED: 'false',
           // Non-`_RESULT` classifier outputs the fail-closed gates require
           // (see the AGENT_CHANGED/APP_CHANGED three-branch checks below).
-          AGENT_CHANGED: 'true', APP_CHANGED: 'true',
+          AGENT_CHANGED: 'true', ENDPOINT_CHANGED: 'true', APP_CHANGED: 'true',
           // Every per-area flag true: the producer runs because the stack changed.
           API_CHANGED: 'true', WEB_CHANGED: 'true', PORTAL_CHANGED: 'true', ADDINS_CHANGED: 'true', M365_CHANGED: 'true', RUST_CHANGED: 'true',
           MOBILE_NATIVE_REQUIRED: 'true', BUILD_SMOKE_IMAGES_RESULT: result,

@@ -38,7 +38,9 @@ test('mobile compilation watches all native and workspace dependency inputs', ()
   assert.match(changes, /node \.github\/scripts\/mobile-lockfile-closure\.mjs "\$\{RUNNER_TEMP\}\/pnpm-lock\.base\.yaml" pnpm-lock\.yaml \| tee -a "\$GITHUB_OUTPUT"/u);
   assert.match(changes, /steps\.lockfile\.outputs\.changed == 'true'/u, 'closure result must feed the mobile output');
   assert.match(changes, /github\.event\.pull_request\.base\.sha \|\| github\.event\.merge_group\.base_sha/u);
-  assert.match(changes, /runs-on: ubuntu-latest/u);
+  // Classification runs on Linux; external fork PRs must use a hosted runner.
+  const routing = `runs-on: \${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}`;
+  assert.ok(changes.includes(routing), 'mobile classifier must preserve trusted/private versus external/hosted routing');
   // ci.yml no longer runs on pushes to main (the merge queue evaluated every
   // landing on its merge-group ref), so there is no multi-commit push to span:
   // PRs and merge groups compare against the default branch, and a manual
@@ -114,7 +116,7 @@ for (const [label, detector, required, result, passes] of [
         // but ci-success's fail-closed gates require them to be exactly
         // 'true'/'false' or the whole check goes red regardless of the
         // mobile-specific fixture below.
-        AGENT_CHANGED: 'true',
+        AGENT_CHANGED: 'true', ENDPOINT_CHANGED: 'true',
         APP_CHANGED: 'true',
         // Every per-area flag true (same fail-closed tri-state as AGENT_CHANGED).
         API_CHANGED: 'true', WEB_CHANGED: 'true', PORTAL_CHANGED: 'true', ADDINS_CHANGED: 'true', M365_CHANGED: 'true', RUST_CHANGED: 'true',

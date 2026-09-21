@@ -51,7 +51,7 @@ test('classifier: emits every area output, in order, after code/docs/agent/app, 
   assert.deepEqual(
     run.stdout.trim().split('\n').map((l) => l.split('=')[0]),
     // topology_browser (#6117) is a single-job gate, not an area; it trails the areas.
-    ['code', 'docs', 'agent', 'app', ...AREAS, 'topology_browser'],
+    ['code', 'docs', 'agent', 'app', ...AREAS, 'topology_browser', 'endpoint'],
   );
 });
 
@@ -386,7 +386,7 @@ const onlyAreas = (on, { isPr = 'true' } = {}) => {
   const env = {
     ...allResults('success'),
     CHANGES_RESULT: 'success', CODE_CHANGED: 'true', DOCS_CHANGED: 'false', DOCS_CHECK_RESULT: 'skipped',
-    APP_CHANGED: 'true', AGENT_CHANGED: 'false', RECOVERY_MEDIA_E2E_RESULT: 'skipped',
+    APP_CHANGED: 'true', ENDPOINT_CHANGED: 'true', AGENT_CHANGED: 'false', RECOVERY_MEDIA_E2E_RESULT: 'skipped',
     MOBILE_NATIVE_REQUIRED: 'false', BUILD_MOBILE_IOS_RESULT: 'skipped', IS_PR: isPr,
   };
   for (const area of AREAS) {
@@ -507,4 +507,43 @@ for (const flag of Object.values(FLAG)) {
       assert.equal(runSummary({ ...onlyAreas(AREAS), [flag]: bad }).status, 1);
     });
   }
+}
+
+// Native agent execution is independent of the recovery-media QEMU gate.
+const ENDPOINT_JOBS = ['build-agent', 'agent-windows-manifest-guard', 'test-agent', 'test-agent-windows', 'lint-agent', 'test-agent-race', 'windows-runtime-smoke'];
+const ENDPOINT_RESULTS = ['BUILD_AGENT_RESULT', 'TEST_AGENT_RESULT', 'TEST_AGENT_WINDOWS_RESULT', 'WINDOWS_RUNTIME_SMOKE_RESULT'];
+for (const [path, expected] of [
+  ['apps/web/src/components/integrations/ThreeCx.tsx', 'false'],
+  ['apps/api/src/routes/integrations/threecx.ts', 'false'],
+  ['apps/m365-graph-read-executor/src/index.ts', 'false'],
+  ['apps/api/src/routes/agents/heartbeat.ts', 'true'],
+  ['apps/web/public/scripts/uninstall.sh', 'true'],
+  ['apps/api/src/services/agentCommands.ts', 'true'],
+  ['agent/internal/heartbeat/heartbeat.go', 'true'],
+  ['packages/shared/src/types/index.ts', 'true'],
+  ['pnpm-lock.yaml', 'true'],
+  ['unknown-new-component/index.ts', 'true'],
+  ['README.md', 'false'],
+]) {
+  test(`endpoint classifier: ${path} -> ${expected}`, () => assert.equal(classify([path]).endpoint, expected));
+}
+test('endpoint classifier fails safe for missing evidence and mixed changes', () => {
+  assert.equal(classify([]).endpoint, 'true');
+  assert.equal(classify(['apps/web/src/pages/index.astro', 'agent/main.go']).endpoint, 'true');
+});
+for (const name of ENDPOINT_JOBS) {
+  test(`${name} is gated by broad endpoint changes`, () => {
+    assert.match(job(name), new RegExp(`^    if: ${escape(`${APP_IF} && needs.changes.outputs.endpoint == 'true'`)}$`, 'mu'));
+  });
+}
+for (const result of ENDPOINT_RESULTS) {
+  test(`CI Success validates ${result} endpoint tri-state`, () => {
+    assert.match(summary, triState('ENDPOINT_CHANGED', result));
+    const website = { ...onlyAreas(['api', 'web']), ENDPOINT_CHANGED: 'false', ...Object.fromEntries(ENDPOINT_RESULTS.map(key => [key, 'skipped'])) };
+    assert.equal(runSummary(website).status, 0);
+    assert.equal(runSummary({ ...website, [result]: 'success' }).status, 1);
+    assert.equal(runSummary({ ...website, ENDPOINT_CHANGED: '' }).status, 1);
+    assert.equal(runSummary({ ...onlyAreas(AREAS), [result]: 'skipped' }).status, 1);
+    assert.equal(runSummary({ ...onlyAreas(AREAS), [result]: 'failure' }).status, 1);
+  });
 }
