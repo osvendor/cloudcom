@@ -320,9 +320,11 @@ jobs:
 
   typecheck:
     name: Type Check
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
+    # The sole CloudCom worker has 8 GB RAM, below this job's 12 GB heap.
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    timeout-minutes: 30
     env:
       # tsc on the full apps/api project (dense Drizzle types) + astro check
       # exceed Node's default heap on the type-heaviest branches. Give the
@@ -364,7 +366,8 @@ jobs:
 
   test-api:
     name: Test API (shard ${{ matrix.shard }}/8)
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
+    # Keep all eight shards parallel; the sole CloudCom worker would serialize them.
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.api == 'true'
     # ~2470 vitest files, import-time dominated, 26-34 min unsharded. Only the
@@ -746,7 +749,8 @@ jobs:
 
   test-web:
     name: Test Web (shard ${{ matrix.shard }}/4)
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
+    # Keep all four shards parallel; the sole CloudCom worker would serialize them.
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.web == 'true'
     # ~1030 jsdom vitest files, 17 min unsharded — the longest job on an
@@ -2627,7 +2631,8 @@ jobs:
   # aggregates across the matrix (success only if every shard passed).
   integration-test:
     name: Integration Tests (shard ${{ matrix.shard }}/16)
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
+    # Keep all sixteen shards parallel; the sole CloudCom worker would serialize them.
+    runs-on: ubuntu-24.04
     # Sharded 16 ways (was 8). Deliberately does NOT `needs: [lint, typecheck]`
     # — that dependency added ~8 min of pure wait to the critical path before
     # this job could even start, for no isolation benefit: a lint or

@@ -4,7 +4,9 @@ The fork keeps Breeze's existing area classifier and the single `CI Success` res
 
 ## Local Linux runner
 
-Use a dedicated disposable VM, labeled `self-hosted`, `linux`, `cloudcom`, with Docker access. Install Git, GitHub CLI (`gh`), jq, curl, tar, unzip, build-essential, ripgrep, and socat. Actions install the pinned Node, pnpm, and Go versions. Allocate 8 GB minimum / 16 GB recommended RAM, and at least 20 GB free disk (60 GB or larger disk recommended). Large TypeScript checks budget a 12 GB heap. Avoid running multiple runner services against the same work directory.
+Use a dedicated disposable VM, labeled `self-hosted`, `linux`, `cloudcom`, with Docker access. Install Git, GitHub CLI (`gh`), jq, curl, tar, unzip, build-essential, ripgrep, and socat. Actions install the pinned Node, pnpm, and Go versions. Allocate 8 GB minimum / 16 GB recommended RAM, and at least 20 GB free disk (60 GB or larger disk recommended). Avoid running multiple runner services against the same work directory.
+
+The `typecheck`, `test-api` (8 shards), `test-web` (4 shards), and `integration-test` (16 shards) jobs always use `ubuntu-24.04` hosted runners. For this public repository, GitHub documents 16 GB RAM for that label in its [hosted-runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners). A single CloudCom worker would serialize the 28 test shards, and its assigned 8 GB cannot safely satisfy Type Check's 12 GB Node heap. Type Check also has a 30-minute deadline to bound pathological hangs. This limited routing leaves the remaining trusted-job and external-fork routing unchanged.
 
 `check-cloudcom-runner.sh` reports missing tools, insufficient resources, and incomplete checkouts before the application jobs queue. The classifier uses a full checkout because persistent runners reuse working directories. Temporary scanner binaries live in `RUNNER_TEMP`, not `/usr/local/bin`.
 

@@ -4,6 +4,13 @@ import { test } from 'node:test';
 
 const workflows = new URL('../workflows/', import.meta.url);
 const safeRouting = `\${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}`;
+const ci = readFileSync(new URL('ci.yml', workflows), 'utf8');
+
+function jobBody(source, name) {
+  const body = source.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  [a-z][\\w-]*:|$(?![\\s\\S]))`, 'm'))?.[1];
+  assert.ok(body, `ci.yml: missing job ${name}`);
+  return body;
+}
 
 test('fork PR workflows keep CloudCom Linux execution off the private runner', () => {
   let checked = 0;
@@ -37,6 +44,26 @@ test('privileged and native dependency jobs use disposable hosted runners', () =
         assert.match(body, /^            runner: ubuntu-22\.04$/m, name);
         assert.doesNotMatch(body, /^            runner: cloudcom$/m, name);
       }
+    }
+  }
+});
+
+test('memory-heavy and sharded application jobs use hosted runners', () => {
+  for (const [name, shardCount, condition] of [
+    ['typecheck', null, "needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'"],
+    ['test-api', 8, "needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.api == 'true'"],
+    ['test-web', 4, "needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.web == 'true'"],
+    ['integration-test', 16, "needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.api == 'true'"],
+  ]) {
+    const body = jobBody(ci, name);
+    assert.match(body, /^    runs-on: ubuntu-24\.04$/m, `${name}: must use a hosted runner`);
+    assert.match(body, /^    needs: \[changes\]$/m, `${name}: changes gate changed`);
+    assert.ok(body.split('\n').includes(`    if: ${condition}`), `${name}: area gate changed`);
+    if (name === 'typecheck') {
+      assert.match(body, /^    timeout-minutes: 30$/m, 'typecheck: timeout changed');
+    }
+    if (shardCount !== null) {
+      assert.match(body, new RegExp(`shard: \\[${Array.from({ length: shardCount }, (_, index) => index + 1).join(', ')}\\]`), `${name}: shard matrix changed`);
     }
   }
 });
