@@ -57,7 +57,7 @@ describe('ConnectDesktopButton — pending teardown is never rendered as connect
   it('shows the session-ending card (not the connected/idle state) when terminationPhase is pending', async () => {
     rigLaunch({ status: 'disconnected', terminationPhase: 'pending' });
 
-    render(<ConnectDesktopButton deviceId="dev-1" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-1" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {
@@ -78,7 +78,7 @@ describe('ConnectDesktopButton — pending teardown is never rendered as connect
   it('treats a pending teardown as ended even if the status still reads live', async () => {
     rigLaunch({ status: 'active', terminationPhase: 'pending' });
 
-    render(<ConnectDesktopButton deviceId="dev-1" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-1" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {
@@ -89,7 +89,7 @@ describe('ConnectDesktopButton — pending teardown is never rendered as connect
   it('still goes quietly idle when the viewer connects (terminationPhase none)', async () => {
     rigLaunch({ status: 'active', terminationPhase: 'none' });
 
-    render(<ConnectDesktopButton deviceId="dev-1" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-1" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {
@@ -107,7 +107,7 @@ describe('ConnectDesktopButton — pending teardown is never rendered as connect
   it('dismisses the session-ending card', async () => {
     rigLaunch({ status: 'disconnected', terminationPhase: 'pending' });
 
-    render(<ConnectDesktopButton deviceId="dev-1" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-1" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {

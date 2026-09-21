@@ -2,6 +2,13 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { classify, readBaseline } from './cloudcom-delta.mjs';
 
+test('browser viewer changes require web validation while unrelated web surfaces fail closed', () => {
+  for (const path of ['apps/web/src/components/cloudcom/browserDesktop/browserFetch.ts', 'apps/web/src/components/remote/ConnectDesktopButton.tsx', 'apps/web/src/components/remote/ConnectDesktopButton.browser.test.tsx']) {
+    assert.equal(classify([path]).web, true);
+    assert.deepEqual(classify([path]).unsupported, []);
+  }
+});
+
 test('baseline accepts a valid release fixture and rejects an arbitrary repository', () => {
   assert.deepEqual(readBaseline(JSON.stringify({
     repository: 'LanternOps/breeze', tag: 'v9.8.7', commit: 'a'.repeat(40),

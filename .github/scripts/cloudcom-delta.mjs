@@ -48,7 +48,8 @@ export function classify(paths) {
       result.api = true;
       continue;
     }
-    if (remoteAccessWebPaths.has(path)) {
+    if (remoteAccessWebPaths.has(path) || path.startsWith('apps/web/src/components/cloudcom/browserDesktop/') ||
+        /^apps\/web\/src\/components\/remote\/ConnectDesktopButton(?:\.[\w]+)*\.tsx$/.test(path)) {
       result.web = true;
       continue;
     }

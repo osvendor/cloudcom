@@ -14,6 +14,8 @@ import '@/lib/i18n';
 import SessionPickerModal from './SessionPickerModal';
 
 interface Props {
+  /** Browser is the default; native remains available to explicit consumers. */
+  viewerMode?: 'browser' | 'native';
   deviceId: string;
   className?: string;
   compact?: boolean;
@@ -105,7 +107,7 @@ function desktopAccessUnavailableReason(
   }
 }
 
-export default function ConnectDesktopButton({ deviceId, className = '', compact = false, iconOnly = false, disabled = false, disabledTitle, isHeadless = false, desktopAccess = null, remoteAccessPolicy = null, helperLifecycleMode = null }: Props) {
+export default function ConnectDesktopButton({ viewerMode = 'browser', deviceId, className = '', compact = false, iconOnly = false, disabled = false, disabledTitle, isHeadless = false, desktopAccess = null, remoteAccessPolicy = null, helperLifecycleMode = null }: Props) {
   const { t } = useTranslation('remote');
   const [status, setStatus] = useState<'idle' | 'creating' | 'launching' | 'fallback' | 'denied' | 'ending' | 'revoked'>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -147,6 +149,9 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
     setError(null);
 
     try {
+      const browserViewer = viewerMode === 'browser'
+        ? await import('@/components/cloudcom/browserDesktop/launch') : null;
+      if (browserViewer?.isBrowserDesktopActive()) throw new Error('Disconnect the active browser desktop before opening another.');
       // The `desktopAccess` prop is fetched once when the Remote Tools page mounts
       // and never refreshed. On a slow helper-attach or after the user logs in
       // on the Mac, the snapshot goes stale and we'd route to VNC even when
@@ -414,7 +419,18 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
         throw new Error(t('connectDesktopButton.errors.invalidDesktopCode'));
       }
 
-      // Build deep link URL
+      if (browserViewer) {
+        try {
+          browserViewer.launchBrowserDesktop({ sessionId: session.id, connectCode: codeData.code, deviceId, targetSessionId });
+          setStatus('idle');
+        } catch (error) {
+          endSession(session.id);
+          throw error;
+        }
+        return;
+      }
+
+      // Build deep link URL for explicit native-viewer consumers.
       const apiUrl = import.meta.env.PUBLIC_API_URL || window.location.origin;
       const deepLink = `breeze://connect?session=${encodeURIComponent(session.id)}&code=${encodeURIComponent(codeData.code)}&api=${encodeURIComponent(apiUrl)}&device=${encodeURIComponent(deviceId)}`
         + (targetSessionId != null ? `&targetSessionId=${targetSessionId}` : '');
@@ -500,7 +516,7 @@ export default function ConnectDesktopButton({ deviceId, className = '', compact
       );
       setStatus('idle');
     }
-  }, [deviceId, desktopAccess, remoteAccessPolicy, endSession, t]);
+  }, [viewerMode, deviceId, desktopAccess, remoteAccessPolicy, endSession, t]);
 
   // Entry point for a connect click. RDS hosts open the session picker first;
   // everything else connects immediately (unchanged behavior).

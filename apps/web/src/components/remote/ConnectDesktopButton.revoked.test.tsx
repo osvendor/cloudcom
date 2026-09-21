@@ -52,7 +52,7 @@ describe('ConnectDesktopButton — server-revoked session', () => {
       errorMessage: 'revoked:membership_removed',
     }));
 
-    render(<ConnectDesktopButton deviceId="dev-revoked" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-revoked" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {
@@ -76,7 +76,7 @@ describe('ConnectDesktopButton — server-revoked session', () => {
       errorMessage: 'revoked:mfa_required',
     }));
 
-    render(<ConnectDesktopButton deviceId="dev-revoked-mfa" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-revoked-mfa" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {
@@ -100,7 +100,7 @@ describe('ConnectDesktopButton — server-revoked session', () => {
       errorMessage: 'revoked:some_future_reason',
     }));
 
-    render(<ConnectDesktopButton deviceId="dev-revoked-unknown" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-revoked-unknown" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {
@@ -127,7 +127,7 @@ describe('ConnectDesktopButton — server-revoked session', () => {
       errorMessage: null,
     }));
 
-    render(<ConnectDesktopButton deviceId="dev-ordinary" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-ordinary" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {
