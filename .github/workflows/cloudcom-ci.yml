@@ -113,12 +113,15 @@ jobs:
       - name: Run API tests and build when API or shared code changed
         if: needs.delta.outputs.api == 'true' || needs.delta.outputs.shared == 'true'
         run: |
-          pnpm --filter @breeze/api test:run
+          pnpm --filter @breeze/api exec vitest run src/services/cloudcom/remoteAccessOptions.test.ts src/routes/devices/cloudcomRemoteAccess.test.ts src/services/remoteAccessLauncher.test.ts src/services/remoteAccessProviders.test.ts src/routes/devices/core.remoteAccessLaunch.test.ts
           pnpm --filter @breeze/api build
       - name: Run web tests and build when web or shared code changed
         if: needs.delta.outputs.web == 'true' || needs.delta.outputs.shared == 'true'
         run: |
-          pnpm --filter @breeze/web test --run
+          node scripts/cloudcom/sync-browser-viewer.mjs --check
+          pnpm --filter @breeze/web exec vitest run src/components/cloudcom/browserDesktop src/components/remote/ConnectDesktopButton.browser.test.tsx
+          pnpm --filter @breeze/viewer exec vitest run src/lib/answerPoll.test.ts src/lib/revocationLease.test.ts src/lib/keymap.test.ts src/lib/api.test.ts
+          pnpm --filter @breeze/web exec vitest run src/components/cloudcom/RemoteAccessAlternatives.test.tsx src/components/remote/ConnectDesktopButton.test.tsx src/components/remote/ConnectDesktopButton.denied.test.tsx src/components/remote/ConnectDesktopButton.revoked.test.tsx src/components/remote/ConnectDesktopButton.teardownPending.test.tsx src/components/remote/RemoteToolsPage.test.tsx src/components/remote/RemoteToolsPage.liveDesktopAccess.test.tsx
           pnpm --filter @breeze/web build
       - name: Run fork infrastructure contracts
         if: needs.delta.outputs.infra == 'true'
@@ -127,6 +130,8 @@ jobs:
           node --test scripts/release/release-image-consumers.test.mjs
           bash scripts/check-guided-setup-systemd-unit.sh
           node --test scripts/cloudcom/update-upstream.test.mjs
+          node --test scripts/cloudcom/customization-contract.test.mjs
+          node scripts/cloudcom/customization-contract.mjs
       - name: Verify the CloudCom delta classifier
         run: node --test .github/scripts/cloudcom-delta.test.mjs
 

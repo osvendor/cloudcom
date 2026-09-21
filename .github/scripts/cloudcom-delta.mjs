@@ -5,9 +5,22 @@ import { fileURLToPath } from 'node:url';
 const baselinePath = new URL('../cloudcom-baseline.json', import.meta.url);
 const docsPath = /^(?:docs\/|apps\/docs\/|scripts\/docs-review\/|README(?:\.[^/]+)?$|AGENTS\.md$|[^/]+\.mdx?$)/u;
 const supported = [
-  ['web', /^apps\/web\//u],
   ['native', /^agent\//u],
 ];
+const remoteAccessWebPaths = new Set([
+  'apps/web/src/components/remote/RemoteToolsPage.tsx',
+  'apps/web/src/components/cloudcom/RemoteAccessAlternatives.tsx',
+  'apps/web/src/components/cloudcom/RemoteAccessAlternatives.test.tsx',
+]);
+// Only this reviewed API surface has change-focused coverage below. Unknown
+// API, schema and portal changes continue to fail closed.
+const remoteAccessApiPaths = new Set([
+  'apps/api/src/routes/devices/index.ts',
+  'apps/api/src/routes/devices/cloudcomRemoteAccess.ts',
+  'apps/api/src/routes/devices/cloudcomRemoteAccess.test.ts',
+  'apps/api/src/services/cloudcom/remoteAccessOptions.ts',
+  'apps/api/src/services/cloudcom/remoteAccessOptions.test.ts',
+]);
 const infraPaths = new Set([
   'AGENTS.md', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',
   '.github/scripts/check-cloudcom-runner.sh', '.github/scripts/ci-area-gating.test.mjs',
@@ -31,6 +44,15 @@ export function classify(paths) {
   const result = { api: false, web: false, shared: false, native: false, infra: false, unsupported: [] };
   for (const path of paths.filter(Boolean)) {
     if (docsPath.test(path)) continue;
+    if (remoteAccessApiPaths.has(path)) {
+      result.api = true;
+      continue;
+    }
+    if (remoteAccessWebPaths.has(path) || path.startsWith('apps/web/src/components/cloudcom/browserDesktop/') ||
+        /^apps\/web\/src\/components\/remote\/ConnectDesktopButton(?:\.[\w]+)*\.tsx$/.test(path)) {
+      result.web = true;
+      continue;
+    }
     if (path === 'apps/api/src/config/envComposeParity.test.ts') {
       result.infra = true;
       continue;

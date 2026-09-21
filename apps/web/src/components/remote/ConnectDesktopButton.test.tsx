@@ -58,7 +58,7 @@ describe('ConnectDesktopButton — launcher skip-reason toast', () => {
     // enough that handleConnect doesn't error before the toast is checked.
     fetchMock.mockResolvedValue(jsonRes({ id: 'sess-1', code: 'code-1' }));
 
-    render(<ConnectDesktopButton deviceId="dev-1" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-1" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {
@@ -81,7 +81,7 @@ describe('ConnectDesktopButton — launcher skip-reason toast', () => {
     }));
     fetchMock.mockResolvedValue(jsonRes({ id: 'sess-1', code: 'code-1' }));
 
-    render(<ConnectDesktopButton deviceId="dev-2" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-2" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     // Give the click handler time to run; if a toast was going to fire, it
@@ -98,7 +98,7 @@ describe('ConnectDesktopButton — launcher skip-reason toast', () => {
     }));
     fetchMock.mockResolvedValue(jsonRes({ id: 'sess-1', code: 'code-1' }));
 
-    render(<ConnectDesktopButton deviceId="dev-3" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-3" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {
@@ -123,7 +123,7 @@ describe('ConnectDesktopButton — launcher skip-reason toast', () => {
       scheme: 'rustdesk',
     }));
 
-    render(<ConnectDesktopButton deviceId="dev-4" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-4" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await new Promise((r) => setTimeout(r, 20));
@@ -176,7 +176,7 @@ describe('ConnectDesktopButton — disabled prop gating (issue #2013)', () => {
   }
 
   it('stays enabled when not disabled', () => {
-    render(<ConnectDesktopButton deviceId="dev-on" disabledTitle="Device is offline" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-on" disabledTitle="Device is offline" />);
     expect(screen.getByRole('button', { name: /connect desktop/i })).not.toBeDisabled();
   });
 
@@ -209,7 +209,7 @@ describe('ConnectDesktopButton — disabled prop gating (issue #2013)', () => {
     fetchMock.mockResolvedValue(jsonRes({ error: 'Device is not online' }, false));
 
     const { rerender } = render(
-      <ConnectDesktopButton deviceId="dev-x" disabledTitle="Device is offline" />,
+      <ConnectDesktopButton viewerMode="native" deviceId="dev-x" disabledTitle="Device is offline" />,
     );
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
     await waitFor(() =>
@@ -218,7 +218,7 @@ describe('ConnectDesktopButton — disabled prop gating (issue #2013)', () => {
 
     // Device flips offline → disabled. The stale error must clear so the offline
     // tooltip is visible rather than the leftover "Connection failed" title.
-    rerender(<ConnectDesktopButton deviceId="dev-x" disabled disabledTitle="Device is offline" />);
+    rerender(<ConnectDesktopButton viewerMode="native" deviceId="dev-x" disabled disabledTitle="Device is offline" />);
     const btn = screen.getByRole('button');
     expect(btn).toBeDisabled();
     expect(btn).toHaveAttribute('title', 'Device is offline');
@@ -248,7 +248,7 @@ describe('ConnectDesktopButton — viewer-not-installed fallback card', () => {
       return Promise.resolve(jsonRes({ status: 'pending' }));
     });
 
-    render(<ConnectDesktopButton deviceId="dev-1" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-1" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     // 5 polls × 1.5s before the card appears. Driven by explicit timer advance
@@ -363,7 +363,7 @@ describe('ConnectDesktopButton — session creation (#4090)', () => {
     }));
     fetchMock.mockResolvedValue(jsonRes({ id: 'sess-1', code: 'code-1', status: 'pending' }));
 
-    render(<ConnectDesktopButton deviceId="dev-4090" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-4090" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {
@@ -413,7 +413,7 @@ describe('ConnectDesktopButton — agent upgrade required', () => {
   it('renders the pending-agent-update reason, distinct from a generic failure', async () => {
     rigUpgradeRequired();
 
-    render(<ConnectDesktopButton deviceId="dev-1" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-1" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {
@@ -438,7 +438,7 @@ describe('ConnectDesktopButton — agent upgrade required', () => {
   it('does not go on to mint a connect code after the gate refuses', async () => {
     rigUpgradeRequired();
 
-    render(<ConnectDesktopButton deviceId="dev-1" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-1" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {

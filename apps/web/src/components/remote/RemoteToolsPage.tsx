@@ -29,6 +29,7 @@ import RegistryEditor from './RegistryEditor';
 import RemoteTerminal from './RemoteTerminal';
 import FileManager from './FileManager';
 import ConnectDesktopButton from './ConnectDesktopButton';
+import RemoteAccessAlternatives from '../cloudcom/RemoteAccessAlternatives';
 import { showToast } from '@/components/shared/Toast';
 import { getInitialFilePath } from './filePathUtils';
 import { useTranslation } from 'react-i18next';
@@ -1001,6 +1002,7 @@ export default function RemoteToolsPage({
         </div>
         <div className="flex items-center gap-2">
           <ConnectDesktopButton deviceId={deviceId} isHeadless={isHeadless} desktopAccess={desktopAccess} remoteAccessPolicy={remoteAccessPolicy} helperLifecycleMode={helperLifecycleMode} />
+          <RemoteAccessAlternatives deviceId={deviceId} />
           {shouldShowClose && (
             <button
               onClick={handleClose}

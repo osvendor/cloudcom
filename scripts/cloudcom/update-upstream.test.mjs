@@ -71,6 +71,29 @@ test('refuses dirty checkouts and release history rollback', (t) => {
   assert.equal(git('status', '--porcelain'), '');
 });
 
+test('aborts a conflict-free upstream update that removes a registered attachment', t => {
+  const { cwd, git, write, baseline } = fixture(t);
+  // Extend baseline on a new upstream branch, then fork only the declaration.
+  git('switch', '-c', 'contract-base', baseline.commit);
+  write('host.ts', 'mount(customModule);\n');
+  git('add', 'host.ts'); git('commit', '-m', 'shared attachment');
+  const base = { commit: git('rev-parse', 'HEAD') };
+  git('switch', '-c', 'contract-upstream');
+  write('host.ts', 'mount(upstreamModule);\n');
+  git('add', 'host.ts'); git('commit', '-m', 'upstream removes attachment');
+  const release = git('rev-parse', 'HEAD');
+  git('switch', '-c', 'contract-fork', base.commit);
+  write('.github/cloudcom-customizations.json', JSON.stringify({ version: 1, customizations: [{
+    id: 'remote', requiredFiles: ['host.ts'], hooks: [{ file: 'host.ts', contains: 'mount(customModule)' }],
+  }] }));
+  git('add', '.'); git('commit', '-m', 'register customization');
+  const original = git('rev-parse', 'HEAD');
+  assert.throws(() => prepareMerge(cwd, release, base), /hook missing/);
+  assert.equal(git('rev-parse', 'HEAD'), original);
+  assert.equal(git('status', '--porcelain'), '');
+  assert.equal(readFileSync(join(cwd, 'host.ts'), 'utf8'), 'mount(customModule);\n');
+});
+
 test('dispatches validation when only earlier heads have runs and avoids duplicate exact-head runs', () => {
   const calls = [];
   const gh = (...args) => {

@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+import { assertCustomizations, readCustomizationContract } from './customization-contract.mjs';
 
 const repository = 'LanternOps/breeze';
 function run(command, args, cwd, env = process.env) {
@@ -12,6 +13,9 @@ export function prepareMerge(cwd, commit, baseline) {
   if (git('status', '--porcelain')) throw new Error('Refusing to update a dirty checkout');
   git('merge-base', '--is-ancestor', baseline.commit, commit);
   const original = git('rev-parse', 'HEAD');
+  // Capture the pre-merge contract: an incoming change cannot remove a
+  // registered module and erase its declaration to make validation pass.
+  const customizations = readCustomizationContract(cwd);
   try {
     try { git('merge', '--no-commit', '--no-ff', commit); }
     catch (error) {
@@ -23,6 +27,7 @@ export function prepareMerge(cwd, commit, baseline) {
     git('restore', '--source', original, '--staged', '--worktree', '--', '.github/workflows');
     const conflicts = git('diff', '--name-only', '--diff-filter=U');
     if (conflicts) throw new Error(`Manual upstream conflict resolution required:\n${conflicts}`);
+    assertCustomizations(cwd, customizations);
     return original;
   } catch (error) {
     try { git('merge', '--abort'); } catch { /* Merge may not have started. */ }

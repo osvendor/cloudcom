@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "customizations": [
+    {
+      "id": "remote-access-alternatives",
+      "requiredFiles": [
+        "apps/api/src/routes/devices/cloudcomRemoteAccess.ts",
+        "apps/api/src/routes/devices/cloudcomRemoteAccess.test.ts",
+        "apps/api/src/services/cloudcom/remoteAccessOptions.ts",
+        "apps/api/src/services/cloudcom/remoteAccessOptions.test.ts",
+        "apps/web/src/components/cloudcom/RemoteAccessAlternatives.tsx",
+        "apps/web/src/components/cloudcom/RemoteAccessAlternatives.test.tsx",
+        "docs/cloudcom-rustdesk.md"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/routes/devices/index.ts",
+          "contains": "deviceRoutes.route('/', cloudcomRemoteAccessRoutes)"
+        },
+        {
+          "file": "apps/web/src/components/remote/RemoteToolsPage.tsx",
+          "contains": "<RemoteAccessAlternatives"
+        }
+      ]
+    },
+    {
+      "id": "browser-desktop",
+      "requiredFiles": [
+        "apps/web/src/components/cloudcom/browserDesktop/launch.tsx",
+        "apps/web/src/components/cloudcom/browserDesktop/browserFetch.ts",
+        "scripts/cloudcom/sync-browser-viewer.mjs",
+        "docs/cloudcom-browser-desktop.md"
+      ],
+      "hooks": [
+        {
+          "file": "apps/web/src/components/remote/ConnectDesktopButton.tsx",
+          "contains": "browserViewer.launchBrowserDesktop"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "sync-browser-viewer.mjs --check"
+        }
+      ]
+    }
+  ]
+}

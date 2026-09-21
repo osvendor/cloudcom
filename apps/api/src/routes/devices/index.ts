@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { cloudcomRemoteAccessRoutes } from './cloudcomRemoteAccess';
 import { coreRoutes } from './core';
 import { metricsRoutes } from './metrics';
 import { processSamplesRoutes } from './processSamples';
@@ -43,6 +44,9 @@ import { bulkLifecycleRoutes } from './bulkLifecycle';
 import { agentRollbackRoutes } from '../agentRollback';
 
 export const deviceRoutes = new Hono();
+
+// CloudCom optional tools: isolated, per-route authorization; no default override.
+deviceRoutes.route('/', cloudcomRemoteAccessRoutes);
 
 // Mount the custom-field VALUE routes FIRST. They use per-route auth that also
 // accepts an X-API-Key header (issue #2066). Hono attaches a sibling sub-router's
