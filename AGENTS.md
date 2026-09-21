@@ -170,6 +170,10 @@ cd e2e-tests && pnpm test
 
 ---
 
+## CloudCom Fork Maintenance
+
+Read `docs/cloudcom-upstream-maintenance.md` before changing fork behavior or integrating upstream updates. Update its change register in the same PR as each CloudCom customization, including affected files, compatibility boundaries, tests, and migration/recovery implications. Distinguish planned work from implemented and verified work. Never treat a conflict-free merge or previous CI results as proof that a new upstream integration is safe.
+
 ## CloudCom Codex Delegation Policy
 
 This policy governs Codex delegation for this project and takes precedence over the older `Codex Delegation` section below wherever they conflict. The primary Codex agent is the coordinator: it owns task scope, decisions, integration, and the final result.
