@@ -132,6 +132,14 @@ jobs:
           node --test scripts/cloudcom/update-upstream.test.mjs
           node --test scripts/cloudcom/customization-contract.test.mjs
           node scripts/cloudcom/customization-contract.mjs
+      - name: Validate RustDesk deployment mutation boundaries
+        if: needs.delta.outputs.infra == 'true'
+        shell: pwsh
+        run: |
+          ./scripts/cloudcom/rustdesk/test-contract.ps1
+          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -Repository PSGallery
+          Import-Module Pester -RequiredVersion 5.7.1
+          Invoke-Pester ./scripts/cloudcom/rustdesk/repair.Tests.ps1 -Output Detailed -CI
       - name: Verify the CloudCom delta classifier
         run: node --test .github/scripts/cloudcom-delta.test.mjs
 
