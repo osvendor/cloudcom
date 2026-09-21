@@ -133,7 +133,7 @@ while IFS= read -r path; do
   # Agent-facing API contracts still exercise them. Shared or unknown paths
   # deliberately run the full endpoint suite (including upstream merges).
   case "${path}" in
-    apps/api/src/routes/agent*|apps/api/src/services/agent*|apps/api/src/services/binar*|apps/api/src/services/remote*|apps/api/src/services/terminal*|apps/api/src/services/releaseArtifact*|apps/api/src/middleware/agent*) endpoint=true ;;
+    apps/web/public/scripts/*|apps/api/src/routes/agent*|apps/api/src/services/agent*|apps/api/src/services/binar*|apps/api/src/services/remote*|apps/api/src/services/terminal*|apps/api/src/services/releaseArtifact*|apps/api/src/middleware/agent*) endpoint=true ;;
     apps/api/*|apps/web/*|apps/portal/*|apps/m365-graph-read-executor/*|apps/m365-graph-actions-executor/*|apps/m365-communications-executor/*) : ;;
     *) endpoint=true ;;
   esac

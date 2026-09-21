@@ -517,6 +517,7 @@ for (const [path, expected] of [
   ['apps/api/src/routes/integrations/threecx.ts', 'false'],
   ['apps/m365-graph-read-executor/src/index.ts', 'false'],
   ['apps/api/src/routes/agents/heartbeat.ts', 'true'],
+  ['apps/web/public/scripts/uninstall.sh', 'true'],
   ['apps/api/src/services/agentCommands.ts', 'true'],
   ['agent/internal/heartbeat/heartbeat.go', 'true'],
   ['packages/shared/src/types/index.ts', 'true'],

@@ -2424,7 +2424,8 @@ jobs:
   # promote it once its runtime/caching is proven.
   rust-check:
     name: Rust Check (Tauri apps)
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
+    # Native system dependencies belong on a disposable hosted runner.
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.rust == 'true'
     timeout-minutes: 35

@@ -280,7 +280,8 @@ jobs:
   build-recovery-media:
     name: Build recovery media (${{ matrix.arch }})
     needs: [build-agent]
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
+    # Native system dependencies belong on a disposable hosted runner.
+    runs-on: ubuntu-24.04
     continue-on-error: ${{ matrix.arch == 'arm64' }}
     strategy:
       fail-fast: false
@@ -1134,7 +1135,7 @@ jobs:
             asset_name: breeze-viewer-windows.msi
             asset_glob: 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi'
           - platform: ubuntu-22.04
-            runner: cloudcom
+            runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset_name: breeze-viewer-linux.AppImage
             asset_glob: 'src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage'
@@ -1294,7 +1295,7 @@ jobs:
             asset_name: breeze-helper-windows.msi
             asset_glob: 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi'
           - platform: ubuntu-22.04
-            runner: cloudcom
+            runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset_name: breeze-helper-linux.AppImage
             asset_glob: 'src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage'
@@ -2285,7 +2286,8 @@ jobs:
 
   create-release:
     name: Create Release
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
+    # Native system dependencies belong on a disposable hosted runner.
+    runs-on: ubuntu-24.04
     needs: [build-api, build-web, build-agent, build-recovery-media, build-windows-unsigned, build-macos-agent, build-macos-installer-app, sign-windows-tauri, build-viewer, build-helper, build-viewer-macos, build-helper-macos, merge-viewer-update-manifest, package-windows-updater, release-integrity-gate, validate-release-lineage, build-binaries-image, build-docker-api, build-docker-web, build-docker-portal, build-docker-m365-graph-read-executor, build-docker-m365-graph-actions-executor, build-docker-m365-communications-executor]
     if: >-
       github.ref_type == 'tag'

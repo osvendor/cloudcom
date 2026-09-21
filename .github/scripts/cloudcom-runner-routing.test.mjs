@@ -20,3 +20,23 @@ test('fork PR workflows keep CloudCom Linux execution off the private runner', (
   }
   assert.ok(checked > 0, 'Expected to inspect CloudCom PR runner routes');
 });
+
+
+test('privileged and native dependency jobs use disposable hosted runners', () => {
+  for (const [file, directJobs, matrixJobs] of [
+    ['ci.yml', ['test-agent', 'recovery-media-e2e', 'rust-check'], []],
+    ['release.yml', ['build-recovery-media', 'create-release'], ['build-viewer', 'build-helper']],
+  ]) {
+    const source = readFileSync(new URL(file, workflows), 'utf8');
+    for (const name of [...directJobs, ...matrixJobs]) {
+      const body = source.match(new RegExp(`^  ${name}:\\n([\\s\\S]*?)(?=^  [a-z][\\w-]*:|$(?![\\s\\S]))`, 'm'))?.[1];
+      assert.ok(body, `${file}: missing job ${name}`);
+      if (directJobs.includes(name)) {
+        assert.match(body, /^    runs-on: ubuntu-24\.04$/m, name);
+      } else {
+        assert.match(body, /^            runner: ubuntu-22\.04$/m, name);
+        assert.doesNotMatch(body, /^            runner: cloudcom$/m, name);
+      }
+    }
+  }
+});
