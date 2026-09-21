@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -221,6 +222,139 @@ func TestConnect_ServerRefusesConnection(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "failed to connect") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConnect_HandshakeFailureReportsOnlyHTTPStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "sensitive server failure detail", http.StatusForbidden)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, noopHandler)
+	err := c.connect()
+	if err == nil {
+		t.Fatal("expected handshake error")
+	}
+	if !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("error = %q, want HTTP status", err)
+	}
+	if strings.Contains(err.Error(), "sensitive server failure detail") {
+		t.Fatalf("error exposed response body: %q", err)
+	}
+}
+
+func TestReadPump_ExitsWhenReadDeadlineExpires(t *testing.T) {
+	pumpStarted := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := testUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if err := conn.WriteJSON(map[string]any{"type": "connected"}); err != nil {
+			return
+		}
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, noopHandler)
+	c.OnConnected = func() { pumpStarted <- struct{}{} }
+	t.Cleanup(c.Stop)
+	if err := c.connect(); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	pumpDone := make(chan struct{})
+	go func() {
+		c.readPump()
+		close(pumpDone)
+	}()
+
+	select {
+	case <-pumpStarted:
+	case <-time.After(time.Second):
+		t.Fatal("read pump did not process the server message")
+	}
+	c.connMu.RLock()
+	conn := c.conn
+	c.connMu.RUnlock()
+	if conn == nil {
+		t.Fatal("connection disappeared before setting the short read deadline")
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	select {
+	case <-pumpDone:
+	case <-time.After(time.Second):
+		t.Fatal("read pump stayed blocked after the read deadline expired")
+	}
+}
+
+func TestConnect_DoesNotPublishConnectionAfterStopDuringHandshake(t *testing.T) {
+	requestReceived := make(chan struct{}, 1)
+	releaseUpgrade := make(chan struct{})
+	serverSawClosedConn := make(chan struct{}, 1)
+	var releaseOnce sync.Once
+	allowUpgrade := func() { releaseOnce.Do(func() { close(releaseUpgrade) }) }
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case requestReceived <- struct{}{}:
+		default:
+		}
+		<-releaseUpgrade
+		conn, err := testUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			select {
+			case serverSawClosedConn <- struct{}{}:
+			default:
+			}
+		}
+	}))
+	defer func() {
+		allowUpgrade()
+		srv.Close()
+	}()
+
+	c := newTestClient(srv.URL, noopHandler)
+	t.Cleanup(c.Stop)
+	connectResult := make(chan error, 1)
+	go func() { connectResult <- c.connect() }()
+
+	select {
+	case <-requestReceived:
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive the handshake request")
+	}
+	c.Stop()
+	allowUpgrade()
+
+	select {
+	case err := <-connectResult:
+		if err == nil || !strings.Contains(err.Error(), "client is stopped") {
+			t.Fatalf("connect error = %v, want client stopped", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("connect did not return after the delayed upgrade")
+	}
+	if c.IsConnected() {
+		t.Fatal("stopped client retained a connection published after Stop")
+	}
+	select {
+	case <-serverSawClosedConn:
+	case <-time.After(time.Second):
+		t.Fatal("client did not close the late-upgraded connection")
 	}
 }
 
@@ -441,5 +575,13 @@ func TestBackoffDoublesCorrectly(t *testing.T) {
 	backoff = time.Duration(float64(backoff) * backoffFactor)
 	if backoff != 8*time.Second {
 		t.Fatalf("third doubling = %v, want 8s", backoff)
+	}
+}
+
+func TestRetryDelayIsBoundedByMaxBackoff(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		if delay := retryDelay(maxBackoff); delay > maxBackoff {
+			t.Fatalf("retry delay = %v, exceeds max backoff %v", delay, maxBackoff)
+		}
 	}
 }
