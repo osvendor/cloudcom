@@ -1,0 +1,116 @@
+name: CloudCom Candidate Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Immutable 40-character commit SHA already validated on main
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  validate:
+    name: Validate candidate source
+    if: github.repository == 'osvendor/cloudcom'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      source_commit: ${{ steps.validate.outputs.source_commit }}
+      source_short: ${{ steps.validate.outputs.source_short }}
+      build_version: ${{ steps.validate.outputs.build_version }}
+      baseline_tag: ${{ steps.validate.outputs.baseline_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: validate
+        name: Require a main-ancestral commit with successful CloudCom CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::source_commit must be a lowercase 40-character SHA"; exit 1;
+          }
+          default_branch="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
+          test "$GITHUB_REF" = "refs/heads/$default_branch" || {
+            echo "::error::Run candidates from the repository default branch ($default_branch)."
+            exit 1
+          }
+          git fetch --no-tags origin "$default_branch"
+          git cat-file -e "$SOURCE_COMMIT^{commit}"
+          git merge-base --is-ancestor "$SOURCE_COMMIT" "origin/$default_branch" || {
+            echo "::error::$SOURCE_COMMIT is not an ancestor of origin/$default_branch"
+            exit 1
+          }
+          run_id="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/cloudcom-ci.yml/runs?event=push&status=completed&branch=$default_branch&head_sha=$SOURCE_COMMIT&per_page=100" --jq '.workflow_runs[] | select(.conclusion == "success") | .id' | head -n 1)"
+          test -n "$run_id" || {
+            echo "::error::No successful push-triggered CloudCom CI run exists for $SOURCE_COMMIT on $default_branch."
+            exit 1
+          }
+          baseline_tag="$(git show "$SOURCE_COMMIT:.github/cloudcom-baseline.json" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).tag))')"
+          build_version="${baseline_tag#v}"
+          printf 'source_commit=%s\nsource_short=%s\nbuild_version=%s\nbaseline_tag=%s\n' \
+            "$SOURCE_COMMIT" "${SOURCE_COMMIT:0:12}" "$build_version" "$baseline_tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.component }} candidate
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: api
+            dockerfile: apps/api/Dockerfile
+          - component: web
+            dockerfile: apps/web/Dockerfile
+          - component: portal
+            dockerfile: apps/portal/Dockerfile
+          - component: migration
+            dockerfile: apps/api/Dockerfile
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.validate.outputs.source_commit }}
+          persist-credentials: false
+      - name: Build a local-only candidate image
+        env:
+          COMPONENT: ${{ matrix.component }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          SOURCE_COMMIT: ${{ needs.validate.outputs.source_commit }}
+          SOURCE_SHORT: ${{ needs.validate.outputs.source_short }}
+          BUILD_VERSION: ${{ needs.validate.outputs.build_version }}
+          BASELINE_TAG: ${{ needs.validate.outputs.baseline_tag }}
+        run: |
+          set -euo pipefail
+          image="cloudcom-candidate/${COMPONENT}:sha-${SOURCE_SHORT}"
+          args=()
+          case "$COMPONENT" in
+            migration) args+=(--target builder) ;;
+            api) args+=(--build-arg "APP_VERSION=$BUILD_VERSION") ;;
+            web) args+=(--build-arg "PUBLIC_APP_VERSION=$BUILD_VERSION" --build-arg 'PUBLIC_API_URL=') ;;
+            portal) args+=(--build-arg 'PORTAL_BASE_PATH=/portal' --build-arg 'PUBLIC_API_URL=') ;;
+            *) echo "::error::Unknown component $COMPONENT"; exit 1 ;;
+          esac
+          docker build --pull --platform linux/amd64 --label "org.opencontainers.image.revision=$SOURCE_COMMIT" --file "$DOCKERFILE" --tag "$image" "${args[@]}" .
+          docker save "$image" | gzip -1 > "${COMPONENT}.tar.gz"
+          sha256sum "${COMPONENT}.tar.gz" > SHA256SUMS
+          IMAGE="$image" SOURCE="$SOURCE_COMMIT" COMPONENT="$COMPONENT" node -e "const fs=require('fs'); const image=JSON.parse(require('child_process').execFileSync('docker',['image','inspect',process.env.IMAGE],{encoding:'utf8'}))[0]; fs.writeFileSync('metadata.json', JSON.stringify({component:process.env.COMPONENT, sourceCommit:process.env.SOURCE, baselineTag:process.env.BASELINE_TAG, imageId:image.Id, repoTags:image.RepoTags, created:image.Created}, null, 2)+'\\n');"
+      - name: Upload candidate image archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cloudcom-candidate-${{ matrix.component }}-${{ needs.validate.outputs.source_short }}
+          path: |
+            ${{ matrix.component }}.tar.gz
+            SHA256SUMS
+            metadata.json
+          retention-days: 7
+          compression-level: 0
