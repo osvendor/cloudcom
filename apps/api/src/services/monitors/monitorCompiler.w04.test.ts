@@ -151,9 +151,20 @@ describe('diagnostic-script binding guard (#5291 W04)', () => {
 
     await compileMonitorInTx(makeTx(), def);
 
-    expect(resolveReferencesMock).toHaveBeenCalledTimes(1);
+    expect(resolveReferencesMock).toHaveBeenCalledTimes(2);
     const actions = (resolveReferencesMock.mock.calls[0] as unknown as unknown[])[2] as Array<Record<string, unknown>>;
     expect(actions).toContainEqual({ type: 'run_script', scriptId: SCRIPT_ID, whenOffline: 'queue' });
+  });
+
+  it('persists only response bindings so admission sees exactly its executable references', async () => {
+    const probeResolved = { probeOnly: true };
+    const responseResolved = { responseOnly: true };
+    resolveReferencesMock.mockResolvedValueOnce(probeResolved as never).mockResolvedValueOnce(responseResolved as never);
+    const responses = [{ type: 'run_script', scriptId: 'a0000000-0000-4000-8000-000000000002', whenOffline: 'queue' }];
+    const def = makeDef({ kind: 'script', condition: { scriptId: SCRIPT_ID, intervalMinutes: 60, timeoutSeconds: 300, breachOnNonZeroExit: true }, responses } as never);
+    await compileMonitorInTx(makeTx(), def);
+    expect(resolveReferencesMock.mock.calls[1]?.[2]).toEqual(responses);
+    expect(replaceBindingsMock).toHaveBeenCalledWith(expect.anything(), expect.any(String), { orgId: def.orgId, partnerId: def.partnerId }, responseResolved);
   });
 
   it('REFUSES a partner-wide script monitor whose script the owner cannot reach', async () => {

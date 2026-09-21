@@ -20,27 +20,53 @@ function Test-CloudComPrivatePath {
     $item = Get-Item -LiteralPath $Path
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
     $acl = Get-Acl -LiteralPath $Path
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($owner -notin @('S-1-5-18', 'S-1-5-32-544')) { return $false }
     foreach ($rule in $acl.Access) {
         if ($rule.AccessControlType -ne 'Allow') { continue }
         $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
         if ($sid -notin @('S-1-5-18', 'S-1-5-32-544')) { return $false }
     }
-    return $true
+    $parent = Split-Path -Parent $Path
+    if ($parent -and $parent -ine $env:ProgramData) {
+        return Test-CloudComPrivatePath $parent
+    }
+    if ($parent -ieq $env:ProgramData) {
+        $root = Get-Item -LiteralPath $parent
+        if ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+        $rootOwner = (Get-Acl -LiteralPath $parent).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        return $rootOwner -in @('S-1-5-18','S-1-5-32-544')
+    }
+    return $false
 }
 
 function Set-CloudComPrivateDirectory {
     param([string]$Path)
-    if (Test-Path -LiteralPath $Path) {
-        if ((Get-Item -LiteralPath $Path).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing reparse-point staging directory.' }
-    } else { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
+    $base = [IO.Path]::GetFullPath($env:ProgramData).TrimEnd('\')
+    $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+    if (!$full.StartsWith($base + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Staging path must be below ProgramData.' }
+    if (Test-Path -LiteralPath $full) {
+        if (!(Test-CloudComPrivatePath $full)) { throw 'Untrusted staging tree; manual recovery required.' }
+        return
+    }
+    $parent = Split-Path -Parent $full
+    if ($parent -ine $base) { Set-CloudComPrivateDirectory $parent }
+    else {
+        $root = Get-Item -LiteralPath $base
+        $owner = (Get-Acl -LiteralPath $base).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if (($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $owner -notin @('S-1-5-18','S-1-5-32-544')) { throw 'Untrusted ProgramData root.' }
+    }
     $acl = New-Object Security.AccessControl.DirectorySecurity
     $acl.SetAccessRuleProtection($true, $false)
+    $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-18')))
     foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
         $identity = New-Object Security.Principal.SecurityIdentifier($sid)
         $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
         $acl.AddAccessRule($rule)
     }
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    # Windows PowerShell 5.1 creates the directory with its final ACL atomically.
+    [IO.Directory]::CreateDirectory($full, $acl) | Out-Null
+    if (!(Test-CloudComPrivatePath $full)) { throw 'Private directory verification failed.' }
 }
 
 function Get-CloudComRustDeskState {

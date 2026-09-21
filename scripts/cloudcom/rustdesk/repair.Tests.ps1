@@ -103,3 +103,40 @@ Describe 'RustDesk desired-state repair mutation boundaries' {
         Should -Invoke Restart-Service -Times 1
     }
 }
+
+Describe 'Private staging tree trust boundaries' {
+    BeforeAll {
+        if (!(Get-Command Get-Acl -ErrorAction SilentlyContinue)) { function Get-Acl { param($LiteralPath) throw 'Unmocked ACL read' } }
+    }
+    BeforeEach {
+        $script:savedProgramData = $env:ProgramData
+        $env:ProgramData = Join-Path $TestDrive 'ProgramData'
+        $script:parentPath = Join-Path $env:ProgramData 'CloudCom'
+        $script:leafPath = Join-Path $script:parentPath 'RustDeskDeployment'
+        $script:badOwnerPath = ''
+        $script:junctionPath = ''
+        Mock Test-Path { $true }
+        Mock Get-Item { [pscustomobject]@{ Attributes = $(if ($LiteralPath -eq $script:junctionPath) { [IO.FileAttributes]::ReparsePoint } else { [IO.FileAttributes]::Directory }) } }
+        Mock Get-Acl {
+            $acl = [pscustomobject]@{ Access=@(); OwnerSid=$(if ($LiteralPath -eq $script:badOwnerPath) { 'S-1-5-21-123-456-789-1001' } else { 'S-1-5-18' }) }
+            $acl | Add-Member ScriptMethod GetOwner { param($type) [pscustomobject]@{Value=$this.OwnerSid} }
+            return $acl
+        }
+    }
+    AfterEach { $env:ProgramData = $script:savedProgramData }
+    It 'rejects a user-owned leaf even with an apparently private DACL' {
+        $script:badOwnerPath=$script:leafPath
+        Test-CloudComPrivatePath $script:leafPath | Should -BeFalse
+    }
+    It 'rejects a trusted leaf below a parent junction' {
+        $script:junctionPath=$script:parentPath
+        Test-CloudComPrivatePath $script:leafPath | Should -BeFalse
+    }
+    It 'rejects a trusted leaf below a user-owned parent' {
+        $script:badOwnerPath=$script:parentPath
+        Test-CloudComPrivatePath $script:leafPath | Should -BeFalse
+    }
+    It 'accepts a trusted private chain rooted in ProgramData' {
+        Test-CloudComPrivatePath $script:leafPath | Should -BeTrue
+    }
+}

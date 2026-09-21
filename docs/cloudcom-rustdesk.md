@@ -61,3 +61,11 @@ pnpm --filter @breeze/web exec vitest run src/components/cloudcom/RemoteAccessAl
 ```
 
 Use the repository-pinned package manager. Mocked route tests exercise real organization/site helper logic with a simulated database and configurable auth gates; they do not replace real-DB RLS or live Cloudflare/end-to-end acceptance.
+
+### Script-monitor response binding compatibility fix
+
+A live stopped-service canary exposed an upstream compiler/runtime mismatch: the compiler stored both the diagnostic probe and response script in the response automation's resource bindings, while admission correctly requires bindings to match executable response actions exactly. This prevented all responses when the probe and repair were different scripts.
+
+The compiler now validates probe ownership separately and persists only response-action bindings. Runtime authorization, tenant boundaries and device binding remain unchanged. Re-saving an existing monitor recompiles its bindings. The focused compiler regression and authorization/device-binding tests are registered in CloudCom CI and the customization contract; preserve this fix during upstream merges until upstream supplies equivalent behavior.
+
+The deployment staging tree must be owned by SYSTEM or Administrators, reject reparse points in ancestors, and have private ACLs. New directories are created atomically with their final ACL under Windows PowerShell 5.1. Existing untrusted trees fail closed for manual recovery; repair never takes over a user-owned directory.

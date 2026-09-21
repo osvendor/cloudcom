@@ -113,6 +113,7 @@ jobs:
       - name: Run API tests and build when API or shared code changed
         if: needs.delta.outputs.api == 'true' || needs.delta.outputs.shared == 'true'
         run: |
+          pnpm --filter @breeze/api exec vitest run src/services/monitors/monitorCompiler.test.ts src/services/monitors/monitorCompiler.w04.test.ts src/services/automationReferenceAuthorization.test.ts src/jobs/automationWorker.monitorBinding.test.ts
           pnpm --filter @breeze/api exec vitest run src/services/cloudcom/remoteAccessOptions.test.ts src/routes/devices/cloudcomRemoteAccess.test.ts src/services/remoteAccessLauncher.test.ts src/services/remoteAccessProviders.test.ts src/routes/devices/core.remoteAccessLaunch.test.ts
           pnpm --filter @breeze/api build
       - name: Run web tests and build when web or shared code changed

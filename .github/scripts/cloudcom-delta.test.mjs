@@ -44,3 +44,11 @@ test('requires API validation for the explicit remote tool module and its mount'
   }
   assert.deepEqual(classify(['apps/api/src/routes/portal/devices.ts']).unsupported, ['apps/api/src/routes/portal/devices.ts']);
 });
+
+test('requires focused API coverage for the monitor response binding fix', () => {
+  for (const path of ['apps/api/src/services/monitors/monitorCompiler.ts', 'apps/api/src/services/monitors/monitorCompiler.w04.test.ts']) {
+    assert.equal(classify([path]).api, true);
+    assert.deepEqual(classify([path]).unsupported, []);
+  }
+  assert.deepEqual(classify(['apps/api/src/services/monitors/monitorService.ts']).unsupported, ['apps/api/src/services/monitors/monitorService.ts']);
+});

@@ -59,6 +59,23 @@
           "contains": "sync-browser-viewer.mjs --check"
         }
       ]
+    },
+    {
+      "id": "monitor-response-reference-fix",
+      "requiredFiles": [
+        "apps/api/src/services/monitors/monitorCompiler.ts",
+        "apps/api/src/services/monitors/monitorCompiler.w04.test.ts"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/services/monitors/monitorCompiler.ts",
+          "contains": "const diagnosticReferences = buildDiagnosticScriptReferences(def)"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "src/services/monitors/monitorCompiler.w04.test.ts"
+        }
+      ]
     }
   ]
 }
