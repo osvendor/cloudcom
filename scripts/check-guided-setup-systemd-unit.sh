@@ -21,7 +21,8 @@
 # 1. Static checks that run everywhere (macOS included): the known-bad shapes.
 # 2. Renders the REAL unit + boot helper through the installer's own code path
 #    (`guided-setup.sh --render-systemd-unit DIR`) and runs `systemd-analyze
-#    verify` on it wherever systemd-analyze exists — every Linux CI runner.
+#    verify` in an empty systemd root wherever systemd-analyze exists — every
+#    Linux CI runner.
 #    That is the same parser systemd uses at `systemctl enable`, so any future
 #    directive systemd rejects fails here, in the required Lint job, instead
 #    of on a self-hoster's box.
@@ -61,13 +62,18 @@ if grep -Eq '^WorkingDirectory=.*(shell_quote|bash_source_quote)' <<<"${unit_tex
 fi
 
 # --- 2. Render through the installer and verify with systemd itself ---------
-# A work dir with a space and a % proves the path survives unquoted and that
-# %-specifier escaping is applied (systemd expands % in unit paths).
+# An isolated systemd root prevents verify from walking units supplied by the
+# host (for example, transient units under /run/systemd/system). A work dir
+# with a space and a % proves the path survives unquoted and that %-specifier
+# escaping is applied (systemd expands % in unit paths).
+SYSTEMD_ROOT="${TMP_DIR}/systemd-root"
 WORK="${TMP_DIR}/breeze work%dir"
+HELPER_PATH="${TMP_DIR}/breeze-compose-boot.sh"
 RENDER="${TMP_DIR}/render"
-mkdir -p "${WORK}"
+mkdir -p "${SYSTEMD_ROOT}${WORK}" "$(dirname "${SYSTEMD_ROOT}${HELPER_PATH}")" \
+  "${SYSTEMD_ROOT}/etc/systemd/system"
 
-if ! BREEZE_SETUP_SYSTEMD_HELPER_FILE="${RENDER}/breeze-compose-boot.sh" \
+if ! BREEZE_SETUP_SYSTEMD_HELPER_FILE="${HELPER_PATH}" \
   bash "${SETUP}" --work-dir "${WORK}" --render-systemd-unit "${RENDER}" >"${TMP_DIR}/render.log" 2>&1; then
   echo "ERROR: guided-setup.sh --render-systemd-unit failed:" >&2
   cat "${TMP_DIR}/render.log" >&2
@@ -94,13 +100,22 @@ if ! grep -qxF "${expected_wd}" "${UNIT}"; then
 fi
 
 if command -v systemd-analyze >/dev/null 2>&1; then
-  # --recursive-errors=no (systemd >= 250): a missing docker.service on the
-  # verifying host is not a defect in OUR unit. Older systemd lacks the flag;
-  # fall back to the plain invocation there.
+  # Verify by unit name inside an otherwise empty root, never by an absolute
+  # file path against the host's unit search path. This keeps unrelated host
+  # units out of CI while still passing the generated unit through systemd's
+  # parser. The required docker.service and wanted network-online.target are
+  # intentionally absent: their presence is deployment state, not syntax in
+  # the unit we generate.
+  install -m 0644 "${UNIT}" "${SYSTEMD_ROOT}/etc/systemd/system/breeze-rmm.service"
+  install -m 0755 "${HELPER}" "${SYSTEMD_ROOT}${HELPER_PATH}"
+
+  # --recursive-errors=no (systemd >= 250): missing external dependencies in
+  # the isolated root are not defects in our unit. Older systemd lacks the
+  # flag, but still verifies the generated unit inside the isolated root.
   if systemd-analyze verify --help 2>/dev/null | grep -q -- '--recursive-errors'; then
-    verify_cmd=(systemd-analyze verify --recursive-errors=no "${UNIT}")
+    verify_cmd=(systemd-analyze --root="${SYSTEMD_ROOT}" verify --recursive-errors=no breeze-rmm.service)
   else
-    verify_cmd=(systemd-analyze verify "${UNIT}")
+    verify_cmd=(systemd-analyze --root="${SYSTEMD_ROOT}" verify breeze-rmm.service)
   fi
   if ! "${verify_cmd[@]}" >"${TMP_DIR}/verify.log" 2>&1; then
     echo "ERROR: systemd-analyze verify rejected the generated unit:" >&2

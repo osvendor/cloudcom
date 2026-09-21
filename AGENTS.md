@@ -170,7 +170,17 @@ cd e2e-tests && pnpm test
 
 ---
 
-## Codex Delegation
+## CloudCom Codex Delegation Policy
+
+This policy governs Codex delegation for this project and takes precedence over the older `Codex Delegation` section below wherever they conflict. The primary Codex agent is the coordinator: it owns task scope, decisions, integration, and the final result.
+
+- Delegate narrow, routine UI or documentation work to `gpt-5.6-luna` at low reasoning effort.
+- Delegate ordinary, bounded implementation work to `gpt-5.6-terra` at medium reasoning effort.
+- Keep architecture, security, client/tenant isolation, migrations, and final critical review with the primary agent.
+- Give delegated agents only the context and files needed for their bounded task. Prefer scripts and CI for deterministic, repeatable work.
+- Do not change global settings as part of project delegation. Do not claim token or cost savings without measurements.
+
+## Legacy Codex Delegation Notes
 
 This project uses OpenAI Codex CLI for task delegation. Claude orchestrates complex work while Codex handles isolated tasks.
 
