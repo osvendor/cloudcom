@@ -17,7 +17,7 @@ function Get-CloudComVersion {
 function Test-CloudComPrivatePath {
     param([string]$Path)
     if (!(Test-Path -LiteralPath $Path)) { return $false }
-    $item = Get-Item -LiteralPath $Path
+    $item = Get-Item -Force -LiteralPath $Path
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
     $acl = Get-Acl -LiteralPath $Path
     $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
@@ -32,7 +32,7 @@ function Test-CloudComPrivatePath {
         return Test-CloudComPrivatePath $parent
     }
     if ($parent -ieq $env:ProgramData) {
-        $root = Get-Item -LiteralPath $parent
+        $root = Get-Item -Force -LiteralPath $parent
         if ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
         $rootOwner = (Get-Acl -LiteralPath $parent).GetOwner([Security.Principal.SecurityIdentifier]).Value
         return $rootOwner -in @('S-1-5-18','S-1-5-32-544')
@@ -52,7 +52,7 @@ function Set-CloudComPrivateDirectory {
     $parent = Split-Path -Parent $full
     if ($parent -ine $base) { Set-CloudComPrivateDirectory $parent }
     else {
-        $root = Get-Item -LiteralPath $base
+        $root = Get-Item -Force -LiteralPath $base
         $owner = (Get-Acl -LiteralPath $base).GetOwner([Security.Principal.SecurityIdentifier]).Value
         if (($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $owner -notin @('S-1-5-18','S-1-5-32-544')) { throw 'Untrusted ProgramData root.' }
     }
