@@ -35,3 +35,5 @@ CloudCom Candidate Images is manual-only on the default branch. Its source_commi
 The workflow exports gzip image archives, SHA256SUMS and exact Docker image IDs as seven-day Actions artifacts. It does not publish a release, push registry tags or deploy. Verify archive hashes and loaded image IDs before using them. These preparation artifacts do not replace signed production release inventories.
 
 Run the migration builder’s pnpm db:migrate command only against an isolated restored database, without Redis or external networking. Normal API startup initializes additional services; do not use it as a migration-only command. Re-run migrations to verify idempotence and test the unprivileged request role. Candidate app acceptance should use a separate disposable database/network. Preserve private backup/configuration and test records outside the public repository.
+
+For promotion of verified local archives without registry publication, follow [local image promotion](cloudcom-local-release.md). It still requires a signed inventory and exact image bindings.
