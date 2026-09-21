@@ -1,21 +1,23 @@
-# CloudCom fork CI
+# CloudCom CI transition
 
-The fork keeps Breeze's existing area classifier and the single `CI Success` result. Website-only changes run web/API checks without building native endpoint agents. Shared inputs, unknown paths, agent-facing API code, and CI changes retain broader validation. Native OS checks are still required when relevant; this is not a blanket test bypass.
+At the user's request, all 17 inherited Breeze workflow definitions were removed. The 12 active workflows were disabled through GitHub; the other five were already disabled. Cancellation was requested for the remaining inherited CI run. Historical workflow records may remain visible in Actions.
 
-## Local Linux runner
+CloudCom automation is temporarily paused. There is no replacement required CI gate yet, and this change does not establish release or deployment readiness. The existing CloudCom-owned Linux runner remains registered for future workflows. No LanternOps-owned runner was registered in the fork. The production server is unchanged.
 
-Use a dedicated disposable VM, labeled `self-hosted`, `linux`, `cloudcom`, with Docker access. Install Git, GitHub CLI (`gh`), jq, curl, tar, unzip, build-essential, ripgrep, and socat. Actions install the pinned Node, pnpm, and Go versions. Allocate 8 GB minimum / 16 GB recommended RAM, and at least 20 GB free disk (60 GB or larger disk recommended). Avoid running multiple runner services against the same work directory.
+## Replacement design
 
-The `typecheck`, `test-api` (8 shards), `test-web` (4 shards), and `integration-test` (16 shards) jobs always use `ubuntu-24.04` hosted runners. For this public repository, GitHub documents 16 GB RAM for that label in its [hosted-runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners). A single CloudCom worker would serialize the 28 test shards, and its assigned 8 GB cannot safely satisfy Type Check's 12 GB Node heap. Type Check also has a 30-minute deadline to bound pathological hangs. This limited routing leaves the remaining trusted-job and external-fork routing unchanged.
+Use published Breeze releases as pinned baselines. The initial v0.115.0 tag resolves to commit 42427328a4efa002b018de0c87fd11c8d35f3719; the fork base dc724dbed1782e4336cffa07a3e0314c60087a67 adds only documentation.
 
-`check-cloudcom-runner.sh` reports missing tools, insufficient resources, and incomplete checkouts before the application jobs queue. The classifier uses a full checkout because persistent runners reuse working directories. Temporary scanner binaries live in `RUNNER_TEMP`, not `/usr/local/bin`.
+Build CloudCom workflows around our cumulative customizations and the interfaces and dependencies they affect. Select relevant lint, type checks, unit and integration regressions, builds, and candidate application acceptance. New upstream releases do not automatically trigger the entire upstream development/release pipeline. Broaden checks when our changes affect authentication, tenant isolation, schemas, shared dependencies or agent protocols. Unknown paths need explicit impact assessment.
 
-External-fork PRs use GitHub-hosted Linux runners, and repository settings must require approval for **all external contributors**. Workflow routing is defense in depth, not protection from edits to the workflow itself: review external workflow changes before approval. Keep production credentials, application databases, and personal files off this VM. Docker access is effectively root access to the VM. Privileged disk/recovery tests use disposable hosted runners.
+Restore secret detection and appropriate security checks in the replacement pipeline. Newly disclosed vulnerabilities need scheduled monitoring independently of code changes. Continue requiring approval for all external contributors. Never run untrusted PR code on the production server.
 
-A private Hyper-V Default Switch address can change after reboot; this does not affect the runner's outbound GitHub registration. Discover its current address from Hyper-V or DHCP rather than committing an IP to workflows. Public repository fetches can use HTTPS; publishing changes should use an authenticated developer checkout, not a long-lived personal token on the runner.
+The existing Lightsail installation remains the production and application-testing destination. Deployment and acceptance must protect its running database and services. Unchanged upstream agents retain their upstream signatures and provenance.
 
-## Fork references
+## Retained source and upstream updates
 
-See [fork image configuration](fork-image-configuration.md). Application builds use the fork namespace. Keep upstream licenses, module/package identities, and agent signing provenance intact until a separate signed fork-agent release process exists. The runner changes do not deploy the platform or modify its production databases.
+Application tests, reusable action implementations and scripts remain in source for selective reuse. Some inherited workflow contract tests directly read the removed YAML files; those contracts describe the retired pipeline and must be adapted or retired when the replacement checks are implemented. A broad legacy test command is not expected to pass unchanged during this transition. Do not treat those missing-file failures as application regressions or silently skip application tests.
 
-Before merging an upstream update, run the workflow contract tests and the full CI suite. Preserve `CI Success` as the required branch check rather than requiring OS jobs that legitimately skip for website-only changes.
+The inherited definitions remain recoverable from Git history at 6169b89cf148dbf5e4d90df11a769bca6e7ad7e5. Pre-removal uncommitted repairs were also saved locally. Future upstream merges may reintroduce workflow files: review that directory explicitly and preserve the CloudCom-owned automation policy. Do not re-enable inherited workflows as a side effect of an upstream update.
+
+Branding, version naming and production deployment are unchanged. See [upstream maintenance](cloudcom-upstream-maintenance.md) for the customization register.
