@@ -119,7 +119,10 @@ for (const name of ['rust-check', 'guided-setup-smoke']) {
         'apt-get': `printf '%s\\n' "$*" >> "$CALLS"\nif [[ "$*" != *Dir::Etc::sourcelist=* || "$*" != *Dir::Etc::sourceparts=* ]]; then exit 91; fi\nfor arg in "$@"; do\n if [[ "$arg" == Dir::Etc::sourcelist=* ]]; then\n  config="\u0024{arg#*=}"; printf '%s\\n' "$config" > "$CONFIG_CAPTURE"\n  [[ -f "$config" ]] || exit 92\n  if grep -q chrome "$config"; then exit 93; fi\n  grep -q signed-by "$config" || exit 94\n fi\ndone\n[[ "$1" == "$APT_FAIL_PHASE" ]] && exit 100\nexit 0`,
       };
       for (const [file, text] of Object.entries(stubs)) { const f = path.join(bin, file); writeFileSync(f, '#!/bin/bash\n' + text + '\n'); chmodSync(f, 0o755); }
-      const script = dependencyScript(name).replace('/etc/apt "$CI_APT_DIR"', '"$FIXTURE_APT_SOURCE" "$CI_APT_DIR"');
+      // The host may already have socat; pin command discovery so these cases
+      // always exercise the installer and its cleanup/error behavior.
+      const absentSocat = 'command() { if [[ "$1" == "-v" && "$2" == "socat" ]]; then return 1; fi; builtin command "$@"; }\n';
+      const script = absentSocat + dependencyScript(name).replace('/etc/apt "$CI_APT_DIR"', '"$FIXTURE_APT_SOURCE" "$CI_APT_DIR"');
       const result = spawnSync('bash', ['-e', '-c', script], { encoding: 'utf8', cwd: new URL('../../', import.meta.url), env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CALLS: calls, CONFIG_CAPTURE: path.join(root, 'config'), APT_FAIL_PHASE: failurePhase, FIXTURE_APT_SOURCE: source } });
       assert.equal(result.status, fail ? (name === 'rust-check' ? 1 : 100) : 0, result.stdout + result.stderr);
       const recorded = readFileSync(calls, 'utf8').trim().split('\n');
@@ -131,3 +134,14 @@ for (const name of ['rust-check', 'guided-setup-smoke']) {
     }));
   }
 }
+
+
+test('guided-setup-smoke: preinstalled socat needs no sudo or apt setup', () => {
+  const script = `command() { if [[ "$1" == "-v" && "$2" == "socat" ]]; then return 0; fi; builtin command "$@"; }
+  sudo() { echo "unexpected sudo" >&2; return 91; }
+  mktemp() { echo "unexpected apt preparation" >&2; return 92; }
+  ${dependencyScript('guided-setup-smoke')}`;
+  const result = spawnSync('bash', ['-e', '-c', script], { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(result.stderr, '');
+});

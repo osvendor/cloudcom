@@ -71,11 +71,12 @@ jobs:
   # and every app's Dockerfile/package.json also set `api`). `ci-success`
   # asserts each gated job with the AGENT_CHANGED three-branch pattern: area
   # `true` → success, `false` → skipped, anything else → red. lint, typecheck,
-  # security-audit and the agent/mobile/viewer jobs are never area-gated.
+  # security-audit and the mobile/viewer jobs are never area-gated. Native
+  # agent jobs use the separate broad endpoint flag; agent remains QEMU-only.
   # Contract: .github/scripts/ci-area-gating.test.mjs.
   changes:
     name: Detect Code Changes
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     permissions:
       contents: read
       pull-requests: read
@@ -83,6 +84,7 @@ jobs:
       code: ${{ steps.classify.outputs.code }}
       docs: ${{ steps.classify.outputs.docs }}
       agent: ${{ steps.classify.outputs.agent }}
+      endpoint: ${{ steps.classify.outputs.endpoint }}
       app: ${{ steps.classify.outputs.app }}
       api: ${{ steps.classify.outputs.api }}
       web: ${{ steps.classify.outputs.web }}
@@ -95,21 +97,23 @@ jobs:
       # fail-safe shape as `code` — anything unresolvable turns it on.
       topology_browser: ${{ steps.classify.outputs.topology_browser }}
     steps:
-      - name: Checkout (classifier script only)
+      - name: Checkout classifier and CI inputs
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          sparse-checkout: .github/scripts
-          sparse-checkout-cone-mode: false
           # A merge-group entry is classified from a real `git diff` between the
           # queue's base and head shas, which needs the history connecting them.
           # The compare API is not used here: it caps `files` at 300, and a
           # silent truncation could DROP the one code path in a docs-heavy
-          # entry — the exact direction that must never happen. Sparse checkout
-          # still keeps the working tree to `.github/scripts`; `fetch-depth: 0`
-          # only affects history. Every other event classifies without git, so
+          # entry — the exact direction that must never happen. Use a full checkout
+          # so reused runners cannot retain a sparse working tree for later jobs.
+          # Every other event classifies without git, so
           # it stays shallow.
           fetch-depth: ${{ github.event_name == 'merge_group' && '0' || '1' }}
+
+      - name: Check local runner prerequisites
+        if: runner.environment == 'self-hosted'
+        run: bash .github/scripts/check-cloudcom-runner.sh
 
       - name: Classify changed files
         id: classify
@@ -126,7 +130,7 @@ jobs:
           # a code change through as docs-only.
           full_suite() {
             echo "$1" >&2
-            printf 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\n' | tee -a "${GITHUB_OUTPUT}"
+            printf 'code=true\ndocs=true\nagent=true\napp=true\napi=true\nweb=true\nportal=true\naddins=true\nm365=true\nrust=true\ntopology_browser=true\nendpoint=true\n' | tee -a "${GITHUB_OUTPUT}"
           }
           if [[ "${EVENT_NAME}" == "pull_request" ]]; then
             # The PR files API needs no checkout and sees renames/deletes too; a
@@ -167,7 +171,7 @@ jobs:
   # `docs-automation-retirement.test.mjs` pins the deterministic steps.
   docs-check:
     name: Docs Check
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.docs == 'true'
     steps:
@@ -209,7 +213,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
     steps:
@@ -278,6 +282,9 @@ jobs:
       - name: Test CI build reuse contract
         run: node --test .github/scripts/ci-build-reuse.test.mjs
 
+      - name: Test private runner routing
+        run: node --test .github/scripts/cloudcom-runner-routing.test.mjs
+
       - name: Test per-area job gating contract
         run: node --test .github/scripts/ci-area-gating.test.mjs
 
@@ -313,7 +320,7 @@ jobs:
 
   typecheck:
     name: Type Check
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
     env:
@@ -357,7 +364,7 @@ jobs:
 
   test-api:
     name: Test API (shard ${{ matrix.shard }}/8)
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.api == 'true'
     # ~2470 vitest files, import-time dominated, 26-34 min unsharded. Only the
@@ -498,7 +505,7 @@ jobs:
 
   test-m365-graph-read-executor:
     name: Test M365 Graph Read Executor
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.m365 == 'true'
     steps:
@@ -526,7 +533,7 @@ jobs:
 
   test-m365-graph-actions-executor:
     name: Test M365 Graph Actions Executor
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.m365 == 'true'
     steps:
@@ -554,7 +561,7 @@ jobs:
 
   test-m365-communications-executor:
     name: Test M365 Communications Executor
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.m365 == 'true'
     services:
@@ -603,7 +610,7 @@ jobs:
   # autoMigrate.test.ts cannot see. Cheap (~1 min) and blocking on PRs.
   check-migrations:
     name: Check Migrations
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.api == 'true'
     services:
@@ -678,7 +685,7 @@ jobs:
   # blocking on PRs. See apps/api/scripts/check-migrations-nonsuperuser.ts.
   check-migrations-nonsuperuser:
     name: Check Migrations (non-superuser)
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.api == 'true'
     services:
@@ -739,7 +746,7 @@ jobs:
 
   test-web:
     name: Test Web (shard ${{ matrix.shard }}/4)
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.web == 'true'
     # ~1030 jsdom vitest files, 17 min unsharded — the longest job on an
@@ -779,7 +786,7 @@ jobs:
   # original gap).
   test-mobile:
     name: Test Mobile
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
     steps:
@@ -813,7 +820,7 @@ jobs:
   # Resolve paths on Linux so unrelated PRs never allocate a macOS runner.
   mobile-native-changes:
     name: Detect Mobile Native Changes
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
     permissions:
@@ -945,7 +952,7 @@ jobs:
 
   test-portal:
     name: Test Portal
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.portal == 'true'
     steps:
@@ -980,7 +987,7 @@ jobs:
   # `turbo run lint` skips it and the repo-wide Lint job does not reach it.
   test-viewer:
     name: Test Viewer
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
     steps:
@@ -1012,7 +1019,7 @@ jobs:
 
   test-office-addin-core:
     name: Test Office Add-in Core
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.addins == 'true'
     steps:
@@ -1043,7 +1050,7 @@ jobs:
 
   test-excel-addin:
     name: Test Excel Add-in
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.addins == 'true'
     steps:
@@ -1071,7 +1078,7 @@ jobs:
 
   test-word-addin:
     name: Test Word Add-in
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.addins == 'true'
     steps:
@@ -1102,7 +1109,7 @@ jobs:
 
   test-powerpoint-addin:
     name: Test PowerPoint Add-in
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.addins == 'true'
     steps:
@@ -1142,7 +1149,7 @@ jobs:
 
   test-outlook-addin:
     name: Test Outlook Add-in
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.addins == 'true'
     steps:
@@ -1173,7 +1180,7 @@ jobs:
 
   security-audit:
     name: Security Audit
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true'
     steps:
@@ -1268,7 +1275,7 @@ jobs:
 
   build-api:
     name: Build API
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [lint, typecheck, changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.api == 'true'
     steps:
@@ -1313,7 +1320,7 @@ jobs:
 
   build-m365-graph-read-executor:
     name: Build M365 Graph Read Executor
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [lint, typecheck, changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.m365 == 'true'
     steps:
@@ -1347,7 +1354,7 @@ jobs:
 
   build-m365-graph-actions-executor:
     name: Build M365 Graph Actions Executor
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [lint, typecheck, changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.m365 == 'true'
     steps:
@@ -1383,7 +1390,7 @@ jobs:
 
   build-m365-communications-executor:
     name: Build M365 Communications Executor
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [lint, typecheck, changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.m365 == 'true'
     steps:
@@ -1419,7 +1426,7 @@ jobs:
 
   build-web:
     name: Build Web
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [lint, typecheck, changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.web == 'true'
     steps:
@@ -1462,7 +1469,7 @@ jobs:
 
   build-portal:
     name: Build Portal
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [lint, typecheck, changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.portal == 'true'
     steps:
@@ -1503,7 +1510,7 @@ jobs:
     name: Build Agent (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ${{ matrix.runner }}
     needs: [lint, changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.endpoint == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1512,12 +1519,12 @@ jobs:
             goarch: amd64
             suffix: ''
             cgo: '0'
-            runner: cloudcom
+            runner: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
           - goos: darwin
             goarch: amd64
             suffix: ''
             cgo: '0'
-            runner: cloudcom
+            runner: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
           - goos: darwin
             goarch: arm64
             suffix: ''
@@ -1527,7 +1534,7 @@ jobs:
             goarch: amd64
             suffix: '.exe'
             cgo: '0'
-            runner: cloudcom
+            runner: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
 
     steps:
       - name: Checkout
@@ -1620,9 +1627,9 @@ jobs:
   # requireAdministrator — both directions are checked.
   agent-windows-manifest-guard:
     name: Agent Windows manifest guard
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.endpoint == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1656,9 +1663,10 @@ jobs:
 
   test-agent:
     name: Test Agent
-    runs-on: [self-hosted, linux, cloudcom]
+    # Privileged disk/QEMU tests require an isolated disposable host.
+    runs-on: ubuntu-24.04
     needs: [changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.endpoint == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1718,7 +1726,7 @@ jobs:
     name: Test Agent (Windows)
     runs-on: windows-latest
     needs: [lint, changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.endpoint == 'true'
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -2021,7 +2029,8 @@ jobs:
     # `go list -deps`. Fail-closed: `agent` is `true` on an empty/unresolvable
     # classification, and on a missing or empty gate list for ANY agent/ path.
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.agent == 'true'
-    runs-on: [self-hosted, linux, cloudcom]
+    # Privileged disk/QEMU tests require an isolated disposable host.
+    runs-on: ubuntu-24.04
     # ~7 min ISO build + up to 40 min QEMU rebuild cycle (see run-qemu.sh).
     timeout-minutes: 60
     steps:
@@ -2120,9 +2129,9 @@ jobs:
   # (incl. ~20 unformatted files) does not block PRs — burn it down separately.
   lint-agent:
     name: Lint Agent (Go)
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.endpoint == 'true'
     # CGO off (matches test-agent): the agent's only cgo files are the linux
     # X11/pcap capture backends, whose C headers are not on the runner. vet +
     # lint cover the CGO-off build; the cgo backends are compiled by build-agent.
@@ -2219,7 +2228,7 @@ jobs:
     name: Test Agent (race)
     runs-on: macos-latest
     needs: [changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.endpoint == 'true'
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -2270,7 +2279,7 @@ jobs:
     name: Windows Runtime Smoke
     runs-on: windows-latest
     needs: [lint, changes]
-    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
+    if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.endpoint == 'true'
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -2415,7 +2424,7 @@ jobs:
   # promote it once its runtime/caching is proven.
   rust-check:
     name: Rust Check (Tauri apps)
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && needs.changes.outputs.rust == 'true'
     timeout-minutes: 35
@@ -2617,7 +2626,7 @@ jobs:
   # aggregates across the matrix (success only if every shard passed).
   integration-test:
     name: Integration Tests (shard ${{ matrix.shard }}/16)
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     # Sharded 16 ways (was 8). Deliberately does NOT `needs: [lint, typecheck]`
     # — that dependency added ~8 min of pure wait to the critical path before
     # this job could even start, for no isolation benefit: a lint or
@@ -2873,7 +2882,7 @@ jobs:
   # consumer to rebuild, and fork PRs must not need registry write credentials.
   build-smoke-images:
     name: Build Smoke Image (${{ matrix.image }})
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && (needs.changes.outputs.api == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.portal == 'true')
     continue-on-error: ${{ github.event_name == 'pull_request' }}
@@ -2902,6 +2911,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
+      - name: Resolve smoke image namespace
+        id: smoke-namespace
+        env:
+          IMAGE_REPOSITORY: ${{ github.repository }}
+        run: echo "prefix=ghcr.io/${IMAGE_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Build and export smoke image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
@@ -2909,7 +2924,7 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
           push: false
-          tags: ghcr.io/lanternops/breeze/${{ matrix.image }}:ci-smoke-${{ github.run_id }}
+          tags: ${{ steps.smoke-namespace.outputs.prefix }}/${{ matrix.image }}:ci-smoke-${{ github.run_id }}
           labels: org.opencontainers.image.revision=${{ github.sha }}
           build-args: ${{ matrix.build-args }}
           outputs: type=docker,dest=${{ runner.temp }}/${{ matrix.image }}.tar
@@ -2938,7 +2953,7 @@ jobs:
   # image build + stack boot + endpoint smoke.
   smoke-test:
     name: Smoke Test
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [lint, typecheck, changes, build-smoke-images]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && (needs.changes.outputs.api == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.portal == 'true')
     continue-on-error: ${{ github.event_name == 'pull_request' }}
@@ -3265,7 +3280,7 @@ jobs:
   # Same policy as smoke-test: non-blocking on PRs, required in the merge queue.
   guided-setup-smoke:
     name: Guided Setup Smoke (self-host installer)
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [lint, typecheck, changes, build-smoke-images]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true' && (needs.changes.outputs.api == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.portal == 'true')
     continue-on-error: ${{ github.event_name == 'pull_request' }}
@@ -3279,6 +3294,7 @@ jobs:
 
       - name: Install socat (stands in for the quickstart's `ssh -L 8443:127.0.0.1:443`)
         run: |
+          if command -v socat >/dev/null 2>&1; then exit 0; fi
           CI_APT_DIR=$(mktemp -d)
           trap 'rm -rf -- "$CI_APT_DIR"' EXIT
           node .github/scripts/prepare-ci-apt-sources.mjs /etc/apt "$CI_APT_DIR"
@@ -3364,7 +3380,7 @@ jobs:
 
   auth-browser-transition-browser-contract:
     name: Auth Browser Transition (Chromium)
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [lint, typecheck, changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
     timeout-minutes: 20
@@ -3495,7 +3511,7 @@ jobs:
   # it runs: ci-success fails on anything but `success` or `skipped`.
   topology-browser-gate:
     name: Topology Production Browser Gate (Chromium)
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes]
     if: needs.changes.outputs.topology_browser == 'true'
     timeout-minutes: 25
@@ -3571,7 +3587,7 @@ jobs:
   # add a `PORTAL_DEV_E2E_RESULT != "success"` clause to its check script.
   portal-dev-e2e:
     name: Portal Dev E2E (hydration, non-blocking)
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [lint, typecheck, changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
     continue-on-error: true
@@ -3613,6 +3629,8 @@ jobs:
       # then creates admin@breeze.local / BreezeAdmin123!, which is the account
       # the wt-stack descriptor hands to Playwright.
       - name: Create .env for the dev stack
+        env:
+          IMAGE_REPOSITORY: ${{ github.repository }}
         run: |
           cat > .env <<'EOF'
           BREEZE_VERSION=ci-portal-dev-e2e
@@ -3654,15 +3672,15 @@ jobs:
           # Image refs — the base docker-compose.yml requires all of these via
           # `${VAR:?}` before profile filtering, even though the dev override
           # builds api/web/portal from this checkout and stubs binaries-init.
-          BREEZE_API_IMAGE_REF=ghcr.io/lanternops/breeze/api:latest
-          BREEZE_WEB_IMAGE_REF=ghcr.io/lanternops/breeze/web:latest
-          BREEZE_PORTAL_IMAGE_REF=ghcr.io/lanternops/breeze/portal:latest
           BREEZE_BINARIES_IMAGE_REF=ghcr.io/lanternops/breeze/binaries:latest
           CADDY_IMAGE_REF=caddy:2-alpine
           POSTGRES_IMAGE_REF=pgvector/pgvector:pg16
           REDIS_IMAGE_REF=redis:7-alpine
           COTURN_IMAGE_REF=coturn/coturn:latest
           EOF
+          for app in api web portal; do
+            printf 'BREEZE_%s_IMAGE_REF=ghcr.io/%s/%s:latest\n' "${app^^}" "${IMAGE_REPOSITORY,,}" "$app" >> .env
+          done
 
       # e2e-tests is deliberately OUTSIDE the pnpm workspace
       # (pnpm-workspace.yaml covers apps/*, packages/* and ee/* only), so it
@@ -3772,7 +3790,7 @@ jobs:
     name: Workspace Runtime Smoke
     needs: [changes]
     if: needs.changes.outputs.code == 'true' && needs.changes.outputs.app == 'true'
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     continue-on-error: ${{ github.event_name == 'pull_request' }}
     timeout-minutes: 20
     steps:
@@ -3811,7 +3829,7 @@ jobs:
   # Summary job that depends on all other jobs for branch protection
   ci-success:
     name: CI Success
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [changes, workspace-runtime, docs-check, lint, typecheck, check-migrations, test-api, test-m365-graph-read-executor, test-m365-graph-actions-executor, test-m365-communications-executor, test-web, test-mobile, mobile-native-changes, build-mobile-ios, test-portal, test-viewer, test-office-addin-core, test-excel-addin, test-word-addin, test-powerpoint-addin, test-outlook-addin, security-audit, build-api, build-m365-graph-read-executor, build-m365-graph-actions-executor, build-m365-communications-executor, build-web, build-portal, build-agent, test-agent, test-agent-windows, recovery-media-e2e, windows-runtime-smoke, integration-test, check-migrations-nonsuperuser, rust-check, build-smoke-images, smoke-test, guided-setup-smoke, auth-browser-transition-browser-contract, topology-browser-gate]
     if: ${{ !cancelled() }}
     steps:
@@ -3820,6 +3838,7 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           CODE_CHANGED: ${{ needs.changes.outputs.code }}
           DOCS_CHANGED: ${{ needs.changes.outputs.docs }}
+          ENDPOINT_CHANGED: ${{ needs.changes.outputs.endpoint }}
           AGENT_CHANGED: ${{ needs.changes.outputs.agent }}
           APP_CHANGED: ${{ needs.changes.outputs.app }}
           API_CHANGED: ${{ needs.changes.outputs.api }}
@@ -3955,10 +3974,18 @@ jobs:
              { [[ "${PORTAL_CHANGED}" == "true" ]] && [[ "${BUILD_PORTAL_RESULT}" != "success" ]]; } || \
              { [[ "${PORTAL_CHANGED}" != "true" ]] && [[ "${PORTAL_CHANGED}" != "false" ]]; } || \
              { [[ "${PORTAL_CHANGED}" == "false" ]] && [[ "${BUILD_PORTAL_RESULT}" != "skipped" ]]; } || \
-             [[ "${BUILD_AGENT_RESULT}" != "success" ]] || \
-             [[ "${TEST_AGENT_RESULT}" != "success" ]] || \
-             [[ "${TEST_AGENT_WINDOWS_RESULT}" != "success" ]] || \
-             [[ "${WINDOWS_RUNTIME_SMOKE_RESULT}" != "success" ]] || \
+             { [[ "${ENDPOINT_CHANGED}" == "true" ]] && [[ "${BUILD_AGENT_RESULT}" != "success" ]]; } || \
+             { [[ "${ENDPOINT_CHANGED}" != "true" ]] && [[ "${ENDPOINT_CHANGED}" != "false" ]]; } || \
+             { [[ "${ENDPOINT_CHANGED}" == "false" ]] && [[ "${BUILD_AGENT_RESULT}" != "skipped" ]]; } || \
+             { [[ "${ENDPOINT_CHANGED}" == "true" ]] && [[ "${TEST_AGENT_RESULT}" != "success" ]]; } || \
+             { [[ "${ENDPOINT_CHANGED}" != "true" ]] && [[ "${ENDPOINT_CHANGED}" != "false" ]]; } || \
+             { [[ "${ENDPOINT_CHANGED}" == "false" ]] && [[ "${TEST_AGENT_RESULT}" != "skipped" ]]; } || \
+             { [[ "${ENDPOINT_CHANGED}" == "true" ]] && [[ "${TEST_AGENT_WINDOWS_RESULT}" != "success" ]]; } || \
+             { [[ "${ENDPOINT_CHANGED}" != "true" ]] && [[ "${ENDPOINT_CHANGED}" != "false" ]]; } || \
+             { [[ "${ENDPOINT_CHANGED}" == "false" ]] && [[ "${TEST_AGENT_WINDOWS_RESULT}" != "skipped" ]]; } || \
+             { [[ "${ENDPOINT_CHANGED}" == "true" ]] && [[ "${WINDOWS_RUNTIME_SMOKE_RESULT}" != "success" ]]; } || \
+             { [[ "${ENDPOINT_CHANGED}" != "true" ]] && [[ "${ENDPOINT_CHANGED}" != "false" ]]; } || \
+             { [[ "${ENDPOINT_CHANGED}" == "false" ]] && [[ "${WINDOWS_RUNTIME_SMOKE_RESULT}" != "skipped" ]]; } || \
              { [[ "${API_CHANGED}" == "true" ]] && [[ "${INTEGRATION_TEST_RESULT}" != "success" ]]; } || \
              { [[ "${API_CHANGED}" != "true" ]] && [[ "${API_CHANGED}" != "false" ]]; } || \
              { [[ "${API_CHANGED}" == "false" ]] && [[ "${INTEGRATION_TEST_RESULT}" != "skipped" ]]; } || \
@@ -4062,7 +4089,7 @@ jobs:
   # Cancelled runs are ignored (they say nothing about main's health).
   main-red-alert:
     name: Main Red Alert
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     needs: [ci-success]
     # Fires on the emergency lane only (manual dispatch on main after an admin
     # bypass merge). Queue landings were evaluated before they merged.

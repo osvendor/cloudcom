@@ -23,7 +23,7 @@ concurrency:
 jobs:
   cancel-superseded:
     name: Cancel superseded merge-group runs
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     timeout-minutes: 5
     steps:
       - name: Cancel merge_group runs whose queue ref is gone

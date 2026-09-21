@@ -29,7 +29,7 @@ env:
 jobs:
   resolve:
     name: Resolve immutable source
-    runs-on: [self-hosted, linux, cloudcom]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-24.04"]' || '["self-hosted","linux","cloudcom"]') }}
     outputs:
       source_sha: ${{ steps.resolve.outputs.source_sha }}
       source_label: ${{ steps.resolve.outputs.source_label }}

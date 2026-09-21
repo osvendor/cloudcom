@@ -13,17 +13,17 @@ const scratch = [];
 afterEach(() => scratch.splice(0).forEach((path) => rmSync(path, { recursive: true, force: true })));
 const digest = (digit) => `sha256:${digit.repeat(64)}`;
 
-function signedFixture() {
+function signedFixture(repository = 'LanternOps/breeze', imagePrefix = 'ghcr.io/lanternops/breeze') {
   const directory = mkdtempSync(join(tmpdir(), 'release-consumer-fixture-'));
   scratch.push(directory);
   const { publicKey, privateKey } = generateKeyPairSync('ed25519');
   const images = REQUIRED_RELEASE_IMAGES.map((name, index) => ({
     digest: digest(String((index + 1) % 10)),
     name,
-    repository: `ghcr.io/lanternops/breeze/${name}`,
+    repository: `${name === 'binaries' ? 'ghcr.io/lanternops/breeze' : imagePrefix}/${name}`,
   })).sort((left, right) => left.name.localeCompare(right.name));
   const manifest = `${JSON.stringify({
-    assets: [], images, release: 'v1.2.3', repository: 'LanternOps/breeze',
+    assets: [], images, release: 'v1.2.3', repository,
     schemaVersion: 1, sourceCommit: 'a'.repeat(40),
   }, null, 2)}\n`;
   writeFileSync(join(directory, 'release-artifact-manifest.json'), manifest);
@@ -34,6 +34,8 @@ function signedFixture() {
   return {
     directory,
     images,
+    repository,
+    imagePrefix,
     key: publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64'),
   };
 }
@@ -48,6 +50,8 @@ function productionEnv(path, fixture, apiDigest = digest('9')) {
     BREEZE_DOMAIN: 'synthetic.invalid',
     DATABASE_URL: 'postgresql://synthetic:synthetic@127.0.0.1:1/synthetic',
     BREEZE_VERSION: '1.2.3',
+    BREEZE_RELEASE_REPOSITORY: fixture.repository,
+    BREEZE_IMAGE_PREFIX: fixture.imagePrefix,
     BREEZE_API_IMAGE_DIGEST: apiDigest,
     BREEZE_WEB_IMAGE_DIGEST: fixture.images.find((image) => image.name === 'web').digest,
     BREEZE_PORTAL_IMAGE_DIGEST: fixture.images.find((image) => image.name === 'portal').digest,
@@ -68,27 +72,52 @@ function productionEnv(path, fixture, apiDigest = digest('9')) {
   writeFileSync(path, `${Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n')}\n`);
 }
 
-test('strict deploy rejects a substituted signed digest before Compose config, pull, migration, or start', () => {
-  const fixture = signedFixture();
+for (const [repository, imagePrefix] of [
+  ['LanternOps/breeze', 'ghcr.io/lanternops/breeze'],
+  ['example/cloudcom', 'ghcr.io/example/cloudcom'],
+]) {
+  test(`strict deploy rejects a substituted signed digest for ${repository} before Compose config, pull, migration, or start`, () => {
+    const fixture = signedFixture(repository, imagePrefix);
+    const bin = join(fixture.directory, 'bin');
+    const envFile = join(fixture.directory, 'deploy.env');
+    const dockerLog = join(fixture.directory, 'docker.log');
+    const pnpmLog = join(fixture.directory, 'pnpm.log');
+    mkdirSync(bin);
+    executable(join(bin, 'docker'), `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${dockerLog}"\n[[ "$*" == "compose version" ]]\n`);
+    executable(join(bin, 'curl'), `#!/usr/bin/env bash\nout=""\nurl=""\nwhile [[ $# -gt 0 ]]; do case "$1" in --output) out="$2"; shift 2;; http*) url="$1"; shift;; *) shift;; esac; done\ncp "${fixture.directory}/\${url##*/}" "$out"\n`);
+    executable(join(bin, 'pnpm'), `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${pnpmLog}"\nexit 97\n`);
+    productionEnv(envFile, fixture);
+
+    const result = spawnSync('bash', [join(repoRoot, 'scripts/prod/deploy.sh'), envFile], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: { ...process.env, ENABLE_MONITORING: 'false', PATH: `${bin}:${process.env.PATH}` },
+    });
+    assert.notEqual(result.status, 0, 'digest substitution must fail');
+    assert.match(result.stderr, /does not match the signed release manifest/u);
+    assert.equal(readFileSync(dockerLog, 'utf8').trim(), 'compose version');
+    assert.equal(existsSync(pnpmLog), false, 'migration command must not run');
+  });
+
+}
+
+test('strict deploy accepts a signed fork image namespace while retaining upstream binaries', () => {
+  const fixture = signedFixture('example/cloudcom', 'ghcr.io/example/cloudcom');
   const bin = join(fixture.directory, 'bin');
   const envFile = join(fixture.directory, 'deploy.env');
   const dockerLog = join(fixture.directory, 'docker.log');
-  const pnpmLog = join(fixture.directory, 'pnpm.log');
   mkdirSync(bin);
   executable(join(bin, 'docker'), `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${dockerLog}"\n[[ "$*" == "compose version" ]]\n`);
   executable(join(bin, 'curl'), `#!/usr/bin/env bash\nout=""\nurl=""\nwhile [[ $# -gt 0 ]]; do case "$1" in --output) out="$2"; shift 2;; http*) url="$1"; shift;; *) shift;; esac; done\ncp "${fixture.directory}/\${url##*/}" "$out"\n`);
-  executable(join(bin, 'pnpm'), `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> "${pnpmLog}"\nexit 97\n`);
-  productionEnv(envFile, fixture);
-
+  executable(join(bin, 'pnpm'), '#!/usr/bin/env bash\nexit 97\n');
+  productionEnv(envFile, fixture, fixture.images.find((image) => image.name === 'api').digest);
   const result = spawnSync('bash', [join(repoRoot, 'scripts/prod/deploy.sh'), envFile], {
-    cwd: repoRoot,
-    encoding: 'utf8',
+    cwd: repoRoot, encoding: 'utf8',
     env: { ...process.env, ENABLE_MONITORING: 'false', PATH: `${bin}:${process.env.PATH}` },
   });
-  assert.notEqual(result.status, 0, 'digest substitution must fail');
-  assert.match(result.stderr, /does not match the signed release manifest/u);
-  assert.equal(readFileSync(dockerLog, 'utf8').trim(), 'compose version');
-  assert.equal(existsSync(pnpmLog), false, 'migration command must not run');
+  assert.notEqual(result.status, 0, 'mock Compose intentionally stops before deployment');
+  assert.doesNotMatch(result.stderr, /does not match the signed release manifest/u);
+  assert.match(readFileSync(dockerLog, 'utf8'), /config/u, 'signed fork inventory must reach Compose validation');
 });
 
 test('guided resolver rejects a tampered inventory before changing image refs', () => {

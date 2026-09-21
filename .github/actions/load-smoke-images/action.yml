@@ -19,25 +19,28 @@ runs:
         # clears SIGNED_IMAGE_INVENTORY_MIN_VERSION (0.112.0); a bare ci-smoke-* tag
         # would silently take the below-floor path and skip inventory verification.
         GUIDED_IMAGE_VERSION: 0.112.0-ci-smoke-${{ github.run_id }}
+        CI_IMAGE_REPOSITORY: ${{ github.repository }}
         CI_IMAGE_REVISION: ${{ github.sha }}
       run: |
         set -euo pipefail
+        image_prefix="ghcr.io/${CI_IMAGE_REPOSITORY,,}"
         for app in api web portal; do
           docker load --input "${IMAGE_ARCHIVE_DIR}/${app}.tar"
-          ref="ghcr.io/lanternops/breeze/${app}:${CI_IMAGE_VERSION}"
+          ref="${image_prefix}/${app}:${CI_IMAGE_VERSION}"
           revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "${ref}")"
           if [[ "${revision}" != "${CI_IMAGE_REVISION}" ]]; then
             echo "::error::${app} image does not match this checkout"
             exit 1
           fi
-          docker tag "${ref}" "ghcr.io/lanternops/breeze/${app}:${GUIDED_IMAGE_VERSION}"
+          docker tag "${ref}" "${image_prefix}/${app}:${GUIDED_IMAGE_VERSION}"
         done
         # Export only after all three images are loaded and verified. Shell
         # environment takes precedence over .env during Compose interpolation.
         {
           echo "BREEZE_VERSION=${CI_IMAGE_VERSION}"
+          echo "GUIDED_SMOKE_IMAGE_PREFIX=${image_prefix}"
           echo "GUIDED_SMOKE_VERSION=${GUIDED_IMAGE_VERSION}"
-          echo "BREEZE_API_IMAGE_REF=ghcr.io/lanternops/breeze/api:${CI_IMAGE_VERSION}"
-          echo "BREEZE_WEB_IMAGE_REF=ghcr.io/lanternops/breeze/web:${CI_IMAGE_VERSION}"
-          echo "BREEZE_PORTAL_IMAGE_REF=ghcr.io/lanternops/breeze/portal:${CI_IMAGE_VERSION}"
+          echo "BREEZE_API_IMAGE_REF=${image_prefix}/api:${CI_IMAGE_VERSION}"
+          echo "BREEZE_WEB_IMAGE_REF=${image_prefix}/web:${CI_IMAGE_VERSION}"
+          echo "BREEZE_PORTAL_IMAGE_REF=${image_prefix}/portal:${CI_IMAGE_VERSION}"
         } >> "${GITHUB_ENV}"
