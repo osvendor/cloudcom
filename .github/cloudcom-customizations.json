@@ -2,6 +2,24 @@
   "version": 1,
   "customizations": [
     {
+      "id": "rustdesk-desired-state",
+      "requiredFiles": [
+        "scripts/cloudcom/rustdesk/common.ps1",
+        "scripts/cloudcom/rustdesk/probe.ps1",
+        "scripts/cloudcom/rustdesk/repair.ps1",
+        "scripts/cloudcom/rustdesk/build-upload.ps1",
+        "scripts/cloudcom/rustdesk/test-contract.ps1",
+        "scripts/cloudcom/rustdesk/repair.Tests.ps1",
+        "scripts/cloudcom/rustdesk/README.md"
+      ],
+      "hooks": [
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "Invoke-Pester ./scripts/cloudcom/rustdesk/repair.Tests.ps1"
+        }
+      ]
+    },
+    {
       "id": "remote-access-alternatives",
       "requiredFiles": [
         "apps/api/src/routes/devices/cloudcomRemoteAccess.ts",
@@ -39,6 +57,23 @@
         {
           "file": ".github/workflows/cloudcom-ci.yml",
           "contains": "sync-browser-viewer.mjs --check"
+        }
+      ]
+    },
+    {
+      "id": "monitor-response-reference-fix",
+      "requiredFiles": [
+        "apps/api/src/services/monitors/monitorCompiler.ts",
+        "apps/api/src/services/monitors/monitorCompiler.w04.test.ts"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/services/monitors/monitorCompiler.ts",
+          "contains": "const diagnosticReferences = buildDiagnosticScriptReferences(def)"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "src/services/monitors/monitorCompiler.w04.test.ts"
         }
       ]
     }

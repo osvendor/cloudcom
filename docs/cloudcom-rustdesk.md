@@ -19,6 +19,14 @@ An external launcher does **not** establish a Breeze-managed session. Issuance d
 
 ## Update protection
 
+### Optional Windows desired-state deployment
+
+`scripts/cloudcom/rustdesk/` supplies separate read-only probe and idempotent repair scripts for Breeze's native Script Monitor response. Attach that monitor through a Configuration Policy, initially assigned to one canary device. A native Required Software compliance rule may report inventory status separately. It does not replace the probe: inventory is asynchronous and does not establish configuration, service health, or credential readiness.
+
+Use the existing monitor mechanism rather than patching the agent/MSI. In the pinned upstream implementation, Configuration Policy compliance's software-deploy remediation is not implemented, and script remediation requires an additional enabled standalone automation reference. Script Monitor response actions provide the supported direct wiring for this deployment.
+
+Build standalone upload bodies with `build-upload.ps1`, supply environment-specific values outside Git, and import through Breeze's versioned script bundle interface. Preserve the mandatory device guard until promotion is explicitly scoped and tested. The customization register and Pester CI tests protect the scripts and mutation boundaries during upstream updates; repeat live Windows acceptance before promotion. See the deployment README for safeguards and outstanding acceptance requirements.
+
 `.github/cloudcom-customizations.json` records module files and their two attachment points. The controlled upstream importer reads this contract **before** the merge and aborts if the merged tree loses one. It does not blindly restore application files over upstream fixes. CI checks the contract again and runs behavior tests/builds. A synthetic Git test covers a conflict-free update that removes an attachment and verifies rollback to the original clean checkout.
 
 This detects deletion/disconnection, not every semantic change. An upstream change to provider schemas, authentication, site scoping, React lifecycle, or secret handling requires review and regression tests even with no Git conflict. Keep the change register current; do not pull directly into production. Rollback for this stage is the previous verified application images; it has no schema migration and does not alter provider preferences.
@@ -53,3 +61,11 @@ pnpm --filter @breeze/web exec vitest run src/components/cloudcom/RemoteAccessAl
 ```
 
 Use the repository-pinned package manager. Mocked route tests exercise real organization/site helper logic with a simulated database and configurable auth gates; they do not replace real-DB RLS or live Cloudflare/end-to-end acceptance.
+
+### Script-monitor response binding compatibility fix
+
+A live stopped-service canary exposed an upstream compiler/runtime mismatch: the compiler stored both the diagnostic probe and response script in the response automation's resource bindings, while admission correctly requires bindings to match executable response actions exactly. This prevented all responses when the probe and repair were different scripts.
+
+The compiler now validates probe ownership separately and persists only response-action bindings. Runtime authorization, tenant boundaries and device binding remain unchanged. Re-saving an existing monitor recompiles its bindings. The focused compiler regression and authorization/device-binding tests are registered in CloudCom CI and the customization contract; preserve this fix during upstream merges until upstream supplies equivalent behavior.
+
+The deployment staging tree must be owned by SYSTEM or Administrators, reject reparse points in ancestors, and have private ACLs. New directories are created atomically with their final ACL under Windows PowerShell 5.1. Existing untrusted trees fail closed for manual recovery; repair never takes over a user-owned directory.

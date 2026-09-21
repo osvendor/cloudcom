@@ -323,13 +323,17 @@ export async function compileMonitorInTx(
   // re-checks at admission time. Without them a compiled automation's
   // run_script action would be refused at execution with no explanation.
   const owner = { orgId: def.orgId, partnerId: def.partnerId };
+  // Validate the probe's ownership independently. It is dispatched by the
+  // monitor worker, not an action of the response automation. Persisting it
+  // as a response binding makes admission reject the extra reference.
+  const diagnosticReferences = buildDiagnosticScriptReferences(def);
+  if (diagnosticReferences.length > 0) {
+    await resolveAutomationReferencesForOwner(tx, owner, diagnosticReferences);
+  }
   const resolved = await resolveAutomationReferencesForOwner(
     tx,
     owner,
-    [
-      ...(automation.actions as AutomationAction[]),
-      ...buildDiagnosticScriptReferences(def),
-    ],
+    automation.actions as AutomationAction[],
   );
   await replaceAutomationResourceBindings(tx, a.id, owner, resolved);
 

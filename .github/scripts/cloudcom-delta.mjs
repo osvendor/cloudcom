@@ -15,6 +15,8 @@ const remoteAccessWebPaths = new Set([
 // Only this reviewed API surface has change-focused coverage below. Unknown
 // API, schema and portal changes continue to fail closed.
 const remoteAccessApiPaths = new Set([
+  'apps/api/src/services/monitors/monitorCompiler.ts',
+  'apps/api/src/services/monitors/monitorCompiler.w04.test.ts',
   'apps/api/src/routes/devices/index.ts',
   'apps/api/src/routes/devices/cloudcomRemoteAccess.ts',
   'apps/api/src/routes/devices/cloudcomRemoteAccess.test.ts',
