@@ -1,6 +1,6 @@
 # CloudCom CI and upstream updates
 
-CloudCom owns two workflows: cloudcom-ci.yml and cloudcom-upstream.yml. The 17 inherited Breeze workflows remain retired. Reusable source tests and scripts remain available, but their existence is not evidence that they run in CloudCom CI.
+CloudCom owns three workflows: cloudcom-ci.yml, cloudcom-upstream.yml and cloudcom-candidate.yml. The 17 inherited Breeze workflows remain retired. Reusable source tests and scripts remain available, but their existence is not evidence that they run in CloudCom CI.
 
 ## Validation
 
@@ -27,3 +27,11 @@ Review release notes, changed dependencies and every retained customization, the
 Prepare the fork in a separate directory from the live installation. The existing Lightsail server remains the production and application-testing destination. Before cutover, validate candidate images and configuration, signed inventories and agent provenance, database upgrade compatibility, and backup/recovery. CI success alone is not deployment acceptance.
 
 Branding and version naming remain unchanged. Preserve upstream licenses, package identities and agent signatures. See [upstream maintenance](cloudcom-upstream-maintenance.md) for customization records.
+
+## Candidate image preparation
+
+CloudCom Candidate Images is manual-only on the default branch. Its source_commit input must be an exact commit ancestral to the default branch with a successful push-triggered CloudCom CI run. It builds Linux amd64 API, web and portal runtime images, plus a migration-only builder image, from the selected commit. Version metadata comes from that commit’s upstream baseline.
+
+The workflow exports gzip image archives, SHA256SUMS and exact Docker image IDs as seven-day Actions artifacts. It does not publish a release, push registry tags or deploy. Verify archive hashes and loaded image IDs before using them. These preparation artifacts do not replace signed production release inventories.
+
+Run the migration builder’s pnpm db:migrate command only against an isolated restored database, without Redis or external networking. Normal API startup initializes additional services; do not use it as a migration-only command. Re-run migrations to verify idempotence and test the unprivileged request role. Candidate app acceptance should use a separate disposable database/network. Preserve private backup/configuration and test records outside the public repository.
