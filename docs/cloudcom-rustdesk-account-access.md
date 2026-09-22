@@ -13,6 +13,10 @@ WebRTC availability uses the same live authorization as session creation and
 requires both endpoint enforcement protocols. The global feature defaults off;
 RustDesk availability remains off until native acceptance succeeds.
 Native target enforcement and app sign-in described below are still required.
+Preparatory native lease and proof-encoding modules now exist behind a disabled
+build feature, with an API proof verifier in source. These are not yet attached to
+the RustDesk connection path. See [the admission protocol](cloudcom-native-admission-protocol.md)
+for the byte contract and remaining integration requirements.
 
 ### Deployment and login boundary
 
@@ -144,8 +148,13 @@ The native source prerequisite was subsequently materialized offline in a separa
 clean worktree at that exact client revision, with `hbb_common` pinned to
 `d9895ff9cb4c77137fb05ce3161bcf7210177aef`. Git connectivity checks passed and
 reported no missing objects; Flutter, resources and Cargo configuration are now
-present. Source availability is not a remaining blocker. Windows compiler/SDK,
-Rust/Flutter tooling and dependency-cache readiness have not yet been verified.
+present. Source availability is not a remaining blocker. The designated Windows
+canary has Visual Studio 2022 C++ tools and Windows SDK 10.0.22621. Rust 1.75 was
+installed in an isolated build directory; full Flutter/native dependency and
+client-build acceptance remain outstanding.
+The standalone native modules compiled on that Windows canary: five lease tests
+and two admission-encoding tests passed with exit code zero. The four API proof
+tests also passed in isolated Linux QA. They do not yet test a RustDesk connection.
 This preparation does not implement native login, ticket admission or revocation.
 
 Observed in the audited trees:
