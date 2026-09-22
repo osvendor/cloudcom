@@ -1,0 +1,10 @@
+---
+import PortalLayout from '../../layouts/PortalLayout.astro';
+import RemoteViewer from '../../components/portal/RemoteViewer';
+import { withBase } from '../../lib/basePath';
+const { sessionId } = Astro.params;
+if (!sessionId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) return Astro.redirect(withBase('/remote'), 302);
+---
+<PortalLayout title="Remote session" remoteOnly>
+  <RemoteViewer sessionId={sessionId} client:load />
+</PortalLayout>

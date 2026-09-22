@@ -23,6 +23,47 @@ const remoteAccessApiPaths = new Set([
   'apps/api/src/services/cloudcom/remoteAccessOptions.ts',
   'apps/api/src/services/cloudcom/remoteAccessOptions.test.ts',
 ]);
+// Customer portal remote access has its own bounded CI path. These entries are
+// deliberately enumerated because the validation uses a disposable Postgres /
+// Redis stack, real portal-login and authorization tests, plus the RLS coverage
+// contract; unknown portal or schema work must still fail closed.
+const portalRemoteApiPaths = new Set([
+  '.env.example', 'docker-compose.yml',
+  'apps/api/migrations/2026-09-21-portal-remote-access.sql',
+  'apps/api/migrations/2026-09-21-portal-remote-session-prompt.sql',
+  'apps/api/migrations/2026-09-22-portal-remote-assignment-identity.sql',
+  'apps/api/src/__tests__/integration/orgMergeRegistry.integration.test.ts',
+  'apps/api/src/__tests__/integration/portalRemoteAccess.integration.test.ts',
+  'apps/api/src/__tests__/integration/portalRemoteLogin.integration.test.ts',
+  'apps/api/src/db/schema/index.ts', 'apps/api/src/db/schema/portal.ts', 'apps/api/src/db/schema/portalRemote.ts',
+  'apps/api/src/extensions/builtinExtensions.test.ts', 'apps/api/src/extensions/builtinRegistry.test.ts', 'apps/api/src/extensions/builtinRegistry.ts',
+  'apps/api/src/middleware/selfManagedDbContextRoutes.test.ts', 'apps/api/src/middleware/selfManagedDbContextRoutes.ts',
+  'apps/api/src/routes/agentWs.test.ts', 'apps/api/src/routes/agentWs.ts',
+  'apps/api/src/routes/devices/cascadeDelete.test.ts', 'apps/api/src/routes/devices/core.ts',
+  'apps/api/src/routes/devices/moveOrg.coverage.test.ts', 'apps/api/src/routes/devices/moveOrg.test.ts', 'apps/api/src/routes/devices/moveOrg.ts',
+  'apps/api/src/routes/portal/accessMode.test.ts', 'apps/api/src/routes/portal/accessMode.ts',
+  'apps/api/src/routes/portal/auth.test.ts', 'apps/api/src/routes/portal/auth.ts', 'apps/api/src/routes/portal/authOrgStatusGate.test.ts',
+  'apps/api/src/routes/portal/helpers.ts', 'apps/api/src/routes/portal/index.ts', 'apps/api/src/routes/portal/profile.ts',
+  'apps/api/src/routes/portal/remote.test.ts', 'apps/api/src/routes/portal/remote.ts',
+  'apps/api/src/routes/portal/remoteDesktop.test.ts', 'apps/api/src/routes/portal/remoteDesktop.ts',
+  'apps/api/src/routes/portal/remoteRateLimit.test.ts', 'apps/api/src/routes/portal/remoteRateLimit.ts', 'apps/api/src/routes/portal/schemas.ts',
+  'apps/api/src/services/orgMergeRegistry.ts', 'apps/api/src/services/portalNativeProof.test.ts', 'apps/api/src/services/portalNativeProof.ts',
+  'apps/api/src/services/portalRemoteAgent.test.ts', 'apps/api/src/services/portalRemoteAgent.ts', 'apps/api/src/services/portalRemoteAuthority.ts',
+  'apps/api/src/services/portalRemoteFeature.ts', 'apps/api/src/services/portalRemoteLease.test.ts', 'apps/api/src/services/portalRemoteLease.ts',
+  'apps/api/src/services/portalRemoteSessionAuth.test.ts', 'apps/api/src/services/portalRemoteSessionAuth.ts',
+  'apps/api/src/services/portalRemoteSessionStore.test.ts', 'apps/api/src/services/portalRemoteSessionStore.ts',
+  'apps/api/src/services/remoteAccessLauncher.test.ts', 'apps/api/src/services/tenantCascade.ts', 'apps/api/src/services/tenantExportPolicyRegistry.ts',
+]);
+const portalRemoteWebPaths = new Set([
+  'apps/portal/src/components/portal/LoginForm.tsx', 'apps/portal/src/components/portal/RemotePage.tsx',
+  'apps/portal/src/components/portal/RemoteViewer.test.tsx', 'apps/portal/src/components/portal/RemoteViewer.tsx',
+  'apps/portal/src/layouts/PortalLayout.astro', 'apps/portal/src/lib/api.ts', 'apps/portal/src/lib/auth.ts',
+  'apps/portal/src/lib/landing.test.ts', 'apps/portal/src/lib/landing.ts', 'apps/portal/src/lib/nextPath.test.ts',
+  'apps/portal/src/lib/nextPath.ts', 'apps/portal/src/lib/protectedPaths.ts', 'apps/portal/src/lib/remoteInput.test.ts',
+  'apps/portal/src/lib/remoteInput.ts', 'apps/portal/src/middleware.test.ts', 'apps/portal/src/middleware.ts',
+  'apps/portal/src/pages/index.astro', 'apps/portal/src/pages/remote/[sessionId].astro', 'apps/portal/src/pages/remote/index.astro',
+]);
+const rustdeskExtensionPaths = /^(?:packages\/ext-rustdesk-access\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/README\.md|src\/(?:authorization(?:\.test)?\.mjs|server\/index(?:\.test)?\.ts|web\/index(?:\.test)?\.ts))|packages\/ext-rustdesk-access\/README\.md)$/u;
 const cloudCommandApiPaths = new Set([
   'apps/api/src/routes/extensionsWeb.test.ts',
   'apps/api/src/routes/extensionsWeb.ts',
@@ -84,9 +125,26 @@ export function readBaseline(text = readFileSync(baselinePath, 'utf8')) {
 }
 
 export function classify(paths) {
-  const result = { api: false, web: false, shared: false, native: false, infra: false, unsupported: [] };
+  const result = { api: false, web: false, shared: false, native: false, infra: false, portalRemote: false, unsupported: [] };
   for (const path of paths.filter(Boolean)) {
-    if (docsPath.test(path) || path === 'packages/ext-cloud-command/README.md') continue;
+    if (docsPath.test(path) || path === 'packages/ext-cloud-command/README.md' || path === 'packages/ext-rustdesk-access/README.md') continue;
+    if (portalRemoteApiPaths.has(path)) {
+      result.api = true;
+      result.portalRemote = true;
+      if (path === '.env.example' || path === 'docker-compose.yml') result.infra = true;
+      continue;
+    }
+    if (portalRemoteWebPaths.has(path)) {
+      result.web = true;
+      result.portalRemote = true;
+      continue;
+    }
+    if (rustdeskExtensionPaths.test(path)) {
+      result.api = true;
+      result.web = true;
+      result.portalRemote = true;
+      continue;
+    }
     if (remoteAccessApiPaths.has(path)) {
       result.api = true;
       continue;
@@ -164,6 +222,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     shared: classification.shared,
     native: classification.native,
     infra: classification.infra,
+    portalRemote: classification.portalRemote,
     docsOnly: classification.docsOnly,
     unsupported: classification.unsupported.length > 0,
   };

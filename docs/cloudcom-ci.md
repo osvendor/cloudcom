@@ -14,6 +14,14 @@ The optional remote-tool module has an exact API/web path allowlist, focused lau
 
 Security dependency/SAST monitoring and full candidate image/upgrade acceptance are separate readiness work; the current secret/workflow checks do not claim to replace them. CI does not publish or deploy images.
 
+Customer remote access now selects `scripts/cloudcom/test-portal-remote.sh` through
+an enumerated path set. That check creates its own PostgreSQL/Redis stack, applies
+core migrations, and runs real portal-login, assignment/session isolation and RLS
+contracts alongside the focused API and portal tests, extension checks and portal
+build. Other portal/schema paths remain unsupported until explicitly covered.
+This wiring is separate from real Windows/browser acceptance and does not enable
+or prove the unfinished native RustDesk transport.
+
 ## Release updates
 
 The upstream workflow checks published stable LanternOps/breeze releases weekly on Monday at 10:23 UTC and can be run manually from the default branch. Schedules become active only after this workflow is on the default branch. GitHub Actions must be permitted to create PRs; default workflow permissions stay read-only and the updater grants only its job the required write permissions.

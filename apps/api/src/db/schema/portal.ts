@@ -75,6 +75,8 @@ export const portalUsers = pgTable('portal_users', {
   // Durable generation snapshotted by portal and client-AI sessions. Redis
   // deletion is cleanup; live authorization compares this column instead.
   authEpoch: integer('auth_epoch').notNull().default(1),
+  // Separate entitlement from organization-wide portal visibility flags.
+  accessMode: text('access_mode').$type<'standard' | 'remote_only'>().notNull().default('standard'),
   linkedUserId: uuid('linked_user_id').references(() => users.id),
   // A portal user is a LOGIN attached to a contact, not a second kind of
   // person (#3258). Nullable because the link is established after the fact by

@@ -15,6 +15,9 @@ function mount(api: CloudCommandHostApi): CloudCommandThreeCxPage {
   // on cross-module custom-element upgrade timing while still exercising the
   // same connectedCallback and shadow-root implementation the host mounts.
   const page = new CloudCommandThreeCxPage();
+  // The operational manifest route is directory-only. Existing page-level
+  // tests exercise both explicitly supported regions together.
+  page.displayMode = 'combined';
   page.context = context;
   page.hostApi = api;
   document.body.append(page);
@@ -24,6 +27,20 @@ function mount(api: CloudCommandHostApi): CloudCommandThreeCxPage {
 afterEach(() => { document.body.replaceChildren(); });
 
 describe('CloudCommandThreeCxPage', () => {
+  it('keeps the operational route directory-only and sends managers to Connect', async () => {
+    const page = new CloudCommandThreeCxPage();
+    page.context = context;
+    page.hostApi = { request: async () => Response.json({ connected: true, canManage: true, enabled: true }) };
+    document.body.append(page);
+    await flush();
+    const root = page.shadowRoot!;
+    expect(root.querySelector('#origin')).toBeNull();
+    expect(root.querySelector('#refresh-users')).toBeTruthy();
+    const navigate = vi.fn();
+    page.addEventListener('breeze-extension-event', navigate);
+    (root.querySelector('#configure-3cx') as HTMLButtonElement).click();
+    expect(navigate.mock.calls[0][0].detail).toMatchObject({ path: '/extensions/cloudcommand/connect#threecx' });
+  });
   it('allows a first test to discover departments without silently selecting full PBX access', async () => {
     const request = vi.fn(async (path: string, init?: RequestInit) => {
       if (path === '/threecx/connection') return Response.json({ connected: false, canManage: true });
