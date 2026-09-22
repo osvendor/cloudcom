@@ -154,7 +154,8 @@ export function classify(paths) {
     }
     if (path === 'deploy/remote-identity/README.md') continue;
     if (['deploy/remote-identity/compose.yml', 'deploy/remote-identity/.env.example', 'deploy/remote-identity/.gitignore',
-      'deploy/remote-identity/custom-templates/.gitkeep', 'deploy/remote-identity/secrets/.gitkeep'].includes(path)) {
+      'deploy/remote-identity/custom-templates/.gitkeep', 'deploy/remote-identity/secrets/.gitkeep',
+      'deploy/remote-identity/company-login.yaml'].includes(path)) {
       result.infra = true;
       continue;
     }

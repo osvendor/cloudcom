@@ -61,8 +61,30 @@ accounts**. Create only the explicitly approved company accounts and use the
 normal password login flow. Individual Breeze accounts remain separate and are
 not imported, linked, or replaced by this deployment. Do not configure customer
 MFA, customer self-signup, customer password recovery, invitations, or account
-provisioning here. This template intentionally includes no blueprints or flows,
-so those decisions remain an explicit follow-up configuration task.
+provisioning here.
+
+## Company login flow
+
+`company-login.yaml` creates a separate username/password flow and an empty,
+non-administrator company group. It does not change the default administrator
+flow, create credentials, expose a listener, or grant access to an application.
+The password stage accepts only local database passwords. Enrollment, recovery,
+passwordless login, external sources, and remembered-device options are absent.
+The session lasts eight hours; parallel company sessions are allowed.
+
+Apply the blueprint explicitly after initial setup:
+
+```sh
+docker compose -f compose.yml cp company-login.yaml server:/blueprints/cloudcom-company-login.yaml
+docker compose -f compose.yml exec -T server ak apply_blueprint --dry-run /blueprints/cloudcom-company-login.yaml
+docker compose -f compose.yml exec -T server ak apply_blueprint /blueprints/cloudcom-company-login.yaml
+```
+
+Objects persist in the identity database. Retain the source blueprint for
+reapplication after rebuilds. Bind the eventual Cloudflare OIDC application to
+`cloudcom-company-gateways`; an authentication flow alone is not an application
+authorization boundary. Public routing, OIDC configuration, company credentials,
+brute-force policy, and end-to-end acceptance remain separate cutover steps.
 
 ## Version and source references
 
