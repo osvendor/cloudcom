@@ -28,6 +28,11 @@
         "element": "cloudcommand-overview-page"
       },
       {
+        "id": "connect",
+        "path": "/connect",
+        "element": "cloudcommand-connect-page"
+      },
+      {
         "id": "threecx",
         "path": "/threecx",
         "element": "cloudcommand-threecx-page"
@@ -44,6 +49,12 @@
         "label": "Cloud Command",
         "path": "/overview",
         "order": 100
+      },
+      {
+        "id": "connect",
+        "label": "Connect",
+        "path": "/connect",
+        "order": 101
       }
     ],
     "slots": []

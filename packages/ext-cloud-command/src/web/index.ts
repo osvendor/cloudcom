@@ -1,5 +1,6 @@
 import './overview';
 import './microsoft';
+import './connect';
 import {
   dispatchExtensionHostEvent,
   parseExtensionPageContextV1,
@@ -7,6 +8,7 @@ import {
 } from '@breeze/extension-web-sdk';
 
 const ELEMENT = 'cloudcommand-threecx-page';
+export type CloudCommandThreeCxMode = 'configuration' | 'directory' | 'combined';
 
 type Connection = {
   connected: boolean;
@@ -73,6 +75,20 @@ export class CloudCommandThreeCxPage extends HTMLElement {
   private statusIsError = false;
   private generation = 0;
   private microsoftNavigationVisible = false;
+  /** The Connect shell embeds only setup; the operational route embeds only the directory. */
+  private mode: CloudCommandThreeCxMode = 'directory';
+
+  set displayMode(mode: CloudCommandThreeCxMode) {
+    if (mode !== 'configuration' && mode !== 'directory' && mode !== 'combined') {
+      throw new Error('Invalid Cloud Command 3CX display mode');
+    }
+    if (this.mode === mode) return;
+    this.mode = mode;
+    this.setAttribute('data-display-mode', mode);
+    if (this.isConnected) this.render();
+  }
+
+  get displayMode(): CloudCommandThreeCxMode { return this.mode; }
 
   set context(input: unknown) {
     const context = parseExtensionPageContextV1(input);
@@ -99,7 +115,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     }
     // A same-organization context refresh must not replace an unsaved draft.
     if (this.isConnected && changedOrganization) void this.loadConnection();
-    else if (this.isConnected) { this.render(); void this.loadMicrosoftNavigation(this.generation, context); }
+    else if (this.isConnected) { this.render(); if (this.mode !== 'configuration') void this.loadMicrosoftNavigation(this.generation, context); }
   }
 
   get context(): ExtensionPageContextV1 | null { return this.pageContext; }
@@ -147,7 +163,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
       this.draft = this.draftFromConnection(connection, this.draft?.secret ?? '');
       this.setStatus(connection.connected ? 'Connection loaded.' : 'No 3CX connection is configured.');
       this.render();
-      void this.loadMicrosoftNavigation(generation, context);
+      if (this.mode !== 'configuration') void this.loadMicrosoftNavigation(generation, context);
     } catch (error) {
       if (generation === this.generation && context === this.pageContext) this.setStatus(error instanceof Error ? error.message : 'Could not load the 3CX connection.', true);
     }
@@ -262,7 +278,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     }, 'Could not save the 3CX connection.', generation, context);
     if (saved && this.isCurrent(generation, context)) {
       await this.loadConnection();
-      if (this.isCurrent(generation, context) && this.connection.connected && this.connection.enabled !== false) await this.loadUsers(true);
+      if (this.mode !== 'configuration' && this.isCurrent(generation, context) && this.connection.connected && this.connection.enabled !== false) await this.loadUsers(true);
     }
   }
 
@@ -340,18 +356,20 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     const canManage = this.connection.canManage === true;
     const connectionEnabled = this.connection.enabled !== false;
     const canReadUsers = connected && connectionEnabled;
+    const showConfiguration = this.mode !== 'directory';
+    const showDirectory = this.mode !== 'configuration';
     const draft = this.draft ?? this.draftFromConnection(this.connection, '');
     const selectedDepartment = draft.departmentId;
     const groupsMatchDraft = this.groupsFor?.origin === draft.origin && this.groupsFor.clientId === draft.clientId;
     const groups = groupsMatchDraft ? this.groups : typeof this.connection.departmentId === 'number' && this.connection.origin === draft.origin && this.connection.clientId === draft.clientId ? [{ id: this.connection.departmentId, name: `Department ${this.connection.departmentId}` }] : [];
     const detail = this.detailIndex === null ? null : this.users[this.detailIndex] ?? null;
     this.root.innerHTML = `
-      <style>${styles}</style>
+      <style>${styles}${this.mode === 'configuration' ? ':host([data-display-mode="configuration"]) main{max-width:none;margin:0;padding:0}' : ''}</style>
       <main aria-labelledby="title">
-        <header><div><p class="eyebrow">Cloud Command</p><h1 id="title">3CX extensions</h1><p class="subtle">Connect one organization’s 3CX PBX, select its scope, and review extensions.</p></div><span class="badge ${connected && connectionEnabled ? 'ok' : connected ? 'disabled' : ''}">${connected ? connectionEnabled ? 'Connected' : 'Disabled' : 'Not connected'}</span></header>
+        <header><div><p class="eyebrow">Cloud Command</p><h1 id="title">${showConfiguration && !showDirectory ? 'Connect 3CX' : '3CX extensions'}</h1><p class="subtle">${showConfiguration && !showDirectory ? 'Connect one organization’s 3CX PBX and select its access scope.' : 'Review extensions from the configured 3CX scope.'}</p></div><span class="badge ${connected && connectionEnabled ? 'ok' : connected ? 'disabled' : ''}">${connected ? (connectionEnabled ? 'Connected' : 'Disabled') : 'Not connected'}</span></header>
         <nav aria-label="Cloud Command providers">${this.microsoftNavigationVisible ? '<button class="secondary compact" id="go-microsoft" type="button">Microsoft 365</button>' : ''}</nav>
         <p class="status" data-status data-error="${this.statusIsError}" aria-live="polite">${escapeHtml(this.statusMessage)}</p>
-        <section class="card" aria-labelledby="connection-heading">
+        ${showConfiguration ? `<section class="card" aria-labelledby="connection-heading">
           <div class="section-title"><div><h2 id="connection-heading">Connection</h2><p>${canManage ? 'Credentials are encrypted server-side. The secret is never returned to this page.' : 'You have read-only access to this organization’s 3CX connection.'}</p></div></div>
           ${canManage ? `<div class="fields">
             <label>HTTPS PBX URL<input id="origin" type="url" autocomplete="url" placeholder="https://pbx.example.com:5001" value="${escapeAttr(draft.origin)}" required></label>
@@ -365,12 +383,12 @@ export class CloudCommandThreeCxPage extends HTMLElement {
             <label class="check"><input id="enabled" type="checkbox" ${draft.enabled ? 'checked' : ''}>Enable this connection</label>
           </div></details>
           <div class="actions"><button class="secondary" id="test" type="button" ${this.busy ? 'disabled' : ''}>${this.busy ? 'Working…' : 'Test connection'}</button><button id="save" type="button" ${this.busy ? 'disabled' : ''}>Save connection</button></div>` : '<p class="readonly-note">Connection configuration is available to organization managers.</p>'}
-        </section>
-        <section class="card" aria-labelledby="extensions-heading">
+        </section>` : canManage ? '<p class="configure-link"><button class="secondary" id="configure-3cx" type="button">Configure 3CX</button></p>' : ''}
+        ${showDirectory ? `<section class="card" aria-labelledby="extensions-heading">
           <div class="section-title"><div><h2 id="extensions-heading">Extensions</h2><p>Read-only view from the configured 3CX scope.</p></div><button class="secondary" id="refresh-users" type="button" ${!canReadUsers || this.busy ? 'disabled' : ''}>Refresh</button></div>
           ${this.users.length ? `<div class="table-wrap"><table><thead><tr><th>Extension</th><th>Name</th><th>Email</th><th>Status</th><th><span class="sr-only">Details</span></th></tr></thead><tbody>${this.users.map((user, index) => `<tr><td>${escapeHtml(user.Number)}</td><td>${escapeHtml([user.FirstName, user.LastName].filter(Boolean).join(' ') || '—')}</td><td>${escapeHtml(user.EmailAddress || '—')}</td><td><span class="state ${user.Enabled ? 'on' : ''}">${user.Enabled ? 'Enabled' : 'Disabled'}</span></td><td><button class="secondary compact" type="button" data-detail-index="${index}">View details</button></td></tr>`).join('')}</tbody></table></div>` : `<div class="empty">${connected ? connectionEnabled ? 'No extensions loaded yet.' : 'This connection is disabled.' : 'Save a connection to view extensions.'}</div>`}
           ${this.nextSkip !== null ? `<button class="secondary more" id="more-users" type="button" ${!canReadUsers || this.busy ? 'disabled' : ''}>Load more</button>` : ''}
-        </section>
+        </section>` : ''}
         ${detail ? `<div class="drawer-layer" data-details-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="details-title"><div class="drawer-header"><div><p class="eyebrow">Extension</p><h2 id="details-title">${escapeHtml(detail.Number)}</h2></div><button class="secondary compact" id="details-close" type="button" aria-label="Close extension details">Close</button></div><dl class="detail-list"><div><dt>Name</dt><dd>${escapeHtml([detail.FirstName, detail.LastName].filter(Boolean).join(' ') || '—')}</dd></div><div><dt>Email</dt><dd>${escapeHtml(detail.EmailAddress || '—')}</dd></div><div><dt>Mobile</dt><dd>${escapeHtml(detail.Mobile || '—')}</dd></div><div><dt>Enabled</dt><dd>${detail.Enabled ? 'Enabled' : 'Disabled'}</dd></div><div><dt>Registered</dt><dd>${detail.IsRegistered ? 'Registered' : 'Not registered'}</dd></div><div><dt>Profile</dt><dd>${escapeHtml(detail.CurrentProfileName || '—')}</dd></div></dl></aside></div>` : ''}
       </main>`;
     this.root.querySelector('#full-pbx')?.addEventListener('change', () => { const select = this.requireInput('departmentId'); select.toggleAttribute('disabled', this.root.querySelector<HTMLInputElement>('#full-pbx')!.checked); });
@@ -381,6 +399,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     this.root.querySelectorAll<HTMLButtonElement>('[data-detail-index]').forEach((button) => button.addEventListener('click', () => this.openDetails(Number(button.dataset.detailIndex))));
     this.root.querySelector('#details-close')?.addEventListener('click', () => this.closeDetails());
     this.root.querySelector('#go-microsoft')?.addEventListener('click', () => dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path: '/extensions/cloudcommand/microsoft' }));
+    this.root.querySelector('#configure-3cx')?.addEventListener('click', () => dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path: '/extensions/cloudcommand/connect#threecx' }));
     this.root.querySelector('[data-details-backdrop]')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) this.closeDetails(); });
     this.root.querySelector<HTMLElement>('[role="dialog"]')?.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); this.closeDetails(); } else if (event.key === 'Tab') { event.preventDefault(); this.root.querySelector<HTMLButtonElement>('#details-close')?.focus(); } });
   }

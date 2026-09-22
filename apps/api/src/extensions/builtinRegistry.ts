@@ -16,6 +16,7 @@ import {
 } from '@breeze/extension-sdk';
 import type { ExtensionTenancyDeclaration } from '@breeze/extension-sdk';
 import workspaceExtension from '@breeze/ext-workspace';
+import remoteAccessExtension from '@cloudcom/ext-rustdesk-access';
 import { createCloudCommandExtension } from '@cloudcom/ext-cloud-command';
 
 /** One statically-imported, first-party extension. */
@@ -266,6 +267,9 @@ export const BUILTINS: readonly BuiltinExtension[] = [
     // which a stock `postgres:16-alpine` deployment does not have.
     enableEnvVar: 'BREEZE_WORKSPACE_ENABLED',
   }),
+  defineBuiltin({ module: remoteAccessExtension, name: 'rustdeskaccess',
+    packageDir: 'packages/ext-rustdesk-access', packageName: '@cloudcom/ext-rustdesk-access',
+    helperRoutes: false, enableEnvVar: 'CLOUDCOM_REMOTE_ACCESS_ENABLED' }),
 ];
 
 export const BUILTIN_EXTENSION_NAMES: ReadonlySet<string> = new Set(

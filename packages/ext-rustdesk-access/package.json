@@ -1,0 +1,26 @@
+{
+  "name": "@cloudcom/ext-rustdesk-access",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Customer remote-access assignments and administration.",
+  "scripts": {
+    "test": "node --test src/*.test.mjs",
+    "test:server": "vitest run src/server",
+    "test:web": "vitest run --config vitest.web.config.ts",
+    "typecheck": "tsc --noEmit",
+    "build:web": "tsup --config tsup.web.config.ts"
+  },
+  "dependencies": {
+    "@breeze/extension-sdk": "workspace:*",
+    "@breeze/extension-web-sdk": "workspace:*",
+    "hono": "^4.13.5", "drizzle-orm": "^0.45.2", "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "tsup": "8.5.1", "typescript": "5.9.3", "vitest": "^4.1.11",
+    "happy-dom": "^20.11.1", "@types/node": "^26.4.1"
+  },
+  "main": "./src/server/index.ts",
+  "types": "./src/server/index.ts",
+  "exports": { ".": "./src/server/index.ts" }
+}

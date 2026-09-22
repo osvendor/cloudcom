@@ -22,7 +22,7 @@ test('baseline accepts a valid release fixture and rejects an arbitrary reposito
 
 test('classifies supported web, native, and explicit infrastructure changes', () => {
   assert.deepEqual(classify(['apps/web/src/components/remote/RemoteToolsPage.tsx', 'agent/main.go', 'deploy/docker-compose.prod.yml']), {
-    api: false, web: true, shared: false, native: true, infra: true, unsupported: [], docsOnly: false,
+    api: false, web: true, shared: false, native: true, infra: true, portalRemote: false, unsupported: [], docsOnly: false,
   });
   assert.deepEqual(classify(['apps/api/src/routes/devices.ts']).unsupported, ['apps/api/src/routes/devices.ts']);
   assert.deepEqual(classify(['packages/shared/src/types.ts']).unsupported, ['packages/shared/src/types.ts']);
@@ -43,6 +43,25 @@ test('requires API validation for the explicit remote tool module and its mount'
     assert.deepEqual(result.unsupported, []);
   }
   assert.deepEqual(classify(['apps/api/src/routes/portal/devices.ts']).unsupported, ['apps/api/src/routes/portal/devices.ts']);
+});
+
+test('routes the enumerated customer portal remote surface to focused real-DB coverage', () => {
+  for (const path of [
+    'apps/api/migrations/2026-09-21-portal-remote-access.sql',
+    'apps/api/src/routes/portal/remote.ts',
+    'apps/api/src/services/portalRemoteSessionStore.ts',
+    'apps/api/src/__tests__/integration/portalRemoteLogin.integration.test.ts',
+    'apps/portal/src/pages/remote/[sessionId].astro',
+    'packages/ext-rustdesk-access/src/server/index.ts',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.portalRemote, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+  const configuration = classify(['docker-compose.yml']);
+  assert.equal(configuration.portalRemote, true);
+  assert.equal(configuration.infra, true);
+  assert.deepEqual(classify(['apps/api/src/routes/portal/reports.ts']).unsupported, ['apps/api/src/routes/portal/reports.ts']);
 });
 
 test('requires focused API coverage for the monitor response binding fix', () => {

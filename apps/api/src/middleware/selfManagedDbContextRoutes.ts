@@ -28,6 +28,9 @@ interface SelfManagedRoute {
 }
 
 const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
+  // Commit portal session fences before issuing leases or publishing commands.
+  { method: 'POST', pattern: /^\/api\/v1\/portal\/remote\/sessions(?:\/[^/]+\/(?:offer|end))?\/?$/ },
+  { method: 'GET', pattern: /^\/api\/v1\/portal\/remote\/sessions\/[^/]+\/?$/ },
   // Disk Cleanup v2 W04 (spec §13 #5). `startSystemCleanupRun` claims the run
   // in a SHORT COMMITTED transaction, dispatches the command outside any
   // transaction, and finalises in a second one. Under the auth middleware's

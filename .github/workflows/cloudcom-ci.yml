@@ -25,6 +25,7 @@ jobs:
       shared: ${{ steps.delta.outputs.shared }}
       native: ${{ steps.delta.outputs.native }}
       infra: ${{ steps.delta.outputs.infra }}
+      portal_remote: ${{ steps.delta.outputs.portalRemote }}
       unsupported: ${{ steps.delta.outputs.unsupported }}
       baseline_commit: ${{ steps.delta.outputs.baseline_commit }}
     steps:
@@ -128,6 +129,9 @@ jobs:
       - name: Prove Cloud Command 3CX migration and RLS boundaries
         if: needs.delta.outputs.api == 'true' || needs.delta.outputs.shared == 'true'
         run: bash scripts/cloudcom/test-threecx-rls.sh
+      - name: Validate customer portal remote access and RLS boundaries
+        if: needs.delta.outputs.portal_remote == 'true'
+        run: bash scripts/cloudcom/test-portal-remote.sh
       - name: Run web tests and build when web or shared code changed
         if: needs.delta.outputs.web == 'true' || needs.delta.outputs.shared == 'true'
         run: |

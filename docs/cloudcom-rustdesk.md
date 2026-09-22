@@ -2,7 +2,17 @@
 
 ## Status and boundaries
 
-The first implementation adds **Other remote tools** beside Connect Desktop on the technician Remote Tools page. It selects an existing partner-configured provider for one click; it does not change the partner default or technician preference. Configure RustDesk through Breeze's existing partner remote-access settings with `rustdesk_id` and `rustdesk://{id}`. Keep the default provider unset to retain built-in WebRTC. The endpoint still needs a configured RustDesk installation and reachable ID/relay services.
+The first implementation adds **Other remote tools** beside Connect Desktop on the technician Remote Tools page. It selects an existing partner-configured provider for one click; it does not change the partner default or technician preference. Configure RustDesk through Breeze's existing partner remote-access settings with `rustdesk_id`. For a self-hosted server, use the qualified template below. Keep the default provider unset to retain built-in WebRTC. The endpoint still needs a configured RustDesk installation and reachable ID/relay services.
+
+## Self-hosted native launch configuration
+
+Use `rustdesk://{id}/r@<id-server>:21116?key=<percent-encoded-public-key>` for a relay-only deployment. Replace server and key with deployment values in partner settings, never public source. Encode the public key as a URL query value, especially `+` as `%2B`. This is the server's public verification key, not its private key or the device password. Keep the provider preset password empty when devices have unique unattended credentials.
+
+The bare `rustdesk://{id}` template relies on the technician client's effective server configuration. A portable client can pass while an installed Windows client/service still uses public servers. The qualified link selects the intended server independently of that default, including on a fresh viewer launch; it does not reconfigure global client settings.
+
+Acceptance must exercise the actual Breeze button, registered protocol handler, and installed client. Verify encrypted relay connectivity, authenticate with the device credential, inspect the remote desktop, close the viewer, and repeat from Breeze. Repeat with a client whose default is the public server. A password prompt proves routing and endpoint reachability only, not authentication or automatic credential retrieval. Linux/portable-client coverage is supplementary, not a substitute for the installed Windows path.
+
+The launcher regression preserves server/key text and encodes reserved characters in the device identifier. This configuration correction needs no API image rebuild or database migration. Rollback restores the prior template; preserve provider identity, default selection, and device credentials. Breeze-managed per-device credential retrieval remains separate work.
 
 This is launcher issuance, not an embedded RustDesk browser client or completed self-service remote access. Browser transport, endpoint installation, per-user desktop assignments, native session revocation, and Cloudflare acceptance testing are pending. No CortenDesk dashboard, theme assets, or protocol code are included in this change. Deployment and real endpoint acceptance are separate from unit-test results.
 

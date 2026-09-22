@@ -14,6 +14,11 @@ describe('portalLandingPath', () => {
 });
 
 describe('resolveAuthenticatedLanding (sweep 2026-09-08 G5-6)', () => {
+  it('sends remote-only users to the remote portal regardless of dashboard branding', () => {
+    expect(resolveAuthenticatedLanding({ accountDisabled: false, accessMode: 'remote_only', branding: { enableDashboard: true } })).toBe('/remote');
+    expect(resolveAuthenticatedLanding({ accountDisabled: false, accessMode: 'remote_only', branding: {} })).toBe('/remote');
+  });
+
   it('sends a disabled account to the account-disabled page regardless of branding', () => {
     expect(resolveAuthenticatedLanding({
       accountDisabled: true,
