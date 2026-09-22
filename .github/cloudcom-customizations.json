@@ -154,6 +154,45 @@
           "contains": "cloudcommand-connect-page"
         }
       ]
+    },
+    {
+      "id": "unifi-sync-lock-order",
+      "requiredFiles": [
+        "apps/api/src/services/unifi/unifiSyncLocks.ts",
+        "apps/api/src/jobs/unifiWorker.ts",
+        "apps/api/src/jobs/unifiWorker.test.ts",
+        "apps/api/src/__tests__/integration/unifiSyncLockOrder.integration.test.ts"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/services/unifi/unifiSyncLocks.ts",
+          "contains": "SELECT public.breeze_partner_export_lock_orgs_exclusive(ARRAY("
+        },
+        {
+          "file": "apps/api/src/jobs/unifiWorker.ts",
+          "contains": "await lockUnifiSyncOrganizations(db, data.integrationId, prep.mappings);"
+        },
+        {
+          "file": ".github/scripts/cloudcom-delta.mjs",
+          "contains": "if (unifiSyncLockPaths.has(path))"
+        },
+        {
+          "file": ".github/scripts/cloudcom-delta.mjs",
+          "contains": "result.unifiSyncLock = true;"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "unifi_sync_lock: ${{ steps.delta.outputs.unifiSyncLock }}"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "pnpm --filter @breeze/api exec vitest run src/jobs/unifiWorker.test.ts"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts src/__tests__/integration/unifiSyncLockOrder.integration.test.ts"
+        }
+      ]
     }
   ]
 }
