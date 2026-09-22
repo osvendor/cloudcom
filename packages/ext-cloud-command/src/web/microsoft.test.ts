@@ -317,6 +317,37 @@ describe('CloudCommandMicrosoftPage', () => {
     expect(page.shadowRoot!.textContent).not.toContain('Example!Password123');
   });
 
+  it('keeps password-reset success intact and does not send a no-change profile update', async () => {
+    const user = { id: 'user-1', displayName: 'Cloud Command QA Config Check', accountEnabled: false };
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/threecx/connection') return Response.json({ connected: false });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: user.id, values: { displayName: user.displayName } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration') {
+        const type = JSON.parse(String(init?.body)).type;
+        if (type === 'user.get') return Response.json(user);
+        if (type === 'user.password.reset') return Response.json({ accepted: true, temporaryPassword: 'Example!Password123', forceChangePasswordNextSignIn: true });
+        if (type === 'user.update') return Response.json({ accepted: true });
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush(); openUser(page, user.id); await flush();
+    const root = page.shadowRoot!;
+    root.querySelector<HTMLButtonElement>('#user-password-reset-start')!.click();
+    root.querySelector<HTMLInputElement>('#user-security-confirm')!.click();
+    root.querySelector<HTMLButtonElement>('#user-security-submit')!.click(); await flush();
+    expect(root.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('Password reset.');
+    expect(root.querySelector<HTMLButtonElement>('#user-save')!.textContent).toContain('Save profile changes');
+
+    root.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush();
+
+    const operations = request.mock.calls.filter(([, init]) => init?.method === 'POST').map(([, init]) => JSON.parse(String(init?.body)).type);
+    expect(operations.filter(type => type === 'user.password.reset')).toHaveLength(1);
+    expect(operations).not.toContain('user.update');
+    expect(root.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('Password reset.');
+    expect(root.querySelector('#temporary-password')).not.toBeNull();
+  });
+
   it('confirms session revocation once and explains its propagation delay', async () => {
     const request = vi.fn(async (path: string, init?: RequestInit) => {
       if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
