@@ -1,5 +1,8 @@
 # Native Microsoft administration extension: corrected architecture
 
+> Onboarding requirement: [one Microsoft 365 connection under Extensions > Connect](cloudcom-microsoft-onboarding.md). This supersedes older customer-facing Integrations redirects or separate profile setup instructions below. Internal profile security boundaries remain in force.
+
+
 Decision recorded 22 September 2026. This supersedes the proposal to require a running CIPP backend.
 
 ## Product boundary
@@ -28,6 +31,14 @@ A top-level route list is not enough. The coverage ledger must contain one row f
 - Implementation and test status: inventoried, mapped, implemented, fixture-tested, live-tested.
 
 Documentation entries are not interchangeable with screens or operations. The earlier 373-entry documentation inventory is a discovery aid, not proof of complete implementation. Dynamic menus and shared action registries need explicit review.
+
+## Full administration acceptance
+
+The target is full Microsoft administration, including writes. A read-only live test is not the acceptance milestone. The existing broad administration application is a candidate for reuse by an isolated extension-owned administration executor, subject to actual operation, tenant and Exchange authorization checks. Do not reduce its permissions or require a second read-only application solely to begin administration testing.
+
+The dedicated upstream Graph-read profile remains unchanged. Its narrow credential contract does not prohibit a separate administrative backend. The initial native read bridge is reusable infrastructure, not a product scope limit. Likewise, the two native upstream write actions are not a complete replacement for the planned CIPP-derived administrative surface.
+
+Use the approved internal test tenant, disposable owned resources, read-back verification and cleanup. Separate provider-capability tests from end-to-end Breeze tests: a successful Graph or Exchange command does not prove the extension's RBAC, consent mapping, UI or audit path. [Administration acceptance matrix](cloudcom-microsoft-admin-acceptance.md).
 
 ## Runtime design
 
@@ -84,7 +95,7 @@ First: finish the source-to-capability ledger and native connection boundary, th
 
 Next: user and group detail panels and queries, followed by the existing supported disable/reset flows through their native controls. Build mailbox/Exchange execution before presenting mailbox actions as available.
 
-Then: expand in the source-derived domain order (Identity, Tenant, Email/Exchange, Teams/SharePoint, Security/Compliance, Intune and the remaining applicable areas), with explicit per-operation test status. CIPP-only hosting/administration functions are recorded as intentionally excluded, not silently overlooked.
+Then: expand eligible Identity, Tenant, Email/Exchange and Teams/SharePoint capabilities, with explicit per-operation test status and the [non-premium menu exclusions](cloudcom-microsoft-menu-scope.md). Premium-only areas are outside delivery scope. CIPP-only hosting/administration functions are recorded as intentionally excluded, not silently overlooked.
 
 ## Definition of completion
 

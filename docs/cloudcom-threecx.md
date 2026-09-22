@@ -7,13 +7,18 @@ Implemented in `packages/ext-cloud-command`, registered as the compiled-in
 Implementation and local VM verification are distinct from a signed release and
 live PBX acceptance. No legacy PBX credential has been transferred by this change.
 
-Use Breeze's organization selector, then Extensions → Connect. Each
-organization can configure its own HTTPS PBX origin, client ID, secret, department
-scope and enabled state. No partner-wide UniFi-style discovery or matching is
-required. Existing organizations remain the authoritative client records.
+Use Breeze's organization selector, then Extensions → Connect for 3CX setup. The
+operational 3CX page is directory-only; managers return to Connect when they need
+to configure a connection. Each organization can configure its own HTTPS PBX
+origin, client ID, secret, department scope and enabled state. No partner-wide
+UniFi-style discovery or matching is required. Existing organizations remain the
+authoritative client records.
 
 The first slice provides connection verification, accessible department discovery,
-a paginated read-only extension list, and a read-only details drawer. Whole-PBX
+a paginated read-only extension list, and a read-only details drawer. When an
+enabled connection opens in the directory or combined view, the first extension
+page loads automatically; Refresh remains available for a later read. Configuration-only
+views and disabled connections do not issue extension reads. Whole-PBX
 access is an explicit choice; selecting a department filters the returned users.
 This does not establish a permission boundary for future call reports. PBX user
 editing, routing, queues, reports and telephony mutations are not implemented.
@@ -113,3 +118,7 @@ scope, successful list/details display, unauthorized/cross-org denial and disabl
 re-enable behavior without changing PBX settings. Legacy credential reuse requires
 an explicit organization mapping; do not infer that the old default department
 belongs to every client.
+
+## Extension menu design
+
+The [proposed device-style detail menu](cloudcom-threecx-menu-design.md) prioritizes General, Call Forwarding, IP Phone, BLF and Voicemail. It maps the observed PBX API schema to future controls. This is a design, not a claim that PBX editing is implemented.
