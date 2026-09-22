@@ -191,7 +191,7 @@ describe('CloudCommandMicrosoftPage', () => {
     );
   });
 
-  it('edits only supported user fields and reports saved after matching readback', async () => {
+  it('polls bounded user readbacks until an eventually propagated update matches without duplicating the mutation', async () => {
     const user = { id: 'user-1', displayName: 'Ada Lovelace', givenName: 'Ada', surname: 'Lovelace', department: 'Engineering', jobTitle: 'Analyst', officeLocation: 'London', accountEnabled: true };
     let gets = 0;
     const request = vi.fn(async (path: string, init?: RequestInit) => {
@@ -200,7 +200,7 @@ describe('CloudCommandMicrosoftPage', () => {
       if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada Lovelace' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
       if (path === '/microsoft/administration') {
         const body = JSON.parse(String(init?.body));
-        if (body.type === 'user.get') return Response.json({ ...user, displayName: gets++ ? 'Ada Byron' : user.displayName });
+        if (body.type === 'user.get') return Response.json({ ...user, displayName: gets++ >= 2 ? 'Ada Byron' : user.displayName });
         if (body.type === 'user.update') return Response.json({ accepted: true });
       }
       throw new Error(`Unexpected ${path}`);
@@ -208,9 +208,10 @@ describe('CloudCommandMicrosoftPage', () => {
     const page = mount(request); await flush(); await flush();
     page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="user-1"]')!.click(); await flush();
     const name = page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!; name.value = 'Ada Byron';
-    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush(); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await new Promise(resolve => setTimeout(resolve, 1100));
     const update = request.mock.calls.map(([, init]) => init?.body).find(body => String(body).includes('user.update'));
     expect(JSON.parse(String(update))).toEqual({ type: 'user.update', id: 'user-1', update: { displayName: 'Ada Byron', givenName: 'Ada', surname: 'Lovelace', department: 'Engineering', jobTitle: 'Analyst', officeLocation: 'London', accountEnabled: true } });
+    expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
     expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('saved and verified');
   });
 
@@ -228,9 +229,59 @@ describe('CloudCommandMicrosoftPage', () => {
       throw new Error(`Unexpected ${path}`);
     });
     const page = mount(request); await flush(); await flush(); page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="user-1"]')!.click(); await flush();
-    page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!.value = 'Changed'; page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush(); await flush();
+    page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!.value = 'Changed'; page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await new Promise(resolve => setTimeout(resolve, 3100));
     expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('did not confirm');
     expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
+  });
+
+  it('abandons a pending user verification after an organization change without issuing another mutation', async () => {
+    let verify!: (response: Response) => void;
+    let gets = 0;
+    const request = vi.fn((path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Promise.resolve(Response.json({ available: true, connected: true, enabled: true, canManage: true }));
+      if (path === '/threecx/connection') return Promise.resolve(Response.json({ connected: false }));
+      if (path === '/microsoft/resources/users') return Promise.resolve(Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' }));
+      if (path === '/microsoft/administration') {
+        const type = JSON.parse(String(init?.body)).type;
+        if (type === 'user.get' && gets++ === 0) return Promise.resolve(Response.json({ displayName: 'Ada', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '', accountEnabled: true }));
+        if (type === 'user.get') return new Promise<Response>(resolve => { verify = resolve; });
+        if (type === 'user.update') return Promise.resolve(Response.json({ accepted: true }));
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush(); page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="user-1"]')!.click(); await flush();
+    page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!.value = 'Changed'; page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush();
+    page.context = { contractVersion: 1, extensionName: 'cloudcommand', path: '/extensions/cloudcommand/microsoft', organizationId: 'org-b' };
+    verify(Response.json({ displayName: 'Changed', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '', accountEnabled: true })); await flush();
+    expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
+    expect(page.shadowRoot!.textContent).not.toContain('saved and verified');
+  });
+
+  it('cancels a closed drawer verification and lets a reopened drawer start usable', async () => {
+    let verify!: (response: Response) => void;
+    let gets = 0;
+    const request = vi.fn((path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Promise.resolve(Response.json({ available: true, connected: true, enabled: true, canManage: true }));
+      if (path === '/threecx/connection') return Promise.resolve(Response.json({ connected: false }));
+      if (path === '/microsoft/resources/users') return Promise.resolve(Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' }));
+      if (path === '/microsoft/administration') {
+        const type = JSON.parse(String(init?.body)).type;
+        if (type === 'user.get' && gets++ === 0) return Promise.resolve(Response.json({ displayName: 'Ada', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '', accountEnabled: true }));
+        if (type === 'user.get' && gets === 2) return new Promise<Response>(resolve => { verify = resolve; });
+        if (type === 'user.get') return Promise.resolve(Response.json({ displayName: 'Ada', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '', accountEnabled: true }));
+        if (type === 'user.update') return Promise.resolve(Response.json({ accepted: true }));
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="user-1"]')!.click(); await flush();
+    page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!.value = 'Changed'; page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#detail-close')!.click();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="user-1"]')!.click(); await flush();
+    expect(page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.disabled).toBe(false);
+    verify(Response.json({ displayName: 'Changed', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '', accountEnabled: true })); await flush();
+    expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
+    expect(page.shadowRoot!.textContent).not.toContain('saved and verified');
   });
 
   it('requires explicit confirmation before sending a bounded group membership change', async () => {

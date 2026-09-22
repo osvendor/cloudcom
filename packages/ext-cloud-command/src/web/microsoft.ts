@@ -29,6 +29,8 @@ type ResourceData = {
 type DetailKind = 'read' | 'user' | 'group';
 type MicrosoftRecord = Record<string, unknown>;
 const USER_FIELDS = ['displayName', 'givenName', 'surname', 'department', 'jobTitle', 'officeLocation'] as const;
+const USER_VERIFY_READS = 4;
+const USER_VERIFY_DELAY_MS = 1000;
 
 const labels: Record<Resource, string> = {
   users: 'Users',
@@ -49,6 +51,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private detailKind: DetailKind = 'read';
   private detailRecord: MicrosoftRecord | null = null;
   private detailRequest = 0;
+  private userVerificationRequest = 0;
   private drawerMessage = '';
   private drawerError = false;
   private membershipUserId = '';
@@ -88,6 +91,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   disconnectedCallback(): void {
     window.removeEventListener('hashchange', this.onHashChange);
     this.generation += 1;
+    this.userVerificationRequest += 1;
   }
 
   private onHashChange = (): void => {
@@ -96,6 +100,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       this.resource = next;
       this.data = null;
       this.detail = null;
+      this.userVerificationRequest += 1;
+      this.busy = false;
       this.filter = '';
       this.render();
       if (this.canRead()) void this.loadResource();
@@ -119,6 +125,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.detail = null;
     this.detailRecord = null;
     this.detailRequest += 1;
+    this.userVerificationRequest += 1;
     this.drawerMessage = '';
     this.drawerError = false;
     this.membershipUserId = '';
@@ -238,9 +245,11 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path });
   }
   private openDetail(row: ResourceRow): void {
+    this.busy = false;
     this.detail = row;
     this.detailKind = this.resource === 'users' ? 'user' : this.resource === 'groups' ? 'group' : 'read';
     this.detailRecord = null;
+    this.userVerificationRequest += 1;
     this.drawerMessage = '';
     this.drawerError = false;
     this.membershipUserId = '';
@@ -256,6 +265,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.detail = null;
     this.detailRecord = null;
     this.detailRequest += 1;
+    this.userVerificationRequest += 1;
+    this.busy = false;
     this.drawerMessage = '';
     this.drawerError = false;
     this.membershipUserId = '';
@@ -305,24 +316,42 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     update.accountEnabled = enabled.checked;
     return update;
   }
+  private userVerificationIsCurrent(id: string, generation: number, context: ExtensionPageContextV1 | null, request: number): boolean {
+    return this.isConnected && generation === this.generation && context === this.contextValue
+      && request === this.userVerificationRequest && this.detail?.id === id && this.detailKind === 'user';
+  }
+  private async readUserForVerification(id: string, generation: number, context: ExtensionPageContextV1 | null, request: number): Promise<MicrosoftRecord | null> {
+    const body = await this.request<unknown>(this.path('/administration'), {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'user.get', id }),
+    });
+    if (!this.userVerificationIsCurrent(id, generation, context, request)) return null;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('Invalid Microsoft user response.');
+    return body as MicrosoftRecord;
+  }
+  private userMatchesUpdate(user: MicrosoftRecord, update: Record<string, string | boolean>): boolean {
+    return USER_FIELDS.every(field => String(user[field] ?? '') === update[field]) && user.accountEnabled === update.accountEnabled;
+  }
   private async saveUser(): Promise<void> {
     if (!this.connection?.canManage || !this.detail || this.detailKind !== 'user' || this.busy) return;
     const update = this.userUpdate(); if (!update) return;
-    const id = this.detail.id; const generation = this.generation; const context = this.contextValue;
+    const id = this.detail.id; const generation = this.generation; const context = this.contextValue; const verification = ++this.userVerificationRequest;
     this.busy = true; this.drawerError = false; this.drawerMessage = 'Saving user changes…'; this.render();
     try {
       const result = await this.request<{ accepted?: boolean }>(this.path('/administration'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'user.update', id, update }) });
       if (result.accepted !== true) throw new Error('Microsoft did not accept the user update.');
-      if (generation !== this.generation || context !== this.contextValue || this.detail?.id !== id || this.detailKind !== 'user') return;
-      this.busy = false;
-      const readback = await this.loadDetailRecord(id, 'user');
-      if (!readback || generation !== this.generation || context !== this.contextValue || this.detail?.id !== id) return;
-      const matches = USER_FIELDS.every(field => String(readback[field] ?? '') === update[field]) && readback.accountEnabled === update.accountEnabled;
-      if (!matches) { this.drawerError = true; this.drawerMessage = 'Update was accepted, but the user readback did not confirm every change. Review the current values before trying again.'; return; }
-      this.drawerError = false; this.drawerMessage = 'User changes saved and verified.';
+      if (!this.userVerificationIsCurrent(id, generation, context, verification)) return;
+      for (let attempt = 0; attempt < USER_VERIFY_READS; attempt += 1) {
+        const readback = await this.readUserForVerification(id, generation, context, verification);
+        if (!readback || !this.userVerificationIsCurrent(id, generation, context, verification)) return;
+        this.detailRecord = readback;
+        if (this.userMatchesUpdate(readback, update)) { this.drawerError = false; this.drawerMessage = 'User changes saved and verified.'; return; }
+        if (attempt < USER_VERIFY_READS - 1) await new Promise<void>(resolve => setTimeout(resolve, USER_VERIFY_DELAY_MS));
+        if (!this.userVerificationIsCurrent(id, generation, context, verification)) return;
+      }
+      this.drawerError = true; this.drawerMessage = 'Update was accepted, but the user readback did not confirm every change. Review the current values before trying again.';
     } catch (error) {
-      if (generation === this.generation && context === this.contextValue && this.detail?.id === id) { this.drawerError = true; this.drawerMessage = error instanceof Error ? error.message : 'User update could not be completed. Its outcome is uncertain; do not retry automatically.'; }
-    } finally { if (generation === this.generation) { this.busy = false; this.render(); } }
+      if (this.userVerificationIsCurrent(id, generation, context, verification)) { this.drawerError = true; this.drawerMessage = error instanceof Error ? error.message : 'User update could not be completed. Its outcome is uncertain; do not retry automatically.'; }
+    } finally { if (this.userVerificationIsCurrent(id, generation, context, verification)) { this.busy = false; this.render(); } }
   }
   private async changeMembership(): Promise<void> {
     if (!this.connection?.canManage || !this.detail || this.detailKind !== 'group' || this.busy) return;
@@ -368,7 +397,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     } else {
       content = `<p class="meta">Group ID: ${esc(detail.id)}</p><p class="meta">${record.displayName ? `Group: ${esc(String(record.displayName))}` : 'Group details loaded.'}</p>${canManage ? `<label>Member user ID<input id="group-member-user-id" value="${esc(this.membershipUserId)}" autocomplete="off" ${this.busy ? 'disabled' : ''}></label><label>Membership action<select id="group-member-action" ${this.busy ? 'disabled' : ''}><option value="add" ${this.membershipAction === 'add' ? 'selected' : ''}>Add member</option><option value="remove" ${this.membershipAction === 'remove' ? 'selected' : ''}>Remove member</option></select></label><label class="check"><input id="group-member-confirm" type="checkbox" ${this.membershipConfirmed ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> I confirm this membership change</label><div class="actions"><button id="group-member-submit" ${this.busy ? 'disabled' : ''}>Confirm membership change</button></div>` : '<p class="read-only">An organization administrator can change group membership.</p>'}${feedback}`;
     }
-    return `<div class="backdrop" data-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="detail-title"><div class="heading"><h2 id="detail-title">${this.detailKind === 'user' ? 'Edit user' : this.detailKind === 'group' ? 'Group membership' : 'Resource details'}</h2><button class="secondary compact" id="detail-close" ${this.busy ? 'disabled' : ''}>Close</button></div>${content}</aside></div>`;
+    return `<div class="backdrop" data-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="detail-title"><div class="heading"><h2 id="detail-title">${this.detailKind === 'user' ? 'Edit user' : this.detailKind === 'group' ? 'Group membership' : 'Resource details'}</h2><button class="secondary compact" id="detail-close">Close</button></div>${content}</aside></div>`;
   }
 
   private render(): void {
