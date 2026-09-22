@@ -124,6 +124,16 @@ const cloudCommandSharedPaths = new Set([
   'packages/extension-web-sdk/src/hostApi.ts',
   'packages/extension-web-sdk/src/index.ts',
 ]);
+// The UniFi sync lock-order fix changes a background worker and its
+// organization-lock helper.  It has a dedicated real-Postgres proof in the
+// API validation job below; keep this list exact so unrelated UniFi work still
+// fails closed until it has its own reviewed coverage.
+const unifiSyncLockPaths = new Set([
+  'apps/api/src/services/unifi/unifiSyncLocks.ts',
+  'apps/api/src/jobs/unifiWorker.ts',
+  'apps/api/src/jobs/unifiWorker.test.ts',
+  'apps/api/src/__tests__/integration/unifiSyncLockOrder.integration.test.ts',
+]);
 const infraPaths = new Set([
   'AGENTS.md', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',
   '.github/scripts/check-cloudcom-runner.sh', '.github/scripts/ci-area-gating.test.mjs',
@@ -144,7 +154,7 @@ export function readBaseline(text = readFileSync(baselinePath, 'utf8')) {
 }
 
 export function classify(paths) {
-  const result = { api: false, web: false, shared: false, native: false, infra: false, portalRemote: false, unsupported: [] };
+  const result = { api: false, web: false, shared: false, native: false, infra: false, portalRemote: false, unifiSyncLock: false, unsupported: [] };
   for (const path of paths.filter(Boolean)) {
     if (path === 'packages/shared/src/validators/portal.ts' || path === 'packages/shared/src/validators/portal.test.ts') {
       result.shared = true;
@@ -193,6 +203,11 @@ export function classify(paths) {
     }
     if (cloudCommandSharedPaths.has(path)) {
       result.shared = true;
+      continue;
+    }
+    if (unifiSyncLockPaths.has(path)) {
+      result.api = true;
+      result.unifiSyncLock = true;
       continue;
     }
     if (remoteAccessWebPaths.has(path) || path.startsWith('apps/web/src/components/cloudcom/browserDesktop/') ||
@@ -256,6 +271,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     native: classification.native,
     infra: classification.infra,
     portalRemote: classification.portalRemote,
+    unifiSyncLock: classification.unifiSyncLock,
     docsOnly: classification.docsOnly,
     unsupported: classification.unsupported.length > 0,
   };

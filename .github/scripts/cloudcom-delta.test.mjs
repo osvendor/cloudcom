@@ -22,7 +22,7 @@ test('baseline accepts a valid release fixture and rejects an arbitrary reposito
 
 test('classifies supported web, native, and explicit infrastructure changes', () => {
   assert.deepEqual(classify(['apps/web/src/components/remote/RemoteToolsPage.tsx', 'agent/main.go', 'deploy/docker-compose.prod.yml']), {
-    api: false, web: true, shared: false, native: true, infra: true, portalRemote: false, unsupported: [], docsOnly: false,
+    api: false, web: true, shared: false, native: true, infra: true, portalRemote: false, unifiSyncLock: false, unsupported: [], docsOnly: false,
   });
   assert.deepEqual(classify(['apps/api/src/routes/devices.ts']).unsupported, ['apps/api/src/routes/devices.ts']);
   assert.deepEqual(classify(['packages/shared/src/types.ts']).unsupported, ['packages/shared/src/types.ts']);
@@ -84,6 +84,24 @@ test('requires focused API coverage for the monitor response binding fix', () =>
     assert.deepEqual(classify([path]).unsupported, []);
   }
   assert.deepEqual(classify(['apps/api/src/services/monitors/monitorService.ts']).unsupported, ['apps/api/src/services/monitors/monitorService.ts']);
+});
+
+test('routes the bounded UniFi sync lock-order surface to API and real-Postgres coverage', () => {
+  for (const path of [
+    'apps/api/src/services/unifi/unifiSyncLocks.ts',
+    'apps/api/src/jobs/unifiWorker.ts',
+    'apps/api/src/jobs/unifiWorker.test.ts',
+    'apps/api/src/__tests__/integration/unifiSyncLockOrder.integration.test.ts',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.api, true);
+    assert.equal(result.unifiSyncLock, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+  assert.deepEqual(
+    classify(['apps/api/src/services/unifi/unifiSyncService.ts']).unsupported,
+    ['apps/api/src/services/unifi/unifiSyncService.ts'],
+  );
 });
 
 test('classifies only the reviewed Cloud Command server, bridge, registry, and build surfaces', () => {

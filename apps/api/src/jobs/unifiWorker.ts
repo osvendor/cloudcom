@@ -9,6 +9,7 @@ import { getBullMQConnection } from '../services/redis';
 import { createUnifiClient } from '../services/unifi/unifiClient';
 import { getSyncCredentials, markStatus, markSynced } from '../services/unifi/unifiConnectionService';
 import { collectSyncData, applySyncData } from '../services/unifi/unifiSyncService';
+import { lockUnifiSyncOrganizations } from '../services/unifi/unifiSyncLocks';
 import { attachWorkerObservability } from './workerObservability';
 
 export const UNIFI_SYNC_QUEUE = 'unifi-sync';
@@ -129,9 +130,10 @@ async function processSyncIntegration(data: SyncIntegrationJobData): Promise<voi
 
   // 3) Short DB context(s): persist the run + device reconciliation, then status.
   try {
-    const result = await withSystemDbAccessContext(() =>
-      applySyncData(db, { id: data.integrationId, partnerId: data.partnerId }, data.trigger, prep.mappings, collected),
-    );
+    const result = await withSystemDbAccessContext(async () => {
+      await lockUnifiSyncOrganizations(db, data.integrationId, prep.mappings);
+      return applySyncData(db, { id: data.integrationId, partnerId: data.partnerId }, data.trigger, prep.mappings, collected);
+    });
     await withSystemDbAccessContext(async () => {
       await markSynced(db, data.integrationId, data.partnerId, result.status, result.error ?? null);
       if (result.status === 'failed') {
