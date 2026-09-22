@@ -42,7 +42,7 @@ describe('CloudCommandThreeCxPage', () => {
     expect(root.querySelector<HTMLInputElement>('#full-pbx')!.checked).toBe(false);
     expect(root.querySelector<HTMLSelectElement>('#departmentId')!.value).toBe('');
     expect(root.querySelector('#departmentId')!.textContent).toContain('Support');
-    expect(request.mock.calls.map(([path]) => path)).toEqual(['/threecx/connection', '/threecx/test']);
+    expect(request.mock.calls.map(([path]) => path)).toEqual(expect.arrayContaining(['/threecx/connection', '/microsoft/connection', '/threecx/test']));
   });
 
   it('preserves the draft through test, scope selection, and save while clearing the secret after a successful save', async () => {
@@ -77,9 +77,9 @@ describe('CloudCommandThreeCxPage', () => {
     expect((root.querySelector('#clientId') as HTMLInputElement).value).toBe('client-id');
     expect((root.querySelector('#departmentId') as HTMLSelectElement).value).toBe('7');
     expect((root.querySelector('#secret') as HTMLInputElement).value).toBe('');
-    expect(request.mock.calls.map(([path]) => path)).toEqual([
-      '/threecx/connection', '/threecx/test', '/threecx/connection', '/threecx/connection', '/threecx/users?skip=0',
-    ]);
+    expect(request.mock.calls.map(([path]) => path)).toEqual(expect.arrayContaining([
+      '/threecx/connection', '/microsoft/connection', '/threecx/test', '/threecx/users?skip=0',
+    ]));
   });
 
   it('preserves an entered secret after a failed save and rejects stale group selections', async () => {
@@ -150,7 +150,107 @@ describe('CloudCommandThreeCxPage', () => {
     (root.querySelector('#more-users') as HTMLButtonElement).click();
     await flush(); await flush();
     expect(root.textContent).toContain('Grace Hopper');
-    expect(request.mock.calls.map(([path]) => path)).toEqual(['/threecx/connection', '/threecx/users?skip=0', '/threecx/users?skip=100']);
+    expect(request.mock.calls.map(([path]) => path)).toEqual(expect.arrayContaining(['/threecx/connection', '/microsoft/connection', '/threecx/users?skip=0', '/threecx/users?skip=100']));
+  });
+
+  it('shows Microsoft navigation only when Microsoft is available to this organization', async () => {
+    const page = mount({ request: async (path) => path === '/microsoft/connection'
+      ? Response.json({ available: true, connected: true, enabled: true, canManage: false })
+      : Response.json({ connected: false, canManage: true }) });
+    await flush(); await flush();
+    expect(page.shadowRoot!.querySelector('#go-microsoft')).toBeTruthy();
+  });
+
+  it('hides a disabled Microsoft connection from a read-only user', async () => {
+    const page = mount({ request: async (path) => path === '/microsoft/connection'
+      ? Response.json({ available: true, connected: true, enabled: false, canManage: false })
+      : Response.json({ connected: false, canManage: true }) });
+    await flush(); await flush();
+    expect(page.shadowRoot!.querySelector('#go-microsoft')).toBeNull();
+  });
+
+
+  it('hides unavailable Microsoft navigation without disrupting the 3CX page', async () => {
+    const page = mount({ request: async (path) => path === '/microsoft/connection'
+      ? Response.json({ available: false, connected: false, canManage: false })
+      : Response.json({ connected: false, canManage: true }) });
+    await flush(); await flush();
+    expect(page.shadowRoot!.querySelector('#go-microsoft')).toBeNull();
+    expect(page.shadowRoot!.textContent).toContain('No 3CX connection is configured.');
+  });
+
+  it('hides Microsoft navigation when its status request fails while keeping 3CX usable', async () => {
+    const page = mount({ request: async (path) => {
+      if (path === '/microsoft/connection') return Response.json({ error: 'unavailable' }, { status: 503 });
+      return Response.json({ connected: false, canManage: true });
+    } });
+    await flush(); await flush();
+    expect(page.shadowRoot!.querySelector('#go-microsoft')).toBeNull();
+    expect(page.shadowRoot!.querySelector('#origin')).toBeTruthy();
+  });
+
+  it('drops a delayed connection test after the organization changes', async () => {
+    let resolveTest!: (response: Response) => void;
+    const page = mount({ request: (path) => {
+      if (path === '/threecx/test') return new Promise<Response>((resolve) => { resolveTest = resolve; });
+      if (path === '/microsoft/connection') return Promise.resolve(Response.json({ available: false, connected: false, canManage: false }));
+      return Promise.resolve(Response.json({ connected: false, canManage: true }));
+    } });
+    await flush();
+    let root = page.shadowRoot!;
+    (root.querySelector('#origin') as HTMLInputElement).value = 'https://old.example.com';
+    (root.querySelector('#clientId') as HTMLInputElement).value = 'old-client';
+    (root.querySelector('#test') as HTMLButtonElement).click();
+    await flush();
+    page.context = { ...context, organizationId: 'org-2' };
+    resolveTest(Response.json({ success: true, groups: [{ id: 7, name: 'Old organization group' }] }));
+    await flush(); await flush();
+    root = page.shadowRoot!;
+    expect(root.textContent).not.toContain('Old organization group');
+    expect((root.querySelector<HTMLInputElement>('#origin') as HTMLInputElement).value).toBe('');
+    expect(root.querySelector<HTMLButtonElement>('#test')!.disabled).toBe(false);
+  });
+
+  it('drops a delayed connection save after the organization changes', async () => {
+    let resolveSave!: (response: Response) => void;
+    const page = mount({ request: (path, init) => {
+      if (path === '/threecx/connection' && init?.method === 'PUT') return new Promise<Response>((resolve) => { resolveSave = resolve; });
+      if (path === '/microsoft/connection') return Promise.resolve(Response.json({ available: false, connected: false, canManage: false }));
+      return Promise.resolve(Response.json({ connected: false, canManage: true }));
+    } });
+    await flush();
+    let root = page.shadowRoot!;
+    (root.querySelector('#origin') as HTMLInputElement).value = 'https://old.example.com';
+    (root.querySelector('#clientId') as HTMLInputElement).value = 'old-client';
+    (root.querySelector('#full-pbx') as HTMLInputElement).checked = true;
+    (root.querySelector('#save') as HTMLButtonElement).click();
+    await flush();
+    page.context = { ...context, organizationId: 'org-2' };
+    resolveSave(Response.json({ connected: true, canManage: true, origin: 'https://old.example.com', clientId: 'old-client', enabled: true }));
+    await flush(); await flush();
+    root = page.shadowRoot!;
+    expect(root.textContent).not.toContain('old.example.com');
+    expect((root.querySelector<HTMLInputElement>('#origin') as HTMLInputElement).value).toBe('');
+    expect(root.querySelector<HTMLButtonElement>('#save')!.disabled).toBe(false);
+  });
+
+  it('drops a delayed extension response after the organization changes', async () => {
+    let resolveUsers!: (response: Response) => void;
+    const page = mount({ request: (path) => {
+      if (path === '/threecx/users?skip=0') return new Promise<Response>((resolve) => { resolveUsers = resolve; });
+      if (path === '/microsoft/connection') return Promise.resolve(Response.json({ available: false, connected: false, canManage: false }));
+      return Promise.resolve(Response.json({ connected: true, canManage: false, enabled: true }));
+    } });
+    await flush();
+    let root = page.shadowRoot!;
+    (root.querySelector('#refresh-users') as HTMLButtonElement).click();
+    await flush();
+    page.context = { ...context, organizationId: 'org-2' };
+    resolveUsers(Response.json({ items: [{ Id: 9, Number: '999', FirstName: 'Old', LastName: 'Extension', EmailAddress: null, Mobile: null, Enabled: true, IsRegistered: true, CurrentProfileName: null }], nextSkip: null, truncated: false }));
+    await flush(); await flush();
+    root = page.shadowRoot!;
+    expect(root.textContent).not.toContain('Old Extension');
+    expect(root.querySelector<HTMLButtonElement>('#refresh-users')!.disabled).toBe(false);
   });
 
   it('opens read-only details in a drawer and restores focus when Escape closes it', async () => {

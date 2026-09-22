@@ -115,6 +115,33 @@
           "contains": "@cloudcom/ext-cloud-command build:web"
         }
       ]
+    },
+    {
+      "id": "cloud-command-microsoft365",
+      "requiredFiles": [
+        "packages/ext-cloud-command/src/server/cipp-config.ts",
+        "packages/ext-cloud-command/src/server/cipp-provider.ts",
+        "packages/ext-cloud-command/src/server/microsoft.ts",
+        "packages/ext-cloud-command/src/web/microsoft.ts",
+        "packages/ext-cloud-command/migrations/2026-09-22-microsoft-connections.sql",
+        "docs/cloudcom-microsoft365.md",
+        "packages/ext-cloud-command/src/web/overview.ts",
+        "packages/ext-cloud-command/src/web/overview.test.ts"
+      ],
+      "hooks": [
+        {
+          "file": "packages/ext-cloud-command/src/server/index.ts",
+          "contains": "mountMicrosoftRoutes(app, context, fetch, cippConfig)"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/web/index.ts",
+          "contains": "import './microsoft'"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand-microsoft-page"
+        }
+      ]
     }
   ]
 }

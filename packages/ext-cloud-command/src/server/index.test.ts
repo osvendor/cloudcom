@@ -46,6 +46,16 @@ function config(over: Record<string, unknown> = {}) {
 }
 
 describe('Cloud Command 3CX routes', () => {
+  it('canonicalizes organization UUIDs before binding encrypted credentials', async () => {
+    const org = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const h = harness({ write: true, mfa: true, results: [[{ partner_id: PARTNER }], [row({ org_id: org })], [row({ org_id: org, enabled: false })]] });
+    const res = await request(h.app, `/threecx/connection?orgId=${org.toUpperCase()}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(config({ enabled: false, secret: undefined })),
+    });
+    expect(res.status).toBe(200);
+    expect(h.encryptForColumn).toHaveBeenCalledWith('cloudcommand_threecx_connections', `secret_ciphertext:${org}`, 'plain-secret');
+  });
   it('requires injected auth before any organization or secret access', async () => {
     const execute = vi.fn();
     const app = new Hono().route('/', createRoutes({ db: { execute }, secrets: {}, audit: vi.fn(), log: vi.fn() } as never, vi.fn()));

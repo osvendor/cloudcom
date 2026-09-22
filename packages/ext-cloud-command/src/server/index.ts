@@ -5,14 +5,17 @@ import { z } from 'zod';
 import type { BreezeExtensionV1, ExtensionRuntimeContext, ExtensionRequestAuthorization } from '@breeze/extension-sdk';
 import { createThreeCxReadService, normalizePbxOrigin, ThreeCxReadError } from '../threecx/read-service.mjs';
 import { createProvider, ProviderError, type GuardedFetch } from './transport';
+import { readCippDeployment, type CippDeployment } from './cipp-config';
+import { CippError } from './cipp-provider';
+import { mountMicrosoftRoutes } from './microsoft';
 
 const table = 'cloudcommand_threecx_connections';
 type Row = { id: string; org_id: string; origin: string; client_id: string; secret_ciphertext: string;
   department_id: number | null; enabled: boolean; version: number; last_verified_at: string | Date | null };
-type Auth = { user: { id: string }; partnerId: string | null; canAccessOrg(id: string): boolean };
+type Auth = { user: { id: string; isPlatformAdmin?: boolean }; scope?: 'system' | 'partner' | 'organization'; partnerId: string | null; canAccessOrg(id: string): boolean };
 type Scope = { organizationId: string; partnerId: string; actorId: string };
-type Variables = { auth: Auth; extensionAuthorization: ExtensionRequestAuthorization; scope: Scope; canManage: boolean };
-const uuid = z.string().uuid();
+export type Variables = { auth: Auth; extensionAuthorization: ExtensionRequestAuthorization; scope: Scope; canManage: boolean };
+const uuid = z.string().uuid().transform(value => value.toLowerCase());
 const configSchema = z.object({
   origin: z.string().min(1).max(2048), clientId: z.string().trim().min(1).max(512),
   secret: z.string().min(1).max(8192).optional(), departmentId: z.number().int().min(0).max(2147483647).nullable(),
@@ -35,7 +38,7 @@ export function createCloudCommandExtension(fetch: GuardedFetch): BreezeExtensio
   return { register(registrar, context) { registrar.mountRoute(createRoutes(context, fetch) as unknown as Hono); } };
 }
 
-export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFetch) {
+export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFetch, cippConfig: CippDeployment | null = readCippDeployment(process.env)) {
   const app = new Hono<{ Variables: Variables }>();
   const provider = createProvider(fetch);
   async function connection(orgId: string) {
@@ -62,10 +65,11 @@ export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFet
     await next();
   });
   app.onError((error, c) => {
+    if (error instanceof CippError) return c.json({ error: 'The Microsoft 365 request could not be completed. Check the CIPP connection and assigned API permissions.', code: error.code }, 502);
     if (error instanceof RouteError) return c.json({ error: error.code.replaceAll('_', ' '), code: error.code }, error.status);
     if (error instanceof ProviderError || error instanceof ThreeCxReadError) return c.json({ error: 'The PBX request could not be completed.', code: error.code }, 502);
     // Never log upstream bodies, URLs, request payloads, token or DB query values.
-    context.log('error', '3CX request failed');
+    context.log('error', 'Cloud Command request failed');
     return c.json({ error: 'Unable to complete the request.', code: 'request_failed' }, 500);
   });
   app.get('/threecx/connection', async c => {
@@ -130,5 +134,6 @@ export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFet
     });
     return c.json(await service.listExtensions(scope, row.id, skip));
   });
+  mountMicrosoftRoutes(app, context, fetch, cippConfig);
   return app;
 }
