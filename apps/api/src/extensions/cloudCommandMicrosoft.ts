@@ -15,7 +15,7 @@ const actions: Record<MicrosoftResource, M365ReadAction> = {
   sites: { type: 'm365.sites.list', search: '*' },
 };
 const denied = { ok: false as const, code: 'access_denied', message: 'Microsoft access is not permitted for this organization.' };
-const notReady = { ok: false as const, code: 'connection_not_ready', message: 'Configure or retest this organization’s Microsoft connection in Integrations.' };
+const notReady = { ok: false as const, code: 'connection_not_ready', message: 'Configure or retest this organization’s Microsoft connection in Extensions > Connect.' };
 
 // Auth is supplied exclusively by the authenticated extension gateway, not serialized client input.
 function authorized(input: MicrosoftRequest): AuthContext | null {

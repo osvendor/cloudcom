@@ -27,6 +27,7 @@ vi.mock('../../db/schema', () => ({
 vi.mock('../../services/portalRemoteFeature', () => ({ isPortalRemoteFeatureEnabled: vi.fn(async () => true) }));
 vi.mock('../../services/portalRemoteAuthority', () => ({ authorizePortalRemote: mocks.authorize }));
 vi.mock('./remoteDesktop', () => ({ portalDesktopRoutes: new Hono() }));
+vi.mock('./nativeLogin', () => ({ portalNativeAuthorizeRoutes: new Hono() }));
 
 import { portalRemoteRoutes } from './remote';
 

@@ -24,4 +24,4 @@ Microsoft-required administrator consent or role grants cannot be silently bypas
 
 Test first connection, existing credential reuse, consent denial/cancel, wrong-tenant response, partial provisioning, retry, token/certificate expiry, revocation, reconnect and cross-organization denial. Verify that all enabled administration pages use this connection without additional setup. Preserve 3CX, Google and remote-access configuration. Use the Linux test VM and the authorized internal test tenant; separate provider capability evidence from end-to-end Breeze acceptance.
 
-Status: required contract; unified onboarding is not implemented by this document.
+Status: the first inline readiness panel and recheck routes are implemented in the extension. They do not provision administrative executors or start consent yet. The start endpoint returns an explicit unavailable error; inventory verification never marks full administration Ready. Unified onboarding remains incomplete until the provisioning, consent and end-to-end acceptance work above passes.

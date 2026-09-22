@@ -28,6 +28,11 @@ const remoteAccessApiPaths = new Set([
 // Redis stack, real portal-login and authorization tests, plus the RLS coverage
 // contract; unknown portal or schema work must still fail closed.
 const portalRemoteApiPaths = new Set([
+  'apps/api/src/routes/orgPortalUsers.ts', 'apps/api/src/routes/orgPortalUsers.test.ts',
+  'apps/api/src/routes/portal/acceptInvite.test.ts',
+  'apps/api/src/services/portalNativeLogin.ts', 'apps/api/src/services/portalNativeLogin.test.ts',
+  'apps/api/src/routes/portal/nativeLogin.ts', 'apps/api/src/routes/portal/nativeLogin.test.ts',
+  'apps/api/src/__tests__/integration/portalNativeLogin.integration.test.ts',
   '.env.example', 'docker-compose.yml',
   'apps/api/migrations/2026-09-21-portal-remote-access.sql',
   'apps/api/migrations/2026-09-21-portal-remote-session-prompt.sql',
@@ -55,6 +60,10 @@ const portalRemoteApiPaths = new Set([
   'apps/api/src/services/remoteAccessLauncher.test.ts', 'apps/api/src/services/tenantCascade.ts', 'apps/api/src/services/tenantExportPolicyRegistry.ts',
 ]);
 const portalRemoteWebPaths = new Set([
+  'apps/web/src/components/settings/OrgPortalUsersEditor.tsx', 'apps/web/src/components/settings/OrgPortalUsersEditor.test.tsx',
+  'apps/portal/src/pages/remote/native.astro', 'apps/portal/src/lib/nativeLogin.ts', 'apps/portal/src/lib/nativeLogin.test.ts',
+  'apps/portal/src/components/remote/NativeSignInPage.tsx', 'apps/portal/src/components/remote/NativeSignInPage.test.tsx',
+  'apps/portal/src/components/remote/NativeSignInConsent.tsx',
   'apps/portal/src/components/portal/LoginForm.tsx', 'apps/portal/src/components/portal/RemotePage.tsx',
   'apps/portal/src/components/portal/RemoteViewer.test.tsx', 'apps/portal/src/components/portal/RemoteViewer.tsx',
   'apps/portal/src/layouts/PortalLayout.astro', 'apps/portal/src/lib/api.ts', 'apps/portal/src/lib/auth.ts',
@@ -73,6 +82,10 @@ const cloudCommandApiPaths = new Set([
   'apps/api/src/extensions/builtinRegistry.ts',
   'apps/api/src/extensions/cloudCommandMicrosoft.ts',
   'apps/api/src/extensions/cloudCommandMicrosoft.test.ts',
+  'apps/api/src/extensions/cloudCommandAdminRuntime.ts',
+  'apps/api/src/extensions/cloudCommandAdminRuntime.test.ts',
+  'apps/api/src/extensions/cloudCommandAdminAuthorization.ts',
+  'apps/api/src/extensions/cloudCommandAdminAuthorization.test.ts',
   'apps/api/src/extensions/webRegistry.test.ts',
   'apps/api/src/extensions/webRegistry.ts',
   'apps/api/src/extensions/webAssets.test.ts',
@@ -127,6 +140,13 @@ export function readBaseline(text = readFileSync(baselinePath, 'utf8')) {
 export function classify(paths) {
   const result = { api: false, web: false, shared: false, native: false, infra: false, portalRemote: false, unsupported: [] };
   for (const path of paths.filter(Boolean)) {
+    if (path === 'packages/shared/src/validators/portal.ts' || path === 'packages/shared/src/validators/portal.test.ts') {
+      result.shared = true;
+      result.api = true;
+      result.web = true;
+      result.portalRemote = true;
+      continue;
+    }
     if (docsPath.test(path) || path === 'packages/ext-cloud-command/README.md' || path === 'packages/ext-rustdesk-access/README.md') continue;
     if (portalRemoteApiPaths.has(path)) {
       result.api = true;
@@ -149,7 +169,7 @@ export function classify(paths) {
       result.api = true;
       continue;
     }
-    if (cloudCommandApiPaths.has(path) || /^packages\/ext-cloud-command\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/(?:2026-09-21-threecx-connections|2026-09-22-microsoft-connections)\.sql|src\/(?:server|threecx|web)\/.+)$/u.test(path)) {
+    if (cloudCommandApiPaths.has(path) || /^packages\/ext-cloud-command\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/(?:2026-09-21-threecx-connections|2026-09-22-microsoft-connections|2026-09-22-native-admin-connections)\.sql|src\/(?:server|threecx|web)\/.+)$/u.test(path)) {
       result.api = true;
       result.web = true;
       continue;

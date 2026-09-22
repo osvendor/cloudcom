@@ -217,6 +217,11 @@ describe('findUnsafePortalCssPattern', () => {
 });
 
 describe('invitePortalUserSchema', () => {
+  it('accepts only a boolean remote-only restriction', () => {
+    expect(invitePortalUserSchema.safeParse({ email: 'a@b.example', remoteOnly: true }).success).toBe(true);
+    expect(invitePortalUserSchema.safeParse({ email: 'a@b.example', remoteOnly: 'true' }).success).toBe(false);
+    expect(invitePortalUserSchema.safeParse({ email: 'a@b.example', accessMode: 'standard' }).success).toBe(false);
+  });
   it('accepts a valid invite', () => {
     expect(invitePortalUserSchema.safeParse({ email: 'a@b.example', name: 'A', message: 'hi' }).success).toBe(true);
   });

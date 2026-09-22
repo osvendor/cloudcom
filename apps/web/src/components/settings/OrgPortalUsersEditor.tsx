@@ -37,6 +37,7 @@ export default function OrgPortalUsersEditor({ orgId }: { orgId: string }) {
   const [email, setEmail] = useState('');
   const [name, setName] = useState('');
   const [message, setMessage] = useState('');
+  const [remoteOnly, setRemoteOnly] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [pendingRemove, setPendingRemove] = useState<PortalUser | null>(null);
 
@@ -69,7 +70,12 @@ export default function OrgPortalUsersEditor({ orgId }: { orgId: string }) {
         request: () => fetchWithAuth(`${base(orgId)}/invite`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email, name: name || undefined, message: message || undefined })
+          body: JSON.stringify({
+            email,
+            name: name || undefined,
+            message: message || undefined,
+            ...(remoteOnly ? { remoteOnly: true } : {})
+          })
         }),
         errorFallback: t('orgPortalUsersEditor.errors.sendInvite'),
         onUnauthorized: () => void navigateTo('/login', { replace: true })
@@ -92,7 +98,7 @@ export default function OrgPortalUsersEditor({ orgId }: { orgId: string }) {
       } else {
         showToast({ message: t('orgPortalUsersEditor.toasts.inviteSent'), type: 'success' });
       }
-      setInviteOpen(false); setEmail(''); setName(''); setMessage('');
+      setInviteOpen(false); setEmail(''); setName(''); setMessage(''); setRemoteOnly(false);
       await load();
     } catch (err) {
       if (!(err instanceof ActionError)) throw err;
@@ -291,6 +297,24 @@ export default function OrgPortalUsersEditor({ orgId }: { orgId: string }) {
               onChange={(e) => setMessage(e.target.value)}
               className="mt-1 w-full rounded-md border bg-background px-3 py-1.5 text-sm"
             />
+          </div>
+          <div className="rounded-md border bg-background p-3">
+            <label className="flex cursor-pointer items-start gap-2" htmlFor="portal-users-invite-remote-only">
+              <input
+                id="portal-users-invite-remote-only"
+                data-testid="portal-users-invite-remote-only"
+                type="checkbox"
+                checked={remoteOnly}
+                onChange={(e) => setRemoteOnly(e.target.checked)}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="block text-sm font-medium">Remote access only</span>
+                <span className="mt-1 block text-xs text-muted-foreground">
+                  This account can see only computers assigned through Extensions &gt; Remote Access. It cannot see any computers until one is assigned.
+                </span>
+              </span>
+            </label>
           </div>
           <div className="flex justify-end gap-2">
             <button

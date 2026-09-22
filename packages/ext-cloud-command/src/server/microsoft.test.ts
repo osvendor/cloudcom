@@ -4,11 +4,11 @@ import { createRoutes } from './index';
 import { projectMicrosoftResource, type NativeMicrosoftServices } from './native-microsoft';
 const ORG = '11111111-1111-4111-8111-111111111111';
 const PARTNER = '22222222-2222-4222-8222-222222222222';
-function harness(options: { access?: boolean; read?: boolean; sites?: string[]; host?: boolean; failure?: string; partner?: string } = {}) {
+function harness(options: { access?: boolean; read?: boolean; write?: boolean; mfa?: boolean; sites?: string[]; host?: boolean; failure?: string; partner?: string } = {}) {
   const execute = vi.fn(async () => [{ partner_id: PARTNER }]);
   const fetch = vi.fn();
   const auth = { user: { id: ORG }, scope: 'partner', partnerId: options.partner ?? PARTNER, canAccessOrg: () => options.access !== false };
-  const authorization = { hasPermission: (_resource: string, action: string) => action !== 'read' || options.read !== false, mfaSatisfied: true, allowedSiteIds: options.sites };
+  const authorization = { hasPermission: (_resource: string, action: string) => action === 'read' ? options.read !== false : options.write !== false, mfaSatisfied: options.mfa !== false, allowedSiteIds: options.sites };
   const services: NativeMicrosoftServices = {
     version: 1,
     connection: vi.fn(async () => ({ available: true, connected: true, enabled: true, canManage: true, tenantName: 'Native tenant' })),
@@ -22,6 +22,19 @@ function harness(options: { access?: boolean; read?: boolean; sites?: string[]; 
 }
 const path = (suffix: string) => `/microsoft/${suffix}?orgId=${ORG}`;
 describe('native Microsoft extension routes', () => {
+  it.each([{ write: false }, { mfa: false }, { access: false }, { sites: [] }])('denies onboarding mutations before native calls: %j', async options => {
+    const h = harness(options);
+    expect((await h.app.request(path('onboarding/recheck'), { method: 'POST' })).status).toBe(403);
+    expect(h.services.connection).not.toHaveBeenCalled();
+    expect(h.services.read).not.toHaveBeenCalled();
+  });
+  it('does not offer partial read consent as full administration onboarding', async () => {
+    const h = harness();
+    const response = await h.app.request(path('onboarding/start'), { method: 'POST' });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ code: 'onboarding_unavailable' });
+    expect(h.services.read).not.toHaveBeenCalled();
+  });
   it('reports missing host services honestly without CIPP calls', async () => {
     const h = harness({ host: false });
     expect(await (await h.app.request(path('connection'))).json()).toMatchObject({ available: false, connected: false, enabled: false });
