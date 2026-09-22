@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { and, eq, gt, isNull, or } from 'drizzle-orm';
 import { bodyLimit } from 'hono/body-limit';
 import { portalDesktopRoutes } from './remoteDesktop';
+import { portalNativeAuthorizeRoutes } from './nativeLogin';
 import { db } from '../../db';
 import { devices, portalRemoteAssignments, portalRemoteSettings } from '../../db/schema';
 import { isPortalRemoteFeatureEnabled } from '../../services/portalRemoteFeature';
@@ -52,3 +53,4 @@ portalRemoteRoutes.get('/remote/devices', async c => {
 
 portalRemoteRoutes.use('/remote/*', bodyLimit({ maxSize: 70000 }));
 portalRemoteRoutes.route('/', portalDesktopRoutes);
+portalRemoteRoutes.route('/', portalNativeAuthorizeRoutes);

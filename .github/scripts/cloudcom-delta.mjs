@@ -28,6 +28,9 @@ const remoteAccessApiPaths = new Set([
 // Redis stack, real portal-login and authorization tests, plus the RLS coverage
 // contract; unknown portal or schema work must still fail closed.
 const portalRemoteApiPaths = new Set([
+  'apps/api/src/services/portalNativeLogin.ts', 'apps/api/src/services/portalNativeLogin.test.ts',
+  'apps/api/src/routes/portal/nativeLogin.ts', 'apps/api/src/routes/portal/nativeLogin.test.ts',
+  'apps/api/src/__tests__/integration/portalNativeLogin.integration.test.ts',
   '.env.example', 'docker-compose.yml',
   'apps/api/migrations/2026-09-21-portal-remote-access.sql',
   'apps/api/migrations/2026-09-21-portal-remote-session-prompt.sql',
@@ -55,6 +58,9 @@ const portalRemoteApiPaths = new Set([
   'apps/api/src/services/remoteAccessLauncher.test.ts', 'apps/api/src/services/tenantCascade.ts', 'apps/api/src/services/tenantExportPolicyRegistry.ts',
 ]);
 const portalRemoteWebPaths = new Set([
+  'apps/portal/src/pages/remote/native.astro', 'apps/portal/src/lib/nativeLogin.ts', 'apps/portal/src/lib/nativeLogin.test.ts',
+  'apps/portal/src/components/remote/NativeSignInPage.tsx', 'apps/portal/src/components/remote/NativeSignInPage.test.tsx',
+  'apps/portal/src/components/remote/NativeSignInConsent.tsx',
   'apps/portal/src/components/portal/LoginForm.tsx', 'apps/portal/src/components/portal/RemotePage.tsx',
   'apps/portal/src/components/portal/RemoteViewer.test.tsx', 'apps/portal/src/components/portal/RemoteViewer.tsx',
   'apps/portal/src/layouts/PortalLayout.astro', 'apps/portal/src/lib/api.ts', 'apps/portal/src/lib/auth.ts',

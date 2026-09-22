@@ -18,6 +18,30 @@ build feature, with an API proof verifier in source. These are not yet attached 
 the RustDesk connection path. See [the admission protocol](cloudcom-native-admission-protocol.md)
 for the byte contract and remaining integration requirements.
 
+### Native sign-in preparation (not deployed)
+
+The default-off `CLOUDCOM_NATIVE_LOGIN_ENABLED` adds an explicit browser consent
+page at `/portal/remote/native`, plus code authorization/exchange endpoints. A
+registered app uses S256 PKCE, a fresh state value and an exact IPv4 loopback
+callback. Redis consumes the 60-second code once and checks the original browser
+session atomically before creating a separate bearer token. Tokens have a hard
+12-hour maximum, are restricted to the assigned-computer list and logout, and
+still require the live remote-only account, organization and auth epoch. They
+cannot launch a native connection in this checkpoint. No password is exposed.
+
+The paired client has a build-gated sign-in/list surface with an HTTPS service
+origin, external-browser login, memory-only credentials and redirect-disabled
+API requests. The ordinary client remains the default. Windows isolated Dart
+analysis and two callback/cancellation tests passed; these do not prove the full
+client build, successful browser-to-app login, or managed-target admission.
+
+Server validation passed 34 focused authentication/HTTP tests and one real
+PostgreSQL/Redis HTTP test, including eight concurrent exchanges producing one
+token. The combined portal suite passed 785 tests; configuration and remote-list
+checks passed 116 tests. Focused API typechecking and API/portal builds passed.
+Native ticket redemption, target enrollment, encrypted transport binding and
+independent channel revocation remain required before enabling native access.
+
 ### Deployment and login boundary
 
 The first browser release passed packaged-image QA before deployment. Production
