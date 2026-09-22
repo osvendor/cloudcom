@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { randomInt } from 'node:crypto';
 import type { GuardedFetch } from './transport';
 
 const ORIGIN = 'https://graph.microsoft.com/v1.0';
@@ -34,6 +35,22 @@ function parse<T>(schema: z.ZodType<T>, value: unknown, code: AdminGraphErrorCod
   const result = schema.safeParse(value);
   if (!result.success) throw new AdminGraphError(code);
   return result.data;
+}
+const passwordClasses = ['ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnopqrstuvwxyz', '23456789', '!@#$%&*-_+'];
+function createTemporaryPassword(): string {
+  const chars = passwordClasses.map(group => group[randomInt(group.length)]!);
+  const alphabet = passwordClasses.join('');
+  while (chars.length < 32) chars.push(alphabet[randomInt(alphabet.length)]!);
+  for (let i = chars.length - 1; i > 0; i -= 1) {
+    const j = randomInt(i + 1); [chars[i], chars[j]] = [chars[j]!, chars[i]!];
+  }
+  return chars.join('');
+}
+function requireAppRole(token: string, role: string): void {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString());
+    if (!Array.isArray(payload.roles) || !payload.roles.includes(role)) throw new Error();
+  } catch { throw new AdminGraphError('provider_access_denied'); }
 }
 const userSelect = Object.keys(user.shape).join(',');
 const groupSelect = Object.keys(group.shape).join(',');
@@ -124,6 +141,27 @@ export function createAdminGraphProvider(options: {
       const body = parse(adminUserUpdateSchema, update, 'invalid_input');
       const token = await session();
       await request(token, `/users/${id}`, 'PATCH', body);
+      return { accepted: true as const };
+    },
+    async resetUserPassword(id: string, authorize?: () => Promise<void>) {
+      id = parse(uuid, id, 'invalid_input');
+      const token = await session();
+      requireAppRole(token, 'User-PasswordProfile.ReadWrite.All');
+      await authorize?.();
+      await resource(token, '/users', id, user, userSelect);
+      const temporaryPassword = createTemporaryPassword();
+      await authorize?.();
+      await request(token, `/users/${id}`, 'PATCH', { passwordProfile: { password: temporaryPassword, forceChangePasswordNextSignIn: true } });
+      return { accepted: true as const, temporaryPassword, forceChangePasswordNextSignIn: true as const };
+    },
+    async revokeUserSessions(id: string, authorize?: () => Promise<void>) {
+      id = parse(uuid, id, 'invalid_input');
+      const token = await session();
+      requireAppRole(token, 'User.RevokeSessions.All');
+      await authorize?.();
+      await resource(token, '/users', id, user, userSelect);
+      await authorize?.();
+      await request(token, `/users/${id}/revokeSignInSessions`, 'POST');
       return { accepted: true as const };
     },
     addGroupMember: (groupId: string, userId: string) => membership(groupId, userId, false),

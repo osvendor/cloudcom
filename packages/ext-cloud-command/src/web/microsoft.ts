@@ -22,6 +22,7 @@ type ResourceData = {
   checkedAt: string;
 };
 type DetailKind = 'read' | 'user' | 'group';
+type UserSecurityAction = 'reset-password' | 'revoke-sessions';
 type MicrosoftRecord = Record<string, unknown>;
 type UserDraft = Partial<Record<(typeof USER_FIELDS)[number], string>> & { accountEnabled?: boolean };
 const USER_FIELDS = ['displayName', 'givenName', 'surname', 'department', 'jobTitle', 'officeLocation'] as const;
@@ -48,6 +49,10 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private detailRecord: MicrosoftRecord | null = null;
   private detailRequest = 0;
   private userVerificationRequest = 0;
+  private userSecurityRequest = 0;
+  private userSecurityAction: UserSecurityAction | null = null;
+  private userSecurityConfirmed = false;
+  private temporaryPassword: string | null = null;
   private drawerMessage = '';
   private drawerError = false;
   private membershipUserId = '';
@@ -90,6 +95,9 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     window.removeEventListener('hashchange', this.onHashChange);
     this.generation += 1;
     this.userVerificationRequest += 1;
+    this.userSecurityRequest += 1;
+    this.temporaryPassword = null;
+    this.userSecurityAction = null;
   }
 
   private onHashChange = (): void => {
@@ -101,6 +109,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       this.detailRecord = null;
       this.detailRequest += 1;
       this.userVerificationRequest += 1;
+      this.userSecurityRequest += 1;
+      this.userSecurityAction = null; this.userSecurityConfirmed = false; this.temporaryPassword = null;
       this.busy = false;
       this.filter = '';
       this.userDraft = {};
@@ -130,6 +140,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.visibleColumns = [];
     this.detailRequest += 1;
     this.userVerificationRequest += 1;
+    this.userSecurityRequest += 1;
+    this.userSecurityAction = null; this.userSecurityConfirmed = false; this.temporaryPassword = null;
     this.drawerMessage = '';
     this.drawerError = false;
     this.membershipUserId = '';
@@ -218,6 +230,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.detailKind = this.resource === 'users' ? 'user' : this.resource === 'groups' ? 'group' : 'read';
     this.detailRecord = null;
     this.userVerificationRequest += 1;
+    this.userSecurityRequest += 1;
+    this.userSecurityAction = null; this.userSecurityConfirmed = false; this.temporaryPassword = null;
     this.drawerMessage = '';
     this.drawerError = false;
     this.membershipUserId = '';
@@ -235,6 +249,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.detailRecord = null;
     this.detailRequest += 1;
     this.userVerificationRequest += 1;
+    this.userSecurityRequest += 1;
+    this.userSecurityAction = null; this.userSecurityConfirmed = false; this.temporaryPassword = null;
     this.busy = false;
     this.drawerMessage = '';
     this.drawerError = false;
@@ -356,6 +372,37 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (this.userVerificationIsCurrent(id, generation, context, verification)) { this.drawerError = true; this.drawerMessage = error instanceof Error ? error.message : 'User update could not be completed. Its outcome is uncertain; do not retry automatically.'; }
     } finally { if (this.userVerificationIsCurrent(id, generation, context, verification)) { this.busy = false; this.render(); } }
   }
+  private async performUserSecurityAction(): Promise<void> {
+    if (!this.connection?.canManage || !this.detail || this.detailKind !== 'user' || this.busy || !this.userSecurityAction) return;
+    if (!this.userSecurityConfirmed) {
+      this.drawerError = true; this.drawerMessage = 'Confirm this security action before continuing.'; this.render(); return;
+    }
+    const id = this.detail.id; const generation = this.generation; const context = this.contextValue;
+    const request = ++this.userSecurityRequest; const action = this.userSecurityAction;
+    this.temporaryPassword = null; this.busy = true; this.drawerError = false;
+    this.drawerMessage = action === 'reset-password' ? 'Resetting password…' : 'Signing out user sessions…'; this.render();
+    const current = () => this.isConnected && generation === this.generation && context === this.contextValue
+      && request === this.userSecurityRequest && this.detail?.id === id && this.detailKind === 'user';
+    try {
+      const result = await this.request<{ accepted?: boolean; temporaryPassword?: string; forceChangePasswordNextSignIn?: boolean }>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: action === 'reset-password' ? 'user.password.reset' : 'user.sessions.revoke', id }),
+      });
+      if (!current()) return;
+      if (result.accepted !== true) throw new Error('Microsoft did not confirm the security action. Refresh before trying again.');
+      if (action === 'reset-password') {
+        if (typeof result.temporaryPassword !== 'string' || result.forceChangePasswordNextSignIn !== true)
+          throw new Error('Microsoft accepted the reset, but the one-time password could not be safely displayed. Do not retry before checking the account.');
+        this.temporaryPassword = result.temporaryPassword;
+        this.drawerError = false; this.drawerMessage = 'Password reset. Share this temporary password securely; the user must change it at next sign-in.';
+      } else {
+        this.drawerError = false; this.drawerMessage = 'Sign-out request accepted. Microsoft may take a few minutes to revoke existing sessions.';
+      }
+      this.userSecurityAction = null; this.userSecurityConfirmed = false;
+    } catch (error) {
+      if (current()) { this.drawerError = true; this.drawerMessage = error instanceof Error ? error.message : 'Security action outcome is uncertain. Refresh the account before retrying.'; }
+    } finally { if (current()) { this.busy = false; this.render(); } }
+  }
   private async changeMembership(): Promise<void> {
     if (!this.connection?.canManage || !this.detail || this.detailKind !== 'group' || this.busy) return;
     const userId = this.root.querySelector<HTMLInputElement>('#group-member-user-id')?.value.trim() ?? this.membershipUserId;
@@ -400,7 +447,9 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     } else if (this.detailKind === 'user') {
       const field = (name: typeof USER_FIELDS[number], label: string) => `<label><span>${label}</span><input id="user-${name}" value="${esc(String(this.userDraft[name] ?? record[name] ?? ''))}" ${this.busy || !canManage ? 'disabled' : ''}></label>`;
       const enabled = this.userDraft.accountEnabled ?? record.accountEnabled;
-      content = `<div class="drawer-body"><p class="meta">User ID: ${esc(detail.id)}</p><section class="drawer-section"><h3>Profile</h3><div class="field-grid">${field('displayName', 'Display name')}${field('givenName', 'Given name')}${field('surname', 'Surname')}${field('department', 'Department')}${field('jobTitle', 'Job title')}${field('officeLocation', 'Office location')}</div></section><section class="drawer-section"><h3>Account access</h3><label class="check"><input id="user-account-enabled" type="checkbox" ${enabled === true ? 'checked' : ''} ${this.busy || !canManage ? 'disabled' : ''}> Account enabled</label></section></div>${canManage ? `<footer class="drawer-footer"><div class="actions"><button id="user-save" ${this.busy ? 'disabled' : ''}>Save and verify user</button></div>${feedback}</footer>` : `<footer class="drawer-footer"><p class="read-only">An organization administrator can edit this user.</p>${feedback}</footer>`}`;
+      const securityConfirmation = this.userSecurityAction ? `<div class="security-confirmation" role="group" aria-label="Confirm security action"><p>${this.userSecurityAction === 'reset-password' ? 'Microsoft will set a new temporary password and require the user to change it at next sign-in.' : 'Microsoft will invalidate refresh tokens and browser session cookies. Users may need to sign in again; revocation can take a few minutes.'}</p><label class="check"><input id="user-security-confirm" type="checkbox" ${this.userSecurityConfirmed ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> I confirm this security action</label><div class="actions"><button class="secondary" id="user-security-cancel" ${this.busy ? 'disabled' : ''}>Cancel</button><button id="user-security-submit" ${this.busy ? 'disabled' : ''}>${this.userSecurityAction === 'reset-password' ? 'Reset password' : 'Sign out all sessions'}</button></div></div>` : '';
+      const passwordDisplay = this.temporaryPassword ? `<div class="one-time-secret" role="status"><strong>Temporary password</strong><code id="temporary-password">${esc(this.temporaryPassword)}</code><p>It is shown only in this drawer. Copy it now; closing the drawer clears it.</p><button class="secondary compact" id="copy-temporary-password">Copy password</button><button class="secondary compact" id="hide-temporary-password">Hide password</button></div>` : '';
+      content = `<div class="drawer-body"><p class="meta">User ID: ${esc(detail.id)}</p><section class="drawer-section"><h3>Profile</h3><div class="field-grid">${field('displayName', 'Display name')}${field('givenName', 'Given name')}${field('surname', 'Surname')}${field('department', 'Department')}${field('jobTitle', 'Job title')}${field('officeLocation', 'Office location')}</div></section><section class="drawer-section"><h3>Account access</h3><label class="check"><input id="user-account-enabled" type="checkbox" ${enabled === true ? 'checked' : ''} ${this.busy || !canManage ? 'disabled' : ''}> Account enabled</label></section>${canManage ? `<section class="drawer-section"><h3>Security</h3><div class="actions"><button class="secondary" id="user-password-reset-start" ${this.busy ? 'disabled' : ''}>Reset password</button><button class="secondary" id="user-sessions-revoke-start" ${this.busy ? 'disabled' : ''}>Sign out of all sessions</button></div>${securityConfirmation}${passwordDisplay}</section>` : ''}</div>${canManage ? `<footer class="drawer-footer"><div class="actions"><button id="user-save" ${this.busy ? 'disabled' : ''}>Save and verify user</button></div>${feedback}</footer>` : `<footer class="drawer-footer"><p class="read-only">An organization administrator can edit this user.</p>${feedback}</footer>`}`;
     } else {
       content = `<div class="drawer-body"><p class="meta">Group ID: ${esc(detail.id)}</p><p class="meta">${record.displayName ? `Group: ${esc(String(record.displayName))}` : 'Group details loaded.'}</p>${canManage ? `<label>Member user ID<input id="group-member-user-id" value="${esc(this.membershipUserId)}" autocomplete="off" ${this.busy ? 'disabled' : ''}></label><label>Membership action<select id="group-member-action" ${this.busy ? 'disabled' : ''}><option value="add" ${this.membershipAction === 'add' ? 'selected' : ''}>Add member</option><option value="remove" ${this.membershipAction === 'remove' ? 'selected' : ''}>Remove member</option></select></label><label class="check"><input id="group-member-confirm" type="checkbox" ${this.membershipConfirmed ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> I confirm this membership change</label>` : '<p class="read-only">An organization administrator can change group membership.</p>'}</div><footer class="drawer-footer">${canManage ? `<div class="actions"><button id="group-member-submit" ${this.busy ? 'disabled' : ''}>Confirm membership change</button></div>` : ''}${feedback}</footer>`;
     }
@@ -468,6 +517,17 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     );
     this.root.querySelector('#detail-close')?.addEventListener('click', () => this.closeDetail());
     this.root.querySelector('#user-save')?.addEventListener('click', () => void this.saveUser());
+    this.root.querySelector('#user-password-reset-start')?.addEventListener('click', () => { this.userSecurityAction = 'reset-password'; this.userSecurityConfirmed = false; this.temporaryPassword = null; this.drawerError = false; this.drawerMessage = ''; this.render(); this.root.querySelector<HTMLInputElement>('#user-security-confirm')?.focus(); });
+    this.root.querySelector('#user-sessions-revoke-start')?.addEventListener('click', () => { this.userSecurityAction = 'revoke-sessions'; this.userSecurityConfirmed = false; this.temporaryPassword = null; this.drawerError = false; this.drawerMessage = ''; this.render(); this.root.querySelector<HTMLInputElement>('#user-security-confirm')?.focus(); });
+    this.root.querySelector<HTMLInputElement>('#user-security-confirm')?.addEventListener('change', event => { this.userSecurityConfirmed = (event.target as HTMLInputElement).checked; });
+    this.root.querySelector('#user-security-cancel')?.addEventListener('click', () => { this.userSecurityRequest += 1; this.userSecurityAction = null; this.userSecurityConfirmed = false; this.drawerError = false; this.drawerMessage = ''; this.render(); });
+    this.root.querySelector('#user-security-submit')?.addEventListener('click', () => void this.performUserSecurityAction());
+    this.root.querySelector('#hide-temporary-password')?.addEventListener('click', () => { this.temporaryPassword = null; this.render(); });
+    this.root.querySelector('#copy-temporary-password')?.addEventListener('click', () => {
+      if (!this.temporaryPassword) return;
+      if (!navigator.clipboard?.writeText) { this.drawerError = true; this.drawerMessage = 'Clipboard access is unavailable. Select the temporary password to copy it manually.'; this.render(); return; }
+      void navigator.clipboard.writeText(this.temporaryPassword).then(() => { this.drawerError = false; this.drawerMessage = 'Temporary password copied. Share it securely.'; this.render(); }).catch(() => { this.drawerError = true; this.drawerMessage = 'Clipboard access failed. Select the temporary password to copy it manually.'; this.render(); });
+    });
     this.root.querySelectorAll<HTMLInputElement>('[id^="user-"]').forEach(input => input.addEventListener('input', () => {
       const field = input.id.slice('user-'.length) as typeof USER_FIELDS[number];
       if ((USER_FIELDS as readonly string[]).includes(field)) this.userDraft[field] = input.value;
@@ -539,5 +599,5 @@ function parseResourceData(input: unknown): ResourceData {
     throw new Error('Invalid Microsoft resource response.');
   return value as unknown as ResourceData;
 }
-const styles = `:host{display:block;color:hsl(var(--foreground));font-family:var(--font-sans,system-ui)}*{box-sizing:border-box}main{max-width:1200px;margin:auto;padding:1.5rem}header,.directory-top,.heading,.actions{align-items:flex-start;display:flex;gap:1rem;justify-content:space-between}h1,h2,h3,p{margin:0}h1{font-size:1.55rem}h2{font-size:1.1rem}h3{font-size:.9rem}.eyebrow{color:hsl(var(--primary));font-size:.75rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.subtle,.read-only,.meta{color:hsl(var(--muted-foreground));font-size:.875rem;margin-top:.35rem}.status{color:hsl(var(--muted-foreground));min-height:1.4rem;margin-top:.75rem}.status:empty{display:none}.status[data-error="true"],.drawer-feedback.error{color:hsl(var(--destructive))}.badge,.state{background:hsl(var(--muted));border-radius:999px;font-size:.8rem;font-weight:700;padding:.25rem .6rem}.badge.ok,.state.on{background:hsl(var(--success) / .16);color:hsl(var(--success))}.directory{border-top:1px solid hsl(var(--border));margin-top:1.25rem;padding-top:.8rem}.resource-nav{display:flex;gap:.15rem}.resource-tab{background:transparent;border-radius:0;color:hsl(var(--muted-foreground));min-height:2.45rem;padding:.45rem .8rem}.resource-tab[aria-selected="true"]{border-bottom:2px solid hsl(var(--primary));color:hsl(var(--foreground))}label{display:grid;gap:.4rem;font-size:.875rem;font-weight:600;margin-top:1rem}select,input{background:hsl(var(--background));border:1px solid hsl(var(--input));border-radius:calc(var(--radius,.5rem) - 2px);color:inherit;font:inherit;min-height:2.5rem;padding:.5rem .65rem}.filter{margin:0;flex:1;max-width:420px;min-width:180px}.directory-top{align-items:center;flex-wrap:wrap}.directory-top .resource-nav{margin-right:auto}.column-tools{align-items:center;display:flex;flex-wrap:wrap;gap:.4rem;margin-top:1rem}.column-tools>span{color:hsl(var(--muted-foreground));font-size:.8rem;font-weight:700;margin-right:.15rem}.column-chip{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground));font-size:.78rem;min-height:2rem;padding:.25rem .55rem}.column-chip[aria-pressed="false"]{background:transparent;border:1px solid hsl(var(--border));color:hsl(var(--muted-foreground))}.check{align-items:center;display:flex;gap:.5rem}.check input{min-height:auto;width:1rem}.actions{justify-content:flex-end;margin-top:1rem}button{background:hsl(var(--primary));border:0;border-radius:calc(var(--radius,.5rem) - 2px);color:hsl(var(--primary-foreground));cursor:pointer;font:inherit;font-weight:700;min-height:2.5rem;padding:.5rem .85rem}button.secondary{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground))}button.compact{font-size:.8rem;min-height:2rem;padding:.3rem .6rem}button:disabled{cursor:not-allowed;opacity:.6}button:focus,input:focus,select:focus{outline:2px solid hsl(var(--ring));outline-offset:2px}.table-wrap{margin-top:1rem;overflow:auto}table{border-collapse:collapse;color:hsl(var(--foreground));min-width:700px;width:100%}th,td{border-bottom:1px solid hsl(var(--border));padding:.75rem;text-align:left;vertical-align:middle}th{color:hsl(var(--muted-foreground));font-size:.75rem;text-transform:uppercase}.identity strong,.identity span{display:block}.identity span{color:hsl(var(--muted-foreground));font-size:.84rem;margin-top:.15rem}.row-control{text-align:right}.selected-row td{background:hsl(var(--accent) / .42)}.row-actions td{background:hsl(var(--accent) / .28)}.row-actions td>div{align-items:center;display:flex;gap:.7rem}.empty{border:1px dashed hsl(var(--border));border-radius:var(--radius,.5rem);color:hsl(var(--muted-foreground));margin-top:1rem;padding:1.25rem;text-align:center}.sr-only{clip:rect(0,0,0,0);height:1px;margin:-1px;overflow:hidden;position:absolute;width:1px}.backdrop{background:hsl(var(--background) / .64);display:flex;inset:0;justify-content:flex-end;position:fixed;z-index:20}.drawer{background:hsl(var(--card));box-shadow:-8px 0 24px hsl(var(--foreground) / .16);display:flex;flex-direction:column;height:100%;max-width:min(100%,40rem);width:100%}.drawer-heading{border-bottom:1px solid hsl(var(--border));flex:0 0 auto;padding:1.25rem 1.5rem}.drawer-body{flex:1;min-height:0;overflow:auto;padding:1.25rem 1.5rem}.drawer-section{margin-top:1.25rem}.field-grid{display:grid;gap:.85rem;grid-template-columns:1fr}.field-grid label{align-items:center;display:grid;grid-template-columns:140px minmax(0,1fr);margin:0}.drawer-footer{border-top:1px solid hsl(var(--border));flex:0 0 auto;padding:1rem 1.5rem}.drawer-footer .actions{margin-top:0}.drawer-feedback{margin-top:.75rem;min-height:1.4rem}dl{margin:0}dl div{border-bottom:1px solid hsl(var(--border));padding:.75rem 0}dt{color:hsl(var(--muted-foreground));font-size:.75rem;font-weight:700}dd{margin:.25rem 0 0;overflow-wrap:anywhere}@media(max-width:600px){main{padding:1rem}.directory-top,.heading{flex-direction:column}.field-grid label{align-items:stretch;grid-template-columns:1fr}.drawer-heading{padding:1rem}.drawer-body,.drawer-footer{padding-left:1rem;padding-right:1rem}}`;
+const styles = `:host{display:block;color:hsl(var(--foreground));font-family:var(--font-sans,system-ui)}*{box-sizing:border-box}main{max-width:1200px;margin:auto;padding:1.5rem}header,.directory-top,.heading,.actions{align-items:flex-start;display:flex;gap:1rem;justify-content:space-between}h1,h2,h3,p{margin:0}h1{font-size:1.55rem}h2{font-size:1.1rem}h3{font-size:.9rem}.eyebrow{color:hsl(var(--primary));font-size:.75rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.subtle,.read-only,.meta{color:hsl(var(--muted-foreground));font-size:.875rem;margin-top:.35rem}.status{color:hsl(var(--muted-foreground));min-height:1.4rem;margin-top:.75rem}.status:empty{display:none}.status[data-error="true"],.drawer-feedback.error{color:hsl(var(--destructive))}.badge,.state{background:hsl(var(--muted));border-radius:999px;font-size:.8rem;font-weight:700;padding:.25rem .6rem}.badge.ok,.state.on{background:hsl(var(--success) / .16);color:hsl(var(--success))}.directory{border-top:1px solid hsl(var(--border));margin-top:1.25rem;padding-top:.8rem}.resource-nav{display:flex;gap:.15rem}.resource-tab{background:transparent;border-radius:0;color:hsl(var(--muted-foreground));min-height:2.45rem;padding:.45rem .8rem}.resource-tab[aria-selected="true"]{border-bottom:2px solid hsl(var(--primary));color:hsl(var(--foreground))}label{display:grid;gap:.4rem;font-size:.875rem;font-weight:600;margin-top:1rem}select,input{background:hsl(var(--background));border:1px solid hsl(var(--input));border-radius:calc(var(--radius,.5rem) - 2px);color:inherit;font:inherit;min-height:2.5rem;padding:.5rem .65rem}.filter{margin:0;flex:1;max-width:420px;min-width:180px}.directory-top{align-items:center;flex-wrap:wrap}.directory-top .resource-nav{margin-right:auto}.column-tools{align-items:center;display:flex;flex-wrap:wrap;gap:.4rem;margin-top:1rem}.column-tools>span{color:hsl(var(--muted-foreground));font-size:.8rem;font-weight:700;margin-right:.15rem}.column-chip{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground));font-size:.78rem;min-height:2rem;padding:.25rem .55rem}.column-chip[aria-pressed="false"]{background:transparent;border:1px solid hsl(var(--border));color:hsl(var(--muted-foreground))}.check{align-items:center;display:flex;gap:.5rem}.check input{min-height:auto;width:1rem}.actions{justify-content:flex-end;margin-top:1rem}button{background:hsl(var(--primary));border:0;border-radius:calc(var(--radius,.5rem) - 2px);color:hsl(var(--primary-foreground));cursor:pointer;font:inherit;font-weight:700;min-height:2.5rem;padding:.5rem .85rem}button.secondary{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground))}button.compact{font-size:.8rem;min-height:2rem;padding:.3rem .6rem}button:disabled{cursor:not-allowed;opacity:.6}button:focus,input:focus,select:focus{outline:2px solid hsl(var(--ring));outline-offset:2px}.table-wrap{margin-top:1rem;overflow:auto}table{border-collapse:collapse;color:hsl(var(--foreground));min-width:700px;width:100%}th,td{border-bottom:1px solid hsl(var(--border));padding:.75rem;text-align:left;vertical-align:middle}th{color:hsl(var(--muted-foreground));font-size:.75rem;text-transform:uppercase}.identity strong,.identity span{display:block}.identity span{color:hsl(var(--muted-foreground));font-size:.84rem;margin-top:.15rem}.row-control{text-align:right}.selected-row td{background:hsl(var(--accent) / .42)}.row-actions td{background:hsl(var(--accent) / .28)}.row-actions td>div{align-items:center;display:flex;gap:.7rem}.empty{border:1px dashed hsl(var(--border));border-radius:var(--radius,.5rem);color:hsl(var(--muted-foreground));margin-top:1rem;padding:1.25rem;text-align:center}.sr-only{clip:rect(0,0,0,0);height:1px;margin:-1px;overflow:hidden;position:absolute;width:1px}.backdrop{background:hsl(var(--background) / .64);display:flex;inset:0;justify-content:flex-end;position:fixed;z-index:20}.drawer{background:hsl(var(--card));box-shadow:-8px 0 24px hsl(var(--foreground) / .16);display:flex;flex-direction:column;height:100%;max-width:min(100%,40rem);width:100%}.drawer-heading{border-bottom:1px solid hsl(var(--border));flex:0 0 auto;padding:1.25rem 1.5rem}.drawer-body{flex:1;min-height:0;overflow:auto;padding:1.25rem 1.5rem}.drawer-section{margin-top:1.25rem}.security-confirmation,.one-time-secret{background:hsl(var(--muted) / .28);border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);margin-top:1rem;padding:1rem}.security-confirmation p,.one-time-secret p{color:hsl(var(--muted-foreground));margin-bottom:.75rem}.one-time-secret code{display:block;background:hsl(var(--background));border-radius:.35rem;font-size:1rem;margin:.5rem 0;overflow-wrap:anywhere;padding:.65rem;user-select:all}.field-grid{display:grid;gap:.85rem;grid-template-columns:1fr}.field-grid label{align-items:center;display:grid;grid-template-columns:140px minmax(0,1fr);margin:0}.drawer-footer{border-top:1px solid hsl(var(--border));flex:0 0 auto;padding:1rem 1.5rem}.drawer-footer .actions{margin-top:0}.drawer-feedback{margin-top:.75rem;min-height:1.4rem}dl{margin:0}dl div{border-bottom:1px solid hsl(var(--border));padding:.75rem 0}dt{color:hsl(var(--muted-foreground));font-size:.75rem;font-weight:700}dd{margin:.25rem 0 0;overflow-wrap:anywhere}@media(max-width:600px){main{padding:1rem}.directory-top,.heading{flex-direction:column}.field-grid label{align-items:stretch;grid-template-columns:1fr}.drawer-heading{padding:1rem}.drawer-body,.drawer-footer{padding-left:1rem;padding-right:1rem}}`;
 if (!customElements.get(ELEMENT)) customElements.define(ELEMENT, CloudCommandMicrosoftPage);

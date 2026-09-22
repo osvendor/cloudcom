@@ -295,4 +295,42 @@ describe('CloudCommandMicrosoftPage', () => {
     expect(JSON.parse(String(mutation))).toEqual({ type: 'group.member.remove', groupId: 'group-1', userId: 'user-9' });
     expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('verification is pending');
   });
+
+  it('requires confirmation for password reset and clears the one-time password when the drawer closes', async () => {
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/threecx/connection') return Response.json({ connected: false });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration' && init?.method === 'GET') return Response.json({ id: 'user-1', displayName: 'Ada', accountEnabled: true });
+      if (path === '/microsoft/administration') return Response.json({ accepted: true, temporaryPassword: 'Example!Password123', forceChangePasswordNextSignIn: true });
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-password-reset-start')!.click();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-security-submit')!.click(); await flush();
+    expect(request.mock.calls.some(([, init]) => String(init?.body).includes('user.password.reset'))).toBe(false);
+    page.shadowRoot!.querySelector<HTMLInputElement>('#user-security-confirm')!.click();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-security-submit')!.click(); await flush();
+    expect(page.shadowRoot!.querySelector('#temporary-password')!.textContent).toBe('Example!Password123');
+    expect(page.shadowRoot!.textContent).toContain('must change it at next sign-in');
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#detail-close')!.click();
+    expect(page.shadowRoot!.textContent).not.toContain('Example!Password123');
+  });
+
+  it('confirms session revocation once and explains its propagation delay', async () => {
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/threecx/connection') return Response.json({ connected: false });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration' && init?.method === 'GET') return Response.json({ id: 'user-1', displayName: 'Ada', accountEnabled: true });
+      if (path === '/microsoft/administration') return Response.json({ accepted: true });
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-sessions-revoke-start')!.click();
+    page.shadowRoot!.querySelector<HTMLInputElement>('#user-security-confirm')!.click();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-security-submit')!.click(); await flush();
+    expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.sessions.revoke'))).toHaveLength(1);
+    expect(page.shadowRoot!.textContent).toContain('may take a few minutes');
+  });
 });
