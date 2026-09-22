@@ -181,8 +181,12 @@ function Set-CloudComRustDeskQuietMode {
 function Invoke-CloudComRustDesk {
     param([string]$Exe, [string[]]$Arguments)
     $process = Start-Process -FilePath $Exe -ArgumentList $Arguments -WindowStyle Hidden -PassThru
-    if (!$process.WaitForExit(90000)) { $process.Kill(); throw 'RustDesk command timed out.' }
-    if ($process.ExitCode -ne 0) { throw 'RustDesk command failed.' }
+    try {
+        # Retain the process handle before a short-lived Windows CLI can exit.
+        $null = $process.Handle
+        if (!$process.WaitForExit(90000)) { $process.Kill(); throw 'RustDesk command timed out.' }
+        if ($null -eq $process.ExitCode -or $process.ExitCode -ne 0) { throw 'RustDesk command failed.' }
+    } finally { $process.Dispose() }
 }
 
 function Write-CloudComRustDeskId {
