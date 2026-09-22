@@ -9,6 +9,32 @@ Configuration belongs in a separate **Extensions → RustDesk Access** page. Kee
 existing device-page Connect action as the technician entry point. The Cloud Command
 extension and its 3CX code are owned by concurrent work and must not be modified.
 
+### Customer identity and portal clarification
+
+Customers need remote access, not technician/dashboard access. Reuse Breeze's
+existing customer identity (`portal_users`) and portal authentication as the
+starting point, with a remote-access-only entitlement and landing page. The exact
+URL can be under the existing deployment; a URL such as `/remote` must not be
+assumed available because the technician application already owns that route.
+The installed operator app and emergency browser viewer use the same customer
+identity and assignments. Administrators manage these in the RustDesk extension.
+
+The existing portal has invites, login, account status/auth-epoch invalidation,
+and organization-scoped identities. Its current Devices API lists devices for the
+whole organization (`routes/portal/devices.ts`), NOT user-assigned computers. Do not
+enable or reuse that list as the customer's remote-access authorization boundary.
+Add an assigned-computers API and enforce its predicates again during connection.
+
+Existing portal section toggles are primarily organization-level, not proof of a
+remote-only per-user role. A remote-only entitlement must deny unrelated portal
+APIs server-side, including tickets, invoices and organization-wide device exports;
+hiding navigation is insufficient. Do not promote portal users into technician
+`users`, inherit `linkedUserId` permissions, or accept portal sessions at technician
+routes. Represent the subject as `(principalType, principalId)` in all assignments,
+audits and authorizations so customer and technician identities cannot be confused.
+Verify portal MFA/SSO support for this new use case; do not assume staff MFA applies.
+The current pure policy prototype is not yet a portal-auth integration.
+
 The current server-qualified native URL correction only fixes routing. It neither
 authorizes a user nor supplies an unattended password. Do not replace it with a
 password-bearing URL, command line, or shared partner password.
