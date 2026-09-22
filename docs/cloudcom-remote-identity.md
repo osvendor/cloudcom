@@ -6,12 +6,39 @@ The design uses one shared company username/password in an isolated Docker Authe
 
 ## Customer experience and administration
 
+- Cloudflare One/WARP installation and device enrollment are not prerequisites.
+  The selected default is browser-assisted sign-in from the custom native app,
+  plus direct browser access for emergency sessions. Revisit Cloudflare One only
+  if a future requirement calls for it; do not broaden device enrollment now.
 - The extension manages the company gateway identity and individual Breeze customer accounts, including disablement, manual password resets, session revocation, and device assignments under Extensions → Remote Access.
 - Customers use individual Breeze username/password accounts with the existing `remote_only` entitlement. Do not replace them with Authentik identities.
 - Do not enable customer MFA, self-registration, email codes, or self-service account recovery. Existing administrator authentication and MFA policy remain unchanged.
 - Customers receive no Breeze administrator role or general customer-portal access. A successful login with no explicit assignment returns no computers.
 - Native login uses the system browser and authorization code flow with PKCE. The app API's Cloudflare transport still needs an explicit solution; do not place a shared gateway secret or embedded credential in a native binary or app bundle.
 - Remote authentication does not sign the user into Windows on the target computer.
+
+## Native Cloudflare transport decision
+
+Opening the system browser does not authenticate later native HTTP requests.
+The native client must obtain its own user-scoped Access application token and
+send it only to the configured HTTPS service, alongside the separate Breeze
+session credential. The selected flow must retain both the company check and
+the personal Breeze login. A browser cookie must not be scraped or copied.
+
+Cloudflare documents a browser-based cryptographic token transfer through
+`cloudflared access login`, followed by application-scoped token retrieval and
+the `cf-access-token` request header. This is a candidate transport for a bundled,
+verified helper, not an implemented or accepted dependency yet. Any helper must
+have a pinned integrity-checked executable, bounded lifetime and output, private
+token storage, and no token-bearing logs or URLs. No shared service token may be
+embedded in the app. Cloudflare One is not a fallback requirement.
+
+Acceptance must cover first sign-in, retained company browser sessions, native
+code exchange and device-list API requests, expired Access sessions, cancellation,
+sign-out, another company's personal account, and live assignment revocation.
+Do not enable native access based only on a successful browser login.
+
+Reference: [Cloudflare Access CLI authentication](https://developers.cloudflare.com/cloudflare-one/tutorials/cli/).
 
 ## Isolation and integration contract
 
