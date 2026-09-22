@@ -3,11 +3,12 @@
 ## Status and intended experience
 
 The browser implementation is deployed behind explicit organization settings and
-customer device assignments; production acceptance is still in progress. Core migrations
+customer device assignments. Production-origin Windows acceptance passed on
+2026-09-22 at source `a88a6267766ee7279277b06defcab14139266fe3`. Core migrations
 provide forced-RLS customer assignments/settings/sessions, and portal routes
 enforce the remote-only identity boundary. The separate extension manages
 assignments through the scoped host API. Browser session creation, offers,
-live leases, viewer presence and fenced termination are wired for testing.
+live leases, viewer presence and fenced termination passed the acceptance below.
 WebRTC availability uses the same live authorization as session creation and
 requires both endpoint enforcement protocols. The global feature defaults off;
 RustDesk availability remains off until native acceptance succeeds.
@@ -32,7 +33,8 @@ The current public ingress also has a host-wide Cloudflare Access login. Custome
 portal reachability needs separately reviewed, narrowly scoped Access routing for
 the portal and its API paths while retaining staff-route protection. An origin
 tunnel used for acceptance does not prove public customer reachability. No Access
-policy was changed by this implementation.
+policy was changed by this implementation. Public customer access is therefore
+not ready solely because the origin acceptance passed.
 
 A production-origin canary with an existing Windows agent streamed a real
 1920×1080 lock screen, denied the unassigned same-organization customer with 404,
@@ -40,6 +42,21 @@ survived a further 75 seconds of viewing, and confirmed the customer's End sessi
 action. This used temporary remote-only credentials and an authenticated origin
 tunnel; it validates the Windows transport, not public Cloudflare reachability or
 TURN relay fallback. No Windows password was entered during this canary.
+The corrected deployed release also passed the actual login form: both temporary
+customers received `remote_only`, landed directly on their assigned-computer page,
+and the unassigned customer could not retrieve the active session. Both Windows
+test sessions reached agent-confirmed termination. The two temporary customers,
+their grant, and their session rows were removed after confirmation; the previous
+organization settings were restored and the private test tunnel was stopped.
+
+The final login correction passed 23 API authentication tests, the real-database
+login regression, all 771 portal tests, focused remote API TypeScript checking,
+and API/portal builds. All three final images were built from the same immutable
+source archive, independently verified, and included in the signed local release
+inventory. Packaged QA repeated settings save, grant, revoke, actual login,
+video/mouse input and 75-second lease survival; assignment revocation was observed
+in 4.7 seconds and the endpoint confirmed its terminal fence. Existing agent
+binary version and unrelated extension images/configuration were preserved.
 
 ### Browser QA checkpoint (2026-09-22)
 
@@ -63,11 +80,12 @@ Focused TypeScript checking of the remote API production files and their unit
 and integration test roots also passed with a 6 GB heap. This is not a claim
 that the entire inherited API typecheck passed.
 
-The checkpoint above is isolated Linux acceptance, not Windows acceptance. The
+The Linux checkpoint above is separate from the production-origin Windows test. The
 test used an Xvfb desktop and a locally supplied OpenH264 library; it does not
-validate production codec packaging, cross-network TURN routing, Windows login
-screens, a Breeze upgrade, or the custom native RustDesk client. Those remain
-release/transport acceptance requirements.
+validate production codec packaging, cross-network TURN routing, a future upstream
+Breeze upgrade, or the custom native RustDesk client. The separate Windows test
+validated the deployed codec/lock-screen path; it did not validate Windows credential
+entry or TURN fallback. Those untested paths remain explicit acceptance requirements.
 
 Device lifecycle boundary: permanent device deletion removes remote sessions
 before assignments through the existing audited cascade. Organization moves and
@@ -77,7 +95,7 @@ workflow is needed for transfer without permanent device deletion. This avoids
 silently carrying customer access or ownership history into another tenant.
 The user wants an installed RustDesk client: sign in with a Breeze account, list
 only explicitly approved devices, then connect without entering a device password.
-Configuration belongs in a separate **Extensions → RustDesk Access** page. Keep the
+Configuration is in the separate **Extensions → Remote Access** page. Keep the
 existing device-page Connect action as the technician entry point. The Cloud Command
 extension and its 3CX code are owned by concurrent work and must not be modified.
 
@@ -217,9 +235,10 @@ unstable private authentication code or overwrite its shared registry changes.
    settings/assignment UI are implemented in source. Existing focused unit and
    integration evidence covers the authorization policy, RLS/schema contracts,
    portal routing/API contracts, and extension behavior. The complete browser
-   desktop acceptance flow is still in progress: live signaling, media/input,
-   revocation, and end-to-end portal acceptance remain to be run in designated
-   QA. Native RustDesk client/server changes, native sign-in, and native
+   desktop acceptance flow passed in designated Linux QA, and the deployed
+   Windows transport and corrected customer login passed origin acceptance as
+   recorded above. Public ingress and TURN fallback remain unverified.
+   Native RustDesk client/server changes, native sign-in, and native
    transport enforcement remain untouched and are not claimed complete.
 2. Pin client/server builds and implement a canary target + operator protocol proof.
    Prove unauthorized direct-ID access fails with the OLD device password. Prove
