@@ -3,7 +3,7 @@ import type { Variables } from './index';
 import { microsoftResources, projectMicrosoftResource, type MicrosoftResource, type NativeMicrosoftServices } from './native-microsoft';
 import { microsoftOnboardingStatus } from './onboarding';
 
-/** Native connection lifecycle remains owned by Breeze's Integrations surface. */
+/** Native connection lifecycle remains owned by the single Extensions Connect surface. */
 export function mountMicrosoftRoutes(app: Hono<{ Variables: Variables }>, services?: NativeMicrosoftServices) {
   app.use('/microsoft/*', async (c, next) => {
     const queries = new URL(c.req.url).searchParams;
@@ -30,8 +30,8 @@ export function mountMicrosoftRoutes(app: Hono<{ Variables: Variables }>, servic
     code: 'onboarding_unavailable',
   }, 503));
   // Old clients must not silently create a second tenant mapping or revive CIPP.
-  app.put('/microsoft/connection', c => c.json({ error: 'Manage the native Microsoft connection in Integrations.', code: 'native_connection_required' }, 409));
-  app.get('/microsoft/tenants', c => c.json({ error: 'Manage the native Microsoft connection in Integrations.', code: 'native_connection_required' }, 409));
+  app.put('/microsoft/connection', c => c.json({ error: 'Manage the native Microsoft connection in Extensions > Connect.', code: 'native_connection_required' }, 409));
+  app.get('/microsoft/tenants', c => c.json({ error: 'Manage the native Microsoft connection in Extensions > Connect.', code: 'native_connection_required' }, 409));
   app.get('/microsoft/resources/:resource', async c => {
     const resource = c.req.param('resource');
     if (!Object.hasOwn(microsoftResources, resource)) return c.json({ error: 'Unsupported resource.', code: 'unsupported_resource' }, 404);

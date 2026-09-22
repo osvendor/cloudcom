@@ -107,7 +107,7 @@ describe('CloudCommandMicrosoftPage', () => {
     await flush();
     await flush();
     expect(page.shadowRoot!.textContent).toContain('Admin consent is pending.');
-    expect(page.shadowRoot!.querySelector('#setup-integrations')?.getAttribute('href')).toBe('/integrations');
+    expect(page.shadowRoot!.querySelector('#setup-integrations')?.getAttribute('href')).toBe('/extensions/cloudcommand/connect#microsoft');
     expect(page.shadowRoot!.querySelector('#tenant')).toBeNull();
     expect(page.shadowRoot!.querySelector('#bind')).toBeNull();
     expect(request.mock.calls.every(([path, init]) => path !== '/microsoft/tenants' && !init?.method)).toBe(true);
