@@ -1,8 +1,4 @@
-import {
-  dispatchExtensionHostEvent,
-  parseExtensionPageContextV1,
-  type ExtensionPageContextV1,
-} from '@breeze/extension-web-sdk';
+import { parseExtensionPageContextV1, type ExtensionPageContextV1 } from '@breeze/extension-web-sdk';
 
 const ELEMENT = 'cloudcommand-microsoft-page';
 const RESOURCES = ['users', 'groups', 'licenses', 'sites'] as const;
@@ -18,7 +14,6 @@ type Connection = {
   status?: string;
   reason?: string;
 };
-type ThreeCxNavigationStatus = { connected: boolean; canManage?: boolean; enabled?: boolean };
 type ResourceRow = { id: string; values: Record<string, string | number | boolean | null> };
 type ResourceData = {
   items: ResourceRow[];
@@ -28,6 +23,7 @@ type ResourceData = {
 };
 type DetailKind = 'read' | 'user' | 'group';
 type MicrosoftRecord = Record<string, unknown>;
+type UserDraft = Partial<Record<(typeof USER_FIELDS)[number], string>> & { accountEnabled?: boolean };
 const USER_FIELDS = ['displayName', 'givenName', 'surname', 'department', 'jobTitle', 'officeLocation'] as const;
 const USER_VERIFY_READS = 4;
 const USER_VERIFY_DELAY_MS = 1000;
@@ -57,13 +53,15 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private membershipUserId = '';
   private membershipAction: 'add' | 'remove' = 'add';
   private membershipConfirmed = false;
+  private userDraft: UserDraft = {};
+  private visibleColumns: string[] = [];
+  private expandedRowId: string | null = null;
   private returnFocus: string | null = null;
   private message = '';
   private error = false;
   private generation = 0;
   private busy = false;
   private resourceRequest = 0;
-  private threeCxNavigationVisible = false;
 
   set context(input: unknown) {
     const context = parseExtensionPageContextV1(input);
@@ -100,9 +98,14 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       this.resource = next;
       this.data = null;
       this.detail = null;
+      this.detailRecord = null;
+      this.detailRequest += 1;
       this.userVerificationRequest += 1;
       this.busy = false;
       this.filter = '';
+      this.userDraft = {};
+      this.expandedRowId = null;
+      this.visibleColumns = [];
       this.render();
       if (this.canRead()) void this.loadResource();
     }
@@ -120,10 +123,11 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.resourceRequest += 1;
     this.busy = false;
     this.connection = null;
-    this.threeCxNavigationVisible = false;
     this.data = null;
     this.detail = null;
     this.detailRecord = null;
+    this.expandedRowId = null;
+    this.visibleColumns = [];
     this.detailRequest += 1;
     this.userVerificationRequest += 1;
     this.drawerMessage = '';
@@ -131,6 +135,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.membershipUserId = '';
     this.membershipAction = 'add';
     this.membershipConfirmed = false;
+    this.userDraft = {};
     this.filter = '';
     this.message = '';
     this.error = false;
@@ -172,31 +177,14 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       const result = await this.request<Connection>(this.path('/connection'));
       if (generation !== this.generation || context !== this.contextValue) return;
       this.connection = result;
-      this.setMessage(result.reason || (result.connected ? 'Microsoft connection loaded.' : 'Connect Microsoft 365 in Extensions > Connect.'));
+      this.setMessage(result.connected ? '' : (result.reason || 'Connect Microsoft 365 in Extensions > Connect.'));
       this.render();
-      void this.loadThreeCxNavigation(generation, context);
       if (this.canRead()) void this.loadResource();
     } catch (e) {
       if (generation === this.generation && context === this.contextValue) {
         this.setMessage(e instanceof Error ? e.message : 'Could not load Microsoft connection.', true);
         this.render();
       }
-    }
-  }
-  private async loadThreeCxNavigation(
-    generation: number,
-    context: ExtensionPageContextV1 | null,
-  ): Promise<void> {
-    try {
-      const status = await this.request<ThreeCxNavigationStatus>('/threecx/connection');
-      if (generation !== this.generation || context !== this.contextValue) return;
-      this.threeCxNavigationVisible =
-        (status.connected === true && status.enabled === true) || status.canManage === true;
-      this.render();
-    } catch {
-      if (generation !== this.generation || context !== this.contextValue) return;
-      this.threeCxNavigationVisible = false;
-      this.render();
     }
   }
   private async loadResource(): Promise<void> {
@@ -206,6 +194,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const request = ++this.resourceRequest;
     this.data = null;
     this.detail = null;
+    this.setMessage(`Loading ${labels[resource].toLowerCase()}…`);
     this.render();
     try {
       const raw = await this.request<unknown>(this.path(`/resources/${resource}`));
@@ -213,36 +202,15 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (generation !== this.generation || resource !== this.resource || request !== this.resourceRequest)
         return;
       this.data = data;
-      this.setMessage(
-        data.items.length
-          ? `${labels[resource]} loaded.`
-          : `No ${labels[resource].toLowerCase()} are available for this tenant.`,
-      );
+      this.visibleColumns = this.visibleColumns.filter(key => data.columns.some(column => column.key === key));
+      if (!this.visibleColumns.length) this.visibleColumns = data.columns.map(column => column.key);
+      this.setMessage(data.items.length ? '' : `No ${labels[resource].toLowerCase()} are available for this tenant.`);
     } catch (e) {
       if (generation === this.generation && resource === this.resource && request === this.resourceRequest)
         this.setMessage(e instanceof Error ? e.message : 'Could not load Microsoft resource.', true);
     } finally {
       if (generation === this.generation && request === this.resourceRequest) this.render();
     }
-  }
-  private async run(action: () => Promise<void>, fallback: string): Promise<void> {
-    if (this.busy) return;
-    const generation = this.generation;
-    this.busy = true;
-    this.render();
-    try {
-      await action();
-    } catch (e) {
-      if (generation === this.generation) this.setMessage(e instanceof Error ? e.message : fallback, true);
-    } finally {
-      if (generation === this.generation) {
-        this.busy = false;
-        this.render();
-      }
-    }
-  }
-  private navigate(path: string): void {
-    dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path });
   }
   private openDetail(row: ResourceRow): void {
     this.busy = false;
@@ -255,6 +223,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.membershipUserId = '';
     this.membershipAction = 'add';
     this.membershipConfirmed = false;
+    this.userDraft = {};
     this.returnFocus = `row-${row.id}`;
     this.render();
     queueMicrotask(() => this.root.querySelector<HTMLButtonElement>('#detail-close')?.focus());
@@ -272,6 +241,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.membershipUserId = '';
     this.membershipAction = 'add';
     this.membershipConfirmed = false;
+    this.userDraft = {};
     this.render();
     if (id)
       queueMicrotask(() =>
@@ -292,7 +262,9 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (generation !== this.generation || context !== this.contextValue || request !== this.detailRequest || this.detail?.id !== id || this.detailKind !== kind) return null;
       if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error(`Invalid Microsoft ${kind} response.`);
       this.detailRecord = body as MicrosoftRecord;
+      this.userDraft = {};
       this.render();
+      queueMicrotask(() => this.root.querySelector<HTMLButtonElement>('#detail-close')?.focus());
       return this.detailRecord;
     } catch (error) {
       if (generation === this.generation && context === this.contextValue && request === this.detailRequest && this.detail?.id === id && this.detailKind === kind) {
@@ -315,6 +287,29 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     if (!enabled) return null;
     update.accountEnabled = enabled.checked;
     return update;
+  }
+  private updateVisibleColumns(key: string): void {
+    const columns = this.data?.columns ?? [];
+    const identity = columns[0]?.key;
+    if (key === identity) return;
+    this.visibleColumns = this.visibleColumns.includes(key)
+      ? this.visibleColumns.filter(column => column !== key)
+      : [...this.visibleColumns, key];
+    this.render();
+  }
+  private resetVisibleColumns(): void {
+    this.visibleColumns = this.data?.columns.map(column => column.key) ?? [];
+    this.render();
+  }
+  private rowIdentity(row: ResourceRow, column: { key: string; label: string }): string {
+    if (this.resource !== 'users') return esc(String(row.values[column.key] ?? '—'));
+    const name = row.values.displayName ?? row.values[column.key] ?? row.id;
+    const email = row.values.userPrincipalName ?? row.values.mail;
+    return `<strong>${esc(String(name))}</strong>${email && String(email) !== String(name) ? `<span>${esc(String(email))}</span>` : ''}`;
+  }
+  private formatCheckedAt(value: string): string {
+    const date = new Date(value);
+    return Number.isNaN(date.valueOf()) ? value : new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(date);
   }
   private userVerificationIsCurrent(id: string, generation: number, context: ExtensionPageContextV1 | null, request: number): boolean {
     return this.isConnected && generation === this.generation && context === this.contextValue
@@ -344,7 +339,15 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
         const readback = await this.readUserForVerification(id, generation, context, verification);
         if (!readback || !this.userVerificationIsCurrent(id, generation, context, verification)) return;
         this.detailRecord = readback;
-        if (this.userMatchesUpdate(readback, update)) { this.drawerError = false; this.drawerMessage = 'User changes saved and verified.'; return; }
+        if (this.userMatchesUpdate(readback, update)) {
+          this.detailRecord = readback;
+          const row = this.data?.items.find(item => item.id === id);
+          if (row) for (const field of [...USER_FIELDS, 'accountEnabled'] as const) {
+            if (field in readback && typeof readback[field] !== 'object') row.values[field] = readback[field] as string | number | boolean | null;
+          }
+          this.userDraft = {};
+          this.drawerError = false; this.drawerMessage = 'User changes saved and verified.'; return;
+        }
         if (attempt < USER_VERIFY_READS - 1) await new Promise<void>(resolve => setTimeout(resolve, USER_VERIFY_DELAY_MS));
         if (!this.userVerificationIsCurrent(id, generation, context, verification)) return;
       }
@@ -386,43 +389,59 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const detail = this.detail!;
     const record = this.detailRecord;
     const feedback = `<p class="drawer-feedback ${this.drawerError ? 'error' : ''}" data-testid="detail-mutation-feedback" role="${this.drawerError ? 'alert' : 'status'}">${esc(this.drawerMessage)}</p>`;
+    const userName = String(record?.displayName ?? detail.values.displayName ?? detail.id);
+    const userEmail = record?.userPrincipalName ?? detail.values.userPrincipalName ?? detail.values.mail;
+    const subtitle = this.detailKind === 'user' ? `${esc(userName)}${userEmail && String(userEmail) !== userName ? ` · ${esc(String(userEmail))}` : ''}` : '';
     let content: string;
     if (this.detailKind === 'read') {
-      content = `<dl>${Object.entries(detail.values).map(([key, value]) => `<div><dt>${esc(key)}</dt><dd>${esc(String(value ?? '—'))}</dd></div>`).join('')}</dl>`;
+      content = `<div class="drawer-body"><dl>${Object.entries(detail.values).map(([key, value]) => `<div><dt>${esc(key)}</dt><dd>${esc(String(value ?? '—'))}</dd></div>`).join('')}</dl></div><footer class="drawer-footer">${feedback}</footer>`;
     } else if (!record) {
-      content = `<p class="subtle">Loading current ${this.detailKind} details…</p>${feedback}`;
+      content = `<div class="drawer-body"><p class="subtle">Loading current ${this.detailKind} details…</p></div><footer class="drawer-footer">${feedback}</footer>`;
     } else if (this.detailKind === 'user') {
-      const field = (name: typeof USER_FIELDS[number], label: string) => `<label>${label}<input id="user-${name}" value="${esc(String(record[name] ?? ''))}" ${this.busy || !canManage ? 'disabled' : ''}></label>`;
-      content = `<p class="meta">User ID: ${esc(detail.id)}</p>${field('displayName', 'Display name')}${field('givenName', 'Given name')}${field('surname', 'Surname')}${field('department', 'Department')}${field('jobTitle', 'Job title')}${field('officeLocation', 'Office location')}<label class="check"><input id="user-account-enabled" type="checkbox" ${record.accountEnabled === true ? 'checked' : ''} ${this.busy || !canManage ? 'disabled' : ''}> Account enabled</label>${canManage ? `<div class="actions"><button id="user-save" ${this.busy ? 'disabled' : ''}>Save and verify user</button></div>` : '<p class="read-only">An organization administrator can edit this user.</p>'}${feedback}`;
+      const field = (name: typeof USER_FIELDS[number], label: string) => `<label><span>${label}</span><input id="user-${name}" value="${esc(String(this.userDraft[name] ?? record[name] ?? ''))}" ${this.busy || !canManage ? 'disabled' : ''}></label>`;
+      const enabled = this.userDraft.accountEnabled ?? record.accountEnabled;
+      content = `<div class="drawer-body"><p class="meta">User ID: ${esc(detail.id)}</p><section class="drawer-section"><h3>Profile</h3><div class="field-grid">${field('displayName', 'Display name')}${field('givenName', 'Given name')}${field('surname', 'Surname')}${field('department', 'Department')}${field('jobTitle', 'Job title')}${field('officeLocation', 'Office location')}</div></section><section class="drawer-section"><h3>Account access</h3><label class="check"><input id="user-account-enabled" type="checkbox" ${enabled === true ? 'checked' : ''} ${this.busy || !canManage ? 'disabled' : ''}> Account enabled</label></section></div>${canManage ? `<footer class="drawer-footer"><div class="actions"><button id="user-save" ${this.busy ? 'disabled' : ''}>Save and verify user</button></div>${feedback}</footer>` : `<footer class="drawer-footer"><p class="read-only">An organization administrator can edit this user.</p>${feedback}</footer>`}`;
     } else {
-      content = `<p class="meta">Group ID: ${esc(detail.id)}</p><p class="meta">${record.displayName ? `Group: ${esc(String(record.displayName))}` : 'Group details loaded.'}</p>${canManage ? `<label>Member user ID<input id="group-member-user-id" value="${esc(this.membershipUserId)}" autocomplete="off" ${this.busy ? 'disabled' : ''}></label><label>Membership action<select id="group-member-action" ${this.busy ? 'disabled' : ''}><option value="add" ${this.membershipAction === 'add' ? 'selected' : ''}>Add member</option><option value="remove" ${this.membershipAction === 'remove' ? 'selected' : ''}>Remove member</option></select></label><label class="check"><input id="group-member-confirm" type="checkbox" ${this.membershipConfirmed ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> I confirm this membership change</label><div class="actions"><button id="group-member-submit" ${this.busy ? 'disabled' : ''}>Confirm membership change</button></div>` : '<p class="read-only">An organization administrator can change group membership.</p>'}${feedback}`;
+      content = `<div class="drawer-body"><p class="meta">Group ID: ${esc(detail.id)}</p><p class="meta">${record.displayName ? `Group: ${esc(String(record.displayName))}` : 'Group details loaded.'}</p>${canManage ? `<label>Member user ID<input id="group-member-user-id" value="${esc(this.membershipUserId)}" autocomplete="off" ${this.busy ? 'disabled' : ''}></label><label>Membership action<select id="group-member-action" ${this.busy ? 'disabled' : ''}><option value="add" ${this.membershipAction === 'add' ? 'selected' : ''}>Add member</option><option value="remove" ${this.membershipAction === 'remove' ? 'selected' : ''}>Remove member</option></select></label><label class="check"><input id="group-member-confirm" type="checkbox" ${this.membershipConfirmed ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> I confirm this membership change</label>` : '<p class="read-only">An organization administrator can change group membership.</p>'}</div><footer class="drawer-footer">${canManage ? `<div class="actions"><button id="group-member-submit" ${this.busy ? 'disabled' : ''}>Confirm membership change</button></div>` : ''}${feedback}</footer>`;
     }
-    return `<div class="backdrop" data-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="detail-title"><div class="heading"><h2 id="detail-title">${this.detailKind === 'user' ? 'Edit user' : this.detailKind === 'group' ? 'Group membership' : 'Resource details'}</h2><button class="secondary compact" id="detail-close">Close</button></div>${content}</aside></div>`;
+    const title = this.detailKind === 'user' ? (canManage ? 'Edit account' : 'View account') : this.detailKind === 'group' ? 'Manage members' : 'Resource details';
+    return `<div class="backdrop" data-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="detail-title"><div class="heading drawer-heading"><div><h2 id="detail-title">${title}</h2>${subtitle ? `<p class="subtle">${subtitle}</p>` : ''}</div><button class="secondary compact" id="detail-close">Close</button></div>${content}</aside></div>`;
   }
 
   private render(): void {
     const connection = this.connection;
     const canManage = connection?.canManage === true;
     const canRead = this.canRead();
-    const filtered =
-      this.data?.items.filter((row) =>
-        JSON.stringify(row.values).toLowerCase().includes(this.filter.toLowerCase()),
-      ) ?? [];
-    this.root.innerHTML = `<style>${styles}</style><main><header><div><p class="eyebrow">Cloud Command</p><h1>Microsoft 365</h1><p class="subtle">${canManage ? 'Manage supported Microsoft users and group membership for this organization.' : 'Read-only Microsoft tenant inventory for this organization.'}</p></div><span class="badge ${canRead ? 'ok' : ''}">${connection?.available === false ? 'Unavailable' : connection?.connected ? (connection.enabled === false ? 'Disabled' : 'Connected') : 'Not configured'}</span></header><p class="status" data-testid="status" data-error="${this.error}" aria-live="polite">${esc(this.message)}</p><nav aria-label="Cloud Command providers">${this.threeCxNavigationVisible ? '<button class="secondary compact" data-testid="go-threecx">3CX</button>' : ''}<button class="secondary compact" data-testid="go-microsoft">Microsoft 365</button></nav><section class="card"><div class="heading"><div><h2>${connection?.available === false ? 'Provider unavailable' : 'Microsoft connection'}</h2><p class="subtle">${esc(connection?.reason || (connection?.connected ? `Connected${connection.tenantName ? ` to ${connection.tenantName}` : ''}.` : 'Connect Microsoft 365 in Extensions > Connect to enable inventory.'))}</p>${connection?.status ? `<p class="meta">Status: ${esc(connection.status)}</p>` : ''}</div>${canManage ? '<a class="setup-link" id="setup-integrations" href="/extensions/cloudcommand/connect#microsoft">Open Connect</a>' : ''}</div></section><section class="card"><div class="heading"><div><h2>Directory and service inventory</h2><p class="subtle">Only the available read resources are shown.</p></div><button class="secondary compact" id="refresh-resource" ${!canRead ? 'disabled' : ''}>Refresh</button></div><div class="resource-nav"><span>Identity</span><button data-resource="users" class="secondary compact ${this.resource === 'users' ? 'selected' : ''}" ${!canRead ? 'disabled' : ''}>Users</button><button data-resource="groups" class="secondary compact ${this.resource === 'groups' ? 'selected' : ''}" ${!canRead ? 'disabled' : ''}>Groups</button><span>Tenant</span><button data-resource="licenses" class="secondary compact ${this.resource === 'licenses' ? 'selected' : ''}" ${!canRead ? 'disabled' : ''}>Licenses</button><span>Teams &amp; SharePoint</span><button data-resource="sites" class="secondary compact ${this.resource === 'sites' ? 'selected' : ''}" ${!canRead ? 'disabled' : ''}>Sites</button></div>${canRead ? `<label class="filter">Filter ${labels[this.resource]}<input id="filter" data-testid="filter" value="${esc(this.filter)}" placeholder="Filter loaded rows"></label>${this.data ? `<p class="meta">${this.data.complete ? 'Complete' : 'Partial'} · checked ${esc(this.data.checkedAt)}</p>${filtered.length ? `<div class="table-wrap"><table><thead><tr>${this.data.columns.map((column) => `<th>${esc(column.label)}</th>`).join('')}<th><span class="sr-only">Details</span></th></tr></thead><tbody>${filtered.map((row) => `<tr>${this.data!.columns.map((column) => `<td>${esc(String(row.values[column.key] ?? '—'))}</td>`).join('')}<td><button class="secondary compact" data-testid="row-${esc(row.id)}" data-detail="${esc(row.id)}">View details</button></td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No rows match this filter.</div>'}` : '<div class="empty">Select a resource to load its current read-only inventory.</div>'}` : `<div class="empty">${connection?.connected && connection.enabled === false ? 'Enable this connection before loading inventory.' : 'Connect Microsoft 365 in Extensions > Connect before loading inventory.'}</div>`}</section>${
-      this.detail ? this.renderDrawer(canManage) : ''
-    }</main>`;
-    this.root
-      .querySelector('[data-testid="go-threecx"]')
-      ?.addEventListener('click', () => this.navigate('/extensions/cloudcommand/threecx'));
-    this.root
-      .querySelector('[data-testid="go-microsoft"]')
-      ?.addEventListener('click', () => this.navigate('/extensions/cloudcommand/microsoft'));
+    const filtered = this.data?.items.filter(row => JSON.stringify(row.values).toLowerCase().includes(this.filter.toLowerCase())) ?? [];
+    const columns = this.data?.columns.filter((column, index) => (index === 0 || this.visibleColumns.includes(column.key)) && !(this.resource === 'users' && column.key === 'userPrincipalName')) ?? [];
+    const loadedCount = this.data ? `${this.data.items.length}${this.data.complete ? '' : ' loaded'}` : '—';
+    const tenant = connection?.tenantName || 'Microsoft 365 tenant';
+    const tabs = (['users', 'groups', 'licenses'] as const).map(resource => `<button data-resource="${resource}" role="tab" aria-selected="${this.resource === resource}" class="resource-tab" ${!canRead ? 'disabled' : ''}>${labels[resource]}</button>`).join('');
+    const chips = this.data ? `<div class="column-tools"><span>Columns</span>${this.data.columns.filter(column => !(this.resource === 'users' && column.key === 'userPrincipalName')).map((column, index) => `<button class="column-chip" data-column="${esc(column.key)}" aria-pressed="${index === 0 || this.visibleColumns.includes(column.key)}" ${index === 0 ? 'disabled' : ''}>${esc(column.label)}</button>`).join('')}<button class="secondary compact" id="reset-columns">Reset</button></div>` : '';
+    const rows = filtered.map(row => {
+      const expanded = this.expandedRowId === row.id;
+      const cells = columns.map((column, index) => `<td class="${index === 0 ? 'identity' : ''}">${index === 0 ? this.rowIdentity(row, column) : typeof row.values[column.key] === 'boolean' ? `<span class="state ${row.values[column.key] ? 'on' : ''}">${row.values[column.key] ? 'Enabled' : 'Disabled'}</span>` : esc(String(row.values[column.key] ?? '—'))}</td>`).join('');
+      const action = this.resource === 'users' ? `<button class="secondary compact" data-testid="row-${esc(row.id)}" data-expand="${esc(row.id)}" aria-expanded="${expanded}">${canManage ? 'Account' : 'View account'} <span aria-hidden="true">${expanded ? '⌃' : '⌄'}</span></button>` : `<button class="secondary compact" data-testid="row-${esc(row.id)}" data-detail="${esc(row.id)}">${this.resource === 'groups' ? 'Manage members' : 'View details'}</button>`;
+      const expandedRow = this.resource === 'users' && expanded ? `<tr class="row-actions"><td colspan="${columns.length + 1}"><div><span>Account</span><button class="secondary compact" data-detail="${esc(row.id)}">${canManage ? 'Edit account' : 'View account'}</button></div></td></tr>` : '';
+      return `<tr class="${this.detail?.id === row.id || expanded ? 'selected-row' : ''}">${cells}<td class="row-control">${action}</td></tr>${expandedRow}`;
+    }).join('');
+    const inventory = !canRead ? `<div class="empty">${connection?.connected && connection.enabled === false ? 'Enable this connection before loading inventory.' : 'Connect Microsoft 365 in Extensions > Connect before loading inventory.'}</div>` : !this.data ? `<div class="empty">${this.error ? `Could not load ${labels[this.resource].toLowerCase()}. Use Refresh to try again.` : `Loading current ${labels[this.resource].toLowerCase()}…`}</div>` : !filtered.length ? `<div class="empty">${this.filter ? 'No rows match this search.' : `No ${labels[this.resource].toLowerCase()} are available for this tenant.`}</div>` : `<div class="table-wrap"><table><thead><tr>${columns.map(column => `<th>${esc(column.label)}</th>`).join('')}<th><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    this.root.innerHTML = `<style>${styles}</style><main><header><div><p class="eyebrow">Microsoft 365</p><h1>Directory</h1><p class="subtle">${esc(tenant)} · ${labels[this.resource]}: ${loadedCount}</p></div><span class="badge ${canRead ? 'ok' : ''}">${connection?.available === false ? 'Unavailable' : connection?.connected ? (connection.enabled === false ? 'Disabled' : 'Connected') : 'Not configured'}</span></header>${this.message ? `<p class="status" data-testid="status" data-error="${this.error}" aria-live="polite">${esc(this.message)}</p>` : '<p class="status" data-testid="status" aria-live="polite"></p>'}<section class="directory"><div class="directory-top">${canRead ? `<label class="filter"><span class="sr-only">Search ${labels[this.resource]}</span><input id="filter" data-testid="filter" value="${esc(this.filter)}" placeholder="${this.resource === 'users' ? 'Search name or email' : `Search ${labels[this.resource].toLowerCase()}`}"></label>` : ''}<nav class="resource-nav" role="tablist" aria-label="Microsoft directory resources">${tabs}</nav><button class="secondary compact" id="refresh-resource" ${!canRead ? 'disabled' : ''}>Refresh</button></div>${canRead ? `${chips}${this.data ? `<p class="meta">${this.data.complete ? 'Complete inventory' : 'Partial inventory'} · checked ${esc(this.formatCheckedAt(this.data.checkedAt))}</p>` : ''}${inventory}` : inventory}</section>${this.detail ? this.renderDrawer(canManage) : ''}</main>`;
     this.root.querySelector('#refresh-resource')?.addEventListener('click', () => void this.loadResource());
     this.root
       .querySelectorAll<HTMLButtonElement>('[data-resource]')
       .forEach((button) =>
         button.addEventListener('click', () => this.setResource(button.dataset.resource as Resource)),
       );
+    this.root.querySelectorAll<HTMLButtonElement>('[data-column]').forEach(button => button.addEventListener('click', () => {
+      const key = button.dataset.column!;
+      this.updateVisibleColumns(key);
+      queueMicrotask(() => Array.from(this.root.querySelectorAll<HTMLButtonElement>('[data-column]')).find(next => next.dataset.column === key)?.focus());
+    }));
+    this.root.querySelector('#reset-columns')?.addEventListener('click', () => {
+      this.resetVisibleColumns();
+      queueMicrotask(() => this.root.querySelector<HTMLButtonElement>('#reset-columns')?.focus());
+    });
     this.root.querySelector<HTMLInputElement>('#filter')?.addEventListener('input', (event) => {
       const input = event.target as HTMLInputElement;
       const start = input.selectionStart;
@@ -435,6 +454,12 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
         if (start !== null && end !== null) next?.setSelectionRange(start, end);
       });
     });
+    this.root.querySelectorAll<HTMLButtonElement>('[data-expand]').forEach(button => button.addEventListener('click', () => {
+      const id = button.dataset.expand!;
+      this.expandedRowId = this.expandedRowId === id ? null : id;
+      this.render();
+      queueMicrotask(() => Array.from(this.root.querySelectorAll<HTMLButtonElement>('[data-expand]')).find(next => next.dataset.expand === id)?.focus());
+    }));
     this.root.querySelectorAll<HTMLButtonElement>('[data-detail]').forEach((button) =>
       button.addEventListener('click', () => {
         const row = this.data?.items.find((item) => item.id === button.dataset.detail);
@@ -443,6 +468,23 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     );
     this.root.querySelector('#detail-close')?.addEventListener('click', () => this.closeDetail());
     this.root.querySelector('#user-save')?.addEventListener('click', () => void this.saveUser());
+    this.root.querySelectorAll<HTMLInputElement>('[id^="user-"]').forEach(input => input.addEventListener('input', () => {
+      const field = input.id.slice('user-'.length) as typeof USER_FIELDS[number];
+      if ((USER_FIELDS as readonly string[]).includes(field)) this.userDraft[field] = input.value;
+    }));
+    this.root.querySelector('#user-account-enabled')?.addEventListener('change', event => {
+      this.userDraft.accountEnabled = (event.target as HTMLInputElement).checked;
+    });
+    this.root.querySelector<HTMLInputElement>('#group-member-user-id')?.addEventListener('input', event => {
+      this.membershipUserId = (event.target as HTMLInputElement).value;
+    });
+    this.root.querySelector<HTMLSelectElement>('#group-member-action')?.addEventListener('change', event => {
+      const action = (event.target as HTMLSelectElement).value;
+      if (action === 'add' || action === 'remove') this.membershipAction = action;
+    });
+    this.root.querySelector<HTMLInputElement>('#group-member-confirm')?.addEventListener('change', event => {
+      this.membershipConfirmed = (event.target as HTMLInputElement).checked;
+    });
     this.root.querySelector('#group-member-submit')?.addEventListener('click', () => void this.changeMembership());
     this.root.querySelector('[data-backdrop]')?.addEventListener('click', (event) => {
       if (event.target === event.currentTarget) this.closeDetail();
@@ -452,8 +494,10 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
         event.preventDefault();
         this.closeDetail();
       } else if (event.key === 'Tab') {
-        event.preventDefault();
-        this.root.querySelector<HTMLButtonElement>('#detail-close')?.focus();
+        const focusable = Array.from(this.root.querySelectorAll<HTMLElement>('[role="dialog"] button:not(:disabled),[role="dialog"] input:not(:disabled),[role="dialog"] select:not(:disabled)'));
+        const index = focusable.indexOf(this.root.activeElement as HTMLElement);
+        const next = event.shiftKey ? (index <= 0 ? focusable.length - 1 : index - 1) : (index === focusable.length - 1 ? 0 : index + 1);
+        if (focusable.length && (index === -1 || next !== index + (event.shiftKey ? -1 : 1))) { event.preventDefault(); focusable[next]?.focus(); }
       }
     });
   }
@@ -495,5 +539,5 @@ function parseResourceData(input: unknown): ResourceData {
     throw new Error('Invalid Microsoft resource response.');
   return value as unknown as ResourceData;
 }
-const styles = `:host{display:block;color:hsl(var(--foreground));font-family:var(--font-sans,system-ui)}*{box-sizing:border-box}main{max-width:1100px;margin:auto;padding:1.5rem}header,.heading,.actions{display:flex;justify-content:space-between;gap:1rem;align-items:flex-start}h1,h2,p{margin:0}h1{font-size:1.5rem}h2{font-size:1.1rem}.eyebrow{color:hsl(var(--primary));font-weight:700;font-size:.75rem;text-transform:uppercase;letter-spacing:.08em}.subtle,.read-only,.meta{color:hsl(var(--muted-foreground));font-size:.875rem;margin-top:.35rem}.status{min-height:1.4rem;margin-top:.75rem;color:hsl(var(--muted-foreground))}.status[data-error="true"],.drawer-feedback.error{color:hsl(var(--destructive))}.badge,.state{background:hsl(var(--muted));border-radius:999px;font-size:.8rem;font-weight:700;padding:.25rem .6rem}.badge.ok,.state.on{background:hsl(var(--success) / .16);color:hsl(var(--success))}.setup-link{display:inline-block;background:hsl(var(--secondary));color:hsl(var(--secondary-foreground));border-radius:var(--radius,.5rem);padding:.5rem .85rem;text-decoration:none;font-weight:700}.card{background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);margin-top:1.25rem;padding:1.25rem}nav,.resource-nav{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-top:1rem}.resource-nav span{color:hsl(var(--muted-foreground));font-size:.8rem;font-weight:700;margin-left:.5rem}.resource-nav button.selected{background:transparent;border-bottom:2px solid hsl(var(--primary));border-radius:0;color:hsl(var(--primary));padding-bottom:calc(.3rem - 2px)}label{display:grid;gap:.4rem;font-size:.875rem;font-weight:500;margin-top:1rem;max-width:440px}select,input{background:hsl(var(--background));border:1px solid hsl(var(--input));border-radius:calc(var(--radius,.5rem) - 2px);color:inherit;font:inherit;min-height:2.5rem;padding:.5rem .65rem}.check{display:flex;align-items:center;gap:.5rem}.check input{min-height:auto;width:1rem}.actions{justify-content:flex-end;margin-top:1rem}button{background:hsl(var(--primary));border:0;border-radius:calc(var(--radius,.5rem) - 2px);color:hsl(var(--primary-foreground));cursor:pointer;font:inherit;font-weight:700;min-height:2.5rem;padding:.5rem .85rem}button.secondary{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground))}button.compact{font-size:.8rem;min-height:2rem;padding:.3rem .6rem}button:disabled{opacity:.6;cursor:not-allowed}button:focus,input:focus,select:focus{outline:2px solid hsl(var(--ring));outline-offset:2px}.filter{max-width:320px}.table-wrap{overflow:auto;margin-top:1rem}table{color:hsl(var(--foreground));border-collapse:collapse;min-width:640px;width:100%}th,td{border-bottom:1px solid hsl(var(--border));padding:.7rem;text-align:left}th{color:hsl(var(--muted-foreground));font-size:.75rem;text-transform:uppercase}.empty{border:1px dashed hsl(var(--border));border-radius:var(--radius,.5rem);color:hsl(var(--muted-foreground));margin-top:1rem;padding:1.25rem;text-align:center}.sr-only{clip:rect(0,0,0,0);height:1px;margin:-1px;overflow:hidden;position:absolute;width:1px}.backdrop{background:hsl(var(--foreground) / .32);display:flex;inset:0;justify-content:flex-end;position:fixed;z-index:20}.drawer{background:hsl(var(--card));box-shadow:-8px 0 24px hsl(var(--foreground) / .16);max-width:min(100%,30rem);overflow:auto;padding:1.5rem;width:100%}.drawer-feedback{margin-top:1rem;min-height:1.4rem}dl{margin:1.5rem 0}dl div{border-bottom:1px solid hsl(var(--border));padding:.75rem 0}dt{color:hsl(var(--muted-foreground));font-size:.75rem;font-weight:700}dd{margin:.25rem 0 0;overflow-wrap:anywhere}@media(max-width:600px){main{padding:1rem}header,.heading{flex-direction:column}}`;
+const styles = `:host{display:block;color:hsl(var(--foreground));font-family:var(--font-sans,system-ui)}*{box-sizing:border-box}main{max-width:1200px;margin:auto;padding:1.5rem}header,.directory-top,.heading,.actions{align-items:flex-start;display:flex;gap:1rem;justify-content:space-between}h1,h2,h3,p{margin:0}h1{font-size:1.55rem}h2{font-size:1.1rem}h3{font-size:.9rem}.eyebrow{color:hsl(var(--primary));font-size:.75rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.subtle,.read-only,.meta{color:hsl(var(--muted-foreground));font-size:.875rem;margin-top:.35rem}.status{color:hsl(var(--muted-foreground));min-height:1.4rem;margin-top:.75rem}.status:empty{display:none}.status[data-error="true"],.drawer-feedback.error{color:hsl(var(--destructive))}.badge,.state{background:hsl(var(--muted));border-radius:999px;font-size:.8rem;font-weight:700;padding:.25rem .6rem}.badge.ok,.state.on{background:hsl(var(--success) / .16);color:hsl(var(--success))}.directory{border-top:1px solid hsl(var(--border));margin-top:1.25rem;padding-top:.8rem}.resource-nav{display:flex;gap:.15rem}.resource-tab{background:transparent;border-radius:0;color:hsl(var(--muted-foreground));min-height:2.45rem;padding:.45rem .8rem}.resource-tab[aria-selected="true"]{border-bottom:2px solid hsl(var(--primary));color:hsl(var(--foreground))}label{display:grid;gap:.4rem;font-size:.875rem;font-weight:600;margin-top:1rem}select,input{background:hsl(var(--background));border:1px solid hsl(var(--input));border-radius:calc(var(--radius,.5rem) - 2px);color:inherit;font:inherit;min-height:2.5rem;padding:.5rem .65rem}.filter{margin:0;flex:1;max-width:420px;min-width:180px}.directory-top{align-items:center;flex-wrap:wrap}.directory-top .resource-nav{margin-right:auto}.column-tools{align-items:center;display:flex;flex-wrap:wrap;gap:.4rem;margin-top:1rem}.column-tools>span{color:hsl(var(--muted-foreground));font-size:.8rem;font-weight:700;margin-right:.15rem}.column-chip{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground));font-size:.78rem;min-height:2rem;padding:.25rem .55rem}.column-chip[aria-pressed="false"]{background:transparent;border:1px solid hsl(var(--border));color:hsl(var(--muted-foreground))}.check{align-items:center;display:flex;gap:.5rem}.check input{min-height:auto;width:1rem}.actions{justify-content:flex-end;margin-top:1rem}button{background:hsl(var(--primary));border:0;border-radius:calc(var(--radius,.5rem) - 2px);color:hsl(var(--primary-foreground));cursor:pointer;font:inherit;font-weight:700;min-height:2.5rem;padding:.5rem .85rem}button.secondary{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground))}button.compact{font-size:.8rem;min-height:2rem;padding:.3rem .6rem}button:disabled{cursor:not-allowed;opacity:.6}button:focus,input:focus,select:focus{outline:2px solid hsl(var(--ring));outline-offset:2px}.table-wrap{margin-top:1rem;overflow:auto}table{border-collapse:collapse;color:hsl(var(--foreground));min-width:700px;width:100%}th,td{border-bottom:1px solid hsl(var(--border));padding:.75rem;text-align:left;vertical-align:middle}th{color:hsl(var(--muted-foreground));font-size:.75rem;text-transform:uppercase}.identity strong,.identity span{display:block}.identity span{color:hsl(var(--muted-foreground));font-size:.84rem;margin-top:.15rem}.row-control{text-align:right}.selected-row td{background:hsl(var(--accent) / .42)}.row-actions td{background:hsl(var(--accent) / .28)}.row-actions td>div{align-items:center;display:flex;gap:.7rem}.empty{border:1px dashed hsl(var(--border));border-radius:var(--radius,.5rem);color:hsl(var(--muted-foreground));margin-top:1rem;padding:1.25rem;text-align:center}.sr-only{clip:rect(0,0,0,0);height:1px;margin:-1px;overflow:hidden;position:absolute;width:1px}.backdrop{background:hsl(var(--background) / .64);display:flex;inset:0;justify-content:flex-end;position:fixed;z-index:20}.drawer{background:hsl(var(--card));box-shadow:-8px 0 24px hsl(var(--foreground) / .16);display:flex;flex-direction:column;height:100%;max-width:min(100%,40rem);width:100%}.drawer-heading{border-bottom:1px solid hsl(var(--border));flex:0 0 auto;padding:1.25rem 1.5rem}.drawer-body{flex:1;min-height:0;overflow:auto;padding:1.25rem 1.5rem}.drawer-section{margin-top:1.25rem}.field-grid{display:grid;gap:.85rem;grid-template-columns:1fr}.field-grid label{align-items:center;display:grid;grid-template-columns:140px minmax(0,1fr);margin:0}.drawer-footer{border-top:1px solid hsl(var(--border));flex:0 0 auto;padding:1rem 1.5rem}.drawer-footer .actions{margin-top:0}.drawer-feedback{margin-top:.75rem;min-height:1.4rem}dl{margin:0}dl div{border-bottom:1px solid hsl(var(--border));padding:.75rem 0}dt{color:hsl(var(--muted-foreground));font-size:.75rem;font-weight:700}dd{margin:.25rem 0 0;overflow-wrap:anywhere}@media(max-width:600px){main{padding:1rem}.directory-top,.heading{flex-direction:column}.field-grid label{align-items:stretch;grid-template-columns:1fr}.drawer-heading{padding:1rem}.drawer-body,.drawer-footer{padding-left:1rem;padding-right:1rem}}`;
 if (!customElements.get(ELEMENT)) customElements.define(ELEMENT, CloudCommandMicrosoftPage);

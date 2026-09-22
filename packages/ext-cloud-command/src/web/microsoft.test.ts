@@ -3,6 +3,11 @@ import { CloudCommandMicrosoftPage } from './microsoft';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 const emptyResource = () => Response.json({ items: [], columns: [], complete: true, checkedAt: 'now' });
+function openUser(page: CloudCommandMicrosoftPage, id: string) {
+  const expand = page.shadowRoot!.querySelector<HTMLButtonElement>(`[data-expand="${id}"]`)!;
+  if (expand.getAttribute('aria-expanded') !== 'true') expand.click();
+  page.shadowRoot!.querySelector<HTMLButtonElement>(`[data-detail="${id}"]`)!.click();
+}
 function mount(request: (path: string, init?: RequestInit) => Promise<Response>, org = 'org-a') {
   const page = new CloudCommandMicrosoftPage();
   page.context = {
@@ -21,37 +26,17 @@ afterEach(() => {
 });
 
 describe('CloudCommandMicrosoftPage', () => {
-  it('shows 3CX navigation only when its connection is usable or manageable', async () => {
-    const page = mount(async (path) =>
-      path === '/threecx/connection'
-        ? Response.json({ connected: true, enabled: true, canManage: false })
-        : Response.json({ available: true, connected: false, canManage: false }),
-    );
-    await flush();
-    await flush();
-    expect(page.shadowRoot!.querySelector('[data-testid="go-threecx"]')).toBeTruthy();
-  });
-
-  it('hides a disabled 3CX connection from a read-only user', async () => {
-    const page = mount(async (path) =>
-      path === '/threecx/connection'
-        ? Response.json({ connected: true, enabled: false, canManage: false })
-        : Response.json({ available: true, connected: false, canManage: false }),
-    );
-    await flush();
-    await flush();
-    expect(page.shadowRoot!.querySelector('[data-testid="go-threecx"]')).toBeNull();
-  });
-
-  it('hides 3CX navigation when its status request fails without breaking Microsoft', async () => {
-    const page = mount(async (path) => {
-      if (path === '/threecx/connection') return Response.json({ error: 'unavailable' }, { status: 503 });
-      return Response.json({ available: false, connected: false, canManage: false, reason: 'Not installed' });
-    });
-    await flush();
-    await flush();
-    expect(page.shadowRoot!.querySelector('[data-testid="go-threecx"]')).toBeNull();
-    expect(page.shadowRoot!.textContent).toContain('Provider unavailable');
+  it('uses sidebar navigation and omits redundant connected setup and routine success text', async () => {
+    const request = vi.fn(async (path: string) => path === '/microsoft/connection'
+      ? Response.json({ available: true, connected: true, enabled: true, canManage: true, tenantName: 'Contoso' })
+      : emptyResource());
+    const page = mount(request);
+    await flush(); await flush();
+    expect(page.shadowRoot!.querySelector('[aria-label="Cloud Command providers"]')).toBeNull();
+    expect(page.shadowRoot!.querySelector('#setup-integrations')).toBeNull();
+    expect(page.shadowRoot!.textContent).not.toContain('Microsoft connection');
+    expect(page.shadowRoot!.textContent).not.toContain('Users loaded.');
+    expect(request.mock.calls.some(([path]) => path === '/threecx/connection')).toBe(false);
   });
 
   it('shows unavailable and read-only connection states honestly', async () => {
@@ -59,7 +44,8 @@ describe('CloudCommandMicrosoftPage', () => {
       Response.json({ available: false, connected: false, canManage: false, reason: 'Not installed' }),
     );
     await flush();
-    expect(unavailable.shadowRoot!.textContent).toContain('Provider unavailable');
+    expect(unavailable.shadowRoot!.querySelector('.badge')!.textContent).toBe('Unavailable');
+    expect(unavailable.shadowRoot!.textContent).toContain('Not installed');
     document.body.replaceChildren();
     const reader = mount(async (path) =>
       path.startsWith('/microsoft/resources/')
@@ -107,7 +93,8 @@ describe('CloudCommandMicrosoftPage', () => {
     await flush();
     await flush();
     expect(page.shadowRoot!.textContent).toContain('Admin consent is pending.');
-    expect(page.shadowRoot!.querySelector('#setup-integrations')?.getAttribute('href')).toBe('/extensions/cloudcommand/connect#microsoft');
+    expect(page.shadowRoot!.textContent).toContain('Connect Microsoft 365 in Extensions > Connect');
+    expect(page.shadowRoot!.querySelector('#setup-integrations')).toBeNull();
     expect(page.shadowRoot!.querySelector('#tenant')).toBeNull();
     expect(page.shadowRoot!.querySelector('#bind')).toBeNull();
     expect(request.mock.calls.every(([path, init]) => path !== '/microsoft/tenants' && !init?.method)).toBe(true);
@@ -206,13 +193,14 @@ describe('CloudCommandMicrosoftPage', () => {
       throw new Error(`Unexpected ${path}`);
     });
     const page = mount(request); await flush(); await flush();
-    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="user-1"]')!.click(); await flush();
+    openUser(page, 'user-1'); await flush();
     const name = page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!; name.value = 'Ada Byron';
     page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await new Promise(resolve => setTimeout(resolve, 1100));
     const update = request.mock.calls.map(([, init]) => init?.body).find(body => String(body).includes('user.update'));
     expect(JSON.parse(String(update))).toEqual({ type: 'user.update', id: 'user-1', update: { displayName: 'Ada Byron', givenName: 'Ada', surname: 'Lovelace', department: 'Engineering', jobTitle: 'Analyst', officeLocation: 'London', accountEnabled: true } });
     expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
     expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('saved and verified');
+    expect(page.shadowRoot!.querySelector('table')!.textContent).toContain('Ada Byron');
   });
 
   it('reports a mismatched user readback as uncertain without retrying', async () => {
@@ -228,7 +216,7 @@ describe('CloudCommandMicrosoftPage', () => {
       }
       throw new Error(`Unexpected ${path}`);
     });
-    const page = mount(request); await flush(); await flush(); page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="user-1"]')!.click(); await flush();
+    const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush();
     page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!.value = 'Changed'; page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await new Promise(resolve => setTimeout(resolve, 3100));
     expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('did not confirm');
     expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
@@ -249,7 +237,7 @@ describe('CloudCommandMicrosoftPage', () => {
       }
       throw new Error(`Unexpected ${path}`);
     });
-    const page = mount(request); await flush(); await flush(); page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="user-1"]')!.click(); await flush();
+    const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush();
     page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!.value = 'Changed'; page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush();
     page.context = { contractVersion: 1, extensionName: 'cloudcommand', path: '/extensions/cloudcommand/microsoft', organizationId: 'org-b' };
     verify(Response.json({ displayName: 'Changed', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '', accountEnabled: true })); await flush();
@@ -274,10 +262,10 @@ describe('CloudCommandMicrosoftPage', () => {
       throw new Error(`Unexpected ${path}`);
     });
     const page = mount(request); await flush(); await flush();
-    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="user-1"]')!.click(); await flush();
+    openUser(page, 'user-1'); await flush();
     page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!.value = 'Changed'; page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush();
     page.shadowRoot!.querySelector<HTMLButtonElement>('#detail-close')!.click();
-    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="user-1"]')!.click(); await flush();
+    openUser(page, 'user-1'); await flush();
     expect(page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.disabled).toBe(false);
     verify(Response.json({ displayName: 'Changed', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '', accountEnabled: true })); await flush();
     expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);

@@ -4,6 +4,12 @@ Cloud Command provides one Microsoft 365 connection per organization. Extensions
 
 ## Implemented boundary
 
+### Directory presentation
+
+The Microsoft operational page uses a directory layout with search, resource tabs, optional columns, expandable user rows and an account drawer, styled with Breeze theme tokens. Established services are reached through the Cloud Command sidebar. The connected page omits duplicate provider navigation, routine loaded notices and the connection setup card; setup remains in Connect. Errors, partial results, loading and empty states remain visible.
+
+Only returned inventory fields and implemented administration actions are displayed. User rows expose account details/editing; groups retain the explicit membership-change flow. Sites navigation is omitted because the native administration provider does not implement it. Mailbox classification/usage, archive/OneDrive usage, exclusions, email/alias editing, password resets, session revocation and threat/message-trace navigation are not implied by this presentation. Column controls change presentation only.
+
 The current implementation supports Microsoft OAuth consent and identity completion through the authenticated extension host bridge, then stores an organization-scoped administration connection. The browser never receives a certificate, private key, access token, authorization code after callback submission, or a reusable provider credential.
 
 Directory inventory covers users, groups, and licenses. The site search surface remains unavailable in this administration provider. Managers can edit only these user fields: `displayName`, `givenName`, `surname`, `department`, `jobTitle`, `officeLocation`, and `accountEnabled`. They can request an explicitly confirmed group membership add or removal by object ID. User writes are read back and reported saved only when the returned fields match. Group changes report acceptance; membership verification remains pending unless a future provider response supplies a bounded member list.
