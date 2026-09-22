@@ -122,6 +122,9 @@ function buildFollowsParentEntries(): Record<string, OrgMergePolicy> {
 }
 
 const SPECIAL: Record<string, OrgMergePolicy> = {
+  portal_remote_settings: { kind: 'blocks-merge', note: 'Explicitly disable and remove remote access configuration before merging customer identities; assignments never transfer authority between organizations.' },
+  portal_remote_assignments: { kind: 'blocks-merge', note: 'Remote approvals are bound to the original customer organization; revoke and remove assignments before merging.' },
+  portal_remote_sessions: { kind: 'blocks-merge', note: 'Remote session identity and audit history remain bound to the original customer organization.' },
   organizations: { kind: 'loser-shell' },
 
   // Track A durable authorization bindings copy both the automation owner and

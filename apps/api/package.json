@@ -53,6 +53,7 @@
     "@aws-sdk/lib-storage": "^3.1100.0",
     "@aws-sdk/s3-request-presigner": "^3.1096.0",
     "@breeze/ext-workspace": "workspace:*",
+    "@cloudcom/ext-rustdesk-access": "workspace:*",
     "@breeze/extension-sdk": "workspace:*",
     "@breeze/shared": "workspace:*",
     "@elastic/elasticsearch": "^9.5.0",

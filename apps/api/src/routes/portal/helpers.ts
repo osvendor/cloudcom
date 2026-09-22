@@ -351,6 +351,7 @@ export function buildPortalUserPayload(user: {
   name: string | null;
   receiveNotifications: boolean;
   status: string;
+  accessMode?: 'standard' | 'remote_only';
 }) {
   return {
     id: user.id,
@@ -361,7 +362,8 @@ export function buildPortalUserPayload(user: {
     email: user.email,
     name: user.name,
     receiveNotifications: user.receiveNotifications,
-    status: user.status
+    status: user.status,
+    accessMode: user.accessMode ?? 'standard'
   };
 }
 

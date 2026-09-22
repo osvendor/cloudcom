@@ -1025,8 +1025,8 @@ describe('loadBuiltinExtensions — helperRoutes staging', () => {
 });
 
 describe('BUILTIN_EXTENSION_NAMES', () => {
-  it('names the workspace extension (the first and only built-in)', () => {
-    expect([...BUILTIN_EXTENSION_NAMES]).toEqual(['workspace']);
+  it('names the compiled-in workspace and remote access extensions', () => {
+    expect([...BUILTIN_EXTENSION_NAMES]).toEqual(['workspace', 'rustdeskaccess']);
   });
 
   /**

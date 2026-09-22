@@ -46,6 +46,9 @@ const runtimeWebSlotSchema = z.object({
 
 const runtimeWebExtensionSchema = z.object({
   name: z.string().min(1),
+  // This is a server-validated manifest value, but it is also an input to the
+  // browser host's API capability, so keep the browser registry strict.
+  routeNamespace: z.string().regex(/^[a-z0-9][a-z0-9-]*$/),
   version: z.string().min(1),
   digest: z.string().min(1),
   moduleUrl: z.string().min(1),

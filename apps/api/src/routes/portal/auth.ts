@@ -51,6 +51,7 @@ import {
 import { isSelfManagedDbContextRoute } from '../../middleware/selfManagedDbContextRoutes';
 import { purgeClientAiSessionsForUsers } from '../../services/clientAiSessionStore';
 import { ANONYMOUS_ACTOR_ID, writeAuditEventAsync } from '../../services/auditEvents';
+import { portalAccessModeAllows } from './accessMode';
 
 export const authRoutes = new Hono();
 const ALLOW_IN_MEMORY_PORTAL_STATE = !PORTAL_USE_REDIS;
@@ -221,6 +222,7 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
         receiveNotifications: portalUsers.receiveNotifications,
         status: portalUsers.status,
         authEpoch: portalUsers.authEpoch,
+        accessMode: portalUsers.accessMode,
       })
       .from(portalUsers)
       .where(and(eq(portalUsers.id, sessionData.portalUserId), eq(portalUsers.orgId, sessionData.orgId)))
@@ -319,6 +321,10 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
       clearPortalSessionCookies(c);
     }
     return c.json({ error: 'Organization is not available' }, 403);
+  }
+
+  if (!portalAccessModeAllows(user.accessMode, c.req.method, c.req.path)) {
+    return c.json({ error: 'This account is limited to assigned remote computers', code: 'PORTAL_REMOTE_ONLY' }, 403);
   }
 
   // Resolve only after the durable session checks. A stale/legacy generation

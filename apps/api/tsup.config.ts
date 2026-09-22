@@ -47,5 +47,5 @@ export default defineConfig({
   // (today: @anthropic-ai/sdk, drizzle-orm, hono, zod) is deliberately left OFF this
   // list: it stays external and resolves from apps/api's own deployed node_modules,
   // which pnpm already dedupes at install time -- smaller bundle, one copy on disk.
-  noExternal: [/^@breeze\//, 'dotenv', 'mailparser', 'v9u-smb2'],
+  noExternal: [/^@breeze\//, '@cloudcom/ext-rustdesk-access', 'dotenv', 'mailparser', 'v9u-smb2'],
 });

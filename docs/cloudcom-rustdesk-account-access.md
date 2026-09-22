@@ -2,7 +2,42 @@
 
 ## Status and intended experience
 
-Development design and executable authorization contract, not a deployed feature.
+Gated implementation in progress, not a deployed feature. Core migrations now
+provide forced-RLS customer assignments/settings/sessions, and portal routes
+enforce the remote-only identity boundary. The separate extension manages
+assignments through the scoped host API. Browser session creation, offers,
+live leases, viewer presence and fenced termination are wired for testing.
+WebRTC availability uses the same live authorization as session creation and
+requires both endpoint enforcement protocols. The global feature defaults off;
+RustDesk availability remains off until native acceptance succeeds.
+Native target enforcement and app sign-in described below are still required.
+
+### Browser QA checkpoint (2026-09-22)
+
+An isolated Linux API/portal/PostgreSQL/Redis stack and an enrolled agent passed
+real Chromium sign-in, assigned-computer listing, the browser Connect button,
+decoded 800×600 desktop video, mouse movement, and keyboard press/release. The
+same-organization customer without assignments saw no devices and received 404
+when guessing the active session URL through the API. A session survived 75
+seconds of continuous viewing (beyond its initial 60-second authorization lease).
+Revoking its assignment ended viewing in approximately five seconds and the
+agent acknowledged the terminal fence. Closing the browser also reached a
+confirmed terminal state after fixing portal handling of authenticated endpoint
+disconnect notifications. The focused route/agent regression suite passed 36
+tests, and API and portal builds passed on that source snapshot.
+
+This is isolated Linux acceptance, not production or Windows acceptance. The
+test used an Xvfb desktop and a locally supplied OpenH264 library; it does not
+validate production codec packaging, cross-network TURN routing, Windows login
+screens, a Breeze upgrade, or the custom native RustDesk client. Those remain
+release/transport acceptance requirements.
+
+Device lifecycle boundary: permanent device deletion removes remote sessions
+before assignments through the existing audited cascade. Organization moves and
+merges are refused while remote grants/history exist; revoking a grant does not
+erase its history or make it transferable. A future explicit archival/reset
+workflow is needed for transfer without permanent device deletion. This avoids
+silently carrying customer access or ownership history into another tenant.
 The user wants an installed RustDesk client: sign in with a Breeze account, list
 only explicitly approved devices, then connect without entering a device password.
 Configuration belongs in a separate **Extensions → RustDesk Access** page. Keep the
@@ -13,9 +48,10 @@ extension and its 3CX code are owned by concurrent work and must not be modified
 
 Customers need remote access, not technician/dashboard access. Reuse Breeze's
 existing customer identity (`portal_users`) and portal authentication as the
-starting point, with a remote-access-only entitlement and landing page. The exact
-URL can be under the existing deployment; a URL such as `/remote` must not be
-assumed available because the technician application already owns that route.
+starting point, with a remote-access-only entitlement and landing page. The
+customer portal now provides a dedicated `/remote` landing page and
+`/remote/:sessionId` browser-viewer route. These routes are portal-authenticated
+and do not replace the technician application's device routes.
 The installed operator app and emergency browser viewer use the same customer
 identity and assignments. Administrators manage these in the RustDesk extension.
 
@@ -33,7 +69,8 @@ hiding navigation is insufficient. Do not promote portal users into technician
 routes. Represent the subject as `(principalType, principalId)` in all assignments,
 audits and authorizations so customer and technician identities cannot be confused.
 Verify portal MFA/SSO support for this new use case; do not assume staff MFA applies.
-The current pure policy prototype is not yet a portal-auth integration.
+Portal middleware now enforces this entitlement; the native sign-in integration
+is still pending.
 
 The current server-qualified native URL correction only fixes routing. It neither
 authorizes a user nor supplies an unattended password. Do not replace it with a
@@ -137,8 +174,16 @@ unstable private authentication code or overwrite its shared registry changes.
 
 ## Implementation and acceptance gates
 
-1. **Current checkpoint:** source audit, separate package, tested pure eligibility
-   policy. No live feature, credential store, database migration, or client patch.
+1. **Current checkpoint:** the server-side extension package, forced-RLS account
+   settings/assignments/sessions, portal remote-only routing, assigned-computer
+   API, browser session signaling, customer viewer source, and separate extension
+   settings/assignment UI are implemented in source. Existing focused unit and
+   integration evidence covers the authorization policy, RLS/schema contracts,
+   portal routing/API contracts, and extension behavior. The complete browser
+   desktop acceptance flow is still in progress: live signaling, media/input,
+   revocation, and end-to-end portal acceptance remain to be run in designated
+   QA. Native RustDesk client/server changes, native sign-in, and native
+   transport enforcement remain untouched and are not claimed complete.
 2. Pin client/server builds and implement a canary target + operator protocol proof.
    Prove unauthorized direct-ID access fails with the OLD device password. Prove
    concurrent redemption yields exactly one successful connection.

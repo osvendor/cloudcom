@@ -13,6 +13,7 @@
  * of the generic outage copy (see authOrgStatusGate.test.ts for that half).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
 
 const { portalUserRow, activeOrgResult } = vi.hoisted(() => ({
   portalUserRow: { current: null as Record<string, unknown> | null },
@@ -67,7 +68,7 @@ vi.mock('../../services/tenantStatus', () => ({
   invalidateAgentTenantCache: vi.fn(async () => undefined),
 }));
 
-import { authRoutes } from './auth';
+import { authRoutes, portalAuthMiddleware } from './auth';
 import { portalSessions } from './helpers';
 import {
   PORTAL_SESSION_COOKIE_NAME,
@@ -104,8 +105,31 @@ beforeEach(() => {
     status: 'active',
     authMethod: 'password',
     authEpoch: 1,
+    accessMode: 'standard',
   };
   activeOrgResult.current = { orgId: ORG_ID, partnerId: 'partner-1' };
+});
+
+describe('remote-only middleware authorization', () => {
+  const app = new Hono();
+  app.use('/api/v1/portal/*', portalAuthMiddleware);
+  app.get('/api/v1/portal/*', c => c.json({ reachedHandler: true }));
+
+  it.each(['/devices', '/devices/export.csv', '/tickets', '/invoices', '/quotes', '/reports'])('blocks direct calls to %s', async path => {
+    seedSession();
+    portalUserRow.current!.accessMode = 'remote_only';
+    const result = await app.request(`/api/v1/portal${path}`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect(result.status).toBe(403);
+    expect(await result.json()).toMatchObject({ code: 'PORTAL_REMOTE_ONLY' });
+  });
+
+  it('allows remote handlers and preserves ordinary portal accounts', async () => {
+    seedSession();
+    portalUserRow.current!.accessMode = 'remote_only';
+    expect((await app.request('/api/v1/portal/remote/devices', { headers: { Authorization: `Bearer ${TOKEN}` } })).status).toBe(200);
+    portalUserRow.current!.accessMode = 'standard';
+    expect((await app.request('/api/v1/portal/devices', { headers: { Authorization: `Bearer ${TOKEN}` } })).status).toBe(200);
+  });
 });
 
 describe('POST /auth/logout — disabled portal user', () => {

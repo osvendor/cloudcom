@@ -79,7 +79,8 @@ profileRoutes.patch('/profile', zValidator('json', updateProfileSchema), async (
       email: portalUsers.email,
       name: portalUsers.name,
       receiveNotifications: portalUsers.receiveNotifications,
-      status: portalUsers.status
+      status: portalUsers.status,
+      accessMode: portalUsers.accessMode
     });
 
   const user = userResult[0];
