@@ -1,7 +1,7 @@
 // The BUILT-IN extension registry: first-party extensions compiled into the
 // core image and imported statically.
 //
-// Deliberately a LEAF module — it imports the built-in packages, the manifest
+// Deliberately a LEAF module â€” it imports the built-in packages, the manifest
 // parser and node fs/path, and nothing else from `src/extensions/`. It is
 // imported by the loading pipeline; keeping the registry separate keeps the
 // pipeline's own import graph acyclic and lets tests import the registry without
@@ -17,6 +17,7 @@ import {
 import type { ExtensionTenancyDeclaration } from '@breeze/extension-sdk';
 import workspaceExtension from '@breeze/ext-workspace';
 import remoteAccessExtension from '@cloudcom/ext-rustdesk-access';
+import { createCloudCommandExtension } from '@cloudcom/ext-cloud-command';
 
 /** One statically-imported, first-party extension. */
 export interface BuiltinExtension {
@@ -29,8 +30,8 @@ export interface BuiltinExtension {
    *
    * IMMUTABLE ONCE MIGRATIONS HAVE SHIPPED UNDER IT. Extension migrations are
    * recorded in the core ledger under `<manifest.name>/<file>` (see
-   * builtinExtensions.ts `runMigrations`), and — because resolution pins
-   * `manifest.name === name` — that is this string. `builtinEverMigrated` finds
+   * builtinExtensions.ts `runMigrations`), and â€” because resolution pins
+   * `manifest.name === name` â€” that is this string. `builtinEverMigrated` finds
    * those rows by the same string, so renaming a built-in that has already
    * migrated somewhere would make the probe answer "never ran here" about a
    * database that has its tables. A rename must therefore be paired with a
@@ -66,19 +67,19 @@ export interface BuiltinExtension {
 
 /**
  * Ordered, bounded candidates for `<root>/<packageDir>`, most-trustworthy
- * first — {@link resolveBuiltinRoot} and {@link loadBuiltinManifest} both walk
+ * first â€” {@link resolveBuiltinRoot} and {@link loadBuiltinManifest} both walk
  * this SAME list so a miss can be reported against exactly what was tried:
  *
- *   1. the source-file walk-up (src/extensions → apps/api → apps → repo) —
+ *   1. the source-file walk-up (src/extensions â†’ apps/api â†’ apps â†’ repo) â€”
  *      exact for dev tsx/vitest, where this file's real location is on disk.
- *   2. `process.cwd()` — exact for both Docker images: the Dockerfile COPYs
+ *   2. `process.cwd()` â€” exact for both Docker images: the Dockerfile COPYs
  *      `<packageDir>/{manifest.json,migrations,dist}` to the image root, and
  *      the process is always started from there.
- *   3. up to 3 ancestors of `process.cwd()` — covers running the bundle from
+ *   3. up to 3 ancestors of `process.cwd()` â€” covers running the bundle from
  *      inside a plain repo checkout (e.g. `cwd = <repo>/apps/api`, so
  *      `<repo>/ee/workspace` is `cwd/../../ee/workspace`).
  *
- * Deliberately bounded — no unbounded upward search.
+ * Deliberately bounded â€” no unbounded upward search.
  */
 function candidateBuiltinRoots(packageDir: string): string[] {
   const candidates: string[] = [];
@@ -98,7 +99,7 @@ function candidateBuiltinRoots(packageDir: string): string[] {
 
 /**
  * Resolve `<repo or image root>/<packageDir>`: the first candidate (see
- * {@link candidateBuiltinRoots}) whose `manifest.json` actually exists — not
+ * {@link candidateBuiltinRoots}) whose `manifest.json` actually exists â€” not
  * just the directory, so an empty same-named directory can never shadow the
  * real root. Falls back to
  * `cwd/<packageDir>` when nothing matched, so callers (and error messages)
@@ -113,7 +114,7 @@ export function resolveBuiltinRoot(packageDir: string): string {
 
 /**
  * Build the contextual error for a built-in whose manifest could not be found
- * in ANY candidate root — naming the package, every path tried, and the
+ * in ANY candidate root â€” naming the package, every path tried, and the
  * Dockerfile/runtime contract that's supposed to guarantee one of them exists,
  * so the failure is diagnosable from the message alone instead of a bare
  * `ENOENT` with no indication of what root(s) were even considered.
@@ -135,7 +136,7 @@ function missingBuiltinManifestMessage(packageDir: string): string {
 
 /**
  * Read and parse a built-in's manifest, resolving its root the same way
- * {@link resolveBuiltinRoot} does. A miss is NOT a bare `ENOENT` — every
+ * {@link resolveBuiltinRoot} does. A miss is NOT a bare `ENOENT` â€” every
  * candidate root was already computed to resolve `root`, so re-using that list
  * to name what was tried costs nothing and turns an opaque boot failure into
  * an actionable one.
@@ -174,7 +175,7 @@ export function loadBuiltinManifest(packageDir: string): ExtensionManifestV1 {
 }
 
 /**
- * Define a built-in whose manifest is read from disk LAZILY — on first access
+ * Define a built-in whose manifest is read from disk LAZILY â€” on first access
  * to `.manifest`, never during module evaluation (#3470).
  *
  * Importing this registry must touch no filesystem. `apps/api/src/index.ts`
@@ -185,8 +186,8 @@ export function loadBuiltinManifest(packageDir: string): ExtensionManifestV1 {
  * ENABLED path resolves the manifest immediately and still fails hard.
  *
  * BOTH outcomes are memoised, and neither re-reads disk:
- *   - success → every later access returns the SAME manifest object.
- *   - failure → every later access rethrows the IDENTICAL error instance, so a
+ *   - success â†’ every later access returns the SAME manifest object.
+ *   - failure â†’ every later access rethrows the IDENTICAL error instance, so a
  *     retrying caller cannot hammer the disk and the operator sees one stable
  *     diagnostic instead of a different one per attempt.
  *
@@ -238,6 +239,19 @@ export function defineBuiltin(spec: Omit<BuiltinExtension, 'manifest'>): Builtin
  */
 export const BUILTINS: readonly BuiltinExtension[] = [
   defineBuiltin({
+    module: createCloudCommandExtension(async (url, init) => {
+      // Lazy bridge keeps this registry acyclic. No outbound work during boot.
+      const { safeFetch } = await import('../services/urlSafety');
+      const { runOutsideDbContext } = await import('../db');
+      return runOutsideDbContext(() => safeFetch(url, { ...init, signal: init.signal ?? undefined, allowPrivateNetwork: false, allowCarrierNat: false }));
+    }),
+    name: 'cloudcommand',
+    packageDir: 'packages/ext-cloud-command',
+    packageName: '@cloudcom/ext-cloud-command',
+    helperRoutes: false,
+    enableEnvVar: 'CLOUDCOM_THREECX_ENABLED',
+  }),
+  defineBuiltin({
     module: workspaceExtension,
     name: 'workspace',
     packageDir: 'ee/workspace',
@@ -260,18 +274,18 @@ export const BUILTIN_EXTENSION_NAMES: ReadonlySet<string> = new Set(
 
 /**
  * Every built-in's tenancy declaration, as a pure read of the compiled-in
- * manifests — available BEFORE (and independently of) the loading pipeline that
+ * manifests â€” available BEFORE (and independently of) the loading pipeline that
  * publishes them to the tenancy registry.
  *
  * The source loader is gone, so this accessor now has no production caller. It
  * is retained for the tenancy/tenant-export contract tests in
  * builtinExtensions.test.ts, which pin the real manifest's classification.
  *
- * DELIBERATELY STATIC — it ignores {@link BuiltinExtension.enableEnvVar}, and
+ * DELIBERATELY STATIC â€” it ignores {@link BuiltinExtension.enableEnvVar}, and
  * must keep doing so. That property is inherited from the boot-time sweep this
  * once fed, which only examined tables that EXIST: declaring a table that was
  * never created was inert there, while gating the accessor on the enable flag
- * would have resurrected exactly the failure it was written to prevent — a
+ * would have resurrected exactly the failure it was written to prevent â€” a
  * deployment that enabled workspace once (creating `workspace_*`) and later
  * unset the flag would have had those tables read as unaccounted and abort
  * boot. That sweep is no longer wired into any boot path; the property is kept

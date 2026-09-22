@@ -10,7 +10,7 @@ import { defineBuiltin, loadBuiltinManifest, resolveBuiltinRoot } from './builti
  * process would see it in each of the runtime contexts the resolver targets
  * (dev tsx/vitest, both Docker images, and a bundle run from a plain repo
  * checkout). No neighboring test in this directory fakes cwd yet, so this
- * uses `vi.spyOn(process, 'cwd')` directly — the standard vitest seam.
+ * uses `vi.spyOn(process, 'cwd')` directly â€” the standard vitest seam.
  *
  * A fresh, never-real packageDir name is used throughout (`ee/fixture-builtin`
  * rather than `ee/workspace`) so the resolver's REAL source-file walk-up
@@ -74,7 +74,7 @@ describe('resolveBuiltinRoot', () => {
   it('does not resolve past the bounded 3-ancestor search', () => {
     root = mkdtempSync(join(tmpdir(), 'breeze-builtin-'));
     scaffold(root);
-    // 4 levels up from cwd is one hop beyond the bounded search — must miss.
+    // 4 levels up from cwd is one hop beyond the bounded search â€” must miss.
     const cwd = join(root, 'a', 'b', 'c', 'd');
     mkdirSync(cwd, { recursive: true });
     vi.spyOn(process, 'cwd').mockReturnValue(cwd);
@@ -147,7 +147,7 @@ describe('loadBuiltinManifest', () => {
     root = mkdtempSync(join(tmpdir(), 'breeze-builtin-'));
     const dir = join(root, PACKAGE_DIR);
     mkdirSync(dir, { recursive: true });
-    // A directory named manifest.json triggers EISDIR on read, not ENOENT —
+    // A directory named manifest.json triggers EISDIR on read, not ENOENT â€”
     // must NOT be downgraded to the "missing everywhere" message.
     mkdirSync(join(dir, 'manifest.json'));
     vi.spyOn(process, 'cwd').mockReturnValue(root);
@@ -175,7 +175,7 @@ describe('BUILTINS manifest resolution is lazy (#3470)', () => {
     expect(manifestReads, `read during import: ${manifestReads.join(', ')}`).toEqual([]);
     expect(mod.BUILTINS.length).toBeGreaterThan(0);
     // The name set is derived from the STATIC name field, so it stays free of I/O too.
-    expect([...mod.BUILTIN_EXTENSION_NAMES]).toEqual(['workspace', 'rustdeskaccess']);
+    expect([...mod.BUILTIN_EXTENSION_NAMES]).toEqual(['cloudcommand', 'workspace', 'rustdeskaccess']);
     expect(manifestReads, `read for names: ${manifestReads.join(', ')}`).toEqual([]);
 
     vi.doUnmock('node:fs');

@@ -209,8 +209,8 @@ function enoent(message: string): Error {
 
 /**
  * Every phase is a recording stub, and `registry.activate` is recorded into the
- * SAME ordered log — so the phase order (migration → tenancy → stage → validate
- * → activate) is provable rather than merely plausible.
+ * SAME ordered log â€” so the phase order (migration â†’ tenancy â†’ stage â†’ validate
+ * â†’ activate) is provable rather than merely plausible.
  */
 function createHarness(overrides: {
   builtins?: readonly BuiltinExtension[];
@@ -227,7 +227,7 @@ function createHarness(overrides: {
   const migrationSqlOpens = { count: 0 };
   const rateLimitPrefixes: string[] = [];
   const registeredWebAssets: Array<{ name: string; asset: RegisterableExtensionWebAsset }> = [];
-  /** Every manifest handed to publishTenancy — the declaration that goes LIVE. */
+  /** Every manifest handed to publishTenancy â€” the declaration that goes LIVE. */
   const publishedTenancy: ExtensionManifestV1[] = [];
   /** Every (name, declaration) pair the RLS tripwire port was asked to verify. */
   const validatedTenancy: Array<{ name: string; tenancy: ExtensionManifestV1['tenancy'] }> = [];
@@ -345,7 +345,7 @@ describe('loadBuiltinExtensions', () => {
     await h.load();
 
     // The routes activate but the snapshot is DISABLED, so the enabled gate
-    // 404s them — and the persisted flag was never rewritten.
+    // 404s them â€” and the persisted flag was never rewritten.
     expect(h.registry.get(NAME)?.enabled).toBe(false);
     expect(setEnabled).not.toHaveBeenCalled();
     expect((await stateStore.get(NAME))?.enabled).toBe(false);
@@ -365,7 +365,7 @@ describe('loadBuiltinExtensions', () => {
     const builtin2 = fixtureBuiltin({
       name: NAME_2,
       enableEnvVar: ENABLE_ENV_VAR_2,
-      // Same NAMESPACE as the first builtin (fixtureManifest's default) —
+      // Same NAMESPACE as the first builtin (fixtureManifest's default) â€”
       // ExtensionContributionRegistry.activate() throws a real "route
       // namespace already owned" error for this, once the first builtin is
       // already active.
@@ -379,13 +379,13 @@ describe('loadBuiltinExtensions', () => {
       await expect(h.load()).rejects.toThrow(/route namespace .* is already owned by extension "demo-builtin"/i);
 
       // Full pipeline ran for builtin 1, and got as far as 'activate' (where
-      // it throws) for builtin 2 — nothing downstream of that ran for it.
+      // it throws) for builtin 2 â€” nothing downstream of that ran for it.
       expect(h.calls).toEqual([
         'migration', 'tenancy', 'stage', 'validate', 'activate', 'web',
         'migration', 'tenancy', 'stage', 'validate', 'activate',
       ]);
 
-      // Built-in 1: unaffected by built-in 2's later failure — still
+      // Built-in 1: unaffected by built-in 2's later failure â€” still
       // correctly activated with its real active version recorded.
       const snapshot1 = h.registry.get(NAME);
       expect(snapshot1?.enabled).toBe(true);
@@ -395,7 +395,7 @@ describe('loadBuiltinExtensions', () => {
       expect(row1?.lifecycleState).toBe('active');
 
       // Built-in 2: activate() threw, so it never reached the registry, and
-      // — this is the bug this test guards against — `installed_extensions`
+      // â€” this is the bug this test guards against â€” `installed_extensions`
       // must NOT claim an active version that was never actually activated.
       // upsertObserved ran (before activate) and seeded configuredVersion,
       // but recordActive (after activate) never ran.
@@ -430,7 +430,7 @@ describe('loadBuiltinExtensions', () => {
 
   it('production boot fails when the web dist is missing; dev warns and skips web asset', async () => {
     // The ABSENT-DIRECTORY condition is now decided by an explicit existence
-    // check, not by catching ENOENT around the whole operation — so this is
+    // check, not by catching ENOENT around the whole operation â€” so this is
     // what a missing bundle looks like, and `readWebDist` is never reached.
     const noWebDir = { webDistExists: () => false, readWebDist: () => { throw new Error('must not be called'); } };
 
@@ -450,7 +450,7 @@ describe('loadBuiltinExtensions', () => {
       const dev = createHarness({ ports: noWebDir });
       await expect(dev.load()).resolves.toBeUndefined();
 
-      // Server routes still activate — API-only development needs no web build.
+      // Server routes still activate â€” API-only development needs no web build.
       expect(dev.registry.get(NAME)?.enabled).toBe(true);
       expect(dev.registeredWebAssets).toEqual([]);
       expect(dev.calls).not.toContain('web');
@@ -465,7 +465,7 @@ describe('loadBuiltinExtensions', () => {
 
   // A failure from a PRESENT web dist is a real fault (permissions, a file
   // vanishing mid-walk, a corrupt tree) and must never be downgraded to a dev
-  // warning — including when it happens to carry `code: 'ENOENT'`, which the
+  // warning â€” including when it happens to carry `code: 'ENOENT'`, which the
   // previous catch-based shape swallowed outside production.
   it.each([
     ['a permissions failure', Object.assign(new Error('permission denied'), { code: 'EACCES' })],
@@ -513,7 +513,7 @@ describe('loadBuiltinExtensions', () => {
     // downstream ran, so no tenancy was published for tables that do not exist,
     // nothing is live, and no `installed_extensions` row was seeded claiming an
     // active version. (This is the state the DISABLED path then has to survive
-    // on the next boot — see the partial-schema test below.)
+    // on the next boot â€” see the partial-schema test below.)
     expect(h.calls).toEqual(['migration']);
     expect(h.registry.get(NAME)).toBeUndefined();
     expect(await h.stateStore.get(NAME)).toBeNull();
@@ -532,13 +532,13 @@ describe('loadBuiltinExtensions', () => {
 });
 
 /**
- * `mode: 'worker'` (wave 3.5d-b, #4086) — the counterpart pipeline for a
+ * `mode: 'worker'` (wave 3.5d-b, #4086) â€” the counterpart pipeline for a
  * `BREEZE_ROLE=worker` process: parity-check-never-apply instead of
  * migrate, and no web-asset registration (a worker has no HTTP server to
  * serve it from). Everything else (publish tenancy, stage, validate, seed
  * state, activate) runs identically to `'full'`.
  */
-describe('loadBuiltinExtensions — mode: worker', () => {
+describe('loadBuiltinExtensions â€” mode: worker', () => {
   enableFixtureBuiltin();
 
   it('runs parity-check instead of migrate, activates, and skips web-asset registration', async () => {
@@ -569,7 +569,7 @@ describe('loadBuiltinExtensions — mode: worker', () => {
   it('aborts boot when the built-in is not at migration parity', async () => {
     const boom = new Error(
       '[extensions] built-in "demo-builtin" is not at migration parity on a worker-role process ' +
-        '(missing from ledger: demo-builtin/0001-init.sql) — an api/all-role process must apply its migrations first',
+        '(missing from ledger: demo-builtin/0001-init.sql) â€” an api/all-role process must apply its migrations first',
     );
     const h = createHarness({ ports: { checkMigrationParity: async () => { throw boom; } } });
 
@@ -595,10 +595,10 @@ describe('loadBuiltinExtensions — mode: worker', () => {
  * The DEPLOYMENT enable flag. Being compiled into the image makes a built-in
  * available, not loaded: a deployment that never asked for it must boot with no
  * migrations, no schema and none of the built-in's infrastructure requirements
- * (workspace's pgvector) — while a deployment that enabled it ONCE and later
+ * (workspace's pgvector) â€” while a deployment that enabled it ONCE and later
  * switched it off must still boot, with its orphaned tables accounted for.
  */
-describe('loadBuiltinExtensions — deployment enable flag', () => {
+describe('loadBuiltinExtensions â€” deployment enable flag', () => {
   afterEach(() => {
     delete process.env[ENABLE_ENV_VAR];
   });
@@ -671,7 +671,7 @@ describe('loadBuiltinExtensions — deployment enable flag', () => {
 
   /**
    * `BREEZE_WORKSPACE_ENABLED=1` looks enabled to a human reading the compose
-   * file, and the old skip line said only "this one is not enabled" — which
+   * file, and the old skip line said only "this one is not enabled" â€” which
    * reads as a lie to the operator who just set it. The value-strictness has to
    * be in the log, along with what was actually observed.
    */
@@ -698,7 +698,7 @@ describe('loadBuiltinExtensions — deployment enable flag', () => {
   // A previously-enabled deployment left `demo_*` on the database. Without the
   // declaration, the unaccounted-public-tables sweep aborts boot on those
   // tables, and org-deletion cascades skip them.
-  it('publishes tenancy — and ONLY tenancy (plus its RLS check) — when the built-in left tables behind', async () => {
+  it('publishes tenancy â€” and ONLY tenancy (plus its RLS check) â€” when the built-in left tables behind', async () => {
     const warn = captureWarnings();
     try {
       const probed: Array<readonly string[]> = [];
@@ -750,19 +750,19 @@ describe('loadBuiltinExtensions — deployment enable flag', () => {
   });
 
   /**
-   * THE PARTIAL-SCHEMA CASE — the state a failed enabled boot actually leaves
+   * THE PARTIAL-SCHEMA CASE â€” the state a failed enabled boot actually leaves
    * behind, and the one the old boolean probe could not represent.
    *
    * Enabling the built-in on a database that cannot satisfy its migrations
    * aborts boot part-way through the file sequence, so the files that committed
    * leave their tables and the rest never run. (Workspace on stock Postgres:
    * three files apply, the fourth dies on `CREATE EXTENSION vector`.) Unsetting
-   * the flag then reaches this path with SOME tables present — and a yes/no
+   * the flag then reaches this path with SOME tables present â€” and a yes/no
    * probe answered "yes", which published the WHOLE manifest declaration and
    * pointed org-cascade and tenant-export SQL at relations that were never
    * created. Only the present subset may be declared.
    */
-  it('publishes a FILTERED declaration — and warns — when only SOME of the tables exist', async () => {
+  it('publishes a FILTERED declaration â€” and warns â€” when only SOME of the tables exist', async () => {
     const warn = captureWarnings();
     try {
       const h = createHarness({
@@ -774,7 +774,7 @@ describe('loadBuiltinExtensions — deployment enable flag', () => {
 
       expect(h.calls).toEqual(['tenancy', 'validate']);
 
-      // Every one of the four lists is narrowed to the tables that EXIST —
+      // Every one of the four lists is narrowed to the tables that EXIST â€”
       // `demo_projects` appears in none of them.
       const published = h.publishedTenancy[0]?.tenancy;
       expect(published).toEqual({
@@ -785,7 +785,7 @@ describe('loadBuiltinExtensions — deployment enable flag', () => {
       });
       expect(JSON.stringify(published)).not.toContain('demo_projects');
 
-      // The RLS tripwire runs over the SAME filtered declaration — asserting the
+      // The RLS tripwire runs over the SAME filtered declaration â€” asserting the
       // manifest's whole tenancy here would fail on the table that isn't there,
       // and skipping the assertion would leave an orphaned table holding tenant
       // rows with no boot-time RLS check at all.
@@ -804,7 +804,7 @@ describe('loadBuiltinExtensions — deployment enable flag', () => {
   });
 
   // The published declaration is the object the tripwire sees, and the
-  // manifest's own tenancy must not be mutated on the way there — a later
+  // manifest's own tenancy must not be mutated on the way there â€” a later
   // reader (builtinTenancyDeclarations, the export registry) would inherit the
   // narrowing and forget tables that merely need their migration re-run.
   it('leaves the built-in\'s own manifest tenancy untouched while filtering', async () => {
@@ -867,7 +867,7 @@ describe('loadBuiltinExtensions — deployment enable flag', () => {
   });
 });
 
-describe('loadBuiltinExtensions — disabled built-in with an unreadable manifest (#3470)', () => {
+describe('loadBuiltinExtensions â€” disabled built-in with an unreadable manifest (#3470)', () => {
   afterEach(() => {
     delete process.env[ENABLE_ENV_VAR];
   });
@@ -985,13 +985,13 @@ describe('loadBuiltinExtensions — disabled built-in with an unreadable manifes
  * Restores the `/helper/*` auth coverage that was dropped along with the
  * workspace legacy manifest: the gateway keys core helper auth off the
  * `helperRoutes` flag on the STAGED manifest (gateway.ts), while the flag is
- * NOT part of the strict v1 wire schema. Both halves must hold at once —
+ * NOT part of the strict v1 wire schema. Both halves must hold at once â€”
  * gateway-visible flag present, strict parse of the clean manifest unpolluted.
  *
  * These use the REAL `defaultStageExtension` (no `stageExtension` port
  * override), because the staged manifest is exactly what that function decides.
  */
-describe('loadBuiltinExtensions — helperRoutes staging', () => {
+describe('loadBuiltinExtensions â€” helperRoutes staging', () => {
   enableFixtureBuiltin();
 
   it('stages helperRoutes:true onto the manifest the registry session sees', async () => {
@@ -1025,13 +1025,13 @@ describe('loadBuiltinExtensions — helperRoutes staging', () => {
 });
 
 describe('BUILTIN_EXTENSION_NAMES', () => {
-  it('names the compiled-in workspace and remote access extensions', () => {
-    expect([...BUILTIN_EXTENSION_NAMES]).toEqual(['workspace', 'rustdeskaccess']);
+  it('names the compiled-in extensions', () => {
+    expect([...BUILTIN_EXTENSION_NAMES]).toEqual(['cloudcommand', 'workspace', 'rustdeskaccess']);
   });
 
   /**
-   * The flag NAME is a deployment contract — it appears in .env.example, both
-   * dev composes, docker-compose.yml, the CI boot step and the deploy docs — so
+   * The flag NAME is a deployment contract â€” it appears in .env.example, both
+   * dev composes, docker-compose.yml, the CI boot step and the deploy docs â€” so
    * renaming it silently would leave every one of those switching nothing.
    */
   it('gates the workspace built-in on BREEZE_WORKSPACE_ENABLED, default off', () => {
@@ -1053,7 +1053,7 @@ describe('BUILTIN_EXTENSION_NAMES', () => {
   /**
    * Workspace's /helper/* tree is called by the device helper, so it must sit
    * behind core helper auth rather than the user default-deny. On the built-in
-   * path that boundary is declared ONLY by this field — the legacy
+   * path that boundary is declared ONLY by this field â€” the legacy
    * breeze-extension.json the upstream repo asserted it from is not part of
    * this delivery mode. Dropping the field would silently move helper traffic
    * to authMiddleware (see the gateway's helperRoutes arm), so it is pinned
@@ -1067,7 +1067,7 @@ describe('BUILTIN_EXTENSION_NAMES', () => {
   /**
    * The static `name` is what the disabled path probes the migration ledger
    * with when the manifest cannot be read, so it MUST match the shipped
-   * `manifest.name`. `defineBuiltin` already enforces that at resolution time —
+   * `manifest.name`. `defineBuiltin` already enforces that at resolution time â€”
    * which is exactly why the assertion here is `not.toThrow()` and not an
    * equality check: an equality check could never observe a mismatch, because
    * the getter throws before returning one. What this test contributes is
@@ -1088,8 +1088,8 @@ describe('BUILTIN_EXTENSION_NAMES', () => {
  * Publishing a built-in's tenancy is not free: `getExtensionOrgExportColumns()`
  * walks EVERY published declaration's `orgCascadeDeleteTables` and THROWS on the
  * first table with no export classification. That throw surfaces at
- * `getTenantExportPolicyRegistry()` — i.e. on the GDPR right-of-access export
- * path — so a built-in that declares cascade tables without `orgExportColumns`
+ * `getTenantExportPolicyRegistry()` â€” i.e. on the GDPR right-of-access export
+ * path â€” so a built-in that declares cascade tables without `orgExportColumns`
  *500s every org's data export from the moment it boots, with nothing in the
  * boot logs. These tests pin the whole classification, against the REAL
  * manifest.
@@ -1106,7 +1106,8 @@ describe('built-in tenancy participates in the tenant-export contract', () => {
   }
 
   it('classifies every org-cascade table the workspace built-in declares', () => {
-    const [workspace] = builtinTenancyDeclarations();
+    const declarations = builtinTenancyDeclarations();
+    const workspace = BUILTINS.find(b => b.name === 'workspace')!.manifest.tenancy;
     expect(workspace?.orgCascadeDeleteTables.length).toBeGreaterThan(0);
     publishBuiltinTenancy();
 
@@ -1115,7 +1116,7 @@ describe('built-in tenancy participates in the tenant-export contract', () => {
     // classification`.
     const classified = getExtensionOrgExportColumns();
     expect(Object.keys(classified).sort()).toEqual(
-      [...workspace!.orgCascadeDeleteTables].sort(),
+      declarations.flatMap(d => d.orgCascadeDeleteTables).sort(),
     );
 
     // Every table classifies a non-empty column set, and include/exclude never
