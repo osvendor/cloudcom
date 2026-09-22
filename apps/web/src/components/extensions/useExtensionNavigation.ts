@@ -12,18 +12,31 @@
 // rendered as a real Sidebar `<a href>`. `isSafeExtensionHref` below is the
 // one place that re-derives and re-validates every href before it can reach
 // the DOM.
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   getExtensionRegistry,
   type RuntimeWebExtension,
   type RuntimeWebNavItem,
   type RuntimeWebRegistry,
 } from '@/lib/extensions/registry';
+import { createExtensionHostApi } from '@/lib/extensions/hostApi';
+import { CLOUD_COMMAND_CONNECTIONS_CHANGED_EVENT, type CloudCommandConnectionsChangedDetail } from '@/lib/extensions/cloudCommandNavigationEvents';
+import { useOrgScope } from '@/hooks/useOrgScope';
+import { useAuthStore } from '@/stores/auth';
 
 export interface ExtensionNavLink {
   readonly name: string;
   readonly href: string;
+  readonly children?: readonly { name: string; href: string }[];
+  readonly loading?: boolean;
 }
+
+const CLOUD_COMMAND_NAME = 'cloudcommand';
+const CLOUD_COMMAND_OVERVIEW_HREF = '/extensions/cloudcommand/overview';
+const CLOUD_COMMAND_CHILDREN = [
+  { name: '3CX', href: '/extensions/cloudcommand/threecx', pagePath: '/threecx' },
+  { name: 'Microsoft 365', href: '/extensions/cloudcommand/microsoft', pagePath: '/microsoft' },
+] as const;
 
 // Mirrors packages/extension-sdk/src/manifest.ts NAME_RE — kept as a literal
 // copy (not imported) so this trust-boundary check never silently changes
@@ -91,6 +104,44 @@ export function extensionNavLinksFromRegistry(registry: RuntimeWebRegistry): Ext
     .map((ranked) => ranked.link);
 }
 
+type CloudCommandStatus = { connected?: unknown; enabled?: unknown; available?: unknown };
+
+function isCloudCommandOverview(registry: RuntimeWebRegistry): boolean {
+  const extension = registry.extensions.find((candidate) => candidate.name === CLOUD_COMMAND_NAME);
+  return extension?.pages.some((page) => page.path === '/overview') === true
+    && extension.navigation.some((item) => item.path === '/overview');
+}
+
+function cloudCommandPages(registry: RuntimeWebRegistry): Set<string> {
+  const extension = registry.extensions.find((candidate) => candidate.name === CLOUD_COMMAND_NAME);
+  return new Set(extension?.pages.map((page) => page.path) ?? []);
+}
+
+function decorateCloudCommandOverview(
+  links: ExtensionNavLink[],
+  registry: RuntimeWebRegistry,
+  children: readonly { name: string; href: string }[],
+  loading: boolean,
+): ExtensionNavLink[] {
+  if (!isCloudCommandOverview(registry)) return links;
+  return links.map((link) => link.href === CLOUD_COMMAND_OVERVIEW_HREF
+    ? { ...link, children, loading }
+    : link,
+  );
+}
+
+function enabledThreeCx(value: unknown): boolean {
+  const status = value as CloudCommandStatus | null;
+  return status?.connected === true && status.enabled === true;
+}
+
+function enabledMicrosoft(value: unknown): boolean {
+  const status = value as CloudCommandStatus | null;
+  return status?.available === true && status.connected === true && status.enabled === true;
+}
+
+type NavigationState = { links: ExtensionNavLink[]; connectionOrgId: string | null; sessionKey: string | null };
+
 /**
  * Enabled runtime-extension navigation links, deterministically ordered.
  * Never throws: a registry fetch failure (401, network error, shape
@@ -98,24 +149,86 @@ export function extensionNavLinksFromRegistry(registry: RuntimeWebRegistry): Ext
  * the host" posture as the rest of the extension surface.
  */
 export function useExtensionNavigation(): ExtensionNavLink[] {
-  const [links, setLinks] = useState<ExtensionNavLink[]>([]);
+  const [state, setState] = useState<NavigationState>({ links: [], connectionOrgId: null, sessionKey: null });
+  const [refresh, setRefresh] = useState(0);
+  const scope = useOrgScope();
+  const organizationId = scope.status === 'resolved' && scope.scope === 'org' ? scope.orgId : null;
+  // Match the registry cache boundary: clear organization-specific children
+  // across login/logout and account changes, not merely selector changes.
+  const authenticated = useAuthStore((state) => state.isAuthenticated);
+  const userId = useAuthStore((state) => state.user?.id ?? null);
+  const accessToken = useAuthStore((state) => state.tokens?.accessToken ?? null);
+  const sessionKey = authenticated ? `${userId ?? 'authenticated'}:${accessToken ?? ''}` : null;
+
+  useEffect(() => {
+    const onConnectionsChanged = (event: Event) => {
+      const detail = (event as CustomEvent<unknown>).detail as CloudCommandConnectionsChangedDetail | null;
+      if (detail?.organizationId === organizationId) setRefresh((value) => value + 1);
+    };
+    window.addEventListener(CLOUD_COMMAND_CONNECTIONS_CHANGED_EVENT, onConnectionsChanged);
+    return () => window.removeEventListener(CLOUD_COMMAND_CONNECTIONS_CHANGED_EVENT, onConnectionsChanged);
+  }, [organizationId]);
+
+  useEffect(() => {
+    const revalidate = () => setRefresh((value) => value + 1);
+    document.addEventListener('astro:after-swap', revalidate);
+    window.addEventListener('focus', revalidate);
+    return () => {
+      document.removeEventListener('astro:after-swap', revalidate);
+      window.removeEventListener('focus', revalidate);
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
+    let revoke: (() => void) | null = null;
 
     getExtensionRegistry()
       .then((registry) => {
         if (cancelled) return;
-        setLinks(extensionNavLinksFromRegistry(registry));
+        const links = extensionNavLinksFromRegistry(registry);
+        if (!organizationId || !authenticated || !isCloudCommandOverview(registry)) {
+          setState({ links: decorateCloudCommandOverview(links, registry, [], false), connectionOrgId: organizationId, sessionKey });
+          return;
+        }
+
+        setState({ links: decorateCloudCommandOverview(links, registry, [], true), connectionOrgId: organizationId, sessionKey });
+        const pages = cloudCommandPages(registry);
+        if (!pages.has('/threecx') && !pages.has('/microsoft')) {
+          setState({ links: decorateCloudCommandOverview(links, registry, [], false), connectionOrgId: organizationId, sessionKey });
+          return;
+        }
+        const { hostApi, revoke: revokeHostApi } = createExtensionHostApi({ extensionName: CLOUD_COMMAND_NAME, organizationId });
+        revoke = revokeHostApi;
+        const status = async (path: string): Promise<unknown> => {
+          const response = await hostApi.request(path);
+          if (!response.ok) throw new Error('connection status unavailable');
+          return response.json();
+        };
+        void Promise.all([
+          pages.has('/threecx') ? status('/threecx/connection').then(enabledThreeCx).catch(() => false) : Promise.resolve(false),
+          pages.has('/microsoft') ? status('/microsoft/connection').then(enabledMicrosoft).catch(() => false) : Promise.resolve(false),
+        ]).then(([threeCx, microsoft]) => {
+          if (cancelled) return;
+          const children = [
+            ...(threeCx ? [{ name: CLOUD_COMMAND_CHILDREN[0].name, href: CLOUD_COMMAND_CHILDREN[0].href }] : []),
+            ...(microsoft ? [{ name: CLOUD_COMMAND_CHILDREN[1].name, href: CLOUD_COMMAND_CHILDREN[1].href }] : []),
+          ];
+          setState({ links: decorateCloudCommandOverview(links, registry, children, false), connectionOrgId: organizationId, sessionKey });
+        });
       })
       .catch(() => {
-        if (!cancelled) setLinks([]);
+        if (!cancelled) setState({ links: [], connectionOrgId: organizationId, sessionKey });
       });
 
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    return () => { cancelled = true; revoke?.(); };
+  }, [organizationId, authenticated, userId, accessToken, sessionKey, refresh]);
 
-  return links;
+  // Effects run after paint. Never expose the prior organization's children in
+  // that gap: selector/account changes synchronously render an empty group.
+  return useMemo(() => state.connectionOrgId === organizationId && state.sessionKey === sessionKey
+    ? state.links
+    : state.links.map((link) => link.href === CLOUD_COMMAND_OVERVIEW_HREF
+      ? { ...link, children: [], loading: organizationId !== null }
+      : link), [state, organizationId, sessionKey]);
 }

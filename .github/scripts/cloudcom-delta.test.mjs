@@ -98,6 +98,10 @@ test('classifies only the reviewed Cloud Command server, bridge, registry, and b
   }
   for (const path of [
     'apps/web/src/lib/extensions/hostApi.ts',
+    'apps/web/src/components/extensions/useExtensionNavigation.ts',
+    'apps/web/src/components/layout/Sidebar.tsx',
+    'apps/web/src/components/layout/Sidebar.extensions.test.tsx',
+    'apps/web/src/lib/extensions/cloudCommandNavigationEvents.ts',
     'apps/web/src/components/extensions/ExtensionElementHost.tsx',
   ]) assert.equal(classify([path]).web, true);
   assert.equal(classify(['packages/extension-web-sdk/src/hostApi.ts']).shared, true);

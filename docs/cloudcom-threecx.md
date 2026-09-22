@@ -145,7 +145,7 @@ user-authorized dedicated test extension: an identity/voicemail PATCH and a
 forwarding update through `Users/Pbx.MultiUserUpdate` both succeeded and were
 restored afterward. The proof used no production or customer identifiers. It does
 not establish atomic stale-write protection, ETag support, or deployment readiness.
-This revision is implemented and locally verified, but not deployed.
+The profile compatibility fix shipped in PR #22. Live detail loading and narrow save/restore checks passed on the authorized test extension.
 
 ## Extension menu design
 

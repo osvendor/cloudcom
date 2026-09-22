@@ -186,6 +186,8 @@ type NavItem = {
   // (`native`) means a failed mode fetch shows the module rather than hiding
   // one the partner pays for.
   requiresModule?: 'service_management';
+  children?: readonly { name: string; href: string }[];
+  loading?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -594,7 +596,13 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
           label: 'Extensions',
           labelKey: 'nav.sectionExtensions',
           icon: Puzzle,
-          items: extensionNavLinks.map((link) => ({ name: link.name, href: link.href, icon: Puzzle })),
+          items: extensionNavLinks.map((link) => ({
+            name: link.name,
+            href: link.href,
+            icon: Puzzle,
+            children: link.children,
+            loading: link.loading,
+          })),
         }
       : null;
 
@@ -723,7 +731,13 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
   const resolvedPath = pathAliases[currentPath] ?? currentPath;
   const activeHref = useMemo(() => {
     let best: string | null = null;
-    const candidates = extensionsSection ? [...allNavItems, ...extensionsSection.items] : allNavItems;
+    const extensionItems = extensionsSection
+      ? extensionsSection.items.flatMap((item) => [
+          item,
+          ...(item.children ?? []).map((child) => ({ ...item, name: child.name, href: child.href, children: undefined })),
+        ])
+      : [];
+    const candidates = extensionsSection ? [...allNavItems, ...extensionItems] : allNavItems;
     for (const item of candidates) {
       const matches = item.href === '/'
         ? resolvedPath === '/'
@@ -740,7 +754,9 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
   // `sectionForHref`) when the active href belongs to it.
   const activeSectionId = activeHref
     ? (sectionForHref(activeHref)
-        ?? (extensionsSection && extensionsSection.items.some((item) => item.href === activeHref)
+        ?? (extensionsSection && extensionsSection.items.some((item) =>
+          item.href === activeHref || item.children?.some((child) => child.href === activeHref),
+        )
           ? extensionsSection.id
           : null))
     : null;
@@ -830,6 +846,63 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
 
   const renderNavItem = (item: NavItem, forMobileOverlay = false) => {
     if (!isNavItemVisible(item)) return null;
+    if (item.children !== undefined) {
+      const labels = forMobileOverlay ? true : showLabels;
+      const groupId = `extension-group:${item.name}`;
+      const hasActiveChild = item.children.some((child) => child.href === activeHref);
+      const expanded = groupId in expandedSections
+        ? expandedSections[groupId]
+        : hasActiveChild || item.href === activeHref;
+      return (
+        <div key={item.name}>
+          <button
+            type="button"
+            aria-expanded={expanded}
+            onClick={() => {
+
+              const next = { ...expandedSections, [groupId]: !expanded };
+              setExpandedSections(next);
+              saveExpandedSections(next);
+            }}
+            aria-label={!labels ? item.name : undefined}
+            className={cn(
+              'flex items-center gap-3 w-full rounded-md py-2 text-sm font-medium transition-colors',
+              labels ? 'px-3' : 'justify-center',
+              hasActiveChild ? 'bg-muted text-foreground' : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+            )}
+            title={!labels && !hovered ? item.name : undefined}
+          >
+            <item.icon className="h-5 w-5 shrink-0" />
+            {labels && <span className="truncate flex-1 text-left">{item.name}</span>}
+            {labels && <ChevronDown className={cn('h-3.5 w-3.5 transition-transform duration-200', expanded ? 'rotate-0' : '-rotate-90')} />}
+          </button>
+          {labels && (
+            <div className={cn('nav-section-content', expanded && 'nav-section-expanded')} aria-hidden={!expanded} inert={!expanded || undefined}>
+              <div className="space-y-0.5 pl-8">
+                {item.loading ? (
+                  <p className="px-3 py-1.5 text-xs text-muted-foreground">Loading…</p>
+                ) : item.children.length === 0 ? (
+                  <p className="px-3 py-1.5 text-xs text-muted-foreground">No connections. Set up services in Connect.</p>
+                ) : item.children.map((child) => (
+                  <a
+                    key={child.href}
+                    href={child.href}
+                    aria-current={child.href === activeHref ? 'page' : undefined}
+                    onClick={forMobileOverlay ? () => closeMobileMenu() : undefined}
+                    className={cn(
+                      'flex items-center rounded-md px-3 py-1.5 text-sm transition-colors',
+                      child.href === activeHref ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+                    )}
+                  >
+                    <span className="truncate">{child.name}</span>
+                  </a>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
     const isActive = item.href === activeHref;
     const labels = forMobileOverlay ? true : showLabels;
     const narrow = forMobileOverlay ? false : isNarrow;
