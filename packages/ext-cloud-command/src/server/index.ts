@@ -8,14 +8,16 @@ import { createProvider, ProviderError, type GuardedFetch } from './transport';
 import type { NativeMicrosoftServices } from './native-microsoft';
 export type { NativeMicrosoftServices, MicrosoftRequest, MicrosoftResource } from './native-microsoft';
 import { mountMicrosoftRoutes } from './microsoft';
+import { mountThreeCxDetails, ThreeCxDetailError } from './threecx-details';
 import type { AdministrationRuntime } from './admin-runtime';
 import { createAdministrationServices } from './admin-services';
 export type { AdministrationRuntime } from './admin-runtime';
 export { createAdministrationTokenProvider } from './admin-token-provider';
 
 const table = 'cloudcommand_threecx_connections';
-type Row = { id: string; org_id: string; origin: string; client_id: string; secret_ciphertext: string;
+export type ThreeCxConnection = { id: string; org_id: string; origin: string; client_id: string; secret_ciphertext: string;
   department_id: number | null; enabled: boolean; version: number; last_verified_at: string | Date | null };
+type Row = ThreeCxConnection;
 type Auth = { user: { id: string; isPlatformAdmin?: boolean }; scope?: 'system' | 'partner' | 'organization'; partnerId: string | null; canAccessOrg(id: string): boolean };
 type Scope = { organizationId: string; partnerId: string; actorId: string };
 export type Variables = { auth: Auth; extensionAuthorization: ExtensionRequestAuthorization; scope: Scope; canManage: boolean };
@@ -71,7 +73,7 @@ export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFet
     await next();
   });
   app.onError((error, c) => {
-    if (error instanceof RouteError) return c.json({ error: error.code.replaceAll('_', ' '), code: error.code }, error.status);
+    if (error instanceof RouteError || error instanceof ThreeCxDetailError) return c.json({ error: error.code.replaceAll('_', ' '), code: error.code }, error.status);
     if (error instanceof ProviderError || error instanceof ThreeCxReadError) return c.json({ error: 'The PBX request could not be completed.', code: error.code }, 502);
     // Never log upstream bodies, URLs, request payloads, token or DB query values.
     context.log('error', 'Cloud Command request failed');
@@ -139,6 +141,7 @@ export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFet
     });
     return c.json(await service.listExtensions(scope, row.id, skip));
   });
+  mountThreeCxDetails(app, { connection, credentials: row => ({ origin: row.origin, clientId: row.client_id, secret: secret(row) }), provider, context });
   mountMicrosoftRoutes(app, administration ? createAdministrationServices(context, fetch, administration) : microsoft);
   return app;
 }

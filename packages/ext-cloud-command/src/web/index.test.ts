@@ -24,7 +24,13 @@ function mount(api: CloudCommandHostApi): CloudCommandThreeCxPage {
   return page;
 }
 
-afterEach(() => { document.body.replaceChildren(); });
+const detail = (editable = { general: false, voicemail: false, forwarding: false }) => ({
+  user: { Id: 1, Number: '100', FirstName: 'Ada', LastName: 'Lovelace', EmailAddress: 'ada@example.com', Mobile: '555-0100', Enabled: true, IsRegistered: true, OutboundCallerID: '555-0100', VMEnabled: true },
+  groups: [{ id: 1, name: 'Support', role: 'Member' }], phones: [], forwardingProfiles: [], forwardingExceptions: [], greetings: [],
+  blf: { configured: false, entries: [], readable: true }, revision: 'rev-1', editable, notices: [],
+});
+
+afterEach(() => { document.body.replaceChildren(); window.location.hash = ''; vi.restoreAllMocks(); });
 
 describe('CloudCommandThreeCxPage', () => {
   it('keeps the operational route directory-only', async () => {
@@ -296,10 +302,11 @@ describe('CloudCommandThreeCxPage', () => {
     expect(root.textContent).toContain('No extensions found.');
   });
 
-  it('opens read-only details in a drawer and restores focus when Escape closes it', async () => {
-    const page = mount({ request: async (path) => path === '/threecx/users?skip=0'
+  it('loads a hash-selected read-only extension as a full page', async () => {
+    const request = vi.fn(async (path: string) => path === '/threecx/users?skip=0'
       ? Response.json({ items: [{ Id: 1, Number: '100', FirstName: 'Ada', LastName: 'Lovelace', EmailAddress: 'ada@example.com', Mobile: '555-0100', Enabled: true, IsRegistered: true, CurrentProfileName: 'Default' }], nextSkip: null, truncated: false })
-      : Response.json({ connected: true, canManage: false, enabled: true }) });
+      : path === '/threecx/users/1' ? Response.json(detail()) : Response.json({ connected: true, canManage: false, enabled: true }));
+    const page = mount({ request });
     await flush();
     let root = page.shadowRoot!;
     (root.querySelector('#refresh-users') as HTMLButtonElement).click();
@@ -307,12 +314,65 @@ describe('CloudCommandThreeCxPage', () => {
     root = page.shadowRoot!;
     const opener = root.querySelector<HTMLButtonElement>('[data-detail-index="0"]')!;
     opener.click();
-    await flush();
-    expect(root.querySelector('[role="dialog"]')!.textContent).toContain('ada@example.com');
-    expect(root.querySelector<HTMLButtonElement>('#details-close')).toBe(root.activeElement);
-    root.querySelector('[role="dialog"]')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-    await flush();
+    await flush(); await flush();
+    expect(root.querySelector('#detail-title')!.textContent).toContain('Ada Lovelace');
+    expect(root.textContent).toContain('ada@example.com');
+    expect(root.querySelector('[data-detail-field="FirstName"]')).toBeNull();
     expect(root.querySelector('[role="dialog"]')).toBeNull();
-    expect(root.querySelector<HTMLButtonElement>('[data-detail-index="0"]')).toBe(root.activeElement);
+    expect(request.mock.calls.map(([path]) => path)).toContain('/threecx/users/1');
+    (root.querySelector('#detail-back') as HTMLButtonElement).click();
+    await flush();
+    expect(root.querySelector('[data-detail-index="0"]')).toBeTruthy();
+  });
+
+  it('keeps general drafts across tabs, saves only allowed fields, and reloads the detail', async () => {
+    window.location.hash = '#extension=1&tab=general';
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/threecx/users/1' && init?.method === 'PATCH') { expect(JSON.parse(String(init.body))).toEqual({ revision: 'rev-1', changes: { FirstName: 'Grace' } }); return Response.json({ success: true }); }
+      if (path === '/threecx/users/1') return Response.json(detail({ general: true, voicemail: true, forwarding: false }));
+      if (path === '/threecx/users?skip=0') return Response.json({ items: [], nextSkip: null, truncated: false });
+      return Response.json({ connected: true, canManage: false, enabled: true });
+    });
+    const page = mount({ request });
+    await flush(); await flush();
+    let root = page.shadowRoot!;
+    root.querySelector<HTMLButtonElement>('[data-detail-tab="general"]')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight' }));
+    await flush();
+    expect(root.activeElement?.id).toBe('threecx-detail-forwarding');
+    (root.querySelector('[data-detail-tab="general"]') as HTMLButtonElement).click();
+    await flush();
+    const first = root.querySelector<HTMLInputElement>('[data-detail-field="FirstName"]')!;
+    first.value = 'Grace'; first.dispatchEvent(new Event('input'));
+    (root.querySelector('[data-detail-tab="voicemail"]') as HTMLButtonElement).click();
+    await flush();
+    expect(root.textContent).toContain('Pending changes');
+    window.location.hash = '#extension=1&tab=general'; window.dispatchEvent(new HashChangeEvent('hashchange'));
+    await flush();
+    root = page.shadowRoot!;
+    expect(root.querySelector<HTMLInputElement>('[data-detail-field="FirstName"]')!.value).toBe('Grace');
+    (root.querySelector('#detail-save') as HTMLButtonElement).click();
+    await flush(); await flush();
+    expect(request.mock.calls.filter(([path, init]) => path === '/threecx/users/1' && (init as RequestInit | undefined)?.method === 'PATCH')).toHaveLength(1);
+    root = page.shadowRoot!;
+    const last = root.querySelector<HTMLInputElement>('[data-detail-field="LastName"]')!;
+    last.value = 'Hopper'; last.dispatchEvent(new Event('input'));
+    (root.querySelector('#detail-discard') as HTMLButtonElement).click();
+    await flush();
+    expect(root.querySelector<HTMLInputElement>('[data-detail-field="LastName"]')!.value).toBe('Lovelace');
+  });
+
+  it('drops a delayed detail response after an organization scope switch', async () => {
+    window.location.hash = '#extension=1&tab=general';
+    let resolveDetail!: (response: Response) => void;
+    const page = mount({ request: (path) => {
+      if (path === '/threecx/users/1') return new Promise<Response>((resolve) => { resolveDetail = resolve; });
+      if (path === '/threecx/users?skip=0') return Promise.resolve(Response.json({ items: [], nextSkip: null, truncated: false }));
+      return Promise.resolve(Response.json({ connected: true, canManage: false, enabled: true }));
+    } });
+    await flush();
+    page.context = { ...context, organizationId: 'org-2' };
+    resolveDetail(Response.json(detail()));
+    await flush(); await flush();
+    expect(page.shadowRoot!.textContent).not.toContain('Ada Lovelace');
   });
 });
