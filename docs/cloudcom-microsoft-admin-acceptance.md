@@ -1,5 +1,8 @@
 # Microsoft administration acceptance
 
+> Onboarding requirement: [one Microsoft 365 connection under Extensions > Connect](cloudcom-microsoft-onboarding.md). This supersedes older customer-facing Integrations redirects or separate profile setup instructions below. Internal profile security boundaries remain in force.
+
+
 ## Target and implementation boundary
 
 Acceptance covers reads and writes across the eligible, non-premium portion of the CIPP-derived feature ledger, not only directory inventory. Existing administrative certificates and grants may be reused by an isolated administration executor where verified compatible. The dedicated upstream customer-graph-read and customer-graph-actions profile manifests must not be silently widened or bypassed.

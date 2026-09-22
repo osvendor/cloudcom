@@ -1,5 +1,8 @@
 # Cloud Command native Microsoft 365 extension
 
+> Onboarding requirement: [one Microsoft 365 connection under Extensions > Connect](cloudcom-microsoft-onboarding.md). This supersedes older customer-facing Integrations redirects or separate profile setup instructions below. Internal profile security boundaries remain in force.
+
+
 ## Implemented boundary
 
 The Microsoft extension uses Breeze's native Microsoft Graph read executor through a versioned, compiled host bridge. CIPP is a pinned source and capability reference only. There is no CIPP server, API URL, client secret, tenant discovery call or runtime dependency.

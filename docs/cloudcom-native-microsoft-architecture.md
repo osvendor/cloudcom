@@ -1,5 +1,8 @@
 # Native Microsoft administration extension: corrected architecture
 
+> Onboarding requirement: [one Microsoft 365 connection under Extensions > Connect](cloudcom-microsoft-onboarding.md). This supersedes older customer-facing Integrations redirects or separate profile setup instructions below. Internal profile security boundaries remain in force.
+
+
 Decision recorded 22 September 2026. This supersedes the proposal to require a running CIPP backend.
 
 ## Product boundary
