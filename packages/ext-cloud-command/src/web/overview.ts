@@ -58,7 +58,7 @@ export class CloudCommandOverviewPage extends HTMLElement {
       const state = this.states[provider.id];
       return state && (provider.id !== 'microsoft' || state.available === true) && ((state.connected === true && state.enabled === true) || state.canManage === true);
     });
-    this.root.innerHTML = `<style>${styles}</style><main><header><div><h1>Cloud Command</h1><p>Services for the selected organization.</p></div><button id="refresh" ${this.loading ? 'disabled' : ''}>Refresh</button></header><p role="status">${this.loading ? 'Loading servicesâ€¦' : this.failed ? 'Some service statuses could not be loaded. Refresh to try again.' : ''}</p><section aria-label="Organization services" class="providers">${visible.map(provider => {
+    this.root.innerHTML = `<style>${styles}</style><main><header><div><h1>Cloud Command</h1><p>Services for the selected organization.</p></div><button id="refresh" ${this.loading ? 'disabled' : ''}>Refresh</button></header><p role="status">${this.loading ? 'Loading services…' : this.failed ? 'Some service statuses could not be loaded. Refresh to try again.' : ''}</p><section aria-label="Organization services" class="providers">${visible.map(provider => {
       const enabled = this.states[provider.id]!.connected && this.states[provider.id]!.enabled === true;
       return `<article><h2>${provider.title}</h2><p>${provider.description}</p><span>${enabled ? 'Enabled' : 'Not enabled'}</span><button data-provider="${provider.id}">${enabled ? 'Open' : 'Configure'} ${provider.title}</button></article>`;
     }).join('')}</section>${!this.loading && !visible.length ? '<p class="empty">No enabled services are available for this organization.</p>' : ''}</main>`;

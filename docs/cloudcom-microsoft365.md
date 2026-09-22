@@ -119,7 +119,7 @@ real breeze_app RLS. Repeat affected contracts after each Breeze/CIPP upgrade.
 
 ## Organization entry page
 
-Extensions â†’ Cloud Command opens a provider overview for the selected organization.
+Extensions → Cloud Command opens a provider overview for the selected organization.
 Readers see only enabled providers; managers can reopen available provider setup.
 Microsoft stays hidden until its partner backend is configured. Existing provider
 deep links remain stable. Switching organizations clears pending drafts and data
