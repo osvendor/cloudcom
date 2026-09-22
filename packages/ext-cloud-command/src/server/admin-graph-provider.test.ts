@@ -116,6 +116,23 @@ describe('bounded Microsoft administration provider', () => {
     expect(h.fetch).toHaveBeenCalledTimes(2);
   });
 
+  it.each(['add', 'remove'] as const)('allows %s for an ordinary group with explicit null role assignability', async action => {
+    const h = harness();
+    h.fetch.mockResolvedValueOnce(response({ ...staticGroup, isAssignableToRole: null }))
+      .mockResolvedValueOnce(response({ id: USER })).mockResolvedValueOnce(new Response(null, { status: 204 }));
+    expect(await (action === 'add' ? h.provider.addGroupMember(GROUP, USER) : h.provider.removeGroupMember(GROUP, USER)))
+      .toEqual({ accepted: true });
+    expect(h.fetch).toHaveBeenCalledTimes(4);
+    expect(h.fetch.mock.calls[3][1].method).toBe(action === 'add' ? 'POST' : 'DELETE');
+  });
+
+  it('rejects malformed role assignability before any membership mutation', async () => {
+    const h = harness();
+    h.fetch.mockResolvedValueOnce(response({ ...staticGroup, isAssignableToRole: 'false' }));
+    await expect(h.provider.addGroupMember(GROUP, USER)).rejects.toMatchObject({ code: 'invalid_provider_response' });
+    expect(h.fetch).toHaveBeenCalledTimes(2);
+  });
+
   it('rejects object identity substitution', async () => {
     const h = harness();
     h.fetch.mockResolvedValueOnce(response({ id: GROUP }));

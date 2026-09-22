@@ -103,7 +103,10 @@ export function createAdminGraphProvider(options: {
     const token = await session();
     const target = await resource(token, '/groups', groupId, group, groupSelect);
     if (target.groupTypes.includes('DynamicMembership') || target.onPremisesSyncEnabled === true
-      || target.isAssignableToRole !== false || (!target.securityEnabled && !target.groupTypes.includes('Unified'))
+      // Graph returns explicit null for ordinary non-role-assignable groups.
+      // Omission remains unknown and fails closed; true is always excluded.
+      || (target.isAssignableToRole !== false && target.isAssignableToRole !== null)
+      || (!target.securityEnabled && !target.groupTypes.includes('Unified'))
       || (target.mailEnabled && !target.groupTypes.includes('Unified'))) throw new AdminGraphError('unsupported_group');
     await resource(token, '/users', userId, user, userSelect);
     if (remove) await request(token, `/groups/${groupId}/members/${userId}/$ref`, 'DELETE');
