@@ -1,8 +1,8 @@
 /**
- * Read-only 3CX orchestration. Not registered with the host yet.
+ * Read-only 3CX orchestration used by the extension's authenticated route.
  * Ports MUST be server-owned: authorize through Breeze, load with enforced RLS,
- * and call the PBX through an egress-safe transport. No network implementation
- * or credential store is bundled here, so this cannot send credentials itself.
+ * and call the PBX through an egress-safe transport. This module itself has no
+ * network implementation or credential store.
  */
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const fields = ['Id', 'Number', 'FirstName', 'LastName', 'EmailAddress', 'Mobile', 'Enabled', 'IsRegistered', 'CurrentProfileName'];

@@ -11,6 +11,7 @@ COPY packages/extension-sdk/package.json ./packages/extension-sdk/
 COPY packages/extension-web-sdk/package.json ./packages/extension-web-sdk/
 COPY packages/extension-testkit/package.json ./packages/extension-testkit/
 COPY ee/workspace/package.json ./ee/workspace/
+COPY packages/ext-cloud-command/package.json ./packages/ext-cloud-command/
 RUN pnpm install --frozen-lockfile
 
 FROM base AS builder
@@ -22,9 +23,11 @@ COPY --from=deps /app/packages/extension-sdk/node_modules ./packages/extension-s
 COPY --from=deps /app/packages/extension-web-sdk/node_modules ./packages/extension-web-sdk/node_modules
 COPY --from=deps /app/packages/extension-testkit/node_modules ./packages/extension-testkit/node_modules
 COPY --from=deps /app/ee/workspace/node_modules ./ee/workspace/node_modules
+COPY --from=deps /app/packages/ext-cloud-command/node_modules ./packages/ext-cloud-command/node_modules
 COPY . .
 RUN pnpm --filter @breeze/api build
 RUN pnpm --filter @breeze/ext-workspace build:web
+RUN pnpm --filter @cloudcom/ext-cloud-command build:web
 # Create a self-contained deployment (resolves pnpm symlinks).
 # pnpm 10's deploy command requires workspace deps be declared injected.
 # TODO: declare @breeze/shared (and other workspace deps) as injected in
@@ -81,3 +84,7 @@ USER hono
 
 EXPOSE 3001
 CMD ["node", "dist/index.cjs"]
+
+COPY --from=builder --chown=hono:nodejs /app/packages/ext-cloud-command/manifest.json ./packages/ext-cloud-command/manifest.json
+COPY --from=builder --chown=hono:nodejs /app/packages/ext-cloud-command/migrations ./packages/ext-cloud-command/migrations
+COPY --from=builder --chown=hono:nodejs /app/packages/ext-cloud-command/dist ./packages/ext-cloud-command/dist

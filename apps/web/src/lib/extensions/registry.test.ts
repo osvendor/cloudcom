@@ -46,6 +46,7 @@ function registryDoc(over: Partial<RuntimeWebRegistry> = {}): RuntimeWebRegistry
     extensions: [
       {
         name: 'demo',
+        routeNamespace: 'demo',
         version: '1.0.0',
         digest: 'abc123',
         moduleUrl: '/api/v1/extensions/assets/demo/abc123/index.js',

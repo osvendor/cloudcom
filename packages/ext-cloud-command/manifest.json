@@ -1,0 +1,74 @@
+{
+  "apiVersion": "breeze.extensions/v1",
+  "name": "cloudcommand",
+  "version": "0.1.0",
+  "routeNamespace": "cloud-command",
+  "requires": {
+    "breeze": ">=0.1.0 <0.2.0",
+    "serverSdk": "^1.0.0",
+    "webSdk": "^1.0.0",
+    "capabilities": [
+      "server.routes.v1",
+      "web.pages.v1",
+      "web.navigation.v1",
+      "server.db.rls.v1",
+      "server.secrets.v1",
+      "server.audit.v1"
+    ]
+  },
+  "server": {
+    "entry": "server/index.cjs"
+  },
+  "web": {
+    "entry": "web/index.js",
+    "pages": [
+      {
+        "id": "threecx",
+        "path": "/threecx",
+        "element": "cloudcommand-threecx-page"
+      }
+    ],
+    "navigation": [
+      {
+        "id": "threecx",
+        "label": "Cloud Command",
+        "path": "/threecx",
+        "order": 100
+      }
+    ],
+    "slots": []
+  },
+  "migrationsDir": "migrations",
+  "schemaCompatibilityFloor": "0.1.0",
+  "publicRoutes": [],
+  "agentRoutes": false,
+  "jobs": [],
+  "aiTools": [],
+  "tenancy": {
+    "orgCascadeDeleteTables": [
+      "cloudcommand_threecx_connections"
+    ],
+    "deviceCascadeDeleteTables": [],
+    "deviceOrgDenormalizedTables": [],
+    "nonTenantTables": [],
+    "orgExportColumns": {
+      "cloudcommand_threecx_connections": {
+        "include": [
+          "id",
+          "org_id",
+          "origin",
+          "client_id",
+          "department_id",
+          "enabled",
+          "version",
+          "last_verified_at",
+          "created_at",
+          "updated_at"
+        ],
+        "exclude": [
+          "secret_ciphertext"
+        ]
+      }
+    }
+  }
+}

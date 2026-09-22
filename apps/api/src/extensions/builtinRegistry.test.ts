@@ -175,7 +175,7 @@ describe('BUILTINS manifest resolution is lazy (#3470)', () => {
     expect(manifestReads, `read during import: ${manifestReads.join(', ')}`).toEqual([]);
     expect(mod.BUILTINS.length).toBeGreaterThan(0);
     // The name set is derived from the STATIC name field, so it stays free of I/O too.
-    expect([...mod.BUILTIN_EXTENSION_NAMES]).toEqual(['workspace']);
+    expect([...mod.BUILTIN_EXTENSION_NAMES]).toEqual(['cloudcommand', 'workspace']);
     expect(manifestReads, `read for names: ${manifestReads.join(', ')}`).toEqual([]);
 
     vi.doUnmock('node:fs');

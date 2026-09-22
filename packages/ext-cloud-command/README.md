@@ -1,30 +1,17 @@
-# Cloud Command extension foundation
+# Cloud Command: 3CX
 
-Initial read-only 3CX orchestration; NOT a registered or deployable extension yet.
-No API endpoints, migration, credentials, live PBX calls or UI activation are included.
+Compiled-in Breeze extension, default off (`CLOUDCOM_THREECX_ENABLED=true` opts in).
+See [implementation and operations](../../docs/cloudcom-threecx.md).
 
-Each connection belongs to one partner and organization and has its own HTTPS PBX origin,
-encrypted credential reference and optional department ID. The server must supply the
-authorized actor/scope; the browser is not trusted to assert these values.
+The first slice supports per-organization credentials, connection verification,
+explicit department or whole-PBX scope, and a read-only extension directory with
+a details drawer. It does not change PBX configuration, calls, users, or routing.
 
-The service receives server-owned ports for authorization, RLS-protected connection
-lookup and a readUsers transport. It rejects mismatched/disabled connections, projects
-only supported user fields and handles pagination before department filtering.
+Server-owned transport uses Breeze's public-only DNS-pinned HTTPS egress guard.
+The web component uses a revocable host API bridge; it never reads login tokens.
+Credentials are encrypted with organization-bound AAD and excluded from exports.
 
-Before registration: implement and test secret storage, forced RLS/migrations, audited
-connection configuration, MFA, connection verification, native Breeze UI and the transport.
-The transport must enforce DNS/IP egress policy (including rebinding and redirects), TLS,
-timeouts, bounded response size, redacted errors and per-connection client-credentials
-authentication. normalizePbxOrigin is syntax validation, NOT SSRF protection. Private PBXs
-need an explicit controlled reachability policy. Never use unrestricted fetch as this port.
-
-Do not transfer the legacy hardcoded PBX origin, organization or DEFAULT department to
-source. Discover accessible departments per connection. Full PBX scope is an explicit
-configuration choice; department filtering here does not prove report isolation.
-
-Next slice: connection persistence + test-connection endpoint + native connection/list UI.
-Call reports and mutations follow separately. CIPP and Google are not part of this slice.
-
-Reference: https://www.3cx.com/docs/configuration-rest-api-endpoints/
-
-Run foundation tests with `npm test` inside this package (Node 22+).
+Run `pnpm --filter @cloudcom/ext-cloud-command typecheck`, `build:web`, `test`,
+`test:server`, and `test:web`. `bash scripts/cloudcom/test-threecx-rls.sh` from the
+repository root creates a disposable local database and verifies real forced RLS.
+The runtime bundle, manifest and migrations must ship with the same API release.

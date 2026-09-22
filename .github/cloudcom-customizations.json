@@ -84,6 +84,37 @@
           "contains": "src/services/monitors/monitorCompiler.w04.test.ts"
         }
       ]
+    },
+    {
+      "id": "cloud-command-threecx",
+      "requiredFiles": [
+        "packages/ext-cloud-command/manifest.json",
+        "packages/ext-cloud-command/src/server/index.ts",
+        "packages/ext-cloud-command/src/server/transport.ts",
+        "packages/ext-cloud-command/src/web/index.ts",
+        "packages/ext-cloud-command/migrations/2026-09-21-threecx-connections.sql",
+        "apps/web/src/lib/extensions/hostApi.ts",
+        "packages/extension-web-sdk/src/hostApi.ts",
+        "docs/cloudcom-threecx.md"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "enableEnvVar: 'CLOUDCOM_THREECX_ENABLED'"
+        },
+        {
+          "file": "apps/web/src/components/extensions/ExtensionElementHost.tsx",
+          "contains": "createExtensionHostApi"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "scripts/cloudcom/test-threecx-rls.sh"
+        },
+        {
+          "file": "apps/api/Dockerfile",
+          "contains": "@cloudcom/ext-cloud-command build:web"
+        }
+      ]
     }
   ]
 }

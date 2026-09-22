@@ -1025,8 +1025,8 @@ describe('loadBuiltinExtensions — helperRoutes staging', () => {
 });
 
 describe('BUILTIN_EXTENSION_NAMES', () => {
-  it('names the workspace extension (the first and only built-in)', () => {
-    expect([...BUILTIN_EXTENSION_NAMES]).toEqual(['workspace']);
+  it('names the compiled-in extensions', () => {
+    expect([...BUILTIN_EXTENSION_NAMES]).toEqual(['cloudcommand', 'workspace']);
   });
 
   /**
@@ -1106,7 +1106,8 @@ describe('built-in tenancy participates in the tenant-export contract', () => {
   }
 
   it('classifies every org-cascade table the workspace built-in declares', () => {
-    const [workspace] = builtinTenancyDeclarations();
+    const declarations = builtinTenancyDeclarations();
+    const workspace = BUILTINS.find(b => b.name === 'workspace')!.manifest.tenancy;
     expect(workspace?.orgCascadeDeleteTables.length).toBeGreaterThan(0);
     publishBuiltinTenancy();
 
@@ -1115,7 +1116,7 @@ describe('built-in tenancy participates in the tenant-export contract', () => {
     // classification`.
     const classified = getExtensionOrgExportColumns();
     expect(Object.keys(classified).sort()).toEqual(
-      [...workspace!.orgCascadeDeleteTables].sort(),
+      declarations.flatMap(d => d.orgCascadeDeleteTables).sort(),
     );
 
     // Every table classifies a non-empty column set, and include/exclude never

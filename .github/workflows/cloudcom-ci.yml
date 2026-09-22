@@ -110,12 +110,24 @@ jobs:
           node-version-file: .node-version
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Typecheck and test the Cloud Command extension package
+        if: needs.delta.outputs.api == 'true' || needs.delta.outputs.web == 'true' || needs.delta.outputs.shared == 'true'
+        run: |
+          pnpm --filter @cloudcom/ext-cloud-command typecheck
+          pnpm --filter @cloudcom/ext-cloud-command build:web
+          pnpm --filter @cloudcom/ext-cloud-command test
+          pnpm --filter @cloudcom/ext-cloud-command test:server
+          pnpm --filter @cloudcom/ext-cloud-command test:web
       - name: Run API tests and build when API or shared code changed
         if: needs.delta.outputs.api == 'true' || needs.delta.outputs.shared == 'true'
         run: |
           pnpm --filter @breeze/api exec vitest run src/services/monitors/monitorCompiler.test.ts src/services/monitors/monitorCompiler.w04.test.ts src/services/automationReferenceAuthorization.test.ts src/jobs/automationWorker.monitorBinding.test.ts
           pnpm --filter @breeze/api exec vitest run src/services/cloudcom/remoteAccessOptions.test.ts src/routes/devices/cloudcomRemoteAccess.test.ts src/services/remoteAccessLauncher.test.ts src/services/remoteAccessProviders.test.ts src/routes/devices/core.remoteAccessLaunch.test.ts
+          pnpm --filter @breeze/api exec vitest run src/extensions/builtinExtensions.test.ts src/extensions/builtinRegistry.test.ts src/extensions/webRegistry.test.ts src/extensions/webAssets.test.ts src/extensions/stageExtension.test.ts src/extensions/gateway.test.ts src/services/urlSafety.test.ts src/services/urlSafety.tripwire.test.ts src/routes/extensionsWeb.test.ts
           pnpm --filter @breeze/api build
+      - name: Prove Cloud Command 3CX migration and RLS boundaries
+        if: needs.delta.outputs.api == 'true' || needs.delta.outputs.shared == 'true'
+        run: bash scripts/cloudcom/test-threecx-rls.sh
       - name: Run web tests and build when web or shared code changed
         if: needs.delta.outputs.web == 'true' || needs.delta.outputs.shared == 'true'
         run: |
@@ -123,6 +135,7 @@ jobs:
           pnpm --filter @breeze/web exec vitest run src/components/cloudcom/browserDesktop src/components/remote/ConnectDesktopButton.browser.test.tsx
           pnpm --filter @breeze/viewer exec vitest run src/lib/answerPoll.test.ts src/lib/revocationLease.test.ts src/lib/keymap.test.ts src/lib/api.test.ts
           pnpm --filter @breeze/web exec vitest run src/components/cloudcom/RemoteAccessAlternatives.test.tsx src/components/remote/ConnectDesktopButton.test.tsx src/components/remote/ConnectDesktopButton.denied.test.tsx src/components/remote/ConnectDesktopButton.revoked.test.tsx src/components/remote/ConnectDesktopButton.teardownPending.test.tsx src/components/remote/RemoteToolsPage.test.tsx src/components/remote/RemoteToolsPage.liveDesktopAccess.test.tsx
+          pnpm --filter @breeze/web exec vitest run src/lib/extensions/hostApi.test.ts src/lib/extensions/registry.test.ts src/components/extensions/ExtensionElementHost.test.tsx src/components/extensions/ExtensionSlotHost.test.tsx src/components/extensions/ExtensionPageHost.test.tsx src/components/extensions/useExtensionNavigation.test.tsx
           pnpm --filter @breeze/web build
       - name: Run fork infrastructure contracts
         if: needs.delta.outputs.infra == 'true'

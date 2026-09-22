@@ -23,6 +23,45 @@ const remoteAccessApiPaths = new Set([
   'apps/api/src/services/cloudcom/remoteAccessOptions.ts',
   'apps/api/src/services/cloudcom/remoteAccessOptions.test.ts',
 ]);
+const cloudCommandApiPaths = new Set([
+  'apps/api/src/routes/extensionsWeb.test.ts',
+  'apps/api/src/routes/extensionsWeb.ts',
+  'apps/api/src/extensions/builtinExtensions.test.ts',
+  'apps/api/src/extensions/builtinExtensions.ts',
+  'apps/api/src/extensions/builtinRegistry.test.ts',
+  'apps/api/src/extensions/builtinRegistry.ts',
+  'apps/api/src/extensions/webRegistry.test.ts',
+  'apps/api/src/extensions/webRegistry.ts',
+  'apps/api/src/extensions/webAssets.test.ts',
+  'apps/api/src/extensions/webAssets.ts',
+  'apps/api/src/extensions/stageExtension.test.ts',
+  'apps/api/src/extensions/stageExtension.ts',
+  'apps/api/src/extensions/gateway.test.ts',
+  'apps/api/src/extensions/gateway.ts',
+  'apps/api/src/services/urlSafety.test.ts',
+  'apps/api/src/services/urlSafety.tripwire.test.ts',
+  'apps/api/src/services/urlSafety.ts',
+  'apps/api/src/__tests__/integration/cloudCommandThreeCx.integration.test.ts',
+  'apps/api/package.json',
+  'apps/api/tsup.config.ts',
+  'apps/api/Dockerfile',
+  'docker/Dockerfile.api',
+  'pnpm-lock.yaml',
+]);
+const cloudCommandWebPaths = new Set([
+  'apps/web/src/components/extensions/ExtensionElementHost.tsx',
+  'apps/web/src/components/extensions/ExtensionPageHost.test.tsx',
+  'apps/web/src/components/extensions/ExtensionSlotHost.test.tsx',
+  'apps/web/src/components/extensions/useExtensionNavigation.test.tsx',
+  'apps/web/src/lib/extensions/hostApi.test.ts',
+  'apps/web/src/lib/extensions/hostApi.ts',
+  'apps/web/src/lib/extensions/registry.test.ts',
+  'apps/web/src/lib/extensions/registry.ts',
+]);
+const cloudCommandSharedPaths = new Set([
+  'packages/extension-web-sdk/src/hostApi.ts',
+  'packages/extension-web-sdk/src/index.ts',
+]);
 const infraPaths = new Set([
   'AGENTS.md', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',
   '.github/scripts/check-cloudcom-runner.sh', '.github/scripts/ci-area-gating.test.mjs',
@@ -45,9 +84,22 @@ export function readBaseline(text = readFileSync(baselinePath, 'utf8')) {
 export function classify(paths) {
   const result = { api: false, web: false, shared: false, native: false, infra: false, unsupported: [] };
   for (const path of paths.filter(Boolean)) {
-    if (docsPath.test(path)) continue;
+    if (docsPath.test(path) || path === 'packages/ext-cloud-command/README.md') continue;
     if (remoteAccessApiPaths.has(path)) {
       result.api = true;
+      continue;
+    }
+    if (cloudCommandApiPaths.has(path) || /^packages\/ext-cloud-command\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/2026-09-21-threecx-connections\.sql|src\/(?:server|threecx|web)\/.+)$/u.test(path)) {
+      result.api = true;
+      result.web = true;
+      continue;
+    }
+    if (cloudCommandWebPaths.has(path)) {
+      result.web = true;
+      continue;
+    }
+    if (cloudCommandSharedPaths.has(path)) {
+      result.shared = true;
       continue;
     }
     if (remoteAccessWebPaths.has(path) || path.startsWith('apps/web/src/components/cloudcom/browserDesktop/') ||
