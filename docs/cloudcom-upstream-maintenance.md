@@ -71,3 +71,7 @@ Include the purpose, status (planned/implemented/verified/deployed), affected pa
 The inherited CI Success/routing contracts reference retired workflow files and are not replacement gates. `apps/api/src/config/envComposeParity.test.ts` classifies `BREEZE_RELEASE_REPOSITORY` as a host-side deployment input consumed by `scripts/prod/deploy.sh`, not an API container variable. The environment parity check is selected by the new pipeline; The inherited CI pipeline is now retired; replacement checks must assess these contracts for relevance before selecting them.
 
 At the initial 2026-09-21 review, full CI was incomplete and an earlier Type Check had received a runner shutdown signal. The release workflow was still coupled to agent/desktop publishing, and repository Actions secrets were not configured. A verified application release path, signing configuration, fresh-install validation and recovery rehearsal are required before production cutover. Update this section when evidence resolves each item; do not infer readiness from the existence of configuration options.
+
+## Microsoft menu licensing boundary (2026-09-22)
+
+Planned extension expansion excludes premium-only features under [the menu scope](cloudcom-microsoft-menu-scope.md). Current four-resource navigation needs no removal. Preserve this boundary during upstream/CIPP imports; verify menus, nested actions and direct routes when implementing new features. Documentation-only change, no migration or deployment required; baseline 7e898d625c713d8521c561c2f28f3de8786fd7da, PR #16.
