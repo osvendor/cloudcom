@@ -15,7 +15,10 @@ UniFi-style discovery or matching is required. Existing organizations remain the
 authoritative client records.
 
 The first slice provides connection verification, accessible department discovery,
-a paginated read-only extension list, and a read-only details drawer. Whole-PBX
+a paginated read-only extension list, and a read-only details drawer. When an
+enabled connection opens in the directory or combined view, the first extension
+page loads automatically; Refresh remains available for a later read. Configuration-only
+views and disabled connections do not issue extension reads. Whole-PBX
 access is an explicit choice; selecting a department filters the returned users.
 This does not establish a permission boundary for future call reports. PBX user
 editing, routing, queues, reports and telephony mutations are not implemented.

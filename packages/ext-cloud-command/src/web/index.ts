@@ -67,6 +67,8 @@ export class CloudCommandThreeCxPage extends HTMLElement {
   private groupsFor: Pick<ConnectionDraft, 'origin' | 'clientId'> | null = null;
   private draft: ConnectionDraft | null = null;
   private users: User[] = [];
+  /** Keeps an empty completed directory distinct from a directory not yet read. */
+  private usersLoaded = false;
   private nextSkip: number | null = null;
   private detailIndex: number | null = null;
   private focusReturnIndex: number | null = null;
@@ -105,6 +107,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
       this.groupsFor = null;
       this.draft = null;
       this.users = [];
+      this.usersLoaded = false;
       this.nextSkip = null;
       this.detailIndex = null;
       this.focusReturnIndex = null;
@@ -164,6 +167,9 @@ export class CloudCommandThreeCxPage extends HTMLElement {
       this.setStatus(connection.connected ? 'Connection loaded.' : 'No 3CX connection is configured.');
       this.render();
       if (this.mode !== 'configuration') void this.loadMicrosoftNavigation(generation, context);
+      if (this.mode !== 'configuration' && connection.connected && connection.enabled !== false) {
+        await this.loadUsers(true);
+      }
     } catch (error) {
       if (generation === this.generation && context === this.pageContext) this.setStatus(error instanceof Error ? error.message : 'Could not load the 3CX connection.', true);
     }
@@ -265,6 +271,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
       // A save can change the PBX, client credentials, department, or enabled
       // state. Never leave rows or a drawer from the previous scope onscreen.
       this.users = [];
+      this.usersLoaded = false;
       this.nextSkip = null;
       this.detailIndex = null;
       this.focusReturnIndex = null;
@@ -278,7 +285,6 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     }, 'Could not save the 3CX connection.', generation, context);
     if (saved && this.isCurrent(generation, context)) {
       await this.loadConnection();
-      if (this.mode !== 'configuration' && this.isCurrent(generation, context) && this.connection.connected && this.connection.enabled !== false) await this.loadUsers(true);
     }
   }
 
@@ -288,11 +294,13 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     if (skip === null) return;
     const generation = this.generation;
     const context = this.pageContext;
+    this.setStatus('Loading extensions…');
     await this.withBusy(async () => {
       const page = await this.request<{ items: User[]; nextSkip: number | null; truncated: boolean }>(this.url('/users', { skip }));
       if (!this.isCurrent(generation, context)) return;
       this.users = reset ? page.items : [...this.users, ...page.items];
       this.nextSkip = page.nextSkip;
+      this.usersLoaded = true;
       this.render();
       this.setStatus(page.truncated ? 'Extension list is truncated at the service limit.' : `${this.users.length} extension${this.users.length === 1 ? '' : 's'} loaded.`);
     }, 'Could not load extensions.', generation, context);
@@ -386,7 +394,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
         </section>` : ''}
         ${showDirectory ? `<section class="card" aria-labelledby="extensions-heading">
           <div class="section-title"><div><h2 id="extensions-heading">Extensions</h2><p>Read-only view from the configured 3CX scope.</p></div><button class="secondary" id="refresh-users" type="button" ${!canReadUsers || this.busy ? 'disabled' : ''}>Refresh</button></div>
-          ${this.users.length ? `<div class="table-wrap"><table><thead><tr><th>Extension</th><th>Name</th><th>Email</th><th>Status</th><th><span class="sr-only">Details</span></th></tr></thead><tbody>${this.users.map((user, index) => `<tr><td>${escapeHtml(user.Number)}</td><td>${escapeHtml([user.FirstName, user.LastName].filter(Boolean).join(' ') || '—')}</td><td>${escapeHtml(user.EmailAddress || '—')}</td><td><span class="state ${user.Enabled ? 'on' : ''}">${user.Enabled ? 'Enabled' : 'Disabled'}</span></td><td><button class="secondary compact" type="button" data-detail-index="${index}">View details</button></td></tr>`).join('')}</tbody></table></div>` : `<div class="empty">${connected ? connectionEnabled ? 'No extensions loaded yet.' : 'This connection is disabled.' : 'Save a connection to view extensions.'}</div>`}
+          ${this.users.length ? `<div class="table-wrap"><table><thead><tr><th>Extension</th><th>Name</th><th>Email</th><th>Status</th><th><span class="sr-only">Details</span></th></tr></thead><tbody>${this.users.map((user, index) => `<tr><td>${escapeHtml(user.Number)}</td><td>${escapeHtml([user.FirstName, user.LastName].filter(Boolean).join(' ') || '—')}</td><td>${escapeHtml(user.EmailAddress || '—')}</td><td><span class="state ${user.Enabled ? 'on' : ''}">${user.Enabled ? 'Enabled' : 'Disabled'}</span></td><td><button class="secondary compact" type="button" data-detail-index="${index}">View details</button></td></tr>`).join('')}</tbody></table></div>` : `<div class="empty">${connected ? connectionEnabled ? this.usersLoaded ? 'No extensions found.' : 'No extensions loaded yet.' : 'This connection is disabled.' : 'Save a connection to view extensions.'}</div>`}
           ${this.nextSkip !== null ? `<button class="secondary more" id="more-users" type="button" ${!canReadUsers || this.busy ? 'disabled' : ''}>Load more</button>` : ''}
         </section>` : ''}
         ${detail ? `<div class="drawer-layer" data-details-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="details-title"><div class="drawer-header"><div><p class="eyebrow">Extension</p><h2 id="details-title">${escapeHtml(detail.Number)}</h2></div><button class="secondary compact" id="details-close" type="button" aria-label="Close extension details">Close</button></div><dl class="detail-list"><div><dt>Name</dt><dd>${escapeHtml([detail.FirstName, detail.LastName].filter(Boolean).join(' ') || '—')}</dd></div><div><dt>Email</dt><dd>${escapeHtml(detail.EmailAddress || '—')}</dd></div><div><dt>Mobile</dt><dd>${escapeHtml(detail.Mobile || '—')}</dd></div><div><dt>Enabled</dt><dd>${detail.Enabled ? 'Enabled' : 'Disabled'}</dd></div><div><dt>Registered</dt><dd>${detail.IsRegistered ? 'Registered' : 'Not registered'}</dd></div><div><dt>Profile</dt><dd>${escapeHtml(detail.CurrentProfileName || '—')}</dd></div></dl></aside></div>` : ''}
