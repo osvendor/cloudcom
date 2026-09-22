@@ -72,3 +72,11 @@ test('classifies only the reviewed Cloud Command server, bridge, registry, and b
   assert.equal(classify(['packages/extension-web-sdk/src/hostApi.ts']).shared, true);
   assert.deepEqual(classify(['packages/ext-cloud-command/src/unsafe.ts']).unsupported, ['packages/ext-cloud-command/src/unsafe.ts']);
 });
+
+// Native Microsoft must remain covered even when its upstream attachment merges cleanly.
+test('requires API and web validation for the native Microsoft host bridge', () => {
+  const result = classify(['apps/api/src/extensions/cloudCommandMicrosoft.ts', 'apps/api/src/extensions/cloudCommandMicrosoft.test.ts']);
+  assert.equal(result.api, true);
+  assert.equal(result.web, true);
+  assert.deepEqual(result.unsupported, []);
+});

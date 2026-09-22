@@ -5,8 +5,8 @@ import { z } from 'zod';
 import type { BreezeExtensionV1, ExtensionRuntimeContext, ExtensionRequestAuthorization } from '@breeze/extension-sdk';
 import { createThreeCxReadService, normalizePbxOrigin, ThreeCxReadError } from '../threecx/read-service.mjs';
 import { createProvider, ProviderError, type GuardedFetch } from './transport';
-import { readCippDeployment, type CippDeployment } from './cipp-config';
-import { CippError } from './cipp-provider';
+import type { NativeMicrosoftServices } from './native-microsoft';
+export type { NativeMicrosoftServices, MicrosoftRequest, MicrosoftResource } from './native-microsoft';
 import { mountMicrosoftRoutes } from './microsoft';
 
 const table = 'cloudcommand_threecx_connections';
@@ -34,11 +34,11 @@ function summary(row: Row, canManage: boolean) {
 }
 
 /** Only the statically compiled host can provide this public-egress transport. */
-export function createCloudCommandExtension(fetch: GuardedFetch): BreezeExtensionV1 {
-  return { register(registrar, context) { registrar.mountRoute(createRoutes(context, fetch) as unknown as Hono); } };
+export function createCloudCommandExtension(fetch: GuardedFetch, microsoft?: NativeMicrosoftServices): BreezeExtensionV1 {
+  return { register(registrar, context) { registrar.mountRoute(createRoutes(context, fetch, microsoft) as unknown as Hono); } };
 }
 
-export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFetch, cippConfig: CippDeployment | null = readCippDeployment(process.env)) {
+export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFetch, microsoft?: NativeMicrosoftServices) {
   const app = new Hono<{ Variables: Variables }>();
   const provider = createProvider(fetch);
   async function connection(orgId: string) {
@@ -65,7 +65,6 @@ export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFet
     await next();
   });
   app.onError((error, c) => {
-    if (error instanceof CippError) return c.json({ error: 'The Microsoft 365 request could not be completed. Check the CIPP connection and assigned API permissions.', code: error.code }, 502);
     if (error instanceof RouteError) return c.json({ error: error.code.replaceAll('_', ' '), code: error.code }, error.status);
     if (error instanceof ProviderError || error instanceof ThreeCxReadError) return c.json({ error: 'The PBX request could not be completed.', code: error.code }, 502);
     // Never log upstream bodies, URLs, request payloads, token or DB query values.
@@ -134,6 +133,6 @@ export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFet
     });
     return c.json(await service.listExtensions(scope, row.id, skip));
   });
-  mountMicrosoftRoutes(app, context, fetch, cippConfig);
+  mountMicrosoftRoutes(app, microsoft);
   return app;
 }

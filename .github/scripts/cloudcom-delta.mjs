@@ -30,6 +30,8 @@ const cloudCommandApiPaths = new Set([
   'apps/api/src/extensions/builtinExtensions.ts',
   'apps/api/src/extensions/builtinRegistry.test.ts',
   'apps/api/src/extensions/builtinRegistry.ts',
+  'apps/api/src/extensions/cloudCommandMicrosoft.ts',
+  'apps/api/src/extensions/cloudCommandMicrosoft.test.ts',
   'apps/api/src/extensions/webRegistry.test.ts',
   'apps/api/src/extensions/webRegistry.ts',
   'apps/api/src/extensions/webAssets.test.ts',
