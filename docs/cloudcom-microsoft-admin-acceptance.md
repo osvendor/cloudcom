@@ -2,11 +2,15 @@
 
 ## Target and implementation boundary
 
-Acceptance covers reads and writes across the CIPP-derived feature ledger, not only directory inventory. Existing administrative certificates and grants may be reused by an isolated administration executor where verified compatible. The dedicated upstream customer-graph-read and customer-graph-actions profile manifests must not be silently widened or bypassed.
+Acceptance covers reads and writes across the eligible, non-premium portion of the CIPP-derived feature ledger, not only directory inventory. Existing administrative certificates and grants may be reused by an isolated administration executor where verified compatible. The dedicated upstream customer-graph-read and customer-graph-actions profile manifests must not be silently widened or bypassed.
 
 A new extension-owned administrative executor needs a fixed, versioned operation registry, organization-to-tenant resolution on the server, independent role and MFA checks, tenant-bound job context, secure certificate storage, bounded execution, result redaction and durable operation/audit records. The browser cannot submit raw Graph URLs, arbitrary command names or credentials. Existing action-intent semantics must be retained when reusing an upstream mutation.
 
 CIPP remains the source reference for operation coverage. Microsoft is the live provider. No CIPP instance is required. A full administration test is not evidence that every CIPP feature has already been implemented.
+
+## Menu scope
+
+Apply [the Microsoft menu scope](cloudcom-microsoft-menu-scope.md) before importing any CIPP menu, detail tab, drawer action or dashboard card. Premium-only features are excluded from acceptance rather than blocked prerequisites for release.
 
 ## Evidence layers
 
@@ -29,8 +33,6 @@ CIPP remains the source reference for operation coverage. Microsoft is the live 
 | Mail flow and quarantine | Query bounded test-related trace/quarantine views; exercise handling only on controlled test messages | Sending mail or releasing real quarantined mail is not a test substitute. Record unavailable fixtures explicitly. |
 | SharePoint/OneDrive | Query test sites/drives; create/edit/delete only test content; validate permissions/shortcuts separately | Requires applicable grants, provisioned sites/drives and licenses; native site search is not storage-report parity. |
 | Teams | Create/configure test team and test membership/channel where supported; clean up | Validate Teams-specific grants, asynchronous provisioning and licensing. Group permission alone is not assumed sufficient. |
-| Conditional Access/security | Evaluate supported queries; create/update/remove disabled or report-only test policy restricted to fixture principals | No change to an existing organization-wide policy or administrator access. Confirm necessary grants/licenses first. |
-| Intune | Query capability; use enrolled noncritical test device and fixture policy/app assignments for mutations | Requires Intune grants/licenses and a real test endpoint. Do not use a production device for wipe/retire testing. |
 | Roles | Query authorized role surface; validate operation eligibility and denials | Broad grant presence is not authorization to assign privileged production roles. Elevated-role tests need a controlled test principal and a defined restoration case. |
 | Jobs/bulk actions | Cancellation, throttling, retry, partial success and ambiguous timeout cases | Do not blindly retry non-idempotent writes; reconcile provider state first. |
 
@@ -45,6 +47,6 @@ Use a unique run ID and persist returned object IDs immediately in a private man
 - [Microsoft user updates](https://learn.microsoft.com/en-us/graph/api/user-update?view=graph-rest-1.0).
 - [Group membership](https://learn.microsoft.com/en-us/graph/api/group-post-members?view=graph-rest-1.0).
 - [Exchange application authentication and authorization](https://learn.microsoft.com/en-us/powershell/exchange/app-only-auth-powershell-v2?view=exchange-ps).
-- [Conditional Access policy creation](https://learn.microsoft.com/en-us/graph/api/conditionalaccessroot-post-policies?view=graph-rest-1.0).
+- [Microsoft licensing and premium-feature exclusions](cloudcom-microsoft-menu-scope.md).
 
 Per-run identities, object IDs, grants and deployment addresses belong in private evidence, never this public document. This matrix is a delivery/acceptance plan; it is not a claim that these operations have all passed or are available in the extension today.

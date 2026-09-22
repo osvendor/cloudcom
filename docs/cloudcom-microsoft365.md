@@ -4,7 +4,7 @@
 
 The Microsoft extension uses Breeze's native Microsoft Graph read executor through a versioned, compiled host bridge. CIPP is a pinned source and capability reference only. There is no CIPP server, API URL, client secret, tenant discovery call or runtime dependency.
 
-The stable page is `/extensions/cloudcommand/microsoft`. The initial implemented resources are users, groups, licenses and SharePoint sites. They use fixed native read actions and show only fields actually supplied by those actions. This is not full CIPP feature parity. User administration, Exchange, Teams administration, Intune administration and other CIPP-derived features remain separate delivery work.
+The stable page is `/extensions/cloudcommand/microsoft`. The initial implemented resources are users, groups, licenses and SharePoint sites. They use fixed native read actions and show only fields actually supplied by those actions. This is not full CIPP feature parity. User administration, Exchange, Teams administration and other eligible CIPP-derived features remain separate delivery work. Apply the [non-premium menu scope](cloudcom-microsoft-menu-scope.md); premium-only areas are excluded.
 
 The extension reuses Breeze styling, organization context, authenticated host requests, resource navigation, filters and a details drawer. Native connection setup, consent, retest and disconnect remain in Integrations. The extension does not create another tenant mapping or credential form.
 

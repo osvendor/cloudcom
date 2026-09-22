@@ -92,7 +92,7 @@ First: finish the source-to-capability ledger and native connection boundary, th
 
 Next: user and group detail panels and queries, followed by the existing supported disable/reset flows through their native controls. Build mailbox/Exchange execution before presenting mailbox actions as available.
 
-Then: expand in the source-derived domain order (Identity, Tenant, Email/Exchange, Teams/SharePoint, Security/Compliance, Intune and the remaining applicable areas), with explicit per-operation test status. CIPP-only hosting/administration functions are recorded as intentionally excluded, not silently overlooked.
+Then: expand eligible Identity, Tenant, Email/Exchange and Teams/SharePoint capabilities, with explicit per-operation test status and the [non-premium menu exclusions](cloudcom-microsoft-menu-scope.md). Premium-only areas are outside delivery scope. CIPP-only hosting/administration functions are recorded as intentionally excluded, not silently overlooked.
 
 ## Definition of completion
 
