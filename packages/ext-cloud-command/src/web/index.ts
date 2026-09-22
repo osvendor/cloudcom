@@ -425,7 +425,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     for (const input of this.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-detail-field], [data-forwarding-field]')) {
       if (!input.disabled && !input.reportValidity()) return;
     }
-    this.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-detail-field]').forEach((input) => this.changeDetail(input.dataset.detailField as keyof ThreeCxDetailChanges, input instanceof HTMLInputElement && input.type === 'checkbox' ? input.checked : input.value));
+    this.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-detail-field]:not(:disabled)').forEach((input) => this.changeDetail(input.dataset.detailField as keyof ThreeCxDetailChanges, input instanceof HTMLInputElement && input.type === 'checkbox' ? input.checked : input.value));
     if (!this.detail || !isDirty(this.detailDraft)) return;
     const forwarding = hasForwardingChanges(this.detailDraft);
     const scalar = Object.keys(this.detailDraft).some((key) => key !== 'ForwardingProfiles');
