@@ -1,172 +1,82 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { createRoutes } from './index';
-import type { CippDeployment } from './cipp-config';
+import { projectMicrosoftResource, type NativeMicrosoftServices } from './native-microsoft';
 const ORG = '11111111-1111-4111-8111-111111111111';
 const PARTNER = '22222222-2222-4222-8222-222222222222';
-const TENANT = '33333333-3333-4333-8333-333333333333';
-const deployment: CippDeployment = {
-  origin: 'https://cipp.example.test',
-  partnerId: PARTNER,
-  authTenantId: PARTNER,
-  clientId: TENANT,
-  secret: 'fixture-secret',
-  scope: `api://${TENANT}/.default`,
-  identity: 'pinned-backend',
-};
-const row = (over = {}) => ({
-  id: ORG,
-  org_id: ORG,
-  tenant_id: TENANT,
-  tenant_domain: 'tenant.example.test',
-  tenant_name: 'Test tenant',
-  backend_identity: deployment.identity,
-  version: 1,
-  enabled: true,
-  ...over,
-});
-function harness(
-  options: {
-    scope?: string;
-    write?: boolean;
-    mfa?: boolean;
-    platform?: boolean;
-    access?: boolean;
-    partner?: string;
-    db?: unknown[];
-    config?: CippDeployment | null;
-    responses?: unknown[];
-  } = {},
-) {
-  const queue = [...(options.db ?? [[{ partner_id: PARTNER }]])];
-  const execute = vi.fn(async () => queue.shift() ?? []);
-  const responses = [...(options.responses ?? [])];
-  const fetch = vi.fn(async (_url: string, _init?: RequestInit) => Response.json(responses.shift() ?? {}));
-  const audit = vi.fn();
-  const context = { db: { execute }, audit, log: vi.fn(), secrets: {} };
+function harness(options: { access?: boolean; read?: boolean; sites?: string[]; host?: boolean; failure?: string; partner?: string } = {}) {
+  const execute = vi.fn(async () => [{ partner_id: PARTNER }]);
+  const fetch = vi.fn();
+  const auth = { user: { id: ORG }, scope: 'partner', partnerId: options.partner ?? PARTNER, canAccessOrg: () => options.access !== false };
+  const authorization = { hasPermission: (_resource: string, action: string) => action !== 'read' || options.read !== false, mfaSatisfied: true, allowedSiteIds: options.sites };
+  const services: NativeMicrosoftServices = {
+    version: 1,
+    connection: vi.fn(async () => ({ available: true, connected: true, enabled: true, canManage: true, tenantName: 'Native tenant' })),
+    read: vi.fn(async () => options.failure ? { ok: false as const, code: options.failure, message: 'Safe native failure', retryAfterSeconds: 12 } : { ok: true as const, items: [{ id: ORG, displayName: 'User', secret: 'must-not-leave' }], truncated: true }),
+  };
+  const context = { db: { execute }, audit: vi.fn(), log: vi.fn(), secrets: {} };
   const app = new Hono<{ Variables: Record<string, unknown> }>();
-  app.use('*', async (c, next) => {
-    c.set('auth', {
-      user: { id: ORG, isPlatformAdmin: options.platform },
-      scope: options.scope ?? 'partner',
-      partnerId: options.partner ?? PARTNER,
-      canAccessOrg: () => options.access !== false,
-    });
-    c.set('extensionAuthorization', {
-      hasPermission: (_r: string, action: string) => action === 'read' || options.write !== false,
-      mfaSatisfied: options.mfa !== false,
-    });
-    await next();
-  });
-  app.route(
-    '/',
-    createRoutes(context as never, fetch, options.config === undefined ? deployment : options.config),
-  );
-  return { app, fetch, execute, audit };
+  app.use('*', async (c, next) => { c.set('auth', auth); c.set('extensionAuthorization', authorization); await next(); });
+  app.route('/', createRoutes(context as never, fetch, options.host === false ? undefined : services));
+  return { app, fetch, execute, services, auth, authorization };
 }
 const path = (suffix: string) => `/microsoft/${suffix}?orgId=${ORG}`;
-const put = (values = {}) => ({
-  method: 'PUT',
-  headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ tenantId: TENANT, enabled: true, version: 1, ...values }),
-});
-const token = { access_token: 'synthetic-token' };
-const tenants = [
-  { customerId: TENANT, defaultDomainName: 'tenant.example.test', displayName: 'Test tenant' },
-];
-describe('CIPP organization adapter', () => {
-  it('shows an honest unavailable state without accessing credentials or mappings', async () => {
-    const h = harness({ config: null });
-    const response = await h.app.request(path('connection'));
-    expect(await response.json()).toMatchObject({ available: false, connected: false, canManage: false });
+describe('native Microsoft extension routes', () => {
+  it('reports missing host services honestly without CIPP calls', async () => {
+    const h = harness({ host: false });
+    expect(await (await h.app.request(path('connection'))).json()).toMatchObject({ available: false, connected: false, enabled: false });
+    expect(h.fetch).not.toHaveBeenCalled();
     expect(h.execute).toHaveBeenCalledTimes(1);
-    expect(h.fetch).not.toHaveBeenCalled();
   });
-  it('does not share the deployment CIPP identity with another Breeze partner', async () => {
-    const h = harness({ config: { ...deployment, partnerId: TENANT } });
-    expect((await h.app.request(path('resources/users'))).status).toBe(503);
-    expect(h.fetch).not.toHaveBeenCalled();
-  });
-  it.each([
-    { scope: 'organization' },
-    { write: false },
-    { mfa: false },
-    { scope: 'system', platform: false },
-  ])('restricts binding and discovery to authorized partner managers: %j', async (options) => {
-    const h = harness(options);
-    expect((await h.app.request(path('tenants'))).status).toBe(403);
-    const second = harness(options);
-    expect((await second.app.request(path('connection'), put())).status).toBe(403);
-    expect(second.fetch).not.toHaveBeenCalled();
-    expect(h.fetch).not.toHaveBeenCalled();
-  });
-  it('denies cross-organization requests before database and provider work', async () => {
-    const h = harness({ access: false });
-    expect((await h.app.request(path('resources/users'))).status).toBe(403);
-    expect(h.execute).not.toHaveBeenCalled();
-    expect(h.fetch).not.toHaveBeenCalled();
-  });
-  it('rejects stale save and unknown body fields before remote calls', async () => {
-    const h = harness({ db: [[{ partner_id: PARTNER }], [row()]] });
-    expect((await h.app.request(path('connection'), put({ version: 2 }))).status).toBe(409);
-    expect(h.fetch).not.toHaveBeenCalled();
-    const invalid = harness();
-    expect(
-      (await invalid.app.request(path('connection'), put({ backendUrl: 'https://other.example.test' })))
-        .status,
-    ).toBe(400);
-  });
-  it('binds only a tenant returned by the configured CIPP service and audits the save', async () => {
-    const h = harness({ db: [[{ partner_id: PARTNER }], [], [row()]], responses: [token, tenants] });
-    const response = await h.app.request(path('connection'), put({ version: null }));
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ connected: true, tenantId: TENANT });
-    expect(h.audit).toHaveBeenCalledWith(
-      expect.objectContaining({ orgId: ORG, action: 'cloudcommand.microsoft.bind' }),
-    );
-    const denied = harness({ db: [[{ partner_id: PARTNER }], []], responses: [token, []] });
-    expect((await denied.app.request(path('connection'), put({ version: null }))).status).toBe(400);
-    expect(denied.execute).toHaveBeenCalledTimes(2);
-  });
-  it('disables an existing connection without contacting an unavailable provider', async () => {
-    const h = harness({ db: [[{ partner_id: PARTNER }], [row()], [row({ enabled: false, version: 2 })]] });
-    expect((await h.app.request(path('connection'), put({ enabled: false }))).status).toBe(200);
-    expect(h.fetch).not.toHaveBeenCalled();
-  });
-  it.each([{ enabled: false }, { backend_identity: 'replacement' }])(
-    'rejects disabled or stale backend bindings before network: %j',
-    async (over) => {
-      const h = harness({ db: [[{ partner_id: PARTNER }], [row(over)]] });
-      expect((await h.app.request(path('resources/users'))).status).toBe(409);
-      expect(h.fetch).not.toHaveBeenCalled();
-    },
-  );
-  it('revalidates tenant identity and domain before sending a scoped resource request', async () => {
-    const h = harness({
-      db: [[{ partner_id: PARTNER }], [row()]],
-      responses: [token, tenants, token, [{ id: ORG, displayName: 'Example', password: 'never-forward' }]],
-    });
-    const response = await h.app.request(path('resources/users') + '&tenantFilter=AllTenants');
-    expect(response.status).toBe(200);
-    expect(JSON.stringify(await response.json())).not.toContain('never-forward');
-    expect(h.fetch.mock.calls[3]![0]).toContain('tenantFilter=tenant.example.test');
-    expect(h.fetch.mock.calls[3]![0]).not.toContain('AllTenants');
-    const stale = harness({
-      db: [[{ partner_id: PARTNER }], [row()]],
-      responses: [token, [{ ...tenants[0], defaultDomainName: 'changed.example.test' }]],
-    });
-    expect((await stale.app.request(path('resources/users'))).status).toBe(409);
-    expect(stale.fetch).toHaveBeenCalledTimes(2);
-  });
-  it('rejects unsupported operations and redacts upstream failure bodies', async () => {
+  it('uses the authenticated host context and canonical organization', async () => {
     const h = harness();
-    expect((await h.app.request(path('resources/GraphRequest'))).status).toBe(404);
-    const failing = harness({
-      db: [[{ partner_id: PARTNER }], [row()]],
-      responses: [token, [{ Results: 'secret debug text', customerId: '' }]],
-    });
-    const response = await failing.app.request(path('resources/users'));
-    expect(response.status).toBe(502);
-    expect(await response.text()).not.toContain('secret debug');
+    expect(await (await h.app.request(path('connection'))).json()).toMatchObject({ tenantName: 'Native tenant' });
+    expect(h.services.connection).toHaveBeenCalledWith({ orgId: ORG, auth: h.auth, authorization: h.authorization });
+    expect(h.execute).toHaveBeenCalledTimes(1); // Only active organization; no legacy mapping query.
+    expect(h.fetch).not.toHaveBeenCalled();
+  });
+  it.each([{ access: false }, { read: false }, { sites: [] }, { partner: ORG }])('denies before calling native services: %j', async options => {
+    const h = harness(options);
+    expect([403, 404]).toContain((await h.app.request(path('resources/users'))).status);
+    expect(h.services.read).not.toHaveBeenCalled();
+  });
+  it.each(['tenants', 'connection'])('retires CIPP binding operation %s', async suffix => {
+    const h = harness();
+    const res = await h.app.request(path(suffix), suffix === 'connection' ? { method: 'PUT', body: JSON.stringify({ tenantId: PARTNER }) } : undefined);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: 'native_connection_required' });
+    expect(h.services.read).not.toHaveBeenCalled();
+    expect(h.fetch).not.toHaveBeenCalled();
+  });
+  it.each(['users', 'groups', 'licenses', 'sites'])('routes only the fixed native resource %s', async resource => {
+    const h = harness();
+    const res = await h.app.request(path(`resources/${resource}`));
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.complete).toBe(false);
+    expect(JSON.stringify(data)).not.toContain('must-not-leave');
+    expect(h.services.read).toHaveBeenCalledWith({ orgId: ORG, auth: h.auth, authorization: h.authorization }, resource);
+  });
+  it.each(['&tenantId=other', `&orgId=${PARTNER}`, '&url=https://example.test'])('rejects caller-selected tenant or provider query %s', async query => {
+    const h = harness();
+    expect((await h.app.request(path('resources/users') + query)).status).toBe(400);
+    expect(h.services.read).not.toHaveBeenCalled();
+  });
+  it('rejects arbitrary native actions', async () => {
+    const h = harness();
+    expect((await h.app.request(path('resources/deleteUser'))).status).toBe(404);
+    expect(h.services.read).not.toHaveBeenCalled();
+  });
+  it.each([['read_rate_limited', 429], ['connection_changed', 409], ['connection_not_ready', 409], ['tools_disabled', 503], ['access_denied', 403]] as const)('preserves safe native failure %s', async (failure, status) => {
+    const h = harness({ failure });
+    const res = await h.app.request(path('resources/users'));
+    expect(res.status).toBe(status);
+    expect(await res.json()).toMatchObject({ code: failure });
+  });
+  it('projects native fields without fabricating unsupported CIPP report columns', () => {
+    const result = projectMicrosoftResource('sites', [{ id: ORG, displayName: 'Site', webUrl: 'https://example.test', storageUsedInGigabytes: 123 }], false);
+    expect(result.complete).toBe(true);
+    expect(result.items[0]?.values).not.toHaveProperty('storageUsedInGigabytes');
+    expect(result.items[0]?.values.name).toBeNull();
   });
 });

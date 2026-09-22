@@ -6,7 +6,7 @@ Decision recorded 22 September 2026. This supersedes the proposal to require a r
 
 CIPP is the source reference for capability breadth and menu depth. Breeze remains the running application. The Cloud Command extension owns custom Microsoft administration code and UI. Microsoft Graph, Exchange Online and any other explicitly required Microsoft service are the provider backends. No CIPP installation, CIPP API client or Azure deployment for CIPP is required.
 
-The deployed first adapter still calls CIPP and is unavailable without configuration. It is transitional code that must be replaced, not the approved final architecture. Its list/drawer components, organization isolation tests and provider overview can be retained. Do not activate it by provisioning CIPP.
+The original deployed adapter called CIPP and was unavailable without configuration. The native replacement in this branch removes that runtime dependency and retains the list/drawer components and provider overview. Deployment and live Microsoft acceptance are separate checks; do not activate an older image by provisioning CIPP.
 
 Breeze remains authoritative for organizations, staff identities, roles, MFA policy, audit, existing jobs and equivalent native capabilities. Do not import CIPP's customer editor, operator login, Azure hosting system or MSP billing interfaces just to reproduce its navigation.
 

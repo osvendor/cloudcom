@@ -243,6 +243,10 @@ export const BUILTINS: readonly BuiltinExtension[] = [
       const { safeFetch } = await import('../services/urlSafety');
       const { runOutsideDbContext } = await import('../db');
       return runOutsideDbContext(() => safeFetch(url, { ...init, signal: init.signal ?? undefined, allowPrivateNetwork: false, allowCarrierNat: false }));
+    }, {
+      version: 1,
+      connection: async request => (await import('./cloudCommandMicrosoft')).nativeMicrosoftServices.connection(request),
+      read: async (request, resource) => (await import('./cloudCommandMicrosoft')).nativeMicrosoftServices.read(request, resource),
     }),
     name: 'cloudcommand',
     packageDir: 'packages/ext-cloud-command',
