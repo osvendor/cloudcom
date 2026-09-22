@@ -1,6 +1,6 @@
 # Microsoft extension menu scope
 
-The user excludes capabilities requiring Entra ID P1, P2, Entra Suite or additional premium administration/security licenses. This overrides the earlier plan to reproduce the whole CIPP navigation. CIPP is a reference inventory, not the shipped menu specification.
+The feature ceiling is Microsoft 365 Business Standard. Exclude capabilities requiring Entra ID P1, P2, Entra Suite, Intune, Defender add-ons or any other separate/higher-tier license. This overrides the earlier plan to reproduce the whole CIPP navigation. CIPP is a reference inventory, not the shipped menu specification.
 
 ## Included scope
 
@@ -18,6 +18,10 @@ Keep standard user lifecycle management, password reset, session revocation, sup
 Do not show excluded features as disabled items or upsell placeholders. Apply the exclusion to navigation, search, detail tabs, expanding drawers, context menus, bulk actions, templates and dashboard shortcuts. Remove empty parent sections. Do not request broader permissions or execute premium-feature probes merely to support an excluded item. Do not alter tenant policies, subscriptions or existing data.
 
 Mixed-license features require operation-level review: preserve eligible base functionality and omit only the premium action or field. Verify group-based licensing eligibility separately; do not assume it is equivalent to ordinary direct license assignment. Unclassified imported CIPP features remain outside the delivered menu until licensing and backend support are established.
+
+## eDiscovery and content search
+
+The user requests eDiscovery where included with Business Standard. Assess individual capabilities rather than importing the whole Purview menu. Current Microsoft eDiscovery documentation lists E3/E5 requirements for case workflows; do not present case management, legal holds, review sets or premium analysis as Business Standard entitlements. Basic content search/export eligibility and its supported automation interface must be verified separately before exposing those actions. Do not enable pay-as-you-go billing as an implicit prerequisite. See [current eDiscovery prerequisites](https://learn.microsoft.com/en-us/purview/edisc-get-started) and [billing](https://learn.microsoft.com/en-us/purview/edisc-billing).
 
 ## Current implementation and update checks
 
