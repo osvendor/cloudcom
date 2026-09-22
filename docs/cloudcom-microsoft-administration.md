@@ -6,7 +6,7 @@ Cloud Command provides one Microsoft 365 connection per organization. Extensions
 
 The current implementation supports Microsoft OAuth consent and identity completion through the authenticated extension host bridge, then stores an organization-scoped administration connection. The browser never receives a certificate, private key, access token, authorization code after callback submission, or a reusable provider credential.
 
-Directory inventory remains limited to users, groups, licenses, and the existing site search surface. Managers can edit only these user fields: `displayName`, `givenName`, `surname`, `department`, `jobTitle`, `officeLocation`, and `accountEnabled`. They can request an explicitly confirmed group membership add or removal by object ID. User writes are read back and reported saved only when the returned fields match. Group changes report acceptance; membership verification remains pending unless a future provider response supplies a bounded member list.
+Directory inventory covers users, groups, and licenses. The site search surface remains unavailable in this administration provider. Managers can edit only these user fields: `displayName`, `givenName`, `surname`, `department`, `jobTitle`, `officeLocation`, and `accountEnabled`. They can request an explicitly confirmed group membership add or removal by object ID. User writes are read back and reported saved only when the returned fields match. Group changes report acceptance; membership verification remains pending unless a future provider response supplies a bounded member list.
 
 The UI and server both enforce organization context and manager authorization. Mutations additionally require the interactive authorization/MFA checks in the host. Dispatched writes have no automatic retry. A rejected request or a write whose outcome cannot be established must be reconciled by reading the affected Microsoft object.
 
@@ -29,6 +29,8 @@ The API host reads only the absolute path named by `CLOUDCOM_MICROSOFT_ADMIN_CON
 The paths must be absolute and host-controlled. The redirect URI must be HTTPS and exactly the Cloud Command Connect callback path, without credentials, query parameters, or a fragment. The certificate and PKCS#8 private key are loaded only by the API host to create short-lived certificate assertions for fixed Microsoft endpoints. Rotating the descriptor's `credentialVersion` disables old stored bindings until the organization reconnects; it is not a browser-side migration.
 
 ## Persistence and tenancy
+
+The existing Entra app registration must include the exact Web redirect URI and emit directory roles in ID tokens (`groupMembershipClaims: DirectoryRole`, unless an existing broader group-claim configuration already includes roles). Connect validates the signed `wids` claim for an active Global Administrator or Privileged Role Administrator. Configuring this identity claim does not grant additional Graph permissions.
 
 `packages/ext-cloud-command/migrations/2026-09-22-native-admin-connections.sql` is additive. It creates:
 
