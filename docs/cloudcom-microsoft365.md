@@ -1,5 +1,7 @@
 # Cloud Command Microsoft 365 extension
 
+> Architecture decision, 2026-09-22: the user confirmed that CIPP is a source and capability reference, not a running service dependency. The adapter described below is the currently shipped, unavailable transitional implementation. Do not provision CIPP to complete this extension. Follow [the native Microsoft architecture](cloudcom-native-microsoft-architecture.md) and [pinned source map](cloudcom-microsoft-source-map.md) when replacing it.
+
 ## Implemented boundary
 
 This is the first read-only CIPP adapter, not full CIPP feature parity. The extension
