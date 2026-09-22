@@ -133,6 +133,7 @@ beforeEach(() => {
     contactId: CONTACT_ID,
     receiveNotifications: true,
     authMethod: 'password',
+    accessMode: 'standard',
     status: 'active',
     authEpoch: 1,
   };

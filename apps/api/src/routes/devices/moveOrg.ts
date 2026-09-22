@@ -1188,6 +1188,18 @@ moveOrgRoutes.post(
       });
     } catch (err) {
       const pgNode = pgErrorNode(err);
+      if (pgNode && ['portal_remote_assignment_identity_guard', 'portal_remote_assignment_device_org_fk']
+        .includes(String(pgNode.constraint_name))) {
+        writeRouteAudit(c, {
+          orgId: sourceOrgId, action: 'device.move_org.failed', resourceType: 'device',
+          resourceId: deviceId, resourceName: device.hostname,
+          details: { code: 'PORTAL_REMOTE_DEVICE_MOVE_BLOCKED' },
+        });
+        return c.json({
+          error: 'This computer has customer remote access assignments or history tied to its current organization. It cannot be transferred while those records exist.',
+          code: 'PORTAL_REMOTE_DEVICE_MOVE_BLOCKED',
+        }, 409);
+      }
       if (
         err instanceof PamDeviceMoveBlockedError
         || (

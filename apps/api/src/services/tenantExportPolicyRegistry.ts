@@ -474,7 +474,10 @@ export const CORE_TENANT_EXPORT_POLICY: TenantExportPolicyRegistry = {
   // customer content. Exporting it would disclose credential/status transition
   // history and invite consumers to treat an internal generation as restorable
   // identity state. Keep it with the password verifier outside tenant exports.
-  "portal_users": tablePolicy("org_id", {"included":["id","org_id","email","name","entra_oid","entra_tenant_id","auth_method","linked_user_id","contact_id","receive_notifications","last_login_at","status","created_at","updated_at"],"reviewedIncluded":["invited_by","invited_at"],"excludedSensitive":["password_hash","auth_epoch"],"excludedOpen":[]}),
+  "portal_remote_settings": tablePolicy("org_id", {"included":["org_id","enabled","webrtc_enabled","rustdesk_enabled","updated_at"],"reviewedIncluded":[],"excludedSensitive":[],"excludedOpen":[]}),
+  "portal_remote_assignments": tablePolicy("org_id", {"included":["id","org_id","portal_user_id","device_id","version","enabled","expires_at","created_by_user_id","created_at","updated_at"],"reviewedIncluded":[],"excludedSensitive":[],"excludedOpen":[]}),
+  "portal_remote_sessions": tablePolicy("org_id", {"included":["id","org_id","portal_user_id","device_id","assignment_id","assignment_version","transport","status","desktop_prompt_mode","desktop_start_command_id","desktop_start_generation","terminal_generation","termination_phase","hard_deadline","ended_at","created_at"],"reviewedIncluded":[],"excludedSensitive":["auth_epoch","webrtc_offer","webrtc_answer"],"excludedOpen":[]}),
+  "portal_users": tablePolicy("org_id", {"included":["id","org_id","email","name","entra_oid","entra_tenant_id","auth_method","access_mode","linked_user_id","contact_id","receive_notifications","last_login_at","status","created_at","updated_at"],"reviewedIncluded":["invited_by","invited_at"],"excludedSensitive":["password_hash","auth_epoch"],"excludedOpen":[]}),
   "provision_credential_handles": tablePolicy("org_id", {"included":["id","org_id","device_id","created_by","created_at","expires_at","consumed_at","consumed_from_ip"],"reviewedIncluded":[],"excludedSensitive":["token"],"excludedOpen":["credentials"]}),
   // partner_id (epic #2135, 2026-08-17): dual ownership — org_id XOR partner_id.
   // A tenant identifier like org_id, so `included`. Note the org export only

@@ -1505,6 +1505,31 @@ describe('POST /devices/:id/move-org', () => {
       expect(schedulePeripheralPolicyDeviceMock).not.toHaveBeenCalled();
     });
 
+    it('maps the immutable portal remote assignment identity guard to a stable 409', async () => {
+      rigMove();
+      rigTransactionSuccess(undefined, Object.assign(new Error('remote assignment ownership'), {
+        code: '23514',
+        constraint_name: 'portal_remote_assignment_identity_guard',
+      }));
+
+      const response = await postMove();
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({
+        error: 'This computer has customer remote access assignments or history tied to its current organization. It cannot be transferred while those records exist.',
+        code: 'PORTAL_REMOTE_DEVICE_MOVE_BLOCKED',
+      });
+      expect(captureExceptionMock).not.toHaveBeenCalled();
+      expect(disconnectAgent).not.toHaveBeenCalled();
+      expect(schedulePeripheralPolicyDeviceMock).not.toHaveBeenCalled();
+      expect(writeRouteAudit).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(writeRouteAudit).mock.calls[0]![1]).toMatchObject({
+        orgId: SOURCE_ORG,
+        action: 'device.move_org.failed',
+        details: { code: 'PORTAL_REMOTE_DEVICE_MOVE_BLOCKED' },
+      });
+    });
+
     it('keeps unrelated 23514 errors on the generic failure path', async () => {
       rigMove();
       const unrelated = Object.assign(new Error('other check'), {
