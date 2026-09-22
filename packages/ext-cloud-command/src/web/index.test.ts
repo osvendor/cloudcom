@@ -27,7 +27,7 @@ function mount(api: CloudCommandHostApi): CloudCommandThreeCxPage {
 afterEach(() => { document.body.replaceChildren(); });
 
 describe('CloudCommandThreeCxPage', () => {
-  it('keeps the operational route directory-only and sends managers to Connect', async () => {
+  it('keeps the operational route directory-only', async () => {
     const page = new CloudCommandThreeCxPage();
     page.context = context;
     page.hostApi = { request: async () => Response.json({ connected: true, canManage: true, enabled: true }) };
@@ -35,11 +35,9 @@ describe('CloudCommandThreeCxPage', () => {
     await flush();
     const root = page.shadowRoot!;
     expect(root.querySelector('#origin')).toBeNull();
+    expect(root.querySelector('#connection-heading')).toBeNull();
     expect(root.querySelector('#refresh-users')).toBeTruthy();
-    const navigate = vi.fn();
-    page.addEventListener('breeze-extension-event', navigate);
-    (root.querySelector('#configure-3cx') as HTMLButtonElement).click();
-    expect(navigate.mock.calls[0][0].detail).toMatchObject({ path: '/extensions/cloudcommand/connect#threecx' });
+    expect(root.querySelector('#configure-3cx')).toBeNull();
   });
   it('allows a first test to discover departments without silently selecting full PBX access', async () => {
     const request = vi.fn(async (path: string, init?: RequestInit) => {

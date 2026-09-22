@@ -383,7 +383,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
             <label class="check"><input id="enabled" type="checkbox" ${draft.enabled ? 'checked' : ''}>Enable this connection</label>
           </div></details>
           <div class="actions"><button class="secondary" id="test" type="button" ${this.busy ? 'disabled' : ''}>${this.busy ? 'Working…' : 'Test connection'}</button><button id="save" type="button" ${this.busy ? 'disabled' : ''}>Save connection</button></div>` : '<p class="readonly-note">Connection configuration is available to organization managers.</p>'}
-        </section>` : canManage ? '<p class="configure-link"><button class="secondary" id="configure-3cx" type="button">Configure 3CX</button></p>' : ''}
+        </section>` : ''}
         ${showDirectory ? `<section class="card" aria-labelledby="extensions-heading">
           <div class="section-title"><div><h2 id="extensions-heading">Extensions</h2><p>Read-only view from the configured 3CX scope.</p></div><button class="secondary" id="refresh-users" type="button" ${!canReadUsers || this.busy ? 'disabled' : ''}>Refresh</button></div>
           ${this.users.length ? `<div class="table-wrap"><table><thead><tr><th>Extension</th><th>Name</th><th>Email</th><th>Status</th><th><span class="sr-only">Details</span></th></tr></thead><tbody>${this.users.map((user, index) => `<tr><td>${escapeHtml(user.Number)}</td><td>${escapeHtml([user.FirstName, user.LastName].filter(Boolean).join(' ') || '—')}</td><td>${escapeHtml(user.EmailAddress || '—')}</td><td><span class="state ${user.Enabled ? 'on' : ''}">${user.Enabled ? 'Enabled' : 'Disabled'}</span></td><td><button class="secondary compact" type="button" data-detail-index="${index}">View details</button></td></tr>`).join('')}</tbody></table></div>` : `<div class="empty">${connected ? connectionEnabled ? 'No extensions loaded yet.' : 'This connection is disabled.' : 'Save a connection to view extensions.'}</div>`}
@@ -399,7 +399,6 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     this.root.querySelectorAll<HTMLButtonElement>('[data-detail-index]').forEach((button) => button.addEventListener('click', () => this.openDetails(Number(button.dataset.detailIndex))));
     this.root.querySelector('#details-close')?.addEventListener('click', () => this.closeDetails());
     this.root.querySelector('#go-microsoft')?.addEventListener('click', () => dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path: '/extensions/cloudcommand/microsoft' }));
-    this.root.querySelector('#configure-3cx')?.addEventListener('click', () => dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path: '/extensions/cloudcommand/connect#threecx' }));
     this.root.querySelector('[data-details-backdrop]')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) this.closeDetails(); });
     this.root.querySelector<HTMLElement>('[role="dialog"]')?.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); this.closeDetails(); } else if (event.key === 'Tab') { event.preventDefault(); this.root.querySelector<HTMLButtonElement>('#details-close')?.focus(); } });
   }
