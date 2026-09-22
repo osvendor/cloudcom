@@ -20,6 +20,7 @@ type Connection = {
 };
 
 type Group = { id: number; name: string };
+type MicrosoftNavigationStatus = { available: boolean; connected: boolean; canManage: boolean; enabled?: boolean };
 type ConnectionDraft = {
   origin: string;
   clientId: string;
@@ -69,11 +70,15 @@ export class CloudCommandThreeCxPage extends HTMLElement {
   private busy = false;
   private statusMessage = '';
   private statusIsError = false;
+  private generation = 0;
+  private microsoftNavigationVisible = false;
 
   set context(input: unknown) {
     const context = parseExtensionPageContextV1(input);
     if (context.extensionName !== 'cloudcommand') throw new Error('Cloud Command received the wrong extension context');
+    this.generation += 1;
     this.pageContext = context;
+    this.microsoftNavigationVisible = false;
     if (this.isConnected) void this.loadConnection();
   }
 
@@ -107,14 +112,32 @@ export class CloudCommandThreeCxPage extends HTMLElement {
   }
 
   private async loadConnection(): Promise<void> {
+    const generation = this.generation;
+    const context = this.pageContext;
     try {
       this.setStatus('Loading connection…');
-      this.connection = await this.request<Connection>(this.url('/connection'));
-      this.draft = this.draftFromConnection(this.connection, this.draft?.secret ?? '');
-      this.setStatus(this.connection.connected ? 'Connection loaded.' : 'No 3CX connection is configured.');
+      const connection = await this.request<Connection>(this.url('/connection'));
+      if (generation !== this.generation || context !== this.pageContext) return;
+      this.connection = connection;
+      this.draft = this.draftFromConnection(connection, this.draft?.secret ?? '');
+      this.setStatus(connection.connected ? 'Connection loaded.' : 'No 3CX connection is configured.');
       this.render();
+      void this.loadMicrosoftNavigation(generation, context);
     } catch (error) {
-      this.setStatus(error instanceof Error ? error.message : 'Could not load the 3CX connection.', true);
+      if (generation === this.generation && context === this.pageContext) this.setStatus(error instanceof Error ? error.message : 'Could not load the 3CX connection.', true);
+    }
+  }
+
+  private async loadMicrosoftNavigation(generation: number, context: ExtensionPageContextV1 | null): Promise<void> {
+    try {
+      const status = await this.request<MicrosoftNavigationStatus>('/microsoft/connection');
+      if (generation !== this.generation || context !== this.pageContext) return;
+      this.microsoftNavigationVisible = status.available === true && ((status.connected === true && status.enabled === true) || status.canManage === true);
+      this.render();
+    } catch {
+      if (generation !== this.generation || context !== this.pageContext) return;
+      this.microsoftNavigationVisible = false;
+      this.render();
     }
   }
 
@@ -287,7 +310,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
       <style>${styles}</style>
       <main aria-labelledby="title">
         <header><div><p class="eyebrow">Cloud Command</p><h1 id="title">3CX extensions</h1><p class="subtle">Connect one organization’s 3CX PBX, select its scope, and review extensions.</p></div><span class="badge ${connected && connectionEnabled ? 'ok' : connected ? 'disabled' : ''}">${connected ? connectionEnabled ? 'Connected' : 'Disabled' : 'Not connected'}</span></header>
-        <nav aria-label="Cloud Command providers"><button class="secondary compact" id="go-microsoft" type="button">Microsoft 365</button></nav>
+        <nav aria-label="Cloud Command providers">${this.microsoftNavigationVisible ? '<button class="secondary compact" id="go-microsoft" type="button">Microsoft 365</button>' : ''}</nav>
         <p class="status" data-status data-error="${this.statusIsError}" aria-live="polite">${escapeHtml(this.statusMessage)}</p>
         <section class="card" aria-labelledby="connection-heading">
           <div class="section-title"><div><h2 id="connection-heading">Connection</h2><p>${canManage ? 'Credentials are encrypted server-side. The secret is never returned to this page.' : 'You have read-only access to this organization’s 3CX connection.'}</p></div></div>

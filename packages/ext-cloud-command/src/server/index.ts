@@ -15,7 +15,7 @@ type Row = { id: string; org_id: string; origin: string; client_id: string; secr
 type Auth = { user: { id: string; isPlatformAdmin?: boolean }; scope?: 'system' | 'partner' | 'organization'; partnerId: string | null; canAccessOrg(id: string): boolean };
 type Scope = { organizationId: string; partnerId: string; actorId: string };
 export type Variables = { auth: Auth; extensionAuthorization: ExtensionRequestAuthorization; scope: Scope; canManage: boolean };
-const uuid = z.string().uuid();
+const uuid = z.string().uuid().transform(value => value.toLowerCase());
 const configSchema = z.object({
   origin: z.string().min(1).max(2048), clientId: z.string().trim().min(1).max(512),
   secret: z.string().min(1).max(8192).optional(), departmentId: z.number().int().min(0).max(2147483647).nullable(),
@@ -69,7 +69,7 @@ export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFet
     if (error instanceof RouteError) return c.json({ error: error.code.replaceAll('_', ' '), code: error.code }, error.status);
     if (error instanceof ProviderError || error instanceof ThreeCxReadError) return c.json({ error: 'The PBX request could not be completed.', code: error.code }, 502);
     // Never log upstream bodies, URLs, request payloads, token or DB query values.
-    context.log('error', '3CX request failed');
+    context.log('error', 'Cloud Command request failed');
     return c.json({ error: 'Unable to complete the request.', code: 'request_failed' }, 500);
   });
   app.get('/threecx/connection', async c => {

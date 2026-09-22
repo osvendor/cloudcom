@@ -75,6 +75,14 @@ Provider bodies, secrets and tokens never enter logs or error responses.
   accepted CIPP response array was fully projected, not an independent guarantee
   that Microsoft's reporting data is current or every object is licensed/visible.
 
+## Validation status
+
+The Linux VM passed 57 server tests, 23 UI tests, four database integration tests,
+103 RLS coverage checks, API/web builds and synthetic Chromium light/dark/mobile
+checks. These counts describe the initial candidate; later focused tests may add
+coverage. No live CIPP backend or Microsoft tenant has been certified by these
+checks.
+
 ## Remaining capability coverage
 
 The approved planning ledger covers Identity, Tenant, Security/Compliance, Copilot,
