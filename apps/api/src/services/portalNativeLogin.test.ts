@@ -37,6 +37,14 @@ beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date('2026-09-22T12:
 afterEach(() => vi.useRealTimers());
 
 describe('native browser PKCE handoff', () => {
+  it('denies a different company before creating a native session', async () => {
+    const redis = store(); getRedisMock.mockReturnValue(redis);
+    const exchange = await issue();
+    expect(await exchangeNativeLoginCode(exchange, '33333333-3333-4333-8333-333333333333')).toBeNull();
+    expect([...redis.values.keys()].some(key => key.startsWith('portal:session:ccn1.'))).toBe(false);
+    expect(await exchangeNativeLoginCode(exchange, principal.orgId)).toBeNull();
+    expect(await exchangeNativeLoginCode(await issue(), principal.orgId)).not.toBeNull();
+  });
   it('accepts only the registered loopback client/path and S256 values', () => {
     expect(validateNativeLoginRequest(request)).toBe(true);
     for (const redirectUri of ['http://localhost:49871/cloudcom/callback', 'http://127.0.0.1:65536/cloudcom/callback',

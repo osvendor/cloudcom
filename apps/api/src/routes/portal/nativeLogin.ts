@@ -12,6 +12,7 @@ import { writeAuditEventAsync } from '../../services/auditEvents';
 import { issueNativeLoginCode, exchangeNativeLoginCode, validateNativeLoginRequest,
   NATIVE_CLIENT_ID } from '../../services/portalNativeLogin';
 import { getClientIp, validatePortalCookieCsrfRequest } from './helpers';
+import { verifyPortalCompanyGateway } from '../../services/portalCompanyGateway';
 
 export const portalNativeExchangeRoutes = new Hono();
 export const portalNativeAuthorizeRoutes = new Hono();
@@ -68,6 +69,8 @@ portalNativeExchangeRoutes.post('/auth/native/exchange', zValidator('json', z.ob
 }).strict()), async c => {
   const limit = await rateLimiter(getRedis(), `portal_native_exchange:${rateLimitIpKey(getClientIp(c))}`, 30, 60);
   if (!limit.allowed) { c.header('Retry-After', '60'); return c.json({ error: 'Too many sign-in attempts' }, 429); }
-  const result = await exchangeNativeLoginCode(c.req.valid('json'));
+  const company = await verifyPortalCompanyGateway(c.req.header('Cf-Access-Jwt-Assertion'));
+  if (!company.ok) return c.json({ error: 'Company authentication is required' }, company.status);
+  const result = await exchangeNativeLoginCode(c.req.valid('json'), company.orgId ?? undefined);
   return result ? c.json(result) : c.json({ error: 'Invalid or expired sign-in code' }, 401);
 });

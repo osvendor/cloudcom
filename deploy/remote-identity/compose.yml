@@ -1,0 +1,94 @@
+name: ${AUTHENTIK_COMPOSE_PROJECT_NAME:-cloudcom-authentik}
+
+# Authentik 2026.8.3 topology, adapted from the upstream Compose template.
+# This stack deliberately has no Docker socket and publishes only HTTP to the
+# local host for a private reverse proxy. PostgreSQL has no host port.
+services:
+  postgresql:
+    # Docker Hub manifest list for postgres:16-alpine, resolved 2026-09-22.
+    image: docker.io/library/postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${AUTHENTIK_POSTGRESQL_DATABASE:-authentik}
+      POSTGRES_USER: ${AUTHENTIK_POSTGRESQL_USER:-authentik}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgresql_password
+    secrets:
+      - postgresql_password
+    volumes:
+      - postgresql-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  server:
+    # ghcr.io/goauthentik/server:2026.8.3 manifest list, resolved 2026-09-22.
+    image: ghcr.io/goauthentik/server@sha256:ab9b4e8cc4ab3f8d1198d2db6aeea66bafea1963b3f2843589e0d163f97d9849
+    command: server
+    restart: unless-stopped
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL_DATABASE:-authentik}
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: file:///run/secrets/postgresql_password
+      AUTHENTIK_SECRET_KEY: file:///run/secrets/authentik_secret_key
+      AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS: ${AUTHENTIK_TRUSTED_PROXY_CIDRS:-127.0.0.1/32,::1/128}
+    secrets:
+      - postgresql_password
+      - authentik_secret_key
+    ports:
+      - "127.0.0.1:${AUTHENTIK_HTTP_PORT:-9000}:9000"
+    volumes:
+      - authentik-data:/data
+      - ./custom-templates:/templates:ro
+    shm_size: 512mb
+    healthcheck:
+      # Matches the HEALTHCHECK embedded in the pinned Authentik 2026.8.3 image.
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 600s
+
+  worker:
+    # ghcr.io/goauthentik/server:2026.8.3 manifest list, resolved 2026-09-22.
+    image: ghcr.io/goauthentik/server@sha256:ab9b4e8cc4ab3f8d1198d2db6aeea66bafea1963b3f2843589e0d163f97d9849
+    command: worker
+    restart: unless-stopped
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL_DATABASE:-authentik}
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: file:///run/secrets/postgresql_password
+      AUTHENTIK_SECRET_KEY: file:///run/secrets/authentik_secret_key
+    secrets:
+      - postgresql_password
+      - authentik_secret_key
+    volumes:
+      - authentik-data:/data
+      - ./custom-templates:/templates:ro
+    shm_size: 512mb
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 600s
+
+secrets:
+  postgresql_password:
+    file: ${AUTHENTIK_POSTGRESQL_PASSWORD_FILE:?set AUTHENTIK_POSTGRESQL_PASSWORD_FILE in .env}
+  authentik_secret_key:
+    file: ${AUTHENTIK_SECRET_KEY_FILE:?set AUTHENTIK_SECRET_KEY_FILE in .env}
+
+volumes:
+  postgresql-data:
+  authentik-data:

@@ -1,0 +1,62 @@
+version: 1
+metadata:
+  name: CloudCom - Company gateway login
+entries:
+  - model: authentik_flows.flow
+    id: company-flow
+    identifiers:
+      slug: cloudcom-company-login
+    attrs:
+      name: Company remote access
+      title: Sign in with your company credentials
+      designation: authentication
+      authentication: none
+  - model: authentik_stages_password.passwordstage
+    id: company-password
+    identifiers:
+      name: cloudcom-company-password
+    attrs:
+      backends:
+        - authentik.core.auth.InbuiltBackend
+      configure_flow: null
+      failed_attempts_before_cancel: 5
+      allow_show_password: false
+  - model: authentik_stages_identification.identificationstage
+    id: company-identification
+    identifiers:
+      name: cloudcom-company-identification
+    attrs:
+      user_fields: [username]
+      password_stage: !KeyOf company-password
+      show_matched_user: false
+      pretend_user_exists: true
+      enable_remember_me: false
+      enrollment_flow: null
+      recovery_flow: null
+      passwordless_flow: null
+      webauthn_stage: null
+      sources: []
+  - model: authentik_stages_user_login.userloginstage
+    id: company-login
+    identifiers:
+      name: cloudcom-company-login
+    attrs:
+      session_duration: hours=8
+      remember_me_offset: seconds=0
+      remember_device: seconds=0
+      terminate_other_sessions: false
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf company-flow
+      stage: !KeyOf company-identification
+      order: 10
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !KeyOf company-flow
+      stage: !KeyOf company-login
+      order: 100
+  - model: authentik_core.group
+    identifiers:
+      name: cloudcom-company-gateways
+    attrs:
+      is_superuser: false

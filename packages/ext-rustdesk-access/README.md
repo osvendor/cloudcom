@@ -5,11 +5,23 @@ portal assignments. Browser access is implemented behind the remote access featu
 gate. Managed native admission remains unfinished. No device credentials are collected.
 The existing native RustDesk provider remains a separate password-authenticated path.
 
-The product target is an installed client where the user signs into Breeze and sees
-approved computers. The extension owns settings, assignments and audit under
+Selected default for the future company gateway identity: one shared company
+username/password in an isolated Docker Authentik service, administered through
+this extension, for Cloudflare gateway authentication only. Individual customers
+remain Breeze `remote_only` username/password identities, so the two login steps
+are intentional. No customer MFA or self-service recovery. See
+[`cloudcom-remote-identity.md`](../../docs/cloudcom-remote-identity.md).
+This is the approved architecture, not an enabled authentication provider.
+
+The product target is an installed client where the user signs into Breeze and then
+the company gateway, and sees approved computers. The extension owns the company
+gateway identity, individual Breeze accounts, assignments and audit under
 **Extensions → Remote Access**; native enrollment remains planned. No changes belong in Cloud Command
 or its 3CX package. Native-client login and target enforcement are separate consumers
 of this extension's authorization service.
+
+Native login uses the system browser with PKCE. The app API Cloudflare transport
+still requires an explicit design; never embed a shared gateway secret in the app.
 
 `src/authorization.mjs` defines the decision required before issuing and redeeming
 a connection authorization. It receives server-owned, current account/role, device,

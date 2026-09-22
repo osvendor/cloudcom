@@ -113,6 +113,17 @@ describe('verifyCfAccessJwt', () => {
     expect(typeof claims.iat).toBe('number');
   });
 
+  it('preserves custom claims only after cryptographic verification', async () => {
+    const custom = { cloudcom_org_id: '11111111-1111-4111-8111-111111111111', cloudcom_account_kind: 'company_gateway' };
+    const token = await mintCfAccessJwt({ email: 'company@example.test', sub: 'company', type: 'app', custom });
+    expect((await verifyCfAccessJwt(token, { teamDomain, audience })).custom).toEqual(custom);
+    const parts = token.split('.');
+    const payload = JSON.parse(Buffer.from(parts[1]!, 'base64url').toString());
+    payload.custom.cloudcom_org_id = '22222222-2222-4222-8222-222222222222';
+    parts[1] = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    await expect(verifyCfAccessJwt(parts.join('.'), { teamDomain, audience })).rejects.toBeInstanceOf(CfAccessInvalidTokenError);
+  });
+
   it('rejects a token signed by a different key', async () => {
     const attacker = await generateRsaKeypair();
     const token = await mintCfAccessJwt(

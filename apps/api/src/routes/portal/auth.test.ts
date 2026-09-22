@@ -21,6 +21,10 @@ const { portalUserRow, activeOrgResult } = vi.hoisted(() => ({
 }));
 
 const resolveOrgTimezone = vi.hoisted(() => vi.fn(async () => 'UTC'));
+const gateway = vi.hoisted(() => vi.fn());
+const passwordCheck = vi.hoisted(() => vi.fn());
+vi.mock('../../services/portalCompanyGateway', () => ({ checkPortalCompanyGateway: gateway }));
+vi.mock('../../services/password', () => ({ verifyPassword: passwordCheck, hashPassword: vi.fn(), isPasswordStrong: vi.fn() }));
 
 vi.mock('../../services/portal/timezone', () => ({
   resolveOrgTimezone,
@@ -38,6 +42,7 @@ function project(columns: Record<string, unknown>): Array<Record<string, unknown
 
 vi.mock('../../db', () => ({
   db: {
+    update: () => ({ set: () => ({ where: async () => undefined }) }),
     select: (columns: Record<string, unknown>) => ({
       from: () => ({
         where: () => ({ limit: () => Promise.resolve(project(columns)) }),
@@ -94,6 +99,8 @@ function seedSession() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  gateway.mockResolvedValue({ ok: true, orgId: ORG_ID });
+  passwordCheck.mockResolvedValue(true);
   portalSessions.clear();
   portalUserRow.current = {
     id: USER_ID,
@@ -108,6 +115,32 @@ beforeEach(() => {
     accessMode: 'standard',
   };
   activeOrgResult.current = { orgId: ORG_ID, partnerId: 'partner-1' };
+});
+
+describe('two-step remote login', () => {
+  function login() {
+    const app = new Hono(); app.route('/', authRoutes);
+    return app.request('/auth/login', { method: 'POST', headers: {
+      'Content-Type': 'application/json', 'Cf-Access-Jwt-Assertion': 'company-assertion',
+    }, body: JSON.stringify({ email: 'cust@acme.example', password: 'synthetic-password' }) });
+  }
+  beforeEach(() => { portalUserRow.current!.passwordHash = 'synthetic-hash'; portalUserRow.current!.accessMode = 'remote_only'; });
+  it('does not issue a session when a correct individual password has the wrong company', async () => {
+    gateway.mockResolvedValue({ ok: false, status: 403 });
+    expect((await login()).status).toBe(403);
+    expect(gateway).toHaveBeenCalledWith('company-assertion', ORG_ID);
+    expect(portalSessions.size).toBe(0);
+  });
+  it('still requires the individual password before company authorization', async () => {
+    passwordCheck.mockResolvedValue(false);
+    expect((await login()).status).toBe(401);
+    expect(gateway).not.toHaveBeenCalled(); expect(portalSessions.size).toBe(0);
+  });
+  it('creates a remote-only session when both credentials pass', async () => {
+    const response = await login(); expect(response.status).toBe(200);
+    expect((await response.json()).user.accessMode).toBe('remote_only');
+    expect(portalSessions.size).toBe(1);
+  });
 });
 
 describe('remote-only middleware authorization', () => {

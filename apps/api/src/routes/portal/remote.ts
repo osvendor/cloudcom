@@ -7,6 +7,7 @@ import { db } from '../../db';
 import { devices, portalRemoteAssignments, portalRemoteSettings } from '../../db/schema';
 import { isPortalRemoteFeatureEnabled } from '../../services/portalRemoteFeature';
 import { authorizePortalRemote } from '../../services/portalRemoteAuthority';
+import { checkPortalCompanyGateway } from '../../services/portalCompanyGateway';
 
 
 export const portalRemoteRoutes = new Hono();
@@ -18,6 +19,8 @@ portalRemoteRoutes.use('/remote/*', async (c, next) => {
   if (auth.user.accessMode !== 'remote_only' || !Number.isSafeInteger(auth.user.authEpoch)) {
     return c.json({ error: 'Remote access is not enabled for this account' }, 403);
   }
+  const company = await checkPortalCompanyGateway(c.req.header('Cf-Access-Jwt-Assertion'), auth.user.orgId);
+  if (!company.ok) return c.json({ error: 'Company authentication is required' }, company.status);
   await next();
 });
 

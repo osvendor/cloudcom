@@ -82,7 +82,7 @@ return 1`;
  * expiry; the browser cookie is never returned. All malformed failures are equal. */
 export async function exchangeNativeLoginCode(request: {
   code: string; clientId: string; redirectUri: string; codeVerifier: string;
-}): Promise<{ accessToken: string; tokenType: 'Bearer'; expiresIn: number } | null> {
+}, requiredOrgId?: string): Promise<{ accessToken: string; tokenType: 'Bearer'; expiresIn: number } | null> {
   if (!canonical32(request.code) || typeof request.codeVerifier !== 'string'
     || !/^[A-Za-z0-9._~-]{43,128}$/.test(request.codeVerifier)) return null;
   const redis = getRedis();
@@ -91,6 +91,7 @@ export async function exchangeNativeLoginCode(request: {
     const raw = await redis.eval(CONSUME_CODE, 1, CODE_PREFIX + hash(request.code));
     if (typeof raw !== 'string') return null;
     const record = JSON.parse(raw) as StoredCode;
+    if (requiredOrgId !== undefined && record?.orgId !== requiredOrgId) return null;
     if (!record || record.version !== 1 || !validateNativeLoginRequest(record) || !validPrincipal(record)
       || !Number.isSafeInteger(record.expiresAt) || Date.now() >= record.expiresAt
       || record.expiresAt > Date.now() + CODE_SECONDS * 1000

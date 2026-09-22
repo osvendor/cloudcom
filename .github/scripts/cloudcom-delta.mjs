@@ -30,6 +30,8 @@ const remoteAccessApiPaths = new Set([
 const portalRemoteApiPaths = new Set([
   'apps/api/src/routes/orgPortalUsers.ts', 'apps/api/src/routes/orgPortalUsers.test.ts',
   'apps/api/src/routes/portal/acceptInvite.test.ts',
+  'apps/api/src/services/portalCompanyGateway.ts', 'apps/api/src/services/portalCompanyGateway.test.ts',
+  'apps/api/src/services/cfAccessJwt.ts', 'apps/api/src/services/cfAccessJwt.test.ts',
   'apps/api/src/services/portalNativeLogin.ts', 'apps/api/src/services/portalNativeLogin.test.ts',
   'apps/api/src/routes/portal/nativeLogin.ts', 'apps/api/src/routes/portal/nativeLogin.test.ts',
   'apps/api/src/__tests__/integration/portalNativeLogin.integration.test.ts',
@@ -149,6 +151,13 @@ export function classify(paths) {
       result.api = true;
       result.web = true;
       result.portalRemote = true;
+      continue;
+    }
+    if (path === 'deploy/remote-identity/README.md') continue;
+    if (['deploy/remote-identity/compose.yml', 'deploy/remote-identity/.env.example', 'deploy/remote-identity/.gitignore',
+      'deploy/remote-identity/custom-templates/.gitkeep', 'deploy/remote-identity/secrets/.gitkeep',
+      'deploy/remote-identity/company-login.yaml'].includes(path)) {
+      result.infra = true;
       continue;
     }
     if (docsPath.test(path) || path === 'packages/ext-cloud-command/README.md' || path === 'packages/ext-rustdesk-access/README.md') continue;

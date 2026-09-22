@@ -48,6 +48,8 @@ export interface CfAccessJwtClaims {
   type?: string;
   identity_nonce?: string;
   country?: string;
+  /** Signature-verified but intentionally unvalidated; each consumer must validate its schema. */
+  custom?: unknown;
 }
 
 export interface CfAccessVerifyConfig {
@@ -172,5 +174,6 @@ export async function verifyCfAccessJwt(
     identity_nonce:
       typeof payload.identity_nonce === 'string' ? payload.identity_nonce : undefined,
     country: typeof payload.country === 'string' ? payload.country : undefined,
+    custom: payload.custom,
   };
 }
