@@ -50,8 +50,8 @@ function token() { return new Response(JSON.stringify({ access_token: 'token' })
 function getUser(raw = providerUser()) { return new Response(JSON.stringify(raw)); }
 function forwardingProfiles() {
   return [
-    { Id: 1, Name: 'Available', NoAnswerTimeout: 20, RingMyMobile: false, CustomProviderValue: 'keep-me', AvailableRoute: { NoAnswerInternal: { To: 'Extension', Number: '102' } } },
-    { Id: 2, Name: 'Away', NoAnswerTimeout: 30, RingMyMobile: true, CustomProviderValue: 'also-keep', AwayRoute: { External: { To: 'External', External: '+15550000' } } },
+    { Name: 'Available', NoAnswerTimeout: 20, RingMyMobile: false, CustomProviderValue: 'keep-me', AvailableRoute: { NoAnswerInternal: { To: 'Extension', Number: '102' } } },
+    { Name: 'Away', NoAnswerTimeout: 30, RingMyMobile: true, CustomProviderValue: 'also-keep', AwayRoute: { External: { To: 'External', External: '+15550000' } } },
   ];
 }
 
@@ -124,6 +124,49 @@ describe('Cloud Command 3CX extension details', () => {
     expect((await res.json()).editable).toMatchObject({ general: true, voicemail: true, forwarding: true });
   });
 
+  it('projects the five provider forwarding profiles when they have names but no numeric Id values', async () => {
+    const names = ['Out of office', 'Custom 1', 'Available', 'Custom 2', 'Away'];
+    const h = harness({ results: [[{ partner_id: PARTNER }], [row()]] });
+    h.fetch.mockResolvedValueOnce(token()).mockResolvedValueOnce(getUser(providerUser({
+      ForwardingProfiles: names.map((Name) => ({ Name, RingMyMobile: false })),
+    })));
+
+    const res = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`);
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).forwardingProfiles).toEqual(expect.arrayContaining(
+      names.map((Name) => expect.objectContaining({ key: Name, Name })),
+    ));
+  });
+
+  it.each([
+    ['missing provider Name', [{ RingMyMobile: true }]],
+    ['duplicate provider Name', [{ Name: 'Available' }, { Name: 'Available' }]],
+  ])('rejects %s in forwarding profiles', async (_label, ForwardingProfiles) => {
+    const h = harness({ results: [[{ partner_id: PARTNER }], [row()]] });
+    h.fetch.mockResolvedValueOnce(token()).mockResolvedValueOnce(getUser(providerUser({ ForwardingProfiles })));
+
+    const res = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`);
+
+    expect(res.status).toBe(502);
+    expect((await res.json()).code).toBe('invalid_provider_response');
+  });
+
+  it('projects missing phone and forwarding-exception IDs as null read-only metadata', async () => {
+    const h = harness({ results: [[{ partner_id: PARTNER }], [row()]] });
+    h.fetch.mockResolvedValueOnce(token()).mockResolvedValueOnce(getUser(providerUser({
+      Phones: [{ Name: 'Desk', MacAddress: '00:11:22:33:44:55' }],
+      ForwardingExceptions: [{ CallType: 'Internal', Destination: { To: 'Extension', Number: '102' } }],
+    })));
+
+    const res = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`);
+
+    expect(res.status).toBe(200);
+    const detail = await res.json();
+    expect(detail.phones).toEqual([expect.objectContaining({ id: null, name: 'Desk' })]);
+    expect(detail.forwardingExceptions).toEqual([expect.objectContaining({ id: null })]);
+  });
+
   it.each([
     ['missing write permission', { write: false, mfa: true }],
     ['missing verified MFA', { write: true, mfa: false }],
@@ -166,12 +209,39 @@ describe('Cloud Command 3CX extension details', () => {
     h.fetch.mockResolvedValueOnce(token()).mockResolvedValueOnce(getUser(current)).mockResolvedValueOnce(token()).mockResolvedValueOnce(getUser(current)).mockResolvedValueOnce(token()).mockResolvedValueOnce(new Response(null, { status: 204 }));
     const detail = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`);
     const { revision } = await detail.json();
-    const res = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ revision, changes: { ForwardingProfiles: [{ Id: 1, NoAnswerTimeout: 45, RingMyMobile: true }] } }) });
+    const res = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ revision, changes: { ForwardingProfiles: [{ key: 'Available', NoAnswerTimeout: 45, RingMyMobile: true }] } }) });
     expect(res.status).toBe(200);
     const expectedProfiles = forwardingProfiles();
     expectedProfiles[0] = { ...expectedProfiles[0], NoAnswerTimeout: 45, RingMyMobile: true };
     expect(h.fetch).toHaveBeenLastCalledWith(expect.stringContaining('/Users/Pbx.MultiUserUpdate'), expect.objectContaining({ method: 'POST', body: JSON.stringify({ ids: [EXTENSION], user: { ForwardingProfiles: expectedProfiles } }) }));
     expect(h.audit).toHaveBeenCalledWith(expect.objectContaining({ details: { extensionId: EXTENSION, fields: ['ForwardingProfiles'] } }));
+  });
+
+  it('matches forwarding saves by raw provider Name when custom display names collide and never sends the browser key upstream', async () => {
+    const initialProfiles = [
+      { Name: 'Available', CustomName: 'Shared display name', RingMyMobile: false },
+      { Name: 'Away', CustomName: 'Shared display name', RingMyMobile: true },
+    ];
+    const current = providerUser({ ForwardingProfiles: initialProfiles });
+    const h = harness({ write: true, mfa: true, results: [[{ partner_id: PARTNER }], [row()], [{ partner_id: PARTNER }], [row()], [row()]] });
+    h.fetch.mockResolvedValueOnce(token()).mockResolvedValueOnce(getUser(current)).mockResolvedValueOnce(token()).mockResolvedValueOnce(getUser(current)).mockResolvedValueOnce(token()).mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const detail = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`);
+    const { revision, forwardingProfiles } = await detail.json();
+    expect(forwardingProfiles).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: 'Available', Name: 'Shared display name' }),
+      expect.objectContaining({ key: 'Away', Name: 'Shared display name' }),
+    ]));
+
+    const res = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ revision, changes: { ForwardingProfiles: [{ key: 'Available', RingMyMobile: true }] } }) });
+
+    expect(res.status).toBe(200);
+    expect(h.fetch).toHaveBeenLastCalledWith(expect.stringContaining('/Users/Pbx.MultiUserUpdate'), expect.objectContaining({
+      body: JSON.stringify({ ids: [EXTENSION], user: { ForwardingProfiles: [
+        { Name: 'Available', CustomName: 'Shared display name', RingMyMobile: true },
+        { Name: 'Away', CustomName: 'Shared display name', RingMyMobile: true },
+      ] } }),
+    }));
+    expect(String(h.fetch.mock.calls.at(-1)?.[1]?.body)).not.toContain('"key"');
   });
 
   it('rejects unknown forwarding profiles after preflight without a bulk update', async () => {
@@ -180,7 +250,7 @@ describe('Cloud Command 3CX extension details', () => {
     h.fetch.mockResolvedValueOnce(token()).mockResolvedValueOnce(getUser(current)).mockResolvedValueOnce(token()).mockResolvedValueOnce(getUser(current));
     const initial = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`);
     const { revision } = await initial.json();
-    const res = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ revision, changes: { ForwardingProfiles: [{ Id: 99, RingMyMobile: true }] } }) });
+    const res = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ revision, changes: { ForwardingProfiles: [{ key: 'Unknown', RingMyMobile: true }] } }) });
     expect(res.status).toBe(400);
     expect((await res.json()).code).toBe('unknown_forwarding_profile');
     expect(h.fetch).toHaveBeenCalledTimes(4);
@@ -188,11 +258,11 @@ describe('Cloud Command 3CX extension details', () => {
   });
 
   it.each([
-    ['duplicate profile IDs', { ForwardingProfiles: [{ Id: 1, RingMyMobile: true }, { Id: 1, NoAnswerTimeout: 20 }] }],
-    ['unsafe timeout', { ForwardingProfiles: [{ Id: 1, NoAnswerTimeout: 4 }] }],
-    ['provider destination edit', { ForwardingProfiles: [{ Id: 1, RingMyMobile: true, AvailableRoute: { NoAnswerInternal: { Number: '999' } } }] }],
-    ['caller bulk IDs', { ids: [999], ForwardingProfiles: [{ Id: 1, RingMyMobile: true }] }],
-    ['arbitrary profile field', { ForwardingProfiles: [{ Id: 1, RingMyMobile: true, arbitrary: 'no' }] }],
+    ['duplicate profile keys', { ForwardingProfiles: [{ key: 'Available', RingMyMobile: true }, { key: 'Available', NoAnswerTimeout: 20 }] }],
+    ['unsafe timeout', { ForwardingProfiles: [{ key: 'Available', NoAnswerTimeout: 4 }] }],
+    ['provider destination edit', { ForwardingProfiles: [{ key: 'Available', RingMyMobile: true, AvailableRoute: { NoAnswerInternal: { Number: '999' } } }] }],
+    ['caller bulk IDs', { ids: [999], ForwardingProfiles: [{ key: 'Available', RingMyMobile: true }] }],
+    ['arbitrary profile field', { ForwardingProfiles: [{ key: 'Available', RingMyMobile: true, arbitrary: 'no' }] }],
   ])('rejects %s before provider mutation', async (_label, changes) => {
     const h = harness({ write: true, mfa: true });
     const res = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ revision: 'a'.repeat(64), changes }) });
@@ -208,7 +278,7 @@ describe('Cloud Command 3CX extension details', () => {
     h.fetch.mockResolvedValueOnce(token()).mockResolvedValueOnce(getUser(current)).mockResolvedValueOnce(token()).mockResolvedValueOnce(getUser(current));
     const initial = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`);
     const { revision } = await initial.json();
-    const res = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ revision, changes: { FirstName: 'Grace', ForwardingProfiles: [{ Id: 1, RingMyMobile: true }] } }) });
+    const res = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ revision, changes: { FirstName: 'Grace', ForwardingProfiles: [{ key: 'Available', RingMyMobile: true }] } }) });
     expect(res.status).toBe(400);
     expect((await res.json()).code).toBe('save_forwarding_separately');
     expect(h.fetch).toHaveBeenCalledTimes(4);
@@ -218,7 +288,7 @@ describe('Cloud Command 3CX extension details', () => {
   it('applies the stale revision guard before a forwarding bulk update', async () => {
     const h = harness({ write: true, mfa: true, results: [[{ partner_id: PARTNER }], [row()]] });
     h.fetch.mockResolvedValueOnce(token()).mockResolvedValueOnce(getUser(providerUser({ ForwardingProfiles: forwardingProfiles() })));
-    const res = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ revision: 'c'.repeat(64), changes: { ForwardingProfiles: [{ Id: 1, RingMyMobile: true }] } }) });
+    const res = await request(h.app, `/threecx/users/${EXTENSION}?orgId=${ORG}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ revision: 'c'.repeat(64), changes: { ForwardingProfiles: [{ key: 'Available', RingMyMobile: true }] } }) });
     expect(res.status).toBe(409);
     expect((await res.json()).code).toBe('extension_changed_reload_before_saving');
     expect(h.fetch).toHaveBeenCalledTimes(2);

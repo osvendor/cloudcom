@@ -2,15 +2,15 @@
 export type DetailValue = string | number | boolean | null;
 export type DetailFields = Record<string, DetailValue>;
 export type ForwardingProfile = {
-  Id: number; Name: string; fields: DetailFields;
+  key: string; Name: string; fields: DetailFields;
   destinations: { label: string; type: string; target: string | null }[];
 };
 export type ThreeCxDetail = {
   user: DetailFields & { Id: number; Number: string };
   groups: { id: number; name: string; role: string | null }[];
-  phones: { id: number; name: string; macAddress: string | null; template: string | null; interface: string | null }[];
+  phones: { id: number | null; name: string; macAddress: string | null; template: string | null; interface: string | null }[];
   forwardingProfiles: ForwardingProfile[];
-  forwardingExceptions: { id: number; fields: DetailFields; destination: string | null }[];
+  forwardingExceptions: { id: number | null; fields: DetailFields; destination: string | null }[];
   greetings: { name: string; profile: string | null }[];
   blf: { configured: boolean; entries: { position: number; type: string; target: string; label: string }[]; readable: boolean };
   revision: string;
@@ -22,7 +22,7 @@ export type ThreeCxDetailChanges = {
   VMEnabled?: boolean; VMEmailOptions?: 'None' | 'Notification' | 'Attachment' | 'AttachmentAndDelete';
   VMPlayCallerID?: boolean; VMPlayMsgDateTime?: 'None' | 'Play12Hr' | 'Play24Hr';
   ForwardingProfiles?: {
-    Id: number; NoAnswerTimeout?: number; RingMyMobile?: boolean; AcceptMultipleCalls?: boolean;
+    key: string; NoAnswerTimeout?: number; RingMyMobile?: boolean; AcceptMultipleCalls?: boolean;
     BlockPushCalls?: boolean; DisableRingGroupCalls?: boolean; OfficeHoursAutoQueueLogOut?: boolean;
   }[];
 };

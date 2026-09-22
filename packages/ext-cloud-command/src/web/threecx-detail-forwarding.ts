@@ -13,7 +13,7 @@ export function mountForwardingEditors(root: ShadowRoot, profiles: ForwardingPro
   profiles.forEach((profile, index) => {
     const card = cards[index];
     if (!card) return;
-    const current = changes.ForwardingProfiles?.find((item) => item.Id === profile.Id) ?? { Id: profile.Id };
+    const current = changes.ForwardingProfiles?.find((item) => item.key === profile.key) ?? { key: profile.key };
     const disabled = !editable || scalarDirty;
     const controls = document.createElement('div');
     controls.className = 'detail-fields forwarding-controls';
@@ -25,10 +25,10 @@ export function mountForwardingEditors(root: ShadowRoot, profiles: ForwardingPro
     if (editable) card.querySelector('.readonly-note:last-child')?.replaceChildren('Ring controls are editable; routing destinations remain read-only.');
     controls.querySelectorAll<HTMLInputElement>('[data-forwarding-field]').forEach((input) => input.addEventListener(input.type === 'checkbox' ? 'change' : 'input', () => {
       const key = input.dataset.forwardingField as typeof scalarKeys[number];
-      const latest = changes.ForwardingProfiles?.find((item) => item.Id === profile.Id) ?? { Id: profile.Id };
+      const latest = changes.ForwardingProfiles?.find((item) => item.key === profile.key) ?? { key: profile.key };
       const next: ProfileChange = { ...latest, [key]: input.type === 'checkbox' ? input.checked : Number(input.value) };
-      const normalized = Object.fromEntries(Object.entries(next).filter(([field, value]) => field === 'Id' || value !== profile.fields[field])) as ProfileChange;
-      const all = (changes.ForwardingProfiles ?? []).filter((item) => item.Id !== profile.Id);
+      const normalized = Object.fromEntries(Object.entries(next).filter(([field, value]) => field === 'key' || value !== profile.fields[field])) as ProfileChange;
+      const all = (changes.ForwardingProfiles ?? []).filter((item) => item.key !== profile.key);
       if (Object.keys(normalized).length === 1) onChange(all);
       else onChange([...all, normalized]);
     }));
