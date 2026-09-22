@@ -99,3 +99,21 @@ test('requires API and web validation for the native Microsoft host bridge', () 
   assert.equal(result.web, true);
   assert.deepEqual(result.unsupported, []);
 });
+
+test('classifies the bounded Microsoft administration runtime, authorization, and additive migration', () => {
+  for (const path of [
+    'apps/api/src/extensions/cloudCommandAdminRuntime.ts',
+    'apps/api/src/extensions/cloudCommandAdminRuntime.test.ts',
+    'apps/api/src/extensions/cloudCommandAdminAuthorization.ts',
+    'apps/api/src/extensions/cloudCommandAdminAuthorization.test.ts',
+    'packages/ext-cloud-command/src/server/admin-runtime.ts',
+    'packages/ext-cloud-command/src/server/admin-services.ts',
+    'packages/ext-cloud-command/src/server/admin-store.ts',
+    'packages/ext-cloud-command/migrations/2026-09-22-native-admin-connections.sql',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.api, true);
+    assert.equal(result.web, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+});

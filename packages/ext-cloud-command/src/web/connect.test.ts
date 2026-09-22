@@ -131,4 +131,9 @@ describe('CloudCommandConnectPage', () => {
     await flush();
     expect(page.shadowRoot!.querySelector('cloudcommand-threecx-page')).toBeTruthy();
   });
+  it('selects Microsoft when an OAuth callback is present before the hash is restored', () => {
+    window.history.replaceState({}, '', '/extensions/cloudcommand/connect?state=callback-state&admin_consent=True&tenant=tenant-a');
+    const { page } = mount();
+    expect(page.shadowRoot!.querySelector('cloudcommand-microsoft-connect')).toBeTruthy();
+  });
 });

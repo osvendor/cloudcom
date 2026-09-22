@@ -248,6 +248,12 @@ export const BUILTINS: readonly BuiltinExtension[] = [
       version: 1,
       connection: async request => (await import('./cloudCommandMicrosoft')).nativeMicrosoftServices.connection(request),
       read: async (request, resource) => (await import('./cloudCommandMicrosoft')).nativeMicrosoftServices.read(request, resource),
+    }, {
+      configuration: async () => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.configuration(),
+      acquireToken: async connection => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.acquireToken(connection),
+      verifyAuthorization: async input => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.verifyAuthorization(input),
+      audit: async event => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.audit(event),
+      authorize: async (request, orgId, mutation) => (await import('./cloudCommandAdminAuthorization')).authorizeCloudCommandAdministration(request, orgId, mutation),
     }),
     name: 'cloudcommand',
     packageDir: 'packages/ext-cloud-command',

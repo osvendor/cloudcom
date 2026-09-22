@@ -190,4 +190,70 @@ describe('CloudCommandMicrosoftPage', () => {
       'Invalid Microsoft resource response.',
     );
   });
+
+  it('edits only supported user fields and reports saved after matching readback', async () => {
+    const user = { id: 'user-1', displayName: 'Ada Lovelace', givenName: 'Ada', surname: 'Lovelace', department: 'Engineering', jobTitle: 'Analyst', officeLocation: 'London', accountEnabled: true };
+    let gets = 0;
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/threecx/connection') return Response.json({ connected: false });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada Lovelace' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration') {
+        const body = JSON.parse(String(init?.body));
+        if (body.type === 'user.get') return Response.json({ ...user, displayName: gets++ ? 'Ada Byron' : user.displayName });
+        if (body.type === 'user.update') return Response.json({ accepted: true });
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="user-1"]')!.click(); await flush();
+    const name = page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!; name.value = 'Ada Byron';
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush(); await flush();
+    const update = request.mock.calls.map(([, init]) => init?.body).find(body => String(body).includes('user.update'));
+    expect(JSON.parse(String(update))).toEqual({ type: 'user.update', id: 'user-1', update: { displayName: 'Ada Byron', givenName: 'Ada', surname: 'Lovelace', department: 'Engineering', jobTitle: 'Analyst', officeLocation: 'London', accountEnabled: true } });
+    expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('saved and verified');
+  });
+
+  it('reports a mismatched user readback as uncertain without retrying', async () => {
+    let gets = 0;
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/threecx/connection') return Response.json({ connected: false });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration') {
+        const type = JSON.parse(String(init?.body)).type;
+        if (type === 'user.get') return Response.json({ displayName: gets++ ? 'Ada' : 'Ada', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '', accountEnabled: true });
+        if (type === 'user.update') return Response.json({ accepted: true });
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush(); page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="user-1"]')!.click(); await flush();
+    page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!.value = 'Changed'; page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush(); await flush();
+    expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('did not confirm');
+    expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
+  });
+
+  it('requires explicit confirmation before sending a bounded group membership change', async () => {
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/threecx/connection') return Response.json({ connected: false });
+      if (path === '/microsoft/resources/users') return emptyResource();
+      if (path === '/microsoft/resources/groups') return Response.json({ items: [{ id: 'group-1', values: { displayName: 'Operators' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration') {
+        const type = JSON.parse(String(init?.body)).type;
+        if (type === 'group.get') return Response.json({ displayName: 'Operators' });
+        if (type === 'group.member.remove') return Response.json({ accepted: true });
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); window.location.hash = 'groups'; window.dispatchEvent(new HashChangeEvent('hashchange')); await flush(); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="group-1"]')!.click(); await flush();
+    const root = page.shadowRoot!; root.querySelector<HTMLInputElement>('#group-member-user-id')!.value = 'user-9'; (root.querySelector<HTMLSelectElement>('#group-member-action')!).value = 'remove';
+    root.querySelector<HTMLButtonElement>('#group-member-submit')!.click(); await flush();
+    expect(request.mock.calls.some(([, init]) => String(init?.body).includes('group.member.remove'))).toBe(false);
+    root.querySelector<HTMLInputElement>('#group-member-confirm')!.checked = true; root.querySelector<HTMLButtonElement>('#group-member-submit')!.click(); await flush();
+    const mutation = request.mock.calls.map(([, init]) => init?.body).find(body => String(body).includes('group.member.remove'));
+    expect(JSON.parse(String(mutation))).toEqual({ type: 'group.member.remove', groupId: 'group-1', userId: 'user-9' });
+    expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('verification is pending');
+  });
 });

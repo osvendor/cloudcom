@@ -6,6 +6,7 @@ export async function microsoftOnboardingStatus(
   request: MicrosoftRequest,
   recheck = false,
 ) {
+  if (services?.administration) return services.administration.status(request, recheck);
   const connection = services?.version === 1 ? await services.connection(request) : null;
   const canManage = connection?.canManage === true;
   const configured = connection?.available === true && connection.connected && connection.enabled === true;

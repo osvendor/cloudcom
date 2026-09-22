@@ -11,6 +11,8 @@ const providers: ReadonlyArray<{ id: Provider; name: string; href: string; detai
 ];
 type ThreeCxElement = HTMLElement & { context: ExtensionPageContextV1; hostApi: CloudCommandHostApi; displayMode: CloudCommandThreeCxMode };
 const selectedFromHash = (): Provider => {
+  const callback = new URLSearchParams(window.location.search);
+  if (callback.has('state') && (callback.has('code') || callback.has('admin_consent') || callback.has('error'))) return 'microsoft';
   const value = window.location.hash.replace(/^#/, '');
   return value === 'threecx' || value === 'microsoft' || value === 'google' ? value : 'threecx';
 };

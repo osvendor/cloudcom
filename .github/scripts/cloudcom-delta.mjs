@@ -73,6 +73,10 @@ const cloudCommandApiPaths = new Set([
   'apps/api/src/extensions/builtinRegistry.ts',
   'apps/api/src/extensions/cloudCommandMicrosoft.ts',
   'apps/api/src/extensions/cloudCommandMicrosoft.test.ts',
+  'apps/api/src/extensions/cloudCommandAdminRuntime.ts',
+  'apps/api/src/extensions/cloudCommandAdminRuntime.test.ts',
+  'apps/api/src/extensions/cloudCommandAdminAuthorization.ts',
+  'apps/api/src/extensions/cloudCommandAdminAuthorization.test.ts',
   'apps/api/src/extensions/webRegistry.test.ts',
   'apps/api/src/extensions/webRegistry.ts',
   'apps/api/src/extensions/webAssets.test.ts',
@@ -149,7 +153,7 @@ export function classify(paths) {
       result.api = true;
       continue;
     }
-    if (cloudCommandApiPaths.has(path) || /^packages\/ext-cloud-command\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/(?:2026-09-21-threecx-connections|2026-09-22-microsoft-connections)\.sql|src\/(?:server|threecx|web)\/.+)$/u.test(path)) {
+    if (cloudCommandApiPaths.has(path) || /^packages\/ext-cloud-command\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/(?:2026-09-21-threecx-connections|2026-09-22-microsoft-connections|2026-09-22-native-admin-connections)\.sql|src\/(?:server|threecx|web)\/.+)$/u.test(path)) {
       result.api = true;
       result.web = true;
       continue;
