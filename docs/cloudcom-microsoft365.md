@@ -8,6 +8,10 @@ The stable page is `/extensions/cloudcommand/microsoft`. The initial implemented
 
 The extension reuses Breeze styling, organization context, authenticated host requests, resource navigation, filters and a details drawer. Native connection setup, consent, retest and disconnect remain in Integrations. The extension does not create another tenant mapping or credential form.
 
+## Administration end goal
+
+This initial read bridge is not the product acceptance target. Full administrative reads and writes are required. The existing broader application can be assessed and reused through an isolated administrative executor; its mismatch with the dedicated native read profile is not a reason to reduce permissions or require a read-only live-test milestone. See [the administration acceptance matrix](cloudcom-microsoft-admin-acceptance.md).
+
 ## Host attachment and configuration
 
 `packages/ext-cloud-command/src/server/native-microsoft.ts` defines the version-1 boundary. `apps/api/src/extensions/cloudCommandMicrosoft.ts` is the single host implementation; `builtinRegistry.ts` loads it lazily to preserve the extension boot dependency boundary.

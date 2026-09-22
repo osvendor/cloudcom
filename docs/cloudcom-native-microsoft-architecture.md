@@ -29,6 +29,14 @@ A top-level route list is not enough. The coverage ledger must contain one row f
 
 Documentation entries are not interchangeable with screens or operations. The earlier 373-entry documentation inventory is a discovery aid, not proof of complete implementation. Dynamic menus and shared action registries need explicit review.
 
+## Full administration acceptance
+
+The target is full Microsoft administration, including writes. A read-only live test is not the acceptance milestone. The existing broad administration application is a candidate for reuse by an isolated extension-owned administration executor, subject to actual operation, tenant and Exchange authorization checks. Do not reduce its permissions or require a second read-only application solely to begin administration testing.
+
+The dedicated upstream Graph-read profile remains unchanged. Its narrow credential contract does not prohibit a separate administrative backend. The initial native read bridge is reusable infrastructure, not a product scope limit. Likewise, the two native upstream write actions are not a complete replacement for the planned CIPP-derived administrative surface.
+
+Use the approved internal test tenant, disposable owned resources, read-back verification and cleanup. Separate provider-capability tests from end-to-end Breeze tests: a successful Graph or Exchange command does not prove the extension's RBAC, consent mapping, UI or audit path. [Administration acceptance matrix](cloudcom-microsoft-admin-acceptance.md).
+
 ## Runtime design
 
 Browser -> Breeze extension page -> authenticated, organization-pinned extension route -> typed operation service -> Microsoft Graph or isolated Exchange worker.
