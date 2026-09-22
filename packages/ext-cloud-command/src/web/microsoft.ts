@@ -304,10 +304,16 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     update.accountEnabled = enabled.checked;
     return update;
   }
-  private userUpdateHasChanges(update: Record<string, string | boolean>): boolean {
-    if (!this.detailRecord) return false;
-    return USER_FIELDS.some(field => String(this.detailRecord?.[field] ?? '') !== update[field])
-      || (this.detailRecord.accountEnabled === true) !== update.accountEnabled;
+  private userUpdateChanges(update: Record<string, string | boolean>): Record<string, string | boolean> {
+    if (!this.detailRecord) return {};
+    const changes: Record<string, string | boolean> = {};
+    for (const field of USER_FIELDS) {
+      if (String(this.detailRecord[field] ?? '') !== update[field]) changes[field] = update[field]!;
+    }
+    if ((this.detailRecord.accountEnabled === true) !== update.accountEnabled) {
+      changes.accountEnabled = update.accountEnabled!;
+    }
+    return changes;
   }
   private updateVisibleColumns(key: string): void {
     const columns = this.data?.columns ?? [];
@@ -345,26 +351,32 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     return body as MicrosoftRecord;
   }
   private userMatchesUpdate(user: MicrosoftRecord, update: Record<string, string | boolean>): boolean {
-    return USER_FIELDS.every(field => String(user[field] ?? '') === update[field]) && user.accountEnabled === update.accountEnabled;
+    return Object.entries(update).every(([field, value]) => field === 'accountEnabled'
+      ? user.accountEnabled === value
+      : String(user[field] ?? '') === value);
   }
   private async saveUser(): Promise<void> {
     if (!this.connection?.canManage || !this.detail || this.detailKind !== 'user' || this.busy) return;
     const update = this.userUpdate(); if (!update) return;
+    const changes = this.userUpdateChanges(update);
     // The security actions in this drawer are independent of profile editing. In
     // particular, clicking Save after a password reset must not issue a redundant
     // PATCH or replace the successful reset notice with an unrelated error.
-    if (!this.userUpdateHasChanges(update)) return;
+    if (!Object.keys(changes).length) return;
     const id = this.detail.id; const generation = this.generation; const context = this.contextValue; const verification = ++this.userVerificationRequest;
     this.busy = true; this.drawerError = false; this.drawerMessage = 'Saving user changes…'; this.render();
     try {
-      const result = await this.request<{ accepted?: boolean }>(this.path('/administration'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'user.update', id, update }) });
+      // Match Cloud Command's Graph flow: PATCH only the fields the operator
+      // actually changed. Sending the entire form includes untouched empty or
+      // read-only values and can make Graph reject an otherwise valid edit.
+      const result = await this.request<{ accepted?: boolean }>(this.path('/administration'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'user.update', id, update: changes }) });
       if (result.accepted !== true) throw new Error('Microsoft did not accept the user update.');
       if (!this.userVerificationIsCurrent(id, generation, context, verification)) return;
       for (let attempt = 0; attempt < USER_VERIFY_READS; attempt += 1) {
         const readback = await this.readUserForVerification(id, generation, context, verification);
         if (!readback || !this.userVerificationIsCurrent(id, generation, context, verification)) return;
         this.detailRecord = readback;
-        if (this.userMatchesUpdate(readback, update)) {
+        if (this.userMatchesUpdate(readback, changes)) {
           this.detailRecord = readback;
           const row = this.data?.items.find(item => item.id === id);
           if (row) for (const field of [...USER_FIELDS, 'accountEnabled'] as const) {
