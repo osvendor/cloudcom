@@ -61,4 +61,30 @@ describe('Cloud Command 3CX database boundary', () => {
     expect(decryptForColumn(table, 'secret_ciphertext:org-a', value)).toBe('synthetic-test-secret');
     expect(() => decryptForColumn(table, 'secret_ciphertext:org-b', value)).toThrow();
   });
+
+  it('enforces forced RLS for Microsoft connection reads, writes, reparenting and deletion', async () => {
+    const admin = getTestDb();
+    const [partner] = await admin.insert(partners).values({ name: 'Microsoft isolation test', slug: `microsoft-${crypto.randomUUID()}`, type: 'msp' }).returning();
+    const [a, b, c] = await admin.insert(organizations).values(['a', 'b', 'c'].map(suffix => ({
+      partnerId: partner!.id, name: `Microsoft ${suffix}`, slug: `microsoft-${suffix}-${crypto.randomUUID()}`, currencyCode: 'USD',
+    }))).returning();
+    const state = await admin.execute(sql`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = 'cloudcommand_microsoft_connections'::regclass`);
+    expect(state[0]).toMatchObject({ relrowsecurity: true, relforcerowsecurity: true });
+    const tenant = '55555555-5555-4555-8555-555555555555';
+    const insert = (org: string) => sql`INSERT INTO cloudcommand_microsoft_connections (org_id, tenant_id, tenant_domain, tenant_name, backend_identity) VALUES (${org}::uuid, ${tenant}::uuid, 'customer.example.test', 'Customer', 'fixture')`;
+    await admin.execute(insert(b!.id));
+    const context = { scope: 'organization' as const, orgId: a!.id, partnerId: partner!.id, accessibleOrgIds: [a!.id] };
+    await withDbAccessContext(context, async () => {
+      const role = await db.execute(sql`SELECT current_user AS role`);
+      expect(role[0]!.role).toBe('breeze_app');
+      await db.execute(insert(a!.id));
+      expect((await db.execute(sql`SELECT org_id FROM cloudcommand_microsoft_connections`)).map(r => r.org_id)).toEqual([a!.id]);
+      expect(await db.execute(sql`UPDATE cloudcommand_microsoft_connections SET enabled = true WHERE org_id = ${b!.id}::uuid RETURNING id`)).toHaveLength(0);
+      expect(await db.execute(sql`DELETE FROM cloudcommand_microsoft_connections WHERE org_id = ${b!.id}::uuid RETURNING id`)).toHaveLength(0);
+    });
+    await expect(withDbAccessContext(context, () => db.execute(insert(c!.id)))).rejects.toThrow();
+    await expect(withDbAccessContext(context, () => db.execute(sql`UPDATE cloudcommand_microsoft_connections SET org_id = ${c!.id}::uuid WHERE org_id = ${a!.id}::uuid`))).rejects.toThrow();
+    expect(await getAppDb().execute(sql`SELECT * FROM cloudcommand_microsoft_connections`)).toHaveLength(0);
+    await expect(getAppDb().execute(insert(c!.id))).rejects.toThrow();
+  });
 });

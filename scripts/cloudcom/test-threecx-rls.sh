@@ -28,9 +28,11 @@ trap cleanup EXIT
 
 docker compose --project-name "$project" -f docker-compose.test.yml up -d --wait
 pnpm --filter @breeze/api db:migrate
-for _ in 1 2; do
-  docker compose --project-name "$project" -f docker-compose.test.yml exec -T postgres-test \
-    psql -v ON_ERROR_STOP=1 -U breeze_test -d breeze_test < packages/ext-cloud-command/migrations/2026-09-21-threecx-connections.sql
+for migration in packages/ext-cloud-command/migrations/*.sql; do
+  for _ in 1 2; do
+    docker compose --project-name "$project" -f docker-compose.test.yml exec -T postgres-test \
+      psql -v ON_ERROR_STOP=1 -U breeze_test -d breeze_test < "$migration"
+  done
 done
 pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts src/__tests__/integration/cloudCommandThreeCx.integration.test.ts
 pnpm --filter @breeze/api exec vitest run --config vitest.config.rls-coverage.ts

@@ -21,7 +21,8 @@
     "tsup": "8.5.1",
     "typescript": "5.9.3",
     "vitest": "^4.1.11",
-    "happy-dom": "^20.11.1"
+    "happy-dom": "^20.11.1",
+    "@types/node": "^26.4.1"
   },
   "main": "./src/server/index.ts",
   "types": "./src/server/index.ts",

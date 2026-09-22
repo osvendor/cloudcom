@@ -26,6 +26,11 @@
         "id": "threecx",
         "path": "/threecx",
         "element": "cloudcommand-threecx-page"
+      },
+      {
+        "id": "microsoft",
+        "path": "/microsoft",
+        "element": "cloudcommand-microsoft-page"
       }
     ],
     "navigation": [
@@ -46,7 +51,8 @@
   "aiTools": [],
   "tenancy": {
     "orgCascadeDeleteTables": [
-      "cloudcommand_threecx_connections"
+      "cloudcommand_threecx_connections",
+      "cloudcommand_microsoft_connections"
     ],
     "deviceCascadeDeleteTables": [],
     "deviceOrgDenormalizedTables": [],
@@ -67,6 +73,22 @@
         ],
         "exclude": [
           "secret_ciphertext"
+        ]
+      },
+      "cloudcommand_microsoft_connections": {
+        "include": [
+          "id",
+          "org_id",
+          "tenant_id",
+          "tenant_domain",
+          "tenant_name",
+          "enabled",
+          "version",
+          "created_at",
+          "updated_at"
+        ],
+        "exclude": [
+          "backend_identity"
         ]
       }
     }
