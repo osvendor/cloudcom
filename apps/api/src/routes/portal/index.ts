@@ -19,6 +19,7 @@ import { portalBackupRoutes } from './backups';
 import { portalReportRoutes } from './reports';
 import { portalServiceRoutes } from './service';
 import { portalDocumentRoutes } from './documents';
+import { portalRemoteRoutes } from './remote';
 
 export const portalRoutes = new Hono();
 
@@ -38,6 +39,7 @@ portalRoutes.use('/branding', portalAuthMiddleware);
 portalRoutes.route('/', brandingRoutes);
 
 // Protected routes
+portalRoutes.use('/remote/*', portalAuthMiddleware);
 portalRoutes.use('/devices/*', portalAuthMiddleware);
 portalRoutes.use('/devices/*', portalDevicesEnabledMiddleware);
 portalRoutes.use('/assets/*', portalAuthMiddleware);
@@ -105,3 +107,4 @@ portalRoutes.route('/', portalBackupRoutes);
 portalRoutes.route('/', portalReportRoutes);
 portalRoutes.route('/', portalServiceRoutes);
 portalRoutes.route('/', portalDocumentRoutes);
+portalRoutes.route('/', portalRemoteRoutes);

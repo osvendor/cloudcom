@@ -74,7 +74,9 @@ describe('portal middleware — disabled account guard', () => {
     '/devices',
     '/profile',
     '/quotes',
-    '/quotes/7'
+    '/quotes/7',
+    '/remote',
+    '/remote/123'
   ];
 
   it.each(protectedPages)('redirects %s to /account-disabled for a disabled account', async (path) => {
@@ -103,6 +105,24 @@ describe('portal middleware — disabled account guard', () => {
     const response = await run(context);
 
     expect(response.status).toBe(200);
+  });
+
+  it.each(['/remote', '/remote/123', '/profile'])('keeps remote-only customers on %s', async path => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => Promise.resolve(
+      new Response(JSON.stringify(String(url).includes('/profile')
+        ? { user: { accessMode: 'remote_only' } } : { name: 'Acme' }), { status: 200 })
+    )));
+    expect((await run(contextFor(path, { signedIn: true }))).status).toBe(200);
+  });
+
+  it('redirects remote-only customers away from the ordinary portal', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => Promise.resolve(
+      new Response(JSON.stringify(String(url).includes('/profile')
+        ? { user: { accessMode: 'remote_only' } } : { name: 'Acme' }), { status: 200 })
+    )));
+    const response = await run(contextFor('/devices', { signedIn: true }));
+    expect(response.status).toBe(302);
+    expect(response.headers.get('Location')).toBe(withBase('/remote'));
   });
 
   // Deliberate fail-open, asserted so it stays deliberate: the API is the

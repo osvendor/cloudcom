@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 import { createHash } from 'node:crypto';
+vi.mock('../services/portalRemoteLease', () => ({ renewPortalRemoteLeaseIfPresent: vi.fn(async () => null) }));
+vi.mock('../services/portalRemoteAgent', () => ({ handlePortalRemoteAgentResult: vi.fn(async () => false) }));
 
 // #3409 PR4a: sealing a secret envelope requires v3 (AAD-bound) encryption,
 // which only happens when a key id and keyring are configured. Set before the

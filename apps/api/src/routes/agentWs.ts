@@ -3,6 +3,8 @@ import type { WSContext } from 'hono/ws';
 import type Redis from 'ioredis';
 import { z } from 'zod';
 import { renewRevocationLease } from '../services/remoteRevocationLease';
+import { renewPortalRemoteLeaseIfPresent } from '../services/portalRemoteLease';
+import { handlePortalRemoteAgentResult } from '../services/portalRemoteAgent';
 import { applyProbeResult, parseProbeCommandId } from '../services/assetProbe';
 import { eq, and, or, ne, notInArray, sql } from 'drizzle-orm';
 import { createHash, randomUUID } from 'crypto';
@@ -2805,7 +2807,9 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
           // Bind the renew to the device this socket authenticated as: an agent
           // must never be able to renew (or learn about) another tenant's
           // session by guessing a session id.
-          const leaseResult = await renewRevocationLease(leaseSessionId, {
+          const leaseResult = await renewPortalRemoteLeaseIfPresent(leaseSessionId, {
+            expectDeviceId: authenticatedAgent.deviceId,
+          }) ?? await renewRevocationLease(leaseSessionId, {
             expectDeviceId: authenticatedAgent.deviceId,
           });
           if (leaseResult.status === 'renewed') {
@@ -2913,6 +2917,17 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
           const fastResult: Record<string, unknown> | undefined =
             fastMsg.result as Record<string, unknown> | undefined;
           const fastError = fastMsg.error;
+          if (!isTerm) {
+            try {
+              if (await handlePortalRemoteAgentResult({ commandId: fastCommandId, status: fastStatus,
+                result: fastResult, deviceId: authenticatedAgent.deviceId, agentId })) return;
+            } catch {
+              // A storage fault must not reinterpret a customer result as a
+              // technician result. Its lease will expire at the endpoint.
+              console.error('[AgentWs] Portal desktop result could not be recorded');
+              return;
+            }
+          }
           if (isTerm && fastStatus === 'failed') {
             // The start command id embeds the terminal connection generation
             // that issued it, so the failure is resolved against that exact

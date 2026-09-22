@@ -183,6 +183,17 @@ describe('device hard-delete table coverage contract', () => {
     expect(deviceCascadeDeleteTables).not.toContain('tickets');
   });
 
+  it('removes portal remote session history before its assignment during a permanent device purge', () => {
+    // portal_remote_sessions references the assignment's immutable
+    // (id, org_id, portal_user_id, device_id) identity. Deleting the grant
+    // first would leave the session FK blocking the whole device purge.
+    expect(deviceCascadeDeleteTables.indexOf('portal_remote_sessions')).toBeGreaterThanOrEqual(0);
+    expect(deviceCascadeDeleteTables.indexOf('portal_remote_assignments')).toBeGreaterThanOrEqual(0);
+    expect(deviceCascadeDeleteTables.indexOf('portal_remote_sessions')).toBeLessThan(
+      deviceCascadeDeleteTables.indexOf('portal_remote_assignments'),
+    );
+  });
+
   it('deletes ML output rows before anomaly parent rows during device hard-delete', () => {
     expect(deviceCascadeDeleteTables).toContain('remediation_suggestions');
     expect(deviceCascadeDeleteTables).toContain('metric_anomalies');
