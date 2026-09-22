@@ -14,6 +14,7 @@ vi.mock('@/lib/extensions/registry', () => ({
 function extension(over: Partial<RuntimeWebExtension> = {}): RuntimeWebExtension {
   return {
     name: 'demo',
+    routeNamespace: 'demo',
     version: '1.0.0',
     digest: 'abc123',
     moduleUrl: '/api/v1/extensions/assets/demo/abc123/index.js',

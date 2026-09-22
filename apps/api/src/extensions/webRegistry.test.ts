@@ -93,6 +93,7 @@ describe('buildRuntimeWebRegistry', () => {
     const ext = registry.extensions[0]!;
     expect(ext).toEqual({
       name: 'demo',
+      routeNamespace: 'demo',
       version: '2.3.4',
       digest: `sha256:${'b'.repeat(64)}`,
       moduleUrl: `/api/v1/extensions/assets/t/tok-demo-sha256:${'b'.repeat(64)}/demo/sha256:${'b'.repeat(64)}/web/index.js`,

@@ -62,6 +62,7 @@ export interface RuntimeWebSlot {
 
 export interface RuntimeWebExtension {
   readonly name: string;
+  readonly routeNamespace: string;
   readonly version: string;
   readonly digest: string;
   readonly moduleUrl: string;
@@ -166,6 +167,7 @@ function projectExtension(
 
   return {
     name: source.name,
+    routeNamespace: source.manifest.routeNamespace,
     version: source.version,
     digest: source.digest,
     moduleUrl: buildExtensionAssetPath(

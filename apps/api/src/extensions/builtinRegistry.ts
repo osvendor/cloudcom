@@ -16,6 +16,7 @@ import {
 } from '@breeze/extension-sdk';
 import type { ExtensionTenancyDeclaration } from '@breeze/extension-sdk';
 import workspaceExtension from '@breeze/ext-workspace';
+import { createCloudCommandExtension } from '@cloudcom/ext-cloud-command';
 
 /** One statically-imported, first-party extension. */
 export interface BuiltinExtension {
@@ -236,6 +237,19 @@ export function defineBuiltin(spec: Omit<BuiltinExtension, 'manifest'>): Builtin
  * both other delivery paths.
  */
 export const BUILTINS: readonly BuiltinExtension[] = [
+  defineBuiltin({
+    module: createCloudCommandExtension(async (url, init) => {
+      // Lazy bridge keeps this registry acyclic. No outbound work during boot.
+      const { safeFetch } = await import('../services/urlSafety');
+      const { runOutsideDbContext } = await import('../db');
+      return runOutsideDbContext(() => safeFetch(url, { ...init, signal: init.signal ?? undefined, allowPrivateNetwork: false, allowCarrierNat: false }));
+    }),
+    name: 'cloudcommand',
+    packageDir: 'packages/ext-cloud-command',
+    packageName: '@cloudcom/ext-cloud-command',
+    helperRoutes: false,
+    enableEnvVar: 'CLOUDCOM_THREECX_ENABLED',
+  }),
   defineBuiltin({
     module: workspaceExtension,
     name: 'workspace',

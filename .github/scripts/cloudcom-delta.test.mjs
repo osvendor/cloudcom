@@ -52,3 +52,23 @@ test('requires focused API coverage for the monitor response binding fix', () =>
   }
   assert.deepEqual(classify(['apps/api/src/services/monitors/monitorService.ts']).unsupported, ['apps/api/src/services/monitors/monitorService.ts']);
 });
+
+test('classifies only the reviewed Cloud Command server, bridge, registry, and build surfaces', () => {
+  for (const path of [
+    'packages/ext-cloud-command/src/server/index.ts',
+    'packages/ext-cloud-command/src/web/index.test.ts',
+    'packages/ext-cloud-command/migrations/2026-09-21-threecx-connections.sql',
+    'apps/api/src/extensions/webRegistry.ts',
+    'apps/api/src/__tests__/integration/cloudCommandThreeCx.integration.test.ts',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.api, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+  for (const path of [
+    'apps/web/src/lib/extensions/hostApi.ts',
+    'apps/web/src/components/extensions/ExtensionElementHost.tsx',
+  ]) assert.equal(classify([path]).web, true);
+  assert.equal(classify(['packages/extension-web-sdk/src/hostApi.ts']).shared, true);
+  assert.deepEqual(classify(['packages/ext-cloud-command/src/unsafe.ts']).unsupported, ['packages/ext-cloud-command/src/unsafe.ts']);
+});

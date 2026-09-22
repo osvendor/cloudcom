@@ -61,6 +61,7 @@ describe('ExtensionPageHost', () => {
     findExtensionPage.mockResolvedValue({
       extension: {
         name: 'demo',
+        routeNamespace: 'demo',
         version: '1.0.0',
         digest: 'abc123',
         moduleUrl: '/api/v1/extensions/assets/demo/abc123/index.js',
@@ -100,7 +101,7 @@ describe('ExtensionPageHost', () => {
     // First mount: page resolves fine.
     findExtensionPage.mockResolvedValueOnce({
       extension: {
-        name: 'demo', version: '1.0.0', digest: 'abc123',
+        name: 'demo', routeNamespace: 'demo', version: '1.0.0', digest: 'abc123',
         moduleUrl: '/api/v1/extensions/assets/demo/abc123/index.js',
         pages: [], navigation: [], slots: [],
       },

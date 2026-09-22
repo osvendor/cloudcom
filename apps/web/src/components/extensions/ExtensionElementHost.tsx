@@ -13,6 +13,7 @@ import {
   parseExtensionHostEventV1,
 } from '@breeze/extension-web-sdk';
 import { loadExtensionModule } from '@/lib/extensions/registry';
+import { createExtensionHostApi } from '@/lib/extensions/hostApi';
 import { navigateTo } from '@/lib/navigation';
 import { showToast } from '@/components/shared/Toast';
 
@@ -129,6 +130,7 @@ function ExtensionElementHostInner({
 
   useEffect(() => {
     let cancelled = false;
+    let revokeBridge: (() => void) | null = null;
     setError(null);
 
     (async () => {
@@ -140,8 +142,18 @@ function ExtensionElementHostInner({
           throw new Error('extension element did not register the declared tag name');
         }
 
-        const el = document.createElement(elementName) as HTMLElement & { context?: unknown };
+        const el = document.createElement(elementName) as HTMLElement & { context?: unknown; hostApi?: unknown };
         el.context = Object.freeze(context);
+        // `hostApi` is intentionally separate from the strict plain-data
+        // context contracts. Only an org-scoped element receives it.
+        const organizationId = context.organizationId;
+        const bridge = typeof organizationId === 'string' && organizationId.length > 0
+          ? createExtensionHostApi({ extensionName, organizationId })
+          : null;
+        if (bridge) {
+          el.hostApi = bridge.hostApi;
+          revokeBridge = bridge.revoke;
+        }
 
         if (cancelled) return;
         hostRef.current?.appendChild(el);
@@ -154,6 +166,7 @@ function ExtensionElementHostInner({
 
     return () => {
       cancelled = true;
+      revokeBridge?.();
       if (elementRef.current?.parentNode) {
         elementRef.current.parentNode.removeChild(elementRef.current);
       }
