@@ -195,12 +195,34 @@ describe('CloudCommandMicrosoftPage', () => {
     const page = mount(request); await flush(); await flush();
     openUser(page, 'user-1'); await flush();
     const name = page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!; name.value = 'Ada Byron';
-    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await new Promise(resolve => setTimeout(resolve, 1100));
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await new Promise(resolve => setTimeout(resolve, 2200));
     const update = request.mock.calls.map(([, init]) => init?.body).find(body => String(body).includes('user.update'));
-    expect(JSON.parse(String(update))).toEqual({ type: 'user.update', id: 'user-1', update: { displayName: 'Ada Byron', givenName: 'Ada', surname: 'Lovelace', department: 'Engineering', jobTitle: 'Analyst', officeLocation: 'London', accountEnabled: true } });
+    expect(JSON.parse(String(update))).toEqual({ type: 'user.update', id: 'user-1', update: { displayName: 'Ada Byron' } });
     expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
     expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('saved and verified');
     expect(page.shadowRoot!.querySelector('table')!.textContent).toContain('Ada Byron');
+  });
+
+  it('sends only the account-enabled field when changing sign-in access', async () => {
+    let enabled = false;
+    const user = { id: 'user-1', displayName: 'Ada', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '' };
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/threecx/connection') return Response.json({ connected: false });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration') {
+        const body = JSON.parse(String(init?.body));
+        if (body.type === 'user.get') return Response.json({ ...user, accountEnabled: enabled });
+        if (body.type === 'user.update') { enabled = body.update.accountEnabled; return Response.json({ accepted: true }); }
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush();
+    page.shadowRoot!.querySelector<HTMLInputElement>('#user-account-enabled')!.checked = true;
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush(); await flush(); await flush();
+    const update = request.mock.calls.map(([, init]) => init?.body).find(body => String(body).includes('user.update'));
+    expect(JSON.parse(String(update))).toEqual({ type: 'user.update', id: 'user-1', update: { accountEnabled: true } });
+    expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('saved and verified');
   });
 
   it('reports a mismatched user readback as uncertain without retrying', async () => {
