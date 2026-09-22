@@ -33,6 +33,7 @@ Apply [the Microsoft menu scope](cloudcom-microsoft-menu-scope.md) before import
 | Mail flow and quarantine | Query bounded test-related trace/quarantine views; exercise handling only on controlled test messages | Sending mail or releasing real quarantined mail is not a test substitute. Record unavailable fixtures explicitly. |
 | SharePoint/OneDrive | Query test sites/drives; create/edit/delete only test content; validate permissions/shortcuts separately | Requires applicable grants, provisioned sites/drives and licenses; native site search is not storage-report parity. |
 | Teams | Create/configure test team and test membership/channel where supported; clean up | Validate Teams-specific grants, asynchronous provisioning and licensing. Group permission alone is not assumed sufficient. |
+| Basic content search/export | Search uniquely marked fixture content; verify estimate, completed export and downloaded contents; clean up | Included scope; supported no-add-on backend remains pending. Follow [provider boundary](cloudcom-content-search.md). |
 | Roles | Query authorized role surface; validate operation eligibility and denials | Broad grant presence is not authorization to assign privileged production roles. Elevated-role tests need a controlled test principal and a defined restoration case. |
 | Jobs/bulk actions | Cancellation, throttling, retry, partial success and ambiguous timeout cases | Do not blindly retry non-idempotent writes; reconcile provider state first. |
 

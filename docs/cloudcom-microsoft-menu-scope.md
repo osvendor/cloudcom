@@ -21,7 +21,7 @@ Mixed-license features require operation-level review: preserve eligible base fu
 
 ## eDiscovery and content search
 
-The user requests eDiscovery where included with Business Standard. Assess individual capabilities rather than importing the whole Purview menu. Current Microsoft eDiscovery documentation lists E3/E5 requirements for case workflows; do not present case management, legal holds, review sets or premium analysis as Business Standard entitlements. Basic content search/export eligibility and its supported automation interface must be verified separately before exposing those actions. Do not enable pay-as-you-go billing as an implicit prerequisite. See [current eDiscovery prerequisites](https://learn.microsoft.com/en-us/purview/edisc-get-started) and [billing](https://learn.microsoft.com/en-us/purview/edisc-billing).
+Basic content search and export are explicitly included at the user's request, based on their existing use. Assess individual capabilities rather than importing the whole Purview menu. Current Microsoft eDiscovery documentation lists E3/E5 requirements for case workflows; do not present case management, legal holds, review sets or premium analysis as Business Standard entitlements. The supported automation interface still requires verification; portal availability must not be mistaken for API eligibility. See the [content search implementation boundary](cloudcom-content-search.md). Do not enable pay-as-you-go billing as an implicit prerequisite. See [current eDiscovery prerequisites](https://learn.microsoft.com/en-us/purview/edisc-get-started) and [billing](https://learn.microsoft.com/en-us/purview/edisc-billing).
 
 ## Current implementation and update checks
 
