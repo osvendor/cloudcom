@@ -13,7 +13,7 @@ function setup() {
   };
   const authorize = vi.fn(async () => ({ actorId } as { actorId: string } | null));
   const loadConnection = vi.fn(async () => connection);
-  const acquireToken = vi.fn(async () => 'private-token');
+  const acquireToken = vi.fn(async () => `h.${Buffer.from(JSON.stringify({ roles: ['User-PasswordProfile.ReadWrite.All', 'User.RevokeSessions.All'] })).toString('base64url')}.s`);
   const fetch = vi.fn(async (url: string, init: RequestInit) => {
     if (init.method !== 'GET') return new Response(null, { status: 204 });
     if (url.includes('/organization?')) return Response.json({ value: [{ id: tenantId }] });
@@ -105,6 +105,26 @@ describe('organization-bound Microsoft administration execution', () => {
     expect(s.audit).toHaveBeenLastCalledWith(expect.objectContaining({ targets: { userId: id }, changedFields: ['displayName'] }));
     expect(JSON.stringify(s.audit.mock.calls)).not.toContain('Private name');
     expect(JSON.stringify(s.audit.mock.calls)).not.toContain('private-token');
+  });
+  it.each([
+    { type: 'user.password.reset', expected: ['passwordProfile'] },
+    { type: 'user.sessions.revoke', expected: ['signInSessions'] },
+  ])('audits $type without secrets and dispatches exactly one mutation', async ({ type, expected }) => {
+    const s = setup();
+    s.fetch.mockImplementation(async (url, init) => {
+      if (init.method !== 'GET') return Response.json({ accepted: true, temporaryPassword: 'never-in-audit' }, { status: 200 });
+      if (url.includes('/organization?')) return Response.json({ value: [{ id: tenantId }] });
+      return Response.json({ id, displayName: 'Fixture' });
+    });
+    const result = await s.run(request, orgId, { type, id });
+    expect(result).toMatchObject({ accepted: true });
+    if (type === 'user.password.reset') expect(result).toMatchObject({ forceChangePasswordNextSignIn: true, temporaryPassword: expect.any(String) });
+    expect(s.fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
+    expect(s.audit.mock.calls.map(([event]) => event)).toEqual([
+      expect.objectContaining({ phase: 'intent', changedFields: expected }),
+      expect.objectContaining({ phase: 'outcome', outcome: 'success', changedFields: expected }),
+    ]);
+    expect(JSON.stringify(s.audit.mock.calls)).not.toContain('never-in-audit');
   });
   it('reports audit failure after an accepted write without retrying the write', async () => {
     const s = setup(); s.audit.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('internal'));

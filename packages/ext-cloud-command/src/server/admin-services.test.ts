@@ -83,4 +83,10 @@ describe('unified administration onboarding', () => {
     await expect(h.admin.complete(request, { state: 'a'.repeat(43), code: 'code' })).rejects.toMatchObject({ code: 'administration_permissions_missing' });
     expect(store.save).not.toHaveBeenCalled();
   });
+  it('does not require optional password-reset and session-revocation roles during the single onboarding step', async () => {
+    const h = setup(); store.claim.mockResolvedValue(attempt());
+    h.runtime.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['Organization.Read.All', 'User.ReadWrite.All', 'Group.ReadWrite.All', 'User.EnableDisableAccount.All'] })).toString('base64url')}.s`);
+    await expect(h.admin.complete(request, { state: 'a'.repeat(43), code: 'code' })).resolves.toEqual({ success: true });
+    expect(store.save).toHaveBeenCalledOnce();
+  });
 });

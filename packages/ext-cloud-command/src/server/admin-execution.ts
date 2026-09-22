@@ -11,6 +11,8 @@ const operation = z.discriminatedUnion('type', [
   z.object({ type: z.literal('user.get'), id: uuid }).strict(),
   z.object({ type: z.literal('group.get'), id: uuid }).strict(),
   z.object({ type: z.literal('user.update'), id: uuid, update: adminUserUpdateSchema }).strict(),
+  z.object({ type: z.literal('user.password.reset'), id: uuid }).strict(),
+  z.object({ type: z.literal('user.sessions.revoke'), id: uuid }).strict(),
   z.object({ type: z.literal('group.member.add'), groupId: uuid, userId: uuid }).strict(),
   z.object({ type: z.literal('group.member.remove'), groupId: uuid, userId: uuid }).strict(),
 ]);
@@ -56,7 +58,8 @@ export function createAdministrationExecutor<Request>(ports: {
     if (!initial.success || initial.data.orgId !== orgId) throw new AdministrationExecutionError('connection_not_ready');
     const snapshot = Object.freeze(initial.data);
     const fields = Object.keys(connectionSchema.shape) as (keyof AdministrationConnection)[];
-    const mutation = op.type === 'user.update' || op.type.startsWith('group.member.');
+    const mutation = op.type === 'user.update' || op.type === 'user.password.reset'
+      || op.type === 'user.sessions.revoke' || op.type.startsWith('group.member.');
     let dispatched = false;
     let fenceFailure: AdministrationExecutionError | undefined;
     async function checkFence() {
@@ -76,7 +79,9 @@ export function createAdministrationExecutor<Request>(ports: {
     const targets = 'groupId' in op ? { groupId: op.groupId, userId: op.userId }
       : 'id' in op ? (op.type === 'group.get' ? { groupId: op.id } : { userId: op.id }) : {};
     const event = { executionId: randomUUID(), orgId, actorId: principal.actorId, connectionId: snapshot.id,
-      operation: op.type, targets, changedFields: op.type === 'user.update' ? Object.keys(op.update) : [] };
+      operation: op.type, targets, changedFields: op.type === 'user.update' ? Object.keys(op.update)
+        : op.type === 'user.password.reset' ? ['passwordProfile']
+          : op.type === 'user.sessions.revoke' ? ['signInSessions'] : [] };
     async function audit(phase: Audit['phase'], outcome?: Audit['outcome']) {
       try { await ports.audit({ ...event, phase, ...(outcome ? { outcome } : {}) }); }
       catch { throw new AdministrationExecutionError(dispatched ? 'unknown_write_outcome' : 'audit_unavailable'); }
@@ -109,6 +114,8 @@ export function createAdministrationExecutor<Request>(ports: {
         case 'user.get': result = await provider.getUser(op.id); break;
         case 'group.get': result = await provider.getGroup(op.id); break;
         case 'user.update': result = await provider.updateUser(op.id, op.update); break;
+        case 'user.password.reset': result = await provider.resetUserPassword(op.id, fence); break;
+        case 'user.sessions.revoke': result = await provider.revokeUserSessions(op.id, fence); break;
         case 'group.member.add': result = await provider.addGroupMember(op.groupId, op.userId); break;
         case 'group.member.remove': result = await provider.removeGroupMember(op.groupId, op.userId); break;
       }

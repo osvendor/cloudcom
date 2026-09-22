@@ -68,6 +68,46 @@ describe('bounded Microsoft administration provider', () => {
     expect(h.fetch.mock.calls[1]).toEqual([`${ORIGIN}/users/${USER}`, expect.objectContaining({ method: 'PATCH', body: '{"department":null,"accountEnabled":false}' })]);
   });
 
+  it('resets a password only with the app role, verifies the user and requires next-sign-in change', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['User-PasswordProfile.ReadWrite.All'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ id: USER, displayName: 'Fixture' }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    const result = await provider.resetUserPassword(USER);
+    expect(result).toMatchObject({ accepted: true, forceChangePasswordNextSignIn: true });
+    expect(result.temporaryPassword).toHaveLength(32);
+    expect(result.temporaryPassword).toMatch(/[A-Z]/);
+    expect(result.temporaryPassword).toMatch(/[a-z]/);
+    expect(result.temporaryPassword).toMatch(/[0-9]/);
+    expect(result.temporaryPassword).toMatch(/[!@#$%&*\\-_+]/);
+    expect(fetch.mock.calls[2]).toEqual([`${ORIGIN}/users/${USER}`, expect.objectContaining({
+      method: 'PATCH', body: JSON.stringify({ passwordProfile: { password: result.temporaryPassword, forceChangePasswordNextSignIn: true } }),
+    })]);
+  });
+
+  it('fails closed without the reset-password app role before reading the target', async () => {
+    const h = harness();
+    await expect(h.provider.resetUserPassword(USER)).rejects.toMatchObject({ code: 'provider_access_denied' });
+    expect(h.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('revokes sessions through the bounded Graph action with the required role', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['User.RevokeSessions.All'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ id: USER, displayName: 'Fixture' }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }));
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    expect(await provider.revokeUserSessions(USER)).toEqual({ accepted: true });
+    expect(fetch.mock.calls[2]).toEqual([`${ORIGIN}/users/${USER}/revokeSignInSessions`, expect.objectContaining({ method: 'POST', body: undefined })]);
+  });
+
+  it('fails closed without the session-revocation app role before reading the target', async () => {
+    const h = harness();
+    await expect(h.provider.revokeUserSessions(USER)).rejects.toMatchObject({ code: 'provider_access_denied' });
+    expect(h.fetch).toHaveBeenCalledTimes(1);
+  });
+
   it('does not follow hostile pagination links and explicitly marks partial collections', async () => {
     const h = harness();
     h.fetch.mockResolvedValueOnce(response({ value: [{ id: USER, displayName: 'One', accessToken: 'secret' }], '@odata.nextLink': 'https://attacker.example/token' }));
