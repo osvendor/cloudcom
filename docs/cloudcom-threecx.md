@@ -35,8 +35,11 @@ the verified empty envelope; arbitrary BLF XML is not parsed or round-tripped.
 Updates are deliberately narrow. A save carries the detail revision and the
 selected fields, rechecks the organization connection/version, rejects mixed scalar
 and forwarding saves, and targets exactly one extension. Forwarding updates merge
-only known profile IDs and require a reload afterward because the provider can
-regenerate profile IDs. The revision is a preflight comparison: 3CX does not
+only validated profile keys and require a reload after a forwarding save. Expanded
+3CX profiles do not reliably include numeric IDs: the browser key is a validated,
+unique raw `Name`, while `CustomName` is display-only. The key is stripped before
+the provider update and the complete expanded profile object is preserved. Phone
+and forwarding-exception IDs are nullable in the read-only projection. The revision is a preflight comparison: 3CX does not
 document conditional PATCH, so it is not an ETag and does not make the provider
 operation atomic against an external concurrent edit. PBX user editing outside these
 fields, queues, reports, and other telephony mutations are unavailable.

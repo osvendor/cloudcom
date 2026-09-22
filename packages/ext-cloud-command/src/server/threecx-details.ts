@@ -26,7 +26,7 @@ export const detailQuery = {
 const text = z.string().trim().max(255).refine(v => !/[\u0000-\u001f\u007f]/.test(v));
 const telephone = text.max(64).refine(v => /^[+0-9*#(). \-]*$/.test(v));
 const forwardingChanges = z.object({
-  Id: z.number().int().min(0).max(2147483647), NoAnswerTimeout: z.number().int().min(5).max(180).optional(),
+  key: z.string().min(1).max(255).refine(v => !/[\u0000-\u001f\u007f]/.test(v)), NoAnswerTimeout: z.number().int().min(5).max(180).optional(),
   RingMyMobile: z.boolean().optional(), AcceptMultipleCalls: z.boolean().optional(), BlockPushCalls: z.boolean().optional(),
   DisableRingGroupCalls: z.boolean().optional(), OfficeHoursAutoQueueLogOut: z.boolean().optional(),
 }).strict().refine(value => Object.keys(value).length > 1);
@@ -35,7 +35,7 @@ const changesSchema = z.object({
   Mobile: telephone.optional(), OutboundCallerID: telephone.optional(),
   VMEnabled: z.boolean().optional(), VMEmailOptions: z.enum(['None', 'Notification', 'Attachment', 'AttachmentAndDelete']).optional(),
   VMPlayCallerID: z.boolean().optional(), VMPlayMsgDateTime: z.enum(['None', 'Play12Hr', 'Play24Hr']).optional(),
-  ForwardingProfiles: z.array(forwardingChanges).min(1).max(20).refine(items => new Set(items.map(item => item.Id)).size === items.length).optional(),
+  ForwardingProfiles: z.array(forwardingChanges).min(1).max(20).refine(items => new Set(items.map(item => item.key)).size === items.length).optional(),
 }).strict().refine(v => Object.keys(v).length > 0);
 const inputSchema = z.object({ revision: z.string().regex(/^[a-f0-9]{64}$/), changes: changesSchema }).strict();
 const object = (v: unknown): Record<string, unknown> => v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {};
@@ -68,27 +68,28 @@ export function projectDetail(raw: Record<string, unknown>, row: Connection, id:
   // resolve entities, or guess how non-empty BLF entries should round-trip.
   const emptyBlf = raw.Blfs == null || raw.Blfs === '' || (typeof raw.Blfs === 'string' &&
     /^\s*(?:<\?xml[^?]*\?>\s*)?<PhoneDevice>\s*<BLFS(?:\s*\/>|>\s*<\/BLFS>)\s*<\/PhoneDevice>\s*$/.test(raw.Blfs));
+  const profileNames = new Set<string>();
   const profiles = array(raw.ForwardingProfiles, 20).map(p => {
-    if (!Number.isSafeInteger(p.Id)) throw new ProviderError('invalid_provider_response');
+    const key = str(p.Name);
+    if (!key || key.length > 255 || /[\u0000-\u001f\u007f]/.test(key) || profileNames.has(key)) throw new ProviderError('invalid_provider_response');
+    profileNames.add(key);
     const destinations: ThreeCxDetail['forwardingProfiles'][number]['destinations'] = [];
     for (const [route, labels] of Object.entries({ AvailableRoute: ['BusyInternal', 'BusyExternal', 'NoAnswerInternal', 'NoAnswerExternal', 'NotRegisteredInternal', 'NotRegisteredExternal'], AwayRoute: ['Internal', 'External'] })) {
       const routing = object(p[route]);
       for (const label of labels) if (routing[label] != null) destinations.push({ label: `${route}.${label}`, ...destination(routing[label]) });
     }
-    return { Id: Number(p.Id), Name: str(p.CustomName) || str(p.Name) || `Profile ${p.Id}`,
+    return { key, Name: str(p.CustomName) || key,
       fields: fields(p, ['NoAnswerTimeout', 'RingMyMobile', 'AcceptMultipleCalls', 'BlockPushCalls', 'DisableRingGroupCalls', 'OfficeHoursAutoQueueLogOut']), destinations };
   });
   const dto: Omit<ThreeCxDetail, 'revision'> = {
     user,
     groups: visibleGroups.map(g => ({ id: Number(g.GroupId), name: str(g.Name) || `Department ${g.GroupId}`, role: str(object(g.Rights).RoleName) })),
     phones: array(raw.Phones, 100).map(p => {
-      if (!Number.isSafeInteger(p.Id)) throw new ProviderError('invalid_provider_response');
-      return { id: Number(p.Id), name: str(p.Name) || 'IP phone', macAddress: str(p.MacAddress), template: str(p.TemplateName), interface: str(p.Interface) };
+      return { id: Number.isSafeInteger(p.Id) ? Number(p.Id) : null, name: str(p.Name) || 'IP phone', macAddress: str(p.MacAddress), template: str(p.TemplateName), interface: str(p.Interface) };
     }),
     forwardingProfiles: profiles,
     forwardingExceptions: array(raw.ForwardingExceptions, 100).map(r => {
-      if (!Number.isSafeInteger(r.Id)) throw new ProviderError('invalid_provider_response');
-      return { id: Number(r.Id), fields: fields(r, ['CallType', 'Condition', 'Data', 'Enabled']), destination: [destination(r.Destination).type, destination(r.Destination).target].filter(Boolean).join(' · ') };
+      return { id: Number.isSafeInteger(r.Id) ? Number(r.Id) : null, fields: fields(r, ['CallType', 'Condition', 'Data', 'Enabled']), destination: [destination(r.Destination).type, destination(r.Destination).target].filter(Boolean).join(' · ') };
     }),
     greetings: array(raw.Greetings, 100).map(g => ({ name: str(g.DisplayName) || 'Greeting', profile: str(g.Type) })),
     blf: { configured: !emptyBlf, entries: [], readable: emptyBlf },
@@ -135,9 +136,14 @@ export function mountThreeCxDetails(app: Hono<{ Variables: Variables }>, ports: 
     if (profileChanges && Object.keys(scalarChanges).length) throw new ThreeCxDetailError('save_forwarding_separately');
     if (profileChanges) {
       const existing = array(raw.ForwardingProfiles, 20);
-      if (profileChanges.some(patch => !existing.some(profile => profile.Id === patch.Id))) throw new ThreeCxDetailError('unknown_forwarding_profile');
-      const merged = existing.map(profile => ({ ...profile, ...profileChanges.find(patch => patch.Id === profile.Id) }));
-      // This documented action regenerates profile IDs. The client must reload after saving.
+      if (profileChanges.some(patch => !existing.some(profile => profile.Name === patch.key))) throw new ThreeCxDetailError('unknown_forwarding_profile');
+      const merged = existing.map(profile => {
+        const patch = profileChanges.find(patch => profile.Name === patch.key);
+        if (!patch) return profile;
+        const { key: _key, ...changes } = patch;
+        return { ...profile, ...changes };
+      });
+      // Profiles are matched by their verified unique provider Name; never send browser keys upstream.
       // It receives exactly one scoped extension, never caller-provided bulk targets.
       await ports.provider.updateForwarding(ports.credentials(row), id, merged);
     } else await ports.provider.updateUser(ports.credentials(row), id, scalarChanges);
