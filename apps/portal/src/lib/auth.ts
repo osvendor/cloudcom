@@ -41,6 +41,7 @@ export interface PortalUser {
   orgId?: string;
   orgName?: string;
   avatarUrl?: string;
+  accessMode?: 'standard' | 'remote_only';
 }
 
 export interface Tokens {
@@ -150,7 +151,8 @@ export async function portalLogin(
       organizationId: data.user?.organizationId ?? data.user?.orgId,
       organizationName: data.user?.organizationName ?? data.user?.orgName ?? 'Organization',
       orgId: data.user?.orgId ?? data.user?.organizationId,
-      orgName: data.user?.orgName ?? data.user?.organizationName
+      orgName: data.user?.orgName ?? data.user?.organizationName,
+      accessMode: data.user?.accessMode === 'remote_only' ? 'remote_only' : 'standard'
     };
 
     const expiresInSeconds = data.tokens?.expiresInSeconds

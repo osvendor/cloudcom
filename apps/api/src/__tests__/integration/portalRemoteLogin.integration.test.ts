@@ -20,14 +20,21 @@ import { getTestDb } from './setup';
 
 describe.runIf(!!process.env.DATABASE_URL_APP)('portal remote list through real login', () => {
   const priorFeatureFlag = process.env.CLOUDCOM_REMOTE_ACCESS_ENABLED;
+  let priorExtension: typeof installedExtensions.$inferSelect | undefined;
 
-  beforeAll(() => {
+  beforeAll(async () => {
+    [priorExtension] = await getTestDb().select().from(installedExtensions).where(eq(installedExtensions.name, 'rustdeskaccess'));
     process.env.CLOUDCOM_REMOTE_ACCESS_ENABLED = 'true';
   });
 
-  afterAll(() => {
+  afterAll(async () => {
     if (priorFeatureFlag === undefined) delete process.env.CLOUDCOM_REMOTE_ACCESS_ENABLED;
     else process.env.CLOUDCOM_REMOTE_ACCESS_ENABLED = priorFeatureFlag;
+    if (priorExtension) {
+      await getTestDb().update(installedExtensions).set(priorExtension).where(eq(installedExtensions.name, 'rustdeskaccess'));
+    } else {
+      await getTestDb().delete(installedExtensions).where(eq(installedExtensions.name, 'rustdeskaccess'));
+    }
   });
 
   it('lists only the logged-in customer assignment and invalidates removal and epoch changes', async () => {
@@ -58,7 +65,7 @@ describe.runIf(!!process.env.DATABASE_URL_APP)('portal remote list through real 
     }).returning();
     await admin.insert(installedExtensions).values({
       name: 'rustdeskaccess', enabled: true, lifecycleState: 'active', configuredVersion: 'test', activeVersion: 'test',
-    });
+    }).onConflictDoUpdate({ target: installedExtensions.name, set: { enabled: true, lifecycleState: 'active' } });
 
     const app = new Hono();
     app.route('/api/v1/portal', authRoutes);
@@ -76,6 +83,7 @@ describe.runIf(!!process.env.DATABASE_URL_APP)('portal remote list through real 
         body: JSON.stringify({ email, password, orgId: org!.id }),
       });
       expect(response.status).toBe(200);
+      expect((await response.clone().json()).user.accessMode).toBe('remote_only');
       const cookie = response.headers.get('set-cookie')?.split(';', 1)[0];
       expect(cookie).toBeTruthy();
       return { Cookie: cookie! };

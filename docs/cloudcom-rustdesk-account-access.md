@@ -2,7 +2,8 @@
 
 ## Status and intended experience
 
-Gated implementation in progress, not a deployed feature. Core migrations now
+The browser implementation is deployed behind explicit organization settings and
+customer device assignments; production acceptance is still in progress. Core migrations
 provide forced-RLS customer assignments/settings/sessions, and portal routes
 enforce the remote-only identity boundary. The separate extension manages
 assignments through the scoped host API. Browser session creation, offers,
@@ -11,6 +12,34 @@ WebRTC availability uses the same live authorization as session creation and
 requires both endpoint enforcement protocols. The global feature defaults off;
 RustDesk availability remains off until native acceptance succeeds.
 Native target enforcement and app sign-in described below are still required.
+
+### Deployment and login boundary
+
+The first browser release passed packaged-image QA before deployment. Production
+acceptance identified a login payload projection that omitted `accessMode`; login
+and invite acceptance now project that field, and the browser maps it to the
+remote-only landing page. A real-database login regression asserts the returned
+mode, while navigation tests retain supported remote deep links and reject
+off-origin destinations.
+
+The portal's server-side API requests must traverse a trusted internal proxy hop
+when HTTPS enforcement is enabled. Keep its private address stable and trust only
+that exact portal address in addition to the existing ingress proxy; do not disable
+HTTPS enforcement or trust an entire container subnet to solve an SSR redirect.
+This deployment correction is configuration, not a change to customer privileges.
+
+The current public ingress also has a host-wide Cloudflare Access login. Customer
+portal reachability needs separately reviewed, narrowly scoped Access routing for
+the portal and its API paths while retaining staff-route protection. An origin
+tunnel used for acceptance does not prove public customer reachability. No Access
+policy was changed by this implementation.
+
+A production-origin canary with an existing Windows agent streamed a real
+1920×1080 lock screen, denied the unassigned same-organization customer with 404,
+survived a further 75 seconds of viewing, and confirmed the customer's End session
+action. This used temporary remote-only credentials and an authenticated origin
+tunnel; it validates the Windows transport, not public Cloudflare reachability or
+TURN relay fallback. No Windows password was entered during this canary.
 
 ### Browser QA checkpoint (2026-09-22)
 
@@ -34,7 +63,7 @@ Focused TypeScript checking of the remote API production files and their unit
 and integration test roots also passed with a 6 GB heap. This is not a claim
 that the entire inherited API typecheck passed.
 
-This is isolated Linux acceptance, not production or Windows acceptance. The
+The checkpoint above is isolated Linux acceptance, not Windows acceptance. The
 test used an Xvfb desktop and a locally supplied OpenH264 library; it does not
 validate production codec packaging, cross-network TURN routing, Windows login
 screens, a Breeze upgrade, or the custom native RustDesk client. Those remain
