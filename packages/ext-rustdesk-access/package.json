@@ -1,0 +1,8 @@
+{
+  "name": "@cloudcom/ext-rustdesk-access",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Transport-independent authorization contract for the planned RustDesk Access extension; no live credential broker.",
+  "scripts": { "test": "node --test src/*.test.mjs" }
+}
