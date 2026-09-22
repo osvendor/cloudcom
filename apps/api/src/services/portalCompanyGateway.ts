@@ -3,21 +3,47 @@ import { CfAccessJwksUnavailableError, verifyCfAccessJwt } from './cfAccessJwt';
 
 // This proves a COMPANY, never an individual identity or permission to skip
 // the individual password. Independent from technician Cloudflare SSO.
-const configuration = z.object({
+const commonConfiguration = {
   teamDomain: z.string().regex(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.cloudflareaccess\.com$/),
   audience: z.string().min(1).max(256),
-  companies: z.array(z.object({
-    subject: z.string().min(1).max(256), orgId: z.string().uuid(), enabled: z.boolean(),
-  }).strict()).min(1).max(10000),
-}).strict().superRefine((value, ctx) => {
-  const subjects = new Set<string>(); const organizations = new Set<string>();
-  for (const company of value.companies) {
-    if (subjects.has(company.subject) || organizations.has(company.orgId)) {
+};
+const configuration = z.union([
+  z.object({
+    ...commonConfiguration,
+    mode: z.literal('subject').optional(),
+    companies: z.array(z.object({
+      subject: z.string().trim().min(1).max(256), orgId: z.string().uuid(), enabled: z.boolean(),
+    }).strict()).min(1).max(10000),
+  }).strict(),
+  z.object({
+    ...commonConfiguration,
+    mode: z.literal('custom-claims'),
+    organizations: z.array(z.object({
+      orgId: z.string().uuid(), enabled: z.boolean(),
+    }).strict()).min(1).max(10000),
+  }).strict(),
+]).superRefine((value, ctx) => {
+  const organizations = new Set<string>();
+  const subjects = new Set<string>();
+  const entries = value.mode === 'custom-claims' ? value.organizations : value.companies;
+  for (const entry of entries) {
+    if (organizations.has(entry.orgId)
+      || ('subject' in entry && subjects.has(entry.subject))) {
       ctx.addIssue({ code: 'custom', message: 'Company mappings must be unique' });
     }
-    subjects.add(company.subject); organizations.add(company.orgId);
+    organizations.add(entry.orgId);
+    if ('subject' in entry) subjects.add(entry.subject);
   }
 });
+
+// Only this explicit shape is supported. Cloudflare documents the signed `custom`
+// claim and best-effort trimming, but not the OIDC inner shape. Verify a live
+// application token before enabling this mode; never guess alternate wrappers.
+// Access must require the intended company IdP for this application audience.
+const companyClaims = z.object({
+  cloudcom_org_id: z.string().uuid(),
+  cloudcom_account_kind: z.literal('company_gateway'),
+}).strict();
 
 export type CompanyGatewayDecision =
   | { ok: true; orgId: string | null }
@@ -40,9 +66,15 @@ export async function verifyPortalCompanyGateway(assertion: string | undefined):
   if (!assertion || assertion.length > 16384) return { ok: false, status: 403 };
   try {
     const claims = await verifyCfAccessJwt(assertion, config);
-    if (typeof claims.sub !== 'string' || !claims.sub
+    if (typeof claims.sub !== 'string' || !claims.sub.trim() || claims.type !== 'app'
       || !Number.isSafeInteger(claims.exp) || claims.exp * 1000 <= Date.now()) {
       return { ok: false, status: 403 };
+    }
+    if (config.mode === 'custom-claims') {
+      const custom = companyClaims.safeParse(claims.custom);
+      if (!custom.success) return { ok: false, status: 403 };
+      const company = config.organizations.find(item => item.enabled && item.orgId === custom.data.cloudcom_org_id);
+      return company ? { ok: true, orgId: company.orgId } : { ok: false, status: 403 };
     }
     const company = config.companies.find(item => item.enabled && item.subject === claims.sub);
     return company ? { ok: true, orgId: company.orgId } : { ok: false, status: 403 };

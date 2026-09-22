@@ -38,7 +38,16 @@ The reverse proxy must forward the original `Host`, `X-Forwarded-Proto`,
 these headers from trusted proxy networks. The default trust list covers common
 Docker private networks. This template narrows that default to loopback; set
 `AUTHENTIK_TRUSTED_PROXY_CIDRS` in `.env` to only the proxy's direct source
-network after verifying that address. Do not include customer networks.
+address after verifying it. Do not include customer networks. When a host-side
+proxy connects through Docker's loopback-published port, Authentik can see the
+Compose bridge gateway as the source rather than loopback. Inspect the running
+server container's network gateway and add only that address as a `/32` (or the
+corresponding IPv6 host prefix). Preserve the loopback entries. Recreate only the
+server service after updating this environment value.
+
+Verify the public HTTPS flow document generates an HTTPS `api.base`, and check
+that its username/password form actually renders. An HTTP API base on an HTTPS
+page causes mixed-content failures even when a direct API health request passes.
 
 Verify the stack with `docker compose --env-file .env -f compose.yml ps` and
 the proxy path with `/-/health/ready/`. The server readiness endpoint verifies a

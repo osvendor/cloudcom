@@ -31,6 +31,7 @@ const portalRemoteApiPaths = new Set([
   'apps/api/src/routes/orgPortalUsers.ts', 'apps/api/src/routes/orgPortalUsers.test.ts',
   'apps/api/src/routes/portal/acceptInvite.test.ts',
   'apps/api/src/services/portalCompanyGateway.ts', 'apps/api/src/services/portalCompanyGateway.test.ts',
+  'apps/api/src/services/cfAccessJwt.ts', 'apps/api/src/services/cfAccessJwt.test.ts',
   'apps/api/src/services/portalNativeLogin.ts', 'apps/api/src/services/portalNativeLogin.test.ts',
   'apps/api/src/routes/portal/nativeLogin.ts', 'apps/api/src/routes/portal/nativeLogin.test.ts',
   'apps/api/src/__tests__/integration/portalNativeLogin.integration.test.ts',

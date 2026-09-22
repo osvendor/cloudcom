@@ -15,7 +15,7 @@ function configure(value: unknown = config) {
 }
 beforeEach(() => {
   vi.resetAllMocks(); vi.stubEnv('CLOUDCOM_COMPANY_GATEWAY_ENABLED', 'true'); configure();
-  mocks.verify.mockResolvedValue({ sub: 'company-subject', email: 'company@example.test',
+  mocks.verify.mockResolvedValue({ type: 'app', sub: 'company-subject', email: 'company@example.test',
     exp: Math.floor(Date.now() / 1000) + 300 });
 });
 afterEach(() => vi.unstubAllEnvs());
@@ -71,6 +71,58 @@ describe('company gateway is separate from individual identity', () => {
   it.each([{ sub: 12, exp: 9999999999 }, { sub: '', exp: 9999999999 },
     { sub: 'company-subject', exp: 1 }, { sub: 'company-subject', exp: '9999999999' }])('rejects malformed subject/expiry', async claims => {
     mocks.verify.mockResolvedValue(claims);
+    expect(await verifyPortalCompanyGateway('token')).toEqual({ ok: false, status: 403 });
+  });
+});
+
+
+describe('explicit custom claim organization allowlist', () => {
+  const custom = { cloudcom_org_id: orgId, cloudcom_account_kind: 'company_gateway' };
+  const claimConfig = { teamDomain: config.teamDomain, audience: config.audience,
+    mode: 'custom-claims', organizations: [{ orgId, enabled: true }] };
+  beforeEach(() => {
+    configure(claimConfig);
+    mocks.verify.mockResolvedValue({ type: 'app', sub: 'new-company-subject',
+      email: 'not-used@example.test', exp: Math.floor(Date.now()/1000)+300, custom });
+  });
+  it('allows only the configured organization without pre-registering subjects', async () => {
+    expect(await checkPortalCompanyGateway('token', orgId)).toEqual({ ok: true, orgId });
+    expect(await checkPortalCompanyGateway('token', otherOrg)).toEqual({ ok: false, status: 403 });
+  });
+  it('immediately denies disabled or removed organizations', async () => {
+    for (const organizations of [[{ orgId, enabled: false }], [{ orgId: otherOrg, enabled: true }]]) {
+      configure({ ...claimConfig, organizations });
+      expect(await verifyPortalCompanyGateway('token')).toEqual({ ok: false, status: 403 });
+    }
+  });
+  it.each([undefined, null, [], 'company_gateway', {},
+    { cloudcom_org_id: orgId }, { cloudcom_account_kind: 'company_gateway' },
+    { ...custom, cloudcom_org_id: [orgId] }, { ...custom, cloudcom_org_id: 'invalid' },
+    { ...custom, cloudcom_org_id: otherOrg }, { ...custom, cloudcom_account_kind: 'admin' },
+    { ...custom, cloudcom_account_kind: ['company_gateway'] }, { oidc_fields: custom },
+    { ...custom, unexpected: true },
+  ])('denies missing, trimmed, malformed or unrecognized custom claims', async value => {
+    mocks.verify.mockResolvedValue({ type: 'app', sub: 'subject', exp: 9999999999, custom: value });
+    expect(await verifyPortalCompanyGateway('token')).toEqual({ ok: false, status: 403 });
+  });
+  it.each([{ type: 'org', sub: 'subject' }, { type: 'warp', sub: 'subject' },
+    { sub: 'subject' }, { type: 'app', sub: '' }, { type: 'app', sub: ' ' },
+    { type: 'app', sub: 5 }])('requires an application token and individual Cloudflare subject', async value => {
+    mocks.verify.mockResolvedValue({ ...value, exp: 9999999999, custom });
+    expect(await verifyPortalCompanyGateway('token')).toEqual({ ok: false, status: 403 });
+  });
+  it.each([
+    { mode: undefined }, { mode: 'other' }, { companies: config.companies },
+    { organizations: [] }, { organizations: [{ orgId, enabled: 'true' }] },
+    { organizations: [{ orgId, enabled: true }, { orgId, enabled: false }] },
+    { organizations: [{ orgId, enabled: true, subject: 'unexpected' }] },
+  ])('rejects ambiguous or malformed operator configuration', async overrides => {
+    configure({ ...claimConfig, ...overrides });
+    expect(await verifyPortalCompanyGateway('token')).toEqual({ ok: false, status: 503 });
+    expect(mocks.verify).not.toHaveBeenCalled();
+  });
+  it('does not use custom claims as a fallback in subject mapping mode', async () => {
+    configure(config);
     expect(await verifyPortalCompanyGateway('token')).toEqual({ ok: false, status: 403 });
   });
 });
