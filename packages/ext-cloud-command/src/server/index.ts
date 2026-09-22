@@ -8,6 +8,10 @@ import { createProvider, ProviderError, type GuardedFetch } from './transport';
 import type { NativeMicrosoftServices } from './native-microsoft';
 export type { NativeMicrosoftServices, MicrosoftRequest, MicrosoftResource } from './native-microsoft';
 import { mountMicrosoftRoutes } from './microsoft';
+import type { AdministrationRuntime } from './admin-runtime';
+import { createAdministrationServices } from './admin-services';
+export type { AdministrationRuntime } from './admin-runtime';
+export { createAdministrationTokenProvider } from './admin-token-provider';
 
 const table = 'cloudcommand_threecx_connections';
 type Row = { id: string; org_id: string; origin: string; client_id: string; secret_ciphertext: string;
@@ -34,11 +38,11 @@ function summary(row: Row, canManage: boolean) {
 }
 
 /** Only the statically compiled host can provide this public-egress transport. */
-export function createCloudCommandExtension(fetch: GuardedFetch, microsoft?: NativeMicrosoftServices): BreezeExtensionV1 {
-  return { register(registrar, context) { registrar.mountRoute(createRoutes(context, fetch, microsoft) as unknown as Hono); } };
+export function createCloudCommandExtension(fetch: GuardedFetch, microsoft?: NativeMicrosoftServices, administration?: AdministrationRuntime): BreezeExtensionV1 {
+  return { register(registrar, context) { registrar.mountRoute(createRoutes(context, fetch, microsoft, administration) as unknown as Hono); } };
 }
 
-export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFetch, microsoft?: NativeMicrosoftServices) {
+export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFetch, microsoft?: NativeMicrosoftServices, administration?: AdministrationRuntime) {
   const app = new Hono<{ Variables: Variables }>();
   const provider = createProvider(fetch);
   async function connection(orgId: string) {
@@ -57,7 +61,9 @@ export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFet
     if (!org.success) throw new RouteError('invalid_organization');
     if (!auth.canAccessOrg(org.data) || !permissions.hasPermission('organizations', 'read') || permissions.allowedSiteIds !== undefined) throw new RouteError('access_denied', 403);
     const canManage = permissions.hasPermission('organizations', 'write') && permissions.mfaSatisfied;
-    if (c.req.method !== 'GET' && !canManage) throw new RouteError('configuration_access_denied', 403);
+    // Administration's typed dispatcher distinguishes reads from writes and re-authorizes
+    // every operation. All configuration mutations retain the outer write/MFA gate.
+    if (c.req.method !== 'GET' && !canManage && !c.req.path.endsWith('/microsoft/administration')) throw new RouteError('configuration_access_denied', 403);
     const organization = rows<{ partner_id: string }>(await context.db.execute(sql`SELECT partner_id FROM organizations WHERE id = ${org.data}::uuid AND deleted_at IS NULL AND status IN ('active', 'trial')`))[0];
     if (!organization || (auth.partnerId && auth.partnerId !== organization.partner_id)) throw new RouteError('not_available', 404);
     c.set('scope', { organizationId: org.data, partnerId: organization.partner_id, actorId: auth.user.id });
@@ -133,6 +139,6 @@ export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFet
     });
     return c.json(await service.listExtensions(scope, row.id, skip));
   });
-  mountMicrosoftRoutes(app, microsoft);
+  mountMicrosoftRoutes(app, administration ? createAdministrationServices(context, fetch, administration) : microsoft);
   return app;
 }

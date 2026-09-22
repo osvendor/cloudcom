@@ -14,8 +14,20 @@ export type MicrosoftRequest = {
   orgId: string;
 };
 export type MicrosoftFailure = { ok: false; code: string; message: string; retryAfterSeconds?: number };
+export type MicrosoftOnboarding = {
+  state: string; canManage: boolean; canStart: boolean; tenantId?: string; tenantName?: string;
+  version?: number | null; reason?: string;
+  capabilities: { id: string; label: string; status: string; message?: string }[];
+};
 export interface NativeMicrosoftServices {
   version: 1;
+  administration?: {
+    status(request: MicrosoftRequest, recheck: boolean): Promise<MicrosoftOnboarding>;
+    start(request: MicrosoftRequest, input: unknown): Promise<unknown>;
+    complete(request: MicrosoftRequest, input: unknown): Promise<unknown>;
+    execute(request: MicrosoftRequest, input: unknown): Promise<unknown>;
+    disconnect(request: MicrosoftRequest, input: unknown): Promise<unknown>;
+  };
   connection(request: MicrosoftRequest): Promise<{
     available: boolean; connected: boolean; enabled: boolean; canManage: boolean;
     tenantId?: string; tenantName?: string; status?: string; reason?: string;

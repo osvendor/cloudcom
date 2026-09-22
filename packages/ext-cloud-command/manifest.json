@@ -68,7 +68,9 @@
   "tenancy": {
     "orgCascadeDeleteTables": [
       "cloudcommand_threecx_connections",
-      "cloudcommand_microsoft_connections"
+      "cloudcommand_microsoft_connections",
+      "cloudcommand_microsoft_admin_connections",
+      "cloudcommand_microsoft_admin_consent"
     ],
     "deviceCascadeDeleteTables": [],
     "deviceOrgDenormalizedTables": [],
@@ -105,6 +107,42 @@
         ],
         "exclude": [
           "backend_identity"
+        ]
+      },
+      "cloudcommand_microsoft_admin_connections": {
+        "exclude": [
+          "credential_version"
+        ],
+        "include": [
+          "id",
+          "org_id",
+          "tenant_id",
+          "tenant_name",
+          "client_id",
+          "permission_manifest_version",
+          "enabled",
+          "generation",
+          "verified_at",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "cloudcommand_microsoft_admin_consent": {
+        "exclude": [
+          "state_hash",
+          "credential_version",
+          "verifier_ciphertext",
+          "nonce"
+        ],
+        "include": [
+          "org_id",
+          "actor_id",
+          "tenant_id",
+          "client_id",
+          "expected_generation",
+          "stage",
+          "expires_at",
+          "created_at"
         ]
       }
     }

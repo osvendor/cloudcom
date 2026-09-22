@@ -126,6 +126,8 @@ export type UpdatePortalSettingsInput = z.infer<typeof updatePortalSettingsSchem
 export const invitePortalUserSchema = z.object({
   email: z.string().email().max(255),
   name: z.string().min(1).max(255).optional(),
+  // Restriction only: omission/false must never promote an existing remote account.
+  remoteOnly: z.boolean().optional(),
   message: z.string().max(1000).optional()
 }).strict();
 export type InvitePortalUserInput = z.infer<typeof invitePortalUserSchema>;

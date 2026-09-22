@@ -50,7 +50,19 @@ test('routes the enumerated customer portal remote surface to focused real-DB co
     'apps/api/migrations/2026-09-21-portal-remote-access.sql',
     'apps/api/src/routes/portal/remote.ts',
     'apps/api/src/services/portalRemoteSessionStore.ts',
+    'apps/api/src/routes/orgPortalUsers.ts',
+    'apps/api/src/routes/orgPortalUsers.test.ts',
+    'apps/api/src/routes/portal/acceptInvite.test.ts',
+    'apps/web/src/components/settings/OrgPortalUsersEditor.tsx',
+    'apps/web/src/components/settings/OrgPortalUsersEditor.test.tsx',
+    'packages/shared/src/validators/portal.ts',
+    'packages/shared/src/validators/portal.test.ts',
     'apps/api/src/__tests__/integration/portalRemoteLogin.integration.test.ts',
+    'apps/api/src/__tests__/integration/portalNativeLogin.integration.test.ts',
+    'apps/api/src/routes/portal/nativeLogin.ts',
+    'apps/api/src/services/portalNativeLogin.ts',
+    'apps/portal/src/pages/remote/native.astro',
+    'apps/portal/src/components/remote/NativeSignInPage.tsx',
     'apps/portal/src/pages/remote/[sessionId].astro',
     'packages/ext-rustdesk-access/src/server/index.ts',
   ]) {
@@ -98,4 +110,22 @@ test('requires API and web validation for the native Microsoft host bridge', () 
   assert.equal(result.api, true);
   assert.equal(result.web, true);
   assert.deepEqual(result.unsupported, []);
+});
+
+test('classifies the bounded Microsoft administration runtime, authorization, and additive migration', () => {
+  for (const path of [
+    'apps/api/src/extensions/cloudCommandAdminRuntime.ts',
+    'apps/api/src/extensions/cloudCommandAdminRuntime.test.ts',
+    'apps/api/src/extensions/cloudCommandAdminAuthorization.ts',
+    'apps/api/src/extensions/cloudCommandAdminAuthorization.test.ts',
+    'packages/ext-cloud-command/src/server/admin-runtime.ts',
+    'packages/ext-cloud-command/src/server/admin-services.ts',
+    'packages/ext-cloud-command/src/server/admin-store.ts',
+    'packages/ext-cloud-command/migrations/2026-09-22-native-admin-connections.sql',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.api, true);
+    assert.equal(result.web, true);
+    assert.deepEqual(result.unsupported, []);
+  }
 });

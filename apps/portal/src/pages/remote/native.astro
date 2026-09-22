@@ -1,0 +1,17 @@
+---
+import PortalLayout from '../../layouts/PortalLayout.astro';
+import NativeSignInPage from '../../components/remote/NativeSignInPage';
+import { loadPortalProfile } from '../../lib/server';
+import { withBase, stripBase } from '../../lib/basePath';
+import { parseNativeLoginRequest } from '../../lib/nativeLogin';
+
+Astro.response.headers.set('Cache-Control', 'no-store');
+Astro.response.headers.set('Referrer-Policy', 'no-referrer');
+const profile = await loadPortalProfile(Astro.request);
+if (!profile) return Astro.redirect(withBase('/login') + '?next=' + encodeURIComponent(stripBase(Astro.url.pathname) + Astro.url.search), 302);
+if (profile.accessMode !== 'remote_only') return Astro.redirect(withBase('/quotes'), 302);
+const request = parseNativeLoginRequest(Astro.url.searchParams);
+---
+<PortalLayout title="Sign in to the remote app" remoteOnly>
+  <NativeSignInPage accountName={profile.name || profile.email} request={request} client:load />
+</PortalLayout>

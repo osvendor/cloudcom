@@ -52,6 +52,7 @@ import { isSelfManagedDbContextRoute } from '../../middleware/selfManagedDbConte
 import { purgeClientAiSessionsForUsers } from '../../services/clientAiSessionStore';
 import { ANONYMOUS_ACTOR_ID, writeAuditEventAsync } from '../../services/auditEvents';
 import { portalAccessModeAllows } from './accessMode';
+import { nativeSessionAllows, NATIVE_SESSION_PREFIX } from '../../services/portalNativeLogin';
 
 export const authRoutes = new Hono();
 const ALLOW_IN_MEMORY_PORTAL_STATE = !PORTAL_USE_REDIS;
@@ -167,6 +168,7 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
             && typeof parsed.orgId === 'string'
             && Number.isSafeInteger(parsed.authEpoch)
             && parsed.authEpoch > 0
+            && nativeSessionAllows(token, parsed, c.req.method, c.req.path, authMethod === 'bearer')
           ) {
             sessionData = {
               portalUserId: parsed.portalUserId,
@@ -182,6 +184,7 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
   }
 
   if (!sessionData && ALLOW_IN_MEMORY_PORTAL_STATE) {
+    if (token.startsWith(NATIVE_SESSION_PREFIX)) return c.json({ error: 'Invalid or expired session' }, 401);
     const session = portalSessions.get(token);
     if (session && session.expiresAt.getTime() > Date.now()) {
       sessionData = {
@@ -233,6 +236,9 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
   // Browser portal sessions are password-ceremony sessions. Entra JIT uses a
   // separate Client-AI session and must never inherit browser access merely
   // because a historical recovery/invite path populated password_hash.
+  if (token.startsWith(NATIVE_SESSION_PREFIX) && user?.accessMode !== 'remote_only') {
+    return c.json({ error: 'Native remote access is not enabled for this account' }, 403);
+  }
   if (!user || user.authMethod !== 'password') {
     if (PORTAL_USE_REDIS) {
       const redis = getRedis();
@@ -332,7 +338,7 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
   const timezone = await withSystemDbAccessContext(() => resolveOrgTimezone(sessionData.orgId));
 
   // Sliding session timeout: any authenticated activity pushes expiry forward.
-  if (PORTAL_USE_REDIS) {
+  if (PORTAL_USE_REDIS && !token.startsWith(NATIVE_SESSION_PREFIX)) {
     const redis = getRedis();
     if (redis) {
       try {
