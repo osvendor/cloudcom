@@ -5,8 +5,8 @@ const ELEMENT = 'cloudcommand-connect-page';
 type Provider = 'threecx' | 'microsoft' | 'google';
 const providers: ReadonlyArray<{ id: Provider; name: string; href: string; detail: string; icon: string }> = [
   { id: 'threecx', name: '3CX', href: '', detail: 'Connect a PBX and select the directory scope for this organization.', icon: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14v14H5z"/><path d="M8 9h8M8 12h5M8 15h8"/></svg>' },
-  { id: 'microsoft', name: 'Microsoft 365', href: '/integrations#m365', detail: 'Configure Microsoft 365 in the native Identity integrations page.', icon: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h8v8H3zM13 3h8v8h-8zM3 13h8v8H3zM13 13h8v8H3z"/></svg>' },
-  { id: 'google', name: 'Google Workspace', href: '/integrations#google', detail: 'Configure Google Workspace in the native Identity integrations page.', icon: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a12 12 0 0 0 0 16M4 12h16"/></svg>' },
+  { id: 'microsoft', name: 'Microsoft 365', href: '/integrations#m365', detail: 'Manage Microsoft 365 connections, consent, and access for your organization.', icon: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h8v8H3zM13 3h8v8h-8zM3 13h8v8H3zM13 13h8v8H3z"/></svg>' },
+  { id: 'google', name: 'Google Workspace', href: '/integrations#google', detail: 'Manage Google Workspace connections and access for your organization.', icon: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 4a12 12 0 0 0 0 16M4 12h16"/></svg>' },
 ];
 type ThreeCxElement = HTMLElement & { context: ExtensionPageContextV1; hostApi: CloudCommandHostApi; displayMode: CloudCommandThreeCxMode };
 const selectedFromHash = (): Provider => {
