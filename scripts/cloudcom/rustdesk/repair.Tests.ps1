@@ -7,6 +7,9 @@ BeforeAll {
             Set-Item -Path "Function:$command" -Value { param($Name,$StartupType,[switch]$Force) throw 'Unmocked Windows service command.' }
         }
     }
+    if (!(Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+        function Get-CimInstance { param($ClassName,$Filter) throw 'Unmocked CIM query' }
+    }
     . "$PSScriptRoot\common.ps1"
     $source = Get-Content "$PSScriptRoot\repair.ps1" -Raw
     $source = $source.Replace('. "$PSScriptRoot\common.ps1"','')
@@ -35,6 +38,7 @@ Describe 'RustDesk desired-state repair mutation boundaries' {
         Mock Start-Service {}
         Mock Restart-Service {}
         Mock Get-Service { [pscustomobject]@{Status='Stopped'} }
+        Mock Get-CimInstance { [pscustomobject]@{State='Running';StartMode='Auto';PathName='test-exe --service'} }
         Mock Start-Sleep {}
         Mock Write-CloudComRustDeskId {}
         Mock Invoke-CloudComRustDesk {}
@@ -74,6 +78,13 @@ Describe 'RustDesk desired-state repair mutation boundaries' {
         Should -Invoke Set-CloudComRustDeskQuietMode -Times 1
         Should -Invoke Invoke-CloudComRustDesk -Times 0
         Should -Invoke Restart-Service -Times 0
+        Should -Invoke Set-Service -Times 0
+    }
+    It 'repairs a nonautomatic service startup mode' {
+        $script:first.Issues=@('service_not_automatic')
+        Mock Get-CimInstance { [pscustomobject]@{State='Running';StartMode='Manual'} }
+        & $script:repair @script:arguments
+        Should -Invoke Set-Service -Times 1 -ParameterFilter { $StartupType -eq 'Automatic' }
     }
     It 'interrupted provisioning refuses another mutation' {
         $script:first.Issues=@('provisioning_requires_review')
@@ -109,7 +120,8 @@ Describe 'RustDesk desired-state repair mutation boundaries' {
         Should -Invoke Invoke-CloudComRustDesk -Times 1 -ParameterFilter { $Arguments[0] -eq '--password' -and $Arguments[1] -eq 'test-existing-secret' }
         Should -Invoke Invoke-CloudComRustDesk -Times 1 -ParameterFilter { $Arguments[0] -eq '--silent-install' }
         Should -Invoke Set-Content -Times 0 -ParameterFilter { $LiteralPath -eq 'test-credential' -or $LiteralPath -like '*credential-pending*' }
-        Should -Invoke Restart-Service -Times 1
+        Should -Invoke Restart-Service -Times 0
+        Should -Invoke Set-Service -Times 0
     }
 }
 
@@ -189,5 +201,14 @@ Describe 'Quiet mode termination safety' {
         Mock Get-CimInstance { $script:tray }
         Set-CloudComRustDeskQuietMode $script:tray.ExecutablePath
         Should -Invoke Stop-Process -Times 1 -ParameterFilter { $Id -eq 42 }
+    }
+}
+
+Describe 'Final service identity' {
+    It 'rejects the vendor temporary import service and accepts only its final service' {
+        $exe='C:\Program Files\RustDesk\rustdesk.exe'
+        Test-CloudComRustDeskServicePath ('"'+$exe+'" --service') $exe | Should -BeTrue
+        Test-CloudComRustDeskServicePath ('"'+$exe+'" --import-config file') $exe | Should -BeFalse
+        Test-CloudComRustDeskServicePath ('"'+$exe+'" --server') $exe | Should -BeFalse
     }
 }

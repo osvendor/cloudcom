@@ -14,6 +14,11 @@ function Get-CloudComVersion {
     return [version]$Matches[1]
 }
 
+function Test-CloudComRustDeskServicePath {
+    param([string]$PathName, [string]$Exe)
+    return $PathName -match ('(?i)^"?' + [regex]::Escape($Exe) + '"?\s+--service\s*$')
+}
+
 function Test-CloudComPrivatePath {
     param([string]$Path)
     if (!(Test-Path -LiteralPath $Path)) { return $false }
@@ -88,7 +93,7 @@ function Get-CloudComRustDeskState {
     else {
         if ($service.State -ne 'Running') { $issues.Add('service_stopped') }
         if ($service.StartMode -ne 'Auto') { $issues.Add('service_not_automatic') }
-        if ($service.PathName -notmatch ('(?i)^"?' + [regex]::Escape($exe) + '"?(?:\s|$)')) { $issues.Add('service_path_unexpected') }
+        if (!(Test-CloudComRustDeskServicePath $service.PathName $exe)) { $issues.Add('service_path_unexpected') }
     }
     $configOk = $false
     if (Test-Path -LiteralPath $ConfigurationPath) {

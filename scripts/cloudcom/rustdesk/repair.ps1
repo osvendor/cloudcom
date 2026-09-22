@@ -62,11 +62,14 @@ try {
             $repairStage = 'installed-version-check'
             $deadline = [datetime]::UtcNow.AddSeconds(40)
             do {
-                $installedService=Get-Service -Name RustDesk -ErrorAction SilentlyContinue
-                if ($installedService -and (Test-Path -LiteralPath $state.Exe)) { break }
+                # CIM does not retain a ServiceController handle across the vendor's
+                # asynchronous service replacement/initialization.
+                $installedService=Get-CimInstance Win32_Service -Filter "Name='RustDesk'"
+                $serviceReady = $installedService -and $installedService.State -eq 'Running' -and (Test-CloudComRustDeskServicePath $installedService.PathName $state.Exe)
+                if ($serviceReady -and (Test-Path -LiteralPath $state.Exe)) { break }
                 Start-Sleep -Seconds 2
             } while ([datetime]::UtcNow -lt $deadline)
-            if (!$installedService) { throw 'Installed service did not appear.' }
+            if (!$serviceReady) { throw 'Installed service did not become ready.' }
             if (!(Test-Path -LiteralPath $state.Exe)) { throw 'Installation did not produce expected executable.' }
             if ((Get-CloudComVersion (Get-Item -LiteralPath $state.Exe).VersionInfo.ProductVersion) -ne $pinned) { throw 'Installed version mismatch.' }
             $changed = $true
@@ -115,8 +118,11 @@ try {
         finally { $password=$null; $secure=$null }
     }
     $repairStage = 'service-startup'
-    Set-Service -Name RustDesk -StartupType Automatic
-    if ($changed) { Restart-Service -Name RustDesk -Force }
+    $currentService = Get-CimInstance Win32_Service -Filter "Name='RustDesk'"
+    if (!$currentService) { throw 'Expected service is missing.' }
+    if ($currentService.StartMode -ne 'Auto') { Set-Service -Name RustDesk -StartupType Automatic }
+    # Fresh install already started the service; CLI settings were applied over IPC.
+    if ($changed -and $installed) { Restart-Service -Name RustDesk -Force }
     elseif ((Get-Service -Name RustDesk).Status -ne 'Running') { Start-Service -Name RustDesk }
     Start-Sleep -Seconds 3
     $repairStage = 'quiet-profile'
