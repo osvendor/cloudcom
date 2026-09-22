@@ -32,13 +32,14 @@ import { portalRemoteRoutes } from './remote';
 
 const principal = {
   id: 'portal-user', orgId: '11111111-1111-4111-8111-111111111111', authEpoch: 4,
-  accessMode: 'remote_only',
+  email: 'portal-user@example.test', name: 'Portal user', contactId: null,
+  receiveNotifications: true, status: 'active', accessMode: 'remote_only' as const,
 };
 
 function app() {
   const app = new Hono();
   app.use('*', async (c, next) => {
-    c.set('portalAuth', { user: principal });
+    c.set('portalAuth', { user: principal, token: 'test-token', authMethod: 'bearer', timezone: 'UTC' });
     await next();
   });
   app.route('/', portalRemoteRoutes);

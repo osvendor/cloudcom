@@ -7,6 +7,9 @@ import { loadPortalRemoteAssignment } from '../../services/portalRemoteAuthority
 import { createPortalDesktopSession, commitPortalDesktopStartIntent, endPortalDesktopSession } from '../../services/portalRemoteSessionStore';
 import { preparePortalRemoteLease, renewPortalRemoteLeaseIfPresent } from '../../services/portalRemoteLease';
 import { getRedis } from '../../services/redis';
+import { Hono } from 'hono';
+import { createRoutes } from '@cloudcom/ext-rustdesk-access';
+import type { ExtensionRuntimeContext } from '@breeze/extension-sdk';
 
 vi.mock('../../services/portalRemoteFeature', () => ({ isPortalRemoteFeatureEnabled: vi.fn().mockResolvedValue(true) }));
 vi.mock('../../services/tenantStatus', () => ({ getActiveOrgTenant: vi.fn().mockResolvedValue({ partnerId: 'partner' }) }));
@@ -41,6 +44,35 @@ async function fixture() {
 }
 
 describe('portal remote database authorization', () => {
+  it('runs extension settings, account conversion, grants and revocation against real tenant-scoped SQL', async () => {
+    const f = await fixture();
+    await f.admin.update(portalUsers).set({ accessMode: 'standard' }).where(eq(portalUsers.id, f.bob.id));
+    const app = new Hono();
+    app.use('*', async (c, next) => {
+      c.set('auth' as never, { user: { id: f.staff.id }, partnerId: f.staff.partnerId,
+        canAccessOrg: (id: string) => id === f.a.id } as never);
+      c.set('extensionAuthorization' as never, { hasPermission: () => true, mfaSatisfied: true } as never);
+      await next();
+    });
+    app.route('/', createRoutes({ db, audit: vi.fn(), log: vi.fn() } as unknown as ExtensionRuntimeContext));
+    const request = (path: string, init?: RequestInit) => withDbAccessContext({ ...f.context,
+      accessiblePartnerIds: [f.staff.partnerId!] }, async () => app.request(path, init));
+    const base = `/orgs/${f.a.id}`;
+    expect((await request(`${base}/settings`)).status).toBe(200);
+    expect((await request(`${base}/options`)).status).toBe(200);
+    expect((await request(`/orgs/${f.b.id}/settings`)).status).toBe(403);
+    const write = (body: unknown) => ({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    expect((await request(`${base}/assignments`, write({ portalUserId: f.bob.id, deviceId: f.deviceB.id }))).status).toBe(404);
+    const granted = await request(`${base}/assignments`, write({ portalUserId: f.bob.id, deviceId: f.deviceA.id }));
+    expect(granted.status).toBe(201);
+    const { assignment } = await granted.json() as { assignment: { id: string; version: number } };
+    const [converted] = await f.admin.select().from(portalUsers).where(eq(portalUsers.id, f.bob.id));
+    expect(converted).toMatchObject({ accessMode: 'remote_only', authEpoch: 2 });
+    expect((await request(`${base}/assignments/${assignment.id}`, { method: 'DELETE' })).status).toBe(200);
+    const [revoked] = await f.admin.select().from(portalRemoteAssignments).where(eq(portalRemoteAssignments.id, assignment.id));
+    expect(revoked).toMatchObject({ enabled: false, version: assignment.version + 1 });
+  });
+
   it('enforces forced RLS for all three tables as the real application role', async () => {
     const f = await fixture();
     const rows = await f.admin.execute(sql`SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname IN ('portal_remote_settings','portal_remote_assignments','portal_remote_sessions')`);

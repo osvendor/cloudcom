@@ -34,7 +34,7 @@ export function createRoutes(context: ExtensionRuntimeContext) {
       || !permissions.hasPermission('organizations', 'write') || !permissions.hasPermission('users', 'write'))) {
       return c.json({ error: 'Account administration and MFA are required' }, 403);
     }
-    const org = rows<{ partner_id: string }>(await context.db.execute(sql`SELECT o.partner_id FROM organizations o JOIN partners p ON p.id=o.partner_id WHERE o.id=${parsed.data}::uuid AND o.deleted_at IS NULL AND o.status IN ('active','trial') AND p.deleted_at IS NULL AND p.status IN ('active','trial')`))[0];
+    const org = rows<{ partner_id: string }>(await context.db.execute(sql`SELECT o.partner_id FROM organizations o JOIN partners p ON p.id=o.partner_id WHERE o.id=${parsed.data}::uuid AND o.deleted_at IS NULL AND o.status IN ('active','trial') AND p.deleted_at IS NULL AND p.status='active'`))[0];
     if (!org || (auth.partnerId && auth.partnerId !== org.partner_id)) return c.json({ error: 'Organization unavailable' }, 404);
     c.set('orgId', parsed.data); c.set('actorId', auth.user.id);
     await next();

@@ -25,6 +25,14 @@ agent acknowledged the terminal fence. Closing the browser also reached a
 confirmed terminal state after fixing portal handling of authenticated endpoint
 disconnect notifications. The focused route/agent regression suite passed 36
 tests, and API and portal builds passed on that source snapshot.
+The authenticated Extensions UI also passed settings save, grant, and revoke
+against the real API. Its partner-status SQL regression is covered by a real
+database test; the remote database suite now has ten passing tests. The merged
+Cloud Command baseline passed both extensions' tests, 53 shared web-host tests,
+all 767 portal tests, and API/web/portal builds.
+Focused TypeScript checking of the remote API production files and their unit
+and integration test roots also passed with a 6 GB heap. This is not a claim
+that the entire inherited API typecheck passed.
 
 This is isolated Linux acceptance, not production or Windows acceptance. The
 test used an Xvfb desktop and a locally supplied OpenH264 library; it does not

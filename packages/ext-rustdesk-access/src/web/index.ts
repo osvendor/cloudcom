@@ -210,7 +210,7 @@ export class RemoteAccessSettingsPage extends HTMLElement {
     this.root.replaceChildren();
     const style = document.createElement("style");
     style.textContent =
-      ":host{display:block;font:14px system-ui;color:#17231d}main{max-width:760px;padding:20px}section{border:1px solid #d5ddd8;border-radius:8px;padding:16px;margin:16px 0}h1{font-size:22px}h2{font-size:16px}label{display:block;margin:10px 0}button,select,input{font:inherit;padding:7px;margin-top:4px}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.5}[data-error=true]{color:#a33}.row{display:flex;gap:10px;align-items:end;flex-wrap:wrap}";
+      ":host{display:block;font:14px system-ui;color:hsl(var(--foreground));background:hsl(var(--background))}main{max-width:760px;padding:20px}section{border:1px solid hsl(var(--border));background:hsl(var(--card));border-radius:8px;padding:16px;margin:16px 0}h1{font-size:22px}h2{font-size:16px}label{display:block;margin:10px 0}button,select,input{font:inherit;padding:7px;margin-top:4px;color:hsl(var(--foreground));background:hsl(var(--input,var(--background)));border:1px solid hsl(var(--border));border-radius:4px}button{cursor:pointer}button:focus-visible{outline:2px solid hsl(var(--ring));outline-offset:2px}button:disabled{cursor:not-allowed;opacity:.5}[data-error=true]{color:hsl(var(--destructive))}.row{display:flex;gap:10px;align-items:end;flex-wrap:wrap}";
     this.root.append(style);
     const main = document.createElement("main");
     const heading = document.createElement("h1");
@@ -230,20 +230,22 @@ export class RemoteAccessSettingsPage extends HTMLElement {
         [
           ["enabled", "Enable Remote Access"],
           ["webrtcEnabled", "Allow browser connections"],
-          ["rustdeskEnabled", "Allow RustDesk connections"],
+          ["rustdeskEnabled", "RustDesk account sign-in (not available yet)"],
         ] as const
       ).forEach(([key, text]) => {
         const label = this.label(text);
         const input = document.createElement("input");
         input.type = "checkbox";
         input.checked = this.settings![key];
-        input.disabled = disabled;
+        input.disabled = disabled || key === "rustdeskEnabled";
         input.dataset.setting = key;
+        input.dataset.testid = `remote-setting-${key}`;
         label.prepend(input);
         section.append(label);
       });
       const save = document.createElement("button");
       save.textContent = "Save settings";
+      save.dataset.testid = "remote-save-settings";
       save.disabled = disabled;
       save.onclick = () => void this.saveSettings();
       section.append(save);
@@ -305,7 +307,7 @@ export class RemoteAccessSettingsPage extends HTMLElement {
     }
     const current = document.createElement("section");
     const title = document.createElement("h2");
-    title.textContent = "Current access";
+    title.textContent = "Computer assignments";
     current.append(title);
     if (!this.assignments.length) {
       const empty = document.createElement("p");
@@ -318,6 +320,11 @@ export class RemoteAccessSettingsPage extends HTMLElement {
         const text = document.createElement("span");
         text.textContent = `${assignment.userName || assignment.email || assignment.portalUserId} → ${assignment.hostname || assignment.deviceId}${assignment.expiresAt ? ` (expires ${assignment.expiresAt})` : ""}`;
         row.append(text);
+        const state = document.createElement("span");
+        state.dataset.testid = `remote-assignment-state-${assignment.id}`;
+        state.textContent = !assignment.enabled ? "Revoked"
+          : assignment.expiresAt && Date.parse(assignment.expiresAt) <= Date.now() ? "Expired" : "Active";
+        row.append(state);
         const revoke = document.createElement("button");
         revoke.textContent = "Revoke";
         revoke.dataset.testid = `remote-revoke-${assignment.id}`;

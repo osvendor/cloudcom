@@ -27,7 +27,8 @@ import { portalDesktopRoutes } from './remoteDesktop';
 
 const SESSION = '11111111-1111-4111-8111-111111111111';
 const DEVICE = '22222222-2222-4222-8222-222222222222';
-const principal = { id: 'portal-user', orgId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', authEpoch: 3, name: 'Customer' };
+const principal = { id: 'portal-user', orgId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', authEpoch: 3,
+  email: 'customer@example.test', name: 'Customer', contactId: null, receiveNotifications: true, status: 'active' };
 const row = (extra = {}) => ({ session: { id: SESSION, deviceId: DEVICE, assignmentId: 'grant', assignmentVersion: 2, authEpoch: 3, status: 'pending', terminationPhase: 'none', terminalGeneration: null, desktopStartGeneration: 2n, hardDeadline: new Date(Date.now() + 60_000), createdAt: new Date(), webrtcAnswer: null, ...extra }, device: { agentId: 'agent-1', hostname: 'desktop' } });
 function app(user = principal) { const a = new Hono(); a.use('*', async (c, next) => { c.set('portalAuth', { user, token: 'x', authMethod: 'bearer', timezone: 'UTC' }); await next(); }); a.route('/', portalDesktopRoutes); return a; }
 function request(path: string, init: RequestInit = {}) { return app().request(path, { ...init, headers: { 'content-type': 'application/json', ...(init.headers ?? {}) } }); }
