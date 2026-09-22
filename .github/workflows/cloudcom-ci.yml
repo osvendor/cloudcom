@@ -26,6 +26,7 @@ jobs:
       native: ${{ steps.delta.outputs.native }}
       infra: ${{ steps.delta.outputs.infra }}
       portal_remote: ${{ steps.delta.outputs.portalRemote }}
+      unifi_sync_lock: ${{ steps.delta.outputs.unifiSyncLock }}
       unsupported: ${{ steps.delta.outputs.unsupported }}
       baseline_commit: ${{ steps.delta.outputs.baseline_commit }}
     steps:
@@ -129,6 +130,32 @@ jobs:
       - name: Prove Cloud Command 3CX migration and RLS boundaries
         if: needs.delta.outputs.api == 'true' || needs.delta.outputs.shared == 'true'
         run: bash scripts/cloudcom/test-threecx-rls.sh
+      - name: Prove UniFi sync organization lock ordering
+        if: needs.delta.outputs.unifi_sync_lock == 'true'
+        env:
+          BREEZE_TEST_PG_PORT: 127.0.0.1:55434
+          BREEZE_TEST_REDIS_PORT: 127.0.0.1:56381
+          BREEZE_TEST_PG_CONTAINER: cloudcom-unifi-ci-postgres
+          BREEZE_TEST_REDIS_CONTAINER: cloudcom-unifi-ci-redis
+          BREEZE_TEST_NETWORK: cloudcom-unifi-ci-network
+          NODE_ENV: test
+          DATABASE_URL: postgresql://breeze_test:breeze_test@localhost:55434/breeze_test
+          DATABASE_URL_APP: postgresql://breeze_app:breeze_test@localhost:55434/breeze_test
+          BREEZE_TEST_DB_URL: postgresql://breeze_test:breeze_test@localhost:55434/breeze_test
+          BREEZE_APP_DB_PASSWORD: breeze_test
+          POSTGRES_PASSWORD: breeze_test
+          REDIS_URL: redis://localhost:56381
+          JWT_SECRET: test-jwt-secret-must-be-at-least-32-characters-long
+          APP_ENCRYPTION_KEY: test-app-encryption-key-at-least-32-chars-long!!
+          APP_ENCRYPTION_KEY_ID: test-key-1
+        run: |
+          set -euo pipefail
+          project="cloudcom-unifi-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() { docker compose --project-name "$project" -f docker-compose.test.yml down -v --remove-orphans; }
+          trap cleanup EXIT
+          docker compose --project-name "$project" -f docker-compose.test.yml up -d --wait
+          pnpm --filter @breeze/api exec vitest run src/jobs/unifiWorker.test.ts
+          pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts src/__tests__/integration/unifiSyncLockOrder.integration.test.ts
       - name: Validate customer portal remote access and RLS boundaries
         if: needs.delta.outputs.portal_remote == 'true'
         run: bash scripts/cloudcom/test-portal-remote.sh
