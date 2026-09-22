@@ -39,6 +39,8 @@ export type PortalAuthContext = {
     contactId: string | null;
     receiveNotifications: boolean;
     status: string;
+    accessMode?: 'standard' | 'remote_only';
+    authEpoch?: number;
   };
   token: string;
   authMethod: 'bearer' | 'cookie';

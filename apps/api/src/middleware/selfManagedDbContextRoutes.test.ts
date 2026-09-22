@@ -353,3 +353,15 @@ describe('isSelfManagedDbContextRoute', () => {
     // And the file engine's routes are untouched.
     expect(isSelfManagedDbContextRoute('POST', '/api/v1/devices/22222222-2222-4222-8222-222222222222/filesystem/scan')).toBe(false);
   });
+
+  it('makes only the portal remote lifecycle phases self-managed so fences commit before lease and dispatch', () => {
+    const id = '11111111-1111-4111-8111-111111111111';
+    for (const [method, path] of [
+      ['POST', '/api/v1/portal/remote/sessions'],
+      ['POST', `/api/v1/portal/remote/sessions/${id}/offer`],
+      ['POST', `/api/v1/portal/remote/sessions/${id}/end`],
+      ['GET', `/api/v1/portal/remote/sessions/${id}`],
+    ] as const) expect(isSelfManagedDbContextRoute(method, path)).toBe(true);
+    expect(isSelfManagedDbContextRoute('GET', '/api/v1/portal/remote/devices')).toBe(false);
+    expect(isSelfManagedDbContextRoute('POST', `/api/v1/portal/remote/sessions/${id}/other`)).toBe(false);
+  });

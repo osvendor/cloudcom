@@ -21,6 +21,7 @@ const ALLOWED_PREFIXES = [
   '/devices',
   '/assets',
   '/profile',
+  '/remote',
   '/dashboard',
   '/security',
   '/backups',
@@ -67,4 +68,13 @@ export function safeNextPath(raw: string | null | undefined): string | null {
     (prefix) => pathOnly === prefix || pathOnly.startsWith(`${prefix}/`)
   );
   return allowed ? value : null;
+}
+
+/** Choose the customer landing page; API authorization remains authoritative. */
+export function postLoginPath(rawNext: string | null, accessMode?: string): string {
+  const next = safeNextPath(rawNext);
+  if (accessMode !== 'remote_only') return next ?? '/';
+  const path = next?.split(/[?#]/)[0];
+  return path && ['/remote', '/profile'].some(prefix => path === prefix || path.startsWith(prefix + '/'))
+    ? next! : '/remote';
 }

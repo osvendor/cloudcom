@@ -30,6 +30,26 @@ describe('buildRemoteAccessLaunchUrl', () => {
     expect(url).toBe('rustdesk://294064193?password=plain');
   });
 
+  it('builds a server-qualified RustDesk link without a password', () => {
+    const serverQualified: InheritableRemoteAccessSettings = {
+      defaultProviderId: 'rustdesk',
+      providers: [{
+        ...baseProvider,
+        // RustDesk parses this as `<id>/r@<server>?key=<public-key>`.
+        // `%2B` is required for a literal `+` in a base64 public key.
+        urlTemplate: 'rustdesk://{id}/r@rd.example.test:21116?key=AbC%2BDe/Fg=',
+        password: undefined,
+      }],
+    };
+
+    expect(
+      buildRemoteAccessLaunchUrl(
+        { customFields: { rustdesk_id: '294064193?attempt=inject' } },
+        serverQualified,
+      ),
+    ).toBe('rustdesk://294064193%3Fattempt%3Dinject/r@rd.example.test:21116?key=AbC%2BDe/Fg=');
+  });
+
   it('passes through templates with no {password} placeholder (e.g. ScreenConnect HTTPS launcher)', () => {
     const sc: InheritableRemoteAccessSettings = {
       defaultProviderId: 'sc',

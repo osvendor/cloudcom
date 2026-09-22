@@ -4,7 +4,7 @@ import { hasPortalSessionCookie } from './lib/session';
 import { isOutsideBase, stripBase, withBase } from './lib/basePath';
 import { buildFallbackCspDirectives, resolvePortalCspHeader } from './lib/csp';
 import { prefixDevAssetUrls, shouldPrefixDevAssetUrls } from './lib/devAssetBase';
-import { loadPortalBrandingWithStatus } from './lib/server';
+import { loadPortalBrandingWithStatus, loadPortalProfile } from './lib/server';
 import { resolveAuthenticatedLanding } from './lib/landing';
 import { isProtectedPath, requiresAccountStatusGuard } from './lib/protectedPaths';
 import { redirectToAccountDisabled } from './lib/accountStatus';
@@ -24,9 +24,10 @@ function loginWithNext(pathname: string, search: string): string {
  *  403 all over again with no explanation. Otherwise, per their org's
  *  visibility flags: they come to read a proposal or pay a bill; `/dashboard`
  *  only leads when the org has explicitly turned it on (fail-closed, #4562). */
-async function authenticatedLanding(request: Request): Promise<'/dashboard' | '/quotes' | '/account-disabled'> {
+async function authenticatedLanding(request: Request): Promise<'/dashboard' | '/quotes' | '/remote' | '/account-disabled'> {
   const { branding, accountDisabled } = await loadPortalBrandingWithStatus(request);
-  return resolveAuthenticatedLanding({ accountDisabled, branding });
+  const profile = await loadPortalProfile(request);
+  return resolveAuthenticatedLanding({ accountDisabled, branding, accessMode: profile?.accessMode });
 }
 
 /** True for env flags set to `1`/`true`. Mirrors apps/web/src/middleware.ts. */
@@ -100,6 +101,12 @@ export const onRequest = defineMiddleware(async (context, next) => {
       const { accountDisabled } = await loadPortalBrandingWithStatus(context.request);
       if (accountDisabled) {
         return redirectToAccountDisabled(context);
+      }
+      const profile = await loadPortalProfile(context.request);
+      const remoteAllowed = pathname === '/remote' || pathname.startsWith('/remote/')
+        || pathname === '/profile' || pathname.startsWith('/profile/');
+      if (profile?.accessMode === 'remote_only' && !remoteAllowed) {
+        return context.redirect(withBase('/remote'), 302);
       }
     }
   }

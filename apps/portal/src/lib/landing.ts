@@ -23,9 +23,11 @@ export function portalLandingPath(
 export function resolveAuthenticatedLanding(status: {
   accountDisabled: boolean;
   branding: Pick<BrandingConfig, 'enableDashboard'>;
-}): '/dashboard' | '/quotes' | '/account-disabled' {
+  accessMode?: string;
+}): '/dashboard' | '/quotes' | '/remote' | '/account-disabled' {
   if (status.accountDisabled) {
     return '/account-disabled';
   }
+  if (status.accessMode === 'remote_only') return '/remote';
   return portalLandingPath(status.branding);
 }
