@@ -1,11 +1,18 @@
 import type { ExtensionHostApi } from '@breeze/extension-web-sdk';
 import { fetchWithAuth } from '@/stores/auth';
 import { getExtensionRegistry } from './registry';
+import { dispatchCloudCommandConnectionsChanged } from './cloudCommandNavigationEvents';
 
 const API_PREFIX = '/api/v1/';
 const FORBIDDEN_HEADER_NAMES = new Set(['authorization', 'proxy-authorization', 'cookie']);
 const ENCODED_PATH_SEPARATOR = /%2f|%5c/i;
 const NAMESPACE_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+const CLOUD_COMMAND_CONNECTION_MUTATIONS = new Set([
+  'PUT /threecx/connection',
+  'POST /microsoft/onboarding/complete',
+  'POST /microsoft/onboarding/recheck',
+  'POST /microsoft/disconnect',
+]);
 
 export class ExtensionHostApiError extends Error {
   constructor(message: string) {
@@ -105,7 +112,7 @@ export function createExtensionHostApi(options: ExtensionHostApiOptions): {
     target.search = subpath.search;
 
     if (revoked) throw abortedError();
-    return fetchWithAuth(`${target.pathname}${target.search}`, {
+    const response = await fetchWithAuth(`${target.pathname}${target.search}`, {
       ...init,
       headers,
       credentials: undefined,
@@ -113,6 +120,15 @@ export function createExtensionHostApi(options: ExtensionHostApiOptions): {
       orgIdOverride: options.organizationId,
       signal: mergeSignals(controller.signal, init?.signal),
     });
+    if (
+      !revoked
+      && response.ok
+      && options.extensionName === 'cloudcommand'
+      && CLOUD_COMMAND_CONNECTION_MUTATIONS.has(`${(init?.method ?? 'GET').toUpperCase()} ${subpath.pathname}`)
+    ) {
+      dispatchCloudCommandConnectionsChanged(options.organizationId);
+    }
+    return response;
   };
 
   return {

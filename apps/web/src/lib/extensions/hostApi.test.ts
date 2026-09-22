@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createExtensionHostApi, ExtensionHostApiError } from './hostApi';
+import { CLOUD_COMMAND_CONNECTIONS_CHANGED_EVENT } from './cloudCommandNavigationEvents';
 
 const { fetchWithAuth, getExtensionRegistry } = vi.hoisted(() => ({ fetchWithAuth: vi.fn(), getExtensionRegistry: vi.fn() }));
 vi.mock('@/stores/auth', () => ({ fetchWithAuth }));
@@ -71,5 +72,23 @@ describe('createExtensionHostApi', () => {
     // The in-flight promise is intentionally unresolved in this mock; it was
     // handed an aborted signal, which is what real fetch observes.
     void pending;
+  });
+
+  it('emits an organization-scoped refresh only after a successful Cloud Command connection mutation', async () => {
+    getExtensionRegistry.mockResolvedValue({ extensions: [{ name: 'cloudcommand', routeNamespace: 'cloud-command' }] });
+    const changes: unknown[] = [];
+    const listener = (event: Event) => changes.push((event as CustomEvent).detail);
+    window.addEventListener(CLOUD_COMMAND_CONNECTIONS_CHANGED_EVENT, listener);
+    try {
+      const { hostApi } = createExtensionHostApi({ extensionName: 'cloudcommand', organizationId: 'org-a' });
+      fetchWithAuth.mockResolvedValueOnce(new Response('{}', { status: 500 }));
+      await hostApi.request('/threecx/connection', { method: 'PUT' });
+      await hostApi.request('/threecx/connection');
+      fetchWithAuth.mockResolvedValueOnce(new Response('{}', { status: 200 }));
+      await hostApi.request('/microsoft/onboarding/recheck', { method: 'POST' });
+      expect(changes).toEqual([{ organizationId: 'org-a' }]);
+    } finally {
+      window.removeEventListener(CLOUD_COMMAND_CONNECTIONS_CHANGED_EVENT, listener);
+    }
   });
 });
