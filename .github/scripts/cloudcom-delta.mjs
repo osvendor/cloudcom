@@ -28,6 +28,8 @@ const remoteAccessApiPaths = new Set([
 // Redis stack, real portal-login and authorization tests, plus the RLS coverage
 // contract; unknown portal or schema work must still fail closed.
 const portalRemoteApiPaths = new Set([
+  'apps/api/src/routes/orgPortalUsers.ts', 'apps/api/src/routes/orgPortalUsers.test.ts',
+  'apps/api/src/routes/portal/acceptInvite.test.ts',
   'apps/api/src/services/portalNativeLogin.ts', 'apps/api/src/services/portalNativeLogin.test.ts',
   'apps/api/src/routes/portal/nativeLogin.ts', 'apps/api/src/routes/portal/nativeLogin.test.ts',
   'apps/api/src/__tests__/integration/portalNativeLogin.integration.test.ts',
@@ -58,6 +60,7 @@ const portalRemoteApiPaths = new Set([
   'apps/api/src/services/remoteAccessLauncher.test.ts', 'apps/api/src/services/tenantCascade.ts', 'apps/api/src/services/tenantExportPolicyRegistry.ts',
 ]);
 const portalRemoteWebPaths = new Set([
+  'apps/web/src/components/settings/OrgPortalUsersEditor.tsx', 'apps/web/src/components/settings/OrgPortalUsersEditor.test.tsx',
   'apps/portal/src/pages/remote/native.astro', 'apps/portal/src/lib/nativeLogin.ts', 'apps/portal/src/lib/nativeLogin.test.ts',
   'apps/portal/src/components/remote/NativeSignInPage.tsx', 'apps/portal/src/components/remote/NativeSignInPage.test.tsx',
   'apps/portal/src/components/remote/NativeSignInConsent.tsx',
@@ -137,6 +140,13 @@ export function readBaseline(text = readFileSync(baselinePath, 'utf8')) {
 export function classify(paths) {
   const result = { api: false, web: false, shared: false, native: false, infra: false, portalRemote: false, unsupported: [] };
   for (const path of paths.filter(Boolean)) {
+    if (path === 'packages/shared/src/validators/portal.ts' || path === 'packages/shared/src/validators/portal.test.ts') {
+      result.shared = true;
+      result.api = true;
+      result.web = true;
+      result.portalRemote = true;
+      continue;
+    }
     if (docsPath.test(path) || path === 'packages/ext-cloud-command/README.md' || path === 'packages/ext-rustdesk-access/README.md') continue;
     if (portalRemoteApiPaths.has(path)) {
       result.api = true;

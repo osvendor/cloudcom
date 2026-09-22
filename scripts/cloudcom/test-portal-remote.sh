@@ -30,6 +30,7 @@ docker compose --project-name "$project" -f docker-compose.test.yml up -d --wait
 pnpm --filter @breeze/api db:migrate
 
 pnpm --filter @breeze/api exec vitest run \
+  src/routes/orgPortalUsers.test.ts src/routes/portal/acceptInvite.test.ts \
   src/services/portalNativeLogin.test.ts src/routes/portal/nativeLogin.test.ts \
   src/routes/portal/accessMode.test.ts src/routes/portal/auth.test.ts src/routes/portal/authOrgStatusGate.test.ts \
   src/routes/portal/remote.test.ts src/routes/portal/remoteDesktop.test.ts src/routes/portal/remoteRateLimit.test.ts \
@@ -55,3 +56,5 @@ pnpm --filter @breeze/portal exec vitest run \
   src/components/portal/RemoteViewer.test.tsx src/lib/landing.test.ts src/lib/nextPath.test.ts \
   src/lib/protectedPaths.test.ts src/lib/remoteInput.test.ts src/middleware.test.ts
 pnpm --filter @breeze/portal build
+pnpm --filter @breeze/shared exec vitest run src/validators/portal.test.ts
+pnpm --filter @breeze/web exec vitest run src/components/settings/OrgPortalUsersEditor.test.tsx
