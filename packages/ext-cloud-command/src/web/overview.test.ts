@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CloudCommandOverviewPage } from './overview';
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 const context = (organizationId = 'org-a') => ({ contractVersion: 1, extensionName: 'cloudcommand', path: '/extensions/cloudcommand/overview', organizationId });
@@ -18,6 +18,13 @@ describe('organization provider overview', () => {
   await flush();
   expect(page.shadowRoot!.textContent).toContain('Configure 3CX');
   expect(page.shadowRoot!.querySelector('[data-provider="microsoft"]')).toBeNull();
+ });
+ it('routes a manager configuration action to Connect', async () => {
+  const page = mount(async () => Response.json({ connected: false, canManage: true, available: true }));
+  await flush();
+  const navigate = vi.fn(); page.addEventListener('breeze-extension-event', navigate);
+  (page.shadowRoot!.querySelector('[data-provider="threecx"]') as HTMLButtonElement).click();
+  expect(navigate.mock.calls[0][0].detail).toMatchObject({ path: '/extensions/cloudcommand/connect#threecx' });
  });
  it('reports partial status failure without hiding the working provider', async () => {
   const page = mount(async path => path.startsWith('/microsoft') ? Response.json({}, {status:503}) : Response.json({ connected:true, enabled:true }));

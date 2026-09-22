@@ -7,7 +7,7 @@ Implemented in `packages/ext-cloud-command`, registered as the compiled-in
 Implementation and local VM verification are distinct from a signed release and
 live PBX acceptance. No legacy PBX credential has been transferred by this change.
 
-Use Breeze's organization selector, then Extensions → Cloud Command. Each
+Use Breeze's organization selector, then Extensions → Cloud Command → Connect. Each
 organization can configure its own HTTPS PBX origin, client ID, secret, department
 scope and enabled state. No partner-wide UniFi-style discovery or matching is
 required. Existing organizations remain the authoritative client records.
