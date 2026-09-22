@@ -30,6 +30,7 @@ docker compose --project-name "$project" -f docker-compose.test.yml up -d --wait
 pnpm --filter @breeze/api db:migrate
 
 pnpm --filter @breeze/api exec vitest run \
+  src/services/portalNativeLogin.test.ts src/routes/portal/nativeLogin.test.ts \
   src/routes/portal/accessMode.test.ts src/routes/portal/auth.test.ts src/routes/portal/authOrgStatusGate.test.ts \
   src/routes/portal/remote.test.ts src/routes/portal/remoteDesktop.test.ts src/routes/portal/remoteRateLimit.test.ts \
   src/services/portalNativeProof.test.ts src/services/portalRemoteAgent.test.ts src/services/portalRemoteLease.test.ts \
@@ -40,6 +41,8 @@ pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts 
   src/__tests__/integration/orgMergeRegistry.integration.test.ts src/__tests__/integration/tenantCascade.integration.test.ts \
   src/__tests__/integration/tenant-export-policy.integration.test.ts src/__tests__/integration/tenantExportErasureRoundtrip.integration.test.ts
 pnpm --filter @breeze/api exec vitest run --config vitest.config.rls-coverage.ts
+PORTAL_STATE_BACKEND=redis pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts \
+  src/__tests__/integration/portalNativeLogin.integration.test.ts
 
 pnpm --filter @cloudcom/ext-rustdesk-access typecheck
 pnpm --filter @cloudcom/ext-rustdesk-access build:web
@@ -48,6 +51,7 @@ pnpm --filter @cloudcom/ext-rustdesk-access test:server
 pnpm --filter @cloudcom/ext-rustdesk-access test:web
 
 pnpm --filter @breeze/portal exec vitest run \
+  src/lib/nativeLogin.test.ts src/components/remote/NativeSignInPage.test.tsx \
   src/components/portal/RemoteViewer.test.tsx src/lib/landing.test.ts src/lib/nextPath.test.ts \
   src/lib/protectedPaths.test.ts src/lib/remoteInput.test.ts src/middleware.test.ts
 pnpm --filter @breeze/portal build

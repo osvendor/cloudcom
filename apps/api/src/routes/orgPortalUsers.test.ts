@@ -106,6 +106,48 @@ describe('GET /organizations/:id/portal-users', () => {
 describe('POST /organizations/:id/portal-users/invite', () => {
   const invite = (body: unknown) => makeApp().request(`/organizations/${ORG_ID}/portal-users/invite`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 
+  it.each([true, false, undefined])('creates the requested initial restriction (%s) before emailing', async (remoteOnly) => {
+    selectResult.mockResolvedValueOnce([{ id: ORG_ID }]).mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ id: 'ct-1', roles: ['portal'] }]).mockResolvedValueOnce([{ name: 'Acme Co' }]);
+    insertReturning.mockResolvedValueOnce([{ id: 'pu-new' }]);
+    sendInvite.mockImplementationOnce(async () => {
+      expect(valuesSpy).toHaveBeenCalledWith(expect.objectContaining({
+        status: 'invited', passwordHash: null, accessMode: remoteOnly ? 'remote_only' : 'standard',
+      }));
+      return { success: true };
+    });
+    const res = await invite({ email: 'new@acme.example', ...(remoteOnly === undefined ? {} : { remoteOnly }) });
+    expect(res.status).toBe(200);
+    expect(sendInvite).toHaveBeenCalledTimes(1);
+    expect(valuesSpy).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'invited', passwordHash: null, accessMode: remoteOnly ? 'remote_only' : 'standard',
+    }));
+    expect(valuesSpy.mock.invocationCallOrder[0]).toBeLessThan(sendInvite.mock.invocationCallOrder[0]!);
+  });
+
+  it.each([false, undefined])('never promotes a remote-only account on reinvite (%s)', async (remoteOnly) => {
+    selectResult.mockResolvedValueOnce([{ id: ORG_ID }])
+      .mockResolvedValueOnce([{ id: 'pu-1', authMethod: 'password', status: 'invited', passwordHash: null, contactId: 'ct-1', accessMode: 'remote_only' }])
+      .mockResolvedValueOnce([{ name: 'Acme Co' }]);
+    insertReturning.mockResolvedValueOnce([{ id: 'pu-1' }]);
+    const res = await invite({ email: 'remote@acme.example', ...(remoteOnly === undefined ? {} : { remoteOnly }) });
+    expect(res.status).toBe(200);
+    expect(setSpy).toHaveBeenCalledTimes(1);
+    expect(setSpy.mock.calls[0]![0]).not.toHaveProperty('accessMode');
+    expect(purgePortalSessionsForUsers).toHaveBeenCalledWith(['pu-1']);
+  });
+
+  it('restricts a pending standard account before sending its replacement invitation', async () => {
+    selectResult.mockResolvedValueOnce([{ id: ORG_ID }])
+      .mockResolvedValueOnce([{ id: 'pu-1', authMethod: 'password', status: 'invited', passwordHash: null, contactId: 'ct-1' }])
+      .mockResolvedValueOnce([{ name: 'Acme Co' }]);
+    insertReturning.mockResolvedValueOnce([{ id: 'pu-1' }]);
+    const res = await invite({ email: 'remote@acme.example', remoteOnly: true });
+    expect(res.status).toBe(200);
+    expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ accessMode: 'remote_only', status: 'invited' }));
+    expect(purgePortalSessionsForUsers).toHaveBeenCalledWith(['pu-1']);
+  });
+
   it('creates an invited user and emails a link', async () => {
     selectResult
       .mockResolvedValueOnce([{ id: ORG_ID }]) // org existence

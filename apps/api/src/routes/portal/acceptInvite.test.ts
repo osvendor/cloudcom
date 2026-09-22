@@ -101,6 +101,14 @@ describe('portal authentication lifecycle audit', () => {
 });
 
 describe('POST /auth/accept-invite', () => {
+  it('keeps a remote invitation restricted in its first authenticated session', async () => {
+    userRow.current = { id: USER_ID, orgId: ORG_ID, email: 'remote@acme.example', name: null, passwordHash: null, authMethod: 'password', receiveNotifications: true, status: 'invited', authEpoch: 4, accessMode: 'remote_only' };
+    const token = await storePortalInviteToken(USER_ID);
+    const res = await post({ token, password: 'Str0ngPass!' });
+    expect(res.status).toBe(200);
+    expect((await res.json()).user.accessMode).toBe('remote_only');
+    expect(updateSpy.mock.calls[0]![0]).not.toHaveProperty('accessMode');
+  });
   it('activates an invited user and issues a session', async () => {
     userRow.current = { id: USER_ID, orgId: ORG_ID, email: 'cust@acme.example', name: null, passwordHash: null, authMethod: 'password', receiveNotifications: true, status: 'invited', authEpoch: 4 };
     const token = await storePortalInviteToken(USER_ID);

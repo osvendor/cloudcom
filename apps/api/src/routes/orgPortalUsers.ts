@@ -195,7 +195,7 @@ export function registerOrgPortalUsersRoutes(orgRoutes: Hono) {
     const org = await resolveAccessibleOrg(c);
     if (org instanceof Response) return org;
     const auth = c.get('auth') as AuthContext;
-    const { email, name, message } = c.req.valid('json');
+    const { email, name, message, remoteOnly } = c.req.valid('json');
     const normalizedEmail = email.trim().toLowerCase();
 
     const [existing] = await db.select({ id: portalUsers.id, email: portalUsers.email, passwordHash: portalUsers.passwordHash, authMethod: portalUsers.authMethod, status: portalUsers.status, contactId: portalUsers.contactId })
@@ -236,7 +236,9 @@ export function registerOrgPortalUsersRoutes(orgRoutes: Hono) {
         contactLink = resolved.link;
         if (resolved.contactId) contactPatch.contactId = resolved.contactId;
       }
-      await db.update(portalUsers).set({ name: name ?? undefined, status: 'invited', authEpoch: sql`${portalUsers.authEpoch} + 1`, invitedBy: auth.user.id, invitedAt: now, updatedAt: now, ...contactPatch }).where(eq(portalUsers.id, existing.id)).returning({ id: portalUsers.id });
+      // Never widen an existing account during re-invitation. Remote-only
+      // accounts remain restricted even when an older caller omits this flag.
+      await db.update(portalUsers).set({ name: name ?? undefined, status: 'invited', ...(remoteOnly ? { accessMode: 'remote_only' as const } : {}), authEpoch: sql`${portalUsers.authEpoch} + 1`, invitedBy: auth.user.id, invitedAt: now, updatedAt: now, ...contactPatch }).where(eq(portalUsers.id, existing.id)).returning({ id: portalUsers.id });
       await purgePortalSessionsForUsers([existing.id]);
       const redis = getRedis();
       if (redis) await purgeClientAiSessionsForUsers(redis, [existing.id]);
@@ -244,14 +246,14 @@ export function registerOrgPortalUsersRoutes(orgRoutes: Hono) {
     } else {
       const resolved = await resolveInviteContact(org.id, normalizedEmail, name ?? null, auth.user.id);
       contactLink = resolved.link;
-      const [created] = await db.insert(portalUsers).values({ orgId: org.id, email: normalizedEmail, name: name ?? null, passwordHash: null, authMethod: 'password', status: 'invited', invitedBy: auth.user.id, invitedAt: now, contactId: resolved.contactId }).returning({ id: portalUsers.id });
+      const [created] = await db.insert(portalUsers).values({ orgId: org.id, email: normalizedEmail, name: name ?? null, passwordHash: null, authMethod: 'password', status: 'invited', accessMode: remoteOnly ? 'remote_only' : 'standard', invitedBy: auth.user.id, invitedAt: now, contactId: resolved.contactId }).returning({ id: portalUsers.id });
       userId = created!.id;
     }
 
     const [orgRow] = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, org.id)).limit(1);
     const emailSent = await issueAndSendInvite(c, org.id, { id: userId, email: normalizedEmail }, orgRow?.name ?? null, auth.user.name, message);
 
-    writeRouteAudit(c, { orgId: org.id, action: 'organization.portal_user.invite', resourceType: 'portal_user', resourceId: userId, details: { email: normalizedEmail, emailSent, contactLink } });
+    writeRouteAudit(c, { orgId: org.id, action: 'organization.portal_user.invite', resourceType: 'portal_user', resourceId: userId, details: { email: normalizedEmail, emailSent, contactLink, remoteOnlyRequested: remoteOnly === true } });
     // `contactLink` is returned, not only audited: 'ambiguous' means the login
     // was created WITHOUT a contact and therefore cannot see the tickets that
     // address has emailed in (routes/portal/ticketOwnership.ts). The audit log

@@ -57,6 +57,30 @@ describe('OrgPortalUsersEditor', () => {
       `/orgs/organizations/${ORG_ID}/portal-users/invite`,
       expect.objectContaining({ method: 'POST' })
     ));
+    const inviteCall = fetchWithAuth.mock.calls.find(([url]) => url === `/orgs/organizations/${ORG_ID}/portal-users/invite`);
+    expect(inviteCall).toBeTruthy();
+    expect(JSON.parse(String((inviteCall![1] as RequestInit).body))).toEqual({ email: 'new@acme.example' });
+  });
+
+  it('sends remoteOnly for a remote-access-only invite', async () => {
+    fetchWithAuth
+      .mockResolvedValueOnce(ok({ data: [] }))
+      .mockResolvedValueOnce(ok({ data: { id: 'pu-new', status: 'invited' }, emailSent: true }))
+      .mockResolvedValueOnce(ok({ data: [] }));
+    render(<OrgPortalUsersEditor orgId={ORG_ID} />);
+    await waitFor(() => expect(fetchWithAuth).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByTestId('portal-users-invite-open'));
+    fireEvent.change(screen.getByTestId('portal-users-invite-email'), { target: { value: 'remote@acme.example' } });
+    fireEvent.click(screen.getByTestId('portal-users-invite-remote-only'));
+    fireEvent.click(screen.getByTestId('portal-users-invite-submit'));
+
+    await waitFor(() => expect(fetchWithAuth).toHaveBeenCalledWith(
+      `/orgs/organizations/${ORG_ID}/portal-users/invite`,
+      expect.objectContaining({ method: 'POST' })
+    ));
+    const inviteCall = fetchWithAuth.mock.calls.find(([url]) => url === `/orgs/organizations/${ORG_ID}/portal-users/invite`);
+    expect(inviteCall).toBeTruthy();
+    expect(JSON.parse(String((inviteCall![1] as RequestInit).body))).toEqual({ email: 'remote@acme.example', remoteOnly: true });
   });
 
   it('warns when the invite could not link a contact because several contacts share the address', async () => {
