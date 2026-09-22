@@ -92,6 +92,8 @@
         "packages/ext-cloud-command/src/server/index.ts",
         "packages/ext-cloud-command/src/server/transport.ts",
         "packages/ext-cloud-command/src/web/index.ts",
+        "packages/ext-cloud-command/src/web/connect.ts",
+        "packages/ext-cloud-command/src/web/connect.test.ts",
         "packages/ext-cloud-command/migrations/2026-09-21-threecx-connections.sql",
         "apps/web/src/lib/extensions/hostApi.ts",
         "packages/extension-web-sdk/src/hostApi.ts",
@@ -140,6 +142,10 @@
         {
           "file": "packages/ext-cloud-command/manifest.json",
           "contains": "cloudcommand-microsoft-page"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand-connect-page"
         }
       ]
     }
