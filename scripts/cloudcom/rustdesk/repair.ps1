@@ -19,6 +19,7 @@ foreach ($value in @($RendezvousServer,$RelayServer,$PublicKey)) {
 }
 $mutex = New-Object Threading.Mutex($false, 'Global\CloudComRustDeskDesiredState')
 $locked = $false
+$repairStage = 'preflight'
 try {
     try { $locked = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $locked = $true }
     if (!$locked) { throw 'Another RustDesk repair is in progress.' }
@@ -49,26 +50,33 @@ try {
     $provisioning = !$installed -or !(Test-Path -LiteralPath $state.Credential)
     if ($provisioning) { 'Manual review required if this transaction does not complete.' | Set-Content -LiteralPath $provisioningMarker }
     if (!$installed) {
+        $repairStage = 'download'
         $download = Join-Path $state.Directory 'approved-installer.exe'
         if (Test-Path -LiteralPath $download) { throw 'Staged installer already exists; review previous attempt.' }
         try {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             Invoke-WebRequest -Uri $InstallerUrl.AbsoluteUri -OutFile $download -UseBasicParsing
             if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash -ine $InstallerSha256) { throw 'Installer checksum mismatch.' }
+            $repairStage = 'installer'
             Invoke-CloudComRustDesk $download @('--silent-install')
+            $repairStage = 'installed-version-check'
             $deadline = [datetime]::UtcNow.AddSeconds(40)
             do {
-                $installedService=Get-Service -Name RustDesk -ErrorAction SilentlyContinue
-                if ($installedService -and (Test-Path -LiteralPath $state.Exe)) { break }
+                # CIM does not retain a ServiceController handle across the vendor's
+                # asynchronous service replacement/initialization.
+                $installedService=Get-CimInstance Win32_Service -Filter "Name='RustDesk'"
+                $serviceReady = $installedService -and $installedService.State -eq 'Running' -and (Test-CloudComRustDeskServicePath $installedService.PathName $state.Exe)
+                if ($serviceReady -and (Test-Path -LiteralPath $state.Exe)) { break }
                 Start-Sleep -Seconds 2
             } while ([datetime]::UtcNow -lt $deadline)
-            if (!$installedService) { throw 'Installed service did not appear.' }
+            if (!$serviceReady) { throw 'Installed service did not become ready.' }
             if (!(Test-Path -LiteralPath $state.Exe)) { throw 'Installation did not produce expected executable.' }
             if ((Get-CloudComVersion (Get-Item -LiteralPath $state.Exe).VersionInfo.ProductVersion) -ne $pinned) { throw 'Installed version mismatch.' }
             $changed = $true
         } finally { if (Test-Path -LiteralPath $download) { Remove-Item -LiteralPath $download -Force } }
     }
     if ($state.Issues -contains 'configuration_drift' -or !$installed) {
+        $repairStage = 'server-configuration'
         $json = @{host=$RendezvousServer;relay=$RelayServer;key=$PublicKey;api=''} | ConvertTo-Json -Compress
         $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+','-').Replace('/','_').ToCharArray()
         [array]::Reverse($encoded)
@@ -76,6 +84,7 @@ try {
         $changed = $true
     }
     if (!(Test-Path -LiteralPath $state.Credential)) {
+        $repairStage = 'credential-provisioning'
         # Never rotate/reapply a previously stored password during routine remediation.
         $bytes = New-Object byte[] 24
         $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -101,16 +110,24 @@ try {
         $changed = $true
     }
     elseif (!$installed) {
+        $repairStage = 'credential-restore'
         # Reinstallation loses RustDesk's own password state; restore the SAME protected secret once.
         $secure = (Get-Content -LiteralPath $state.Credential -Raw).Trim() | ConvertTo-SecureString
         $password = (New-Object Net.NetworkCredential('', $secure)).Password
         try { Invoke-CloudComRustDesk $state.Exe @('--password',$password) }
         finally { $password=$null; $secure=$null }
     }
-    Set-Service -Name RustDesk -StartupType Automatic
-    if ($changed) { Restart-Service -Name RustDesk -Force }
+    $repairStage = 'service-startup'
+    $currentService = Get-CimInstance Win32_Service -Filter "Name='RustDesk'"
+    if (!$currentService) { throw 'Expected service is missing.' }
+    if ($currentService.StartMode -ne 'Auto') { Set-Service -Name RustDesk -StartupType Automatic }
+    # Fresh install already started the service; CLI settings were applied over IPC.
+    if ($changed -and $installed) { Restart-Service -Name RustDesk -Force }
     elseif ((Get-Service -Name RustDesk).Status -ne 'Running') { Start-Service -Name RustDesk }
     Start-Sleep -Seconds 3
+    $repairStage = 'quiet-profile'
+    Set-CloudComRustDeskQuietMode $state.Exe
+    $repairStage = 'verification'
     $after = Get-CloudComRustDeskState $ConfigurationPath $RendezvousServer $RelayServer $PublicKey $PinnedVersion
     $remainingIssues = @($after.Issues | Where-Object { !($provisioning -and $_ -eq 'provisioning_requires_review') })
     if ($remainingIssues.Count -gt 0) { throw 'RustDesk remains noncompliant; see read-only probe for details.' }
@@ -120,7 +137,8 @@ try {
     Write-Output 'RustDesk desired state restored.'
 } catch {
     # Avoid accidental credential/command-line disclosure through nested native exceptions.
-    Write-Output 'RustDesk repair stopped safely. Check the probe and protected local repair journal; do not automatically reset the attempt counter.'
+    Write-Output ('RustDesk repair stopped safely at stage ' + $repairStage + '. Check the probe and protected local repair journal; do not automatically reset the attempt counter.')
+    Write-Output ('Failure type=' + $_.Exception.GetType().Name + '; line=' + $_.InvocationInfo.ScriptLineNumber)
     throw 'RustDesk desired-state repair failed.'
 } finally {
     if ($locked) { $mutex.ReleaseMutex() }

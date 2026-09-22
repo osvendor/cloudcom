@@ -16,6 +16,14 @@
         {
           "file": ".github/workflows/cloudcom-ci.yml",
           "contains": "Invoke-Pester ./scripts/cloudcom/rustdesk/repair.Tests.ps1"
+        },
+        {
+          "file": "scripts/cloudcom/rustdesk/common.ps1",
+          "contains": "$quiet = Get-CloudComRustDeskQuietState $exe"
+        },
+        {
+          "file": "scripts/cloudcom/rustdesk/repair.ps1",
+          "contains": "Set-CloudComRustDeskQuietMode $state.Exe"
         }
       ]
     },
