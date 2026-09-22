@@ -12,12 +12,14 @@ export function mountMicrosoftRoutes(app: Hono<{ Variables: Variables }>, servic
     try { return c.json(await services.administration[method](request(c), await c.req.json())); }
     catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : 'invalid_or_failed_request';
-      const allowed = new Set(['access_denied', 'invalid_operation', 'connection_not_ready', 'connection_changed', 'audit_unavailable', 'unknown_write_outcome', 'provider_failed', 'consent_expired_or_used', 'consent_rejected', 'tenant_verification_failed', 'administration_permissions_missing', 'provider_access_denied', 'provider_rate_limited', 'unsupported_group']);
+      const allowed = new Set(['access_denied', 'invalid_operation', 'connection_not_ready', 'connection_changed', 'audit_unavailable', 'unknown_write_outcome', 'provider_failed', 'provider_rejected', 'consent_expired_or_used', 'consent_rejected', 'tenant_verification_failed', 'administration_permissions_missing', 'provider_access_denied', 'provider_rate_limited', 'unsupported_group']);
       const operation = method === 'execute' ? await c.req.json().catch(() => null) as { type?: unknown } | null : null;
       const optionalRole = operation?.type === 'user.password.reset' ? 'User-PasswordProfile.ReadWrite.All'
         : operation?.type === 'user.sessions.revoke' ? 'User.RevokeSessions.All' : null;
       const message = code === 'unknown_write_outcome'
         ? 'The change may have been applied. Refresh before attempting another change.'
+        : code === 'provider_rejected' && operation?.type === 'user.update'
+          ? 'Microsoft rejected the profile update. Refresh the user and review the current values before trying again.'
         : code === 'provider_access_denied' && optionalRole
           ? `This action is not enabled. Grant the ${optionalRole} application permission to the connected enterprise app, then retry.`
           : 'The Microsoft request could not be completed. Check setup and try again.';
