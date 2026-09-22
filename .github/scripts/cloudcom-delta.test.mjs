@@ -61,6 +61,8 @@ test('routes the enumerated customer portal remote surface to focused real-DB co
     'apps/api/src/__tests__/integration/portalNativeLogin.integration.test.ts',
     'apps/api/src/routes/portal/nativeLogin.ts',
     'apps/api/src/services/portalNativeLogin.ts',
+    'apps/api/src/services/portalCompanyGateway.ts',
+    'apps/api/src/services/portalCompanyGateway.test.ts',
     'apps/portal/src/pages/remote/native.astro',
     'apps/portal/src/components/remote/NativeSignInPage.tsx',
     'apps/portal/src/pages/remote/[sessionId].astro',

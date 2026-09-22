@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 const mocks = vi.hoisted(() => ({
   rows: [] as Array<{ id: string; hostname: string; displayName: string | null; status: string }>,
   authorize: vi.fn(),
+  company: vi.fn(),
 }));
 
 vi.mock('../../db', () => ({
@@ -26,6 +27,7 @@ vi.mock('../../db/schema', () => ({
 }));
 vi.mock('../../services/portalRemoteFeature', () => ({ isPortalRemoteFeatureEnabled: vi.fn(async () => true) }));
 vi.mock('../../services/portalRemoteAuthority', () => ({ authorizePortalRemote: mocks.authorize }));
+vi.mock('../../services/portalCompanyGateway', () => ({ checkPortalCompanyGateway: mocks.company }));
 vi.mock('./remoteDesktop', () => ({ portalDesktopRoutes: new Hono() }));
 vi.mock('./nativeLogin', () => ({ portalNativeAuthorizeRoutes: new Hono() }));
 
@@ -59,9 +61,17 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.rows = [];
   mocks.authorize.mockResolvedValue(capable());
+  mocks.company.mockResolvedValue({ ok: true, orgId: principal.orgId });
 });
 
 describe('GET /remote/devices WebRTC availability', () => {
+  it('denies a company mismatch before reading devices', async () => {
+    mocks.company.mockResolvedValue({ ok: false, status: 403 });
+    const response = await app().request('/remote/devices', { headers: { 'Cf-Access-Jwt-Assertion': 'test-assertion' } });
+    expect(response.status).toBe(403);
+    expect(mocks.company).toHaveBeenCalledWith('test-assertion', principal.orgId);
+    expect(mocks.authorize).not.toHaveBeenCalled();
+  });
   it('uses the authenticated portal principal for every assigned device', async () => {
     mocks.rows = [device(), device('33333333-3333-4333-8333-333333333333')];
 

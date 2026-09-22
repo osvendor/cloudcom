@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { checkPortalCompanyGateway } from '../../services/portalCompanyGateway';
 import type { Context, Next } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { and, eq, sql } from 'drizzle-orm';
@@ -471,6 +472,11 @@ authRoutes.post('/auth/login', zValidator('json', loginSchema), async (c) => {
 
   if (user.status !== 'active') {
     return c.json({ error: 'Account is not active' }, 403);
+  }
+
+  if (user.accessMode === 'remote_only') {
+    const company = await checkPortalCompanyGateway(c.req.header('Cf-Access-Jwt-Assertion'), user.orgId);
+    if (!company.ok) return c.json({ error: 'Company authentication is required' }, company.status);
   }
 
   const now = new Date();

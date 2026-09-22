@@ -1,7 +1,8 @@
 import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({ csrf: vi.fn(), issue: vi.fn(), exchange: vi.fn(),
-  limit: vi.fn(), settings: vi.fn(), redis: vi.fn() }));
+  limit: vi.fn(), settings: vi.fn(), redis: vi.fn(), company: vi.fn() }));
+vi.mock('../../services/portalCompanyGateway', () => ({ verifyPortalCompanyGateway: mocks.company }));
 vi.mock('../../db', () => ({ runOutsideDbContext: (fn: () => unknown) => fn(), db: { select: () => ({ from: () => ({ where: () => ({ limit: mocks.settings }) }) }) } }));
 vi.mock('../../services/redis', () => ({ getRedis: mocks.redis }));
 vi.mock('../../services/rate-limit', () => ({ rateLimiter: mocks.limit }));
@@ -19,7 +20,7 @@ const prior = process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED;
 beforeEach(() => { vi.clearAllMocks(); process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED = 'true';
   mocks.redis.mockReturnValue({}); mocks.csrf.mockReturnValue(null); mocks.limit.mockResolvedValue({ allowed: true });
   mocks.settings.mockResolvedValue([{ enabled: true }]); mocks.issue.mockResolvedValue({ redirectUri: input.redirectUri, expiresIn: 60 });
-  mocks.exchange.mockResolvedValue(null); });
+  mocks.exchange.mockResolvedValue(null); mocks.company.mockResolvedValue({ ok: true, orgId: null }); });
 afterEach(() => { if (prior === undefined) delete process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED; else process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED = prior; });
 function app(authMethod: 'cookie' | 'bearer' = 'cookie') {
   const result = new Hono();
@@ -31,6 +32,17 @@ function app(authMethod: 'cookie' | 'bearer' = 'cookie') {
 }
 const post = (body: unknown) => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 describe('native sign-in HTTP boundary', () => {
+  it('passes the verified company into exchange and denies missing company proof', async () => {
+    const body = { clientId: input.clientId, redirectUri: input.redirectUri,
+      code: Buffer.alloc(32, 9).toString('base64url'), codeVerifier: 'x'.repeat(43) };
+    mocks.company.mockResolvedValue({ ok: false, status: 403 });
+    expect((await app().request('/auth/native/exchange', post(body))).status).toBe(403);
+    expect(mocks.exchange).not.toHaveBeenCalled();
+    const orgId = '22222222-2222-4222-8222-222222222222';
+    mocks.company.mockResolvedValue({ ok: true, orgId });
+    await app().request('/auth/native/exchange', post(body));
+    expect(mocks.exchange).toHaveBeenCalledWith(body, orgId);
+  });
   it('defaults off before code issuance or consumption', async () => {
     delete process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED;
     expect((await app().request('/remote/native/authorize', post(input))).status).toBe(404);

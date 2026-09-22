@@ -31,6 +31,7 @@ pnpm --filter @breeze/api db:migrate
 
 pnpm --filter @breeze/api exec vitest run \
   src/routes/orgPortalUsers.test.ts src/routes/portal/acceptInvite.test.ts \
+  src/services/portalCompanyGateway.test.ts src/services/cfAccessJwt.test.ts \
   src/services/portalNativeLogin.test.ts src/routes/portal/nativeLogin.test.ts \
   src/routes/portal/accessMode.test.ts src/routes/portal/auth.test.ts src/routes/portal/authOrgStatusGate.test.ts \
   src/routes/portal/remote.test.ts src/routes/portal/remoteDesktop.test.ts src/routes/portal/remoteRateLimit.test.ts \
