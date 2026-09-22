@@ -29,7 +29,7 @@ that exact portal address in addition to the existing ingress proxy; do not disa
 HTTPS enforcement or trust an entire container subnet to solve an SSR redirect.
 This deployment correction is configuration, not a change to customer privileges.
 
-The current public ingress also has a host-wide Cloudflare Access login. Customer
+The current public portal path also has a Cloudflare Access login. Customer
 portal reachability needs separately reviewed, narrowly scoped Access routing for
 the portal and its API paths while retaining staff-route protection. An origin
 tunnel used for acceptance does not prove public customer reachability. No Access
@@ -139,6 +139,14 @@ RustDesk Server OSS 1.1.16, and RustDesk client `763d4eeb05fbfe2f368a55e24a2ab72
 The latter identifies itself as 1.5.0; it is NOT byte-identical source for the
 installed 1.4.9 binary. Pin the exact production client source/build before patching
 or claiming native compatibility. No remote source or running server was updated.
+
+The native source prerequisite was subsequently materialized offline in a separate
+clean worktree at that exact client revision, with `hbb_common` pinned to
+`d9895ff9cb4c77137fb05ce3161bcf7210177aef`. Git connectivity checks passed and
+reported no missing objects; Flutter, resources and Cargo configuration are now
+present. Source availability is not a remaining blocker. Windows compiler/SDK,
+Rust/Flutter tooling and dependency-cache readiness have not yet been verified.
+This preparation does not implement native login, ticket admission or revocation.
 
 Observed in the audited trees:
 
