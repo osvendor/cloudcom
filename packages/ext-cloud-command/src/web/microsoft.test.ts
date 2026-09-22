@@ -74,97 +74,7 @@ describe('CloudCommandMicrosoftPage', () => {
     );
     await flush();
     expect(reader.shadowRoot!.querySelector('#bind')).toBeNull();
-    expect(reader.shadowRoot!.textContent).toContain('read-only access');
-  });
-
-  it('preserves a pending binding choice when a delayed provider navigation status rerenders', async () => {
-    let resolveThreeCx!: (response: Response) => void;
-    const page = mount((path) => {
-      if (path === '/threecx/connection')
-        return new Promise<Response>((resolve) => {
-          resolveThreeCx = resolve;
-        });
-      if (path === '/microsoft/connection')
-        return Promise.resolve(
-          Response.json({ available: true, connected: false, canManage: true, version: 1 }),
-        );
-      if (path === '/microsoft/tenants')
-        return Promise.resolve(
-          Response.json({ items: [{ id: 't1', name: 'Tenant', domain: 'tenant.example' }] }),
-        );
-      return Promise.resolve(emptyResource());
-    });
-    await flush();
-    let root = page.shadowRoot!;
-    (root.querySelector('#load-tenants') as HTMLButtonElement).click();
-    await flush();
-    await flush();
-    root = page.shadowRoot!;
-    const tenant = root.querySelector<HTMLSelectElement>('#tenant')!;
-    tenant.value = 't1';
-    tenant.dispatchEvent(new Event('change'));
-    const enabled = root.querySelector<HTMLInputElement>('#enabled')!;
-    enabled.checked = false;
-    enabled.dispatchEvent(new Event('change'));
-    resolveThreeCx(Response.json({ connected: true, enabled: true, canManage: false }));
-    await flush();
-    await flush();
-    root = page.shadowRoot!;
-    expect(root.querySelector<HTMLSelectElement>('#tenant')!.value).toBe('t1');
-    expect(root.querySelector<HTMLInputElement>('#enabled')!.checked).toBe(false);
-  });
-
-  it('binds an authorized tenant and changes resources through the hash', async () => {
-    let bound = false;
-    const request = vi.fn(async (path: string, init?: RequestInit) => {
-      if (path === '/microsoft/connection' && init?.method === 'PUT') {
-        bound = true;
-        return Response.json({
-          available: true,
-          connected: true,
-          canManage: true,
-          enabled: true,
-          tenantId: 't1',
-          tenantName: 'Contoso',
-          version: 2,
-        });
-      }
-      if (path === '/microsoft/connection')
-        return Response.json(
-          bound
-            ? {
-                available: true,
-                connected: true,
-                canManage: true,
-                enabled: true,
-                tenantId: 't1',
-                tenantName: 'Contoso',
-                version: 2,
-              }
-            : { available: true, connected: false, canManage: true, version: 1 },
-        );
-      if (path === '/microsoft/tenants')
-        return Response.json({ items: [{ id: 't1', name: 'Contoso', domain: 'contoso.example' }] });
-      if (path.startsWith('/microsoft/resources/')) return emptyResource();
-      throw new Error(`unexpected ${path}`);
-    });
-    const page = mount(request);
-    await flush();
-    let root = page.shadowRoot!;
-    (root.querySelector('#load-tenants') as HTMLButtonElement).click();
-    await flush();
-    await flush();
-    root = page.shadowRoot!;
-    (root.querySelector('#tenant') as HTMLSelectElement).value = 't1';
-    (root.querySelector('#bind') as HTMLButtonElement).click();
-    await flush();
-    await flush();
-    await flush();
-    window.location.hash = 'groups';
-    window.dispatchEvent(new HashChangeEvent('hashchange'));
-    await flush();
-    await flush();
-    expect(request.mock.calls.map(([path]) => path)).toContain('/microsoft/resources/groups');
+    expect(reader.shadowRoot!.textContent).toContain('Contoso');
   });
 
   it('ignores a late response after the organization context changes', async () => {
@@ -191,143 +101,31 @@ describe('CloudCommandMicrosoftPage', () => {
     expect(page.shadowRoot!.textContent).not.toContain('old org');
   });
 
-  it('captures an unchecked enabled toggle when binding', async () => {
-    const request = vi.fn(async (path: string, init?: RequestInit) => {
-      if (path === '/microsoft/connection' && init?.method === 'PUT') {
-        expect(JSON.parse(String(init.body))).toMatchObject({ tenantId: 't1', enabled: false, version: 1 });
-        return Response.json({
-          available: true,
-          connected: true,
-          canManage: true,
-          enabled: false,
-          tenantId: 't1',
-          version: 2,
-        });
-      }
-      if (path === '/microsoft/connection')
-        return Response.json({ available: true, connected: false, canManage: true, version: 1 });
-      if (path === '/microsoft/tenants')
-        return Response.json({ items: [{ id: 't1', name: 'Tenant', domain: 'tenant.example' }] });
-      return emptyResource();
-    });
+  it('shows native setup without discovering tenants or sending a binding mutation', async () => {
+    const request = vi.fn(async (_path: string, _init?: RequestInit) => Response.json({ available: true, connected: false, enabled: false, canManage: true, status: 'pending-consent', reason: 'Admin consent is pending.' }));
     const page = mount(request);
     await flush();
-    let root = page.shadowRoot!;
-    (root.querySelector('#load-tenants') as HTMLButtonElement).click();
     await flush();
-    await flush();
-    root = page.shadowRoot!;
-    (root.querySelector('#tenant') as HTMLSelectElement).value = 't1';
-    (root.querySelector('#enabled') as HTMLInputElement).checked = false;
-    (root.querySelector('#bind') as HTMLButtonElement).click();
-    await flush();
-    await flush();
-    expect(
-      request.mock.calls.some(
-        ([path, init]) => path === '/microsoft/connection' && (init as RequestInit)?.method === 'PUT',
-      ),
-    ).toBe(true);
+    expect(page.shadowRoot!.textContent).toContain('Admin consent is pending.');
+    expect(page.shadowRoot!.querySelector('#setup-integrations')?.getAttribute('href')).toBe('/integrations');
+    expect(page.shadowRoot!.querySelector('#tenant')).toBeNull();
+    expect(page.shadowRoot!.querySelector('#bind')).toBeNull();
+    expect(request.mock.calls.every(([path, init]) => path !== '/microsoft/tenants' && !init?.method)).toBe(true);
   });
 
-  it('does not apply a late save response after the organization changes', async () => {
-    let resolveSave!: (response: Response) => void;
-    const page = mount((path, init) => {
-      if (path === '/microsoft/connection' && init?.method === 'PUT')
-        return new Promise<Response>((resolve) => {
-          resolveSave = resolve;
-        });
-      if (path === '/microsoft/connection')
-        return Promise.resolve(
-          Response.json({ available: true, connected: false, canManage: true, version: 1 }),
-        );
-      if (path === '/microsoft/tenants')
-        return Promise.resolve(
-          Response.json({ items: [{ id: 't1', name: 'Tenant', domain: 'tenant.example' }] }),
-        );
-      return Promise.resolve(emptyResource());
+  it('discards an old organization resource after switching organizations', async () => {
+    let resolveOld!: (response: Response) => void;
+    let calls = 0;
+    const page = mount(async path => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: ++calls === 1, enabled: true, canManage: false });
+      if (path === '/microsoft/resources/users') return new Promise<Response>(resolve => { resolveOld = resolve; });
+      return Response.json({ connected: false });
     });
     await flush();
-    let root = page.shadowRoot!;
-    (root.querySelector('#load-tenants') as HTMLButtonElement).click();
+    page.context = { contractVersion: 1, extensionName: 'cloudcommand', path: '/extensions/cloudcommand/microsoft', organizationId: 'org-b' };
+    resolveOld(Response.json({ items: [{ id: 'old', values: { displayName: 'Old tenant secret row' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' }));
     await flush();
-    await flush();
-    root = page.shadowRoot!;
-    (root.querySelector('#tenant') as HTMLSelectElement).value = 't1';
-    (root.querySelector('#bind') as HTMLButtonElement).click();
-    await flush();
-    page.context = {
-      contractVersion: 1,
-      extensionName: 'cloudcommand',
-      path: '/extensions/cloudcommand/microsoft',
-      organizationId: 'org-b',
-    };
-    resolveSave(
-      Response.json({ available: true, connected: true, canManage: true, tenantName: 'old tenant' }),
-    );
-    await flush();
-    await flush();
-    expect(page.shadowRoot!.textContent).not.toContain('old tenant');
-  });
-
-  it('does not paint an old pending resource read while a tenant bind is pending', async () => {
-    let resolveUsers!: (response: Response) => void;
-    let resolveBind!: (response: Response) => void;
-    const page = mount((path, init) => {
-      if (path === '/microsoft/connection' && init?.method === 'PUT')
-        return new Promise<Response>((resolve) => {
-          resolveBind = resolve;
-        });
-      if (path === '/microsoft/connection')
-        return Promise.resolve(
-          Response.json({
-            available: true,
-            connected: true,
-            canManage: true,
-            enabled: true,
-            tenantId: 'old',
-            version: 1,
-          }),
-        );
-      if (path === '/microsoft/tenants')
-        return Promise.resolve(
-          Response.json({ items: [{ id: 'new', name: 'New tenant', domain: 'new.example' }] }),
-        );
-      if (path === '/microsoft/resources/users')
-        return new Promise<Response>((resolve) => {
-          resolveUsers = resolve;
-        });
-      return Promise.resolve(emptyResource());
-    });
-    await flush();
-    let root = page.shadowRoot!;
-    (root.querySelector('#load-tenants') as HTMLButtonElement).click();
-    await flush();
-    await flush();
-    root = page.shadowRoot!;
-    (root.querySelector('#tenant') as HTMLSelectElement).value = 'new';
-    (root.querySelector('#bind') as HTMLButtonElement).click();
-    await flush();
-    resolveUsers(
-      Response.json({
-        items: [{ id: 'old', values: { name: 'old tenant row' } }],
-        columns: [{ key: 'name', label: 'Name' }],
-        complete: true,
-        checkedAt: 'old',
-      }),
-    );
-    await flush();
-    await flush();
-    expect(page.shadowRoot!.textContent).not.toContain('old tenant row');
-    resolveBind(
-      Response.json({
-        available: true,
-        connected: true,
-        canManage: true,
-        enabled: true,
-        tenantId: 'new',
-        version: 2,
-      }),
-    );
+    expect(page.shadowRoot!.textContent).not.toContain('Old tenant secret row');
   });
 
   it('keeps only the latest rapid resource response and preserves filter focus', async () => {

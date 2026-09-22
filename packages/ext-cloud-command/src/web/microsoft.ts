@@ -15,10 +15,9 @@ type Connection = {
   enabled?: boolean;
   tenantId?: string;
   tenantName?: string;
-  version?: number;
+  status?: string;
   reason?: string;
 };
-type Tenant = { id: string; name: string; domain: string };
 type ThreeCxNavigationStatus = { connected: boolean; canManage?: boolean; enabled?: boolean };
 type ResourceRow = { id: string; values: Record<string, string | number | boolean | null> };
 type ResourceData = {
@@ -40,7 +39,6 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private contextValue: ExtensionPageContextV1 | null = null;
   private api: HostApi | null = null;
   private connection: Connection | null = null;
-  private tenants: Tenant[] = [];
   private resource: Resource = 'users';
   private data: ResourceData | null = null;
   private filter = '';
@@ -52,7 +50,6 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private busy = false;
   private resourceRequest = 0;
   private threeCxNavigationVisible = false;
-  private bindingDraft: { tenantId: string; enabled: boolean } | null = null;
 
   set context(input: unknown) {
     const context = parseExtensionPageContextV1(input);
@@ -107,8 +104,6 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.busy = false;
     this.connection = null;
     this.threeCxNavigationVisible = false;
-    this.bindingDraft = null;
-    this.tenants = [];
     this.data = null;
     this.detail = null;
     this.filter = '';
@@ -152,15 +147,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       const result = await this.request<Connection>(this.path('/connection'));
       if (generation !== this.generation || context !== this.contextValue) return;
       this.connection = result;
-      this.setMessage(
-        result.available
-          ? result.connected
-            ? result.enabled === false
-              ? 'Microsoft connection is disabled.'
-              : 'Microsoft connection loaded.'
-            : 'No Microsoft tenant is bound.'
-          : result.reason || 'Microsoft provider is unavailable.',
-      );
+      this.setMessage(result.reason || (result.connected ? 'Microsoft connection loaded.' : 'Connect Microsoft 365 in Integrations.'));
       this.render();
       void this.loadThreeCxNavigation(generation, context);
       if (this.canRead()) void this.loadResource();
@@ -187,49 +174,13 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       this.render();
     }
   }
-  private async loadTenants(): Promise<void> {
-    const generation = this.generation;
-    try {
-      const data = await this.request<{ items: Tenant[] }>(this.path('/tenants'));
-      if (generation !== this.generation) return;
-      this.tenants = data.items;
-      this.render();
-    } catch (e) {
-      if (generation === this.generation) {
-        this.setMessage(e instanceof Error ? e.message : 'Could not load tenants.', true);
-        this.render();
-      }
-    }
-  }
-  private async bind(): Promise<void> {
-    const select = this.root.querySelector<HTMLSelectElement>('#tenant');
-    const enabled = this.root.querySelector<HTMLInputElement>('#enabled')?.checked;
-    const version = this.connection?.version ?? null;
-    const generation = this.generation;
-    if (!select?.value || enabled === undefined || !this.connection) return;
-    this.bindingDraft = { tenantId: select.value, enabled };
-    this.resourceRequest += 1;
-    this.data = null;
-    this.detail = null;
-    this.filter = '';
-    await this.run(async () => {
-      const result = await this.request<Connection>(this.path('/connection'), {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tenantId: select.value, enabled, version }),
-      });
-      if (generation !== this.generation) return;
-      this.connection = result;
-      this.bindingDraft = null;
-      this.setMessage('Microsoft tenant saved.');
-      await this.loadConnection();
-    }, 'Could not save Microsoft tenant.');
-  }
   private async loadResource(): Promise<void> {
     if (!this.canRead()) return;
     const generation = this.generation;
     const resource = this.resource;
     const request = ++this.resourceRequest;
+    this.data = null;
+    this.detail = null;
     this.render();
     try {
       const raw = await this.request<unknown>(this.path(`/resources/${resource}`));
@@ -290,18 +241,11 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const connection = this.connection;
     const canManage = connection?.canManage === true;
     const canRead = this.canRead();
-    const selectedTenantId = this.bindingDraft?.tenantId ?? connection?.tenantId ?? '';
-    const selectedEnabled = this.bindingDraft?.enabled ?? connection?.enabled !== false;
     const filtered =
       this.data?.items.filter((row) =>
         JSON.stringify(row.values).toLowerCase().includes(this.filter.toLowerCase()),
       ) ?? [];
-    const tenantOptions = this.tenants.length
-      ? this.tenants
-      : connection?.tenantId
-        ? [{ id: connection.tenantId, name: connection.tenantName || connection.tenantId, domain: '' }]
-        : [];
-    this.root.innerHTML = `<style>${styles}</style><main><header><div><p class="eyebrow">Cloud Command</p><h1>Microsoft 365</h1><p class="subtle">Read-only Microsoft tenant inventory for this organization.</p></div><span class="badge ${canRead ? 'ok' : ''}">${connection?.available === false ? 'Unavailable' : connection?.connected ? (connection.enabled === false ? 'Disabled' : 'Connected') : 'Not configured'}</span></header><p class="status" data-testid="status" data-error="${this.error}" aria-live="polite">${esc(this.message)}</p><nav aria-label="Cloud Command providers">${this.threeCxNavigationVisible ? '<button class="secondary compact" data-testid="go-threecx">3CX</button>' : ''}<button class="secondary compact" data-testid="go-microsoft">Microsoft 365</button></nav>${connection?.available === false ? `<section class="card"><h2>Provider unavailable</h2><p class="subtle">${esc(connection.reason || 'Microsoft 365 is not available for this deployment.')}</p></section>` : `<section class="card"><div class="heading"><div><h2>Tenant connection</h2><p class="subtle">${canManage ? 'Bind an authorized Microsoft tenant for read-only inventory.' : 'You have read-only access to this tenant connection.'}</p></div></div>${canManage ? `<label>Authorized tenant<select id="tenant"><option value="">Select a tenant</option>${tenantOptions.map((tenant) => `<option value="${esc(tenant.id)}" ${tenant.id === selectedTenantId ? 'selected' : ''}>${esc(tenant.name)}${tenant.domain ? ` · ${esc(tenant.domain)}` : ''}</option>`).join('')}</select></label><label class="check"><input id="enabled" type="checkbox" ${selectedEnabled ? 'checked' : ''}>Enable inventory reads</label><div class="actions"><button class="secondary" id="load-tenants" ${this.busy ? 'disabled' : ''}>Load tenants</button><button id="bind" ${this.busy ? 'disabled' : ''}>Save tenant</button></div>` : connection?.connected ? `<p class="read-only">${esc(connection.tenantName || connection.tenantId || 'A tenant is configured.')}</p>` : '<p class="read-only">No tenant is configured.</p>'}</section><section class="card"><div class="heading"><div><h2>Directory and service inventory</h2><p class="subtle">Only the available read resources are shown.</p></div><button class="secondary compact" id="refresh-resource" ${!canRead ? 'disabled' : ''}>Refresh</button></div><div class="resource-nav"><span>Identity</span><button data-resource="users" class="secondary compact ${this.resource === 'users' ? 'selected' : ''}" ${!canRead ? 'disabled' : ''}>Users</button><button data-resource="groups" class="secondary compact ${this.resource === 'groups' ? 'selected' : ''}" ${!canRead ? 'disabled' : ''}>Groups</button><span>Tenant</span><button data-resource="licenses" class="secondary compact ${this.resource === 'licenses' ? 'selected' : ''}" ${!canRead ? 'disabled' : ''}>Licenses</button><span>Teams &amp; SharePoint</span><button data-resource="sites" class="secondary compact ${this.resource === 'sites' ? 'selected' : ''}" ${!canRead ? 'disabled' : ''}>Sites</button></div>${canRead ? `<label class="filter">Filter ${labels[this.resource]}<input id="filter" data-testid="filter" value="${esc(this.filter)}" placeholder="Filter loaded rows"></label>${this.data ? `<p class="meta">${this.data.complete ? 'Complete' : 'Partial'} · checked ${esc(this.data.checkedAt)}</p>${filtered.length ? `<div class="table-wrap"><table><thead><tr>${this.data.columns.map((column) => `<th>${esc(column.label)}</th>`).join('')}<th><span class="sr-only">Details</span></th></tr></thead><tbody>${filtered.map((row) => `<tr>${this.data!.columns.map((column) => `<td>${esc(String(row.values[column.key] ?? '—'))}</td>`).join('')}<td><button class="secondary compact" data-testid="row-${esc(row.id)}" data-detail="${esc(row.id)}">View details</button></td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No rows match this filter.</div>'}` : '<div class="empty">Select a resource to load its current read-only inventory.</div>'}` : `<div class="empty">${connection?.connected && connection.enabled === false ? 'Enable this connection before loading inventory.' : 'Bind a tenant before loading inventory.'}</div>`}</section>`}${
+    this.root.innerHTML = `<style>${styles}</style><main><header><div><p class="eyebrow">Cloud Command</p><h1>Microsoft 365</h1><p class="subtle">Read-only Microsoft tenant inventory for this organization.</p></div><span class="badge ${canRead ? 'ok' : ''}">${connection?.available === false ? 'Unavailable' : connection?.connected ? (connection.enabled === false ? 'Disabled' : 'Connected') : 'Not configured'}</span></header><p class="status" data-testid="status" data-error="${this.error}" aria-live="polite">${esc(this.message)}</p><nav aria-label="Cloud Command providers">${this.threeCxNavigationVisible ? '<button class="secondary compact" data-testid="go-threecx">3CX</button>' : ''}<button class="secondary compact" data-testid="go-microsoft">Microsoft 365</button></nav><section class="card"><div class="heading"><div><h2>${connection?.available === false ? 'Provider unavailable' : 'Microsoft connection'}</h2><p class="subtle">${esc(connection?.reason || (connection?.connected ? `Connected${connection.tenantName ? ` to ${connection.tenantName}` : ''}.` : 'Connect Microsoft 365 in Integrations to enable inventory.'))}</p>${connection?.status ? `<p class="meta">Status: ${esc(connection.status)}</p>` : ''}</div>${canManage ? '<a class="setup-link" id="setup-integrations" href="/integrations">Open Integrations</a>' : ''}</div></section><section class="card"><div class="heading"><div><h2>Directory and service inventory</h2><p class="subtle">Only the available read resources are shown.</p></div><button class="secondary compact" id="refresh-resource" ${!canRead ? 'disabled' : ''}>Refresh</button></div><div class="resource-nav"><span>Identity</span><button data-resource="users" class="secondary compact ${this.resource === 'users' ? 'selected' : ''}" ${!canRead ? 'disabled' : ''}>Users</button><button data-resource="groups" class="secondary compact ${this.resource === 'groups' ? 'selected' : ''}" ${!canRead ? 'disabled' : ''}>Groups</button><span>Tenant</span><button data-resource="licenses" class="secondary compact ${this.resource === 'licenses' ? 'selected' : ''}" ${!canRead ? 'disabled' : ''}>Licenses</button><span>Teams &amp; SharePoint</span><button data-resource="sites" class="secondary compact ${this.resource === 'sites' ? 'selected' : ''}" ${!canRead ? 'disabled' : ''}>Sites</button></div>${canRead ? `<label class="filter">Filter ${labels[this.resource]}<input id="filter" data-testid="filter" value="${esc(this.filter)}" placeholder="Filter loaded rows"></label>${this.data ? `<p class="meta">${this.data.complete ? 'Complete' : 'Partial'} · checked ${esc(this.data.checkedAt)}</p>${filtered.length ? `<div class="table-wrap"><table><thead><tr>${this.data.columns.map((column) => `<th>${esc(column.label)}</th>`).join('')}<th><span class="sr-only">Details</span></th></tr></thead><tbody>${filtered.map((row) => `<tr>${this.data!.columns.map((column) => `<td>${esc(String(row.values[column.key] ?? '—'))}</td>`).join('')}<td><button class="secondary compact" data-testid="row-${esc(row.id)}" data-detail="${esc(row.id)}">View details</button></td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">No rows match this filter.</div>'}` : '<div class="empty">Select a resource to load its current read-only inventory.</div>'}` : `<div class="empty">${connection?.connected && connection.enabled === false ? 'Enable this connection before loading inventory.' : 'Connect Microsoft 365 in Integrations before loading inventory.'}</div>`}</section>${
       this.detail
         ? `<div class="backdrop" data-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="detail-title"><div class="heading"><h2 id="detail-title">Resource details</h2><button class="secondary compact" id="detail-close">Close</button></div><dl>${Object.entries(
             this.detail.values,
@@ -316,19 +260,6 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.root
       .querySelector('[data-testid="go-microsoft"]')
       ?.addEventListener('click', () => this.navigate('/extensions/cloudcommand/microsoft'));
-    this.root.querySelector('#load-tenants')?.addEventListener('click', () => void this.loadTenants());
-    this.root.querySelector('#bind')?.addEventListener('click', () => void this.bind());
-    this.root.querySelector<HTMLSelectElement>('#tenant')?.addEventListener('change', (event) => {
-      const tenantId = (event.target as HTMLSelectElement).value;
-      const enabled = this.root.querySelector<HTMLInputElement>('#enabled')?.checked ?? true;
-      this.bindingDraft = { tenantId, enabled };
-    });
-    this.root.querySelector<HTMLInputElement>('#enabled')?.addEventListener('change', (event) => {
-      const enabled = (event.target as HTMLInputElement).checked;
-      const tenantId =
-        this.root.querySelector<HTMLSelectElement>('#tenant')?.value ?? this.bindingDraft?.tenantId ?? '';
-      this.bindingDraft = { tenantId, enabled };
-    });
     this.root.querySelector('#refresh-resource')?.addEventListener('click', () => void this.loadResource());
     this.root
       .querySelectorAll<HTMLButtonElement>('[data-resource]')
@@ -405,5 +336,5 @@ function parseResourceData(input: unknown): ResourceData {
     throw new Error('Invalid Microsoft resource response.');
   return value as unknown as ResourceData;
 }
-const styles = `:host{display:block;color:hsl(var(--foreground));font-family:var(--font-sans,system-ui)}*{box-sizing:border-box}main{max-width:1100px;margin:auto;padding:1.5rem}header,.heading,.actions{display:flex;justify-content:space-between;gap:1rem;align-items:flex-start}h1,h2,p{margin:0}h1{font-size:1.5rem}h2{font-size:1.1rem}.eyebrow{color:hsl(var(--primary));font-weight:700;font-size:.75rem;text-transform:uppercase;letter-spacing:.08em}.subtle,.read-only,.meta{color:hsl(var(--muted-foreground));font-size:.875rem;margin-top:.35rem}.status{min-height:1.4rem;margin-top:.75rem;color:hsl(var(--muted-foreground))}.status[data-error="true"]{color:hsl(var(--destructive))}.badge,.state{background:hsl(var(--muted));border-radius:999px;font-size:.8rem;font-weight:700;padding:.25rem .6rem}.badge.ok,.state.on{background:hsl(var(--success) / .16);color:hsl(var(--success))}.card{background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);margin-top:1.25rem;padding:1.25rem}nav,.resource-nav{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-top:1rem}.resource-nav span{color:hsl(var(--muted-foreground));font-size:.8rem;font-weight:700;margin-left:.5rem}.resource-nav button.selected{background:transparent;border-bottom:2px solid hsl(var(--primary));border-radius:0;color:hsl(var(--primary));padding-bottom:calc(.3rem - 2px)}label{display:grid;gap:.4rem;font-size:.875rem;font-weight:500;margin-top:1rem;max-width:440px}select,input{background:hsl(var(--background));border:1px solid hsl(var(--input));border-radius:calc(var(--radius,.5rem) - 2px);color:inherit;font:inherit;min-height:2.5rem;padding:.5rem .65rem}.check{display:flex;align-items:center;gap:.5rem}.check input{min-height:auto;width:1rem}.actions{justify-content:flex-end;margin-top:1rem}button{background:hsl(var(--primary));border:0;border-radius:calc(var(--radius,.5rem) - 2px);color:hsl(var(--primary-foreground));cursor:pointer;font:inherit;font-weight:700;min-height:2.5rem;padding:.5rem .85rem}button.secondary{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground))}button.compact{font-size:.8rem;min-height:2rem;padding:.3rem .6rem}button:disabled{opacity:.6;cursor:not-allowed}button:focus,input:focus,select:focus{outline:2px solid hsl(var(--ring));outline-offset:2px}.filter{max-width:320px}.table-wrap{overflow:auto;margin-top:1rem}table{color:hsl(var(--foreground));border-collapse:collapse;min-width:640px;width:100%}th,td{border-bottom:1px solid hsl(var(--border));padding:.7rem;text-align:left}th{color:hsl(var(--muted-foreground));font-size:.75rem;text-transform:uppercase}.empty{border:1px dashed hsl(var(--border));border-radius:var(--radius,.5rem);color:hsl(var(--muted-foreground));margin-top:1rem;padding:1.25rem;text-align:center}.sr-only{clip:rect(0,0,0,0);height:1px;margin:-1px;overflow:hidden;position:absolute;width:1px}.backdrop{background:hsl(var(--foreground) / .32);display:flex;inset:0;justify-content:flex-end;position:fixed;z-index:20}.drawer{background:hsl(var(--card));box-shadow:-8px 0 24px hsl(var(--foreground) / .16);max-width:min(100%,30rem);overflow:auto;padding:1.5rem;width:100%}dl{margin:1.5rem 0}dl div{border-bottom:1px solid hsl(var(--border));padding:.75rem 0}dt{color:hsl(var(--muted-foreground));font-size:.75rem;font-weight:700}dd{margin:.25rem 0 0;overflow-wrap:anywhere}@media(max-width:600px){main{padding:1rem}header,.heading{flex-direction:column}}`;
+const styles = `:host{display:block;color:hsl(var(--foreground));font-family:var(--font-sans,system-ui)}*{box-sizing:border-box}main{max-width:1100px;margin:auto;padding:1.5rem}header,.heading,.actions{display:flex;justify-content:space-between;gap:1rem;align-items:flex-start}h1,h2,p{margin:0}h1{font-size:1.5rem}h2{font-size:1.1rem}.eyebrow{color:hsl(var(--primary));font-weight:700;font-size:.75rem;text-transform:uppercase;letter-spacing:.08em}.subtle,.read-only,.meta{color:hsl(var(--muted-foreground));font-size:.875rem;margin-top:.35rem}.status{min-height:1.4rem;margin-top:.75rem;color:hsl(var(--muted-foreground))}.status[data-error="true"]{color:hsl(var(--destructive))}.badge,.state{background:hsl(var(--muted));border-radius:999px;font-size:.8rem;font-weight:700;padding:.25rem .6rem}.badge.ok,.state.on{background:hsl(var(--success) / .16);color:hsl(var(--success))}.setup-link{display:inline-block;background:hsl(var(--secondary));color:hsl(var(--secondary-foreground));border-radius:var(--radius,.5rem);padding:.5rem .85rem;text-decoration:none;font-weight:700}.card{background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);margin-top:1.25rem;padding:1.25rem}nav,.resource-nav{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-top:1rem}.resource-nav span{color:hsl(var(--muted-foreground));font-size:.8rem;font-weight:700;margin-left:.5rem}.resource-nav button.selected{background:transparent;border-bottom:2px solid hsl(var(--primary));border-radius:0;color:hsl(var(--primary));padding-bottom:calc(.3rem - 2px)}label{display:grid;gap:.4rem;font-size:.875rem;font-weight:500;margin-top:1rem;max-width:440px}select,input{background:hsl(var(--background));border:1px solid hsl(var(--input));border-radius:calc(var(--radius,.5rem) - 2px);color:inherit;font:inherit;min-height:2.5rem;padding:.5rem .65rem}.check{display:flex;align-items:center;gap:.5rem}.check input{min-height:auto;width:1rem}.actions{justify-content:flex-end;margin-top:1rem}button{background:hsl(var(--primary));border:0;border-radius:calc(var(--radius,.5rem) - 2px);color:hsl(var(--primary-foreground));cursor:pointer;font:inherit;font-weight:700;min-height:2.5rem;padding:.5rem .85rem}button.secondary{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground))}button.compact{font-size:.8rem;min-height:2rem;padding:.3rem .6rem}button:disabled{opacity:.6;cursor:not-allowed}button:focus,input:focus,select:focus{outline:2px solid hsl(var(--ring));outline-offset:2px}.filter{max-width:320px}.table-wrap{overflow:auto;margin-top:1rem}table{color:hsl(var(--foreground));border-collapse:collapse;min-width:640px;width:100%}th,td{border-bottom:1px solid hsl(var(--border));padding:.7rem;text-align:left}th{color:hsl(var(--muted-foreground));font-size:.75rem;text-transform:uppercase}.empty{border:1px dashed hsl(var(--border));border-radius:var(--radius,.5rem);color:hsl(var(--muted-foreground));margin-top:1rem;padding:1.25rem;text-align:center}.sr-only{clip:rect(0,0,0,0);height:1px;margin:-1px;overflow:hidden;position:absolute;width:1px}.backdrop{background:hsl(var(--foreground) / .32);display:flex;inset:0;justify-content:flex-end;position:fixed;z-index:20}.drawer{background:hsl(var(--card));box-shadow:-8px 0 24px hsl(var(--foreground) / .16);max-width:min(100%,30rem);overflow:auto;padding:1.5rem;width:100%}dl{margin:1.5rem 0}dl div{border-bottom:1px solid hsl(var(--border));padding:.75rem 0}dt{color:hsl(var(--muted-foreground));font-size:.75rem;font-weight:700}dd{margin:.25rem 0 0;overflow-wrap:anywhere}@media(max-width:600px){main{padding:1rem}header,.heading{flex-direction:column}}`;
 if (!customElements.get(ELEMENT)) customElements.define(ELEMENT, CloudCommandMicrosoftPage);
