@@ -1,6 +1,7 @@
 import type { Hono } from 'hono';
 import type { Variables } from './index';
 import { microsoftResources, projectMicrosoftResource, type MicrosoftResource, type NativeMicrosoftServices } from './native-microsoft';
+import { microsoftOnboardingStatus } from './onboarding';
 
 /** Native connection lifecycle remains owned by Breeze's Integrations surface. */
 export function mountMicrosoftRoutes(app: Hono<{ Variables: Variables }>, services?: NativeMicrosoftServices) {
@@ -17,6 +18,17 @@ export function mountMicrosoftRoutes(app: Hono<{ Variables: Variables }>, servic
     });
     return c.json(await services.connection({ auth: c.get('auth'), authorization: c.get('extensionAuthorization'), orgId: c.get('scope').organizationId }));
   });
+  app.get('/microsoft/onboarding', async c => c.json(await microsoftOnboardingStatus(services, {
+    auth: c.get('auth'), authorization: c.get('extensionAuthorization'), orgId: c.get('scope').organizationId,
+  })));
+  app.post('/microsoft/onboarding/recheck', async c => c.json(await microsoftOnboardingStatus(services, {
+    auth: c.get('auth'), authorization: c.get('extensionAuthorization'), orgId: c.get('scope').organizationId,
+  }, true)));
+  // Never initiate read-only consent and present it as consent for full administration.
+  app.post('/microsoft/onboarding/start', c => c.json({
+    error: 'Unified Microsoft administration onboarding is not available in this host yet.',
+    code: 'onboarding_unavailable',
+  }, 503));
   // Old clients must not silently create a second tenant mapping or revive CIPP.
   app.put('/microsoft/connection', c => c.json({ error: 'Manage the native Microsoft connection in Integrations.', code: 'native_connection_required' }, 409));
   app.get('/microsoft/tenants', c => c.json({ error: 'Manage the native Microsoft connection in Integrations.', code: 'native_connection_required' }, 409));

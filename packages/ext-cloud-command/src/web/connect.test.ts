@@ -120,7 +120,8 @@ describe('CloudCommandConnectPage', () => {
   it('selects native provider panels and restores them through hash navigation', async () => {
     const { page } = mount();
     page.shadowRoot!.querySelector<HTMLButtonElement>('[data-provider="microsoft"]')!.click();
-    expect(page.shadowRoot!.querySelector('a')!.getAttribute('href')).toBe('/integrations#m365');
+    expect(page.shadowRoot!.querySelector('cloudcommand-microsoft-connect')).toBeTruthy();
+    expect(page.shadowRoot!.querySelector('a')).toBeNull();
     window.history.replaceState({}, '', '/extensions/cloudcommand/connect#google');
     window.dispatchEvent(new HashChangeEvent('hashchange'));
     expect(page.shadowRoot!.querySelector('a')!.getAttribute('href')).toBe('/integrations#google');

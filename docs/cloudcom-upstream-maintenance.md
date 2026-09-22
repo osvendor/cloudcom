@@ -75,3 +75,7 @@ At the initial 2026-09-21 review, full CI was incomplete and an earlier Type Che
 ## Microsoft menu licensing boundary (2026-09-22)
 
 Planned extension expansion excludes premium-only features under [the menu scope](cloudcom-microsoft-menu-scope.md). Current four-resource navigation needs no removal. Preserve this boundary during upstream/CIPP imports; verify menus, nested actions and direct routes when implementing new features. Documentation-only change, no migration or deployment required; baseline 7e898d625c713d8521c561c2f28f3de8786fd7da, PR #16.
+
+## Inline Microsoft Connect readiness
+
+Implemented extension-only first stage in `packages/ext-cloud-command/src/web/microsoft-connect.ts`, Connect child lifecycle, and `src/server/onboarding.ts`/Microsoft routes. The same authenticated organization bridge supplies status and recheck; write/MFA gateway controls apply to POST. No new credentials, mappings, migrations or host-profile changes. Full onboarding remains incomplete and start is unavailable. Preserve organization-switch and provider-switch stale-response protection, and never equate successful inventory verification with administrative readiness. Recovery is an extension bundle rollback; no data migration.
