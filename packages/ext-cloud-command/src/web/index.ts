@@ -1,6 +1,9 @@
 import './overview';
 import './microsoft';
 import './connect';
+import { bindThreeCxDetail, detailStyles, detailTab, isDirty, renderThreeCxDetail, type DetailTab } from './threecx-detail';
+import { hasForwardingChanges, mountForwardingEditors } from './threecx-detail-forwarding';
+import type { ThreeCxDetail, ThreeCxDetailChanges } from '../threecx/detail-contract';
 import {
   dispatchExtensionHostEvent,
   parseExtensionPageContextV1,
@@ -70,7 +73,11 @@ export class CloudCommandThreeCxPage extends HTMLElement {
   /** Keeps an empty completed directory distinct from a directory not yet read. */
   private usersLoaded = false;
   private nextSkip: number | null = null;
-  private detailIndex: number | null = null;
+  private detailId: number | null = null;
+  private detail: ThreeCxDetail | null = null;
+  private detailTab: DetailTab = 'general';
+  private detailDraft: ThreeCxDetailChanges = {};
+  private detailRequest = 0;
   private focusReturnIndex: number | null = null;
   private busy = false;
   private statusMessage = '';
@@ -95,7 +102,8 @@ export class CloudCommandThreeCxPage extends HTMLElement {
   set context(input: unknown) {
     const context = parseExtensionPageContextV1(input);
     if (context.extensionName !== 'cloudcommand') throw new Error('Cloud Command received the wrong extension context');
-    const changedOrganization = this.pageContext?.organizationId !== context.organizationId;
+    const previousOrganization = this.pageContext?.organizationId;
+    const changedOrganization = previousOrganization !== context.organizationId;
     this.generation += 1;
     this.pageContext = context;
     this.microsoftNavigationVisible = false;
@@ -109,11 +117,12 @@ export class CloudCommandThreeCxPage extends HTMLElement {
       this.users = [];
       this.usersLoaded = false;
       this.nextSkip = null;
-      this.detailIndex = null;
+      this.clearDetail();
       this.focusReturnIndex = null;
       this.busy = false;
       this.statusMessage = '';
       this.statusIsError = false;
+      if (previousOrganization && this.mode !== 'configuration' && window.location.hash.includes('extension=')) window.location.hash = '';
       if (this.isConnected) this.render(false);
     }
     // A same-organization context refresh must not replace an unsaved draft.
@@ -131,12 +140,17 @@ export class CloudCommandThreeCxPage extends HTMLElement {
 
   connectedCallback(): void {
     this.render();
+    window.addEventListener('hashchange', this.onHashChange);
+    window.addEventListener('beforeunload', this.onBeforeUnload);
+    if (this.mode !== 'configuration') this.applyHash();
     if (this.pageContext) void this.loadConnection();
   }
 
   disconnectedCallback(): void {
     this.generation += 1;
     this.busy = false;
+    window.removeEventListener('hashchange', this.onHashChange);
+    window.removeEventListener('beforeunload', this.onBeforeUnload);
   }
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -189,6 +203,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
   }
 
   private setStatus(message: string, error = false): void {
+    if (this.detailId !== null && /^(Loading connection|Connection loaded|Loading extensions|\d+ extension)/.test(message)) return;
     this.statusMessage = message;
     this.statusIsError = error;
     const node = this.root.querySelector<HTMLElement>('[data-status]');
@@ -273,7 +288,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
       this.users = [];
       this.usersLoaded = false;
       this.nextSkip = null;
-      this.detailIndex = null;
+      this.clearDetail();
       this.focusReturnIndex = null;
       // The only browser copy of a secret is a pending form draft. Erase it
       // after the server accepted the update; retain it on all failed saves.
@@ -318,20 +333,114 @@ export class CloudCommandThreeCxPage extends HTMLElement {
   }
 
   private openDetails(index: number): void {
-    if (!this.users[index]) return;
-    this.detailIndex = index;
+    const user = this.users[index];
+    if (!user) return;
     this.focusReturnIndex = index;
-    this.render();
-    queueMicrotask(() => this.root.querySelector<HTMLButtonElement>('#details-close')?.focus());
+    window.location.hash = `extension=${encodeURIComponent(String(user.Id))}&tab=general`;
   }
 
-  private closeDetails(): void {
+  private clearDetail(): void {
+    this.detailRequest += 1;
+    this.detailId = null;
+    this.detail = null;
+    this.detailDraft = {};
+    this.detailTab = 'general';
+  }
+
+  private closeDetails(force = false): void {
+    if (!force && isDirty(this.detailDraft) && !window.confirm('Discard unsaved extension changes?')) return;
     const returnIndex = this.focusReturnIndex;
-    this.detailIndex = null;
+    this.clearDetail();
+    if (window.location.hash.includes('extension=')) window.location.hash = '';
     this.render();
     if (returnIndex !== null) {
       queueMicrotask(() => this.root.querySelector<HTMLButtonElement>(`[data-detail-index="${returnIndex}"]`)?.focus());
     }
+  }
+
+  private readonly onHashChange = (): void => this.applyHash();
+  private readonly onBeforeUnload = (event: BeforeUnloadEvent): void => { if (isDirty(this.detailDraft)) { event.preventDefault(); event.returnValue = ''; } };
+
+  private applyHash(): void {
+    if (this.mode === 'configuration') return;
+    const params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+    const rawId = params.get('extension');
+    const id = rawId && /^\d+$/.test(rawId) ? Number(rawId) : null;
+    const tab = detailTab(params.get('tab'));
+    if (id === this.detailId) { if (this.detailTab !== tab) { this.detailTab = tab; this.render(); } return; }
+    if (isDirty(this.detailDraft) && !window.confirm('Discard unsaved extension changes?')) {
+      window.location.hash = this.detailId === null ? '' : `extension=${this.detailId}&tab=${this.detailTab}`;
+      return;
+    }
+    if (id === null) { this.clearDetail(); this.render(); return; }
+    this.detailId = id;
+    this.detailTab = tab;
+    this.detail = null;
+    this.detailDraft = {};
+    this.render();
+    void this.loadDetail(id);
+  }
+
+  private async loadDetail(id: number, afterSave = false): Promise<void> {
+    const generation = this.generation;
+    const context = this.pageContext;
+    const request = ++this.detailRequest;
+    this.setStatus('Loading extension details…');
+    try {
+      const detail = await this.request<ThreeCxDetail>(this.url(`/users/${id}`));
+      if (!this.isCurrent(generation, context) || this.detailId !== id || request !== this.detailRequest) return;
+      this.detail = detail;
+      this.setStatus(afterSave ? 'Extension changes saved.' : 'Extension loaded.');
+      this.render();
+    } catch (error) {
+      if (this.isCurrent(generation, context) && this.detailId === id && request === this.detailRequest) this.setStatus(error instanceof Error ? error.message : 'Could not load extension details.', true);
+    }
+  }
+
+  private changeDetail(key: keyof ThreeCxDetailChanges, value: string | boolean): void {
+    if (!this.detail || this.busy) return;
+    const existing = this.detail.user[key];
+    if (existing === value || (existing == null && value === '')) delete this.detailDraft[key];
+    else this.detailDraft[key] = value as never;
+    const dirty = this.root.querySelector<HTMLElement>('[data-detail-dirty]');
+    if (dirty) dirty.textContent = isDirty(this.detailDraft) ? 'Pending changes' : '';
+    this.root.querySelector<HTMLButtonElement>('#detail-discard')?.toggleAttribute('disabled', !isDirty(this.detailDraft));
+    this.root.querySelector<HTMLButtonElement>('#detail-save')?.toggleAttribute('disabled', !isDirty(this.detailDraft));
+  }
+
+  private changeForwarding(profiles: NonNullable<ThreeCxDetailChanges['ForwardingProfiles']>): void {
+    if (this.busy) return;
+    this.detailDraft.ForwardingProfiles = profiles.length ? profiles : undefined;
+    if (!profiles.length) delete this.detailDraft.ForwardingProfiles;
+    const dirty = this.root.querySelector<HTMLElement>('[data-detail-dirty]');
+    if (dirty) dirty.textContent = isDirty(this.detailDraft) ? 'Pending changes' : '';
+    this.root.querySelector<HTMLButtonElement>('#detail-discard')?.toggleAttribute('disabled', !isDirty(this.detailDraft));
+    this.root.querySelector<HTMLButtonElement>('#detail-save')?.toggleAttribute('disabled', !isDirty(this.detailDraft));
+  }
+
+  private discardDetail(): void { this.detailDraft = {}; this.setStatus('Extension changes discarded.'); this.render(); }
+
+  private async saveDetail(): Promise<void> {
+    if (this.busy) return;
+    for (const input of this.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-detail-field], [data-forwarding-field]')) {
+      if (!input.disabled && !input.reportValidity()) return;
+    }
+    this.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-detail-field]').forEach((input) => this.changeDetail(input.dataset.detailField as keyof ThreeCxDetailChanges, input instanceof HTMLInputElement && input.type === 'checkbox' ? input.checked : input.value));
+    if (!this.detail || !isDirty(this.detailDraft)) return;
+    const forwarding = hasForwardingChanges(this.detailDraft);
+    const scalar = Object.keys(this.detailDraft).some((key) => key !== 'ForwardingProfiles');
+    if (forwarding && scalar) { this.setStatus('Save or discard forwarding changes before saving other settings.', true); return; }
+    if (this.detailDraft.VMEmailOptions === 'AttachmentAndDelete' && !window.confirm('Attach recording and delete removes the PBX copy after email delivery. Save this change?')) return;
+    const id = this.detailId;
+    const generation = this.generation;
+    const context = this.pageContext;
+    await this.withBusy(async () => {
+      await this.request<{ success: true }>(this.url(`/users/${this.detail!.user.Id}`), { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ revision: this.detail!.revision, changes: this.detailDraft }) });
+      if (!this.isCurrent(generation, context) || this.detailId !== id) return;
+      this.detailDraft = {};
+      this.setStatus('Extension changes saved.');
+      await this.loadDetail(id!, true);
+    }, 'Could not save extension changes.', generation, context);
   }
 
   private draftFromConnection(connection: Connection, secret: string): ConnectionDraft {
@@ -370,11 +479,11 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     const selectedDepartment = draft.departmentId;
     const groupsMatchDraft = this.groupsFor?.origin === draft.origin && this.groupsFor.clientId === draft.clientId;
     const groups = groupsMatchDraft ? this.groups : typeof this.connection.departmentId === 'number' && this.connection.origin === draft.origin && this.connection.clientId === draft.clientId ? [{ id: this.connection.departmentId, name: `Department ${this.connection.departmentId}` }] : [];
-    const detail = this.detailIndex === null ? null : this.users[this.detailIndex] ?? null;
+    const detail = this.detail;
     this.root.innerHTML = `
-      <style>${styles}${this.mode === 'configuration' ? ':host([data-display-mode="configuration"]) main{max-width:none;margin:0;padding:0}' : ''}</style>
-      <main aria-labelledby="title">
-        <header><div><p class="eyebrow">Cloud Command</p><h1 id="title">${showConfiguration && !showDirectory ? 'Connect 3CX' : '3CX extensions'}</h1><p class="subtle">${showConfiguration && !showDirectory ? 'Connect one organization’s 3CX PBX and select its access scope.' : 'Review extensions from the configured 3CX scope.'}</p></div><span class="badge ${connected && connectionEnabled ? 'ok' : connected ? 'disabled' : ''}">${connected ? (connectionEnabled ? 'Connected' : 'Disabled') : 'Not connected'}</span></header>
+      <style>${styles}${detailStyles}${this.mode === 'configuration' ? ':host([data-display-mode="configuration"]) main{max-width:none;margin:0;padding:0}' : ''}</style>
+      <main aria-labelledby="${detail || this.detailId !== null ? 'detail-title' : 'title'}">
+        ${detail ? renderThreeCxDetail(detail, this.detailTab, this.detailDraft, this.busy, this.statusMessage, this.statusIsError) : this.detailId !== null ? `<section class="threecx-detail" aria-labelledby="detail-title"><button class="secondary compact" id="detail-back" type="button">Back to extensions</button><h2 id="detail-title">Extension details</h2><p class="status" data-status data-error="${this.statusIsError}" aria-live="polite">${escapeHtml(this.statusMessage || 'Loading extension details…')}</p><button class="secondary" id="detail-retry" type="button">Retry</button></section>` : `<header><div><p class="eyebrow">Cloud Command</p><h1 id="title">${showConfiguration && !showDirectory ? 'Connect 3CX' : '3CX extensions'}</h1><p class="subtle">${showConfiguration && !showDirectory ? 'Connect one organization’s 3CX PBX and select its access scope.' : 'Review extensions from the configured 3CX scope.'}</p></div><span class="badge ${connected && connectionEnabled ? 'ok' : connected ? 'disabled' : ''}">${connected ? (connectionEnabled ? 'Connected' : 'Disabled') : 'Not connected'}</span></header>
         <nav aria-label="Cloud Command providers">${this.microsoftNavigationVisible ? '<button class="secondary compact" id="go-microsoft" type="button">Microsoft 365</button>' : ''}</nav>
         <p class="status" data-status data-error="${this.statusIsError}" aria-live="polite">${escapeHtml(this.statusMessage)}</p>
         ${showConfiguration ? `<section class="card" aria-labelledby="connection-heading">
@@ -397,7 +506,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
           ${this.users.length ? `<div class="table-wrap"><table><thead><tr><th>Extension</th><th>Name</th><th>Email</th><th>Status</th><th><span class="sr-only">Details</span></th></tr></thead><tbody>${this.users.map((user, index) => `<tr><td>${escapeHtml(user.Number)}</td><td>${escapeHtml([user.FirstName, user.LastName].filter(Boolean).join(' ') || '—')}</td><td>${escapeHtml(user.EmailAddress || '—')}</td><td><span class="state ${user.Enabled ? 'on' : ''}">${user.Enabled ? 'Enabled' : 'Disabled'}</span></td><td><button class="secondary compact" type="button" data-detail-index="${index}">View details</button></td></tr>`).join('')}</tbody></table></div>` : `<div class="empty">${connected ? connectionEnabled ? this.usersLoaded ? 'No extensions found.' : 'No extensions loaded yet.' : 'This connection is disabled.' : 'Save a connection to view extensions.'}</div>`}
           ${this.nextSkip !== null ? `<button class="secondary more" id="more-users" type="button" ${!canReadUsers || this.busy ? 'disabled' : ''}>Load more</button>` : ''}
         </section>` : ''}
-        ${detail ? `<div class="drawer-layer" data-details-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="details-title"><div class="drawer-header"><div><p class="eyebrow">Extension</p><h2 id="details-title">${escapeHtml(detail.Number)}</h2></div><button class="secondary compact" id="details-close" type="button" aria-label="Close extension details">Close</button></div><dl class="detail-list"><div><dt>Name</dt><dd>${escapeHtml([detail.FirstName, detail.LastName].filter(Boolean).join(' ') || '—')}</dd></div><div><dt>Email</dt><dd>${escapeHtml(detail.EmailAddress || '—')}</dd></div><div><dt>Mobile</dt><dd>${escapeHtml(detail.Mobile || '—')}</dd></div><div><dt>Enabled</dt><dd>${detail.Enabled ? 'Enabled' : 'Disabled'}</dd></div><div><dt>Registered</dt><dd>${detail.IsRegistered ? 'Registered' : 'Not registered'}</dd></div><div><dt>Profile</dt><dd>${escapeHtml(detail.CurrentProfileName || '—')}</dd></div></dl></aside></div>` : ''}
+        `}
       </main>`;
     this.root.querySelector('#full-pbx')?.addEventListener('change', () => { const select = this.requireInput('departmentId'); select.toggleAttribute('disabled', this.root.querySelector<HTMLInputElement>('#full-pbx')!.checked); });
     this.root.querySelector('#test')?.addEventListener('click', () => void this.testConnection());
@@ -405,10 +514,20 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     this.root.querySelector('#refresh-users')?.addEventListener('click', () => void this.loadUsers(true));
     this.root.querySelector('#more-users')?.addEventListener('click', () => void this.loadUsers(false));
     this.root.querySelectorAll<HTMLButtonElement>('[data-detail-index]').forEach((button) => button.addEventListener('click', () => this.openDetails(Number(button.dataset.detailIndex))));
-    this.root.querySelector('#details-close')?.addEventListener('click', () => this.closeDetails());
+    if (detail) bindThreeCxDetail(this.root, { back: () => this.closeDetails(), discard: () => this.discardDetail(), save: () => void this.saveDetail(), tab: (tab) => { this.detailTab = tab; if (this.detailId !== null) window.location.hash = `extension=${this.detailId}&tab=${tab}`; this.render(); }, change: (key, value) => this.changeDetail(key, value) });
+    if (detail && this.detailTab === 'forwarding') {
+      const scalarDirty = Object.keys(this.detailDraft).some((key) => key !== 'ForwardingProfiles');
+      mountForwardingEditors(this.root, detail.forwardingProfiles, this.detailDraft, detail.editable.forwarding, scalarDirty, (profiles) => this.changeForwarding(profiles));
+    }
+    if (this.busy) this.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-detail-field], [data-forwarding-field]').forEach(input => { input.disabled = true; });
+    if (detail && hasForwardingChanges(this.detailDraft) && this.detailTab !== 'forwarding') {
+      this.root.querySelectorAll<HTMLInputElement | HTMLSelectElement>('[data-detail-field]').forEach((input) => { input.disabled = true; });
+      this.root.querySelector('.detail-panel')?.insertAdjacentHTML('afterbegin', '<p class="readonly-note">Save or discard forwarding changes before editing other settings.</p>');
+    }
+    if (detail?.notices.length) this.root.querySelector('.detail-panel')?.insertAdjacentHTML('afterbegin', detail.notices.map((notice) => `<p class="readonly-note">${escapeHtml(notice)}</p>`).join(''));
+    if (!detail) this.root.querySelector('#detail-back')?.addEventListener('click', () => this.closeDetails());
+    this.root.querySelector('#detail-retry')?.addEventListener('click', () => { if (this.detailId !== null) void this.loadDetail(this.detailId); });
     this.root.querySelector('#go-microsoft')?.addEventListener('click', () => dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path: '/extensions/cloudcommand/microsoft' }));
-    this.root.querySelector('[data-details-backdrop]')?.addEventListener('click', (event) => { if (event.target === event.currentTarget) this.closeDetails(); });
-    this.root.querySelector<HTMLElement>('[role="dialog"]')?.addEventListener('keydown', (event) => { if (event.key === 'Escape') { event.preventDefault(); this.closeDetails(); } else if (event.key === 'Tab') { event.preventDefault(); this.root.querySelector<HTMLButtonElement>('#details-close')?.focus(); } });
   }
 }
 

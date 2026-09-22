@@ -15,13 +15,31 @@ UniFi-style discovery or matching is required. Existing organizations remain the
 authoritative client records.
 
 The first slice provides connection verification, accessible department discovery,
-a paginated read-only extension list, and a read-only details drawer. When an
-enabled connection opens in the directory or combined view, the first extension
-page loads automatically; Refresh remains available for a later read. Configuration-only
-views and disabled connections do not issue extension reads. Whole-PBX
-access is an explicit choice; selecting a department filters the returned users.
-This does not establish a permission boundary for future call reports. PBX user
-editing, routing, queues, reports and telephony mutations are not implemented.
+a paginated extension list, and a full-page extension detail view. When an enabled
+connection opens in the directory or combined view, the first extension page loads
+automatically; Refresh remains available for a later read. Configuration-only views
+and disabled connections do not issue extension reads. Whole-PBX access is an
+explicit choice; selecting a department filters the returned users. This does not
+establish a permission boundary for future call reports.
+
+The detail view has General, Call Forwarding, IP Phone, BLF, Voicemail, Schedule,
+3CX Talk, and View & Options tabs. The server returns a positive, redacted
+projection of the provider response; unsupported or unavailable values are shown as
+read-only notices. General and Voicemail fields, plus the supported ring controls in
+Call Forwarding, can be edited for users with organization write access and a
+verified MFA session. IP Phone, BLF, forwarding destinations and exceptions,
+Schedule, 3CX Talk, View & Options, and assigned DID/routing ownership remain
+read-only or unavailable. BLF is displayed only when the provider response matches
+the verified empty envelope; arbitrary BLF XML is not parsed or round-tripped.
+
+Updates are deliberately narrow. A save carries the detail revision and the
+selected fields, rechecks the organization connection/version, rejects mixed scalar
+and forwarding saves, and targets exactly one extension. Forwarding updates merge
+only known profile IDs and require a reload afterward because the provider can
+regenerate profile IDs. The revision is a preflight comparison: 3CX does not
+document conditional PATCH, so it is not an ETag and does not make the provider
+operation atomic against an external concurrent edit. PBX user editing outside these
+fields, queues, reports, and other telephony mutations are unavailable.
 
 The provider uses the documented 3CX V20 Configuration API client-credentials flow:
 https://www.3cx.com/docs/configuration-rest-api/
@@ -118,6 +136,13 @@ scope, successful list/details display, unauthorized/cross-org denial and disabl
 re-enable behavior without changing PBX settings. Legacy credential reuse requires
 an explicit organization mapping; do not infer that the old default department
 belongs to every client.
+
+Provider proof for the implemented narrow updates was completed against a
+user-authorized dedicated test extension: an identity/voicemail PATCH and a
+forwarding update through `Users/Pbx.MultiUserUpdate` both succeeded and were
+restored afterward. The proof used no production or customer identifiers. It does
+not establish atomic stale-write protection, ETag support, or deployment readiness.
+This revision is implemented and locally verified, but not deployed.
 
 ## Extension menu design
 

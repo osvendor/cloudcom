@@ -13,7 +13,10 @@ export function createProvider(fetch: GuardedFetch) {
       const response = await fetch(url, { ...init, signal, redirect: 'error', timeoutMs: 15000, maxBytes: 2 * 1024 * 1024 });
       if (response.status === 401 || response.status === 403) throw new ProviderError('provider_access_denied');
       if (response.status === 429) throw new ProviderError('provider_rate_limited');
+      if (response.status === 404) throw new ProviderError('provider_not_found');
+      if (response.status === 409 || response.status === 412) throw new ProviderError('provider_conflict');
       if (!response.ok || response.status >= 300) throw new ProviderError('provider_request_failed');
+      if (response.status === 204) return {};
       return await response.json() as Record<string, unknown>;
     } catch (error) {
       if (error instanceof ProviderError) throw error;
@@ -52,6 +55,30 @@ export function createProvider(fetch: GuardedFetch) {
       const { origin, headers } = await session(credentials, signal);
       const params = new URLSearchParams(Object.entries(query).map(([key, value]) => [key, String(value)]));
       return json(`${origin}/xapi/v1/Users?${params}`, { headers }, signal);
+    },
+    async user(credentials: Credentials, id: number, query: Record<string, string>) {
+      if (!Number.isSafeInteger(id) || id < 0 || id > 2147483647) throw new ProviderError('invalid_user');
+      const signal = AbortSignal.timeout(30000);
+      const { origin, headers } = await session(credentials, signal);
+      const params = new URLSearchParams(query);
+      return json(`${origin}/xapi/v1/Users(${id})?${params}`, { headers }, signal);
+    },
+    async updateUser(credentials: Credentials, id: number, changes: Record<string, unknown>) {
+      if (!Number.isSafeInteger(id) || id < 0 || id > 2147483647) throw new ProviderError('invalid_user');
+      const signal = AbortSignal.timeout(30000);
+      const { origin, headers } = await session(credentials, signal);
+      await json(`${origin}/xapi/v1/Users(${id})`, {
+        method: 'PATCH', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify(changes),
+      }, signal);
+    },
+    async updateForwarding(credentials: Credentials, id: number, profiles: Record<string, unknown>[]) {
+      if (!Number.isSafeInteger(id) || id < 0 || id > 2147483647) throw new ProviderError('invalid_user');
+      const signal = AbortSignal.timeout(30000);
+      const { origin, headers } = await session(credentials, signal);
+      await json(`${origin}/xapi/v1/Users/Pbx.MultiUserUpdate`, {
+        method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: [id], user: { ForwardingProfiles: profiles } }),
+      }, signal);
     },
   };
 }
