@@ -189,6 +189,70 @@ describe('CloudCommandThreeCxPage', () => {
     expect(page.shadowRoot!.querySelector('#origin')).toBeTruthy();
   });
 
+  it('drops a delayed connection test after the organization changes', async () => {
+    let resolveTest!: (response: Response) => void;
+    const page = mount({ request: (path) => {
+      if (path === '/threecx/test') return new Promise<Response>((resolve) => { resolveTest = resolve; });
+      if (path === '/microsoft/connection') return Promise.resolve(Response.json({ available: false, connected: false, canManage: false }));
+      return Promise.resolve(Response.json({ connected: false, canManage: true }));
+    } });
+    await flush();
+    let root = page.shadowRoot!;
+    (root.querySelector('#origin') as HTMLInputElement).value = 'https://old.example.com';
+    (root.querySelector('#clientId') as HTMLInputElement).value = 'old-client';
+    (root.querySelector('#test') as HTMLButtonElement).click();
+    await flush();
+    page.context = { ...context, organizationId: 'org-2' };
+    resolveTest(Response.json({ success: true, groups: [{ id: 7, name: 'Old organization group' }] }));
+    await flush(); await flush();
+    root = page.shadowRoot!;
+    expect(root.textContent).not.toContain('Old organization group');
+    expect((root.querySelector<HTMLInputElement>('#origin') as HTMLInputElement).value).toBe('');
+    expect(root.querySelector<HTMLButtonElement>('#test')!.disabled).toBe(false);
+  });
+
+  it('drops a delayed connection save after the organization changes', async () => {
+    let resolveSave!: (response: Response) => void;
+    const page = mount({ request: (path, init) => {
+      if (path === '/threecx/connection' && init?.method === 'PUT') return new Promise<Response>((resolve) => { resolveSave = resolve; });
+      if (path === '/microsoft/connection') return Promise.resolve(Response.json({ available: false, connected: false, canManage: false }));
+      return Promise.resolve(Response.json({ connected: false, canManage: true }));
+    } });
+    await flush();
+    let root = page.shadowRoot!;
+    (root.querySelector('#origin') as HTMLInputElement).value = 'https://old.example.com';
+    (root.querySelector('#clientId') as HTMLInputElement).value = 'old-client';
+    (root.querySelector('#full-pbx') as HTMLInputElement).checked = true;
+    (root.querySelector('#save') as HTMLButtonElement).click();
+    await flush();
+    page.context = { ...context, organizationId: 'org-2' };
+    resolveSave(Response.json({ connected: true, canManage: true, origin: 'https://old.example.com', clientId: 'old-client', enabled: true }));
+    await flush(); await flush();
+    root = page.shadowRoot!;
+    expect(root.textContent).not.toContain('old.example.com');
+    expect((root.querySelector<HTMLInputElement>('#origin') as HTMLInputElement).value).toBe('');
+    expect(root.querySelector<HTMLButtonElement>('#save')!.disabled).toBe(false);
+  });
+
+  it('drops a delayed extension response after the organization changes', async () => {
+    let resolveUsers!: (response: Response) => void;
+    const page = mount({ request: (path) => {
+      if (path === '/threecx/users?skip=0') return new Promise<Response>((resolve) => { resolveUsers = resolve; });
+      if (path === '/microsoft/connection') return Promise.resolve(Response.json({ available: false, connected: false, canManage: false }));
+      return Promise.resolve(Response.json({ connected: true, canManage: false, enabled: true }));
+    } });
+    await flush();
+    let root = page.shadowRoot!;
+    (root.querySelector('#refresh-users') as HTMLButtonElement).click();
+    await flush();
+    page.context = { ...context, organizationId: 'org-2' };
+    resolveUsers(Response.json({ items: [{ Id: 9, Number: '999', FirstName: 'Old', LastName: 'Extension', EmailAddress: null, Mobile: null, Enabled: true, IsRegistered: true, CurrentProfileName: null }], nextSkip: null, truncated: false }));
+    await flush(); await flush();
+    root = page.shadowRoot!;
+    expect(root.textContent).not.toContain('Old Extension');
+    expect(root.querySelector<HTMLButtonElement>('#refresh-users')!.disabled).toBe(false);
+  });
+
   it('opens read-only details in a drawer and restores focus when Escape closes it', async () => {
     const page = mount({ request: async (path) => path === '/threecx/users?skip=0'
       ? Response.json({ items: [{ Id: 1, Number: '100', FirstName: 'Ada', LastName: 'Lovelace', EmailAddress: 'ada@example.com', Mobile: '555-0100', Enabled: true, IsRegistered: true, CurrentProfileName: 'Default' }], nextSkip: null, truncated: false })

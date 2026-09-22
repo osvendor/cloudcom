@@ -23,6 +23,11 @@
     "entry": "web/index.js",
     "pages": [
       {
+        "id": "overview",
+        "path": "/overview",
+        "element": "cloudcommand-overview-page"
+      },
+      {
         "id": "threecx",
         "path": "/threecx",
         "element": "cloudcommand-threecx-page"
@@ -35,9 +40,9 @@
     ],
     "navigation": [
       {
-        "id": "threecx",
+        "id": "overview",
         "label": "Cloud Command",
-        "path": "/threecx",
+        "path": "/overview",
         "order": 100
       }
     ],

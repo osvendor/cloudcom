@@ -77,7 +77,7 @@ Provider bodies, secrets and tokens never enter logs or error responses.
 
 ## Validation status
 
-The Linux VM passed 57 server tests, 23 UI tests, four database integration tests,
+The Linux VM passed 57 server tests, 30 UI tests, four database integration tests,
 103 RLS coverage checks, API/web builds and synthetic Chromium light/dark/mobile
 checks. These counts describe the initial candidate; later focused tests may add
 coverage. No live CIPP backend or Microsoft tenant has been certified by these
@@ -116,3 +116,11 @@ real breeze_app RLS. Repeat affected contracts after each Breeze/CIPP upgrade.
 - https://docs.cipp.app/user-documentation/cipp/integrations/cipp-api
 - https://docs.cipp.app/setup/setting-up-cipp/install
 - https://github.com/KelvinTegelaar/CIPP-API/tree/c04bde0f4b53280c1ed21d838ba2c4bbcfc8a600
+
+## Organization entry page
+
+Extensions â†’ Cloud Command opens a provider overview for the selected organization.
+Readers see only enabled providers; managers can reopen available provider setup.
+Microsoft stays hidden until its partner backend is configured. Existing provider
+deep links remain stable. Switching organizations clears pending drafts and data
+and invalidates old requests before displaying the next organization.

@@ -124,7 +124,9 @@
         "packages/ext-cloud-command/src/server/microsoft.ts",
         "packages/ext-cloud-command/src/web/microsoft.ts",
         "packages/ext-cloud-command/migrations/2026-09-22-microsoft-connections.sql",
-        "docs/cloudcom-microsoft365.md"
+        "docs/cloudcom-microsoft365.md",
+        "packages/ext-cloud-command/src/web/overview.ts",
+        "packages/ext-cloud-command/src/web/overview.test.ts"
       ],
       "hooks": [
         {
