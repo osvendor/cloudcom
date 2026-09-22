@@ -46,13 +46,15 @@ PostgreSQL connection; the worker health check runs `ak healthcheck`.
 
 ## Initial setup and owner handoff
 
-Open the configured Authentik hostname through the private proxy and complete
-the `initial-setup/` flow (the trailing slash is required). Set the initial
+Open the root URL of the configured Authentik hostname through the private proxy
+and follow its setup redirect. The pinned release rejects a direct uninitialized
+`/if/flow/initial-setup/` visit. Set the initial
 `akadmin` password interactively and store it in the approved credential store.
 Then create at least one separately held break-glass administrator and confirm
 both admin sign-ins before handing the service to the owner. Retain the two
 secret files and database volume for backup and recovery; changing the Authentik
-secret key invalidates active sessions.
+secret key invalidates active sessions. Use the currently reachable private Base
+URL during staging; change it to the verified public identity hostname at cutover.
 
 For this deployment, Cloudflare is used with **password-only SHARED COMPANY
 accounts**. Create only the explicitly approved company accounts and use the
