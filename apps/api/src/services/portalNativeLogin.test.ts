@@ -54,7 +54,7 @@ describe('native browser PKCE handoff', () => {
     const exchange = await issue();
     const result = await exchangeNativeLoginCode(exchange);
     expect(result).toMatchObject({ tokenType: 'Bearer', expiresIn: NATIVE_SESSION_SECONDS });
-    expect(result?.accessToken).toMatch(/^ccn1_[A-Za-z0-9_-]{43}$/);
+    expect(result?.accessToken).toMatch(/^ccn1\.[A-Za-z0-9_-]{43}$/);
     expect(JSON.stringify(result)).not.toContain(parentToken);
     const session = JSON.parse(redis.values.get(`portal:session:${result!.accessToken}`)!);
     expect(session).toEqual({ ...principal, nativeClientId: NATIVE_CLIENT_ID,
@@ -92,7 +92,7 @@ describe('native browser PKCE handoff', () => {
     expect(await exchangeNativeLoginCode(exchange)).toBeNull();
   });
   it('limits native sessions to bearer remote APIs with a hard lifetime', () => {
-    const token = 'ccn1_' + Buffer.alloc(32, 1).toString('base64url');
+    const token = 'ccn1.' + Buffer.alloc(32, 1).toString('base64url');
     const session = { ...principal, nativeClientId: NATIVE_CLIENT_ID, nativeExpiresAt: Date.now() + 1000 };
     expect(nativeSessionAllows(token, session, 'GET', '/api/v1/portal/remote/devices', true)).toBe(true);
     expect(nativeSessionAllows(token, session, 'GET', '/api/v1/portal/remote/devices', false)).toBe(false);
@@ -103,5 +103,6 @@ describe('native browser PKCE handoff', () => {
     vi.advanceTimersByTime(1000);
     expect(nativeSessionAllows(token, session, 'GET', '/api/v1/portal/remote/devices', true)).toBe(false);
     expect(nativeSessionAllows(parentToken, principal, 'GET', '/api/v1/portal/profile', false)).toBe(true);
+    expect(nativeSessionAllows('ccn1_' + 'A'.repeat(43), principal, 'GET', '/api/v1/portal/profile', false)).toBe(true);
   });
 });

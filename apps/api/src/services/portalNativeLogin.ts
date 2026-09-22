@@ -2,7 +2,8 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { getRedis } from './redis';
 
 export const NATIVE_CLIENT_ID = 'cloudcom-rustdesk-v1';
-export const NATIVE_SESSION_PREFIX = 'ccn1_';
+// The dot cannot occur in existing nanoid browser-session tokens.
+export const NATIVE_SESSION_PREFIX = 'ccn1.';
 export const NATIVE_SESSION_SECONDS = 12 * 60 * 60;
 const CODE_SECONDS = 60;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
