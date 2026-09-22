@@ -30,7 +30,9 @@ describe('CloudCommandThreeCxPage', () => {
   it('keeps the operational route directory-only', async () => {
     const page = new CloudCommandThreeCxPage();
     page.context = context;
-    page.hostApi = { request: async () => Response.json({ connected: true, canManage: true, enabled: true }) };
+    page.hostApi = { request: async (path) => path === '/threecx/users?skip=0'
+      ? Response.json({ items: [], nextSkip: null, truncated: false })
+      : Response.json({ connected: true, canManage: true, enabled: true }) };
     document.body.append(page);
     await flush();
     const root = page.shadowRoot!;
@@ -38,6 +40,27 @@ describe('CloudCommandThreeCxPage', () => {
     expect(root.querySelector('#connection-heading')).toBeNull();
     expect(root.querySelector('#refresh-users')).toBeTruthy();
     expect(root.querySelector('#configure-3cx')).toBeNull();
+  });
+
+  it('automatically reads the first extension page for an enabled combined view', async () => {
+    const request = vi.fn(async (path: string) => path === '/threecx/users?skip=0'
+      ? Response.json({ items: [{ Id: 1, Number: '100', FirstName: 'Ada', LastName: 'Lovelace', EmailAddress: null, Mobile: null, Enabled: true, IsRegistered: true, CurrentProfileName: null }], nextSkip: null, truncated: false })
+      : Response.json({ connected: true, canManage: false, enabled: true }));
+    const page = mount({ request });
+    await flush(); await flush();
+    expect(page.shadowRoot!.textContent).toContain('Ada Lovelace');
+    expect(request.mock.calls.filter(([path]) => path === '/threecx/users?skip=0')).toHaveLength(1);
+  });
+
+  it('does not read extensions from a configuration-only view', async () => {
+    const request = vi.fn(async (_path: string) => Response.json({ connected: true, canManage: true, enabled: true }));
+    const page = new CloudCommandThreeCxPage();
+    page.displayMode = 'configuration';
+    page.context = context;
+    page.hostApi = { request };
+    document.body.append(page);
+    await flush(); await flush();
+    expect(request.mock.calls.map(([path]) => path)).not.toContain('/threecx/users?skip=0');
   });
   it('allows a first test to discover departments without silently selecting full PBX access', async () => {
     const request = vi.fn(async (path: string, init?: RequestInit) => {
@@ -95,6 +118,7 @@ describe('CloudCommandThreeCxPage', () => {
     expect(request.mock.calls.map(([path]) => path)).toEqual(expect.arrayContaining([
       '/threecx/connection', '/microsoft/connection', '/threecx/test', '/threecx/users?skip=0',
     ]));
+    expect(request.mock.calls.filter(([path]) => path === '/threecx/users?skip=0')).toHaveLength(1);
   });
 
   it('preserves an entered secret after a failed save and rejects stale group selections', async () => {
@@ -130,8 +154,10 @@ describe('CloudCommandThreeCxPage', () => {
   });
 
   it('does not render credential controls or mutation actions for a reader', async () => {
-    const page = mount({ request: async () => Response.json({ connected: true, canManage: false, origin: 'https://pbx.example.com', clientId: 'hidden' }) });
-    await flush();
+    const page = mount({ request: async (path) => path === '/threecx/users?skip=0'
+      ? Response.json({ items: [], nextSkip: null, truncated: false })
+      : Response.json({ connected: true, canManage: false, origin: 'https://pbx.example.com', clientId: 'hidden' }) });
+    await flush(); await flush();
     const root = page.shadowRoot!;
     expect(root.querySelector('#origin')).toBeNull();
     expect(root.querySelector('#test')).toBeNull();
@@ -141,11 +167,13 @@ describe('CloudCommandThreeCxPage', () => {
   });
 
   it('disables extension reads for a configured but disabled connection', async () => {
-    const page = mount({ request: async () => Response.json({ connected: true, canManage: false, enabled: false }) });
+    const request = vi.fn(async (_path: string) => Response.json({ connected: true, canManage: false, enabled: false }));
+    const page = mount({ request });
     await flush();
     const root = page.shadowRoot!;
     expect(root.textContent).toContain('This connection is disabled.');
     expect(root.querySelector<HTMLButtonElement>('#refresh-users')!.disabled).toBe(true);
+    expect(request.mock.calls.map(([path]) => path)).not.toContain('/threecx/users?skip=0');
   });
 
   it('can load through an empty filtered page when the service provides a next skip', async () => {
@@ -156,11 +184,8 @@ describe('CloudCommandThreeCxPage', () => {
       throw new Error(`unexpected ${path}`);
     });
     const page = mount({ request });
-    await flush();
-    let root = page.shadowRoot!;
-    (root.querySelector('#refresh-users') as HTMLButtonElement).click();
     await flush(); await flush();
-    root = page.shadowRoot!;
+    let root = page.shadowRoot!;
     expect(root.querySelector<HTMLButtonElement>('#more-users')).toBeTruthy();
     (root.querySelector('#more-users') as HTMLButtonElement).click();
     await flush(); await flush();
@@ -250,22 +275,25 @@ describe('CloudCommandThreeCxPage', () => {
   });
 
   it('drops a delayed extension response after the organization changes', async () => {
-    let resolveUsers!: (response: Response) => void;
+    const resolveUsers: Array<(response: Response) => void> = [];
     const page = mount({ request: (path) => {
-      if (path === '/threecx/users?skip=0') return new Promise<Response>((resolve) => { resolveUsers = resolve; });
+      if (path === '/threecx/users?skip=0') return new Promise<Response>((resolve) => { resolveUsers.push(resolve); });
       if (path === '/microsoft/connection') return Promise.resolve(Response.json({ available: false, connected: false, canManage: false }));
       return Promise.resolve(Response.json({ connected: true, canManage: false, enabled: true }));
     } });
     await flush();
     let root = page.shadowRoot!;
-    (root.querySelector('#refresh-users') as HTMLButtonElement).click();
-    await flush();
+    expect(root.querySelector('[data-status]')!.textContent).toContain('Loading extensions…');
     page.context = { ...context, organizationId: 'org-2' };
-    resolveUsers(Response.json({ items: [{ Id: 9, Number: '999', FirstName: 'Old', LastName: 'Extension', EmailAddress: null, Mobile: null, Enabled: true, IsRegistered: true, CurrentProfileName: null }], nextSkip: null, truncated: false }));
+    await flush(); await flush();
+    expect(resolveUsers).toHaveLength(2);
+    resolveUsers[0](Response.json({ items: [{ Id: 9, Number: '999', FirstName: 'Old', LastName: 'Extension', EmailAddress: null, Mobile: null, Enabled: true, IsRegistered: true, CurrentProfileName: null }], nextSkip: null, truncated: false }));
+    resolveUsers[1](Response.json({ items: [], nextSkip: null, truncated: false }));
     await flush(); await flush();
     root = page.shadowRoot!;
     expect(root.textContent).not.toContain('Old Extension');
     expect(root.querySelector<HTMLButtonElement>('#refresh-users')!.disabled).toBe(false);
+    expect(root.textContent).toContain('No extensions found.');
   });
 
   it('opens read-only details in a drawer and restores focus when Escape closes it', async () => {
