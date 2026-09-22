@@ -139,7 +139,7 @@ jobs:
           pnpm --filter @breeze/web exec vitest run src/components/cloudcom/browserDesktop src/components/remote/ConnectDesktopButton.browser.test.tsx
           pnpm --filter @breeze/viewer exec vitest run src/lib/answerPoll.test.ts src/lib/revocationLease.test.ts src/lib/keymap.test.ts src/lib/api.test.ts
           pnpm --filter @breeze/web exec vitest run src/components/cloudcom/RemoteAccessAlternatives.test.tsx src/components/remote/ConnectDesktopButton.test.tsx src/components/remote/ConnectDesktopButton.denied.test.tsx src/components/remote/ConnectDesktopButton.revoked.test.tsx src/components/remote/ConnectDesktopButton.teardownPending.test.tsx src/components/remote/RemoteToolsPage.test.tsx src/components/remote/RemoteToolsPage.liveDesktopAccess.test.tsx
-          pnpm --filter @breeze/web exec vitest run src/lib/extensions/hostApi.test.ts src/lib/extensions/registry.test.ts src/components/extensions/ExtensionElementHost.test.tsx src/components/extensions/ExtensionSlotHost.test.tsx src/components/extensions/ExtensionPageHost.test.tsx src/components/extensions/useExtensionNavigation.test.tsx
+          pnpm --filter @breeze/web exec vitest run src/components/layout/Sidebar src/lib/extensions/hostApi.test.ts src/lib/extensions/registry.test.ts src/components/extensions/ExtensionElementHost.test.tsx src/components/extensions/ExtensionSlotHost.test.tsx src/components/extensions/ExtensionPageHost.test.tsx src/components/extensions/useExtensionNavigation.test.tsx
           pnpm --filter @breeze/web build
       - name: Run fork infrastructure contracts
         if: needs.delta.outputs.infra == 'true'
