@@ -65,7 +65,13 @@ export class CloudCommandOverviewPage extends HTMLElement {
     this.root.querySelector('#refresh')?.addEventListener('click', () => { void this.load(); });
     this.root.querySelectorAll<HTMLButtonElement>('[data-provider]').forEach(button => button.addEventListener('click', () => {
       const provider = providers.find(item => item.id === button.dataset.provider);
-      if (provider) dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path: `/extensions/cloudcommand/${provider.id}` });
+      if (provider) {
+        const state = this.states[provider.id];
+        const path = state?.connected === true && state.enabled === true
+          ? `/extensions/cloudcommand/${provider.id}`
+          : `/extensions/cloudcommand/connect#${provider.id}`;
+        dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path });
+      }
     }));
   }
 }
