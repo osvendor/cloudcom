@@ -107,4 +107,13 @@ describe("GoogleWorkspaceIntegration", () => {
     render(<GoogleWorkspaceIntegration />);
     await waitFor(() => expect(screen.getByText(/admin\.reports\.usage\.readonly/)).toBeInTheDocument());
   });
+  it("shows a verified OAuth connection within Connect without asking for a service-account key", async () => {
+    fetchWithAuthMock.mockImplementation(async path => makeResponse(path === "/google/oauth/connection"
+      ? { connected: true, customerDomain: "example.test", authorizedEmail: "admin@example.test" }
+      : { connected: false }));
+    render(<GoogleWorkspaceIntegration />);
+    await waitFor(() => expect(screen.getByText(/Connected: example\.test/)).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Disconnect" })).toBeInTheDocument();
+    expect(screen.queryByText(/Service-account JSON key/i)).not.toBeInTheDocument();
+  });
 });

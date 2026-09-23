@@ -4,6 +4,21 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 const context = (organizationId: string) => ({ contractVersion: 1, extensionName: 'cloudcommand', path: '/extensions/cloudcommand/google', organizationId });
 afterEach(() => document.body.replaceChildren());
 describe('Google directory page', () => {
+  it('offers OAuth audit reports without enabling DWD-only account actions', async () => {
+    const request = vi.fn(async (path: string) => Response.json(path === '/google/connection'
+      ? { available: true, connected: true, enabled: true, canManage: false, canReadReports: true }
+      : path.startsWith('/google/reports/activity')
+        ? { asOf: '2026-09-22T11:00:00.000Z', items: [], nextPageToken: null, partial: false, warning: null }
+        : { items: [{ id: 'u1', name: 'One', email: 'one@example.test', suspended: false }], nextPageToken: null }));
+    const page = new CloudCommandGooglePage(); page.context = context('org-a'); page.hostApi = { request }; document.body.append(page);
+    await flush(); await flush();
+    expect(page.shadowRoot!.querySelector('#activity-tab')).not.toBeNull();
+    expect(page.shadowRoot!.querySelector('#trace-tab')).not.toBeNull();
+    expect(page.shadowRoot!.querySelector('[data-suspend]')).toBeNull();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#activity-tab')!.click();
+    await flush();
+    expect(request.mock.calls.some(([path]) => path.startsWith('/google/reports/activity'))).toBe(true);
+  });
   it('shows bounded Gmail audit trace and labels loaded-result search', async () => {
     const request = vi.fn(async (path: string) => Response.json(path === '/google/connection'
       ? { available: true, connected: true, enabled: true, canManage: true }

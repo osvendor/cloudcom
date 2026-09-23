@@ -8,6 +8,7 @@ import { decryptConnectionKey } from '../services/googleHelpers';
 import { getAuditReportsClient, getDirectoryClient, getGmailClient, getUsageReportsClient } from '../services/googleClient';
 import { createAuditLog } from '../services/auditService';
 import { projectGoogleTrace } from './cloudCommandGoogleTrace';
+import { loadGoogleOAuth, oauthActivity, oauthDirectory, oauthMembers, oauthStorage, oauthTrace } from './cloudCommandGoogleOAuthReads';
 
 const denied = { ok: false as const, code: 'access_denied' as const, message: 'Google Workspace access is not permitted for this organization.' };
 const disconnected = { ok: false as const, code: 'connection_not_ready' as const, message: 'Connect Google Workspace for this organization in Extensions > Connect.' };
@@ -59,7 +60,14 @@ export const nativeGoogleServices: NativeGoogleServices = {
     const canManage = input.authorization.hasPermission('organizations', 'write') && input.authorization.mfaSatisfied;
     if (!GOOGLE_WORKSPACE_ENABLED) return { available: false, connected: false, enabled: false, canManage };
     const row = await load(auth, input.orgId);
-    return row?.orgId === input.orgId ? { available: true, connected: true, enabled: row.status === 'active', canManage,
+    if (!row) {
+      const oauth = await loadGoogleOAuth(auth, input.orgId);
+      return oauth ? { available: true, connected: true, enabled: true, canManage: false,
+        canReadReports: canManage && oauth.granted_scopes.split(/\s+/).includes('https://www.googleapis.com/auth/admin.reports.audit.readonly'),
+        customerDomain: oauth.customer_domain, lastVerifiedAt: oauth.verified_at?.toISOString() ?? null }
+        : { available: true, connected: false, enabled: false, canManage };
+    }
+    return row.orgId === input.orgId ? { available: true, connected: true, enabled: row.status === 'active', canManage,
       customerDomain: row.customerDomain, lastVerifiedAt: row.lastVerifiedAt?.toISOString() ?? null }
       : { available: true, connected: false, enabled: false, canManage };
   },
@@ -68,7 +76,11 @@ export const nativeGoogleServices: NativeGoogleServices = {
     if (!auth) return denied;
     if (!GOOGLE_WORKSPACE_ENABLED) return disconnected;
     const row = await load(auth, input.orgId);
-    if (!row || row.orgId !== input.orgId || row.status !== 'active') return disconnected;
+    if (!row) {
+      const oauth = await loadGoogleOAuth(auth, input.orgId);
+      return oauth ? oauthDirectory(oauth, kind, pageToken) : disconnected;
+    }
+    if (row.orgId !== input.orgId || row.status !== 'active') return disconnected;
     try {
       const client = getDirectoryClient(decryptConnectionKey(row), row.adminEmail);
       if (kind === 'users') {
@@ -95,7 +107,11 @@ export const nativeGoogleServices: NativeGoogleServices = {
     if (!GOOGLE_WORKSPACE_ENABLED) return disconnected;
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(groupId)) return { ok: false, code: 'provider_failed', message: 'Invalid Google group.' };
     const row = await load(auth, input.orgId);
-    if (!row || row.orgId !== input.orgId || row.status !== 'active') return disconnected;
+    if (!row) {
+      const oauth = await loadGoogleOAuth(auth, input.orgId);
+      return oauth ? oauthMembers(oauth, groupId, pageToken) : disconnected;
+    }
+    if (row.orgId !== input.orgId || row.status !== 'active') return disconnected;
     try {
       const client = getDirectoryClient(decryptConnectionKey(row), row.adminEmail);
       const group = (await client.groups.get({ groupKey: groupId, fields: 'id,email' })).data;
@@ -147,7 +163,11 @@ export const nativeGoogleServices: NativeGoogleServices = {
       || Date.now() - time > 180 * 86400000 || (pageToken !== null && (pageToken.length > 2048 || !/^[A-Za-z0-9_\-./+=]+$/.test(pageToken))))
       return { ok: false, code: 'provider_failed', message: 'Invalid storage report request.' };
     const row = await load(auth, input.orgId);
-    if (!row || row.orgId !== input.orgId || row.status !== 'active') return disconnected;
+    if (!row) {
+      const oauth = await loadGoogleOAuth(auth, input.orgId);
+      return oauth ? oauthStorage(oauth, date, pageToken) : disconnected;
+    }
+    if (row.orgId !== input.orgId || row.status !== 'active') return disconnected;
     let key: string;
     let customerId: string | undefined;
     try {
@@ -211,7 +231,11 @@ export const nativeGoogleServices: NativeGoogleServices = {
         || !Number.isFinite(Date.parse(asOf)) || Date.parse(asOf) > Date.now() || Date.now() - Date.parse(asOf) > 3600000)))
       return { ok: false, code: 'provider_failed', message: 'Invalid activity report request.' };
     const row = await load(auth, input.orgId);
-    if (!row || row.orgId !== input.orgId || row.status !== 'active') return disconnected;
+    if (!row) {
+      const oauth = await loadGoogleOAuth(auth, input.orgId);
+      return oauth ? oauthActivity(oauth, source, days, pageToken, asOf) : disconnected;
+    }
+    if (row.orgId !== input.orgId || row.status !== 'active') return disconnected;
     let key: string;
     let customerId: string;
     try {
@@ -275,7 +299,11 @@ export const nativeGoogleServices: NativeGoogleServices = {
         || !Number.isFinite(Date.parse(asOf)) || Date.parse(asOf) > Date.now() || Date.now() - Date.parse(asOf) > 3600000)))
       return { ok: false, code: 'provider_failed', message: 'Invalid Gmail trace request.' };
     const row = await load(auth, input.orgId);
-    if (!row || row.orgId !== input.orgId || row.status !== 'active') return disconnected;
+    if (!row) {
+      const oauth = await loadGoogleOAuth(auth, input.orgId);
+      return oauth ? oauthTrace(oauth, days, pageToken, asOf) : disconnected;
+    }
+    if (row.orgId !== input.orgId || row.status !== 'active') return disconnected;
     let key: string;
     let customerId: string;
     try {

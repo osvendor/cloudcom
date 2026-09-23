@@ -2,7 +2,7 @@ import { parseExtensionPageContextV1, dispatchExtensionHostEvent, type Extension
 import type { CloudCommandHostApi } from './index';
 
 type Kind = 'users' | 'groups' | 'archived';
-type Connection = { available: boolean; connected: boolean; enabled: boolean; canManage?: boolean; customerDomain?: string };
+type Connection = { available: boolean; connected: boolean; enabled: boolean; canManage?: boolean; canReadReports?: boolean; customerDomain?: string };
 type Row = Record<string, string | boolean | null>;
 type Page = { items: Row[]; nextPageToken: string | null; complete: boolean };
 type MailboxSettings = { ok: true; email: string; forwardingEnabled: boolean | null; forwardingAddress: string | null;
@@ -185,7 +185,7 @@ export class CloudCommandGooglePage extends HTMLElement {
     if (generation === this.generation && this.storageOpen) { this.loading = false; this.render(); }
   }
   private async loadActivity(reset: boolean) {
-    if (!this.connection?.enabled || !this.connection.canManage || this.loading || (!reset && !this.activityNext)) return;
+    if (!this.connection?.enabled || !(this.connection.canReadReports ?? this.connection.canManage) || this.loading || (!reset && !this.activityNext)) return;
     const generation = this.generation;
     const token = reset ? null : this.activityNext;
     if (reset) { this.activityRows = []; this.activityNext = null; this.activityAsOf = null; this.activityPartial = false; this.activityWarning = null; this.activityLoaded = false; }
@@ -205,7 +205,7 @@ export class CloudCommandGooglePage extends HTMLElement {
     if (generation === this.generation && this.activityOpen) { this.loading = false; this.render(); }
   }
   private async loadTrace(reset: boolean) {
-    if (!this.connection?.enabled || !this.connection.canManage || this.loading || (!reset && !this.traceNext)) return;
+    if (!this.connection?.enabled || !(this.connection.canReadReports ?? this.connection.canManage) || this.loading || (!reset && !this.traceNext)) return;
     const generation = this.generation;
     const token = reset ? null : this.traceNext;
     if (reset) { this.traceRows = []; this.traceNext = null; this.traceAsOf = null; this.tracePartial = false; this.traceWarning = null; this.traceLoaded = false; }
@@ -302,7 +302,7 @@ export class CloudCommandGooglePage extends HTMLElement {
     if (this.mailbox && this.kind === 'users') this.root.querySelector('main')?.insertAdjacentHTML('beforeend',
       `<section class="members"><div class="members-head"><div><h2>Gmail settings</h2><p>${escape(this.mailbox.email)}</p></div><button id="close-mailbox">Close</button></div>${this.mailbox.settings ? `<div class="table"><table><tbody><tr><th>Automatic forwarding</th><td>${this.mailbox.settings.forwardingEnabled === null ? 'Unavailable' : this.mailbox.settings.forwardingEnabled ? 'On' : 'Off'}</td></tr><tr><th>Destination</th><td>${escape(this.mailbox.settings.forwardingAddress ?? '—')}</td></tr><tr><th>Disposition</th><td>${escape(this.mailbox.settings.forwardingDisposition ?? '—')}</td></tr><tr><th>Out of office</th><td>${this.mailbox.settings.vacationEnabled === null ? 'Unavailable' : this.mailbox.settings.vacationEnabled ? 'On' : 'Off'}</td></tr><tr><th>Subject</th><td>${escape(this.mailbox.settings.vacationSubject ?? '—')}</td></tr></tbody></table></div><p class="note">Read-only settings. Message body is not shown.</p>` : '<p role="status">Loading mailbox settings…</p>'}</section>`);
     this.root.querySelector('main')?.classList.toggle('storage', this.storageOpen || this.activityOpen || this.traceOpen);
-    if (connected) this.root.querySelector('nav')?.insertAdjacentHTML('beforeend', `<button id="storage-tab" aria-current="${this.storageOpen}">Storage</button>${this.connection?.canManage ? `<button id="activity-tab" aria-current="${this.activityOpen}">Security activity</button><button id="trace-tab" aria-current="${this.traceOpen}">Message trace</button>` : ''}`);
+    if (connected) this.root.querySelector('nav')?.insertAdjacentHTML('beforeend', `<button id="storage-tab" aria-current="${this.storageOpen}">Storage</button>${this.connection?.canReadReports ?? this.connection?.canManage ? `<button id="activity-tab" aria-current="${this.activityOpen}">Security activity</button><button id="trace-tab" aria-current="${this.traceOpen}">Message trace</button>` : ''}`);
     if (this.storageOpen) this.root.querySelector('main')?.insertAdjacentHTML('beforeend',
       `<section class="members"><div class="members-head"><div><h2>Daily storage usage</h2><p>Google Reports API · selected date</p></div><label>Report date<input id="storage-date" type="date" value="${escape(this.storageDate)}"></label><button id="load-storage" ${this.loading ? 'disabled' : ''}>Load</button></div><p class="note">Usage may be delayed. This report requires admin.reports.usage.readonly in the existing Google delegation grant; a connected Directory does not prove reporting access.</p>${this.storageWarning ? `<p role="status">${escape(this.storageWarning)}</p>` : ''}${this.storageLoaded ? `<p role="status">${this.storagePartial ? 'Partial or unavailable data' : this.storageNext ? 'More pages available' : 'Complete for the configured domain'} · ${escape(this.storageDate)}</p><div class="table"><table><thead><tr><th>User</th><th>Gmail</th><th>Drive</th><th>Total</th></tr></thead><tbody>${this.storageRows.map(row => `<tr><td>${escape(row.email)}</td><td>${escape(mb(row.gmailMb))}</td><td>${escape(mb(row.driveMb))}</td><td>${escape(mb(row.totalMb))}</td></tr>`).join('')}</tbody></table></div>${!this.storageRows.length ? '<p>No usage records returned. This is not zero usage.</p>' : ''}${this.storageNext ? `<button id="more-storage" ${this.loading ? 'disabled' : ''}>Load more</button>` : ''}` : '<p>Choose a date and load the report.</p>'}</section>`);
     if (this.activityOpen) this.root.querySelector('main')?.insertAdjacentHTML('beforeend',

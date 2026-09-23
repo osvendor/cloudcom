@@ -10,6 +10,7 @@
  */
 
 import { Hono } from 'hono';
+import { cloudCommandGoogleOAuthRoutes } from './cloudCommandGoogleOAuth';
 import { zValidator } from '../lib/validation';
 import { z } from 'zod';
 import { eq } from 'drizzle-orm';
@@ -26,6 +27,7 @@ import { GOOGLE_WORKSPACE_ENABLED } from '../config/env';
 import { getDirectoryClient, parseServiceAccountKey, normalizeGoogleError } from '../services/googleClient';
 
 export const googleRoutes = new Hono();
+googleRoutes.route('/', cloudCommandGoogleOAuthRoutes);
 
 const requireOrgsRead = requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action);
 const requireOrgsWrite = requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action);

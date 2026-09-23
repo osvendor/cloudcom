@@ -76,6 +76,12 @@ const portalRemoteWebPaths = new Set([
 ]);
 const rustdeskExtensionPaths = /^(?:packages\/ext-rustdesk-access\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/README\.md|src\/(?:authorization(?:\.test)?\.mjs|server\/index(?:\.test)?\.ts|web\/index(?:\.test)?\.ts))|packages\/ext-rustdesk-access\/README\.md)$/u;
 const cloudCommandApiPaths = new Set([
+  'apps/api/src/routes/google.ts',
+  'apps/api/src/routes/cloudCommandGoogleOAuth.ts',
+  'apps/api/src/routes/cloudCommandGoogleOAuth.test.ts',
+  'apps/api/src/extensions/cloudCommandGoogleOAuthReads.ts',
+  'apps/api/src/extensions/cloudCommandGoogleOAuthReads.test.ts',
+  'apps/api/src/__tests__/integration/cloudCommandGoogleOAuth.integration.test.ts',
   'apps/api/src/routes/extensionsWeb.test.ts',
   'apps/api/src/routes/extensionsWeb.ts',
   'apps/api/src/extensions/builtinExtensions.test.ts',
@@ -216,7 +222,7 @@ export function classify(paths) {
       result.api = true;
       continue;
     }
-    if (cloudCommandApiPaths.has(path) || /^packages\/ext-cloud-command\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/(?:2026-09-21-threecx-connections|2026-09-22-microsoft-connections|2026-09-22-native-admin-connections|2026-09-22-microsoft-directory-preferences)\.sql|src\/(?:server|threecx|web)\/.+)$/u.test(path)) {
+    if (cloudCommandApiPaths.has(path) || /^packages\/ext-cloud-command\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/(?:2026-09-21-threecx-connections|2026-09-22-microsoft-connections|2026-09-22-native-admin-connections|2026-09-22-microsoft-directory-preferences|2026-09-23-google-oauth-connections)\.sql|src\/(?:server|threecx|web)\/.+)$/u.test(path)) {
       result.api = true;
       result.web = true;
       continue;

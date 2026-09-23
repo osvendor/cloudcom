@@ -12,6 +12,8 @@ vi.mock('../db/schema/google', () => ({ googleWorkspaceConnections: { orgId: 'or
 vi.mock('../middleware/auth', () => ({ dbAccessContextFromAuth: () => ({}) }));
 vi.mock('../config/env', () => ({ GOOGLE_WORKSPACE_ENABLED: true }));
 vi.mock('../services/googleHelpers', () => ({ decryptConnectionKey: googleMocks.decrypt }));
+vi.mock('./cloudCommandGoogleOAuthReads', () => ({ loadGoogleOAuth: vi.fn(async () => null),
+  oauthDirectory: vi.fn(), oauthMembers: vi.fn(), oauthStorage: vi.fn(), oauthActivity: vi.fn(), oauthTrace: vi.fn() }));
 vi.mock('../services/auditService', () => ({ createAuditLog: googleMocks.audit }));
 vi.mock('../services/googleClient', () => ({
   getDirectoryClient: () => ({ users: { list: googleMocks.users, get: googleMocks.userGet, update: googleMocks.userUpdate },
