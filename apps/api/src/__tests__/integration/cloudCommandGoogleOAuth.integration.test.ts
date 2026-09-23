@@ -58,5 +58,30 @@ describe('Cloud Command Google OAuth isolation', () => {
     await withSystemDbAccessContext(async () => {
       expect(await db.execute(sql`SELECT state_hash FROM cloudcommand_google_oauth_attempts WHERE state_hash = 'state-a'`)).toHaveLength(1);
     });
+
+    // The two route write paths take the same organization-row lock before
+    // checking the opposite credential table. Race them against a fresh org:
+    // exactly one mode may commit, regardless of which request wins the lock.
+    const oauthConnect = () => withDbAccessContext(context(b!.id, actorA!.id), () => db.transaction(async tx => {
+      await tx.execute(sql`SELECT id FROM organizations WHERE id = ${b!.id}::uuid FOR UPDATE`);
+      if ((await tx.execute(sql`SELECT id FROM google_workspace_connections WHERE org_id = ${b!.id}::uuid`)).length) return false;
+      await tx.execute(sql`INSERT INTO cloudcommand_google_oauth_connections
+        (org_id, customer_id, customer_domain, authorized_email, refresh_token, granted_scopes)
+        VALUES (${b!.id}::uuid, 'C-race', 'example.test', 'admin@example.test', 'encrypted-fixture', 'scope')`);
+      return true;
+    }));
+    const dwdConnect = () => withDbAccessContext(context(b!.id, actorB!.id), () => db.transaction(async tx => {
+      await tx.execute(sql`SELECT id FROM organizations WHERE id = ${b!.id}::uuid FOR UPDATE`);
+      if ((await tx.execute(sql`SELECT id FROM cloudcommand_google_oauth_connections WHERE org_id = ${b!.id}::uuid`)).length) return false;
+      await tx.execute(sql`INSERT INTO google_workspace_connections
+        (org_id, customer_domain, admin_email, service_account_email, service_account_key)
+        VALUES (${b!.id}::uuid, 'example.test', 'admin@example.test', 'sa@example.test', 'encrypted-fixture')`);
+      return true;
+    }));
+    const winners = await Promise.all([oauthConnect(), dwdConnect()]);
+    expect(winners.filter(Boolean)).toHaveLength(1);
+    const oauthRows = await admin.execute(sql`SELECT id FROM cloudcommand_google_oauth_connections WHERE org_id = ${b!.id}::uuid`);
+    const dwdRows = await admin.execute(sql`SELECT id FROM google_workspace_connections WHERE org_id = ${b!.id}::uuid`);
+    expect(oauthRows.length + dwdRows.length).toBe(1);
   });
 });

@@ -164,14 +164,16 @@ cloudCommandGoogleOAuthRoutes.get('/oauth/callback', async c => {
       || !/^[A-Za-z0-9_-]{1,128}$/.test(customerId)) return failure();
     const encrypted = encryptSecret(tokens.refresh_token, { aad: `${refreshAad}:${attempt.org_id}` });
     if (!encrypted?.startsWith('enc:v3:')) return failure();
-    const saved = await runOutsideDbContext(() => withSystemDbAccessContext(async () => {
+    const saved = await runOutsideDbContext(() => withSystemDbAccessContext(async () => db.transaction(async tx => {
       // Keep one credential mode per org, including a DWD connection created
       // while the browser was at Google. A unique customer ID prevents binding
-      // the same Google customer to two Breeze organizations.
-      const dwd = rows(await db.execute(sql`SELECT org_id FROM google_workspace_connections
+      // the same Google customer to two Breeze organizations. The DWD route
+      // takes the same organization-row lock before its own mode check/write.
+      await tx.execute(sql`SELECT id FROM organizations WHERE id = ${attempt.org_id}::uuid FOR UPDATE`);
+      const dwd = rows(await tx.execute(sql`SELECT org_id FROM google_workspace_connections
         WHERE org_id = ${attempt.org_id}::uuid LIMIT 1`));
       if (dwd.length) return false;
-      const result = rows(await db.execute(sql`INSERT INTO cloudcommand_google_oauth_connections
+      const result = rows(await tx.execute(sql`INSERT INTO cloudcommand_google_oauth_connections
         (org_id, customer_id, customer_domain, authorized_email, refresh_token,
           granted_scopes, created_by, verified_at)
         VALUES (${attempt.org_id}::uuid, ${customerId}, ${attempt.expected_domain}, ${email.toLowerCase()},
@@ -181,9 +183,9 @@ cloudCommandGoogleOAuthRoutes.get('/oauth/callback', async c => {
           refresh_token = EXCLUDED.refresh_token, granted_scopes = EXCLUDED.granted_scopes,
           status = 'active', verified_at = now(), updated_at = now()
         RETURNING id`));
-      await db.execute(sql`DELETE FROM cloudcommand_google_oauth_attempts WHERE state_hash = ${digest(state)}`);
+      await tx.execute(sql`DELETE FROM cloudcommand_google_oauth_attempts WHERE state_hash = ${digest(state)}`);
       return result.length === 1;
-    }, 'cloudcommand-google-oauth-complete'));
+    }), 'cloudcommand-google-oauth-complete'));
     if (!saved) return failure();
     // This callback has no authenticated request context; the verified attempt
     // records the initiating actor and org for the route audit.

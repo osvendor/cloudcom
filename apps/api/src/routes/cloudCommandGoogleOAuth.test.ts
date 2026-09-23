@@ -2,14 +2,15 @@ import { createHash } from 'node:crypto';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 
-const { dbMock, auditMock } = vi.hoisted(() => ({
-  dbMock: { results: [] as unknown[][], execute: vi.fn() }, auditMock: vi.fn(),
+const { dbMock, auditMock, authSpy } = vi.hoisted(() => ({
+  dbMock: { results: [] as unknown[][], execute: vi.fn() }, auditMock: vi.fn(), authSpy: vi.fn(),
 }));
-vi.mock('../db', () => ({ db: { execute: dbMock.execute },
+vi.mock('../db', () => ({ db: { execute: dbMock.execute,
+  transaction: (fn: (tx: { execute: typeof dbMock.execute }) => Promise<unknown>) => fn({ execute: dbMock.execute }) },
   runOutsideDbContext: (fn: () => unknown) => fn(),
   withSystemDbAccessContext: (fn: () => unknown) => fn() }));
 vi.mock('../middleware/auth', () => ({
-  authMiddleware: (c: any, next: () => Promise<void>) => { c.set('auth', { user: { id: '11111111-1111-4111-8111-111111111111' } }); return next(); },
+  authMiddleware: (c: any, next: () => Promise<void>) => { authSpy(c.req.path); c.set('auth', { user: { id: '11111111-1111-4111-8111-111111111111' } }); return next(); },
   requireMfa: () => (_c: unknown, next: () => Promise<void>) => next(),
   requirePermission: () => (_c: unknown, next: () => Promise<void>) => next(),
 }));
@@ -22,8 +23,10 @@ vi.mock('../services/secretCrypto', () => ({ encryptSecret: (value: string) => `
 vi.mock('../services/auditEvents', () => ({ writeAuditEvent: auditMock }));
 vi.mock('../config/env', () => ({ GOOGLE_WORKSPACE_ENABLED: true }));
 import { cloudCommandGoogleOAuthRoutes } from './cloudCommandGoogleOAuth';
+import { googleRoutes } from './google';
 
 function app() { const app = new Hono(); app.route('/google', cloudCommandGoogleOAuthRoutes); return app; }
+function mountedApp() { const app = new Hono(); app.route('/api/v1/google', googleRoutes); return app; }
 const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status,
   headers: { 'Content-Type': 'application/json' } });
 beforeEach(() => {
@@ -33,10 +36,20 @@ beforeEach(() => {
   dbMock.results.length = 0;
   dbMock.execute.mockReset().mockImplementation(async () => dbMock.results.shift() ?? []);
   auditMock.mockReset();
+  authSpy.mockReset();
 });
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 
 describe('Cloud Command Google OAuth Connect', () => {
+  it('mounts the public callback ahead of the legacy Google auth middleware', async () => {
+    const callback = await mountedApp().request('/api/v1/google/oauth/callback?state=invalid&code=code');
+    expect(callback.status).toBe(302);
+    expect(authSpy).not.toHaveBeenCalled();
+    const start = await mountedApp().request('/api/v1/google/oauth/start', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ customerDomain: 'example.test' }) });
+    expect(start.status).toBe(200);
+    expect(authSpy).toHaveBeenCalled();
+  });
   it('starts one PKCE browser-bound flow for a named customer domain', async () => {
     const result = await app().request('/google/oauth/start', { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ customerDomain: 'Example.Test' }) });
@@ -96,7 +109,7 @@ describe('Cloud Command Google OAuth Connect', () => {
       actor_id: '11111111-1111-4111-8111-111111111111',
       browser_hash: createHash('sha256').update(browser).digest('hex'),
       verifier_ciphertext: 'enc:v3:verifier', expected_domain: 'example.test' }],
-      [], [{ id: 'connection' }], []);
+      [], [], [{ id: 'connection' }], []);
     const fetchMock = vi.fn(async (target: string | URL) => {
       const text = String(target);
       if (text.includes('/token')) return response({ access_token: 'access', refresh_token: 'refresh',
