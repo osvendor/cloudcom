@@ -68,16 +68,16 @@ func TestRunPamFlow(t *testing.T) {
 			wantActuated:         false,
 		},
 		{
-			name:                 "auto-approved targets valid high requester session as unsigned decimal and actuates",
+			name:                 "auto-approved targets requester session and dismisses original consent",
 			status:               "auto_approved",
 			subjectSessionID:     0xFFFFFFFE,
 			wantTargetWinSession: "4294967294",
 			dialog:               approved,
 			wantFind:             true,
 			wantDialog:           true,
-			wantTriggered:        true,
-			wantDismissed:        false,
-			wantActuated:         true,
+			wantTriggered:        false,
+			wantDismissed:        true,
+			wantActuated:         false,
 		},
 		{
 			// 0xFFFFFFFF is Windows' invalid/unresolved session sentinel. Treat it
@@ -88,9 +88,9 @@ func TestRunPamFlow(t *testing.T) {
 			dialog:           approved,
 			wantFind:         true,
 			wantDialog:       true,
-			wantTriggered:    true,
-			wantDismissed:    false,
-			wantActuated:     true,
+			wantTriggered:    false,
+			wantDismissed:    true,
+			wantActuated:     false,
 		},
 		{
 			// Zero is the compatibility path for old/fake/non-Windows events: the
@@ -113,7 +113,7 @@ func TestRunPamFlow(t *testing.T) {
 			wantFind:             true,
 			wantDialog:           true,
 			wantTriggered:        false,
-			wantDismissed:        false,
+			wantDismissed:        true,
 			wantActuated:         false,
 		},
 		{
@@ -200,21 +200,18 @@ func TestRunPamFlow(t *testing.T) {
 			wantActuated:  false,
 		},
 		{
-			// FIX I: auto-approved + user-approved, but the credential Promote
-			// fails (e.g. ErrUnsupportedPlatform). actuateElevation returns the
-			// failure early — Trigger is never reached as success, no Demote runs,
-			// and no spurious dismiss occurs. Proves the local flow tolerates a
-			// failed actuation cleanly without panicking.
-			name:               "auto-approved promote failure tolerated, no dismiss",
+			// The local flow must not promote an account even if the old
+			// service-local promotion path would fail.
+			name:               "auto-approved never promotes local account",
 			status:             "auto_approved",
 			dialog:             approved,
 			promoteErr:         elevaccount.ErrUnsupportedPlatform,
 			wantFind:           true,
 			wantDialog:         true,
 			wantTriggered:      false, // Promote fails before Trigger
-			wantDismissed:      false, // actuate path never dismisses
-			wantActuated:       false, // promote→demote pipeline did not complete
-			wantPromoteAttempt: true,  // Promote attempted exactly once
+			wantDismissed:      true,
+			wantActuated:       false,
+			wantPromoteAttempt: false,
 		},
 		{
 			// FIX B: deny path where Dismiss reports the prompt was already gone.
