@@ -163,6 +163,9 @@ jobs:
           docker compose --project-name "$project" -f docker-compose.test.yml up -d --wait
           pnpm --filter @breeze/api exec vitest run src/jobs/unifiWorker.test.ts
           pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts src/__tests__/integration/unifiSyncLockOrder.integration.test.ts
+      - name: Verify PAM cleanup recovery dispatch
+        if: needs.delta.outputs.api == 'true'
+        run: pnpm --filter @breeze/api exec vitest run src/jobs/pamActuationWorker.test.ts src/services/commandDispatch.test.ts
       - name: Validate customer portal remote access and RLS boundaries
         if: needs.delta.outputs.portal_remote == 'true'
         run: bash scripts/cloudcom/test-portal-remote.sh

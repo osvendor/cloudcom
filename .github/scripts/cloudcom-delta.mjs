@@ -149,6 +149,14 @@ const unifiSyncLockPaths = new Set([
   'apps/api/src/jobs/unifiWorker.test.ts',
   'apps/api/src/__tests__/integration/unifiSyncLockOrder.integration.test.ts',
 ]);
+// Cleanup dispatch is an agent recovery path. Keep the API allowlist exact;
+// native agent changes already select the Go race suite independently.
+const pamCleanupRecoveryPaths = new Set([
+  'apps/api/src/jobs/pamActuationWorker.ts',
+  'apps/api/src/jobs/pamActuationWorker.test.ts',
+  'apps/api/src/services/commandDispatch.ts',
+  'apps/api/src/services/commandDispatch.test.ts',
+]);
 const infraPaths = new Set([
   'AGENTS.md', '.dockerignore', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',
   '.github/scripts/check-cloudcom-runner.sh', '.github/scripts/ci-area-gating.test.mjs',
@@ -237,6 +245,10 @@ export function classify(paths) {
     if (unifiSyncLockPaths.has(path)) {
       result.api = true;
       result.unifiSyncLock = true;
+      continue;
+    }
+    if (pamCleanupRecoveryPaths.has(path)) {
+      result.api = true;
       continue;
     }
     if (remoteAccessWebPaths.has(path) || path.startsWith('apps/web/src/components/cloudcom/browserDesktop/') ||

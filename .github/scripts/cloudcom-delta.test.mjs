@@ -140,6 +140,21 @@ test('routes the bounded UniFi sync lock-order surface to API and real-Postgres 
   );
 });
 
+test('routes only reviewed PAM cleanup recovery API files to focused validation', () => {
+  for (const path of [
+    'apps/api/src/jobs/pamActuationWorker.ts',
+    'apps/api/src/jobs/pamActuationWorker.test.ts',
+    'apps/api/src/services/commandDispatch.ts',
+    'apps/api/src/services/commandDispatch.test.ts',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.api, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+  assert.deepEqual(classify(['apps/api/src/services/pamOther.ts']).unsupported,
+    ['apps/api/src/services/pamOther.ts']);
+});
+
 test('classifies only the reviewed Cloud Command server, bridge, registry, and build surfaces', () => {
   for (const path of [
     'packages/ext-cloud-command/src/server/index.ts',
