@@ -88,6 +88,56 @@ export function getReleaseSourceApiBase(): string {
   return `https://api.github.com/repos/${getReleaseSourceRepository()}`;
 }
 
+/** Optional Windows-only self-host release. Unset means the normal source. */
+export function getWindowsReleaseSource(): { repository: string; version: string } | null {
+  const repository = process.env.BINARY_WINDOWS_GITHUB_REPOSITORY?.trim();
+  const rawVersion = process.env.BINARY_WINDOWS_VERSION?.trim();
+  if (!repository && !rawVersion) return null;
+  if (!repository || !rawVersion || !isValidReleaseSourceRepository(repository)) {
+    throw new Error('BINARY_WINDOWS_GITHUB_REPOSITORY and BINARY_WINDOWS_VERSION must both be set to valid values');
+  }
+  const version = rawVersion.replace(/^v/, '');
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new Error('BINARY_WINDOWS_VERSION must be a numeric release version');
+  }
+  if (repository.toLowerCase() === getReleaseSourceRepository().toLowerCase()) {
+    throw new Error('BINARY_WINDOWS_GITHUB_REPOSITORY must differ from the primary release repository');
+  }
+  return { repository, version };
+}
+
+/** Only the configured, exact Windows release may override a download redirect. */
+export function getWindowsReleaseAssetUrl(version: string | null, filename: string): string | null {
+  const source = getWindowsReleaseSource();
+  if (!source || version !== source.version) return null;
+  if (!/^breeze-(agent|backup|watchdog|user-helper)-windows-amd64\.exe$/.test(filename)) {
+    return null;
+  }
+  return `https://github.com/${source.repository}/releases/download/v${source.version}/${filename}`;
+}
+
+/** An opt-in device pilot does not alter the global promoted release. */
+export function getWindowsReleaseCanaryVersion(deviceId: string, platform: string): string | null {
+  const canaryId = process.env.BINARY_WINDOWS_CANARY_DEVICE_ID?.trim().toLowerCase();
+  if (!canaryId) return null;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(canaryId)) {
+    throw new Error('BINARY_WINDOWS_CANARY_DEVICE_ID must be a UUID');
+  }
+  const source = getWindowsReleaseSource();
+  if (!source) throw new Error('Windows canary requires a configured Windows release source');
+  return platform === 'windows' && deviceId.toLowerCase() === canaryId
+    ? source.version
+    : null;
+}
+
+/** Explicit post-canary promotion of the Windows release to all Windows agents. */
+export function isWindowsReleasePromotionEnabled(): boolean {
+  const raw = process.env.BINARY_WINDOWS_PROMOTE_ENABLED?.trim().toLowerCase();
+  if (raw !== 'true') return false;
+  if (!getWindowsReleaseSource()) throw new Error('Windows promotion requires a configured Windows release source');
+  return true;
+}
+
 /** tag === null means "latest". Tags are passed verbatim (e.g. "v1.2.3"). */
 export function getReleaseDownloadUrl(tag: string | null, assetName: string): string {
   const base = getReleaseSourceReleaseBase();
