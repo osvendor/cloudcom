@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { createPrivateKey, createPublicKey, createHash, sign, verify } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { verifyReleaseImageManifest } from '../release/release-image-manifest.mjs';
@@ -15,6 +15,19 @@ const documentName = 'exchange-worker-release.json';
 const signatureName = 'exchange-worker-release.json.ed25519';
 
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+function sha256File(path) {
+  const hash = createHash('sha256');
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  const fd = openSync(path, 'r');
+  try {
+    for (let length; (length = readSync(fd, buffer, 0, buffer.length, null)) > 0;) {
+      hash.update(buffer.subarray(0, length));
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return hash.digest('hex');
+}
 const fail = (message) => { throw new Error(message); };
 
 function keyFromText(text) {
@@ -52,7 +65,7 @@ function validateDocument(document, core, archive) {
   if (document.repository?.toLowerCase() !== core.repository.toLowerCase() || document.release !== core.release || document.sourceCommit !== core.sourceCommit) fail('worker source identity mismatch');
   if (!sourcePattern.test(document.sourceCommit) || document.coreManifestSha256 !== sha256(core.bytes)) fail('worker core manifest binding mismatch');
   if (document.image?.name !== 'exchange-worker' || document.image.repository !== imageRepository || !digestPattern.test(document.image.digest ?? '')) fail('invalid worker image binding');
-  if (!hashPattern.test(document.archiveSha256 ?? '') || document.archiveSha256 !== sha256(readFileSync(archive))) fail('worker archive checksum mismatch');
+  if (!hashPattern.test(document.archiveSha256 ?? '') || document.archiveSha256 !== sha256File(archive)) fail('worker archive checksum mismatch');
   if (typeof document.buildRun !== 'string' || !/^https:\/\/github\.com\/osvendor\/cloudcom\/actions\/runs\/[0-9]+$/u.test(document.buildRun)) fail('invalid worker build run');
   return document;
 }
@@ -81,7 +94,7 @@ export function signWorkerRelease(input) {
     sourceCommit: core.sourceCommit,
     coreManifestSha256: sha256(core.bytes),
     image: { name: 'exchange-worker', repository: imageRepository, digest: input.imageDigest },
-    archiveSha256: sha256(readFileSync(input.archive)),
+    archiveSha256: sha256File(input.archive),
     buildRun: input.buildRun,
   }, core, input.archive);
   const bytes = Buffer.from(`${JSON.stringify(document, null, 2)}\n`);

@@ -10,7 +10,7 @@ export function mountGoogleRoutes(app: Hono<{ Variables: Variables }>, services?
     const keys = [...new URL(c.req.url).searchParams.keys()];
     const pagedDirectory = c.req.method === 'GET' && (c.req.path.startsWith('/google/directory/') || /^\/google\/groups\/[^/]+\/members$/.test(c.req.path));
     const storageReport = c.req.method === 'GET' && c.req.path === '/google/reports/storage';
-    const activityReport = c.req.method === 'GET' && c.req.path === '/google/reports/activity';
+    const activityReport = c.req.method === 'GET' && (c.req.path === '/google/reports/activity' || c.req.path === '/google/reports/trace');
     if (keys.filter(key => key === 'orgId').length !== 1 || keys.some(key => key !== 'orgId' && !(pagedDirectory && key === 'pageToken') && !(storageReport && (key === 'date' || key === 'pageToken')) && !(activityReport && (key === 'source' || key === 'days' || key === 'pageToken' || key === 'asOf'))))
       return c.json({ code: 'invalid_request', error: 'Invalid organization request.' }, 400);
     await next();
@@ -86,6 +86,25 @@ export function mountGoogleRoutes(app: Hono<{ Variables: Variables }>, services?
         || Date.now() - Date.parse(anchors[0]) > 3600000)))
       return c.json({ code: 'invalid_report', error: 'Choose a supported activity source and window.' }, 400);
     const result = await services.activity(request(c), source as import('./native-google').GoogleActivitySource, days as 1 | 7 | 30, tokens[0] ?? null, anchors[0] ?? null);
+    if (!result.ok) return c.json({ code: result.code, error: result.message }, result.code === 'access_denied' ? 403 : result.code === 'connection_not_ready' || result.code === 'scope_required' ? 409 : 502);
+    c.header('Cache-Control', 'no-store');
+    return c.json({ ...result, complete: !result.nextPageToken && !result.partial });
+  });
+  app.get('/google/reports/trace', async c => {
+    if (!services || services.version !== 1) return c.json({ code: 'native_service_unavailable', error: 'Google Workspace is unavailable.' }, 503);
+    if (!c.get('canManage')) return c.json({ code: 'access_denied', error: 'Organization manager access and MFA are required.' }, 403);
+    const params = new URL(c.req.url).searchParams;
+    const daysValues = params.getAll('days');
+    const tokens = params.getAll('pageToken');
+    const anchors = params.getAll('asOf');
+    if (daysValues.length !== 1 || !['1', '7', '30'].includes(daysValues[0])
+      || tokens.length > 1 || (tokens.length === 1 && (!tokens[0] || tokens[0].length > 2048 || !/^[A-Za-z0-9_\-./+=]+$/.test(tokens[0])))
+      || anchors.length > 1 || (anchors.length === 1 && !anchors[0]) || !!tokens[0] !== !!anchors[0]
+      || (anchors[0] && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(anchors[0])
+        || !Number.isFinite(Date.parse(anchors[0])) || Date.parse(anchors[0]) > Date.now()
+        || Date.now() - Date.parse(anchors[0]) > 3600000)))
+      return c.json({ code: 'invalid_report', error: 'Choose a supported Gmail audit window.' }, 400);
+    const result = await services.trace(request(c), Number(daysValues[0]) as 1 | 7 | 30, tokens[0] ?? null, anchors[0] ?? null);
     if (!result.ok) return c.json({ code: result.code, error: result.message }, result.code === 'access_denied' ? 403 : result.code === 'connection_not_ready' || result.code === 'scope_required' ? 409 : 502);
     c.header('Cache-Control', 'no-store');
     return c.json({ ...result, complete: !result.nextPageToken && !result.partial });

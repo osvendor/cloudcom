@@ -134,5 +134,27 @@ class ExchangeBrokerTests(unittest.TestCase):
             time.sleep(0.05); self.assertFalse(second_done.is_set())
             release.set(); first.join(1); second.join(1)
         self.assertTrue(second_done.is_set())
+    def test_trace_rejects_out_of_window_or_injected_continuation_before_powershell(self):
+        now = worker.datetime.datetime.now(worker.datetime.timezone.utc)
+        start = (now - worker.datetime.timedelta(days=2)).isoformat()
+        end = (now - worker.datetime.timedelta(days=1)).isoformat()
+        params = {'start': start, 'end': end, 'sender': None, 'recipient': None, 'status': None, 'cursor': None}
+        search = {**REQUEST, 'operation': 'trace.search', 'parameters': params}
+        broker = worker.Broker('/unused', '/unused.ps1')
+        with patch.object(worker, 'read_config', return_value={REQUEST['tenantId']: DESCRIPTOR}), patch.object(worker, 'PersistentPowerShell') as process:
+            self.assertEqual(broker.execute({**search, 'parameters': {**params, 'end': (now + worker.datetime.timedelta(days=11)).isoformat()}})['code'], 'invalid_request')
+            self.assertEqual(broker.execute({**search, 'parameters': {**params, 'cursor': {'received': end, 'recipient': 'ok@example.com', 'command': 'Remove-Mailbox'}}})['code'], 'invalid_request')
+            self.assertEqual(broker.execute({**search, 'parameters': {**params, 'status': 'NotAStatus'}})['code'], 'invalid_request')
+            process.assert_not_called()
+    def test_trace_response_requires_matching_page_cursor_and_bounded_rows(self):
+        row = {'messageTraceId': '55555555-5555-4555-8555-555555555555', 'received': '2026-09-22T12:00:00Z',
+               'sender': 'sender@example.com', 'recipient': 'recipient@example.com', 'subject': 'Test', 'status': 'Delivered'}
+        result = {'requestId': REQUEST['requestId'], 'ok': True, 'data': {'rows': [row], 'next': {'received': row['received'], 'recipient': 'other@example.com'},
+                  'partial': True, 'checkedAt': '2026-09-22T12:01:00Z'}}
+        self.assertEqual(worker.valid_success_response(result, REQUEST['requestId'], 'trace.search'), 'provider_unreachable')
+        result['data']['next']['recipient'] = row['recipient']
+        self.assertIsNone(worker.valid_success_response(result, REQUEST['requestId'], 'trace.search'))
+        result['data']['rows'] *= 1001
+        self.assertEqual(worker.valid_success_response(result, REQUEST['requestId'], 'trace.search'), 'response_too_large')
 
 if __name__ == '__main__': unittest.main()

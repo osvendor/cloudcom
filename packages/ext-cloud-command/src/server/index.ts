@@ -11,7 +11,7 @@ import { mountMicrosoftRoutes } from './microsoft';
 import { mountDirectoryPreferenceRoutes } from './directory-preferences';
 import { mountGoogleRoutes } from './google';
 import type { NativeGoogleServices } from './native-google';
-export type { NativeGoogleServices, GoogleRequest, GoogleDirectoryKind, GoogleSuspendInput, GoogleSuspendResult, GoogleProfileInput, GoogleProfileResult } from './native-google';
+export type { NativeGoogleServices, GoogleRequest, GoogleDirectoryKind, GoogleSuspendInput, GoogleSuspendResult, GoogleProfileInput, GoogleProfileResult, GoogleTraceItem, GoogleTraceResult } from './native-google';
 import { mountThreeCxDetails, ThreeCxDetailError } from './threecx-details';
 import { mountThreeCxDashboard } from './threecx-dashboard';
 import { mountThreeCxCallLog } from './threecx-call-log';

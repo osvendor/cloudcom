@@ -162,6 +162,33 @@ describe('native Google Workspace bridge', () => {
     expect(result).toMatchObject({ code: 'scope_required' });
     expect(JSON.stringify(result)).not.toContain('private');
   });
+  it('reads tenant-bound Gmail audit events without returning raw provider records', async () => {
+    dbMocks.results.push([row], [row]);
+    googleMocks.userGet.mockResolvedValue({ data: { primaryEmail: 'admin@example.test', customerId: 'C123' } });
+    const at = new Date(Date.now() - 3600000).toISOString();
+    const item = (customerId: string) => ({ id: { customerId, applicationName: 'gmail', time: at, uniqueQualifier: 'event1' },
+      events: [{ name: 'mail_event', parameters: [{ name: 'message_info', messageValue: { parameter: [
+        { name: 'subject', value: 'Subject' }, { name: 'source', messageValue: { parameter: [{ name: 'address', value: 'sender@example.test' }] } },
+        { name: 'destination', messageValue: { parameter: [{ name: 'address', value: 'recipient@outside.test' }] } },
+        { name: 'secret', value: 'private' },
+      ] } }, { name: 'event_info', messageValue: { parameter: [{ name: 'mail_event_type', intValue: '1' }] } }] }] });
+    googleMocks.activityList.mockResolvedValue({ data: { items: [item('C123'), item('OTHER')], nextPageToken: 'next' } });
+    const result = await nativeGoogleServices.trace(request(), 7, null, null);
+    expect(googleMocks.activityList).toHaveBeenCalledWith(expect.objectContaining({ customerId: 'C123', applicationName: 'gmail', maxResults: 100 }));
+    expect(result).toMatchObject({ ok: true, partial: true, nextPageToken: 'next', items: [{ sender: 'sender@example.test', recipient: 'recipient@outside.test', status: 'Sent' }] });
+    expect(JSON.stringify(result)).not.toContain('private');
+    expect(JSON.stringify(result)).not.toContain('OTHER');
+  });
+  it('fences Gmail trace and labels missing audit scope', async () => {
+    expect(await nativeGoogleServices.trace(request(OTHER), 7, null, null)).toMatchObject({ code: 'access_denied' });
+    expect(googleMocks.activityList).not.toHaveBeenCalled();
+    dbMocks.results.push([row], [row]);
+    googleMocks.userGet.mockResolvedValue({ data: { primaryEmail: 'admin@example.test', customerId: 'C123' } });
+    googleMocks.activityList.mockRejectedValue({ response: { status: 403, data: { secret: 'private' } } });
+    const result = await nativeGoogleServices.trace(request(), 7, null, null);
+    expect(result).toMatchObject({ code: 'scope_required' });
+    expect(JSON.stringify(result)).not.toContain('private');
+  });
   const current = { id: '123456', primaryEmail: 'user@example.test', suspended: false, archived: false, isAdmin: false };
   it('rechecks account and credential state before a bounded suspension, then verifies the result', async () => {
     dbMocks.results.push([row], [row]);

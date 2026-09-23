@@ -216,7 +216,7 @@ describe('Microsoft directory interaction', () => {
   it('keeps partial result counts honest and omits unsupported controls', async () => {
     const { root } = await mount(true, false);
     expect(root.textContent).toMatch(/partial|loaded/i);
-    for (const action of ['Delete user', 'Reset password', 'Delegate mailbox', 'Threat Hunting', 'Message trace']) expect(root.textContent).not.toContain(action);
+    for (const action of ['Delete user', 'Reset password', 'Delegate mailbox', 'Threat Hunting']) expect(root.textContent).not.toContain(action);
     expect(root.querySelector('[data-resource="sites"]')).toBeNull();
   });
 

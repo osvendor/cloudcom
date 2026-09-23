@@ -15,6 +15,10 @@ function Send-Forwarding([string]$RequestId, $Data) {
   @{ requestId = $RequestId; ok = $true; data = $Data } | ConvertTo-Json -Depth 5 -Compress
   [Console]::Out.Flush()
 }
+function Trace-Date($Value) {
+  if (-not $Value) { return $null }
+  return ([DateTimeOffset]::Parse([string]$Value)).ToUniversalTime().ToString('o')
+}
 function Get-BoundMailbox([string]$MailboxId) {
   $candidate = Get-EXOMailbox -ExternalDirectoryObjectId $MailboxId -Properties ExternalDirectoryObjectId,PrimarySmtpAddress,RecipientTypeDetails -ErrorAction Stop
   if (-not $candidate -or [string]$candidate.ExternalDirectoryObjectId -ine $MailboxId -or [string]$candidate.RecipientTypeDetails -notin @('UserMailbox','SharedMailbox')) { throw 'mailbox identity mismatch' }
@@ -80,12 +84,12 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     $requestId = [string]$request.requestId
     if ($request.operation -notin @('mailbox.inventory','mailbox.forwarding.get','mailbox.forwarding.set','mailbox.autoreply.get','mailbox.autoreply.set',
       'mailbox.addresses.get','mailbox.primary.set','mailbox.alias.add','mailbox.alias.remove',
-      'mailbox.delegation.get','mailbox.delegation.set')) { throw 'invalid request' }
+      'mailbox.delegation.get','mailbox.delegation.set','trace.search','trace.detail')) { throw 'invalid request' }
     if ($request.operation -eq 'mailbox.inventory') {
       if ($request.parameters.Keys.Count -ne 1 -or -not $request.parameters.ContainsKey('pageSize')) { throw 'invalid request' }
       $pageSize = [int]$request.parameters.pageSize
       if ($pageSize -lt 1 -or $pageSize -gt 200) { throw 'invalid request' }
-    } else {
+    } elseif ($request.operation -notin @('trace.search','trace.detail')) {
       $mailboxId = [string]$request.parameters.mailboxId
       if ($mailboxId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { throw 'invalid request' }
       if ($request.operation -eq 'mailbox.forwarding.set' -and ($request.parameters.Keys.Count -ne 3 -or -not $request.parameters.ContainsKey('smtpAddress') -or -not $request.parameters.ContainsKey('keepCopy'))) { throw 'invalid request' }
@@ -100,6 +104,62 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
       $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPemFile($config.certificatePath, $config.privateKeyPath)
       Connect-ExchangeOnline -AppId $config.clientId -Certificate $certificate -Organization $config.exchangeOrganization -ShowBanner:$false
       $boundTenant = [string]$request.tenantId
+    }
+    if ($request.operation -eq 'trace.search') {
+      $p = $request.parameters
+      if ($p.Keys.Count -ne 6) { throw 'invalid trace request' }
+      foreach ($key in @('start','end','sender','recipient','status','cursor')) { if (-not $p.ContainsKey($key)) { throw 'invalid trace request' } }
+      $start = [DateTimeOffset]::Parse([string]$p.start).ToUniversalTime()
+      $end = [DateTimeOffset]::Parse([string]$p.end).ToUniversalTime()
+      $now = [DateTimeOffset]::UtcNow
+      if ($start -lt $now.AddDays(-90) -or $end -gt $now.AddMinutes(5) -or $start -ge $end -or ($end - $start).TotalDays -gt 10) { throw 'invalid trace dates' }
+      $options = @{ StartDate = $start.UtcDateTime; EndDate = $end.UtcDateTime; ResultSize = 1000; ErrorAction = 'Stop' }
+      foreach ($field in @('sender','recipient')) {
+        if ($p[$field]) {
+          if ([string]$p[$field] -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$' -or ([string]$p[$field]).Length -gt 320) { throw 'invalid trace address' }
+          $key = $(if ($field -eq 'sender') { 'SenderAddress' } else { 'RecipientAddress' })
+          $options[$key] = [string]$p[$field]
+        }
+      }
+      if ($p.status) {
+        if ([string]$p.status -notin @('Delivered','Expanded','Failed','FilteredAsSpam','GettingStatus','Pending','Quarantined')) { throw 'invalid trace status' }
+        $options.Status = [string]$p.status
+      }
+      if ($p.cursor) {
+        if ($p.cursor.Keys.Count -ne 2 -or -not $p.cursor.ContainsKey('received') -or -not $p.cursor.ContainsKey('recipient')) { throw 'invalid trace cursor' }
+        $cursorAt = [DateTimeOffset]::Parse([string]$p.cursor.received).ToUniversalTime()
+        if ($cursorAt -lt $start -or $cursorAt -gt $end -or [string]$p.cursor.recipient -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw 'invalid trace cursor' }
+        $options.EndDate = $cursorAt.UtcDateTime
+        $options.StartingRecipientAddress = [string]$p.cursor.recipient
+      }
+      $raw = @(Get-MessageTraceV2 @options)
+      $rows = @($raw | ForEach-Object {
+        @{ messageTraceId = [string]$_.MessageTraceId; received = (Trace-Date $_.Received);
+           sender = [string]$_.SenderAddress; recipient = [string]$_.RecipientAddress;
+           subject = ([string]$_.Subject).Substring(0, [Math]::Min(([string]$_.Subject).Length, 1000)); status = [string]$_.Status }
+      })
+      $next = $null
+      if ($raw.Count -ge 1000 -and $rows.Count -gt 0) {
+        $last = $rows[-1]
+        $next = @{ received = $last.received; recipient = $last.recipient }
+      }
+      Send-Forwarding $requestId @{ rows = $rows; next = $next; partial = [bool]($null -ne $next); checkedAt = [DateTimeOffset]::UtcNow.ToString('o') }
+      continue
+    }
+    if ($request.operation -eq 'trace.detail') {
+      $p = $request.parameters
+      if ($p.Keys.Count -ne 2 -or -not $p.ContainsKey('messageTraceId') -or -not $p.ContainsKey('recipient') -or
+        [string]$p.messageTraceId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or
+        [string]$p.recipient -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw 'invalid detail request' }
+      $raw = @(Get-MessageTraceDetailV2 -MessageTraceId ([guid]$p.messageTraceId) -RecipientAddress ([string]$p.recipient) -ErrorAction Stop)
+      $events = @($raw | Select-Object -First 1000 | ForEach-Object {
+        $description = $(if ($_.Detail) { [string]$_.Detail } else { [string]$_.Data })
+        @{ date = (Trace-Date $_.Date); event = ([string]$_.Event).Substring(0, [Math]::Min(([string]$_.Event).Length, 120));
+           detail = $description.Substring(0, [Math]::Min($description.Length, 4000)) }
+      })
+      Send-Forwarding $requestId @{ messageTraceId = ([string]([guid]$p.messageTraceId)).ToLowerInvariant(); recipient = [string]$p.recipient;
+        events = $events; partial = [bool]($raw.Count -gt 1000) }
+      continue
     }
     if ($request.operation -ne 'mailbox.inventory') {
       $mailbox = Get-BoundMailbox $mailboxId

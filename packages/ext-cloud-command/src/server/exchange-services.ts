@@ -1,9 +1,15 @@
 import { z } from 'zod';
 import type { AdministrationConnection } from './admin-execution';
-import { createExchangeAddressesClient, createExchangeAutoReplyClient, createExchangeDelegationClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, type ExchangeAddressAction, type ExchangeAddressWrite, type ExchangeAutoReplySet, type ExchangeConnectionBinding, type ExchangeDelegationSet, type ExchangeForwardingSet, type ExchangeWorkerPort, ExchangeWorkerError } from './exchange-contract';
+import { createExchangeAddressesClient, createExchangeAutoReplyClient, createExchangeDelegationClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, createExchangeTraceClient, type ExchangeTraceSearch, type ExchangeTraceDetail, type ExchangeAddressAction, type ExchangeAddressWrite, type ExchangeAutoReplySet, type ExchangeConnectionBinding, type ExchangeDelegationSet, type ExchangeForwardingSet, type ExchangeWorkerPort, ExchangeWorkerError } from './exchange-contract';
 
 const uuid = z.string().uuid().transform(value => value.toLowerCase());
 const inventoryInput = z.object({ pageSize: z.number().int().min(1).max(200).optional() }).strict();
+const traceStatus = z.enum(['Delivered', 'Expanded', 'Failed', 'FilteredAsSpam', 'GettingStatus', 'Pending', 'Quarantined']);
+const traceCursor = z.object({ received: z.string().datetime({ offset: true }), recipient: z.string().email().max(320) }).strict();
+const traceSearchInput = z.object({ start: z.string().datetime({ offset: true }), end: z.string().datetime({ offset: true }),
+  sender: z.string().email().max(320).nullable(), recipient: z.string().email().max(320).nullable(),
+  status: traceStatus.nullable(), cursor: traceCursor.nullable() }).strict();
+const traceDetailInput = z.object({ messageTraceId: uuid, recipient: z.string().email().max(320) }).strict();
 const connection = z.object({
   id: uuid, orgId: uuid, tenantId: uuid, clientId: uuid, enabled: z.literal(true), generation: z.number().int().positive(),
   credentialVersion: z.string().min(1).max(128), permissionManifestVersion: z.string().min(1).max(128),
@@ -45,6 +51,7 @@ export function createExchangeMailboxInventoryService<Request>(ports: {
   const autoReply = createExchangeAutoReplyClient(ports.worker);
   const addresses = createExchangeAddressesClient(ports.worker);
   const delegation = createExchangeDelegationClient(ports.worker);
+  const trace = createExchangeTraceClient(ports.worker);
   async function fence(request: Request, organizationId: string, actorId: string, snapshot: AdministrationConnection, mutation = false) {
     const principal = await ports.authorize(request, organizationId, mutation);
     if (!principal || principal.actorId !== actorId) throw new ExchangeServiceError('access_denied');
@@ -55,6 +62,61 @@ export function createExchangeMailboxInventoryService<Request>(ports: {
     catch { throw new ExchangeServiceError('audit_unavailable'); }
   }
   return {
+    async traceSearch(request: Request, organizationId: string, input: ExchangeTraceSearch) {
+      if (!uuid.safeParse(organizationId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId);
+      const parsed = traceSearchInput.safeParse(input);
+      if (!parsed.success) throw new ExchangeServiceError('invalid_operation');
+      const start = Date.parse(parsed.data.start), end = Date.parse(parsed.data.end), now = Date.now();
+      const cursor = parsed.data.cursor;
+      if (start >= end || end - start > 10 * 86400000 || start < now - 90 * 86400000 || end > now + 5 * 60000 ||
+        (cursor && (Date.parse(cursor.received) < start || Date.parse(cursor.received) > end))) throw new ExchangeServiceError('invalid_operation');
+      const principal = await ports.authorize(request, organizationId, false);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: 'trace.search',
+        hasSender: !!parsed.data.sender, hasRecipient: !!parsed.data.recipient, status: parsed.data.status, continuation: !!cursor };
+      await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.trace.search.intent', result: 'success', details });
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot);
+        const result = await trace.search(bindingOf(snapshot), parsed.data);
+        await fence(request, organizationId, principal.actorId, snapshot);
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.trace.search.outcome', result: 'success', details: { ...details, count: result.rows.length, partial: result.partial } });
+        return result;
+      } catch (error) {
+        const code = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.trace.search.outcome', result: 'failure', details: { ...details, code } });
+        throw new ExchangeServiceError(code === 'provider_access_denied' || code === 'provider_rejected' || code === 'worker_busy' || code === 'connection_changed' || code === 'access_denied' ? code : 'provider_unreachable');
+      }
+    },
+    async traceDetail(request: Request, organizationId: string, input: ExchangeTraceDetail) {
+      if (!uuid.safeParse(organizationId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId);
+      const parsed = traceDetailInput.safeParse(input);
+      if (!parsed.success) throw new ExchangeServiceError('invalid_operation');
+      const principal = await ports.authorize(request, organizationId, false);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: 'trace.detail', messageTraceId: parsed.data.messageTraceId };
+      await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.trace.detail.intent', result: 'success', details });
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot);
+        const result = await trace.detail(bindingOf(snapshot), parsed.data);
+        await fence(request, organizationId, principal.actorId, snapshot);
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.trace.detail.outcome', result: 'success', details: { ...details, count: result.events.length, partial: result.partial } });
+        return result;
+      } catch (error) {
+        const code = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.trace.detail.outcome', result: 'failure', details: { ...details, code } });
+        throw new ExchangeServiceError(code === 'provider_access_denied' || code === 'provider_rejected' || code === 'worker_busy' || code === 'connection_changed' || code === 'access_denied' ? code : 'provider_unreachable');
+      }
+    },
     /** Internal Connect lifecycle hook: invoke immediately after the existing store.save()
      * succeeds and the saved row has been reloaded. Never expose this as a browser route. */
     async provision(connectionInput: AdministrationConnection) {

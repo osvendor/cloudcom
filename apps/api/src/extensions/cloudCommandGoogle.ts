@@ -7,6 +7,7 @@ import { GOOGLE_WORKSPACE_ENABLED } from '../config/env';
 import { decryptConnectionKey } from '../services/googleHelpers';
 import { getAuditReportsClient, getDirectoryClient, getGmailClient, getUsageReportsClient } from '../services/googleClient';
 import { createAuditLog } from '../services/auditService';
+import { projectGoogleTrace } from './cloudCommandGoogleTrace';
 
 const denied = { ok: false as const, code: 'access_denied' as const, message: 'Google Workspace access is not permitted for this organization.' };
 const disconnected = { ok: false as const, code: 'connection_not_ready' as const, message: 'Connect Google Workspace for this organization in Extensions > Connect.' };
@@ -263,6 +264,52 @@ export const nativeGoogleServices: NativeGoogleServices = {
     });
     return { ok: true, source, days, asOf: end.toISOString(), items, nextPageToken: data.nextPageToken ?? null, partial: omitted,
       warning: omitted ? 'Some Google activity records were omitted or shortened because their tenant or fields could not be verified.' : null };
+  },
+  async trace(input, days, pageToken, asOf) {
+    const auth = authorized(input);
+    if (!auth || !input.authorization.hasPermission('organizations', 'write') || !input.authorization.mfaSatisfied) return denied;
+    if (!GOOGLE_WORKSPACE_ENABLED) return disconnected;
+    if (![1, 7, 30].includes(days)
+      || (pageToken !== null && (pageToken.length > 2048 || !/^[A-Za-z0-9_\-./+=]+$/.test(pageToken)))
+      || !!pageToken !== !!asOf || (asOf !== null && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(asOf)
+        || !Number.isFinite(Date.parse(asOf)) || Date.parse(asOf) > Date.now() || Date.now() - Date.parse(asOf) > 3600000)))
+      return { ok: false, code: 'provider_failed', message: 'Invalid Gmail trace request.' };
+    const row = await load(auth, input.orgId);
+    if (!row || row.orgId !== input.orgId || row.status !== 'active') return disconnected;
+    let key: string;
+    let customerId: string;
+    try {
+      key = decryptConnectionKey(row);
+      const admin = (await getDirectoryClient(key, row.adminEmail).users.get({ userKey: row.adminEmail,
+        fields: 'customerId,primaryEmail' })).data;
+      if (!admin.customerId || !/^[A-Za-z0-9_-]{1,128}$/.test(admin.customerId)
+        || admin.primaryEmail?.toLowerCase() !== row.adminEmail.toLowerCase())
+        return { ok: false, code: 'provider_failed', message: 'Google customer ownership could not be verified.' };
+      customerId = admin.customerId;
+      const fresh = await load(auth, input.orgId);
+      if (!fresh || fresh.id !== row.id || fresh.status !== 'active' || fresh.customerDomain !== row.customerDomain
+        || fresh.adminEmail !== row.adminEmail || fresh.serviceAccountKey !== row.serviceAccountKey) return disconnected;
+    } catch {
+      return { ok: false, code: 'provider_failed', message: 'Google customer ownership could not be verified.' };
+    }
+    const end = asOf ? new Date(asOf) : new Date();
+    const start = new Date(end.getTime() - days * 86400000);
+    let data;
+    try {
+      data = (await getAuditReportsClient(key, row.adminEmail).activities.list({ userKey: 'all', applicationName: 'gmail',
+        customerId, startTime: start.toISOString(), endTime: end.toISOString(), maxResults: 100,
+        pageToken: pageToken ?? undefined,
+        fields: 'nextPageToken,items(id(time,uniqueQualifier,applicationName,customerId),events(name,parameters))' })).data;
+    } catch (error) {
+      const status = (error as { response?: { status?: number }; status?: number; code?: number }).response?.status
+        ?? (error as { status?: number; code?: number }).status ?? (error as { code?: number }).code;
+      return status === 401 || status === 403
+        ? { ok: false, code: 'scope_required', message: 'Gmail audit access is unavailable. Update the existing delegation grant with admin.reports.audit.readonly and verify the administrator reporting privilege.' }
+        : { ok: false, code: 'provider_failed', message: 'Gmail audit events could not be loaded for this window.' };
+    }
+    const { rows, partial } = projectGoogleTrace(data.items ?? [], customerId, start.getTime(), end.getTime());
+    return { ok: true, days, asOf: end.toISOString(), items: rows, nextPageToken: data.nextPageToken ?? null, partial,
+      warning: partial ? 'Some Gmail audit records were omitted or shortened because their tenant or fields could not be verified.' : null };
   },
   async auditSuspension(input, userId, stage) {
     const auth = authorized(input);

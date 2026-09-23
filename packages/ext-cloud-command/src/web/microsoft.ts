@@ -36,6 +36,12 @@ type AutoReplyState = { mailboxId: string; state: 'Disabled' | 'Enabled' | 'Sche
 type AddressesState = { mailboxId: string; primarySmtpAddress: string; aliases: string[]; policyEnabled: boolean };
 type DelegationState = { mailboxId: string; delegateId: string; delegateAddress: string;
   fullAccess: boolean; sendAs: boolean; sendOnBehalf: boolean };
+type TraceCursor = { received: string; recipient: string };
+type TraceCriteria = { start: string; end: string; sender: string | null; recipient: string | null;
+  status: string | null; cursor: TraceCursor | null };
+type TraceRow = { messageTraceId: string; received: string; sender: string; recipient: string; subject: string; status: string };
+type TracePage = { rows: TraceRow[]; next: TraceCursor | null; partial: boolean; checkedAt: string };
+type TraceDetail = { messageTraceId: string; recipient: string; events: Array<{ date: string | null; event: string; detail: string }>; partial: boolean };
 const healthyStatuses = new Set(['serviceOperational', 'serviceRestored', 'postIncidentReviewPublished', 'resolved', 'resolvedExternal', 'falsePositive']);
 function healthTone(status: string): 'green' | 'yellow' | 'red' | 'unknown' {
   return healthyStatuses.has(status) ? 'green' : status === 'serviceInterruption' ? 'red' : !status || status === 'unknownFutureValue' ? 'unknown' : 'yellow';
@@ -180,6 +186,16 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private healthOpen = false;
   private healthLoading = false;
   private healthRequest = 0;
+  private traceOpen = false;
+  private traceCriteria: TraceCriteria | null = null;
+  private traceRows: TraceRow[] = [];
+  private traceNext: TraceCursor | null = null;
+  private traceLoading = false;
+  private traceError = '';
+  private traceDetail: TraceDetail | null = null;
+  private traceDetailLoading = false;
+  private traceRequest = 0;
+  private traceDraft = { start: '', end: '', sender: '', recipient: '', status: '' };
 
   set context(input: unknown) {
     const context = parseExtensionPageContextV1(input);
@@ -217,6 +233,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
     this.resetAutoReply(); this.resetAddresses(); this.resetDelegation();
     this.healthRequest += 1;
+    this.traceRequest += 1; this.traceOpen = false; this.traceLoading = false; this.traceDetailLoading = false;
     this.userSecurityAction = null;
   }
 
@@ -263,6 +280,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.busy = false;
     this.connection = null;
     this.health = null; this.healthError = ''; this.healthOpen = false; this.healthLoading = false; this.healthRequest += 1;
+    this.traceRequest += 1; this.traceOpen = false; this.traceRows = []; this.traceNext = null; this.traceCriteria = null; this.traceDetail = null;
+    this.traceLoading = false; this.traceDetailLoading = false; this.traceDraft = { start: '', end: '', sender: '', recipient: '', status: '' }; this.traceError = '';
     this.data = null;
     this.detail = null;
     this.createUserOpen = false;
@@ -1347,6 +1366,94 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     return `<div class="backdrop" data-create-group-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="create-group-title"><div class="heading drawer-heading"><div><h2 id="create-group-title">Add group</h2><p class="subtle">Microsoft 365 group</p></div><button class="secondary compact" id="create-group-close" ${this.createGroupBusy ? 'disabled' : ''}>Close</button></div><div class="drawer-body">${done ? `<p role="status">Microsoft accepted group creation.${done.verified ? ' Group details were verified.' : ' Group details are still propagating; refresh before another action.'}</p><p class="meta">Group ID: ${esc(done.id)} · Microsoft-assigned address: ${esc(done.mail || 'Pending')}</p>` : `<section class="drawer-section"><label>Name<input id="create-group-name" maxlength="256" value="${esc(this.createGroupDraft.name)}" ${this.createGroupBusy ? 'disabled' : ''}></label><label>Mail alias<input id="create-group-alias" maxlength="64" value="${esc(this.createGroupDraft.alias)}" placeholder="team" ${this.createGroupBusy ? 'disabled' : ''}></label><label>Owner<select id="create-group-owner" ${!owners.length || this.createGroupBusy ? 'disabled' : ''}><option value="">Choose a tenant user</option>${owners.map(row => `<option value="${esc(row.id)}" ${row.id === this.createGroupDraft.ownerId ? 'selected' : ''}>${esc(String(row.values.displayName ?? row.id))} · ${esc(String(row.values.userPrincipalName ?? ''))}</option>`).join('')}</select></label><p class="meta">Microsoft assigns the primary address. Distribution lists and address changes require Exchange administration.</p></section>`}${this.createGroupError ? `<p class="status" data-error="true" role="alert">${esc(this.createGroupError)}</p>` : ''}</div><footer class="drawer-footer">${done ? '' : `<div class="actions"><button id="create-group-submit" ${this.createGroupBusy || !owners.length ? 'disabled' : ''}>Create group</button></div>`}</footer></aside></div>`;
   }
 
+  private async searchTrace(nextPage = false): Promise<void> {
+    if (!this.canRead() || this.traceLoading) return;
+    let criteria: TraceCriteria;
+    if (nextPage) {
+      if (!this.traceCriteria || !this.traceNext || this.traceRows.length >= 5000) return;
+      criteria = { ...this.traceCriteria, cursor: this.traceNext };
+    } else {
+      const start = Date.parse(this.traceDraft.start), end = Date.parse(this.traceDraft.end), now = Date.now();
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end || end - start > 10 * 86400000 || start < now - 90 * 86400000 || end > now + 5 * 60000) {
+        this.traceError = 'Choose up to 10 days within the last 90 days.'; this.render(); return;
+      }
+      const sender = this.traceDraft.sender.trim(), recipient = this.traceDraft.recipient.trim();
+      if ([sender, recipient].some(value => value && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value))) {
+        this.traceError = 'Enter complete sender and recipient email addresses.'; this.render(); return;
+      }
+      criteria = { start: new Date(start).toISOString(), end: new Date(end).toISOString(),
+        sender: sender || null, recipient: recipient || null, status: this.traceDraft.status || null, cursor: null };
+      this.traceCriteria = criteria; this.traceRows = []; this.traceNext = null; this.traceDetail = null;
+    }
+    const generation = this.generation, context = this.contextValue, request = ++this.traceRequest;
+    this.traceLoading = true; this.traceError = ''; this.render();
+    try {
+      const data = await this.request<TracePage>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'trace.search', ...criteria }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || request !== this.traceRequest) return;
+      if (!data || !Array.isArray(data.rows) || data.rows.length > 1000 || typeof data.partial !== 'boolean' ||
+        !data.rows.every(row => typeof row.messageTraceId === 'string' && typeof row.received === 'string' && typeof row.recipient === 'string' && typeof row.sender === 'string' && typeof row.subject === 'string' && typeof row.status === 'string') ||
+        (data.next && (!data.partial || !data.rows.some(row => row.received === data.next?.received && row.recipient.toLowerCase() === data.next?.recipient.toLowerCase()))))
+        throw new Error('Microsoft returned an invalid trace page.');
+      if (nextPage && data.next && data.next.received === criteria.cursor?.received && data.next.recipient.toLowerCase() === criteria.cursor.recipient.toLowerCase())
+        throw new Error('Message trace did not advance. Narrow the dates or filters.');
+      const seen = new Set(this.traceRows.map(row => `${row.messageTraceId}|${row.recipient.toLowerCase()}|${row.received}`));
+      for (const row of data.rows) {
+        const key = `${row.messageTraceId}|${row.recipient.toLowerCase()}|${row.received}`;
+        if (!seen.has(key)) { this.traceRows.push(row); seen.add(key); }
+      }
+      this.traceNext = data.next;
+    } catch (error) {
+      if (generation === this.generation && context === this.contextValue && request === this.traceRequest)
+        this.traceError = error instanceof Error ? error.message : 'Message trace could not be loaded.';
+    } finally {
+      if (generation === this.generation && context === this.contextValue && request === this.traceRequest) { this.traceLoading = false; this.render(); }
+    }
+  }
+  private async showTraceDetail(index: number): Promise<void> {
+    const row = this.traceRows[index];
+    if (!row || this.traceDetailLoading) return;
+    const generation = this.generation, context = this.contextValue, request = ++this.traceRequest;
+    this.traceDetailLoading = true; this.traceDetail = null; this.traceError = ''; this.render();
+    try {
+      const data = await this.request<TraceDetail>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'trace.detail', messageTraceId: row.messageTraceId, recipient: row.recipient }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || request !== this.traceRequest) return;
+      if (!data || data.messageTraceId !== row.messageTraceId || data.recipient.toLowerCase() !== row.recipient.toLowerCase() || !Array.isArray(data.events))
+        throw new Error('Microsoft returned invalid delivery events.');
+      this.traceDetail = data;
+    } catch (error) {
+      if (generation === this.generation && context === this.contextValue && request === this.traceRequest)
+        this.traceError = error instanceof Error ? error.message : 'Delivery events could not be loaded.';
+    } finally {
+      if (generation === this.generation && context === this.contextValue && request === this.traceRequest) { this.traceDetailLoading = false; this.render(); }
+    }
+  }
+  private exportTrace(): void {
+    if (!this.traceRows.length) return;
+    const cell = (value: string) => `"${(/^[\s\u0000-\u001f]*[=+\-@]/.test(value) ? `'${value}` : value).replaceAll('"', '""')}"`;
+    const lines = [['Received', 'Sender', 'Recipient', 'Subject', 'Status', 'Message trace ID'],
+      ...this.traceRows.map(row => [row.received, row.sender, row.recipient, row.subject, row.status, row.messageTraceId])];
+    const url = URL.createObjectURL(new Blob([lines.map(line => line.map(cell).join(',')).join('\r\n')], { type: 'text/csv' }));
+    const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'message-trace-loaded-results.csv'; anchor.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  private renderTrace(): string {
+    const rows = this.traceRows.map((row, index) => `<tr><td>${esc(this.formatCheckedAt(row.received))}</td><td>${esc(row.sender)}</td><td>${esc(row.recipient)}</td><td>${esc(row.subject || '—')}</td><td>${esc(row.status)}</td><td><button class="secondary compact" data-trace-detail="${index}">Details</button></td></tr>`).join('');
+    const detail = this.traceDetail;
+    return `<section class="trace-panel" aria-label="Microsoft message trace"><div class="heading"><div><h2>Message trace</h2><p class="meta">Exchange transport results for this connected tenant.</p></div><button class="secondary compact" id="trace-close">Close</button></div>
+      <form id="trace-form" class="trace-form"><label>From<input id="trace-start" type="datetime-local" value="${esc(this.traceDraft.start)}" required></label><label>To<input id="trace-end" type="datetime-local" value="${esc(this.traceDraft.end)}" required></label>
+      <label>Sender<input id="trace-sender" type="email" value="${esc(this.traceDraft.sender)}" placeholder="Optional"></label><label>Recipient<input id="trace-recipient" type="email" value="${esc(this.traceDraft.recipient)}" placeholder="Optional"></label>
+      <label>Status<select id="trace-status">${['', 'Delivered', 'Failed', 'Pending', 'Quarantined', 'FilteredAsSpam', 'Expanded', 'GettingStatus'].map(value => `<option value="${value}" ${this.traceDraft.status === value ? 'selected' : ''}>${value || 'All statuses'}</option>`).join('')}</select></label><button type="submit" ${this.traceLoading ? 'disabled' : ''}>Search</button></form>
+      ${this.traceError ? `<p class="status" data-error="true" role="alert">${esc(this.traceError)}</p>` : ''}<div class="trace-toolbar"><p class="meta">${this.traceLoading ? 'Loading trace…' : `${this.traceRows.length} loaded result${this.traceRows.length === 1 ? '' : 's'}${this.traceNext ? ' · more pages available' : ''}`}</p><button class="secondary compact" id="trace-export" ${!this.traceRows.length ? 'disabled' : ''}>Export loaded CSV</button></div>
+      ${this.traceRows.length ? `<div class="table-wrap"><table><thead><tr><th>Received</th><th>Sender</th><th>Recipient</th><th>Subject</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>` : ''}
+      ${this.traceNext ? `<div class="actions"><button class="secondary compact" id="trace-more" ${this.traceLoading || this.traceRows.length >= 5000 ? 'disabled' : ''}>Load next 1,000</button></div><p class="meta">CSV includes only loaded rows. Narrow the search after 5,000 loaded rows.</p>` : ''}
+      ${this.traceDetailLoading ? '<p class="meta">Loading delivery events…</p>' : detail ? `<div class="trace-events"><div class="heading"><h3>Delivery events</h3><button class="secondary compact" id="trace-detail-close">Close</button></div>${detail.events.map(event => `<p><strong>${esc(event.date ? this.formatCheckedAt(event.date) : 'Time unavailable')} · ${esc(event.event)}</strong><br>${esc(event.detail)}</p>`).join('') || '<p>No delivery events were returned.</p>'}${detail.partial ? '<p class="meta">Only the first 1,000 events are shown.</p>' : ''}</div>` : ''}</section>`;
+  }
+
   private render(): void {
     const connection = this.connection;
     const canManage = connection?.canManage === true;
@@ -1374,7 +1481,23 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     }).join('');
     const exclusionUnavailable = this.resource === 'users' && this.directoryScope === 'exclude' && !!this.directoryExclusionError;
     const inventory = !canRead ? `<div class="empty">${connection?.connected && connection.enabled === false ? 'Enable this connection before loading inventory.' : 'Connect Microsoft 365 in Extensions > Connect before loading inventory.'}</div>` : !this.data ? `<div class="empty">${this.error ? `Could not load ${labels[this.resource].toLowerCase()}. Use Refresh to try again.` : `Loading current ${labels[this.resource].toLowerCase()}…`}</div>` : exclusionUnavailable ? `<div class="empty">Could not load directory exclusions. Refresh before reviewing excluded users.</div>` : !filtered.length ? `<div class="empty">${this.filter ? 'No rows match this search.' : `No ${labels[this.resource].toLowerCase()} are available for this tenant.`}</div>` : `<div class="table-wrap"><table><thead><tr>${columns.map(column => `<th>${esc(column.label)}</th>`).join('')}<th><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div>`;
-    this.root.innerHTML = `<style>${styles}${createUserStyles}${healthStyles}</style><main><header><div><p class="eyebrow">Microsoft 365</p><h1>Directory</h1><p class="subtle">${esc(tenant)} · ${labels[this.resource]}: ${loadedCount}</p></div><div class="header-actions">${createControl}<button class="secondary compact" id="health-open" aria-expanded="${this.healthOpen}" ${!canRead ? 'disabled' : ''}>Service health</button><span class="badge ${canRead ? 'ok' : ''}">${connection?.available === false ? 'Unavailable' : connection?.connected ? (connection.enabled === false ? 'Disabled' : 'Connected') : 'Not configured'}</span></div></header>${this.healthOpen && canRead ? this.renderHealth() : ''}${this.message ? `<p class="status" data-testid="status" data-error="${this.error}" aria-live="polite">${esc(this.message)}</p>` : '<p class="status" data-testid="status" aria-live="polite"></p>'}<section class="directory"><div class="directory-top">${canRead ? `<label class="filter"><span class="sr-only">Search ${labels[this.resource]}</span><input id="filter" data-testid="filter" value="${esc(this.filter)}" placeholder="${this.resource === 'users' ? 'Search name or email' : `Search ${labels[this.resource].toLowerCase()}`}"></label>` : ''}<nav class="resource-nav" role="tablist" aria-label="Microsoft directory resources">${tabs}</nav><button class="secondary compact" id="refresh-resource" ${!canRead ? 'disabled' : ''}>Refresh</button></div>${canRead ? `${chips}${this.data ? `<p class="meta">${this.data.complete ? 'Complete inventory' : 'Partial inventory'} · checked ${esc(this.formatCheckedAt(this.data.checkedAt))}</p>` : ''}${inventory}` : inventory}</section>${this.detail ? this.renderDrawer(canManage) : ''}${this.createUserOpen ? this.renderCreateUserDrawer() : ''}${this.createGroupOpen ? this.renderCreateGroupDrawer() : ''}</main>`;
+    this.root.innerHTML = `<style>${styles}${createUserStyles}${healthStyles}${traceStyles}</style><main><header><div><p class="eyebrow">Microsoft 365</p><h1>Directory</h1><p class="subtle">${esc(tenant)} · ${labels[this.resource]}: ${loadedCount}</p></div><div class="header-actions">${createControl}<button class="secondary compact" id="trace-open" aria-expanded="${this.traceOpen}" ${!canRead ? 'disabled' : ''}>Message trace</button><button class="secondary compact" id="health-open" aria-expanded="${this.healthOpen}" ${!canRead ? 'disabled' : ''}>Service health</button><span class="badge ${canRead ? 'ok' : ''}">${connection?.available === false ? 'Unavailable' : connection?.connected ? (connection.enabled === false ? 'Disabled' : 'Connected') : 'Not configured'}</span></div></header>${this.traceOpen && canRead ? this.renderTrace() : ''}${this.healthOpen && canRead ? this.renderHealth() : ''}${this.message ? `<p class="status" data-testid="status" data-error="${this.error}" aria-live="polite">${esc(this.message)}</p>` : '<p class="status" data-testid="status" aria-live="polite"></p>'}<section class="directory"><div class="directory-top">${canRead ? `<label class="filter"><span class="sr-only">Search ${labels[this.resource]}</span><input id="filter" data-testid="filter" value="${esc(this.filter)}" placeholder="${this.resource === 'users' ? 'Search name or email' : `Search ${labels[this.resource].toLowerCase()}`}"></label>` : ''}<nav class="resource-nav" role="tablist" aria-label="Microsoft directory resources">${tabs}</nav><button class="secondary compact" id="refresh-resource" ${!canRead ? 'disabled' : ''}>Refresh</button></div>${canRead ? `${chips}${this.data ? `<p class="meta">${this.data.complete ? 'Complete inventory' : 'Partial inventory'} · checked ${esc(this.formatCheckedAt(this.data.checkedAt))}</p>` : ''}${inventory}` : inventory}</section>${this.detail ? this.renderDrawer(canManage) : ''}${this.createUserOpen ? this.renderCreateUserDrawer() : ''}${this.createGroupOpen ? this.renderCreateGroupDrawer() : ''}</main>`;
+    this.root.querySelector('#trace-open')?.addEventListener('click', () => {
+      this.traceOpen = !this.traceOpen; this.traceRequest += 1;
+      if (this.traceOpen && !this.traceDraft.start) {
+        const local = (date: Date) => new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+        this.traceDraft.start = local(new Date(Date.now() - 86400000)); this.traceDraft.end = local(new Date());
+      }
+      this.render();
+    });
+    this.root.querySelector('#trace-close')?.addEventListener('click', () => { this.traceRequest += 1; this.traceOpen = false; this.traceLoading = false; this.traceDetailLoading = false; this.traceDetail = null; this.render(); });
+    for (const key of ['start', 'end', 'sender', 'recipient', 'status'] as const)
+      this.root.querySelector<HTMLInputElement | HTMLSelectElement>(`#trace-${key}`)?.addEventListener('input', event => { this.traceDraft[key] = (event.target as HTMLInputElement | HTMLSelectElement).value; });
+    this.root.querySelector('#trace-form')?.addEventListener('submit', event => { event.preventDefault(); void this.searchTrace(); });
+    this.root.querySelector('#trace-more')?.addEventListener('click', () => void this.searchTrace(true));
+    this.root.querySelector('#trace-export')?.addEventListener('click', () => this.exportTrace());
+    this.root.querySelector('#trace-detail-close')?.addEventListener('click', () => { this.traceRequest += 1; this.traceDetail = null; this.render(); });
+    this.root.querySelectorAll<HTMLButtonElement>('[data-trace-detail]').forEach(button => button.addEventListener('click', () => void this.showTraceDetail(Number(button.dataset.traceDetail))));
     this.root.querySelector('#create-group')?.addEventListener('click', () => this.openCreateGroup());
     this.root.querySelector('#create-group-close')?.addEventListener('click', () => { if (!this.createGroupBusy) { this.createGroupOpen = false; this.createdGroup = null; this.render(); } });
     this.root.querySelector('#create-group-submit')?.addEventListener('click', () => void this.createGroup());
@@ -1649,4 +1772,5 @@ function parseMfaMethods(input: unknown): MfaMethod[] {
 const createUserStyles = `.upn-field{display:flex;align-items:center;gap:.45rem;min-width:0}.upn-field input{flex:1;min-width:0}.upn-field select{min-width:0;max-width:55%}@media(max-width:600px){.upn-field{flex-wrap:wrap}.upn-field select{max-width:100%;flex:1}}`;
 const healthStyles = `.header-actions{align-items:center;display:flex;flex-wrap:wrap;gap:.5rem}.health-panel{background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);margin-top:1rem;padding:.85rem 1rem}.health-heading{align-items:flex-start;display:flex;gap:.75rem;justify-content:space-between}.health-headline{align-items:center;display:flex;font-weight:700;gap:.5rem;margin-top:.8rem}.health-dot{background:hsl(var(--muted-foreground));border-radius:50%;display:inline-block;flex:none;height:.7rem;width:.7rem}.health-dot.green{background:hsl(var(--success))}.health-dot.yellow{background:#d9a441}.health-dot.red{background:hsl(var(--destructive))}.health-actions{margin:.65rem 0}.health-service{border-top:1px solid hsl(var(--border));padding:.55rem 0}.health-service summary{align-items:center;cursor:pointer;display:flex;gap:.55rem;font-weight:600}.health-service .meta{margin-left:1.25rem}.health-issue{border-left:2px solid hsl(var(--border));margin:.55rem 0 .55rem 1.25rem;padding:.15rem .65rem}.health-issue p{margin:.3rem 0;overflow-wrap:anywhere}.health-issue small{color:hsl(var(--muted-foreground))}@media(max-width:600px){.health-heading{align-items:flex-start}.header-actions{justify-content:flex-start}}`;
 const styles = `:host{display:block;color:hsl(var(--foreground));font-family:var(--font-sans,system-ui)}*{box-sizing:border-box}main{max-width:1200px;margin:auto;padding:1.5rem}header,.directory-top,.heading,.actions{align-items:flex-start;display:flex;gap:1rem;justify-content:space-between}h1,h2,h3,p{margin:0}h1{font-size:1.55rem}h2{font-size:1.1rem}h3{font-size:.9rem}.eyebrow{color:hsl(var(--primary));font-size:.75rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.subtle,.read-only,.meta{color:hsl(var(--muted-foreground));font-size:.875rem;margin-top:.35rem}.status{color:hsl(var(--muted-foreground));min-height:1.4rem;margin-top:.75rem}.status:empty{display:none}.status[data-error="true"],.drawer-feedback.error{color:hsl(var(--destructive))}.badge,.state{background:hsl(var(--muted));border-radius:999px;font-size:.8rem;font-weight:700;padding:.25rem .6rem}.badge.ok,.state.on{background:hsl(var(--success) / .16);color:hsl(var(--success))}.directory{border-top:1px solid hsl(var(--border));margin-top:1.25rem;padding-top:.8rem}.resource-nav{display:flex;gap:.15rem}.resource-tab{background:transparent;border-radius:0;color:hsl(var(--muted-foreground));min-height:2.45rem;padding:.45rem .8rem}.resource-tab[aria-selected="true"]{border-bottom:2px solid hsl(var(--primary));color:hsl(var(--foreground))}label{display:grid;gap:.4rem;font-size:.875rem;font-weight:600;margin-top:1rem}select,input{background:hsl(var(--background));border:1px solid hsl(var(--input));border-radius:calc(var(--radius,.5rem) - 2px);color:inherit;font:inherit;min-height:2.25rem;padding:.4rem .55rem}.filter{margin:0;flex:1;max-width:420px;min-width:180px}.directory-top{align-items:center;flex-wrap:wrap}.directory-top .resource-nav{margin-right:auto}.column-tools{align-items:center;display:flex;flex-wrap:wrap;gap:.4rem;margin-top:1rem}.column-tools>span{color:hsl(var(--muted-foreground));font-size:.8rem;font-weight:700;margin-right:.15rem}.column-chip{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground));font-size:.78rem;min-height:2rem;padding:.25rem .55rem}.column-chip[aria-pressed="false"]{background:transparent;border:1px solid hsl(var(--border));color:hsl(var(--muted-foreground))}.check{align-items:center;display:flex;gap:.5rem}.check input{min-height:auto;width:1rem}.actions{justify-content:flex-end;margin-top:1rem}button{background:hsl(var(--primary));border:0;border-radius:calc(var(--radius,.5rem) - 2px);color:hsl(var(--primary-foreground));cursor:pointer;font:inherit;font-weight:700;min-height:2.25rem;padding:.4rem .7rem}button.secondary{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground))}button.compact{font-size:.8rem;min-height:1.9rem;padding:.25rem .55rem}button:disabled{cursor:not-allowed;opacity:.6}button:focus,input:focus,select:focus{outline:2px solid hsl(var(--ring));outline-offset:2px}.table-wrap{margin-top:1rem;overflow:auto}table{border-collapse:collapse;color:hsl(var(--foreground));min-width:700px;width:100%}th,td{border-bottom:1px solid hsl(var(--border));padding:.75rem;text-align:left;vertical-align:middle}th{color:hsl(var(--muted-foreground));font-size:.75rem;text-transform:uppercase}.identity strong,.identity span{display:block}.identity span{color:hsl(var(--muted-foreground));font-size:.84rem;margin-top:.15rem}.row-control{text-align:right}.selected-row td{background:hsl(var(--accent) / .42)}.row-actions td{background:hsl(var(--accent) / .28)}.row-actions td>div{align-items:center;display:flex;gap:.7rem}.empty{border:1px dashed hsl(var(--border));border-radius:var(--radius,.5rem);color:hsl(var(--muted-foreground));margin-top:1rem;padding:1.25rem;text-align:center}.sr-only{clip:rect(0,0,0,0);height:1px;margin:-1px;overflow:hidden;position:absolute;width:1px}.backdrop{background:hsl(var(--background) / .64);display:flex;inset:0;justify-content:flex-end;position:fixed;z-index:20}.drawer{background:hsl(var(--card));box-shadow:-8px 0 24px hsl(var(--foreground) / .16);display:flex;flex-direction:column;height:100%;max-width:min(100%,40rem);width:100%}.drawer-heading{border-bottom:1px solid hsl(var(--border));flex:0 0 auto;padding:.85rem 1.1rem}.drawer-body{flex:1;min-height:0;overflow:auto;padding:.9rem 1.1rem}.drawer-section{margin-top:.9rem}.security-confirmation,.one-time-secret{background:hsl(var(--muted) / .28);border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);margin-top:1rem;padding:1rem}.security-confirmation p,.one-time-secret p{color:hsl(var(--muted-foreground));margin-bottom:.75rem}.one-time-secret code{display:block;background:hsl(var(--background));border-radius:.35rem;font-size:1rem;margin:.5rem 0;overflow-wrap:anywhere;padding:.65rem;user-select:all}.field-grid{display:grid;gap:.55rem;grid-template-columns:1fr}.user-field{align-items:end;display:grid;gap:.5rem;grid-template-columns:minmax(0,1fr) auto}.user-field label{align-items:center;display:grid;grid-template-columns:112px minmax(0,1fr);margin:0}.user-field label.check{display:flex;justify-content:flex-start}.field-grid .user-field label{margin:0}.drawer-footer{border-top:1px solid hsl(var(--border));flex:0 0 auto;padding:.7rem 1.1rem}.drawer-footer .actions{margin-top:0}.drawer-feedback{margin-top:.75rem;min-height:1.4rem}dl{margin:0}dl div{border-bottom:1px solid hsl(var(--border));padding:.75rem 0}dt{color:hsl(var(--muted-foreground));font-size:.75rem;font-weight:700}dd{margin:.25rem 0 0;overflow-wrap:anywhere}@media(max-width:600px){main{padding:1rem}.directory-top,.heading{flex-direction:column}.field-grid .user-field label{align-items:stretch;grid-template-columns:1fr}.drawer-heading{padding:1rem}.drawer-body,.drawer-footer{padding-left:1rem;padding-right:1rem}}`;
+const traceStyles = `.trace-panel{border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);margin-top:1rem;padding:.8rem}.trace-form{align-items:end;display:grid;gap:.6rem;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-top:.5rem}.trace-form label{margin:0}.trace-form button{align-self:end}.trace-toolbar{align-items:center;display:flex;flex-wrap:wrap;gap:.6rem;justify-content:space-between;margin-top:.7rem}.trace-panel th,.trace-panel td{font-size:.82rem;padding:.45rem}.trace-panel table{min-width:760px}.trace-panel .table-wrap{max-height:360px;overflow:auto}.trace-events{background:hsl(var(--muted) / .24);border-radius:var(--radius,.5rem);margin-top:.8rem;padding:.8rem}.trace-events p{font-size:.82rem;margin-top:.55rem;overflow-wrap:anywhere}.header-actions{align-items:center;display:flex;flex-wrap:wrap;gap:.4rem}@media(max-width:600px){.trace-form{grid-template-columns:1fr 1fr}}`;
 if (!customElements.get(ELEMENT)) customElements.define(ELEMENT, CloudCommandMicrosoftPage);

@@ -22,6 +22,12 @@ const addressWriteParameters = z.object({ mailboxId: uuid, address: z.string().e
 const delegationGetParameters = z.object({ mailboxId: uuid, delegateId: uuid }).strict();
 const delegationSetParameters = z.object({ mailboxId: uuid, delegateId: uuid,
   right: z.enum(['FullAccess', 'SendAs', 'SendOnBehalf']), enabled: z.boolean() }).strict().refine(value => value.mailboxId !== value.delegateId);
+const traceStatus = z.enum(['Delivered', 'Expanded', 'Failed', 'FilteredAsSpam', 'GettingStatus', 'Pending', 'Quarantined']);
+const traceCursor = z.object({ received: z.string().datetime({ offset: true }), recipient: z.string().email().max(320) }).strict();
+const traceSearchParameters = z.object({ start: z.string().datetime({ offset: true }), end: z.string().datetime({ offset: true }),
+  sender: z.string().email().max(320).nullable(), recipient: z.string().email().max(320).nullable(),
+  status: traceStatus.nullable(), cursor: traceCursor.nullable() }).strict();
+const traceDetailParameters = z.object({ messageTraceId: uuid, recipient: z.string().email().max(320) }).strict();
 const bindingSchema = z.object({
   organizationId: uuid,
   tenantId: uuid,
@@ -55,8 +61,12 @@ const delegationGetRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
   operation: z.literal('mailbox.delegation.get'), parameters: delegationGetParameters }).strict();
 const delegationSetRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
   operation: z.literal('mailbox.delegation.set'), parameters: delegationSetParameters }).strict();
+const traceSearchRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
+  operation: z.literal('trace.search'), parameters: traceSearchParameters }).strict();
+const traceDetailRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
+  operation: z.literal('trace.detail'), parameters: traceDetailParameters }).strict();
 const request = z.discriminatedUnion('operation', [inventoryRequest, forwardingGetRequest, forwardingSetRequest, autoReplyGetRequest, autoReplySetRequest,
-  addressesGetRequest, primarySetRequest, aliasAddRequest, aliasRemoveRequest, delegationGetRequest, delegationSetRequest]);
+  addressesGetRequest, primarySetRequest, aliasAddRequest, aliasRemoveRequest, delegationGetRequest, delegationSetRequest, traceSearchRequest, traceDetailRequest]);
 
 const mailbox = z.object({
   id: uuid,
@@ -95,6 +105,15 @@ const delegationState = z.object({ mailboxId: uuid, delegateId: uuid, delegateAd
   fullAccess: z.boolean(), sendAs: z.boolean(), sendOnBehalf: z.boolean() }).strict();
 const delegationGetResponse = z.object({ requestId: uuid, ok: z.literal(true), data: delegationState }).strict();
 const delegationSetResponse = z.object({ requestId: uuid, ok: z.literal(true), data: delegationState.extend({ accepted: z.literal(true), verified: z.boolean() }) }).strict();
+const traceRecord = z.object({ messageTraceId: uuid, received: z.string().datetime({ offset: true }),
+  sender: z.string().max(320), recipient: z.string().email().max(320), subject: z.string().max(1000), status: z.string().max(80) }).strict();
+const traceEvent = z.object({ date: z.string().datetime({ offset: true }).nullable(), event: z.string().max(120), detail: z.string().max(4000) }).strict();
+const traceSearchResponse = z.object({ requestId: uuid, ok: z.literal(true), data: z.object({
+  rows: z.array(traceRecord).max(1000), next: traceCursor.nullable(), partial: z.boolean(), checkedAt: z.string().datetime({ offset: true }),
+}).strict() }).strict();
+const traceDetailResponse = z.object({ requestId: uuid, ok: z.literal(true), data: z.object({
+  messageTraceId: uuid, recipient: z.string().email().max(320), events: z.array(traceEvent).max(1000), partial: z.boolean(),
+}).strict() }).strict();
 
 export type ExchangeConnectionBinding = z.infer<typeof bindingSchema>;
 export type ExchangeMailboxInventory = z.infer<typeof mailbox>;
@@ -107,6 +126,8 @@ export type ExchangeAutoReplySet = z.infer<typeof autoReplySetParameters>;
 export type ExchangeAddressWrite = z.infer<typeof addressWriteParameters>;
 export type ExchangeAddressAction = 'mailbox.primary.set' | 'mailbox.alias.add' | 'mailbox.alias.remove';
 export type ExchangeDelegationSet = z.infer<typeof delegationSetParameters>;
+export type ExchangeTraceSearch = z.infer<typeof traceSearchParameters>;
+export type ExchangeTraceDetail = z.infer<typeof traceDetailParameters>;
 
 /** A host-only port for the Unix-socket sidecar. Do not implement this with HTTP or expose it to browsers. */
 export interface ExchangeWorkerPort {
@@ -129,6 +150,24 @@ export function createExchangeDelegationClient(port: ExchangeWorkerPort) {
       const data = await forwardingDispatch(port, outbound, delegationSetResponse);
       if (data.mailboxId !== outbound.parameters.mailboxId || data.delegateId !== outbound.parameters.delegateId)
         throw new ExchangeWorkerError('unknown_write_outcome');
+      return data;
+    },
+  };
+}
+export function createExchangeTraceClient(port: ExchangeWorkerPort) {
+  return {
+    async search(binding: ExchangeConnectionBinding, input: ExchangeTraceSearch) {
+      const outbound = traceSearchRequest.parse({ ...bindingSchema.parse(binding), requestId: randomUUID(), operation: 'trace.search', parameters: input });
+      const data = await forwardingDispatch(port, outbound, traceSearchResponse);
+      if (data.next && !data.rows.some(row => row.received === data.next?.received && row.recipient.toLowerCase() === data.next?.recipient.toLowerCase()))
+        throw new ExchangeWorkerError('provider_unreachable');
+      return data;
+    },
+    async detail(binding: ExchangeConnectionBinding, input: ExchangeTraceDetail) {
+      const outbound = traceDetailRequest.parse({ ...bindingSchema.parse(binding), requestId: randomUUID(), operation: 'trace.detail', parameters: input });
+      const data = await forwardingDispatch(port, outbound, traceDetailResponse);
+      if (data.messageTraceId !== outbound.parameters.messageTraceId || data.recipient.toLowerCase() !== outbound.parameters.recipient.toLowerCase())
+        throw new ExchangeWorkerError('provider_unreachable');
       return data;
     },
   };

@@ -4,6 +4,24 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 const context = (organizationId: string) => ({ contractVersion: 1, extensionName: 'cloudcommand', path: '/extensions/cloudcommand/google', organizationId });
 afterEach(() => document.body.replaceChildren());
 describe('Google directory page', () => {
+  it('shows bounded Gmail audit trace and labels loaded-result search', async () => {
+    const request = vi.fn(async (path: string) => Response.json(path === '/google/connection'
+      ? { available: true, connected: true, enabled: true, canManage: true }
+      : path.startsWith('/google/reports/trace')
+        ? { asOf: '2026-09-22T11:00:00.000Z', items: [{ id: 't1', at: '2026-09-22T10:00:00Z', sender: 'one@example.test', recipient: 'two@example.test', subject: 'Test', status: 'Sent' }], nextPageToken: 'next', partial: false, warning: null }
+        : { items: [], nextPageToken: null, complete: true }));
+    const page = new CloudCommandGooglePage(); page.context = context('org-a'); page.hostApi = { request }; document.body.append(page);
+    await flush(); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#trace-tab')!.click();
+    await flush();
+    expect(request.mock.calls.some(([path]) => path === '/google/reports/trace?days=7')).toBe(true);
+    expect(page.shadowRoot!.textContent).toContain('one@example.test');
+    expect(page.shadowRoot!.textContent).toContain('not final delivery proof');
+    expect(page.shadowRoot!.textContent).toContain('More pages available');
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#more-trace')!.click();
+    await flush();
+    expect(request.mock.calls.some(([path]) => path.includes('pageToken=next&asOf=2026-09-22T11%3A00%3A00.000Z'))).toBe(true);
+  });
   it('shows bounded security activity without provider parameter values', async () => {
     const request = vi.fn(async (path: string) => Response.json(path === '/google/connection'
       ? { available: true, connected: true, enabled: true, canManage: true }

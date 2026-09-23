@@ -32,6 +32,32 @@ afterEach(() => {
 });
 
 describe('CloudCommandMicrosoftPage', () => {
+  it('searches bounded message trace pages, loads detail, and labels partial CSV coverage', async () => {
+    const now = new Date(Date.now() - 60000).toISOString();
+    const first = { messageTraceId: '66666666-6666-4666-8666-666666666666', received: now, sender: 'sender@example.com', recipient: 'recipient@example.com', subject: 'Test', status: 'Delivered' };
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: false });
+      if (path === '/microsoft/resources/users') return emptyResource();
+      if (path === '/microsoft/administration') {
+        const body = JSON.parse(String(init?.body));
+        if (body.type === 'trace.search') return Response.json({ rows: body.cursor ? [] : [first], next: body.cursor ? null : { received: first.received, recipient: first.recipient }, partial: !body.cursor, checkedAt: now });
+        if (body.type === 'trace.detail') return Response.json({ messageTraceId: first.messageTraceId, recipient: first.recipient, events: [{ date: now, event: 'DELIVER', detail: 'Delivered' }], partial: false });
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush();
+    const root = page.shadowRoot!; root.querySelector<HTMLButtonElement>('#trace-open')!.click();
+    root.querySelector<HTMLFormElement>('#trace-form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await flush();
+    expect(root.textContent).toContain('more pages available');
+    expect(root.textContent).toContain('CSV includes only loaded rows');
+    root.querySelector<HTMLButtonElement>('[data-trace-detail="0"]')!.click(); await flush();
+    expect(root.textContent).toContain('DELIVER');
+    root.querySelector<HTMLButtonElement>('#trace-more')!.click(); await flush();
+    const calls = request.mock.calls.filter(([path, init]) => path === '/microsoft/administration' && String(init?.body).includes('trace.search'));
+    expect(calls).toHaveLength(2);
+    expect(JSON.parse(String(calls[1]![1]?.body)).cursor).toEqual({ received: first.received, recipient: first.recipient });
+    expect(root.textContent).not.toContain('more pages available');
+  });
   it('loads direct rights for a selected tenant mailbox and confirms one delegation change', async () => {
     const id = '66666666-6666-4666-8666-666666666666', delegateId = '77777777-7777-4777-8777-777777777777';
     const request = vi.fn(async (path: string, init?: RequestInit) => {

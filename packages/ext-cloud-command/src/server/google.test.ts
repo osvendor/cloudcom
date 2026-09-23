@@ -17,6 +17,7 @@ function harness(opts: { access?: boolean; sites?: string[]; read?: boolean; wri
     storage: vi.fn(async (_request, date: string) => ({ ok: true as const, date, items: [{ email: 'test@example.test', gmailMb: 10, driveMb: null, totalMb: 20 }],
       nextPageToken: null, partial: true, warning: 'Some usage data is unavailable.' })),
     activity: vi.fn(async (_request, source, days) => ({ ok: true as const, source, days, asOf: new Date().toISOString(), items: [], nextPageToken: 'next', partial: false, warning: null })),
+    trace: vi.fn(async (_request, days) => ({ ok: true as const, days, asOf: new Date().toISOString(), items: [], nextPageToken: 'next', partial: false, warning: null })),
     auditSuspension: vi.fn(async () => { if (opts.auditFail) throw new Error('audit unavailable'); }),
     setSuspended: vi.fn(async () => ({ ok: true as const, userId: '123456', suspended: true })),
     auditProfile: vi.fn(async () => { if (opts.auditFail) throw new Error('audit unavailable'); }),
@@ -139,6 +140,27 @@ describe('Google native extension bridge', () => {
     for (const extra of ['&source=login', '&days=90', '&customerId=other', '&orgId=' + PARTNER, '&pageToken=a&pageToken=b', '&pageToken=a'])
       expect((await h.app.request(`/google/reports/activity?orgId=${ORG}&source=login&days=7${extra}`)).status).toBe(400);
     expect(h.google.activity).not.toHaveBeenCalled();
+  });
+  it('routes bounded Gmail audit trace only for managers with MFA', async () => {
+    const h = harness();
+    const response = await h.app.request(`/google/reports/trace?orgId=${ORG}&days=7`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(h.google.trace).toHaveBeenCalledWith({ auth: h.auth, authorization: h.authorization, orgId: ORG }, 7, null, null);
+    const asOf = new Date().toISOString();
+    expect((await h.app.request(`/google/reports/trace?orgId=${ORG}&days=7&pageToken=next&asOf=${encodeURIComponent(asOf)}`)).status).toBe(200);
+    expect(h.google.trace).toHaveBeenLastCalledWith(expect.any(Object), 7, 'next', asOf);
+    for (const opts of [{ write: false }, { mfa: false }, { access: false }, { sites: [] }]) {
+      const denied = harness(opts);
+      expect((await denied.app.request(`/google/reports/trace?orgId=${ORG}&days=7`)).status).toBe(403);
+      expect(denied.google.trace).not.toHaveBeenCalled();
+    }
+  });
+  it('rejects caller-selected trace scope and unpaired pagination', async () => {
+    const h = harness();
+    for (const extra of ['&days=30', '&days=90', '&customerId=other', '&orgId=' + PARTNER, '&pageToken=a&pageToken=b', '&pageToken=a'])
+      expect((await h.app.request(`/google/reports/trace?orgId=${ORG}&days=7${extra}`)).status).toBe(400);
+    expect(h.google.trace).not.toHaveBeenCalled();
   });
   const post = (app: ReturnType<typeof harness>['app'], body: unknown) => app.request(`/google/users/suspension?orgId=${ORG}`,
     { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });

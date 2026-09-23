@@ -49,6 +49,34 @@ describe('Exchange mailbox inventory attachment', () => {
   });
 });
 
+describe('Exchange message trace read attachment', () => {
+  const end = new Date(Date.now() - 60000).toISOString(), start = new Date(Date.now() - 86400000).toISOString();
+  const search = { start, end, sender: null, recipient: 'recipient@example.com', status: null, cursor: null };
+  const row = { messageTraceId: '66666666-6666-4666-8666-666666666666', received: end,
+    sender: 'sender@example.com', recipient: 'recipient@example.com', subject: 'Private subject', status: 'Delivered' };
+  it('fences a fixed read and audits counts without message content', async () => {
+    const s = setup(); s.worker.dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,
+      data: { rows: [row], next: null, partial: false, checkedAt: end } }));
+    await expect(s.service.traceSearch({}, org, search)).resolves.toMatchObject({ rows: [row] });
+    expect(s.authorize).toHaveBeenCalledWith({}, org, false);
+    expect(s.worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'trace.search', parameters: search }));
+    expect(JSON.stringify(s.audit.mock.calls)).not.toContain('Private subject');
+    expect(JSON.stringify(s.audit.mock.calls)).not.toContain('recipient@example.com');
+  });
+  it('rejects invalid windows and foreign organizations before worker contact', async () => {
+    const s = setup();
+    await expect(s.service.traceSearch({}, org, { ...search, start: new Date(Date.now() - 100 * 86400000).toISOString() })).rejects.toMatchObject({ code: 'invalid_operation' });
+    await expect(s.service.traceSearch({}, '77777777-7777-4777-8777-777777777777', search)).rejects.toMatchObject({ code: 'connection_not_ready' });
+    expect(s.worker.dispatch).not.toHaveBeenCalled();
+  });
+  it('reads delivery events only for a typed message and recipient', async () => {
+    const s = setup(); s.worker.dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,
+      data: { messageTraceId: row.messageTraceId, recipient: row.recipient, events: [{ date: end, event: 'DELIVER', detail: 'Delivered' }], partial: false } }));
+    await expect(s.service.traceDetail({}, org, { messageTraceId: row.messageTraceId, recipient: row.recipient })).resolves.toMatchObject({ events: [expect.objectContaining({ event: 'DELIVER' })] });
+    expect(s.worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'trace.detail' }));
+  });
+});
+
 describe('Exchange forwarding administration', () => {
   const mailboxId = '66666666-6666-4666-8666-666666666666';
   it('requires mutation authorization and audits a bounded, verified change', async () => {

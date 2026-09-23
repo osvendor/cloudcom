@@ -56,4 +56,22 @@ describe('3CX Call Log page', () => {
     expect(root.querySelector<HTMLElement>('#filter-empty')!.hidden).toBe(false);
     expect(request).toHaveBeenCalledTimes(1);
   });
+  it('matches the retained Call Log details and counts only answered loaded events', async () => {
+    const page = mount(async () => Response.json({ scope: 'full_pbx', truncated: true, nextSkip: null, items: [
+      { CallId: 'call-1', StartTime: '2026-09-22T12:00:00Z', SourceDn: '100', SourceDisplayName: 'Agent', DestinationDn: '200', DestinationDisplayName: 'Customer', Status: 'Answered', TalkingDuration: '0:01:00', RingingDuration: '0:00:05', Direction: 'Outbound', Answered: true },
+      { CallId: 'call-2', StartTime: '2026-09-22T12:05:00Z', SourceDn: '300', DestinationDn: '400', Status: 'Missed', TalkingDuration: '0:00:00', Direction: 'Inbound', Answered: false },
+    ] }));
+    page.shadowRoot!.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flush();
+    const root = page.shadowRoot!;
+    expect(root.querySelector('[role="status"]')!.textContent).toContain('1 answered among loaded events');
+    expect(root.querySelector('[role="status"]')!.textContent).toContain('More events may exist');
+    const first = root.querySelector<HTMLTableRowElement>('tr[data-call-index="0"]')!;
+    const details = first.querySelector('details')!;
+    details.open = true;
+    expect(details.textContent).toContain('100 · Agent');
+    expect(details.textContent).toContain('200 · Customer');
+    expect(details.textContent).toContain('0:00:05');
+    expect(details.textContent).toContain('Outbound');
+  });
 });

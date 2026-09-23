@@ -73,6 +73,11 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
   const delegationGet = z.object({ type: z.literal('mailbox.delegation.get'), mailboxId: uuid, delegateId: uuid }).strict();
   const delegationSet = z.object({ type: z.literal('mailbox.delegation.set'), mailboxId: uuid, delegateId: uuid,
     right: z.enum(['FullAccess', 'SendAs', 'SendOnBehalf']), enabled: z.boolean() }).strict();
+  const traceCursor = z.object({ received: z.string().datetime({ offset: true }), recipient: z.string().email().max(320) }).strict();
+  const traceSearch = z.object({ type: z.literal('trace.search'), start: z.string().datetime({ offset: true }), end: z.string().datetime({ offset: true }),
+    sender: z.string().email().max(320).nullable(), recipient: z.string().email().max(320).nullable(),
+    status: z.enum(['Delivered', 'Expanded', 'Failed', 'FilteredAsSpam', 'GettingStatus', 'Pending', 'Quarantined']).nullable(), cursor: traceCursor.nullable() }).strict();
+  const traceDetail = z.object({ type: z.literal('trace.detail'), messageTraceId: uuid, recipient: z.string().email().max(320) }).strict();
   async function exchangeService() {
     const bridge = await runtime.exchange?.();
     if (!bridge) throw new AdministrationSetupError('exchange_unavailable');
@@ -224,9 +229,13 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
         if (readDelegation.success) return (await exchangeService()).delegationGet(request, request.orgId, readDelegation.data.mailboxId, readDelegation.data.delegateId);
         const saveDelegation = delegationSet.safeParse(input);
         if (saveDelegation.success) return (await exchangeService()).delegationSet(request, request.orgId, saveDelegation.data);
+        const searchTrace = traceSearch.safeParse(input);
+        if (searchTrace.success) return (await exchangeService()).traceSearch(request, request.orgId, searchTrace.data);
+        const detailTrace = traceDetail.safeParse(input);
+        if (detailTrace.success) return (await exchangeService()).traceDetail(request, request.orgId, detailTrace.data);
         if (typeof input === 'object' && input !== null && 'type' in input &&
           typeof input.type === 'string' && (input.type.startsWith('mailbox.forwarding.') || input.type.startsWith('mailbox.autoreply.') ||
-            input.type.startsWith('mailbox.addresses.') || input.type.startsWith('mailbox.primary.') || input.type.startsWith('mailbox.alias.') || input.type.startsWith('mailbox.delegation.')))
+            input.type.startsWith('mailbox.addresses.') || input.type.startsWith('mailbox.primary.') || input.type.startsWith('mailbox.alias.') || input.type.startsWith('mailbox.delegation.') || input.type.startsWith('trace.')))
           throw new AdministrationSetupError('invalid_operation');
         return execute(request, request.orgId, input);
       },

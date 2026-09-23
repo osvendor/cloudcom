@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createExchangeAddressesClient, createExchangeAutoReplyClient, createExchangeDelegationClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, ExchangeWorkerError } from './exchange-contract';
+import { createExchangeAddressesClient, createExchangeAutoReplyClient, createExchangeDelegationClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, createExchangeTraceClient, ExchangeWorkerError } from './exchange-contract';
 
 const binding = {
   organizationId: '11111111-1111-4111-8111-111111111111', tenantId: '22222222-2222-4222-8222-222222222222',
@@ -115,5 +115,30 @@ describe('Exchange delegation contract', () => {
       parameters: { mailboxId, delegateId, right: 'FullAccess', enabled: true } }));
     await expect(client.set(binding, { mailboxId, delegateId: mailboxId, right: 'SendAs', enabled: true })).rejects.toThrow();
     expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Exchange message trace contract', () => {
+  const search = { start: '2026-09-22T00:00:00.000Z', end: '2026-09-23T00:00:00.000Z',
+    sender: null, recipient: 'recipient@example.com', status: null, cursor: null };
+  const row = { messageTraceId: mailbox.id, received: '2026-09-22T12:00:00.000Z', sender: 'sender@example.com',
+    recipient: 'recipient@example.com', subject: 'Test', status: 'Delivered' };
+  it('sends fixed read operations and accepts a bounded continuation', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: request.operation === 'trace.search'
+      ? { rows: [row], next: { received: row.received, recipient: row.recipient }, partial: true, checkedAt: search.end }
+      : { messageTraceId: row.messageTraceId, recipient: row.recipient, events: [{ date: row.received, event: 'DELIVER', detail: 'Delivered' }], partial: false } }));
+    const client = createExchangeTraceClient({ dispatch });
+    await expect(client.search(binding, search)).resolves.toMatchObject({ partial: true });
+    await expect(client.detail(binding, { messageTraceId: row.messageTraceId, recipient: row.recipient })).resolves.toMatchObject({ events: [expect.objectContaining({ event: 'DELIVER' })] });
+    expect(dispatch.mock.calls.map(([request]) => request.operation)).toEqual(['trace.search', 'trace.detail']);
+    expect(JSON.stringify(dispatch.mock.calls)).not.toContain('certificate');
+  });
+  it('rejects injected parameters and a cursor not present in its page', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true,
+      data: { rows: [row], next: { received: row.received, recipient: 'different@example.com' }, partial: true, checkedAt: search.end } }));
+    const client = createExchangeTraceClient({ dispatch });
+    await expect(client.search(binding, { ...search, command: 'Remove-Mailbox' } as never)).rejects.toThrow();
+    expect(dispatch).not.toHaveBeenCalled();
+    await expect(client.search(binding, search)).rejects.toMatchObject({ code: 'provider_unreachable' });
   });
 });

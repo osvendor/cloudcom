@@ -85,6 +85,7 @@ const cloudCommandApiPaths = new Set([
   'apps/api/src/extensions/cloudCommandMicrosoft.ts',
   'apps/api/src/extensions/cloudCommandMicrosoft.test.ts',
   'apps/api/src/extensions/cloudCommandGoogle.ts',
+  'apps/api/src/extensions/cloudCommandGoogleTrace.ts',
   'apps/api/src/extensions/cloudCommandGoogle.test.ts',
   'apps/api/src/services/googleClient.ts',
   'apps/api/src/services/googleClient.test.ts',

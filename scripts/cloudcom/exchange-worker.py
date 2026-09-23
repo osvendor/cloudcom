@@ -5,18 +5,26 @@ Deployment owns the socket path, permitted API uid, config file and certificate 
 process deliberately never listens on TCP and never accepts PowerShell, certificate paths, or
 tenant configuration from a client. It is a service-side companion, not an API endpoint.
 """
-import argparse, datetime, json, os, select, socket, socketserver, stat, struct, subprocess, threading, time, uuid
+import argparse, datetime, json, os, re, select, socket, socketserver, stat, struct, subprocess, threading, time, uuid
 from pathlib import Path
 try: import pwd
 except ModuleNotFoundError: pwd = None
 
 MAX_REQUEST = 64 * 1024
-MAX_RESPONSE = 1024 * 1024
+MAX_RESPONSE = 4 * 1024 * 1024
 MAX_PAGE_SIZE = 200
 COMMAND_TIMEOUT_SECONDS = 45
 ALLOWED_OPERATIONS = frozenset(('mailbox.inventory', 'mailbox.forwarding.get', 'mailbox.forwarding.set',
     'mailbox.autoreply.get', 'mailbox.autoreply.set', 'mailbox.addresses.get', 'mailbox.primary.set',
-    'mailbox.alias.add', 'mailbox.alias.remove', 'mailbox.delegation.get', 'mailbox.delegation.set'))
+    'mailbox.alias.add', 'mailbox.alias.remove', 'mailbox.delegation.get', 'mailbox.delegation.set', 'trace.search', 'trace.detail'))
+TRACE_STATUSES = frozenset(('Delivered', 'Expanded', 'Failed', 'FilteredAsSpam', 'GettingStatus', 'Pending', 'Quarantined'))
+ADDRESS = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+def trace_address(value): return isinstance(value, str) and len(value) <= 320 and ADDRESS.fullmatch(value) is not None
+def trace_time(value):
+    if not isinstance(value, str): raise ValueError()
+    result = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if result.tzinfo is None: raise ValueError()
+    return result.astimezone(datetime.timezone.utc)
 def is_write(operation): return operation.endswith(('.set', '.add', '.remove'))
 SAFE_FAILURES = frozenset(('access_denied', 'connection_mismatch', 'credential_unavailable', 'invalid_request',
                             'provider_access_denied', 'provider_rejected', 'provider_unreachable', 'response_too_large', 'worker_busy', 'unknown_write_outcome'))
@@ -38,6 +46,33 @@ def valid_success_response(result, request_id, operation):
     if operation == 'mailbox.inventory':
         if not isinstance(data, dict) or set(data) != {'records', 'partial', 'collectedAt'} or not isinstance(data['records'], list) or not isinstance(data['partial'], bool) or not isinstance(data['collectedAt'], str): return 'provider_unreachable'
         if len(data['records']) > MAX_PAGE_SIZE: return 'response_too_large'
+    elif operation == 'trace.search':
+        if not isinstance(data, dict) or set(data) != {'rows', 'next', 'partial', 'checkedAt'} or type(data['partial']) is not bool: return 'provider_unreachable'
+        if not isinstance(data['rows'], list) or len(data['rows']) > 1000: return 'response_too_large'
+        try: trace_time(data['checkedAt'])
+        except (TypeError, ValueError): return 'provider_unreachable'
+        for row in data['rows']:
+            if not isinstance(row, dict) or set(row) != {'messageTraceId', 'received', 'sender', 'recipient', 'subject', 'status'}: return 'provider_unreachable'
+            try: normalized_uuid(row['messageTraceId']); trace_time(row['received'])
+            except (TypeError, ValueError): return 'provider_unreachable'
+            if not trace_address(row['recipient']) or not all(isinstance(row[key], str) and len(row[key]) <= size for key, size in (('sender', 320), ('subject', 1000), ('status', 80))): return 'provider_unreachable'
+        if data['next'] is not None:
+            nxt = data['next']
+            if not isinstance(nxt, dict) or set(nxt) != {'received', 'recipient'} or not trace_address(nxt['recipient']) or not data['partial']: return 'provider_unreachable'
+            try: trace_time(nxt['received'])
+            except (TypeError, ValueError): return 'provider_unreachable'
+            if not any(row['received'] == nxt['received'] and row['recipient'].lower() == nxt['recipient'].lower() for row in data['rows']): return 'provider_unreachable'
+    elif operation == 'trace.detail':
+        if not isinstance(data, dict) or set(data) != {'messageTraceId', 'recipient', 'events', 'partial'} or type(data['partial']) is not bool: return 'provider_unreachable'
+        try: normalized_uuid(data['messageTraceId'])
+        except (TypeError, ValueError): return 'provider_unreachable'
+        if not trace_address(data['recipient']) or not isinstance(data['events'], list) or len(data['events']) > 1000: return 'provider_unreachable'
+        for event in data['events']:
+            if not isinstance(event, dict) or set(event) != {'date', 'event', 'detail'}: return 'provider_unreachable'
+            try:
+                if event['date'] is not None: trace_time(event['date'])
+            except (TypeError, ValueError): return 'provider_unreachable'
+            if not isinstance(event['event'], str) or len(event['event']) > 120 or not isinstance(event['detail'], str) or len(event['detail']) > 4000: return 'provider_unreachable'
     elif operation.startswith('mailbox.forwarding.'):
         expected = {'mailboxId', 'smtpAddress', 'keepCopy', 'internalRecipient'}
         if operation == 'mailbox.forwarding.set': expected.update(('accepted', 'verified'))
@@ -99,6 +134,19 @@ def validate_request(value, tenants):
     if not isinstance(params, dict): raise ValueError()
     if operation == 'mailbox.inventory':
         if set(params) != {'pageSize'} or type(params['pageSize']) is not int or not 1 <= params['pageSize'] <= MAX_PAGE_SIZE: raise ValueError()
+    elif operation == 'trace.search':
+        if set(params) != {'start', 'end', 'sender', 'recipient', 'status', 'cursor'}: raise ValueError()
+        start, end, now = trace_time(params['start']), trace_time(params['end']), datetime.datetime.now(datetime.timezone.utc)
+        if not now - datetime.timedelta(days=90) <= start < end <= now + datetime.timedelta(minutes=5) or end - start > datetime.timedelta(days=10): raise ValueError()
+        if any(params[key] is not None and not trace_address(params[key]) for key in ('sender', 'recipient')): raise ValueError()
+        if params['status'] is not None and params['status'] not in TRACE_STATUSES: raise ValueError()
+        cursor = params['cursor']
+        if cursor is not None:
+            if not isinstance(cursor, dict) or set(cursor) != {'received', 'recipient'} or not trace_address(cursor['recipient']): raise ValueError()
+            if not start <= trace_time(cursor['received']) <= end: raise ValueError()
+    elif operation == 'trace.detail':
+        if set(params) != {'messageTraceId', 'recipient'} or not trace_address(params['recipient']): raise ValueError()
+        normalized_uuid(params['messageTraceId'])
     elif operation.startswith('mailbox.forwarding.'):
         if set(params) != ({'mailboxId'} if operation == 'mailbox.forwarding.get' else {'mailboxId', 'smtpAddress', 'keepCopy'}): raise ValueError()
         normalized_uuid(params['mailboxId'])
