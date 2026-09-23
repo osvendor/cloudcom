@@ -382,6 +382,15 @@ describe("binarySync", () => {
         .rejects.toThrow(/missing breeze-backup/);
       expect(dbMocks.insertValues).not.toHaveBeenCalled();
     });
+
+    it('never falls back to unsigned checksums for the Windows release', async () => {
+      stubRelease();
+      delete process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS;
+      delete process.env.BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS;
+      await expect(syncFromGitHub(tag, { repository: repo, windowsOnly: true, autoPromote: false }))
+        .rejects.toThrow(/requires a signed release artifact manifest and configured trust root/);
+      expect(dbMocks.insertValues).not.toHaveBeenCalled();
+    });
   });
 
   afterEach(() => {
