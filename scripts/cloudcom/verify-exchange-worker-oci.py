@@ -44,6 +44,23 @@ def verify(archive, commit, component):
         if index.get('schemaVersion')!=2 or len(index.get('manifests',[]))!=1:
             raise ValueError('Expected exactly one image manifest')
         selected=index['manifests'][0]
+        deployable_digest=selected['digest']
+        if selected.get('mediaType') == 'application/vnd.oci.image.index.v1+json':
+            nested=descriptor(selected,True)
+            if nested.get('schemaVersion')!=2 or len(nested.get('manifests',[])) not in (1,2):
+                raise ValueError('Invalid nested image index')
+            images=[item for item in nested['manifests'] if item.get('platform')=={'os':'linux','architecture':'amd64'}]
+            if len(images)!=1:
+                raise ValueError('Expected one linux/amd64 image')
+            selected=images[0]
+            extras=[item for item in nested['manifests'] if item is not selected]
+            for extra in extras:
+                annotation=extra.get('annotations',{})
+                if (extra.get('platform')!={'os':'unknown','architecture':'unknown'} or
+                    annotation.get('vnd.docker.reference.type')!='attestation-manifest' or
+                    annotation.get('vnd.docker.reference.digest')!=selected.get('digest')):
+                    raise ValueError('Unexpected nested image manifest')
+                descriptor(extra)
         if selected.get('mediaType')!='application/vnd.oci.image.manifest.v1+json':
             raise ValueError('Expected OCI image manifest')
         platform=selected.get('platform',{})
@@ -65,7 +82,8 @@ def verify(archive, commit, component):
                 raise ValueError('Unsupported layer media type')
             descriptor(layer)
         return {'sourceCommit':commit,'component':component,'archiveSha256':archive_sha,
-                'manifestDigest':selected['digest'],'configDigest':manifest['config']['digest'],
+                'manifestDigest':deployable_digest,'imageManifestDigest':selected['digest'],
+                'configDigest':manifest['config']['digest'],
                 'platform':'linux/amd64','layerCount':len(layers),'diffIds':config['rootfs']['diff_ids']}
 
 if __name__=='__main__':

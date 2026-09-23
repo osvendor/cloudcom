@@ -209,6 +209,7 @@
         "scripts/cloudcom/exchange-worker.py",
         "scripts/cloudcom/exchange-worker.test.py",
         "scripts/cloudcom/exchange-persistent.ps1",
+        ".dockerignore",
         "deploy/cloudcom-exchange-worker/Dockerfile",
         "deploy/cloudcom-exchange-worker/healthcheck.py",
         "deploy/cloudcom-exchange-worker/README.md",
@@ -223,6 +224,14 @@
         ".github/workflows/cloudcom-candidate.yml"
       ],
       "hooks": [
+        {
+          "file": ".dockerignore",
+          "contains": "!scripts/cloudcom/exchange-worker.py"
+        },
+        {
+          "file": ".dockerignore",
+          "contains": "!scripts/cloudcom/exchange-persistent.ps1"
+        },
         {
           "file": ".github/workflows/cloudcom-ci.yml",
           "contains": "python3 scripts/cloudcom/exchange-worker.test.py"

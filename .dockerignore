@@ -89,6 +89,11 @@ load-tests
 backups
 monitoring
 scripts
+# The private Exchange worker image copies only these two reviewed runtime files.
+!scripts/cloudcom/
+scripts/cloudcom/*
+!scripts/cloudcom/exchange-worker.py
+!scripts/cloudcom/exchange-persistent.ps1
 internal
 
 # Misc
