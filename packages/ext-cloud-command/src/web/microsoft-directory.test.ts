@@ -85,7 +85,7 @@ describe('Microsoft directory interaction', () => {
     root.querySelector<HTMLButtonElement>('[data-expand="u1"]')!.click();
     root.querySelector<HTMLButtonElement>('[data-detail="u1"]')!.click(); await flush();
     const close = root.querySelector<HTMLButtonElement>('#detail-close')!;
-    const save = root.querySelector<HTMLButtonElement>('#user-save')!;
+    const save = root.querySelector<HTMLButtonElement>('#user-sessions-revoke-start')!;
     save.focus(); save.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
     expect(root.activeElement).toBe(close);
     close.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true }));
