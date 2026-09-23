@@ -155,6 +155,17 @@ test('routes only reviewed PAM cleanup recovery API files to focused validation'
     ['apps/api/src/services/pamOther.ts']);
 });
 
+test('routes the PAM local decision endpoint and regression test to API validation', () => {
+  for (const path of [
+    'apps/api/src/routes/agents/elevationRequests.ts',
+    'apps/api/src/routes/agents/elevationRequests.test.ts',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.api, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+});
+
 test('classifies only the reviewed Cloud Command server, bridge, registry, and build surfaces', () => {
   for (const path of [
     'packages/ext-cloud-command/src/server/index.ts',

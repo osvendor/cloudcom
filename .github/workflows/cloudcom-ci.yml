@@ -166,6 +166,9 @@ jobs:
       - name: Verify PAM cleanup recovery dispatch
         if: needs.delta.outputs.api == 'true'
         run: pnpm --filter @breeze/api exec vitest run src/jobs/pamActuationWorker.test.ts src/services/commandDispatch.test.ts
+      - name: Verify PAM local decision gate
+        if: needs.delta.outputs.api == 'true'
+        run: pnpm --filter @breeze/api exec vitest run src/routes/agents/elevationRequests.test.ts
       - name: Validate customer portal remote access and RLS boundaries
         if: needs.delta.outputs.portal_remote == 'true'
         run: bash scripts/cloudcom/test-portal-remote.sh

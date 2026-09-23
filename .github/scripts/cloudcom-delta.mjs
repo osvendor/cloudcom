@@ -157,6 +157,10 @@ const pamCleanupRecoveryPaths = new Set([
   'apps/api/src/services/commandDispatch.ts',
   'apps/api/src/services/commandDispatch.test.ts',
 ]);
+const pamLocalDecisionPaths = new Set([
+  'apps/api/src/routes/agents/elevationRequests.ts',
+  'apps/api/src/routes/agents/elevationRequests.test.ts',
+]);
 const infraPaths = new Set([
   'AGENTS.md', '.dockerignore', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',
   '.github/scripts/check-cloudcom-runner.sh', '.github/scripts/ci-area-gating.test.mjs',
@@ -248,6 +252,10 @@ export function classify(paths) {
       continue;
     }
     if (pamCleanupRecoveryPaths.has(path)) {
+      result.api = true;
+      continue;
+    }
+    if (pamLocalDecisionPaths.has(path)) {
       result.api = true;
       continue;
     }
