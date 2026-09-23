@@ -47,7 +47,9 @@ func TestRunPamFlow(t *testing.T) {
 		promoteErr error
 		// wantPromoteAttempt asserts Promote was called exactly once even though
 		// the actuation did not complete (used with promoteErr).
-		wantPromoteAttempt bool
+		wantPromoteAttempt    bool
+		localDecisionRequired bool
+		wantReported          string
 		// dismissResult, when non-nil, overrides the broker-dismiss result so the
 		// deny-path logging switch can be exercised against the
 		// benign "no_consent_window" and the genuine-failure reasons.
@@ -78,6 +80,34 @@ func TestRunPamFlow(t *testing.T) {
 			wantTriggered:        false,
 			wantDismissed:        true,
 			wantActuated:         false,
+		},
+		{
+			name:                  "protocol one reports approval only after consent dismissal",
+			status:                "auto_approved",
+			dialog:                approved,
+			localDecisionRequired: true, wantReported: "approved",
+			wantFind:              true,
+			wantDialog:            true,
+			wantDismissed:         true,
+		},
+		{
+			name:                  "protocol one reports local denial",
+			status:                "auto_approved",
+			dialog:                dismissed,
+			localDecisionRequired: true, wantReported: "denied",
+			wantFind:              true,
+			wantDialog:            true,
+			wantDismissed:         true,
+		},
+		{
+			name:                  "protocol one refuses launch if original consent cannot be dismissed",
+			status:                "auto_approved",
+			dialog:                approved,
+			localDecisionRequired: true, wantReported: "denied",
+			dismissResult:         &ipc.PamDismissConsentResult{Success: false, Reason: "send_input_failed"},
+			wantFind:              true,
+			wantDialog:            true,
+			wantDismissed:         true,
 		},
 		{
 			// 0xFFFFFFFF is Windows' invalid/unresolved session sentinel. Treat it
@@ -280,6 +310,7 @@ func TestRunPamFlow(t *testing.T) {
 			swapElevationManagerForTest(t, func() elevaccount.AccountManager { return manager })
 
 			var findCalled, dialogCalled bool
+			var reportedDecision string
 			var gotTargetWinSession string
 			var gotDialog ipc.PamRequestDialog
 			var gotDialogTimeout time.Duration
@@ -292,6 +323,10 @@ func TestRunPamFlow(t *testing.T) {
 			// keep this from dereferencing the nil broker.
 			h := &Heartbeat{}
 			if !tc.noBroker {
+				h.pamReportLocalDecision = func(_ string, decision string) error {
+					reportedDecision = decision
+					return nil
+				}
 				h.pamFindSession = func(capability, targetWinSession string) *sessionbroker.Session {
 					findCalled = true
 					gotTargetWinSession = targetWinSession
@@ -332,9 +367,13 @@ func TestRunPamFlow(t *testing.T) {
 				TargetExecutableSigner: "signer-Acme Corp",
 				CommandLine:            `target.exe --do-thing`,
 			}
-			outcome := etwlua.ElevationOutcome{RequestID: "req-1", Status: tc.status}
+			outcome := etwlua.ElevationOutcome{RequestID: "req-1", Status: tc.status,
+				LocalDecisionRequired: tc.localDecisionRequired}
 
 			h.RunPamFlow(context.Background(), ev, outcome)
+			if reportedDecision != tc.wantReported {
+				t.Errorf("reportedDecision = %q, want %q", reportedDecision, tc.wantReported)
+			}
 
 			if triggered != tc.wantTriggered {
 				t.Errorf("triggered = %v, want %v", triggered, tc.wantTriggered)

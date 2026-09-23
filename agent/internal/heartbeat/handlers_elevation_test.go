@@ -1,6 +1,7 @@
 package heartbeat
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,8 +29,14 @@ func TestSendElevationRequestParsesIngestDecision(t *testing.T) {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		var body struct {
+			LocalDecisionProtocol int `json:"local_decision_protocol"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.LocalDecisionProtocol != 1 {
+			t.Errorf("local decision protocol = %d, decode error = %v", body.LocalDecisionProtocol, err)
+		}
 		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"id":"req-123","status":"auto_approved"}`))
+		_, _ = w.Write([]byte(`{"id":"req-123","status":"auto_approved","localDecisionRequired":true}`))
 	}))
 	defer ts.Close()
 
@@ -48,6 +55,29 @@ func TestSendElevationRequestParsesIngestDecision(t *testing.T) {
 	}
 	if outcome.Status != "auto_approved" {
 		t.Fatalf("Status = %q, want %q", outcome.Status, "auto_approved")
+	}
+	if !outcome.LocalDecisionRequired {
+		t.Fatal("server local decision gate was not parsed")
+	}
+}
+
+func TestReportLocalPamDecision(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/v1/agents/agent-1/elevation-requests/req-123/local-decision" {
+			t.Errorf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var body struct {
+			Decision string `json:"decision"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Decision != "denied" {
+			t.Errorf("decision = %q, decode error = %v", body.Decision, err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	h := NewWithVersion(&config.Config{AgentID: "agent-1", ServerURL: ts.URL, AuthToken: "token"}, "test", nil, nil)
+	if err := h.reportLocalPamDecision("req-123", "denied"); err != nil {
+		t.Fatal(err)
 	}
 }
 

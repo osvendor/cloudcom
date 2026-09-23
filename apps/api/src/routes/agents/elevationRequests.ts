@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
-import { and, eq, inArray, isNull, or } from 'drizzle-orm';
+import { and, eq, inArray, isNull, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { db, runOutsideDbContext, withDbAccessContext, withSystemDbAccessContext } from '../../db';
@@ -98,6 +98,7 @@ function pathBasename(p: string): string {
 }
 
 export const elevationRequestSchema = z.object({
+  local_decision_protocol: z.literal(1).optional(),
   subject_username: z.string().min(1).max(255),
   target_executable_path: z.string().min(1).max(4096),
   target_executable_hash: z.string().max(128).optional(),
@@ -520,6 +521,8 @@ elevationRequestsRoutes.post(
       }
 
       const now = new Date();
+      const waitForLocalDecision = payload.local_decision_protocol === 1
+        && decision.kind === 'auto_approved';
       const status =
         decision.kind === 'auto_approved'
           ? 'auto_approved'
@@ -546,7 +549,7 @@ elevationRequestsRoutes.post(
             targetExecutableSigner: payload.target_executable_signer ?? null,
             status,
             requestedAt: observedAt,
-            approvedAt: decision.kind === 'auto_approved' ? now : null,
+            approvedAt: decision.kind === 'auto_approved' && !waitForLocalDecision ? now : null,
             expiresAt,
             denialReason:
               decision.kind === 'denied'
@@ -566,6 +569,10 @@ elevationRequestsRoutes.post(
               pid: payload.pid,
               parent_image: payload.parent_image,
               command_line: payload.command_line,
+              ...(waitForLocalDecision ? {
+                local_decision_required: true,
+                local_decision_deadline: new Date(now.getTime() + 90_000).toISOString(),
+              } : {}),
               ...(decision.kind !== 'pending' && decision.rule
                 ? { pam_rule_id: decision.rule.ruleId, pam_rule_name: decision.rule.ruleName }
                 : {}),
@@ -629,7 +636,7 @@ elevationRequestsRoutes.post(
           await tx.insert(elevationAudit).values(auditRows);
 
           let enforcementStatus: 'pending_dispatch' | 'cleanup_pending' | null = null;
-          if (decision.kind === 'auto_approved' || decision.kind === 'denied') {
+          if ((decision.kind === 'auto_approved' && !waitForLocalDecision) || decision.kind === 'denied') {
             const actuation = await createPamDecisionIntent(tx, {
               request: {
                 id: insertedRow.id,
@@ -712,6 +719,7 @@ elevationRequestsRoutes.post(
         return c.json({
           id: row.id,
           status: row.status,
+          ...(waitForLocalDecision ? { localDecisionRequired: true } : {}),
           ...(row.enforcementStatus ? { enforcementStatus: row.enforcementStatus } : {}),
         }, 201);
       } catch (err) {
@@ -723,5 +731,120 @@ elevationRequestsRoutes.post(
       }
       },
     );
+  },
+);
+
+// Protocol 1: policy may auto-authorize the target, but the server must not
+// launch it until the interactive user has approved the Breeze dialog. A
+// denied, missing, late, or duplicate decision never creates an active intent.
+elevationRequestsRoutes.post(
+  '/:id/elevation-requests/:requestId/local-decision',
+  zValidator('json', z.object({ decision: z.enum(['approved', 'denied']) })),
+  async (c) => {
+    const agent = c.get('agent') as
+      | { deviceId?: string; orgId?: string; agentId?: string; partnerId?: string }
+      | undefined;
+    if (!agent?.orgId || !agent.deviceId || agent.agentId !== c.req.param('id')) {
+      return c.json({ error: 'Agent context mismatch' }, 401);
+    }
+    const requestId = c.req.param('requestId');
+    if (!z.string().uuid().safeParse(requestId).success) {
+      return c.json({ error: 'Invalid request ID' }, 400);
+    }
+    const { decision } = c.req.valid('json');
+    return withDbAccessContext({
+      scope: 'organization' as const,
+      orgId: agent.orgId,
+      accessibleOrgIds: [agent.orgId],
+      accessiblePartnerIds: [],
+      currentPartnerId: agent.partnerId ?? null,
+    }, async () => {
+      try {
+        return await db.transaction(async (tx) => {
+          type Row = {
+            id: string; org_id: string; device_id: string; status: string;
+            revision: number; target_executable_path: string | null;
+            target_executable_hash: string | null; subject_username: string;
+            expires_at: Date | null; metadata: Record<string, unknown>;
+          };
+          const result = await tx.execute<Row>(sql`
+            SELECT id, org_id, device_id, status, revision,
+                   target_executable_path, target_executable_hash,
+                   subject_username, expires_at, metadata
+            FROM elevation_requests
+            WHERE id = ${requestId} AND org_id = ${agent.orgId}
+              AND device_id = ${agent.deviceId} AND flow_type = 'uac_intercept'
+            FOR UPDATE
+          `);
+          const row = ((result as { rows?: Row[] }).rows ?? result as Row[])[0];
+          if (!row || row.metadata?.local_decision_required !== true) {
+            return c.json({ error: 'Local decision gate not found' }, 404);
+          }
+          const previous = row.metadata.local_decision;
+          if (previous === decision) return c.json({ status: row.status }, 200);
+          if (previous || row.status !== 'auto_approved') {
+            return c.json({ error: 'Request already decided' }, 409);
+          }
+          const deadline = Date.parse(String(row.metadata.local_decision_deadline ?? ''));
+          if (!Number.isFinite(deadline) || Date.now() > deadline) {
+            return c.json({ error: 'Local decision expired' }, 409);
+          }
+          if (decision === 'denied') {
+            await tx.execute(sql`
+              UPDATE elevation_requests
+              SET status = 'denied', denial_reason = 'Denied by interactive user',
+                  metadata = metadata || '{"local_decision":"denied"}'::jsonb,
+                  revision = revision + 1, updated_at = now()
+              WHERE id = ${requestId}
+            `);
+            await tx.insert(elevationAudit).values({
+              orgId: agent.orgId,
+              elevationRequestId: requestId,
+              eventType: 'denied',
+              actor: 'end_user',
+              details: { local_decision_protocol: 1 },
+              occurredAt: new Date(),
+            });
+            return c.json({ status: 'denied' }, 200);
+          }
+          if (!row.expires_at || new Date(row.expires_at).getTime() <= Date.now()
+              || !row.target_executable_path) {
+            return c.json({ error: 'Authorization expired or target missing' }, 409);
+          }
+          await tx.execute(sql`
+            UPDATE elevation_requests
+            SET approved_at = now(),
+                metadata = metadata || '{"local_decision":"approved"}'::jsonb,
+                updated_at = now()
+            WHERE id = ${requestId}
+          `);
+          await tx.insert(elevationAudit).values({
+            orgId: agent.orgId,
+            elevationRequestId: requestId,
+            eventType: 'approved',
+            actor: 'end_user',
+            details: { local_decision_protocol: 1 },
+            occurredAt: new Date(),
+          });
+          await createPamDecisionIntent(tx, {
+            request: {
+              id: row.id,
+              orgId: row.org_id,
+              deviceId: row.device_id,
+              targetExecutablePath: row.target_executable_path,
+              targetExecutableHash: row.target_executable_hash,
+              subjectUsername: row.subject_username,
+            },
+            requestRevision: row.revision,
+            decision: 'auto_approved',
+            expiresAt: new Date(row.expires_at),
+          });
+          return c.json({ status: 'auto_approved', enforcementStatus: 'pending_dispatch' }, 200);
+        });
+      } catch (err) {
+        console.error('[ElevationRequests] local decision failed:', err);
+        return c.json({ error: 'Failed to record local decision' }, 500);
+      }
+    });
   },
 );

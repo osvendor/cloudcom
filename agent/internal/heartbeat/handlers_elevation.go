@@ -27,6 +27,7 @@ import (
 // satisfy the full interface so etwlua doesn't need to import the heartbeat
 // package.
 func (h *Heartbeat) SendElevationRequest(req etwlua.Event) (etwlua.ElevationOutcome, error) {
+	req.LocalDecisionProtocol = 1
 	body, err := json.Marshal(req)
 	if err != nil {
 		return etwlua.ElevationOutcome{}, fmt.Errorf("marshal elevation request: %w", err)
@@ -58,8 +59,9 @@ func (h *Heartbeat) SendElevationRequest(req etwlua.Event) (etwlua.ElevationOutc
 	// zero values) and ignore the unmarshal error.
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	var decoded struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
+		ID                    string `json:"id"`
+		Status                string `json:"status"`
+		LocalDecisionRequired bool   `json:"localDecisionRequired"`
 	}
 	if uerr := json.Unmarshal(respBody, &decoded); uerr != nil && len(bytes.TrimSpace(respBody)) > 0 {
 		// The request was accepted (2xx) but the ingest-decision body did not
@@ -69,5 +71,37 @@ func (h *Heartbeat) SendElevationRequest(req etwlua.Event) (etwlua.ElevationOutc
 		log.Warn("elevation-requests: accepted but ingest-decision body unparseable; local PAM flow will be skipped",
 			"statusCode", resp.StatusCode, "error", uerr.Error())
 	}
-	return etwlua.ElevationOutcome{RequestID: decoded.ID, Status: etwlua.ElevationStatus(decoded.Status)}, nil
+	return etwlua.ElevationOutcome{RequestID: decoded.ID, Status: etwlua.ElevationStatus(decoded.Status), LocalDecisionRequired: decoded.LocalDecisionRequired}, nil
+}
+
+// reportLocalPamDecision completes a protocol-1 request. The API alone owns
+// the v2 launch; a failed report leaves the request inert until its deadline.
+func (h *Heartbeat) reportLocalPamDecision(requestID, decision string) error {
+	if h.pamReportLocalDecision != nil {
+		return h.pamReportLocalDecision(requestID, decision)
+	}
+	body, err := json.Marshal(struct {
+		Decision string `json:"decision"`
+	}{decision})
+	if err != nil {
+		return err
+	}
+	url := fmt.Sprintf("%s/api/v1/agents/%s/elevation-requests/%s/local-decision",
+		h.serverURL(), h.config.AgentID, requestID)
+	headers := http.Header{
+		"Content-Type":  {"application/json"},
+		"Authorization": {h.authHeader()},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	resp, err := httputil.Do(ctx, h.httpClient(), "POST", url, body, headers, h.retryCfg)
+	if err != nil {
+		return fmt.Errorf("report local PAM decision: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		response, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("report local PAM decision returned %d: %s", resp.StatusCode, string(response))
+	}
+	return nil
 }
