@@ -1092,6 +1092,27 @@ describe('POST /pam/elevation-requests/:id/revoke', () => {
     );
   });
 
+  it('revokes a local gate before user approval without requesting nonexistent cleanup', async () => {
+    rigTransaction({
+      row: {
+        ...activeRow,
+        status: 'auto_approved',
+        metadata: { local_decision_required: true },
+      },
+      casWins: true,
+    });
+
+    const res = await app().request(`/pam/elevation-requests/${REQ_ID}/revoke`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'test request no longer needed' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ status: 'revoked', enforcementStatus: 'not_required' });
+    expect(requestPamCleanup).not.toHaveBeenCalled();
+  });
+
   it('409s when the request is not in an active status', async () => {
     rigTransaction({ row: { ...activeRow, status: 'pending' }, casWins: false });
 

@@ -549,7 +549,7 @@ elevationRequestsRoutes.post(
             targetExecutableSigner: payload.target_executable_signer ?? null,
             status,
             requestedAt: observedAt,
-            approvedAt: decision.kind === 'auto_approved' && !waitForLocalDecision ? now : null,
+            approvedAt: decision.kind === 'auto_approved' ? now : null,
             expiresAt,
             denialReason:
               decision.kind === 'denied'
@@ -792,7 +792,8 @@ elevationRequestsRoutes.post(
           if (decision === 'denied') {
             await tx.execute(sql`
               UPDATE elevation_requests
-              SET status = 'denied', denial_reason = 'Denied by interactive user',
+              SET status = 'denied', approved_at = NULL,
+                  denial_reason = 'Denied by interactive user',
                   metadata = metadata || '{"local_decision":"denied"}'::jsonb,
                   revision = revision + 1, updated_at = now()
               WHERE id = ${requestId}

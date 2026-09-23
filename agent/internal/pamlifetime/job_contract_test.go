@@ -63,6 +63,7 @@ type fakeWindowsPrimitives struct {
 	cleanupErr          error
 	cleanupMembers      int
 	privilegedToken     bool
+	privilegedTokenSequence []bool
 	privilegedTokenErr  error
 	identityGone        bool
 	identityGoneErr     error
@@ -232,6 +233,11 @@ func (f *fakeWindowsPrimitives) VerifyProcessIdentityGone(_ context.Context, pro
 
 func (f *fakeWindowsPrimitives) VerifyNoPrivilegedToken(_ context.Context, _ string) (bool, error) {
 	*f.order = append(*f.order, "verify privileged-token absence")
+	if len(f.privilegedTokenSequence) > 0 {
+		present := f.privilegedTokenSequence[0]
+		f.privilegedTokenSequence = f.privilegedTokenSequence[1:]
+		return present, f.privilegedTokenErr
+	}
 	return f.privilegedToken, f.privilegedTokenErr
 }
 
@@ -527,6 +533,27 @@ func TestCleanupPersistsTombstoneBeforeTreeAndVerifiedAccountCleanup(t *testing.
 	if win.closeProcessCount != 1 || win.closeThreadCount != 1 || win.closeJobCount != 1 || win.invalidCloseCount != 0 {
 		t.Fatalf("successful lifecycle close counts process/thread/job/invalid = %d/%d/%d/%d, want 1/1/1/0",
 			win.closeProcessCount, win.closeThreadCount, win.closeJobCount, win.invalidCloseCount)
+	}
+}
+
+func TestCleanupWaitsForTerminatedProcessTokenToDisappear(t *testing.T) {
+	var order []string
+	win := &fakeWindowsPrimitives{
+		order: &order,
+		privilegedTokenSequence: []bool{true, false},
+	}
+	clean := elevaccount.AccountEvidence{Enabled: false, InAdministrators: false}
+	manager := newLifecycleManager(NewStore(filepath.Join(t.TempDir(), "ledger.json")), win,
+		&fakeAccountLifecycle{order: &order, deprovision: clean, verified: clean}, nil)
+	if result := manager.Apply(context.Background(), validApply(1)); result.State != ResultVerifiedActive {
+		t.Fatalf("apply setup failed: %+v", result)
+	}
+	result := manager.Cleanup(context.Background(), validCleanup(2))
+	if result.State != ResultCleaned {
+		t.Fatalf("cleanup = %+v, want cleaned after the terminated token vanished", result)
+	}
+	if scans := strings.Count(strings.Join(order, "|"), "verify privileged-token absence"); scans != 2 {
+		t.Fatalf("token scans = %d, want two", scans)
 	}
 }
 

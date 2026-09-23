@@ -559,7 +559,7 @@ describe('ingest decisioning (#1163)', () => {
       id: 'req-local', status: 'auto_approved', localDecisionRequired: true,
     });
     expect(values).toHaveBeenCalledWith(expect.objectContaining({
-      status: 'auto_approved', approvedAt: null,
+      status: 'auto_approved', approvedAt: expect.any(Date),
       metadata: expect.objectContaining({ local_decision_required: true }),
     }));
     expect(lifecycleMocks.createPamDecisionIntent).not.toHaveBeenCalled();

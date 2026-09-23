@@ -160,6 +160,12 @@ const pamCleanupRecoveryPaths = new Set([
 const pamLocalDecisionPaths = new Set([
   'apps/api/src/routes/agents/elevationRequests.ts',
   'apps/api/src/routes/agents/elevationRequests.test.ts',
+  'apps/api/src/routes/pam.ts',
+  'apps/api/src/routes/pam.test.ts',
+  'apps/api/src/routes/softwarePolicies.ts',
+  'apps/api/src/routes/softwarePolicies.test.ts',
+  'apps/api/src/jobs/pamJobs.ts',
+  'apps/api/src/jobs/pamJobs.test.ts',
 ]);
 const infraPaths = new Set([
   'AGENTS.md', '.dockerignore', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',

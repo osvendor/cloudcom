@@ -159,6 +159,12 @@ test('routes the PAM local decision endpoint and regression test to API validati
   for (const path of [
     'apps/api/src/routes/agents/elevationRequests.ts',
     'apps/api/src/routes/agents/elevationRequests.test.ts',
+    'apps/api/src/routes/pam.ts',
+    'apps/api/src/routes/pam.test.ts',
+    'apps/api/src/routes/softwarePolicies.ts',
+    'apps/api/src/routes/softwarePolicies.test.ts',
+    'apps/api/src/jobs/pamJobs.ts',
+    'apps/api/src/jobs/pamJobs.test.ts',
   ]) {
     const result = classify([path]);
     assert.equal(result.api, true);
