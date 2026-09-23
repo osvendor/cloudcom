@@ -172,6 +172,28 @@ test('routes the PAM local decision endpoint and regression test to API validati
   }
 });
 
+test('routes only the reviewed Windows release source and canary surface to API validation', () => {
+  for (const path of [
+    'apps/api/src/config/validate.ts',
+    'apps/api/src/config/validate.test.ts',
+    'apps/api/src/routes/agents/download.ts',
+    'apps/api/src/routes/agents/download.test.ts',
+    'apps/api/src/routes/agents/heartbeat.ts',
+    'apps/api/src/services/binarySync.ts',
+    'apps/api/src/services/binarySync.test.ts',
+    'apps/api/src/services/installerBuilder.ts',
+    'apps/api/src/services/installerBuilder.test.ts',
+    'apps/api/src/services/releaseSource.ts',
+    'apps/api/src/services/releaseSource.test.ts',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.api, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+  assert.deepEqual(classify(['apps/api/src/services/unreviewedReleaseOverride.ts']).unsupported,
+    ['apps/api/src/services/unreviewedReleaseOverride.ts']);
+});
+
 test('classifies only the reviewed Cloud Command server, bridge, registry, and build surfaces', () => {
   for (const path of [
     'packages/ext-cloud-command/src/server/index.ts',

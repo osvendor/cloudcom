@@ -167,6 +167,22 @@ const pamLocalDecisionPaths = new Set([
   'apps/api/src/jobs/pamJobs.ts',
   'apps/api/src/jobs/pamJobs.test.ts',
 ]);
+// A Windows-only release source changes artifact trust, download routing and
+// canary update selection. Keep this surface exact and pair it with focused
+// release tests in the API CI job.
+const windowsReleasePaths = new Set([
+  'apps/api/src/config/validate.ts',
+  'apps/api/src/config/validate.test.ts',
+  'apps/api/src/routes/agents/download.ts',
+  'apps/api/src/routes/agents/download.test.ts',
+  'apps/api/src/routes/agents/heartbeat.ts',
+  'apps/api/src/services/binarySync.ts',
+  'apps/api/src/services/binarySync.test.ts',
+  'apps/api/src/services/installerBuilder.ts',
+  'apps/api/src/services/installerBuilder.test.ts',
+  'apps/api/src/services/releaseSource.ts',
+  'apps/api/src/services/releaseSource.test.ts',
+]);
 const infraPaths = new Set([
   'AGENTS.md', '.dockerignore', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',
   '.github/scripts/check-cloudcom-runner.sh', '.github/scripts/ci-area-gating.test.mjs',
@@ -262,6 +278,10 @@ export function classify(paths) {
       continue;
     }
     if (pamLocalDecisionPaths.has(path)) {
+      result.api = true;
+      continue;
+    }
+    if (windowsReleasePaths.has(path)) {
       result.api = true;
       continue;
     }

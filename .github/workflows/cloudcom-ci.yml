@@ -169,6 +169,9 @@ jobs:
       - name: Verify PAM local decision gate
         if: needs.delta.outputs.api == 'true'
         run: pnpm --filter @breeze/api exec vitest run src/routes/agents/elevationRequests.test.ts src/routes/pam.test.ts src/routes/softwarePolicies.test.ts src/jobs/pamJobs.test.ts
+      - name: Verify Windows release trust, routing, and canary selection
+        if: needs.delta.outputs.api == 'true'
+        run: pnpm --filter @breeze/api exec vitest run src/config/validate.test.ts src/services/releaseSource.test.ts src/services/binarySync.test.ts src/services/installerBuilder.test.ts src/routes/agents/download.test.ts src/routes/agents/heartbeat.test.ts
       - name: Validate customer portal remote access and RLS boundaries
         if: needs.delta.outputs.portal_remote == 'true'
         run: bash scripts/cloudcom/test-portal-remote.sh
