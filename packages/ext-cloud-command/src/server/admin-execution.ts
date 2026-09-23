@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { adminLicenseAssignSchema, adminUserCreateSchema, adminUserUpdateSchema, AdminGraphError, createAdminGraphProvider } from './admin-graph-provider';
+import { adminGroupCreateSchema, adminGroupUpdateSchema, adminLicenseAssignSchema, adminUserCreateSchema, adminUserUpdateSchema, AdminGraphError, createAdminGraphProvider } from './admin-graph-provider';
 import { AuthenticationMethodError, createAuthenticationMethodsProvider } from './admin-auth-methods';
 import type { GuardedFetch } from './transport';
 
@@ -11,6 +11,8 @@ const operation = z.discriminatedUnion('type', [
   z.object({ type: z.literal('user.create'), user: adminUserCreateSchema }).strict(),
   z.object({ type: z.literal('user.license.assign'), id: uuid, license: adminLicenseAssignSchema }).strict(),
   z.object({ type: z.literal('groups.list') }).strict(),
+  z.object({ type: z.literal('group.create'), group: adminGroupCreateSchema }).strict(),
+  z.object({ type: z.literal('group.update'), id: uuid, update: adminGroupUpdateSchema }).strict(),
   z.object({ type: z.literal('licenses.list') }).strict(),
   z.object({ type: z.literal('service.health.get') }).strict(),
   z.object({ type: z.literal('user.get'), id: uuid }).strict(),
@@ -73,6 +75,7 @@ export function createAdministrationExecutor<Request>(ports: {
     const snapshot = Object.freeze(initial.data);
     const fields = Object.keys(connectionSchema.shape) as (keyof AdministrationConnection)[];
     const mutation = op.type === 'user.create' || op.type === 'user.license.assign' || op.type === 'user.update' || op.type === 'user.password.reset'
+      || op.type === 'group.create' || op.type === 'group.update'
       || op.type === 'user.sessions.revoke' || op.type === 'user.mfa.method.remove'
       || op.type === 'user.globalAdmin.set' || op.type.startsWith('group.member.');
     let dispatched = false;
@@ -91,7 +94,8 @@ export function createAdministrationExecutor<Request>(ports: {
         throw error;
       }
     }
-    const targets = op.type === 'user.license.assign'
+    const targets = op.type === 'group.create' ? { userId: op.group.ownerId }
+      : op.type === 'user.license.assign'
       ? { userId: op.id, licenseSkuId: op.license.skuId }
       : op.type === 'user.mfa.method.remove'
       ? { userId: op.id, methodKind: op.kind, methodId: op.methodId }
@@ -99,6 +103,8 @@ export function createAdministrationExecutor<Request>(ports: {
       : 'id' in op ? (op.type === 'group.get' ? { groupId: op.id } : { userId: op.id }) : {};
     const event = { executionId: randomUUID(), orgId, actorId: principal.actorId, connectionId: snapshot.id,
       operation: op.type, targets, changedFields: op.type === 'user.create' ? ['displayName', 'userPrincipalName', 'passwordProfile', ...(op.user.usageLocation ? ['usageLocation'] : [])]
+        : op.type === 'group.create' ? ['displayName', 'mailNickname', 'owners']
+        : op.type === 'group.update' ? ['displayName']
         : op.type === 'user.license.assign' ? ['assignedLicenses']
         : op.type === 'user.update' ? Object.keys(op.update)
         : op.type === 'user.password.reset' ? ['passwordProfile']
@@ -153,6 +159,8 @@ export function createAdministrationExecutor<Request>(ports: {
         case 'user.create': result = await provider.createUser(op.user, fence); break;
         case 'user.license.assign': result = await provider.assignUserLicense(op.id, op.license, fence); break;
         case 'groups.list': result = await provider.listGroups(); break;
+        case 'group.create': result = await provider.createGroup(op.group, fence); break;
+        case 'group.update': result = await provider.updateGroup(op.id, op.update, fence); break;
         case 'licenses.list': result = await provider.listLicenses(); break;
         case 'service.health.get': result = await provider.serviceHealth(); break;
         case 'user.get': result = await provider.getUser(op.id); break;
@@ -177,7 +185,7 @@ export function createAdministrationExecutor<Request>(ports: {
       if (error instanceof AdministrationExecutionError || error instanceof AdminGraphError || error instanceof AuthenticationMethodError) throw error;
       throw new AdministrationExecutionError('provider_failed');
     }
-    await audit('outcome', op.type === 'user.license.assign' && typeof result === 'object' && result !== null
+    await audit('outcome', (op.type === 'user.license.assign' || op.type === 'group.create' || op.type === 'group.update' || op.type.startsWith('group.member.')) && typeof result === 'object' && result !== null
       && 'verified' in result && result.verified === false ? 'unknown' : 'success');
     return result;
   };

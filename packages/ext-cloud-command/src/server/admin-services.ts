@@ -42,6 +42,7 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
   const execute = createAdministrationExecutor<MicrosoftRequest>({
     authorize: (request, orgId, operation) => runtime.authorize(request, orgId,
       operation === 'user.create' || operation === 'user.license.assign' || operation === 'user.update' || operation === 'user.password.reset'
+      || operation === 'group.create' || operation === 'group.update'
       || operation === 'user.sessions.revoke' || operation === 'user.globalAdmin.get'
       || operation === 'user.globalAdmin.set'
       || operation === 'user.mfa.methods.list' || operation === 'user.mfa.method.remove'

@@ -27,6 +27,25 @@ function setup() {
   };
 }
 describe('organization-bound Microsoft administration execution', () => {
+  it('authorizes, audits, and fences one typed group creation write', async () => {
+    const s = setup();
+    s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['Group.ReadWrite.All', 'User.ReadWrite.All'] })).toString('base64url')}.s`);
+    s.fetch.mockImplementation(async (url, init) => {
+      if (url.includes('/organization?')) return Response.json({ value: [{ id: tenantId }] });
+      if (url.includes(`/users/${actorId}?`)) return Response.json({ id: actorId });
+      if (url.endsWith('/groups') && init.method === 'POST') return Response.json({ id }, { status: 201 });
+      if (url.includes(`/groups/${id}?`)) return Response.json({ id, displayName: 'Ops', mailEnabled: true, securityEnabled: false, groupTypes: ['Unified'], onPremisesSyncEnabled: null, isAssignableToRole: false });
+      if (url.includes(`/groups/${id}/owners?`)) return Response.json({ value: [{ id: actorId }] });
+      throw new Error(`Unexpected ${url}`);
+    });
+    await expect(s.run(request, orgId, { type: 'group.create', group: { displayName: 'Ops', mailNickname: 'ops', ownerId: actorId } }))
+      .resolves.toMatchObject({ accepted: true, id, verified: true });
+    expect(s.audit.mock.calls.map(([event]) => event)).toEqual([
+      expect.objectContaining({ phase: 'intent', operation: 'group.create', changedFields: ['displayName', 'mailNickname', 'owners'] }),
+      expect.objectContaining({ phase: 'outcome', operation: 'group.create', outcome: 'success' }),
+    ]);
+    expect(s.fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
+  });
   it('fences and audits read-only service health without dispatching writes', async () => {
     const s = setup();
     s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['ServiceHealth.Read.All'] })).toString('base64url')}.s`);

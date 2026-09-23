@@ -38,12 +38,13 @@ export class CloudCommandGooglePage extends HTMLElement {
   private query = '';
   private pendingAction: { userId: string; email: string; expectedSuspended: boolean; suspended: boolean } | null = null;
   private pendingProfile: { userId: string; email: string; expectedGivenName: string; expectedFamilyName: string; draftGivenName: string; draftFamilyName: string } | null = null;
+  private memberGroup: { id: string; email: string; items: Row[]; nextToken: string | null } | null = null;
 
   set context(input: unknown) {
     const context = parseExtensionPageContextV1(input);
     if (context.extensionName !== 'cloudcommand') throw new Error('Wrong extension context');
     if (context.organizationId !== this.contextValue?.organizationId) {
-      this.generation++; this.rows = []; this.nextToken = null; this.connection = null; this.error = ''; this.query = ''; this.pendingAction = null; this.pendingProfile = null;
+      this.generation++; this.rows = []; this.nextToken = null; this.connection = null; this.error = ''; this.query = ''; this.pendingAction = null; this.pendingProfile = null; this.memberGroup = null;
       // The existing capability belongs to the previous organization. Wait for
       // the host to provide the replacement before requesting any new data.
       this.api = null;
@@ -97,6 +98,22 @@ export class CloudCommandGooglePage extends HTMLElement {
       if (generation === this.generation) this.error = error instanceof Error ? error.message : 'Could not load directory.';
     }
     if (generation === this.generation) { this.loading = false; this.render(); }
+  }
+  private async loadMembers(reset: boolean) {
+    const selected = this.memberGroup;
+    if (!selected || this.loading || (!reset && !selected.nextToken)) return;
+    const generation = this.generation;
+    const token = reset ? null : selected.nextToken;
+    this.loading = true; this.error = ''; this.render();
+    try {
+      const page = await this.request<Page>(`/google/groups/${encodeURIComponent(selected.id)}/members${token ? `?pageToken=${encodeURIComponent(token)}` : ''}`);
+      if (generation !== this.generation || selected !== this.memberGroup) return;
+      selected.items = reset ? page.items : [...selected.items, ...page.items];
+      selected.nextToken = page.nextPageToken;
+    } catch (error) {
+      if (generation === this.generation && selected === this.memberGroup) this.error = error instanceof Error ? error.message : 'Could not load group members.';
+    }
+    if (generation === this.generation && selected === this.memberGroup) { this.loading = false; this.render(); }
   }
   private async applySuspension() {
     const action = this.pendingAction;
@@ -163,9 +180,27 @@ export class CloudCommandGooglePage extends HTMLElement {
     }
     if (this.pendingProfile) this.root.querySelector('main')?.insertAdjacentHTML('beforeend',
       `<section class="confirm"><h2>Edit account</h2><p>${escape(this.pendingProfile.email)}</p><label>First name<input id="profile-given" maxlength="100" value="${escape(this.pendingProfile.draftGivenName)}"></label><label>Last name<input id="profile-family" maxlength="100" value="${escape(this.pendingProfile.draftFamilyName)}"></label><div><button id="save-profile" ${this.loading ? 'disabled' : ''}>Save name</button><button id="cancel-profile">Cancel</button></div></section>`);
+    if (this.kind === 'groups') {
+      this.root.querySelectorAll<HTMLTableRowElement>('tbody tr').forEach((element, index) => {
+        const row = visible[index];
+        if (typeof row.id === 'string' && typeof row.email === 'string') {
+          element.lastElementChild?.insertAdjacentHTML('beforeend', ` <button data-members="${escape(row.id)}">View members</button>`);
+        }
+      });
+    }
+    if (this.memberGroup && this.kind === 'groups') this.root.querySelector('main')?.insertAdjacentHTML('beforeend',
+      `<section class="members"><div class="members-head"><div><h2>Direct group members</h2><p>${escape(this.memberGroup.email)}</p></div><button id="close-members">Close</button></div><p class="note">Roles are shown as Google reports them. Nested members are not included.</p><div class="table"><table><thead><tr><th>Member</th><th>Role</th><th>Type</th><th>Status</th></tr></thead><tbody>${this.memberGroup.items.map(row => `<tr><td>${cell(row, 'email')}</td><td>${cell(row, 'role')}</td><td>${cell(row, 'type')}</td><td>${cell(row, 'status')}</td></tr>`).join('')}</tbody></table></div>${!this.memberGroup.items.length && !this.loading ? '<p>No direct members in this loaded page.</p>' : ''}${this.memberGroup.nextToken ? `<button id="more-members" ${this.loading ? 'disabled' : ''}>Load more members</button>` : ''}</section>`);
     this.root.querySelector('#refresh')?.addEventListener('click', () => { if (connected) void this.loadPage(true); else void this.loadConnection(); });
     this.root.querySelector('#connect')?.addEventListener('click', () => dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path: '/extensions/cloudcommand/connect#google' }));
     this.root.querySelector('#more')?.addEventListener('click', () => void this.loadPage(false));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-members]').forEach(button => button.addEventListener('click', () => {
+      const row = this.rows.find(item => item.id === button.dataset.members);
+      if (!row || typeof row.id !== 'string' || typeof row.email !== 'string') return;
+      this.memberGroup = { id: row.id, email: row.email, items: [], nextToken: null };
+      this.render(); void this.loadMembers(true);
+    }));
+    this.root.querySelector('#more-members')?.addEventListener('click', () => void this.loadMembers(false));
+    this.root.querySelector('#close-members')?.addEventListener('click', () => { this.generation++; this.memberGroup = null; this.loading = false; this.render(); });
     this.root.querySelectorAll<HTMLButtonElement>('[data-suspend]').forEach(button => button.addEventListener('click', () => {
       const row = this.rows.find(item => item.id === button.dataset.suspend);
       if (!row || typeof row.id !== 'string' || typeof row.email !== 'string' || typeof row.suspended !== 'boolean') return;
@@ -189,7 +224,7 @@ export class CloudCommandGooglePage extends HTMLElement {
     this.root.querySelectorAll<HTMLButtonElement>('[data-kind]').forEach(button => button.addEventListener('click', () => {
       const kind = button.dataset.kind as Kind;
       if (kind === this.kind) return;
-      this.generation++; this.kind = kind; this.rows = []; this.nextToken = null; this.query = ''; this.pendingAction = null; this.pendingProfile = null; this.loading = false;
+      this.generation++; this.kind = kind; this.rows = []; this.nextToken = null; this.query = ''; this.pendingAction = null; this.pendingProfile = null; this.memberGroup = null; this.loading = false;
       this.render(); void this.loadPage(true);
     }));
     this.root.querySelector<HTMLInputElement>('#search')?.addEventListener('input', event => {
@@ -198,5 +233,5 @@ export class CloudCommandGooglePage extends HTMLElement {
     });
   }
 }
-const styles = `:host{display:block;color:hsl(var(--foreground));font-family:var(--font-sans,system-ui)}*{box-sizing:border-box}main{padding:1rem 1.25rem}header{display:flex;justify-content:space-between;align-items:start;gap:1rem;border-bottom:1px solid hsl(var(--border));padding-bottom:.8rem}h1{font-size:1.4rem;margin:.1rem 0}h2{font-size:1rem}p{margin:.25rem 0;color:hsl(var(--muted-foreground));font-size:.85rem}.eyebrow{font-size:.73rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:hsl(var(--primary))}button{font:inherit;font-size:.85rem;min-height:36px;padding:.35rem .7rem;border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);background:hsl(var(--card));color:hsl(var(--foreground));cursor:pointer}button:disabled{opacity:.5}button:focus-visible,input:focus-visible{outline:2px solid hsl(var(--ring))}nav{display:flex;gap:.5rem;margin:1rem 0}nav button[aria-current=true]{border-color:hsl(var(--primary));color:hsl(var(--primary))}.search{display:block;font-size:.82rem;color:hsl(var(--muted-foreground))}input{display:block;width:min(100%,350px);height:38px;margin-top:.35rem;border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);background:hsl(var(--background));color:hsl(var(--foreground));padding:.4rem .6rem;font:inherit}.note{margin:.75rem 0}.table{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:.82rem}th,td{padding:.55rem .65rem;border-bottom:1px solid hsl(var(--border));text-align:left;white-space:nowrap}th{color:hsl(var(--muted-foreground));font-size:.72rem;text-transform:uppercase}.error{color:hsl(var(--destructive))}.empty{padding:1rem;border:1px dashed hsl(var(--border));margin-top:1rem}.empty button{display:block;margin-top:.7rem}.confirm{max-width:440px;border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);padding:1rem;margin-top:1rem}.confirm button{margin:.7rem .5rem 0 0}@media(max-width:600px){main{padding:.8rem}header{flex-wrap:wrap}}`;
+const styles = `:host{display:block;color:hsl(var(--foreground));font-family:var(--font-sans,system-ui)}*{box-sizing:border-box}main{padding:1rem 1.25rem}header{display:flex;justify-content:space-between;align-items:start;gap:1rem;border-bottom:1px solid hsl(var(--border));padding-bottom:.8rem}h1{font-size:1.4rem;margin:.1rem 0}h2{font-size:1rem}p{margin:.25rem 0;color:hsl(var(--muted-foreground));font-size:.85rem}.eyebrow{font-size:.73rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:hsl(var(--primary))}button{font:inherit;font-size:.85rem;min-height:36px;padding:.35rem .7rem;border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);background:hsl(var(--card));color:hsl(var(--foreground));cursor:pointer}button:disabled{opacity:.5}button:focus-visible,input:focus-visible{outline:2px solid hsl(var(--ring))}nav{display:flex;gap:.5rem;margin:1rem 0}nav button[aria-current=true]{border-color:hsl(var(--primary));color:hsl(var(--primary))}.search{display:block;font-size:.82rem;color:hsl(var(--muted-foreground))}input{display:block;width:min(100%,350px);height:38px;margin-top:.35rem;border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);background:hsl(var(--background));color:hsl(var(--foreground));padding:.4rem .6rem;font:inherit}.note{margin:.75rem 0}.table{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:.82rem}th,td{padding:.55rem .65rem;border-bottom:1px solid hsl(var(--border));text-align:left;white-space:nowrap}th{color:hsl(var(--muted-foreground));font-size:.72rem;text-transform:uppercase}.error{color:hsl(var(--destructive))}.empty{padding:1rem;border:1px dashed hsl(var(--border));margin-top:1rem}.empty button{display:block;margin-top:.7rem}.confirm,.members{border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);padding:1rem;margin-top:1rem}.confirm{max-width:440px}.confirm button{margin:.7rem .5rem 0 0}.members-head{display:flex;align-items:start;justify-content:space-between;gap:1rem}@media(max-width:600px){main{padding:.8rem}header{flex-wrap:wrap}}`;
 if (!customElements.get('cloudcommand-google-page')) customElements.define('cloudcommand-google-page', CloudCommandGooglePage);

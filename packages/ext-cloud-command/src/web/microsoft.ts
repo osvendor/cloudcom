@@ -88,6 +88,13 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private createUserDraft = { name: '', local: '', domain: '', location: '', skuId: '' };
   private createLicenseOutcome = '';
   private createLicenseOutcomeError = false;
+  private createGroupOpen = false;
+  private createGroupUsers: ResourceData | null = null;
+  private createGroupDraft = { name: '', alias: '', ownerId: '' };
+  private createGroupError = '';
+  private createGroupBusy = false;
+  private createdGroup: { id: string; mail: string | null; verified: boolean } | null = null;
+  private groupNameDraft = '';
   private detailKind: DetailKind = 'read';
   private detailRecord: MicrosoftRecord | null = null;
   private detailRequest = 0;
@@ -164,6 +171,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.mfaRequest += 1;
     this.temporaryPassword = null;
     this.createdUser = null;
+    this.createGroupOpen = false; this.createdGroup = null;
     this.healthRequest += 1;
     this.userSecurityAction = null;
   }
@@ -177,6 +185,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       this.detail = null;
       this.createUserOpen = false;
       this.createdUser = null; this.createUserBusy = false;
+      this.createGroupOpen = false; this.createdGroup = null;
       this.detailRecord = null;
       this.detailRequest += 1;
       this.userVerificationRequest += 1;
@@ -212,6 +221,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.detail = null;
     this.createUserOpen = false;
     this.createdUser = null; this.createUserBusy = false;
+    this.createGroupOpen = false; this.createdGroup = null; this.createGroupUsers = null; this.createGroupBusy = false;
     this.detailRecord = null;
     this.expandedRowId = null;
     this.visibleColumns = [];
@@ -229,6 +239,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.membershipUsersRequest += 1;
     this.membershipAction = 'add';
     this.membershipConfirmed = false;
+    this.groupNameDraft = '';
     this.userDraft = {};
     this.filter = '';
     this.directoryScope = 'users'; this.directoryExclusions.clear(); this.directoryExclusionsReady = false; this.directoryExclusionError = ''; this.directoryPreferenceRequest += 1;
@@ -422,6 +433,41 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     void this.loadCreateUserDomains();
     void this.loadCreateUserLicenses();
   }
+  private openCreateGroup(): void {
+    if (!this.connection?.canManage || this.resource !== 'groups') return;
+    this.createGroupOpen = true; this.createGroupUsers = null; this.createGroupDraft = { name: '', alias: '', ownerId: '' };
+    this.createGroupError = ''; this.createdGroup = null; this.createGroupBusy = false; this.render();
+    const generation = this.generation; const context = this.contextValue;
+    void this.request<unknown>(this.path('/resources/users')).then(raw => {
+      if (generation !== this.generation || context !== this.contextValue || !this.createGroupOpen) return;
+      this.createGroupUsers = parseResourceData(raw); this.render();
+    }).catch(error => {
+      if (generation !== this.generation || context !== this.contextValue || !this.createGroupOpen) return;
+      this.createGroupError = error instanceof Error ? error.message : 'Could not load owners.'; this.render();
+    });
+  }
+  private async createGroup(): Promise<void> {
+    if (!this.connection?.canManage || this.createGroupBusy || !this.createGroupOpen || this.createdGroup) return;
+    const { name, alias, ownerId } = this.createGroupDraft;
+    if (!name.trim() || !/^[A-Za-z0-9'.!#^~_-]{1,64}$/.test(alias.trim()) || !this.createGroupUsers?.items.some(row => row.id === ownerId)) {
+      this.createGroupError = 'Enter a group name and mail alias, then choose a loaded tenant user as owner.'; this.render(); return;
+    }
+    const generation = this.generation; const context = this.contextValue;
+    this.createGroupBusy = true; this.createGroupError = ''; this.render();
+    try {
+      const result = await this.request<{ accepted: boolean; id: string; verified: boolean; mail: string | null }>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'group.create', group: { displayName: name.trim(), mailNickname: alias.trim(), ownerId } }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || !this.createGroupOpen) return;
+      if (!result.accepted || !result.id) throw new Error('Group creation outcome is uncertain. Refresh before retrying.');
+      this.createdGroup = { id: result.id, mail: result.mail, verified: result.verified };
+      void this.loadResource();
+    } catch (error) {
+      if (generation === this.generation && context === this.contextValue && this.createGroupOpen)
+        this.createGroupError = error instanceof Error ? error.message : 'Group creation outcome is uncertain. Refresh before retrying.';
+    } finally { if (generation === this.generation && context === this.contextValue) { this.createGroupBusy = false; this.render(); } }
+  }
   private closeCreateUser(): void {
     if (this.createUserBusy) return;
     this.createUserOpen = false;
@@ -579,6 +625,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (generation !== this.generation || context !== this.contextValue || request !== this.detailRequest || this.detail?.id !== id || this.detailKind !== kind) return null;
       if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error(`Invalid Microsoft ${kind} response.`);
       this.detailRecord = body as MicrosoftRecord;
+      if (kind === 'group') this.groupNameDraft = String(this.detailRecord.displayName ?? '');
       this.userDraft = {};
       this.render();
       queueMicrotask(() => this.root.querySelector<HTMLButtonElement>('#detail-close')?.focus());
@@ -844,21 +891,38 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const id = this.detail.id; const generation = this.generation; const context = this.contextValue;
     this.busy = true; this.drawerError = false; this.drawerMessage = 'Submitting membership change…'; this.render();
     try {
-      const result = await this.request<{ accepted?: boolean }>(this.path('/administration'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: action === 'add' ? 'group.member.add' : 'group.member.remove', groupId: id, userId }) });
+      const result = await this.request<{ accepted?: boolean; verified?: boolean; changed?: boolean }>(this.path('/administration'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: action === 'add' ? 'group.member.add' : 'group.member.remove', groupId: id, userId }) });
       if (result.accepted !== true) throw new Error('Microsoft did not accept the membership change.');
       if (generation !== this.generation || context !== this.contextValue || this.detail?.id !== id || this.detailKind !== 'group') return;
-      const readback = await this.loadDetailRecord(id, 'group');
-      if (generation !== this.generation || context !== this.contextValue || this.detail?.id !== id || this.detailKind !== 'group') return;
-      const members = readback?.members;
-      if (Array.isArray(members)) {
-        const present = members.some(member => (typeof member === 'string' ? member : member && typeof member === 'object' && String((member as MicrosoftRecord).id ?? '') === userId));
-        const verified = action === 'add' ? present : !present;
-        this.drawerError = !verified;
-        this.drawerMessage = verified ? 'Membership change accepted and verified.' : 'Membership change was accepted, but readback did not confirm it. Review the group before trying again.';
-      } else { this.drawerError = false; this.drawerMessage = 'Membership change accepted. Membership verification is pending because member listing is not available.'; }
+      this.drawerError = result.verified !== true;
+      this.drawerMessage = result.changed === false ? 'Membership was already in the requested state.'
+        : result.verified ? 'Membership change accepted and verified.'
+        : 'Membership change was accepted, but readback did not confirm it. Review the group before trying again.';
     } catch (error) {
       if (generation === this.generation && context === this.contextValue && this.detail?.id === id) { this.drawerError = true; this.drawerMessage = error instanceof Error ? error.message : 'Membership change could not be completed. Its outcome is uncertain; do not retry automatically.'; }
     } finally { if (generation === this.generation) { this.busy = false; this.render(); } }
+  }
+  private async saveGroupName(): Promise<void> {
+    if (!this.connection?.canManage || !this.detail || this.detailKind !== 'group' || !this.detailRecord || this.busy) return;
+    const displayName = this.groupNameDraft.trim();
+    if (!displayName || displayName.length > 256) { this.drawerError = true; this.drawerMessage = 'Enter a valid group name.'; this.render(); return; }
+    const id = this.detail.id; const generation = this.generation; const context = this.contextValue;
+    this.busy = true; this.drawerError = false; this.drawerMessage = 'Saving group name…'; this.render();
+    try {
+      const result = await this.request<{ accepted: boolean; verified: boolean; changed: boolean }>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'group.update', id, update: { displayName } }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || this.detail?.id !== id) return;
+      if (!result.accepted) throw new Error('Microsoft did not confirm the group update.');
+      this.drawerError = !result.verified;
+      this.drawerMessage = result.verified ? 'Group name saved and verified.' : 'Microsoft accepted the name change, but readback is pending. Refresh before retrying.';
+      if (result.verified) { this.detailRecord.displayName = displayName; this.detail.values.displayName = displayName; }
+    } catch (error) {
+      if (generation === this.generation && context === this.contextValue && this.detail?.id === id) {
+        this.drawerError = true; this.drawerMessage = error instanceof Error ? error.message : 'Group update outcome is uncertain. Refresh before retrying.';
+      }
+    } finally { if (generation === this.generation && context === this.contextValue) { this.busy = false; this.render(); } }
   }
 
   private renderDrawer(canManage: boolean): string {
@@ -891,7 +955,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       const users = this.membershipUsers?.items.filter(user => `${user.values.displayName ?? ''} ${user.values.userPrincipalName ?? user.values.mail ?? ''}`.toLowerCase().includes(query)) ?? [];
       const selected = this.membershipUsers?.items.find(user => user.id === this.membershipUserId);
       const picker = !this.membershipUsers ? '<p class="meta" data-testid="member-picker-status">Loading users for member picker…</p>' : !users.length ? '<p class="meta" data-testid="member-picker-status">No loaded users match this search.</p>' : `<div class="member-options" role="listbox" aria-label="Choose user">${users.slice(0, 20).map(user => { const name = String(user.values.displayName ?? user.id); const email = user.values.userPrincipalName ?? user.values.mail; return `<button type="button" class="member-option ${user.id === this.membershipUserId ? 'selected' : ''}" data-member-user="${esc(user.id)}" role="option" aria-selected="${user.id === this.membershipUserId}" ${this.busy ? 'disabled' : ''}><strong>${esc(name)}</strong>${email ? `<small>${esc(String(email))}</small>` : ''}</button>`; }).join('')}</div>`;
-      content = `<div class="drawer-body"><p class="meta">${record.displayName ? `Group: ${esc(String(record.displayName))}` : 'Group details loaded.'}</p>${canManage ? `<section class="drawer-section"><h3>Membership</h3><label>Find user<input id="group-member-search" value="${esc(this.membershipSearch)}" placeholder="Search loaded names or emails" autocomplete="off" ${this.busy ? 'disabled' : ''}></label>${picker}${selected ? `<p class="meta">Selected: ${esc(String(selected.values.displayName ?? selected.id))}</p>` : ''}<label>Membership action<select id="group-member-action" ${this.busy ? 'disabled' : ''}><option value="add" ${this.membershipAction === 'add' ? 'selected' : ''}>Add member</option><option value="remove" ${this.membershipAction === 'remove' ? 'selected' : ''}>Remove member</option></select></label><label class="check"><input id="group-member-confirm" type="checkbox" ${this.membershipConfirmed ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> I confirm this membership change</label></section>` : '<p class="read-only">An organization administrator can change group membership.</p>'}</div><footer class="drawer-footer">${canManage ? `<div class="actions"><button id="group-member-submit" ${this.busy || !this.membershipUserId ? 'disabled' : ''}>Confirm membership change</button></div>` : ''}${feedback}</footer>`;
+      const editable = Array.isArray(record.groupTypes) && record.groupTypes.includes('Unified') && record.onPremisesSyncEnabled !== true && record.isAssignableToRole !== true;
+      content = `<div class="drawer-body"><p class="meta">${record.mail ? esc(String(record.mail)) : 'Microsoft 365 group'}</p>${canManage && editable ? `<section class="drawer-section"><h3>Group</h3><div class="user-field"><label><span>Name</span><input id="group-name" maxlength="256" value="${esc(this.groupNameDraft)}" ${this.busy ? 'disabled' : ''}></label><button class="secondary compact" id="group-name-save" ${this.busy || this.groupNameDraft.trim() === String(record.displayName ?? '') ? 'disabled' : ''}>Save name</button></div><p class="meta">Primary address and external-sender settings require Exchange administration.</p></section>` : ''}${canManage ? `<section class="drawer-section"><h3>Membership</h3><label>Find user<input id="group-member-search" value="${esc(this.membershipSearch)}" placeholder="Search loaded names or emails" autocomplete="off" ${this.busy ? 'disabled' : ''}></label>${picker}${selected ? `<p class="meta">Selected: ${esc(String(selected.values.displayName ?? selected.id))}</p>` : ''}<label>Membership action<select id="group-member-action" ${this.busy ? 'disabled' : ''}><option value="add" ${this.membershipAction === 'add' ? 'selected' : ''}>Add member</option><option value="remove" ${this.membershipAction === 'remove' ? 'selected' : ''}>Remove member</option></select></label><label class="check"><input id="group-member-confirm" type="checkbox" ${this.membershipConfirmed ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> I confirm this membership change</label><p class="meta">Owner changes and distribution-list membership are separate Exchange actions.</p></section>` : '<p class="read-only">An organization administrator can change group membership.</p>'}</div><footer class="drawer-footer">${canManage ? `<div class="actions"><button id="group-member-submit" ${this.busy || !this.membershipUserId ? 'disabled' : ''}>Confirm membership change</button></div>` : ''}${feedback}</footer>`;
     }
     const title = this.detailKind === 'user' ? (canManage ? 'Edit account' : 'View account') : this.detailKind === 'group' ? 'Manage members' : 'Resource details';
     return `<div class="backdrop" data-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="detail-title"><div class="heading drawer-heading"><div><h2 id="detail-title">${title}</h2>${subtitle ? `<p class="subtle">${subtitle}</p>` : ''}</div><button class="secondary compact" id="detail-close">Close</button></div>${content}</aside></div>`;
@@ -907,6 +972,11 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const content = done ? `<div class="drawer-body"><section class="drawer-section"><h3>Created account</h3><p>${esc(done.userPrincipalName)}</p><label>Temporary password<input aria-label="Temporary password" type="text" readonly value="${esc(done.temporaryPassword)}"></label><p class="meta">Copy this password now. It is shown only in this drawer; the user must change it at next sign-in. It may take a moment to appear in the directory.</p></section><section class="drawer-section"><h3>Next assignments</h3>${licenseStatus}<p class="meta">MFA enrollment, aliases, and group membership remain separate actions; they were not applied during creation.</p></section></div>` : `<div class="drawer-body"><section class="drawer-section"><h3>Account</h3><label>Name<input id="create-user-name" aria-label="Name" maxlength="256" value="${esc(this.createUserDraft.name)}" placeholder="Full name" ${this.createUserBusy ? 'disabled' : ''}></label><label>Sign-in name<div class="upn-field"><input id="create-user-local" aria-label="Sign-in name" maxlength="64" value="${esc(this.createUserDraft.local)}" placeholder="name" ${this.createUserBusy ? 'disabled' : ''}><span>@</span><select id="create-user-domain" aria-label="Domain" ${!domains?.length || this.createUserBusy ? 'disabled' : ''}>${domains?.length ? domains.map(domain => `<option value="${esc(domain)}" ${domain === this.createUserDraft.domain ? 'selected' : ''}>${esc(domain)}</option>`).join('') : '<option>Loading verified domains…</option>'}</select></div></label></section><section class="drawer-section"><h3>Sign-in</h3><p class="meta">A temporary password is generated securely when the user is created.</p><label class="check"><input type="checkbox" checked disabled> Force change password at next sign-in</label></section>${licenseForm}</div>`;
     return `<div class="backdrop" data-create-user-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="create-user-title"><div class="heading drawer-heading"><div><h2 id="create-user-title">Add user</h2><p class="subtle">${done ? 'Account created' : 'Create a Microsoft 365 user'}</p></div><button class="secondary compact" id="create-user-close" ${this.createUserBusy ? 'disabled' : ''}>Close</button></div>${status}${content}<footer class="drawer-footer"><div class="actions">${done ? '' : `<button id="create-user-submit" ${!domains?.length || this.createUserBusy ? 'disabled' : ''}>Create user</button>`}</div></footer></aside></div>`;
   }
+  private renderCreateGroupDrawer(): string {
+    const done = this.createdGroup;
+    const owners = this.createGroupUsers?.items ?? [];
+    return `<div class="backdrop" data-create-group-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="create-group-title"><div class="heading drawer-heading"><div><h2 id="create-group-title">Add group</h2><p class="subtle">Microsoft 365 group</p></div><button class="secondary compact" id="create-group-close" ${this.createGroupBusy ? 'disabled' : ''}>Close</button></div><div class="drawer-body">${done ? `<p role="status">Microsoft accepted group creation.${done.verified ? ' Group details were verified.' : ' Group details are still propagating; refresh before another action.'}</p><p class="meta">Group ID: ${esc(done.id)} · Microsoft-assigned address: ${esc(done.mail || 'Pending')}</p>` : `<section class="drawer-section"><label>Name<input id="create-group-name" maxlength="256" value="${esc(this.createGroupDraft.name)}" ${this.createGroupBusy ? 'disabled' : ''}></label><label>Mail alias<input id="create-group-alias" maxlength="64" value="${esc(this.createGroupDraft.alias)}" placeholder="team" ${this.createGroupBusy ? 'disabled' : ''}></label><label>Owner<select id="create-group-owner" ${!owners.length || this.createGroupBusy ? 'disabled' : ''}><option value="">Choose a tenant user</option>${owners.map(row => `<option value="${esc(row.id)}" ${row.id === this.createGroupDraft.ownerId ? 'selected' : ''}>${esc(String(row.values.displayName ?? row.id))} · ${esc(String(row.values.userPrincipalName ?? ''))}</option>`).join('')}</select></label><p class="meta">Microsoft assigns the primary address. Distribution lists and address changes require Exchange administration.</p></section>`}${this.createGroupError ? `<p class="status" data-error="true" role="alert">${esc(this.createGroupError)}</p>` : ''}</div><footer class="drawer-footer">${done ? '' : `<div class="actions"><button id="create-group-submit" ${this.createGroupBusy || !owners.length ? 'disabled' : ''}>Create group</button></div>`}</footer></aside></div>`;
+  }
 
   private render(): void {
     const connection = this.connection;
@@ -918,7 +988,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const columns = allColumns.filter((column, index) => index === 0 || this.visibleColumns.includes(column.key));
     const loadedCount = this.data ? `${this.data.items.length}${this.data.complete ? '' : ' loaded'}` : '—';
     const tenant = connection?.tenantName || 'Microsoft 365 tenant';
-    const createControl = canManage && this.resource === 'users' ? '<button class="secondary compact" id="create-user">Add user</button>' : '';
+    const createControl = canManage && this.resource === 'users' ? '<button class="secondary compact" id="create-user">Add user</button>' : canManage && this.resource === 'groups' ? '<button class="secondary compact" id="create-group">Add group</button>' : '';
     const tabs = `<button class="resource-tab" disabled title="A combined directory feed is not available">All</button><button data-resource="users" role="tab" aria-selected="${this.resource === 'users' && this.directoryScope === 'users'}" class="resource-tab" ${!canRead ? 'disabled' : ''}>Users</button><button class="resource-tab" disabled title="Shared-mailbox inventory requires an Exchange worker">Shared mailboxes</button><button data-resource="groups" role="tab" aria-selected="${this.resource === 'groups'}" class="resource-tab" ${!canRead ? 'disabled' : ''}>Groups</button><button data-directory-scope="exclude" role="tab" aria-selected="${this.resource === 'users' && this.directoryScope === 'exclude'}" class="resource-tab" ${!canRead || this.resource !== 'users' ? 'disabled' : ''}>Exclude</button>`;
     const chips = this.data ? `<div class="column-tools"><span>Columns</span>${allColumns.map((column, index) => `<button class="column-chip" data-column="${esc(column.key)}" aria-pressed="${index === 0 || this.visibleColumns.includes(column.key)}" ${index === 0 ? 'disabled' : ''}>${esc(column.label)}</button>`).join('')}<button class="secondary compact" id="reset-columns">Reset</button></div>` : '';
     const rows = filtered.map(row => {
@@ -935,7 +1005,18 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     }).join('');
     const exclusionUnavailable = this.resource === 'users' && this.directoryScope === 'exclude' && !!this.directoryExclusionError;
     const inventory = !canRead ? `<div class="empty">${connection?.connected && connection.enabled === false ? 'Enable this connection before loading inventory.' : 'Connect Microsoft 365 in Extensions > Connect before loading inventory.'}</div>` : !this.data ? `<div class="empty">${this.error ? `Could not load ${labels[this.resource].toLowerCase()}. Use Refresh to try again.` : `Loading current ${labels[this.resource].toLowerCase()}…`}</div>` : exclusionUnavailable ? `<div class="empty">Could not load directory exclusions. Refresh before reviewing excluded users.</div>` : !filtered.length ? `<div class="empty">${this.filter ? 'No rows match this search.' : `No ${labels[this.resource].toLowerCase()} are available for this tenant.`}</div>` : `<div class="table-wrap"><table><thead><tr>${columns.map(column => `<th>${esc(column.label)}</th>`).join('')}<th><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div>`;
-    this.root.innerHTML = `<style>${styles}${createUserStyles}${healthStyles}</style><main><header><div><p class="eyebrow">Microsoft 365</p><h1>Directory</h1><p class="subtle">${esc(tenant)} · ${labels[this.resource]}: ${loadedCount}</p></div><div class="header-actions">${createControl}<button class="secondary compact" id="health-open" aria-expanded="${this.healthOpen}" ${!canRead ? 'disabled' : ''}>Service health</button><span class="badge ${canRead ? 'ok' : ''}">${connection?.available === false ? 'Unavailable' : connection?.connected ? (connection.enabled === false ? 'Disabled' : 'Connected') : 'Not configured'}</span></div></header>${this.healthOpen && canRead ? this.renderHealth() : ''}${this.message ? `<p class="status" data-testid="status" data-error="${this.error}" aria-live="polite">${esc(this.message)}</p>` : '<p class="status" data-testid="status" aria-live="polite"></p>'}<section class="directory"><div class="directory-top">${canRead ? `<label class="filter"><span class="sr-only">Search ${labels[this.resource]}</span><input id="filter" data-testid="filter" value="${esc(this.filter)}" placeholder="${this.resource === 'users' ? 'Search name or email' : `Search ${labels[this.resource].toLowerCase()}`}"></label>` : ''}<nav class="resource-nav" role="tablist" aria-label="Microsoft directory resources">${tabs}</nav><button class="secondary compact" id="refresh-resource" ${!canRead ? 'disabled' : ''}>Refresh</button></div>${canRead ? `${chips}${this.data ? `<p class="meta">${this.data.complete ? 'Complete inventory' : 'Partial inventory'} · checked ${esc(this.formatCheckedAt(this.data.checkedAt))}</p>` : ''}${inventory}` : inventory}</section>${this.detail ? this.renderDrawer(canManage) : ''}${this.createUserOpen ? this.renderCreateUserDrawer() : ''}</main>`;
+    this.root.innerHTML = `<style>${styles}${createUserStyles}${healthStyles}</style><main><header><div><p class="eyebrow">Microsoft 365</p><h1>Directory</h1><p class="subtle">${esc(tenant)} · ${labels[this.resource]}: ${loadedCount}</p></div><div class="header-actions">${createControl}<button class="secondary compact" id="health-open" aria-expanded="${this.healthOpen}" ${!canRead ? 'disabled' : ''}>Service health</button><span class="badge ${canRead ? 'ok' : ''}">${connection?.available === false ? 'Unavailable' : connection?.connected ? (connection.enabled === false ? 'Disabled' : 'Connected') : 'Not configured'}</span></div></header>${this.healthOpen && canRead ? this.renderHealth() : ''}${this.message ? `<p class="status" data-testid="status" data-error="${this.error}" aria-live="polite">${esc(this.message)}</p>` : '<p class="status" data-testid="status" aria-live="polite"></p>'}<section class="directory"><div class="directory-top">${canRead ? `<label class="filter"><span class="sr-only">Search ${labels[this.resource]}</span><input id="filter" data-testid="filter" value="${esc(this.filter)}" placeholder="${this.resource === 'users' ? 'Search name or email' : `Search ${labels[this.resource].toLowerCase()}`}"></label>` : ''}<nav class="resource-nav" role="tablist" aria-label="Microsoft directory resources">${tabs}</nav><button class="secondary compact" id="refresh-resource" ${!canRead ? 'disabled' : ''}>Refresh</button></div>${canRead ? `${chips}${this.data ? `<p class="meta">${this.data.complete ? 'Complete inventory' : 'Partial inventory'} · checked ${esc(this.formatCheckedAt(this.data.checkedAt))}</p>` : ''}${inventory}` : inventory}</section>${this.detail ? this.renderDrawer(canManage) : ''}${this.createUserOpen ? this.renderCreateUserDrawer() : ''}${this.createGroupOpen ? this.renderCreateGroupDrawer() : ''}</main>`;
+    this.root.querySelector('#create-group')?.addEventListener('click', () => this.openCreateGroup());
+    this.root.querySelector('#create-group-close')?.addEventListener('click', () => { if (!this.createGroupBusy) { this.createGroupOpen = false; this.createdGroup = null; this.render(); } });
+    this.root.querySelector('#create-group-submit')?.addEventListener('click', () => void this.createGroup());
+    for (const [id, field] of [['create-group-name', 'name'], ['create-group-alias', 'alias'], ['create-group-owner', 'ownerId']] as const)
+      this.root.querySelector<HTMLInputElement | HTMLSelectElement>(`#${id}`)?.addEventListener('input', event => { this.createGroupDraft[field] = (event.target as HTMLInputElement | HTMLSelectElement).value; });
+    this.root.querySelector('#group-name')?.addEventListener('input', event => {
+      this.groupNameDraft = (event.target as HTMLInputElement).value;
+      const save = this.root.querySelector<HTMLButtonElement>('#group-name-save');
+      if (save) save.disabled = !this.groupNameDraft.trim() || this.groupNameDraft.trim() === String(this.detailRecord?.displayName ?? '');
+    });
+    this.root.querySelector('#group-name-save')?.addEventListener('click', () => void this.saveGroupName());
     this.root.querySelector('#health-open')?.addEventListener('click', () => { this.healthOpen = !this.healthOpen; this.render(); if (this.healthOpen && !this.health) void this.loadHealth(); });
     this.root.querySelector('#health-close')?.addEventListener('click', () => { this.healthOpen = false; this.render(); });
     this.root.querySelector('#health-refresh')?.addEventListener('click', () => void this.loadHealth());

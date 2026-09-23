@@ -51,6 +51,14 @@ export const adminUserCreateSchema = z.object({
 export type AdminUserCreate = z.infer<typeof adminUserCreateSchema>;
 export const adminLicenseAssignSchema = z.object({ skuId: uuid }).strict();
 export type AdminLicenseAssign = z.infer<typeof adminLicenseAssignSchema>;
+export const adminGroupCreateSchema = z.object({
+  displayName: z.string().trim().min(1).max(256),
+  mailNickname: z.string().trim().min(1).max(64).regex(/^[A-Za-z0-9'.!#^~_-]+$/),
+  ownerId: uuid,
+}).strict();
+export type AdminGroupCreate = z.infer<typeof adminGroupCreateSchema>;
+export const adminGroupUpdateSchema = z.object({ displayName: z.string().trim().min(1).max(256) }).strict();
+export type AdminGroupUpdate = z.infer<typeof adminGroupUpdateSchema>;
 export type AdminGraphErrorCode = 'invalid_input' | 'credential_unavailable' | 'tenant_identity_mismatch'
   | 'invalid_provider_response' | 'provider_access_denied' | 'provider_rate_limited' | 'provider_rejected'
   | 'provider_unreachable' | 'unknown_write_outcome' | 'unsupported_group'
@@ -100,7 +108,7 @@ export function createAdminGraphProvider(options: {
   acquireToken: (tenantId: string) => Promise<string>;
 }) {
   const tenantId = parse(uuid, options.tenantId, 'invalid_input');
-  async function request(token: string, path: string, method = 'GET', body?: unknown, responseBody = false) {
+  async function request(token: string, path: string, method = 'GET', body?: unknown, responseBody = false, allowNotFound = false) {
     const mutation = method !== 'GET';
     try {
       const result = await options.fetch(`${ORIGIN}${path}`, {
@@ -109,6 +117,7 @@ export function createAdminGraphProvider(options: {
         redirect: 'error', signal: AbortSignal.timeout(15000), timeoutMs: 15000, maxBytes: 1024 * 1024,
       });
       if (result.status === 401 || result.status === 403) throw new AdminGraphError('provider_access_denied');
+      if (allowNotFound && method === 'GET' && result.status === 404) return null;
       if (result.status === 429) throw new AdminGraphError('provider_rate_limited');
       if (result.status >= 500 && mutation) throw new AdminGraphError('unknown_write_outcome');
       if (!result.ok || result.status >= 300) throw new AdminGraphError('provider_rejected');
@@ -159,9 +168,19 @@ export function createAdminGraphProvider(options: {
       || (!target.securityEnabled && !target.groupTypes.includes('Unified'))
       || (target.mailEnabled && !target.groupTypes.includes('Unified'))) throw new AdminGraphError('unsupported_group');
     await resource(token, '/users', userId, user, userSelect);
+    const memberPath = `/groups/${groupId}/members/${userId}?$select=id`;
+    const before = await request(token, memberPath, 'GET', undefined, false, true);
+    if (before !== null && parse(z.object({ id: uuid }), before, 'invalid_provider_response').id !== userId)
+      throw new AdminGraphError('invalid_provider_response');
+    if ((before !== null) === !remove) return { accepted: true as const, changed: false as const, verified: true as const };
     if (remove) await request(token, `/groups/${groupId}/members/${userId}/$ref`, 'DELETE');
     else await request(token, `/groups/${groupId}/members/$ref`, 'POST', { '@odata.id': `${ORIGIN}/directoryObjects/${userId}` });
-    return { accepted: true as const };
+    let verified = false;
+    try {
+      const after = await request(token, memberPath, 'GET', undefined, false, true);
+      verified = (after !== null) === !remove && (after === null || parse(z.object({ id: uuid }), after, 'invalid_provider_response').id === userId);
+    } catch { /* accepted write; membership may not have converged */ }
+    return { accepted: true as const, changed: true as const, verified };
   }
   async function globalAdministratorAssignments(token: string) {
     // Do not follow a provider-controlled nextLink here. Removing a role is only safe when
@@ -173,6 +192,48 @@ export function createAdminGraphProvider(options: {
     return result.value;
   }
   return {
+    async createGroup(input: AdminGroupCreate, authorize?: () => Promise<void>) {
+      const value = parse(adminGroupCreateSchema, input, 'invalid_input');
+      const token = await session();
+      requireAppRole(token, 'Group.ReadWrite.All');
+      requireAnyAppRole(token, ['User.Read.All', 'User.ReadWrite.All', 'Directory.Read.All', 'Directory.ReadWrite.All']);
+      await resource(token, '/users', value.ownerId, user, userSelect);
+      await authorize?.();
+      const result = await request(token, '/groups', 'POST', {
+        displayName: value.displayName, mailNickname: value.mailNickname,
+        mailEnabled: true, securityEnabled: false, groupTypes: ['Unified'],
+        'owners@odata.bind': [`${ORIGIN}/users/${value.ownerId}`],
+      }, true);
+      let createdId: string;
+      try { createdId = z.object({ id: uuid }).parse(result).id; }
+      catch { throw new AdminGraphError('unknown_write_outcome'); }
+      let verified = false; let mail: string | null = null;
+      try {
+        const current = await resource(token, '/groups', createdId, group, groupSelect);
+        const owners = parse(z.object({ value: z.array(z.object({ id: uuid })).max(100), '@odata.nextLink': z.string().optional() }),
+          await request(token, `/groups/${createdId}/owners?$select=id&$top=100`), 'invalid_provider_response');
+        verified = current.displayName === value.displayName && current.mailEnabled && current.groupTypes.includes('Unified')
+          && !owners['@odata.nextLink'] && owners.value.some(owner => owner.id === value.ownerId);
+        mail = current.mail ?? null;
+      } catch { /* accepted write; read model may be delayed */ }
+      return { accepted: true as const, id: createdId, verified, mail };
+    },
+    async updateGroup(id: string, input: AdminGroupUpdate, authorize?: () => Promise<void>) {
+      id = parse(uuid, id, 'invalid_input');
+      const { displayName } = parse(adminGroupUpdateSchema, input, 'invalid_input');
+      const token = await session();
+      requireAppRole(token, 'Group.ReadWrite.All');
+      const current = await resource(token, '/groups', id, group, groupSelect);
+      if (!current.groupTypes.includes('Unified') || current.onPremisesSyncEnabled === true || current.isAssignableToRole === true)
+        throw new AdminGraphError('unsupported_group');
+      if (current.displayName === displayName) return { accepted: true as const, changed: false as const, verified: true as const };
+      await authorize?.();
+      await request(token, `/groups/${id}`, 'PATCH', { displayName });
+      let verified = false;
+      try { verified = (await resource(token, '/groups', id, group, groupSelect)).displayName === displayName; }
+      catch { /* accepted write; read model may be delayed */ }
+      return { accepted: true as const, changed: true as const, verified };
+    },
     async serviceHealth() {
       const token = await session();
       requireAppRole(token, 'ServiceHealth.Read.All');

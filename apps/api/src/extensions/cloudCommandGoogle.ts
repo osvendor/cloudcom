@@ -44,6 +44,11 @@ function projectGroup(value: Record<string, unknown>): Record<string, string | b
     ? String(value.directMembersCount) : scalar(value.directMembersCount);
   return { id: scalar(value.id), name: scalar(value.name), email: scalar(value.email), description: scalar(value.description), members };
 }
+function projectMember(value: Record<string, unknown>): Record<string, string | boolean | null> {
+  const role = scalar(value.role);
+  return { id: scalar(value.id), email: scalar(value.email), role: role === 'OWNER' || role === 'MANAGER' || role === 'MEMBER' ? role : 'Unknown',
+    type: scalar(value.type), status: scalar(value.status) };
+}
 
 export const nativeGoogleServices: NativeGoogleServices = {
   version: 1,
@@ -81,6 +86,25 @@ export const nativeGoogleServices: NativeGoogleServices = {
     } catch {
       // Do not forward upstream errors, response bodies, or credential details to the browser.
       return { ok: false, code: 'provider_failed', message: 'Google Workspace directory could not be loaded. Check the connection and delegation scopes.' };
+    }
+  },
+  async members(input, groupId, pageToken) {
+    const auth = authorized(input);
+    if (!auth) return denied;
+    if (!GOOGLE_WORKSPACE_ENABLED) return disconnected;
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(groupId)) return { ok: false, code: 'provider_failed', message: 'Invalid Google group.' };
+    const row = await load(auth, input.orgId);
+    if (!row || row.orgId !== input.orgId || row.status !== 'active') return disconnected;
+    try {
+      const client = getDirectoryClient(decryptConnectionKey(row), row.adminEmail);
+      const group = (await client.groups.get({ groupKey: groupId, fields: 'id,email' })).data;
+      if (group.id !== groupId || !group.email?.toLowerCase().endsWith(`@${row.customerDomain.toLowerCase()}`)) return denied;
+      const response = await client.members.list({ groupKey: groupId, maxResults: 100, pageToken: pageToken ?? undefined,
+        includeDerivedMembership: false, fields: 'nextPageToken,members(id,email,role,type,status)' });
+      return { ok: true, items: (response.data.members ?? []).filter(member => !!member.id && !!member.email)
+        .map(member => projectMember(member as Record<string, unknown>)), nextPageToken: response.data.nextPageToken ?? null };
+    } catch {
+      return { ok: false, code: 'provider_failed', message: 'Google group members could not be loaded. Check the connection and delegation scopes.' };
     }
   },
   async auditSuspension(input, userId, stage) {

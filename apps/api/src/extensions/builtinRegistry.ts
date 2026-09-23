@@ -259,6 +259,7 @@ export const BUILTINS: readonly BuiltinExtension[] = [
       version: 1,
       connection: async request => (await import('./cloudCommandGoogle')).nativeGoogleServices.connection(request),
       directory: async (request, kind, pageToken) => (await import('./cloudCommandGoogle')).nativeGoogleServices.directory(request, kind, pageToken),
+      members: async (request, groupId, pageToken) => (await import('./cloudCommandGoogle')).nativeGoogleServices.members(request, groupId, pageToken),
       auditSuspension: async (request, userId, stage) => (await import('./cloudCommandGoogle')).nativeGoogleServices.auditSuspension(request, userId, stage),
       setSuspended: async (request, input) => (await import('./cloudCommandGoogle')).nativeGoogleServices.setSuspended(request, input),
       auditProfile: async (request, userId, stage) => (await import('./cloudCommandGoogle')).nativeGoogleServices.auditProfile(request, userId, stage),

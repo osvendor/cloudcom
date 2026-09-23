@@ -32,6 +32,50 @@ afterEach(() => {
 });
 
 describe('CloudCommandMicrosoftPage', () => {
+  it('creates a Microsoft 365 group with a selected owner and shows the assigned address', async () => {
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-9', values: { displayName: 'Ada', userPrincipalName: 'ada@example.test' } }], columns: [{ key: 'displayName', label: 'User' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/resources/groups') return emptyResource();
+      if (path === '/microsoft/administration' && JSON.parse(String(init?.body)).type === 'group.create')
+        return Response.json({ accepted: true, id: 'group-1', verified: true, mail: 'ops@tenant.onmicrosoft.com' });
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); window.location.hash = 'groups'; window.dispatchEvent(new HashChangeEvent('hashchange')); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#create-group')!.click(); await flush();
+    const root = page.shadowRoot!;
+    for (const [selector, value] of [['#create-group-name', 'Ops'], ['#create-group-alias', 'ops'], ['#create-group-owner', 'user-9']] as const) {
+      const input = root.querySelector<HTMLInputElement | HTMLSelectElement>(selector)!;
+      input.value = value; input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    root.querySelector<HTMLButtonElement>('#create-group-submit')!.click(); await flush();
+    const write = request.mock.calls.find(([path, init]) => path === '/microsoft/administration' && String(init?.body).includes('group.create'));
+    expect(JSON.parse(String(write?.[1]?.body))).toEqual({ type: 'group.create', group: { displayName: 'Ops', mailNickname: 'ops', ownerId: 'user-9' } });
+    expect(root.textContent).toContain('ops@tenant.onmicrosoft.com');
+    expect(root.textContent).toContain('Group details were verified');
+  });
+  it('saves only a group display-name change after a verified readback', async () => {
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/microsoft/resources/groups') return Response.json({ items: [{ id: 'group-1', values: { displayName: 'Old' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/resources/users') return emptyResource();
+      if (path === '/microsoft/administration') {
+        const type = JSON.parse(String(init?.body)).type;
+        if (type === 'group.get') return Response.json({ id: 'group-1', displayName: 'Old', mail: 'old@example.test', groupTypes: ['Unified'], onPremisesSyncEnabled: null, isAssignableToRole: false });
+        if (type === 'group.update') return Response.json({ accepted: true, changed: true, verified: true });
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); window.location.hash = 'groups'; window.dispatchEvent(new HashChangeEvent('hashchange')); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="group-1"]')!.click(); await flush();
+    const input = page.shadowRoot!.querySelector<HTMLInputElement>('#group-name')!;
+    input.value = 'New'; input.dispatchEvent(new Event('input', { bubbles: true }));
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#group-name-save')!.click(); await flush();
+    const write = request.mock.calls.find(([path, init]) => path === '/microsoft/administration' && String(init?.body).includes('group.update'));
+    expect(JSON.parse(String(write?.[1]?.body))).toEqual({ type: 'group.update', id: 'group-1', update: { displayName: 'New' } });
+    expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('saved and verified');
+    expect(page.shadowRoot!.textContent).toContain('Primary address and external-sender settings require Exchange');
+  });
   it('shows service health to readers and preserves stale detail on refresh error', async () => {
     let healthCalls = 0;
     const request = vi.fn(async (path: string, init?: RequestInit) => path === '/microsoft/connection'
@@ -477,7 +521,7 @@ describe('CloudCommandMicrosoftPage', () => {
       if (path === '/microsoft/administration') {
         const type = JSON.parse(String(init?.body)).type;
         if (type === 'group.get') return Response.json({ displayName: 'Operators' });
-        if (type === 'group.member.remove') return Response.json({ accepted: true });
+        if (type === 'group.member.remove') return Response.json({ accepted: true, changed: true, verified: false });
       }
       throw new Error(`Unexpected ${path}`);
     });
@@ -494,7 +538,7 @@ describe('CloudCommandMicrosoftPage', () => {
     root.querySelector<HTMLInputElement>('#group-member-confirm')!.checked = true; root.querySelector<HTMLButtonElement>('#group-member-submit')!.click(); await flush();
     const mutation = request.mock.calls.map(([, init]) => init?.body).find(body => String(body).includes('group.member.remove'));
     expect(JSON.parse(String(mutation))).toEqual({ type: 'group.member.remove', groupId: 'group-1', userId: 'user-9' });
-    expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('verification is pending');
+    expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('readback did not confirm');
   });
 
   it('requires confirmation for password reset and clears the one-time password when the drawer closes', async () => {

@@ -8,7 +8,7 @@ export function mountGoogleRoutes(app: Hono<{ Variables: Variables }>, services?
   });
   app.use('/google/*', async (c, next) => {
     const keys = [...new URL(c.req.url).searchParams.keys()];
-    const pagedDirectory = c.req.method === 'GET' && c.req.path.startsWith('/google/directory/');
+    const pagedDirectory = c.req.method === 'GET' && (c.req.path.startsWith('/google/directory/') || /^\/google\/groups\/[^/]+\/members$/.test(c.req.path));
     if (keys.filter(key => key === 'orgId').length !== 1 || keys.some(key => key !== 'orgId' && !(pagedDirectory && key === 'pageToken')))
       return c.json({ code: 'invalid_request', error: 'Invalid organization request.' }, 400);
     await next();
@@ -25,6 +25,17 @@ export function mountGoogleRoutes(app: Hono<{ Variables: Variables }>, services?
     if (tokens.length > 1 || (tokens[0] && (tokens[0].length > 2048 || !/^[A-Za-z0-9_\-./+=]+$/.test(tokens[0]))))
       return c.json({ code: 'invalid_page', error: 'Invalid page.' }, 400);
     const result = await services.directory(request(c), kind as GoogleDirectoryKind, tokens[0] ?? null);
+    if (!result.ok) return c.json({ code: result.code, error: result.message }, result.code === 'access_denied' ? 403 : result.code === 'connection_not_ready' ? 409 : 502);
+    return c.json({ items: result.items, nextPageToken: result.nextPageToken, complete: !result.nextPageToken });
+  });
+  app.get('/google/groups/:groupId/members', async c => {
+    if (!services || services.version !== 1) return c.json({ code: 'native_service_unavailable', error: 'Google Workspace is unavailable.' }, 503);
+    const groupId = c.req.param('groupId');
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(groupId)) return c.json({ code: 'invalid_group', error: 'Invalid group.' }, 400);
+    const tokens = new URL(c.req.url).searchParams.getAll('pageToken');
+    if (tokens.length > 1 || (tokens[0] && (tokens[0].length > 2048 || !/^[A-Za-z0-9_\-./+=]+$/.test(tokens[0]))))
+      return c.json({ code: 'invalid_page', error: 'Invalid page.' }, 400);
+    const result = await services.members(request(c), groupId, tokens[0] ?? null);
     if (!result.ok) return c.json({ code: result.code, error: result.message }, result.code === 'access_denied' ? 403 : result.code === 'connection_not_ready' ? 409 : 502);
     return c.json({ items: result.items, nextPageToken: result.nextPageToken, complete: !result.nextPageToken });
   });

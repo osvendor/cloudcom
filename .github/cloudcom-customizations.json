@@ -267,6 +267,7 @@
         { "file": "packages/ext-cloud-command/src/web/index.ts", "contains": "import './google'" },
         { "file": "packages/ext-cloud-command/manifest.json", "contains": "cloudcommand-google-page" },
         { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.directory" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.members" },
         { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.setSuspended" },
         { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.auditSuspension" },
         { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.updateProfile" },

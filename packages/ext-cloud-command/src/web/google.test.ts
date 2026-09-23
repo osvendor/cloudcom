@@ -69,4 +69,21 @@ describe('Google directory page', () => {
     expect(call).toBeTruthy();
     expect(JSON.parse(call![1]!.body as string)).toMatchObject({ givenName: 'New', familyName: 'Person', expectedGivenName: 'Old' });
   });
+  it('shows paged direct group members with their reported roles', async () => {
+    const request = vi.fn(async (path: string) => Response.json(path === '/google/connection'
+      ? { available: true, connected: true, enabled: true }
+      : path.startsWith('/google/groups/g1/members')
+        ? { items: [{ id: 'm1', email: 'owner@example.test', role: 'OWNER', type: 'USER', status: 'ACTIVE' }], nextPageToken: 'next', complete: false }
+        : { items: [{ id: 'g1', name: 'Team', email: 'team@example.test', members: '1' }], nextPageToken: null, complete: true }));
+    const page = new CloudCommandGooglePage(); page.context = context('org-a'); page.hostApi = { request }; document.body.append(page);
+    await flush(); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-kind="groups"]')!.click();
+    await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-members="g1"]')!.click();
+    await flush();
+    expect(request).toHaveBeenCalledWith('/google/groups/g1/members', undefined);
+    expect(page.shadowRoot!.textContent).toContain('owner@example.test');
+    expect(page.shadowRoot!.textContent).toContain('OWNER');
+    expect(page.shadowRoot!.textContent).toContain('Load more members');
+  });
 });

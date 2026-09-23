@@ -11,6 +11,7 @@ function harness(opts: { access?: boolean; sites?: string[]; read?: boolean; wri
     version: 1,
     connection: vi.fn(async () => ({ available: true, connected: true, enabled: true, canManage: true, customerDomain: 'example.test' })),
     directory: vi.fn(async () => ({ ok: true as const, items: [{ id: 'g1', name: 'Test User', email: 'test@example.test' }], nextPageToken: 'next' })),
+    members: vi.fn(async () => ({ ok: true as const, items: [{ id: 'm1', email: 'member@example.test', role: 'OWNER' }], nextPageToken: 'next' })),
     auditSuspension: vi.fn(async () => { if (opts.auditFail) throw new Error('audit unavailable'); }),
     setSuspended: vi.fn(async () => ({ ok: true as const, userId: '123456', suspended: true })),
     auditProfile: vi.fn(async () => { if (opts.auditFail) throw new Error('audit unavailable'); }),
@@ -49,6 +50,23 @@ describe('Google native extension bridge', () => {
     const h = harness();
     expect((await h.app.request(`/google/directory/archived?orgId=${ORG}`)).status).toBe(200);
     expect(h.google.directory).toHaveBeenCalledWith(expect.any(Object), 'archived', null);
+  });
+  it('routes direct group members with the authenticated org and bounded page', async () => {
+    const h = harness();
+    const response = await h.app.request(`/google/groups/g1/members?orgId=${ORG}&pageToken=next`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ complete: false, items: [{ role: 'OWNER' }] });
+    expect(h.google.members).toHaveBeenCalledWith({ auth: h.auth, authorization: h.authorization, orgId: ORG }, 'g1', 'next');
+  });
+  it('rejects unauthorized and caller-expanded group member reads', async () => {
+    const h = harness({ read: false });
+    expect((await h.app.request(`/google/groups/g1/members?orgId=${ORG}`)).status).toBe(403);
+    expect(h.google.members).not.toHaveBeenCalled();
+    const allowed = harness();
+    expect((await allowed.app.request(`/google/groups/g1/members?orgId=${ORG}&orgId=${PARTNER}`)).status).toBe(400);
+    expect((await allowed.app.request(`/google/groups/g1/members?orgId=${ORG}&pageToken=a&pageToken=b`)).status).toBe(400);
+    expect((await allowed.app.request(`/google/groups/%2F/members?orgId=${ORG}`)).status).toBe(400);
+    expect(allowed.google.members).not.toHaveBeenCalled();
   });
   const suspension = { userId: '123456', email: 'test@example.test', expectedSuspended: false, suspended: true, confirmation: 'test@example.test' };
   const post = (app: ReturnType<typeof harness>['app'], body: unknown) => app.request(`/google/users/suspension?orgId=${ORG}`,

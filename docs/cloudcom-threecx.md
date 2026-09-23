@@ -22,6 +22,13 @@ and disabled connections do not issue extension reads. Whole-PBX access is an
 explicit choice; selecting a department filters the returned users. This does not
 establish a permission boundary for future call reports.
 
+The operational directory keeps the retained Cloud Command columns separate:
+User, Extension, Email, Registration, current-profile Status, and Account. Its
+search filters only rows already loaded from the organization-scoped connection;
+when another page exists, the page says to load more before treating the search
+as complete. Registration and profile are read-only provider observations, not
+synonyms for whether the extension account is enabled.
+
 The detail view has General, Call Forwarding, IP Phone, BLF, Voicemail, Schedule,
 3CX Talk, and View & Options tabs. The server returns a positive, redacted
 projection of the provider response; unsupported or unavailable values are shown as

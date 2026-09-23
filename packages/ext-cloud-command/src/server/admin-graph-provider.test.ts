@@ -17,6 +17,42 @@ const staticGroup = { id: GROUP, securityEnabled: true, mailEnabled: false, grou
 afterEach(() => vi.useRealTimers());
 
 describe('bounded Microsoft administration provider', () => {
+  it('creates a Microsoft 365 group with a verified user owner and reports Microsoft-assigned mail', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['Group.ReadWrite.All', 'User.ReadWrite.All'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ id: USER }))
+      .mockResolvedValueOnce(response({ id: GROUP }, 201))
+      .mockResolvedValueOnce(response({ ...staticGroup, displayName: 'Ops', mail: 'ops@tenant.onmicrosoft.com', mailEnabled: true, groupTypes: ['Unified'] }))
+      .mockResolvedValueOnce(response({ value: [{ id: USER }] }));
+    const fence = vi.fn(async () => {});
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    await expect(provider.createGroup({ displayName: 'Ops', mailNickname: 'ops', ownerId: USER }, fence))
+      .resolves.toEqual({ accepted: true, id: GROUP, verified: true, mail: 'ops@tenant.onmicrosoft.com' });
+    expect(fence).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls[2]).toEqual([`${ORIGIN}/groups`, expect.objectContaining({ method: 'POST', body: JSON.stringify({
+      displayName: 'Ops', mailNickname: 'ops', mailEnabled: true, securityEnabled: false, groupTypes: ['Unified'],
+      'owners@odata.bind': [`${ORIGIN}/users/${USER}`],
+    }) })]);
+  });
+  it('rejects group creation without owner permission or valid alias before writing', async () => {
+    for (const [roles, alias] of [[['Group.ReadWrite.All'], 'ops'], [['Group.ReadWrite.All', 'User.ReadWrite.All'], 'ops@bad']] as const) {
+      const token = `h.${Buffer.from(JSON.stringify({ roles })).toString('base64url')}.s`;
+      const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }));
+      const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+      await expect(provider.createGroup({ displayName: 'Ops', mailNickname: alias, ownerId: USER })).rejects.toBeTruthy();
+      expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(0);
+    }
+  });
+  it('updates only the display name of a verified Microsoft 365 group', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['Group.ReadWrite.All'] })).toString('base64url')}.s`;
+    const current = { ...staticGroup, displayName: 'Old', mailEnabled: true, groupTypes: ['Unified'] };
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response(current)).mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(response({ ...current, displayName: 'New' }));
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    await expect(provider.updateGroup(GROUP, { displayName: 'New' })).resolves.toEqual({ accepted: true, changed: true, verified: true });
+    expect(fetch.mock.calls[2]).toEqual([`${ORIGIN}/groups/${GROUP}`, expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ displayName: 'New' }) })]);
+  });
   it('reads only the fixed service-health endpoint for the verified tenant and strips provider extras', async () => {
     const token = `h.${Buffer.from(JSON.stringify({ roles: ['ServiceHealth.Read.All'] })).toString('base64url')}.s`;
     const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
@@ -307,16 +343,20 @@ describe('bounded Microsoft administration provider', () => {
 
   it('uses $ref for member removal, never the directory object deletion endpoint', async () => {
     const h = harness();
-    h.fetch.mockResolvedValueOnce(response(staticGroup)).mockResolvedValueOnce(response({ id: USER })).mockResolvedValueOnce(new Response(null, { status: 204 }));
-    expect(await h.provider.removeGroupMember(GROUP, USER)).toEqual({ accepted: true });
-    expect(h.fetch.mock.calls[3]).toEqual([`${ORIGIN}/groups/${GROUP}/members/${USER}/$ref`, expect.objectContaining({ method: 'DELETE' })]);
+    h.fetch.mockResolvedValueOnce(response(staticGroup)).mockResolvedValueOnce(response({ id: USER }))
+      .mockResolvedValueOnce(response({ id: USER })).mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(response({}, 404));
+    expect(await h.provider.removeGroupMember(GROUP, USER)).toEqual({ accepted: true, changed: true, verified: true });
+    expect(h.fetch.mock.calls[4]).toEqual([`${ORIGIN}/groups/${GROUP}/members/${USER}/$ref`, expect.objectContaining({ method: 'DELETE' })]);
   });
 
   it('adds only the validated user reference to a static group', async () => {
     const h = harness();
-    h.fetch.mockResolvedValueOnce(response(staticGroup)).mockResolvedValueOnce(response({ id: USER })).mockResolvedValueOnce(new Response(null, { status: 204 }));
-    await h.provider.addGroupMember(GROUP, USER);
-    expect(h.fetch.mock.calls[3]).toEqual([`${ORIGIN}/groups/${GROUP}/members/$ref`, expect.objectContaining({ method: 'POST', body: JSON.stringify({ '@odata.id': `${ORIGIN}/directoryObjects/${USER}` }) })]);
+    h.fetch.mockResolvedValueOnce(response(staticGroup)).mockResolvedValueOnce(response({ id: USER }))
+      .mockResolvedValueOnce(response({}, 404)).mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(response({ id: USER }));
+    expect(await h.provider.addGroupMember(GROUP, USER)).toEqual({ accepted: true, changed: true, verified: true });
+    expect(h.fetch.mock.calls[4]).toEqual([`${ORIGIN}/groups/${GROUP}/members/$ref`, expect.objectContaining({ method: 'POST', body: JSON.stringify({ '@odata.id': `${ORIGIN}/directoryObjects/${USER}` }) })]);
   });
 
   it.each([{ groupTypes: ['DynamicMembership'] }, { onPremisesSyncEnabled: true }, { isAssignableToRole: true }, { mailEnabled: true }, { isAssignableToRole: undefined }])('denies unsupported group mutations %j', async changed => {
@@ -329,11 +369,14 @@ describe('bounded Microsoft administration provider', () => {
   it.each(['add', 'remove'] as const)('allows %s for an ordinary group with explicit null role assignability', async action => {
     const h = harness();
     h.fetch.mockResolvedValueOnce(response({ ...staticGroup, isAssignableToRole: null }))
-      .mockResolvedValueOnce(response({ id: USER })).mockResolvedValueOnce(new Response(null, { status: 204 }));
+      .mockResolvedValueOnce(response({ id: USER }))
+      .mockResolvedValueOnce(action === 'add' ? response({}, 404) : response({ id: USER }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(action === 'add' ? response({ id: USER }) : response({}, 404));
     expect(await (action === 'add' ? h.provider.addGroupMember(GROUP, USER) : h.provider.removeGroupMember(GROUP, USER)))
-      .toEqual({ accepted: true });
-    expect(h.fetch).toHaveBeenCalledTimes(4);
-    expect(h.fetch.mock.calls[3][1].method).toBe(action === 'add' ? 'POST' : 'DELETE');
+      .toEqual({ accepted: true, changed: true, verified: true });
+    expect(h.fetch).toHaveBeenCalledTimes(6);
+    expect(h.fetch.mock.calls[4][1].method).toBe(action === 'add' ? 'POST' : 'DELETE');
   });
 
   it('rejects malformed role assignability before any membership mutation', async () => {

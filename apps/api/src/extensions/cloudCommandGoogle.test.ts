@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const { dbMocks, googleMocks } = vi.hoisted(() => ({
   dbMocks: { results: [] as unknown[][], select: vi.fn() },
-  googleMocks: { users: vi.fn(), userGet: vi.fn(), userUpdate: vi.fn(), groups: vi.fn(), decrypt: vi.fn(), audit: vi.fn() },
+  googleMocks: { users: vi.fn(), userGet: vi.fn(), userUpdate: vi.fn(), groups: vi.fn(), groupGet: vi.fn(), members: vi.fn(), decrypt: vi.fn(), audit: vi.fn() },
 }));
 vi.mock('../db', () => ({
   db: { select: () => { dbMocks.select(); return { from: () => ({ where: () => ({ limit: async () => dbMocks.results.shift() ?? [] }) }) }; } },
@@ -12,7 +12,7 @@ vi.mock('../middleware/auth', () => ({ dbAccessContextFromAuth: () => ({}) }));
 vi.mock('../config/env', () => ({ GOOGLE_WORKSPACE_ENABLED: true }));
 vi.mock('../services/googleHelpers', () => ({ decryptConnectionKey: googleMocks.decrypt }));
 vi.mock('../services/auditService', () => ({ createAuditLog: googleMocks.audit }));
-vi.mock('../services/googleClient', () => ({ getDirectoryClient: () => ({ users: { list: googleMocks.users, get: googleMocks.userGet, update: googleMocks.userUpdate }, groups: { list: googleMocks.groups } }) }));
+vi.mock('../services/googleClient', () => ({ getDirectoryClient: () => ({ users: { list: googleMocks.users, get: googleMocks.userGet, update: googleMocks.userUpdate }, groups: { list: googleMocks.groups, get: googleMocks.groupGet }, members: { list: googleMocks.members } }) }));
 import { nativeGoogleServices } from './cloudCommandGoogle';
 
 const ORG = '11111111-1111-4111-8111-111111111111';
@@ -53,6 +53,27 @@ describe('native Google Workspace bridge', () => {
     const result = await nativeGoogleServices.directory(request(), 'groups', null);
     expect(result).toMatchObject({ ok: false, code: 'provider_failed' });
     expect(JSON.stringify(result)).not.toContain('private provider body');
+  });
+  it('reads bounded direct members only after confirming group ownership', async () => {
+    dbMocks.results.push([row]);
+    googleMocks.groupGet.mockResolvedValue({ data: { id: 'g1', email: 'team@example.test' } });
+    googleMocks.members.mockResolvedValue({ data: { members: [{ id: 'm1', email: 'one@example.test', role: 'OWNER', type: 'USER', status: 'ACTIVE', secret: 'hidden' }], nextPageToken: 'next' } });
+    const result = await nativeGoogleServices.members(request(), 'g1', 'token');
+    expect(googleMocks.groupGet).toHaveBeenCalledWith({ groupKey: 'g1', fields: 'id,email' });
+    expect(googleMocks.members).toHaveBeenCalledWith(expect.objectContaining({ groupKey: 'g1', maxResults: 100, pageToken: 'token', includeDerivedMembership: false }));
+    expect(result).toMatchObject({ ok: true, nextPageToken: 'next', items: [{ email: 'one@example.test', role: 'OWNER' }] });
+    expect(JSON.stringify(result)).not.toContain('hidden');
+  });
+  it('refuses cross-domain group details before listing members', async () => {
+    dbMocks.results.push([row]);
+    googleMocks.groupGet.mockResolvedValue({ data: { id: 'g1', email: 'other@elsewhere.test' } });
+    expect(await nativeGoogleServices.members(request(), 'g1', null)).toMatchObject({ code: 'access_denied' });
+    expect(googleMocks.members).not.toHaveBeenCalled();
+  });
+  it('denies cross-org member reads before loading a credential', async () => {
+    expect(await nativeGoogleServices.members(request(OTHER), 'g1', null)).toMatchObject({ code: 'access_denied' });
+    expect(dbMocks.select).not.toHaveBeenCalled();
+    expect(googleMocks.decrypt).not.toHaveBeenCalled();
   });
   const action = { userId: '123456', email: 'user@example.test', expectedSuspended: false, suspended: true, confirmation: 'user@example.test' };
   const current = { id: '123456', primaryEmail: 'user@example.test', suspended: false, archived: false, isAdmin: false };
