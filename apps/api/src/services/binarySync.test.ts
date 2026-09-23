@@ -271,6 +271,119 @@ describe("binarySync", () => {
     __resetRefusedManifestAssetWarnCache();
   });
 
+  describe('Windows-only alternate release', () => {
+    const repo = 'example/windows-signing';
+    const tag = 'v0.115.1';
+    const names = [
+      'breeze-agent-windows-amd64.exe',
+      'breeze-user-helper-windows-amd64.exe',
+      'breeze-watchdog-windows-amd64.exe',
+      'breeze-backup-windows-amd64.exe',
+    ];
+
+    function stubRelease(includeBackup = true) {
+      const selected = includeBackup ? names : names.slice(0, -1);
+      const assets = selected.map((name) => ({
+        name,
+        sha256: createHash('sha256').update(name).digest('hex'),
+        size: Buffer.byteLength(name),
+        edition: 'self-host',
+        platformTrust: 'none',
+      }));
+      const signed = makeSignedReleaseManifestMultiFrom({
+        schemaVersion: 1,
+        repository: repo,
+        release: tag,
+        assets,
+      });
+      process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS = signed.publicKey;
+      const apiAssets = selected.map((name) => ({
+        name,
+        size: Buffer.byteLength(name),
+        browser_download_url: `https://github.com/${repo}/releases/download/${tag}/${name}`,
+      }));
+      apiAssets.push(
+        { name: 'release-artifact-manifest.json', size: signed.manifest.length,
+          browser_download_url: `https://github.com/${repo}/releases/download/${tag}/release-artifact-manifest.json` },
+        { name: 'release-artifact-manifest.json.ed25519', size: signed.signature.length,
+          browser_download_url: `https://github.com/${repo}/releases/download/${tag}/release-artifact-manifest.json.ed25519` },
+      );
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        if (url === `https://api.github.com/repos/${repo}/releases/tags/${tag}`) {
+          return new Response(JSON.stringify({ tag_name: tag, assets: apiAssets }));
+        }
+        if (url.endsWith('/release-artifact-manifest.json')) return new Response(signed.manifest);
+        if (url.endsWith('/release-artifact-manifest.json.ed25519')) return new Response(signed.signature);
+        return new Response('not found', { status: 404 });
+      }));
+    }
+
+    it('registers only four verified Windows rows without fleet promotion', async () => {
+      stubRelease();
+      const result = await syncFromGitHub(tag, { repository: repo, windowsOnly: true, autoPromote: false });
+      expect(result.synced).toEqual(expect.arrayContaining([
+        'agent:windows/amd64', 'user-helper:windows/amd64',
+        'watchdog:windows/amd64', 'backup:windows/amd64',
+      ]));
+      expect(result.synced).toHaveLength(4);
+      expect(dbMocks.updateWhere).not.toHaveBeenCalled();
+      const rows = dbMocks.insertValues.mock.calls.map((call: any[]) => call[0] as Record<string, unknown>);
+      expect(rows).toHaveLength(4);
+      for (const row of rows) {
+        expect(row).toMatchObject({ version: '0.115.1', platform: 'windows', isLatest: false,
+          signingKeyId: 'deploy-test-aaaaaaaa' });
+      }
+    });
+
+    it('promotes only the custom Windows rows after the explicit rollout switch', async () => {
+      stubRelease();
+      const result = await syncFromGitHub(tag, { repository: repo, windowsOnly: true, autoPromote: true });
+      expect(result.synced).toHaveLength(4);
+      const rows = dbMocks.insertValues.mock.calls.map((call: any[]) => call[0] as Record<string, unknown>);
+      expect(rows).toHaveLength(4);
+      expect(rows.every((row) => row.isLatest === true && row.platform === 'windows')).toBe(true);
+      expect(dbMocks.updateWhere).toHaveBeenCalledTimes(4);
+    });
+
+    it('keeps the primary sync from replacing promoted Windows rows', async () => {
+      process.env.BINARY_WINDOWS_GITHUB_REPOSITORY = repo;
+      process.env.BINARY_WINDOWS_VERSION = '0.115.1';
+      process.env.BINARY_WINDOWS_PROMOTE_ENABLED = 'true';
+      const linux = { name: 'breeze-agent-linux-amd64', buffer: Buffer.from('linux-agent') };
+      const windows = { name: 'breeze-agent-windows-amd64.exe', buffer: Buffer.from('windows-agent') };
+      const signed = makeSignedReleaseManifestMulti([linux, windows], 'v1.2.3');
+      process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS = signed.publicKey;
+      const apiAssets = [linux, windows].map((asset) => ({
+        name: asset.name,
+        size: asset.buffer.length,
+        browser_download_url: `https://github.com/LanternOps/breeze/releases/download/v1.2.3/${asset.name}`,
+      }));
+      apiAssets.push(
+        { name: 'release-artifact-manifest.json', size: signed.manifest.length,
+          browser_download_url: 'https://github.com/LanternOps/breeze/releases/download/v1.2.3/release-artifact-manifest.json' },
+        { name: 'release-artifact-manifest.json.ed25519', size: signed.signature.length,
+          browser_download_url: 'https://github.com/LanternOps/breeze/releases/download/v1.2.3/release-artifact-manifest.json.ed25519' },
+      );
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+        if (url.endsWith('/releases/latest')) return new Response(JSON.stringify({ tag_name: 'v1.2.3', assets: apiAssets }));
+        if (url.endsWith('/release-artifact-manifest.json')) return new Response(signed.manifest);
+        if (url.endsWith('/release-artifact-manifest.json.ed25519')) return new Response(signed.signature);
+        return new Response('not found', { status: 404 });
+      }));
+      const result = await syncFromGitHub();
+      expect(result.synced).toEqual(['agent:linux/amd64']);
+      expect(dbMocks.insertValues).toHaveBeenCalledTimes(1);
+      expect(dbMocks.insertValues.mock.calls[0]![0]).toMatchObject({ platform: 'linux' });
+    });
+
+    it('rejects an incomplete Windows release before writing any row', async () => {
+      stubRelease(false);
+      await expect(syncFromGitHub(tag, { repository: repo, windowsOnly: true, autoPromote: false }))
+        .rejects.toThrow(/missing breeze-backup/);
+      expect(dbMocks.insertValues).not.toHaveBeenCalled();
+    });
+  });
+
   afterEach(() => {
     process.env = originalEnv;
     vi.unstubAllGlobals();
