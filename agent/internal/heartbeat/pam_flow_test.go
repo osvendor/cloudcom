@@ -612,18 +612,16 @@ func TestRunPamFlowDismissPanicUnlocksPamActuateMutex(t *testing.T) {
 	h.pamActuateMu.Unlock()
 }
 
-// TestRunPamFlowSurvivesActuatorPanic proves the defer/recover at the top of
-// RunPamFlow contains a syscall-level panic on the local actuate path (which
-// runs on the etwlua loop goroutine, unprotected by the worker-pool recover).
-// The credential-zeroing/demote defers in actuateElevation still run during
-// unwinding; this is purely availability hardening.
-func TestRunPamFlowSurvivesActuatorPanic(t *testing.T) {
+// The ETW loop must survive a helper IPC panic on an approved request. The
+// service must never enter its old local credential-injection path.
+func TestRunPamFlowSurvivesApprovedDismissPanic(t *testing.T) {
 	manager := &fakeElevationManager{cred: elevaccount.Credential{Username: "~breeze_elev", Password: "x"}}
 	swapElevationManagerForTest(t, func() elevaccount.AccountManager { return manager })
 	swapActuatorForTest(t, func(pamactuator.Strategy) pamactuator.Actuator {
 		return fakeActuator{
 			trigger: func(context.Context, pamactuator.Request) pamactuator.Result {
-				panic("simulated SendInput syscall panic")
+				t.Fatal("service-local actuator must not run")
+				return pamactuator.Result{}
 			},
 			dismiss: func(context.Context) pamactuator.Result {
 				return pamactuator.Result{Success: true, Reason: "dismissed"}
@@ -638,6 +636,9 @@ func TestRunPamFlowSurvivesActuatorPanic(t *testing.T) {
 	h.pamRequestDialog = func(_ *sessionbroker.Session, _ string, _ ipc.PamRequestDialog, _ time.Duration) (ipc.PamDialogResult, error) {
 		return ipc.PamDialogResult{Approved: true}, nil
 	}
+	h.pamDismissConsent = func(_ *sessionbroker.Session, _ string, _ time.Duration) (ipc.PamDismissConsentResult, error) {
+		panic("simulated helper IPC panic")
+	}
 
 	ev := etwlua.Event{TargetExecutablePath: `C:\Windows\regedit.exe`}
 	outcome := etwlua.ElevationOutcome{RequestID: "req-panic", Status: "auto_approved"}
@@ -645,10 +646,13 @@ func TestRunPamFlowSurvivesActuatorPanic(t *testing.T) {
 	// Must NOT panic out of RunPamFlow.
 	h.RunPamFlow(context.Background(), ev, outcome)
 
-	// The deferred Demote in actuateElevation must still have run during unwinding.
-	if manager.demoteSeen != 1 {
-		t.Fatalf("Demote called %d times after panic, want 1 (deferred cleanup must run)", manager.demoteSeen)
+	if manager.promoteSeen != 0 || manager.demoteSeen != 0 {
+		t.Fatalf("service-local credentials were used: promote=%d demote=%d", manager.promoteSeen, manager.demoteSeen)
 	}
+	if !h.pamActuateMu.TryLock() {
+		t.Fatal("pamActuateMu remained locked after helper IPC panic")
+	}
+	h.pamActuateMu.Unlock()
 }
 
 // gateClosed reports whether PAM actuation is currently fail-closed.
