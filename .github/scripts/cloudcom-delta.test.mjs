@@ -21,6 +21,8 @@ test('baseline accepts a valid release fixture and rejects an arbitrary reposito
 });
 
 test('classifies supported web, native, and explicit infrastructure changes', () => {
+  assert.deepEqual(classify(['.dockerignore']).unsupported, []);
+  assert.equal(classify(['.dockerignore']).infra, true);
   assert.deepEqual(classify(['apps/web/src/components/remote/RemoteToolsPage.tsx', 'agent/main.go', 'deploy/docker-compose.prod.yml']), {
     api: false, web: true, shared: false, native: true, infra: true, portalRemote: false, unifiSyncLock: false, unsupported: [], docsOnly: false,
   });
