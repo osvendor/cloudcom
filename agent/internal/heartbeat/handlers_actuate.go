@@ -115,9 +115,9 @@ func handlePamCleanupV2(h *Heartbeat, cmd Command) tools.CommandResult {
 	if h == nil || h.pamLifetimeManager == nil {
 		return tools.NewErrorResult(errors.New("PAM lifetime manager unavailable"), time.Since(start).Milliseconds())
 	}
-	if !h.pamReconciled.Load() {
-		return tools.NewErrorResult(errors.New("PAM lifetime reconciliation in progress"), time.Since(start).Milliseconds())
-	}
+	// Cleanup is the recovery path when an earlier actuation blocks reconciliation.
+	// The manager still checks the enrolled identity, ledger generation and
+	// independent process/account/token evidence before reporting cleaned.
 	ctx, cancel := context.WithTimeout(context.Background(), pamLifecycleOperationTimeout)
 	defer cancel()
 	result := h.pamLifetimeManager.Cleanup(ctx, payload)

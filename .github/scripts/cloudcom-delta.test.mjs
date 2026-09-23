@@ -140,6 +140,38 @@ test('routes the bounded UniFi sync lock-order surface to API and real-Postgres 
   );
 });
 
+test('routes only reviewed PAM cleanup recovery API files to focused validation', () => {
+  for (const path of [
+    'apps/api/src/jobs/pamActuationWorker.ts',
+    'apps/api/src/jobs/pamActuationWorker.test.ts',
+    'apps/api/src/services/commandDispatch.ts',
+    'apps/api/src/services/commandDispatch.test.ts',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.api, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+  assert.deepEqual(classify(['apps/api/src/services/pamOther.ts']).unsupported,
+    ['apps/api/src/services/pamOther.ts']);
+});
+
+test('routes the PAM local decision endpoint and regression test to API validation', () => {
+  for (const path of [
+    'apps/api/src/routes/agents/elevationRequests.ts',
+    'apps/api/src/routes/agents/elevationRequests.test.ts',
+    'apps/api/src/routes/pam.ts',
+    'apps/api/src/routes/pam.test.ts',
+    'apps/api/src/routes/softwarePolicies.ts',
+    'apps/api/src/routes/softwarePolicies.test.ts',
+    'apps/api/src/jobs/pamJobs.ts',
+    'apps/api/src/jobs/pamJobs.test.ts',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.api, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+});
+
 test('classifies only the reviewed Cloud Command server, bridge, registry, and build surfaces', () => {
   for (const path of [
     'packages/ext-cloud-command/src/server/index.ts',

@@ -55,6 +55,7 @@ interface TransitionedRow extends Record<string, unknown> {
   device_id: string;
   flow_type: string;
   prior_status: string;
+  metadata?: Record<string, unknown> | null;
 }
 
 function extractRows(result: unknown): TransitionedRow[] {
@@ -131,11 +132,15 @@ export async function enforceElevationExpiry(): Promise<number> {
         e.org_id,
         e.device_id,
         e.flow_type,
+        e.metadata,
         'active'::text AS prior_status;
     `);
     const expired = extractRows(transitioned);
     for (const row of expired) {
-      await requestPamCleanup(tx, { elevationRequestId: row.id, cause: 'expired' });
+      if (row.metadata?.local_decision_required !== true
+          || row.metadata.local_decision === 'approved') {
+        await requestPamCleanup(tx, { elevationRequestId: row.id, cause: 'expired' });
+      }
     }
     if (expired.length > 0) {
       await tx.insert(elevationAudit).values(expired.map((row) => ({

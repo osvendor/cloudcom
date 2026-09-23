@@ -244,7 +244,7 @@ describe('command dispatch helpers', () => {
     expect(rejectWhere).toHaveBeenCalledTimes(1);
     expect(vi.mocked(notInArray)).toHaveBeenCalledWith(
       'deviceCommands.type',
-      ['peripheral_policy_sync_v2', 'agent_rollback_v1', 'pam_apply_v2', 'pam_cleanup_v2'],
+      ['peripheral_policy_sync_v2', 'agent_rollback_v1', 'pam_apply_v2'],
     );
   });
 
@@ -267,7 +267,7 @@ describe('command dispatch helpers', () => {
     );
   });
 
-  it('withholds PAM lifetime commands when this heartbeat does not report protocol v2', async () => {
+  it('withholds PAM apply but permits cleanup when this heartbeat does not report protocol v2', async () => {
     const tx = {
       select: selectChain([]),
       update: vi.fn(),
@@ -282,7 +282,7 @@ describe('command dispatch helpers', () => {
 
     expect(vi.mocked(notInArray)).toHaveBeenCalledWith(
       'deviceCommands.type',
-      ['pam_apply_v2', 'pam_cleanup_v2'],
+      ['pam_apply_v2'],
     );
   });
 

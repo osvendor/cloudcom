@@ -47,7 +47,9 @@ func TestRunPamFlow(t *testing.T) {
 		promoteErr error
 		// wantPromoteAttempt asserts Promote was called exactly once even though
 		// the actuation did not complete (used with promoteErr).
-		wantPromoteAttempt bool
+		wantPromoteAttempt    bool
+		localDecisionRequired bool
+		wantReported          string
 		// dismissResult, when non-nil, overrides the broker-dismiss result so the
 		// deny-path logging switch can be exercised against the
 		// benign "no_consent_window" and the genuine-failure reasons.
@@ -68,16 +70,44 @@ func TestRunPamFlow(t *testing.T) {
 			wantActuated:         false,
 		},
 		{
-			name:                 "auto-approved targets valid high requester session as unsigned decimal and actuates",
+			name:                 "auto-approved targets requester session and dismisses original consent",
 			status:               "auto_approved",
 			subjectSessionID:     0xFFFFFFFE,
 			wantTargetWinSession: "4294967294",
 			dialog:               approved,
 			wantFind:             true,
 			wantDialog:           true,
-			wantTriggered:        true,
-			wantDismissed:        false,
-			wantActuated:         true,
+			wantTriggered:        false,
+			wantDismissed:        true,
+			wantActuated:         false,
+		},
+		{
+			name:                  "protocol one reports approval only after consent dismissal",
+			status:                "auto_approved",
+			dialog:                approved,
+			localDecisionRequired: true, wantReported: "approved",
+			wantFind:              true,
+			wantDialog:            true,
+			wantDismissed:         true,
+		},
+		{
+			name:                  "protocol one reports local denial",
+			status:                "auto_approved",
+			dialog:                dismissed,
+			localDecisionRequired: true, wantReported: "denied",
+			wantFind:              true,
+			wantDialog:            true,
+			wantDismissed:         true,
+		},
+		{
+			name:                  "protocol one refuses launch if original consent cannot be dismissed",
+			status:                "auto_approved",
+			dialog:                approved,
+			localDecisionRequired: true, wantReported: "denied",
+			dismissResult:         &ipc.PamDismissConsentResult{Success: false, Reason: "send_input_failed"},
+			wantFind:              true,
+			wantDialog:            true,
+			wantDismissed:         true,
 		},
 		{
 			// 0xFFFFFFFF is Windows' invalid/unresolved session sentinel. Treat it
@@ -88,9 +118,9 @@ func TestRunPamFlow(t *testing.T) {
 			dialog:           approved,
 			wantFind:         true,
 			wantDialog:       true,
-			wantTriggered:    true,
-			wantDismissed:    false,
-			wantActuated:     true,
+			wantTriggered:    false,
+			wantDismissed:    true,
+			wantActuated:     false,
 		},
 		{
 			// Zero is the compatibility path for old/fake/non-Windows events: the
@@ -113,7 +143,7 @@ func TestRunPamFlow(t *testing.T) {
 			wantFind:             true,
 			wantDialog:           true,
 			wantTriggered:        false,
-			wantDismissed:        false,
+			wantDismissed:        true,
 			wantActuated:         false,
 		},
 		{
@@ -200,21 +230,18 @@ func TestRunPamFlow(t *testing.T) {
 			wantActuated:  false,
 		},
 		{
-			// FIX I: auto-approved + user-approved, but the credential Promote
-			// fails (e.g. ErrUnsupportedPlatform). actuateElevation returns the
-			// failure early — Trigger is never reached as success, no Demote runs,
-			// and no spurious dismiss occurs. Proves the local flow tolerates a
-			// failed actuation cleanly without panicking.
-			name:               "auto-approved promote failure tolerated, no dismiss",
+			// The local flow must not promote an account even if the old
+			// service-local promotion path would fail.
+			name:               "auto-approved never promotes local account",
 			status:             "auto_approved",
 			dialog:             approved,
 			promoteErr:         elevaccount.ErrUnsupportedPlatform,
 			wantFind:           true,
 			wantDialog:         true,
 			wantTriggered:      false, // Promote fails before Trigger
-			wantDismissed:      false, // actuate path never dismisses
-			wantActuated:       false, // promote→demote pipeline did not complete
-			wantPromoteAttempt: true,  // Promote attempted exactly once
+			wantDismissed:      true,
+			wantActuated:       false,
+			wantPromoteAttempt: false,
 		},
 		{
 			// FIX B: deny path where Dismiss reports the prompt was already gone.
@@ -283,6 +310,7 @@ func TestRunPamFlow(t *testing.T) {
 			swapElevationManagerForTest(t, func() elevaccount.AccountManager { return manager })
 
 			var findCalled, dialogCalled bool
+			var reportedDecision string
 			var gotTargetWinSession string
 			var gotDialog ipc.PamRequestDialog
 			var gotDialogTimeout time.Duration
@@ -295,6 +323,10 @@ func TestRunPamFlow(t *testing.T) {
 			// keep this from dereferencing the nil broker.
 			h := &Heartbeat{}
 			if !tc.noBroker {
+				h.pamReportLocalDecision = func(_ string, decision string) error {
+					reportedDecision = decision
+					return nil
+				}
 				h.pamFindSession = func(capability, targetWinSession string) *sessionbroker.Session {
 					findCalled = true
 					gotTargetWinSession = targetWinSession
@@ -335,9 +367,13 @@ func TestRunPamFlow(t *testing.T) {
 				TargetExecutableSigner: "signer-Acme Corp",
 				CommandLine:            `target.exe --do-thing`,
 			}
-			outcome := etwlua.ElevationOutcome{RequestID: "req-1", Status: tc.status}
+			outcome := etwlua.ElevationOutcome{RequestID: "req-1", Status: tc.status,
+				LocalDecisionRequired: tc.localDecisionRequired}
 
 			h.RunPamFlow(context.Background(), ev, outcome)
+			if reportedDecision != tc.wantReported {
+				t.Errorf("reportedDecision = %q, want %q", reportedDecision, tc.wantReported)
+			}
 
 			if triggered != tc.wantTriggered {
 				t.Errorf("triggered = %v, want %v", triggered, tc.wantTriggered)
@@ -615,18 +651,16 @@ func TestRunPamFlowDismissPanicUnlocksPamActuateMutex(t *testing.T) {
 	h.pamActuateMu.Unlock()
 }
 
-// TestRunPamFlowSurvivesActuatorPanic proves the defer/recover at the top of
-// RunPamFlow contains a syscall-level panic on the local actuate path (which
-// runs on the etwlua loop goroutine, unprotected by the worker-pool recover).
-// The credential-zeroing/demote defers in actuateElevation still run during
-// unwinding; this is purely availability hardening.
-func TestRunPamFlowSurvivesActuatorPanic(t *testing.T) {
+// The ETW loop must survive a helper IPC panic on an approved request. The
+// service must never enter its old local credential-injection path.
+func TestRunPamFlowSurvivesApprovedDismissPanic(t *testing.T) {
 	manager := &fakeElevationManager{cred: elevaccount.Credential{Username: "~breeze_elev", Password: "x"}}
 	swapElevationManagerForTest(t, func() elevaccount.AccountManager { return manager })
 	swapActuatorForTest(t, func(pamactuator.Strategy) pamactuator.Actuator {
 		return fakeActuator{
 			trigger: func(context.Context, pamactuator.Request) pamactuator.Result {
-				panic("simulated SendInput syscall panic")
+				t.Fatal("service-local actuator must not run")
+				return pamactuator.Result{}
 			},
 			dismiss: func(context.Context) pamactuator.Result {
 				return pamactuator.Result{Success: true, Reason: "dismissed"}
@@ -641,6 +675,9 @@ func TestRunPamFlowSurvivesActuatorPanic(t *testing.T) {
 	h.pamRequestDialog = func(_ *sessionbroker.Session, _ string, _ ipc.PamRequestDialog, _ time.Duration) (ipc.PamDialogResult, error) {
 		return ipc.PamDialogResult{Approved: true}, nil
 	}
+	h.pamDismissConsent = func(_ *sessionbroker.Session, _ string, _ time.Duration) (ipc.PamDismissConsentResult, error) {
+		panic("simulated helper IPC panic")
+	}
 
 	ev := etwlua.Event{TargetExecutablePath: `C:\Windows\regedit.exe`}
 	outcome := etwlua.ElevationOutcome{RequestID: "req-panic", Status: "auto_approved"}
@@ -648,10 +685,13 @@ func TestRunPamFlowSurvivesActuatorPanic(t *testing.T) {
 	// Must NOT panic out of RunPamFlow.
 	h.RunPamFlow(context.Background(), ev, outcome)
 
-	// The deferred Demote in actuateElevation must still have run during unwinding.
-	if manager.demoteSeen != 1 {
-		t.Fatalf("Demote called %d times after panic, want 1 (deferred cleanup must run)", manager.demoteSeen)
+	if manager.promoteSeen != 0 || manager.demoteSeen != 0 {
+		t.Fatalf("service-local credentials were used: promote=%d demote=%d", manager.promoteSeen, manager.demoteSeen)
 	}
+	if !h.pamActuateMu.TryLock() {
+		t.Fatal("pamActuateMu remained locked after helper IPC panic")
+	}
+	h.pamActuateMu.Unlock()
 }
 
 // gateClosed reports whether PAM actuation is currently fail-closed.
