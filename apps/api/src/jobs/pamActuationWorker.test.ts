@@ -153,4 +153,31 @@ describe('processPamActuationEvent', () => {
       .resolves.toBe('unsupported');
     expect(executeMock).toHaveBeenCalledTimes(2);
   });
+
+  it.each([undefined, 0])('dispatches cleanup when PAM capability is %s', async (version) => {
+    executeMock
+      .mockResolvedValueOnce({ rows: [{ ...current, desired_state: 'cleanup', pam_lifetime_protocol_version: version }] })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    await expect(processPamActuationEvent({ actuationId: current.id, generation: 4 }))
+      .resolves.toBe('dispatched');
+    expect(assertDeviceExecuteAllowedMock).toHaveBeenCalledWith(current.device_id, 'pam_cleanup_v2', null);
+    expect(commandPayloadAt(1)).toEqual({ ...canonical.cleanup, generation: 4 });
+  });
+
+  it('does not dispatch cleanup at capability 0 when the device belongs to another org', async () => {
+    executeMock
+      .mockResolvedValueOnce({ rows: [{ ...current, desired_state: 'cleanup', pam_lifetime_protocol_version: 0,
+        device_org_id: '90000000-0000-4000-8000-000000000001' }] })
+      .mockResolvedValueOnce({ rows: [] });
+
+    await expect(processPamActuationEvent({ actuationId: current.id, generation: 4 }))
+      .resolves.toBe('blocked');
+    expect(assertDeviceExecuteAllowedMock).not.toHaveBeenCalled();
+    expect(executeMock).toHaveBeenCalledTimes(2);
+    const sqlText = executeMock.mock.calls.map(([query]) => JSON.stringify(query)).join('\n');
+    expect(sqlText).toContain('identity_mismatch');
+    expect(sqlText).not.toContain('INSERT INTO device_commands');
+  });
 });
