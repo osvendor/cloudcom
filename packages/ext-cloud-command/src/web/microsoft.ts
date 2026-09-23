@@ -26,8 +26,10 @@ type UserSecurityAction = 'reset-password' | 'revoke-sessions';
 type MicrosoftRecord = Record<string, unknown>;
 type UserDraft = Partial<Record<(typeof USER_FIELDS)[number], string>> & { accountEnabled?: boolean };
 const USER_FIELDS = ['displayName', 'givenName', 'surname', 'department', 'jobTitle', 'officeLocation'] as const;
-const USER_VERIFY_READS = 4;
-const USER_VERIFY_DELAY_MS = 1000;
+// Match Cloud Command's directory update flow: allow Graph's eventual reads
+// to converge for up to 30 seconds before reporting an uncertain outcome.
+const USER_VERIFY_READS = 15;
+const USER_VERIFY_DELAY_MS = 2000;
 
 const labels: Record<Resource, string> = {
   users: 'Users',

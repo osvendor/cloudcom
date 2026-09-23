@@ -21,6 +21,7 @@ function mount(request: (path: string, init?: RequestInit) => Promise<Response>,
   return page;
 }
 afterEach(() => {
+  vi.useRealTimers();
   document.body.replaceChildren();
   window.location.hash = '';
 });
@@ -178,7 +179,7 @@ describe('CloudCommandMicrosoftPage', () => {
     );
   });
 
-  it('polls bounded user readbacks until an eventually propagated update matches without duplicating the mutation', async () => {
+  it('waits for delayed Graph propagation before reporting an update verified', async () => {
     const user = { id: 'user-1', displayName: 'Ada Lovelace', givenName: 'Ada', surname: 'Lovelace', department: 'Engineering', jobTitle: 'Analyst', officeLocation: 'London', accountEnabled: true };
     let gets = 0;
     const request = vi.fn(async (path: string, init?: RequestInit) => {
@@ -187,7 +188,7 @@ describe('CloudCommandMicrosoftPage', () => {
       if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada Lovelace' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
       if (path === '/microsoft/administration') {
         const body = JSON.parse(String(init?.body));
-        if (body.type === 'user.get') return Response.json({ ...user, displayName: gets++ >= 2 ? 'Ada Byron' : user.displayName });
+        if (body.type === 'user.get') return Response.json({ ...user, displayName: gets++ >= 7 ? 'Ada Byron' : user.displayName });
         if (body.type === 'user.update') return Response.json({ accepted: true });
       }
       throw new Error(`Unexpected ${path}`);
@@ -195,10 +196,12 @@ describe('CloudCommandMicrosoftPage', () => {
     const page = mount(request); await flush(); await flush();
     openUser(page, 'user-1'); await flush();
     const name = page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!; name.value = 'Ada Byron';
-    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await new Promise(resolve => setTimeout(resolve, 2200));
+    vi.useFakeTimers();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await vi.runAllTimersAsync();
     const update = request.mock.calls.map(([, init]) => init?.body).find(body => String(body).includes('user.update'));
     expect(JSON.parse(String(update))).toEqual({ type: 'user.update', id: 'user-1', update: { displayName: 'Ada Byron' } });
     expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
+    expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.get'))).toHaveLength(8);
     expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('saved and verified');
     expect(page.shadowRoot!.querySelector('table')!.textContent).toContain('Ada Byron');
   });
@@ -225,23 +228,26 @@ describe('CloudCommandMicrosoftPage', () => {
     expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('saved and verified');
   });
 
-  it('reports a mismatched user readback as uncertain without retrying', async () => {
-    let gets = 0;
+  it('reports an uncertain result after bounded readback retries without repeating the mutation', async () => {
+    let verifyReads = 0;
+    let mutationAccepted = false;
     const request = vi.fn(async (path: string, init?: RequestInit) => {
       if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
       if (path === '/threecx/connection') return Response.json({ connected: false });
       if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
       if (path === '/microsoft/administration') {
         const type = JSON.parse(String(init?.body)).type;
-        if (type === 'user.get') return Response.json({ displayName: gets++ ? 'Ada' : 'Ada', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '', accountEnabled: true });
-        if (type === 'user.update') return Response.json({ accepted: true });
+        if (type === 'user.get') { if (mutationAccepted) verifyReads++; return Response.json({ displayName: 'Ada', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '', accountEnabled: true }); }
+        if (type === 'user.update') { mutationAccepted = true; return Response.json({ accepted: true }); }
       }
       throw new Error(`Unexpected ${path}`);
     });
     const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush();
-    page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!.value = 'Changed'; page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await new Promise(resolve => setTimeout(resolve, 3100));
+    vi.useFakeTimers();
+    page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!.value = 'Changed'; page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await vi.runAllTimersAsync();
     expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('did not confirm');
     expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
+    expect(verifyReads).toBe(15);
   });
 
   it('abandons a pending user verification after an organization change without issuing another mutation', async () => {
