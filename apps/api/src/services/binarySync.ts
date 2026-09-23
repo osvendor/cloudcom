@@ -1367,6 +1367,9 @@ export async function syncFromGitHub(
     throw new Error('Windows-only release tag did not match the configured version');
   }
   const trustedManifest = await fetchTrustedReleaseManifest(release.assets);
+  if (options.windowsOnly && !trustedManifest) {
+    throw new Error('Windows-only release requires a signed release artifact manifest and configured trust root');
+  }
   const fallbackChecksums = trustedManifest
     ? null
     : await parseChecksumsFallback(release.assets);
