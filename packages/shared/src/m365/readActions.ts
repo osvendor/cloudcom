@@ -15,6 +15,7 @@ export const M365_INTERACTIVE_READ_ACTION_IDS = [
   'm365.intune.device.list', 'm365.intune.device.get',
   'm365.group.list', 'm365.group.get', 'm365.group.members.list',
   'm365.org.get', 'm365.org.skus.list',
+  'm365.report.onedrive.usage.list',
   'm365.sites.list', 'm365.site.get',
 ] as const;
 
@@ -53,8 +54,8 @@ export const M365_SYNC_CONTINUATION_MAX_CHARS = 4096;
 /** Per-action projection allowlists. The executor projects every returned
  *  object through these; they are the only fields that ever leave it. */
 export const M365_READ_ACTION_FIELDS: Record<M365ReadActionId, readonly string[]> = {
-  'm365.user.list': ['id', 'userPrincipalName', 'displayName', 'mail', 'accountEnabled', 'jobTitle', 'department', 'createdDateTime'],
-  'm365.user.get': ['id', 'userPrincipalName', 'displayName', 'mail', 'accountEnabled', 'jobTitle', 'department', 'createdDateTime', 'assignedLicenses', 'usageLocation', 'onPremisesSyncEnabled'],
+  'm365.user.list': ['id', 'userPrincipalName', 'displayName', 'mail', 'accountEnabled', 'userType', 'assignedLicenses', 'jobTitle', 'department', 'createdDateTime'],
+  'm365.user.get': ['id', 'userPrincipalName', 'displayName', 'mail', 'accountEnabled', 'userType', 'jobTitle', 'department', 'createdDateTime', 'assignedLicenses', 'usageLocation', 'onPremisesSyncEnabled'],
   'm365.signins.list': ['id', 'createdDateTime', 'userPrincipalName', 'userId', 'appDisplayName', 'ipAddress', 'clientAppUsed', 'conditionalAccessStatus', 'isInteractive', 'status', 'location', 'deviceDetail'],
   'm365.intune.device.list': ['id', 'deviceName', 'operatingSystem', 'osVersion', 'complianceState', 'lastSyncDateTime', 'userPrincipalName', 'managedDeviceOwnerType', 'enrolledDateTime'],
   'm365.intune.device.get': ['id', 'deviceName', 'operatingSystem', 'osVersion', 'complianceState', 'lastSyncDateTime', 'userPrincipalName', 'managedDeviceOwnerType', 'enrolledDateTime', 'model', 'manufacturer', 'serialNumber', 'azureADDeviceId', 'jailBroken', 'managementAgent'],
@@ -63,6 +64,10 @@ export const M365_READ_ACTION_FIELDS: Record<M365ReadActionId, readonly string[]
   'm365.group.members.list': ['id', 'displayName', 'userPrincipalName', 'mail'],
   'm365.org.get': ['id', 'displayName', 'verifiedDomains', 'countryLetterCode', 'createdDateTime'],
   'm365.org.skus.list': ['id', 'skuId', 'skuPartNumber', 'consumedUnits', 'prepaidUnits', 'appliesTo', 'capabilityStatus'],
+  // The executor parses the fixed OneDrive usage CSV and emits only these
+  // scalar account facts; URLs, display names and the rest of the report stay
+  // inside the executor.
+  'm365.report.onedrive.usage.list': ['ownerPrincipalName', 'storageUsedBytes', 'storageAllocatedBytes', 'lastActivityDate'],
   'm365.sites.list': ['id', 'name', 'displayName', 'webUrl', 'createdDateTime', 'lastModifiedDateTime'],
   'm365.site.get': ['id', 'name', 'displayName', 'webUrl', 'createdDateTime', 'lastModifiedDateTime'],
 
@@ -168,6 +173,7 @@ const INTERACTIVE_BRANCHES = [
   }).strict(),
   z.object({ type: z.literal('m365.org.get') }).strict(),
   z.object({ type: z.literal('m365.org.skus.list') }).strict(),
+  z.object({ type: z.literal('m365.report.onedrive.usage.list') }).strict(),
   z.object({
     type: z.literal('m365.sites.list'),
     search: searchTermSchema,

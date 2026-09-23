@@ -28,6 +28,7 @@ describe('m365 read action contracts', () => {
       'm365.intune.device.list', 'm365.intune.device.get',
       'm365.group.list', 'm365.group.get', 'm365.group.members.list',
       'm365.org.get', 'm365.org.skus.list',
+      'm365.report.onedrive.usage.list',
       'm365.sites.list', 'm365.site.get',
     ]);
     for (const id of M365_READ_ACTION_IDS) {
@@ -48,6 +49,7 @@ describe('m365 read action contracts', () => {
       { type: 'm365.group.members.list', groupId: GUID, pageSize: 100 },
       { type: 'm365.org.get' },
       { type: 'm365.org.skus.list' },
+      { type: 'm365.report.onedrive.usage.list' },
       { type: 'm365.sites.list', search: 'intranet' },
       { type: 'm365.site.get', siteId: 'contoso.sharepoint.com,111,222' },
     ];
@@ -57,6 +59,15 @@ describe('m365 read action contracts', () => {
         correlationId: GUID, tenantId: GUID, action,
       }).success).toBe(true);
     }
+  });
+
+  it('requests only the directory fields needed to derive user type and license summaries', () => {
+    expect(M365_READ_ACTION_FIELDS['m365.user.list']).toEqual([
+      'id', 'userPrincipalName', 'displayName', 'mail', 'accountEnabled', 'userType', 'assignedLicenses',
+      'jobTitle', 'department', 'createdDateTime',
+    ]);
+    expect(M365_READ_ACTION_FIELDS['m365.user.get']).toContain('userType');
+    expect(M365_READ_ACTION_FIELDS['m365.user.list']).not.toContain('passwordProfile');
   });
 
   it('rejects out-of-bound and unknown inputs', () => {
@@ -182,7 +193,7 @@ describe('m365 sync action contracts', () => {
     }).success).toBe(true);
   });
 
-  it('keeps all twelve interactive branches, each still .strict()', () => {
+  it('keeps all thirteen interactive branches, each still .strict()', () => {
     // The interactive branches move wholesale from m365ReadActionSchema into
     // INTERACTIVE_BRANCHES. A branch dropped in that cut, or a `.strict()` lost
     // to a retype, is invisible to every other assertion here: the id arrays are
@@ -192,9 +203,9 @@ describe('m365 sync action contracts', () => {
       shape: { type: { value: string } };
     }[]).map((branch) => branch.shape.type.value);
 
-    expect(branchIds).toHaveLength(19);
+    expect(branchIds).toHaveLength(20);
     expect(branchIds.filter((id) => !isM365SyncActionId(id)))
-      .toEqual([...M365_INTERACTIVE_READ_ACTION_IDS]);   // all twelve, in order
+      .toEqual([...M365_INTERACTIVE_READ_ACTION_IDS]);   // all thirteen, in order
     expect(branchIds.filter((id) => isM365SyncActionId(id)))
       .toEqual([...M365_SYNC_ACTION_IDS]);
 
@@ -212,6 +223,7 @@ describe('m365 sync action contracts', () => {
       'm365.group.members.list': { groupId: GUID },
       'm365.org.get': {},
       'm365.org.skus.list': {},
+      'm365.report.onedrive.usage.list': {},
       'm365.sites.list': { search: 'intranet' },
       'm365.site.get': { siteId: 'contoso.sharepoint.com,111,222' },
     };

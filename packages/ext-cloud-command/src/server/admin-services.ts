@@ -4,6 +4,7 @@ import type { ExtensionRuntimeContext } from '@breeze/extension-sdk';
 import type { AdministrationRuntime } from './admin-runtime';
 import { createAdministrationStore } from './admin-store';
 import { createAdministrationExecutor, type AdministrationConnection } from './admin-execution';
+import { createExchangeMailboxInventoryService } from './exchange-services';
 import type { MicrosoftRequest, NativeMicrosoftServices } from './native-microsoft';
 import type { GuardedFetch } from './transport';
 
@@ -39,7 +40,13 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
       resourceId: request.orgId, details, result: 'success' });
   }
   const execute = createAdministrationExecutor<MicrosoftRequest>({
-    authorize: (request, orgId, operation) => runtime.authorize(request, orgId, operation === 'user.update' || operation.startsWith('group.member.')),
+    authorize: (request, orgId, operation) => runtime.authorize(request, orgId,
+      operation === 'user.create' || operation === 'user.license.assign' || operation === 'user.update' || operation === 'user.password.reset'
+      || operation === 'group.create' || operation === 'group.update'
+      || operation === 'user.sessions.revoke' || operation === 'user.globalAdmin.get'
+      || operation === 'user.globalAdmin.set'
+      || operation === 'user.mfa.methods.list' || operation === 'user.mfa.method.remove'
+      || operation.startsWith('group.member.')),
     loadConnection: async (_request, orgId) => {
       const row = await store.load(orgId);
       if (!row) return null;
@@ -52,6 +59,41 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
       result: event.outcome === 'rejected' || event.outcome === 'unknown' ? 'failure' : 'success',
       details: { executionId: event.executionId, targets: event.targets, changedFields: event.changedFields, outcome: event.outcome ?? 'pending' } }),
   });
+  const mailboxInventory = z.object({ type: z.literal('mailbox.inventory'), pageSize: z.number().int().min(1).max(200).optional() }).strict();
+  const forwardingGet = z.object({ type: z.literal('mailbox.forwarding.get'), mailboxId: uuid }).strict();
+  const forwardingSet = z.object({ type: z.literal('mailbox.forwarding.set'), mailboxId: uuid,
+    smtpAddress: z.string().email().max(320).nullable(), keepCopy: z.boolean() }).strict();
+  const autoReplyGet = z.object({ type: z.literal('mailbox.autoreply.get'), mailboxId: uuid }).strict();
+  const autoReplySet = z.object({ type: z.literal('mailbox.autoreply.set'), mailboxId: uuid, state: z.enum(['Disabled', 'Enabled', 'Scheduled']),
+    message: z.string().max(8192), start: z.string().datetime({ offset: true }).nullable(), end: z.string().datetime({ offset: true }).nullable() }).strict();
+  const addressesGet = z.object({ type: z.literal('mailbox.addresses.get'), mailboxId: uuid }).strict();
+  const primarySet = z.object({ type: z.literal('mailbox.primary.set'), mailboxId: uuid, address: z.string().email().max(320) }).strict();
+  const aliasAdd = z.object({ type: z.literal('mailbox.alias.add'), mailboxId: uuid, address: z.string().email().max(320) }).strict();
+  const aliasRemove = z.object({ type: z.literal('mailbox.alias.remove'), mailboxId: uuid, address: z.string().email().max(320) }).strict();
+  const delegationGet = z.object({ type: z.literal('mailbox.delegation.get'), mailboxId: uuid, delegateId: uuid }).strict();
+  const delegationSet = z.object({ type: z.literal('mailbox.delegation.set'), mailboxId: uuid, delegateId: uuid,
+    right: z.enum(['FullAccess', 'SendAs', 'SendOnBehalf']), enabled: z.boolean() }).strict();
+  const traceCursor = z.object({ received: z.string().datetime({ offset: true }), recipient: z.string().email().max(320) }).strict();
+  const traceSearch = z.object({ type: z.literal('trace.search'), start: z.string().datetime({ offset: true }), end: z.string().datetime({ offset: true }),
+    sender: z.string().email().max(320).nullable(), recipient: z.string().email().max(320).nullable(),
+    status: z.enum(['Delivered', 'Expanded', 'Failed', 'FilteredAsSpam', 'GettingStatus', 'Pending', 'Quarantined']).nullable(), cursor: traceCursor.nullable() }).strict();
+  const traceDetail = z.object({ type: z.literal('trace.detail'), messageTraceId: uuid, recipient: z.string().email().max(320) }).strict();
+  async function exchangeService() {
+    const bridge = await runtime.exchange?.();
+    if (!bridge) throw new AdministrationSetupError('exchange_unavailable');
+    return createExchangeMailboxInventoryService<MicrosoftRequest>({
+      authorize: async (request, organizationId, mutation) => runtime.authorize(request, organizationId, mutation === true),
+      loadConnection: async (_request, organizationId) => {
+        const row = await store.load(organizationId);
+        if (!row) return null;
+        const { tenantName: _tenantName, verifiedAt: _verifiedAt, ...value } = row;
+        return value;
+      },
+      registry: bridge.registry, worker: bridge.worker,
+      audit: event => runtime.audit({ orgId: event.organizationId, actorId: event.actorId, action: event.action,
+        resourceId: event.details.connectionId as string ?? event.organizationId, details: event.details, result: event.result }),
+    });
+  }
   async function probe(connection: Pick<AdministrationConnection, 'tenantId' | 'clientId' | 'credentialVersion'>) {
     const token = await runtime.acquireToken(connection);
     // Token is obtained only from the fixed Microsoft token endpoint using the bound certificate.
@@ -93,6 +135,8 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
       async status(request, recheck) {
         const connection = await services.connection(request);
         const row = await store.load(request.orgId);
+        let exchangeReady = false;
+        try { exchangeReady = !!await runtime.exchange?.(); } catch { /* capability remains pending */ }
         let verified = false;
         if (recheck && connection.enabled && row) {
           await authorize(request, true);
@@ -108,7 +152,7 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
           capabilities: [
             { id: 'inventory', label: 'Directory inventory', status: connection.enabled ? 'ready' : 'pending', message: verified ? 'Tenant and application permissions verified.' : undefined },
             { id: 'administration', label: 'User and group administration', status: connection.enabled ? 'ready' : 'pending' },
-            { id: 'exchange', label: 'Exchange administration', status: 'pending', message: 'Uses this same connection; service implementation is pending.' },
+            { id: 'exchange', label: 'Exchange administration', status: 'pending', message: exchangeReady ? 'Worker configured; mailbox inventory requires a successful provider check.' : 'Exchange worker is not configured in this host.' },
             { id: 'collaboration', label: 'Teams, SharePoint and OneDrive', status: 'pending', message: 'Uses this same connection; service implementation is pending.' },
             { id: 'content-search', label: 'Basic content search and export', status: 'pending', message: 'Search and export API support is still being validated.' },
           ] };
@@ -155,15 +199,52 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
         const tenantName = await probe({ tenantId: attempt.tenant_id, clientId: attempt.client_id, credentialVersion: attempt.credential_version });
         await audit(request, 'consent.verified', { tenantId: verified.tenantId, administratorObjectId: verified.administratorObjectId });
         if (!await store.save(attempt, tenantName)) throw new AdministrationSetupError('connection_changed');
+        // Exchange is provisioned from this one saved connection when its host sidecar exists.
+        // A worker configuration gap must not invalidate otherwise successful Graph Connect.
+        try {
+          const saved = await store.load(request.orgId);
+          if (saved) await (await exchangeService()).provision((({ tenantName: _name, verifiedAt: _verifiedAt, ...value }) => value)(saved));
+        } catch { /* inventory will retry provisioning only after its own authorization/fence */ }
         await store.finish(request.orgId, digest(data.state));
         return { success: true };
       },
-      async execute(request, input) { return execute(request, request.orgId, input); },
+      async execute(request, input) {
+        const exchange = mailboxInventory.safeParse(input);
+        if (exchange.success) return (await exchangeService()).inventory(request, request.orgId, { pageSize: exchange.data.pageSize });
+        const readForwarding = forwardingGet.safeParse(input);
+        if (readForwarding.success) return (await exchangeService()).forwardingGet(request, request.orgId, readForwarding.data.mailboxId);
+        const saveForwarding = forwardingSet.safeParse(input);
+        if (saveForwarding.success) return (await exchangeService()).forwardingSet(request, request.orgId, saveForwarding.data);
+        const readAutoReply = autoReplyGet.safeParse(input);
+        if (readAutoReply.success) return (await exchangeService()).autoReplyGet(request, request.orgId, readAutoReply.data.mailboxId);
+        const saveAutoReply = autoReplySet.safeParse(input);
+        if (saveAutoReply.success) return (await exchangeService()).autoReplySet(request, request.orgId, saveAutoReply.data);
+        const readAddresses = addressesGet.safeParse(input);
+        if (readAddresses.success) return (await exchangeService()).addressesGet(request, request.orgId, readAddresses.data.mailboxId);
+        for (const schema of [primarySet, aliasAdd, aliasRemove] as const) {
+          const parsed = schema.safeParse(input);
+          if (parsed.success) return (await exchangeService()).addressWrite(request, request.orgId, parsed.data.type, parsed.data);
+        }
+        const readDelegation = delegationGet.safeParse(input);
+        if (readDelegation.success) return (await exchangeService()).delegationGet(request, request.orgId, readDelegation.data.mailboxId, readDelegation.data.delegateId);
+        const saveDelegation = delegationSet.safeParse(input);
+        if (saveDelegation.success) return (await exchangeService()).delegationSet(request, request.orgId, saveDelegation.data);
+        const searchTrace = traceSearch.safeParse(input);
+        if (searchTrace.success) return (await exchangeService()).traceSearch(request, request.orgId, searchTrace.data);
+        const detailTrace = traceDetail.safeParse(input);
+        if (detailTrace.success) return (await exchangeService()).traceDetail(request, request.orgId, detailTrace.data);
+        if (typeof input === 'object' && input !== null && 'type' in input &&
+          typeof input.type === 'string' && (input.type.startsWith('mailbox.forwarding.') || input.type.startsWith('mailbox.autoreply.') ||
+            input.type.startsWith('mailbox.addresses.') || input.type.startsWith('mailbox.primary.') || input.type.startsWith('mailbox.alias.') || input.type.startsWith('mailbox.delegation.') || input.type.startsWith('trace.')))
+          throw new AdministrationSetupError('invalid_operation');
+        return execute(request, request.orgId, input);
+      },
       async disconnect(request, input) {
         await authorize(request, true);
         const data = z.object({ version: z.number().int().positive() }).strict().parse(input);
         await audit(request, 'disconnect');
         if (!await store.disable(request.orgId, data.version)) throw new AdministrationSetupError('connection_changed');
+        try { await (await exchangeService()).revoke(request.orgId); } catch { /* disabled generation fences all future dispatches */ }
         return { success: true };
       },
     },

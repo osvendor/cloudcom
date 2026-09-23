@@ -59,6 +59,13 @@ describe('native Microsoft extension routes', () => {
       error: 'Microsoft rejected the profile update. Refresh the user and review the current values before trying again.',
     });
   });
+  it('marks administration responses no-store because they may contain a one-time password', async () => {
+    const h = harness({ adminFailure: 'provider_rejected' });
+    const response = await h.app.request(path('administration'), {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'user.create', user: { displayName: 'QA', userPrincipalName: 'qa@example.test' } }),
+    });
+    expect(response.headers.get('cache-control')).toBe('no-store');
+  });
   it('uses the authenticated host context and canonical organization', async () => {
     const h = harness();
     expect(await (await h.app.request(path('connection'))).json()).toMatchObject({ tenantName: 'Native tenant' });
@@ -109,5 +116,26 @@ describe('native Microsoft extension routes', () => {
     expect(result.complete).toBe(true);
     expect(result.items[0]?.values).not.toHaveProperty('storageUsedInGigabytes');
     expect(result.items[0]?.values.name).toBeNull();
+  });
+  it('projects Cloud Command directory identity and the scalar Graph license join without generic profile columns', () => {
+    const result = projectMicrosoftResource('users', [{
+      id: ORG, displayName: 'Ada Lovelace', userPrincipalName: 'ada@example.test', accountEnabled: false,
+      userType: 'Member', licenseSummary: 'SPE_E3, POWER_BI_STANDARD', assignedLicenses: [{ skuId: 'never-expose' }],
+      department: 'Engineering', jobTitle: 'Analyst', officeLocation: 'London',
+    }], false);
+    expect(result.columns).toEqual([
+      { key: 'displayName', label: 'User' },
+      { key: 'userPrincipalName', label: 'Sign-in name' },
+      { key: 'userType', label: 'Type' },
+      { key: 'licenseSummary', label: 'License' },
+      { key: 'oneDrive', label: 'OneDrive' },
+      { key: 'accountEnabled', label: 'Account state' },
+    ]);
+    expect(result.items[0]?.values).toEqual({
+      displayName: 'Ada Lovelace', userPrincipalName: 'ada@example.test', userType: 'Member',
+      licenseSummary: 'SPE_E3, POWER_BI_STANDARD', oneDrive: null, accountEnabled: false,
+    });
+    expect(result.columns.map(column => column.label)).not.toContain('Enabled');
+    expect(JSON.stringify(result)).not.toMatch(/department|jobTitle|officeLocation|assignedLicenses|never-expose/i);
   });
 });

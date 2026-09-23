@@ -165,6 +165,61 @@ describe('nativeMicrosoftServices', () => {
     expect(executorMocks.call).toHaveBeenCalledWith(expect.objectContaining(SNAPSHOT), action, expect.objectContaining({ route: 'read', actorId: ACTOR_ID, correlationId: expect.any(String) }));
   });
 
+  it('joins assigned license ids to this tenant’s subscribed SKU names without disclosing Graph license objects', async () => {
+    dbMocks.selectResults.push([row()], [row()]);
+    executorMocks.call
+      .mockResolvedValueOnce({
+        ok: true, kind: 'collection', truncated: false,
+        items: [
+          { id: 'member', userPrincipalName: 'member@example.test', userType: 'Member', assignedLicenses: [{ skuId: 'sku-e3', disabledPlans: ['never-expose'] }] },
+          { id: 'guest', userType: 'Guest', assignedLicenses: [] },
+        ],
+      })
+      .mockResolvedValueOnce({
+        ok: true, kind: 'collection', truncated: false,
+        items: [{ skuId: 'sku-e3', skuPartNumber: 'SPE_E3', servicePlans: ['never-expose'] }],
+      })
+      .mockResolvedValueOnce({
+        ok: true, kind: 'collection', truncated: false,
+        items: [{ ownerPrincipalName: 'member@example.test', storageUsedBytes: 1073741824, storageAllocatedBytes: 5368709120, siteUrl: 'never-expose' }],
+      });
+
+    await expect(nativeMicrosoftServices.read(request(), 'users')).resolves.toEqual({
+      ok: true, truncated: false,
+      items: [
+        { id: 'member', userPrincipalName: 'member@example.test', userType: 'Member', licenseSummary: 'SPE_E3', oneDrive: '1.0 GB' },
+        { id: 'guest', userType: 'Guest', licenseSummary: 'Unlicensed', oneDrive: null },
+      ],
+    });
+    expect(executorMocks.call).toHaveBeenNthCalledWith(1, expect.objectContaining(SNAPSHOT), { type: 'm365.user.list', pageSize: 50 }, expect.objectContaining({ actorId: ACTOR_ID }));
+    expect(executorMocks.call).toHaveBeenNthCalledWith(2, expect.objectContaining(SNAPSHOT), { type: 'm365.org.skus.list' }, expect.objectContaining({ actorId: ACTOR_ID }));
+    expect(executorMocks.call).toHaveBeenNthCalledWith(3, expect.objectContaining(SNAPSHOT), { type: 'm365.report.onedrive.usage.list' }, expect.objectContaining({ actorId: ACTOR_ID }));
+  });
+
+  it('keeps the directory readable and exposes OneDrive as unavailable when reports permission or data is unavailable', async () => {
+    dbMocks.selectResults.push([row()], [row()]);
+    executorMocks.call
+      .mockResolvedValueOnce({ ok: true, kind: 'collection', items: [{ id: 'member', userPrincipalName: 'member@example.test', assignedLicenses: [] }], truncated: false })
+      .mockResolvedValueOnce({ ok: true, kind: 'collection', items: [], truncated: false })
+      .mockResolvedValueOnce({ ok: false, code: 'graph_permission_missing', message: 'not exposed' });
+
+    await expect(nativeMicrosoftServices.read(request(), 'users')).resolves.toEqual({
+      ok: true, truncated: false,
+      items: [{ id: 'member', userPrincipalName: 'member@example.test', licenseSummary: 'Unlicensed', oneDrive: null }],
+    });
+  });
+
+  it('keeps the directory usable but marks the license summary unknown when the SKU lookup is incomplete', async () => {
+    dbMocks.selectResults.push([row()], [row()]);
+    executorMocks.call
+      .mockResolvedValueOnce({ ok: true, kind: 'collection', items: [{ id: 'member', assignedLicenses: [{ skuId: 'sku-e3' }] }], truncated: false })
+      .mockResolvedValueOnce({ ok: false, code: 'graph_permission_missing', message: 'not exposed' });
+
+    await expect(nativeMicrosoftServices.read(request(), 'users')).resolves.toEqual({
+      ok: true, truncated: false, items: [{ id: 'member', licenseSummary: null, oneDrive: null }],
+    });
+  });
+
   it.each([
     ['tenant rebind', { tenantId: 'tenant-b' }],
     ['consent generation change', { consentGeneration: 4 }],
@@ -185,6 +240,6 @@ describe('nativeMicrosoftServices', () => {
   it('preserves the executor truncation flag', async () => {
     dbMocks.selectResults.push([row()], [row()]);
     executorMocks.call.mockResolvedValue({ ok: true, kind: 'collection', items: [{ id: 'item-1' }], truncated: true });
-    await expect(nativeMicrosoftServices.read(request(), 'users')).resolves.toEqual({ ok: true, items: [{ id: 'item-1' }], truncated: true });
+    await expect(nativeMicrosoftServices.read(request(), 'users')).resolves.toEqual({ ok: true, items: [{ id: 'item-1', licenseSummary: null, oneDrive: null }], truncated: true });
   });
 });

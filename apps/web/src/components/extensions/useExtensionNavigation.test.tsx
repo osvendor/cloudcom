@@ -182,6 +182,23 @@ describe('useExtensionNavigation', () => {
     ]));
   });
 
+  it('shows Google only for an active native connection in the selected organization', async () => {
+    useOrgScope.mockReturnValue({ status: 'resolved', scope: 'org', orgId: 'org-a' });
+    const ext = cloudCommand();
+    getExtensionRegistry.mockResolvedValue(registry([{ ...ext, pages: [
+      ...ext.pages, { id: 'google', path: '/google', element: 'cloudcommand-google-page' },
+    ] }]));
+    const request = vi.fn(async (path: string) => Response.json(path === '/google/connection'
+      ? { available: true, connected: true, enabled: true }
+      : { available: false, connected: false, enabled: false }));
+    createExtensionHostApi.mockReturnValue({ hostApi: { request }, revoke: vi.fn() });
+    const { result } = renderHook(() => useExtensionNavigation());
+    await waitFor(() => expect(result.current[0]).toMatchObject({ children: [
+      { name: 'Google Workspace', href: '/extensions/cloudcommand/google' },
+    ], loading: false }));
+    expect(request).toHaveBeenCalledWith('/google/connection');
+  });
+
   it('keeps an established provider when the other status request fails', async () => {
     useOrgScope.mockReturnValue({ status: 'resolved', scope: 'org', orgId: 'org-a' });
     getExtensionRegistry.mockResolvedValue(registry([cloudCommand()]));

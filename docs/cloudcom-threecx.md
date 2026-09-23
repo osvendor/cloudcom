@@ -22,6 +22,13 @@ and disabled connections do not issue extension reads. Whole-PBX access is an
 explicit choice; selecting a department filters the returned users. This does not
 establish a permission boundary for future call reports.
 
+The operational directory keeps the retained Cloud Command columns separate:
+User, Extension, Email, Registration, current-profile Status, and Account. Its
+search filters only rows already loaded from the organization-scoped connection;
+when another page exists, the page says to load more before treating the search
+as complete. Registration and profile are read-only provider observations, not
+synonyms for whether the extension account is enabled.
+
 The detail view has General, Call Forwarding, IP Phone, BLF, Voicemail, Schedule,
 3CX Talk, and View & Options tabs. The server returns a positive, redacted
 projection of the provider response; unsupported or unavailable values are shown as
@@ -146,6 +153,14 @@ forwarding update through `Users/Pbx.MultiUserUpdate` both succeeded and were
 restored afterward. The proof used no production or customer identifiers. It does
 not establish atomic stale-write protection, ETag support, or deployment readiness.
 The profile compatibility fix shipped in PR #22. Live detail loading and narrow save/restore checks passed on the authorized test extension.
+
+## Call Log candidate
+
+The extension has a read-only Call Log candidate for connections explicitly scoped to the full PBX. It uses a fixed 3CX report function, validates a range of no more than 31 days, reads at most the first 100 events, projects only approved call metadata, audits the scoped read, and labels CSV export as matching loaded results. It does not load call events until the operator searches. The operator can filter the loaded page by call metadata; filtering and CSV export never imply that the complete PBX history was searched. A department-scoped connection receives `report_scope_unverified` before decrypting a credential or calling the provider: the retained Cloud Command report query had no explicit department predicate, so provider role constraints alone must not be assumed to isolate customer call records. PBX server-driven continuation semantics are unverified; an apparent next page is labeled incomplete and never followed or converted into an invented `$skip` query. The focused Call Log web tests pass on the GIT VM, but there is no live PBX report proof or deployment claim. Any future department support requires a demonstrated provider-side boundary or verified row filter before the gate is relaxed.
+
+The candidate detail view now shows the retained Call Log's started time, source/destination numbers and names, result, answered state, durations, direction, and call ID. Its answered count explicitly covers only loaded events. This is display parity for returned rows, not proof of report coverage.
+
+Before enabling pagination, verify against an authorized disposable PBX report fixture that the fixed `GetCallLogData` function returns a stable order and that server continuation can be resolved without accepting an arbitrary credential-bearing URL. A same-origin URL check alone is insufficient: any accepted continuation must also stay under the exact report function path, preserve the authorized date range, reject unexpected query keys or fragments, and have a bounded page count and duplicate-record check. The retained source used `$skip`, while 3CX's public Configuration API documentation only identifies XAPI as OData; it does not prove this function's continuation order. Before enabling department reporting, prove the service principal's selected department and role actually constrain this report on a PBX containing at least two departments, including calls crossing them. If provider-side isolation cannot be shown, require a documented complete row-level department attribution before projecting any record; caller/callee number matching is not a sufficient tenant boundary. Keep both gates closed when any proof is missing.
 
 ## Extension menu design
 

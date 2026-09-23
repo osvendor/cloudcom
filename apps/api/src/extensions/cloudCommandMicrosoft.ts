@@ -14,6 +14,8 @@ const actions: Record<MicrosoftResource, M365ReadAction> = {
   licenses: { type: 'm365.org.skus.list' },
   sites: { type: 'm365.sites.list', search: '*' },
 };
+const skuAction = actions.licenses;
+const oneDriveUsageAction: M365ReadAction = { type: 'm365.report.onedrive.usage.list' };
 const denied = { ok: false as const, code: 'access_denied', message: 'Microsoft access is not permitted for this organization.' };
 const notReady = { ok: false as const, code: 'connection_not_ready', message: 'Configure or retest this organization’s Microsoft connection in Extensions > Connect.' };
 
@@ -38,6 +40,56 @@ async function load(auth: AuthContext, orgId: string) {
       eq(m365Connections.orgId, orgId), eq(m365Connections.profile, 'customer-graph-read'),
     )).limit(1);
     return row;
+  });
+}
+
+function assignedSkuIds(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const ids = value.map(license => {
+    if (typeof license === 'string') return license;
+    if (license && typeof license === 'object' && typeof (license as { skuId?: unknown }).skuId === 'string') {
+      return (license as { skuId: string }).skuId;
+    }
+    return null;
+  });
+  return ids.every((id): id is string => !!id) ? ids : null;
+}
+
+/**
+ * The native directory exposes a scalar, display-safe license value. It never
+ * forwards Graph's assigned-license objects (including disabled service plans).
+ * A missing or incomplete SKU lookup is unknown rather than an invented name.
+ */
+function usageLabel(used: unknown): string | null {
+  if (!Number.isSafeInteger(used) || used < 0) return null;
+  const format = (bytes: number) => bytes < 1024 ? `${bytes} B` : bytes < 1024 ** 2 ? `${(bytes / 1024).toFixed(1)} KB`
+    : bytes < 1024 ** 3 ? `${(bytes / 1024 ** 2).toFixed(1)} MB` : `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  return format(used);
+}
+function enrichDirectoryUsers(users: Record<string, unknown>[], skus: Record<string, unknown>[] | null, oneDriveUsage: Record<string, unknown>[] | null) {
+  const skuNames = new Map<string, string>();
+  for (const sku of skus ?? []) {
+    if (typeof sku.skuId === 'string' && typeof sku.skuPartNumber === 'string' && sku.skuPartNumber.trim()) {
+      skuNames.set(sku.skuId, sku.skuPartNumber.trim());
+    }
+  }
+  const usageByUpn = new Map<string, string>();
+  for (const usage of oneDriveUsage ?? []) {
+    if (typeof usage.ownerPrincipalName !== 'string') continue;
+    const label = usageLabel(usage.storageUsedBytes);
+    if (label) usageByUpn.set(usage.ownerPrincipalName.toLowerCase(), label);
+  }
+  return users.map(user => {
+    const ids = assignedSkuIds(user.assignedLicenses);
+    const names = ids?.map(id => skuNames.get(id));
+    const licenseSummary = ids === null || skus === null || names?.some((name): name is undefined => name === undefined)
+      ? null
+      : ids.length === 0 ? 'Unlicensed'
+        : [...new Set(names)].join(', ');
+    const { assignedLicenses: _assignedLicenses, ...safeUser } = user;
+    const oneDriveLabel = oneDriveUsage === null || typeof user.userPrincipalName !== 'string'
+      ? null : usageByUpn.get(user.userPrincipalName.toLowerCase()) ?? null;
+    return { ...safeUser, licenseSummary, oneDrive: oneDriveLabel };
   });
 }
 
@@ -75,6 +127,17 @@ export const nativeMicrosoftServices: NativeMicrosoftServices = {
         route: 'read', correlationId: randomUUID(), actorId: auth.user.id,
       });
       if (!result.ok) return result;
+      let items = result.kind === 'collection' ? result.items : null;
+      if (resource === 'users' && result.kind === 'collection') {
+        const skuResult = await callGraphReadExecutor(snapshot, skuAction, {
+          route: 'read', correlationId: randomUUID(), actorId: auth.user.id,
+        });
+        const oneDriveResult = await callGraphReadExecutor(snapshot, oneDriveUsageAction, {
+          route: 'read', correlationId: randomUUID(), actorId: auth.user.id,
+        });
+        items = enrichDirectoryUsers(result.items, skuResult.ok && skuResult.kind === 'collection' ? skuResult.items : null,
+          oneDriveResult.ok && oneDriveResult.kind === 'collection' ? oneDriveResult.items : null);
+      }
       // Consent/rebind/revocation during an in-flight read must discard the old tenant's response.
       const after = await load(auth, input.orgId);
       const current = connectionExecutionSnapshot(after);
@@ -84,8 +147,8 @@ export const nativeMicrosoftServices: NativeMicrosoftServices = {
         || current.credentialVersion !== snapshot.credentialVersion || current.vaultRef !== snapshot.vaultRef
         || before?.clientId !== after?.clientId || !enabled(input.orgId))
         return { ok: false, code: 'connection_changed', message: 'The Microsoft connection changed. Refresh and try again.' };
-      if (result.kind !== 'collection') return { ok: false, code: 'invalid_provider_response', message: 'Microsoft returned an unexpected resource response.' };
-      return { ok: true, items: result.items, truncated: result.truncated };
+      if (result.kind !== 'collection' || !items) return { ok: false, code: 'invalid_provider_response', message: 'Microsoft returned an unexpected resource response.' };
+      return { ok: true, items, truncated: result.truncated };
     });
   },
 };

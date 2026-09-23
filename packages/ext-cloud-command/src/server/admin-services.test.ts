@@ -13,10 +13,11 @@ function setup() {
   store.load.mockResolvedValue(null); store.advance.mockResolvedValue(true); store.save.mockResolvedValue(true);
   const runtime = {
     configuration: vi.fn(async () => ({ clientId: client, credentialVersion: 'cert-1', redirectUri: 'https://app.example.com/extensions/cloudcommand/connect' })),
-    authorize: vi.fn(async () => ({ actorId: actor } as { actorId: string } | null)),
+    authorize: vi.fn(async (_request: MicrosoftRequest, _orgId: string, _mutation: boolean) => ({ actorId: actor } as { actorId: string } | null)),
     audit: vi.fn(async () => {}),
     acquireToken: vi.fn(async () => `header.${Buffer.from(JSON.stringify({ roles: ['Organization.Read.All', 'User.ReadWrite.All', 'Group.ReadWrite.All', 'User.EnableDisableAccount.All'] })).toString('base64url')}.signature`),
     verifyAuthorization: vi.fn(async () => ({ tenantId: tenant, administratorObjectId: actor })),
+    exchange: vi.fn(async (): Promise<any> => null),
   };
   const context = { secrets: { encryptForColumn: vi.fn(() => 'enc:v3:opaque'), decryptForColumn: vi.fn(() => 'verifier') } } as unknown as ExtensionRuntimeContext;
   const fetch = vi.fn(async () => Response.json({ value: [{ id: tenant, displayName: 'Fixture tenant' }] }));
@@ -26,6 +27,23 @@ function setup() {
 function attempt() { return { org_id: org, actor_id: actor, tenant_id: tenant, client_id: client, credential_version: 'cert-1',
   expected_generation: null, nonce: 'nonce', verifier_ciphertext: 'enc:v3:opaque', state_hash: 'hashed', stage: 'processing' }; }
 describe('unified administration onboarding', () => {
+  it.each(['user.create', 'user.license.assign', 'user.update', 'user.password.reset', 'user.sessions.revoke', 'user.globalAdmin.get', 'user.globalAdmin.set',
+    'user.mfa.methods.list', 'user.mfa.method.remove', 'group.member.add'])(
+    'requires manager authorization for %s before credential access', async type => {
+      const h = setup();
+      h.runtime.authorize.mockImplementation(async (_request, _orgId, mutation) => mutation ? null : { actorId: actor });
+      const input = type === 'user.create' ? { type, user: { displayName: 'New User', userPrincipalName: 'new@example.test' } }
+        : type === 'user.license.assign' ? { type, id: actor, license: { skuId: actor } }
+        : type === 'user.update' ? { type, id: actor, update: { displayName: 'Changed' } }
+        : type === 'user.globalAdmin.set' ? { type, id: actor, enabled: true, confirmation: 'GLOBAL_ADMIN' }
+        : type === 'user.mfa.methods.list' || type === 'user.globalAdmin.get' ? { type, id: actor }
+        : type === 'user.mfa.method.remove' ? { type, id: actor, kind: 'phone', methodId: actor, confirmation: 'REMOVE_AUTH_METHOD' }
+        : type === 'group.member.add' ? { type, groupId: actor, userId: actor } : { type, id: actor };
+      await expect(h.admin.execute(request, input)).rejects.toMatchObject({ code: 'access_denied' });
+      expect(h.runtime.authorize).toHaveBeenCalledWith(request, org, true);
+      expect(h.runtime.acquireToken).not.toHaveBeenCalled();
+      expect(h.fetch).not.toHaveBeenCalled();
+    });
   it('starts one tenant-bound consent using encrypted PKCE state and server configuration', async () => {
     const h = setup();
     const result = await h.admin.start(request, { tenantId: tenant, version: null }) as { authorizationUrl: string };
@@ -88,5 +106,20 @@ describe('unified administration onboarding', () => {
     h.runtime.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['Organization.Read.All', 'User.ReadWrite.All', 'Group.ReadWrite.All', 'User.EnableDisableAccount.All'] })).toString('base64url')}.s`);
     await expect(h.admin.complete(request, { state: 'a'.repeat(43), code: 'code' })).resolves.toEqual({ success: true });
     expect(store.save).toHaveBeenCalledOnce();
+  });
+  it('attaches fixed mailbox inventory to the existing connection and revokes the descriptor on disconnect', async () => {
+    const h = setup();
+    const row = { id: client, orgId: org, tenantId: tenant, clientId: client, credentialVersion: 'cert-1', permissionManifestVersion: 'business-standard-v1', enabled: true, generation: 3, tenantName: 'Fixture', verifiedAt: null };
+    store.load.mockResolvedValue(row);
+    const registry = { provision: vi.fn(async () => {}), revoke: vi.fn(async () => {}) };
+    const worker = { dispatch: vi.fn(async value => ({ requestId: value.requestId, ok: true, data: { records: [], partial: false, collectedAt: '2026-09-22T00:00:00.000Z' } })) };
+    h.runtime.exchange = vi.fn(async () => ({ registry, worker }));
+    await expect(h.admin.execute(request, { type: 'mailbox.inventory', pageSize: 10 })).resolves.toMatchObject({ records: [] });
+    expect(registry.provision).toHaveBeenCalledWith(expect.objectContaining({ organizationId: org, tenantId: tenant, connectionGeneration: 3 }));
+    expect(worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'mailbox.inventory', parameters: { pageSize: 10 } }));
+    expect(h.fetch).not.toHaveBeenCalled();
+    store.disable.mockResolvedValue(true);
+    await expect(h.admin.disconnect(request, { version: 3 })).resolves.toEqual({ success: true });
+    expect(registry.revoke).toHaveBeenCalledWith(org);
   });
 });

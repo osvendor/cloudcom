@@ -18,14 +18,34 @@ const privateKeyPem = readFileSync(new URL('client-key.pem', fixture), 'utf8');
 const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const descriptor = JSON.stringify({ clientId, credentialVersion: 'cert-1', certificatePath, privateKeyPath, redirectUri: 'https://breeze.example.test/extensions/cloudcommand/connect' });
 
-function runtime(overrides: { config?: string; fetch?: typeof fetch; auditWrite?: (event: never) => Promise<void> } = {}) {
+function runtime(overrides: { config?: string; fetch?: typeof fetch; auditWrite?: (event: never) => Promise<void>; exchange?: boolean } = {}) {
+  const exchangePath = path.resolve(tmpdir(), 'cloudcom-exchange-descriptors.json');
+  const files = new Map<string, string>();
   const readFile = vi.fn(async (file: string) => {
     if (file === configPath) return overrides.config ?? descriptor;
     if (file === certificatePath) return certificatePem;
     if (file === privateKeyPath) return privateKeyPem;
+    if (file === exchangePath && files.has(file)) return files.get(file)!;
+    if (file === exchangePath) throw Object.assign(new Error('missing descriptor'), { code: 'ENOENT' });
     throw new Error('unexpected protected file');
   });
-  return { readFile, runtime: createCloudCommandAdminRuntime({ env: { CLOUDCOM_MICROSOFT_ADMIN_CONFIG_FILE: configPath }, readFile, fetch: overrides.fetch, verificationKey: publicKey, auditWrite: overrides.auditWrite as never }) };
+  const writeFile = vi.fn(async (file: string, value: string) => { files.set(file, value); });
+  const rename = vi.fn(async (from: string, to: string) => { files.set(to, files.get(from)!); files.delete(from); });
+  const chmod = vi.fn(async () => {});
+  let requestedTenant = tenantId;
+  const exchangeFetch = vi.fn(async (url: string) => {
+    if (url.startsWith('https://login.microsoftonline.com/')) {
+      requestedTenant = url.split('/')[3]!;
+      return Response.json({ access_token: 'tenant-bound-test-token', token_type: 'Bearer', expires_in: 3600 });
+    }
+    if (url.startsWith('https://graph.microsoft.com/v1.0/organization?')) return Response.json({ value: [{
+      id: requestedTenant,
+      verifiedDomains: [{ name: 'fixture.onmicrosoft.com', isInitial: true }, { name: 'fixture.example', isInitial: false }],
+    }] });
+    throw new Error('unexpected network target');
+  });
+  const env = { CLOUDCOM_MICROSOFT_ADMIN_CONFIG_FILE: configPath, ...(overrides.exchange ? { CLOUDCOM_EXCHANGE_DESCRIPTOR_FILE: exchangePath, CLOUDCOM_EXCHANGE_SOCKET_PATH: '/run/cloudcom/exchange.sock' } : {}) };
+  return { readFile, writeFile, rename, chmod, files, exchangePath, exchangeFetch, runtime: createCloudCommandAdminRuntime({ env, readFile, writeFile: writeFile as never, rename: rename as never, chmod: chmod as never, fetch: overrides.fetch ?? exchangeFetch, verificationKey: publicKey, auditWrite: overrides.auditWrite as never }) };
 }
 
 async function identity(overrides: Record<string, unknown> = {}) {
@@ -40,6 +60,54 @@ describe('Cloud Command Microsoft administration runtime', () => {
     const { runtime: subject, readFile } = runtime();
     await expect(subject.configuration()).resolves.toEqual({ clientId, credentialVersion: 'cert-1', redirectUri: 'https://breeze.example.test/extensions/cloudcommand/connect' });
     expect(readFile).toHaveBeenCalledWith(configPath, 'utf8');
+  });
+  it('creates and revokes local Exchange descriptors from the same protected application credential', async () => {
+    const h = runtime({ exchange: true });
+    const exchange = await h.runtime.exchange();
+    expect(exchange).not.toBeNull();
+    await exchange!.registry.provision({ organizationId: administratorObjectId, tenantId, clientId, credentialVersion: 'cert-1', connectionGeneration: 3 });
+    const persisted = JSON.parse(h.files.get(h.exchangePath)!);
+    expect(persisted.tenants[tenantId]).toMatchObject({ organizationId: administratorObjectId, tenantId, clientId, credentialVersion: 'cert-1', connectionGeneration: 3, enabled: true, exchangeOrganization: 'fixture.onmicrosoft.com' });
+    expect(JSON.stringify(persisted)).not.toContain(privateKeyPem);
+    await exchange!.registry.revoke(administratorObjectId);
+    expect(JSON.parse(h.files.get(h.exchangePath)!).tenants).toEqual({});
+    expect(h.chmod).toHaveBeenCalledWith(h.exchangePath, 0o600);
+  });
+
+  it('removes an old tenant descriptor when an organization reconnects to a new tenant', async () => {
+    const h = runtime({ exchange: true });
+    const exchange = (await h.runtime.exchange())!;
+    await exchange.registry.provision({ organizationId: administratorObjectId, tenantId, clientId, credentialVersion: 'cert-1', connectionGeneration: 3 });
+    const replacementTenant = '55555555-5555-4555-8555-555555555555';
+    await exchange.registry.provision({ organizationId: administratorObjectId, tenantId: replacementTenant, clientId, credentialVersion: 'cert-1', connectionGeneration: 4 });
+    expect(Object.keys(JSON.parse(h.files.get(h.exchangePath)!).tenants)).toEqual([replacementTenant]);
+  });
+
+  it('fails closed if an existing Exchange descriptor cannot be parsed', async () => {
+    const h = runtime({ exchange: true });
+    h.files.set(h.exchangePath, '{invalid');
+    const exchange = (await h.runtime.exchange())!;
+    await expect(exchange.registry.provision({ organizationId: administratorObjectId, tenantId, clientId, credentialVersion: 'cert-1', connectionGeneration: 3 })).rejects.toThrow('microsoft_administration_unavailable');
+    expect(h.writeFile).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { id: tenantId, verifiedDomains: [{ name: 'example.test', isInitial: true }] },
+    { id: clientId, verifiedDomains: [{ name: 'fixture.onmicrosoft.com', isInitial: true }] },
+    { id: tenantId, verifiedDomains: [{ name: 'fixture.onmicrosoft.com', isInitial: false }] },
+    { id: tenantId, verifiedDomains: [
+      { name: 'fixture.onmicrosoft.com', isInitial: true },
+      { name: 'other.onmicrosoft.com', isInitial: true },
+    ] },
+  ])('refuses Exchange provisioning when Graph does not return the bound initial domain and tenant: %j', async organization => {
+    const fetch = vi.fn(async (url: string) => url.startsWith('https://login.microsoftonline.com/')
+      ? Response.json({ access_token: 'tenant-bound-test-token', token_type: 'Bearer', expires_in: 3600 })
+      : Response.json({ value: [organization] }));
+    const h = runtime({ exchange: true, fetch: fetch as never });
+    const exchange = (await h.runtime.exchange())!;
+    await expect(exchange.registry.provision({ organizationId: administratorObjectId, tenantId, clientId, credentialVersion: 'cert-1', connectionGeneration: 3 }))
+      .rejects.toThrow('microsoft_administration_unavailable');
+    expect(h.writeFile).not.toHaveBeenCalled();
   });
 
   it.each([

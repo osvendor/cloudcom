@@ -1,9 +1,9 @@
 import { dispatchExtensionHostEvent, parseExtensionPageContextV1, type ExtensionPageContextV1 } from '@breeze/extension-web-sdk';
 
-type Provider = 'threecx' | 'microsoft';
+type Provider = 'threecx' | 'microsoft' | 'google';
 type Status = { connected: boolean; enabled?: boolean; canManage?: boolean; available?: boolean };
 type HostApi = { request(path: string): Promise<Response> };
-const providers = [{ id: 'threecx', title: '3CX', description: 'PBX connection and extension directory.' }, { id: 'microsoft', title: 'Microsoft 365', description: 'Users, groups, licenses and SharePoint inventory.' }] as const;
+const providers = [{ id: 'threecx', title: '3CX', description: 'PBX connection and extension directory.' }, { id: 'microsoft', title: 'Microsoft 365', description: 'Users, groups, licenses and SharePoint inventory.' }, { id: 'google', title: 'Google Workspace', description: 'Users and groups from the connected Workspace directory.' }] as const;
 
 export class CloudCommandOverviewPage extends HTMLElement {
   private root = this.attachShadow({ mode: 'open' });
@@ -56,7 +56,7 @@ export class CloudCommandOverviewPage extends HTMLElement {
   private render() {
     const visible = providers.filter(provider => {
       const state = this.states[provider.id];
-      return state && (provider.id !== 'microsoft' || state.available === true) && ((state.connected === true && state.enabled === true) || state.canManage === true);
+      return state && (provider.id === 'threecx' || state.available === true) && ((state.connected === true && state.enabled === true) || state.canManage === true);
     });
     this.root.innerHTML = `<style>${styles}</style><main><header><div><h1>Cloud Command</h1><p>Services for the selected organization.</p></div><button id="refresh" ${this.loading ? 'disabled' : ''}>Refresh</button></header><p role="status">${this.loading ? 'Loading services…' : this.failed ? 'Some service statuses could not be loaded. Refresh to try again.' : ''}</p><section aria-label="Organization services" class="providers">${visible.map(provider => {
       const enabled = this.states[provider.id]!.connected && this.states[provider.id]!.enabled === true;
