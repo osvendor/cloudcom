@@ -212,6 +212,8 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: agent/go.mod
+      - name: Install native packet capture headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpcap-dev
       - working-directory: agent
         run: go test -race ./...
 
