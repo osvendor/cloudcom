@@ -32,6 +32,61 @@ afterEach(() => {
 });
 
 describe('CloudCommandMicrosoftPage', () => {
+  it('loads one internal/external reply and sends a scheduled save only for the selected mailbox', async () => {
+    const id = '66666666-6666-4666-8666-666666666666';
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id, values: { displayName: 'Ada' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration') {
+        const body = JSON.parse(String(init?.body));
+        if (body.type === 'user.get') return Response.json({ id, displayName: 'Ada' });
+        if (body.type === 'user.globalAdmin.get') return Response.json({ enabled: false });
+        if (body.type === 'mailbox.autoreply.get') return Response.json({ mailboxId: id, state: 'Disabled', internalMessage: '', externalMessage: '', externalAudience: 'All', start: null, end: null });
+        if (body.type === 'mailbox.autoreply.set') return Response.json({ mailboxId: id, state: body.state, internalMessage: body.message, externalMessage: body.message, externalAudience: 'All', start: body.start, end: body.end, accepted: true, verified: true });
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush(); openUser(page, id); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#autoreply-open')!.click(); await flush();
+    const root = page.shadowRoot!;
+    const state = root.querySelector<HTMLSelectElement>('#autoreply-state')!;
+    state.value = 'Scheduled'; state.dispatchEvent(new Event('change', { bubbles: true }));
+    for (const [selector, value] of [['#autoreply-start', '2026-09-24T10:00'], ['#autoreply-end', '2026-09-25T10:00'], ['#autoreply-message', 'Away']] as const) {
+      const input = root.querySelector<HTMLInputElement | HTMLTextAreaElement>(selector)!;
+      input.value = value; input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    root.querySelector<HTMLButtonElement>('#autoreply-save')!.click(); await flush();
+    const write = request.mock.calls.find(([path, init]) => path === '/microsoft/administration' && String(init?.body).includes('mailbox.autoreply.set'));
+    const body = JSON.parse(String(write?.[1]?.body));
+    expect(body).toMatchObject({ type: 'mailbox.autoreply.set', mailboxId: id, state: 'Scheduled', message: 'Away' });
+    expect(Date.parse(body.end)).toBeGreaterThan(Date.parse(body.start));
+    expect(root.querySelector<HTMLButtonElement>('#autoreply-save')?.disabled).toBe(true);
+  });
+  it('loads and saves forwarding for the selected mailbox, then requires a refresh', async () => {
+    const id = '66666666-6666-4666-8666-666666666666';
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id, values: { displayName: 'Ada', userPrincipalName: 'ada@example.com' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration') {
+        const body = JSON.parse(String(init?.body));
+        if (body.type === 'user.get') return Response.json({ id, displayName: 'Ada', userPrincipalName: 'ada@example.com' });
+        if (body.type === 'user.globalAdmin.get') return Response.json({ enabled: false });
+        if (body.type === 'mailbox.forwarding.get') return Response.json({ mailboxId: id, smtpAddress: null, keepCopy: true, internalRecipient: null });
+        if (body.type === 'mailbox.forwarding.set') return Response.json({ mailboxId: id, smtpAddress: body.smtpAddress, keepCopy: body.keepCopy, internalRecipient: null, accepted: true, verified: true });
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush();
+    openUser(page, id); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#forwarding-open')!.click(); await flush();
+    const input = page.shadowRoot!.querySelector<HTMLInputElement>('#forwarding-address')!;
+    input.value = 'new@example.com'; input.dispatchEvent(new Event('input', { bubbles: true }));
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#forwarding-save')!.click(); await flush();
+    const write = request.mock.calls.find(([path, init]) => path === '/microsoft/administration' && String(init?.body).includes('mailbox.forwarding.set'));
+    expect(JSON.parse(String(write?.[1]?.body))).toEqual({ type: 'mailbox.forwarding.set', mailboxId: id, smtpAddress: 'new@example.com', keepCopy: true });
+    expect(page.shadowRoot!.querySelector<HTMLButtonElement>('#forwarding-save')?.disabled).toBe(true);
+    expect(page.shadowRoot!.textContent).toContain('saved and verified');
+  });
   it('creates a Microsoft 365 group with a selected owner and shows the assigned address', async () => {
     const request = vi.fn(async (path: string, init?: RequestInit) => {
       if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });

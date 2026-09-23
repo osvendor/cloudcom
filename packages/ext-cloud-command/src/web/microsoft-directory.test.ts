@@ -76,18 +76,18 @@ describe('Microsoft directory interaction', () => {
     expect(root.querySelectorAll<HTMLTableCellElement>('tbody tr:first-child td')[1]?.textContent).toBe('Guest');
   });
 
-  it('shows the retained directory scopes and never presents unavailable workers as actions', async () => {
+  it('shows the retained directory scopes and marks unavailable mailbox actions', async () => {
     const { root } = await mount();
     expect(root.textContent).toContain('All');
     expect(root.textContent).toContain('Shared mailboxes');
     expect(root.textContent).toContain('Groups');
     expect(root.textContent).toContain('Exclude');
     root.querySelector<HTMLButtonElement>('[data-expand="u1"]')!.click();
-    expect(root.textContent).toContain('Mailbox delegation, forwarding, and out-of-office require an Exchange worker.');
+    expect(root.textContent).toContain('Mailbox delegation is not available yet.');
     expect(root.querySelector('#user-password-reset-start')).toBeNull();
     expect(root.querySelector('[data-row-security="reset-password"]')).toBeTruthy();
     expect(root.textContent).not.toContain('Delegate mailbox');
-    expect(root.textContent).not.toContain('Manage forwarding');
+    expect(root.textContent).toContain('Manage forwarding');
   });
 
   it('loads verified domains and creates an account without claiming assignments were applied', async () => {
@@ -234,7 +234,7 @@ describe('Microsoft directory interaction', () => {
     root.querySelector<HTMLButtonElement>('[data-expand="u1"]')!.click();
     root.querySelector<HTMLButtonElement>('[data-detail="u1"]')!.click(); await flush();
     const close = root.querySelector<HTMLButtonElement>('#detail-close')!;
-    const save = root.querySelector<HTMLButtonElement>('#user-sessions-revoke-start')!;
+    const save = root.querySelector<HTMLButtonElement>('#autoreply-open')!;
     save.focus(); save.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
     expect(root.activeElement).toBe(close);
     close.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true }));

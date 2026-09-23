@@ -60,11 +60,17 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
       details: { executionId: event.executionId, targets: event.targets, changedFields: event.changedFields, outcome: event.outcome ?? 'pending' } }),
   });
   const mailboxInventory = z.object({ type: z.literal('mailbox.inventory'), pageSize: z.number().int().min(1).max(200).optional() }).strict();
+  const forwardingGet = z.object({ type: z.literal('mailbox.forwarding.get'), mailboxId: uuid }).strict();
+  const forwardingSet = z.object({ type: z.literal('mailbox.forwarding.set'), mailboxId: uuid,
+    smtpAddress: z.string().email().max(320).nullable(), keepCopy: z.boolean() }).strict();
+  const autoReplyGet = z.object({ type: z.literal('mailbox.autoreply.get'), mailboxId: uuid }).strict();
+  const autoReplySet = z.object({ type: z.literal('mailbox.autoreply.set'), mailboxId: uuid, state: z.enum(['Disabled', 'Enabled', 'Scheduled']),
+    message: z.string().max(8192), start: z.string().datetime({ offset: true }).nullable(), end: z.string().datetime({ offset: true }).nullable() }).strict();
   async function exchangeService() {
     const bridge = await runtime.exchange?.();
     if (!bridge) throw new AdministrationSetupError('exchange_unavailable');
     return createExchangeMailboxInventoryService<MicrosoftRequest>({
-      authorize: async (request, organizationId) => runtime.authorize(request, organizationId, false),
+      authorize: async (request, organizationId, mutation) => runtime.authorize(request, organizationId, mutation === true),
       loadConnection: async (_request, organizationId) => {
         const row = await store.load(organizationId);
         if (!row) return null;
@@ -193,6 +199,17 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
       async execute(request, input) {
         const exchange = mailboxInventory.safeParse(input);
         if (exchange.success) return (await exchangeService()).inventory(request, request.orgId, { pageSize: exchange.data.pageSize });
+        const readForwarding = forwardingGet.safeParse(input);
+        if (readForwarding.success) return (await exchangeService()).forwardingGet(request, request.orgId, readForwarding.data.mailboxId);
+        const saveForwarding = forwardingSet.safeParse(input);
+        if (saveForwarding.success) return (await exchangeService()).forwardingSet(request, request.orgId, saveForwarding.data);
+        const readAutoReply = autoReplyGet.safeParse(input);
+        if (readAutoReply.success) return (await exchangeService()).autoReplyGet(request, request.orgId, readAutoReply.data.mailboxId);
+        const saveAutoReply = autoReplySet.safeParse(input);
+        if (saveAutoReply.success) return (await exchangeService()).autoReplySet(request, request.orgId, saveAutoReply.data);
+        if (typeof input === 'object' && input !== null && 'type' in input &&
+          typeof input.type === 'string' && (input.type.startsWith('mailbox.forwarding.') || input.type.startsWith('mailbox.autoreply.')))
+          throw new AdministrationSetupError('invalid_operation');
         return execute(request, request.orgId, input);
       },
       async disconnect(request, input) {

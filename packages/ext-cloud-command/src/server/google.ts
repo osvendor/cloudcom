@@ -9,7 +9,8 @@ export function mountGoogleRoutes(app: Hono<{ Variables: Variables }>, services?
   app.use('/google/*', async (c, next) => {
     const keys = [...new URL(c.req.url).searchParams.keys()];
     const pagedDirectory = c.req.method === 'GET' && (c.req.path.startsWith('/google/directory/') || /^\/google\/groups\/[^/]+\/members$/.test(c.req.path));
-    if (keys.filter(key => key === 'orgId').length !== 1 || keys.some(key => key !== 'orgId' && !(pagedDirectory && key === 'pageToken')))
+    const storageReport = c.req.method === 'GET' && c.req.path === '/google/reports/storage';
+    if (keys.filter(key => key === 'orgId').length !== 1 || keys.some(key => key !== 'orgId' && !(pagedDirectory && key === 'pageToken') && !(storageReport && (key === 'date' || key === 'pageToken'))))
       return c.json({ code: 'invalid_request', error: 'Invalid organization request.' }, 400);
     await next();
   });
@@ -38,6 +39,32 @@ export function mountGoogleRoutes(app: Hono<{ Variables: Variables }>, services?
     const result = await services.members(request(c), groupId, tokens[0] ?? null);
     if (!result.ok) return c.json({ code: result.code, error: result.message }, result.code === 'access_denied' ? 403 : result.code === 'connection_not_ready' ? 409 : 502);
     return c.json({ items: result.items, nextPageToken: result.nextPageToken, complete: !result.nextPageToken });
+  });
+  app.get('/google/users/:userId/mailbox-settings', async c => {
+    if (!services || services.version !== 1) return c.json({ code: 'native_service_unavailable', error: 'Google Workspace is unavailable.' }, 503);
+    if (!c.get('canManage')) return c.json({ code: 'access_denied', error: 'Organization manager access and MFA are required.' }, 403);
+    const userId = c.req.param('userId');
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(userId)) return c.json({ code: 'invalid_user', error: 'Invalid user.' }, 400);
+    const result = await services.mailboxSettings(request(c), userId);
+    if (!result.ok) return c.json({ code: result.code, error: result.message }, result.code === 'access_denied' ? 403 : result.code === 'connection_not_ready' || result.code === 'state_changed' ? 409 : 502);
+    c.header('Cache-Control', 'no-store');
+    return c.json(result);
+  });
+  app.get('/google/reports/storage', async c => {
+    if (!services || services.version !== 1) return c.json({ code: 'native_service_unavailable', error: 'Google Workspace is unavailable.' }, 503);
+    const params = new URL(c.req.url).searchParams;
+    const dates = params.getAll('date');
+    const tokens = params.getAll('pageToken');
+    const date = dates[0];
+    const time = date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? Date.parse(`${date}T00:00:00Z`) : NaN;
+    if (dates.length !== 1 || !date || !Number.isFinite(time) || new Date(time).toISOString().slice(0, 10) !== date
+      || time > Date.now() || Date.now() - time > 180 * 86400000
+      || tokens.length > 1 || (tokens[0] && (tokens[0].length > 2048 || !/^[A-Za-z0-9_\-./+=]+$/.test(tokens[0]))))
+      return c.json({ code: 'invalid_report', error: 'Choose a valid report date within 180 days.' }, 400);
+    const result = await services.storage(request(c), date, tokens[0] ?? null);
+    if (!result.ok) return c.json({ code: result.code, error: result.message }, result.code === 'access_denied' ? 403 : result.code === 'connection_not_ready' || result.code === 'scope_required' ? 409 : 502);
+    c.header('Cache-Control', 'no-store');
+    return c.json({ ...result, complete: !result.nextPageToken && !result.partial });
   });
   app.post('/google/users/suspension', async c => {
     if (!services || services.version !== 1) return c.json({ code: 'native_service_unavailable', error: 'Google Workspace is unavailable.' }, 503);

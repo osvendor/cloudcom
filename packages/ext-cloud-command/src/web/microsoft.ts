@@ -30,6 +30,9 @@ type LicenseOption = { skuId: string; skuPartNumber: string; capabilityStatus: s
 type HealthIssue = { id: string; title?: string | null; impactDescription?: string | null; status?: string | null; lastModifiedDateTime?: string | null };
 type HealthService = { id: string; service: string; status: string; issues?: HealthIssue[] };
 type HealthData = { services: HealthService[]; partial: boolean; checkedAt: string };
+type ForwardingState = { mailboxId: string; smtpAddress: string | null; keepCopy: boolean; internalRecipient: string | null };
+type AutoReplyState = { mailboxId: string; state: 'Disabled' | 'Enabled' | 'Scheduled'; internalMessage: string; externalMessage: string;
+  externalAudience: 'None' | 'Known' | 'All'; start: string | null; end: string | null };
 const healthyStatuses = new Set(['serviceOperational', 'serviceRestored', 'postIncidentReviewPublished', 'resolved', 'resolvedExternal', 'falsePositive']);
 function healthTone(status: string): 'green' | 'yellow' | 'red' | 'unknown' {
   return healthyStatuses.has(status) ? 'green' : status === 'serviceInterruption' ? 'red' : !status || status === 'unknownFutureValue' ? 'unknown' : 'yellow';
@@ -95,6 +98,23 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private createGroupBusy = false;
   private createdGroup: { id: string; mail: string | null; verified: boolean } | null = null;
   private groupNameDraft = '';
+  private forwardingOpen = false;
+  private forwarding: ForwardingState | null = null;
+  private forwardingAddress = '';
+  private forwardingKeepCopy = true;
+  private forwardingLoading = false;
+  private forwardingError = '';
+  private forwardingMessage = '';
+  private forwardingNeedsRefresh = false;
+  private forwardingRequest = 0;
+  private autoReplyOpen = false;
+  private autoReply: AutoReplyState | null = null;
+  private autoReplyDraft = { state: 'Disabled' as AutoReplyState['state'], message: '', start: '', end: '' };
+  private autoReplyLoading = false;
+  private autoReplyError = '';
+  private autoReplyMessage = '';
+  private autoReplyNeedsRefresh = false;
+  private autoReplyRequest = 0;
   private detailKind: DetailKind = 'read';
   private detailRecord: MicrosoftRecord | null = null;
   private detailRequest = 0;
@@ -172,6 +192,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.temporaryPassword = null;
     this.createdUser = null;
     this.createGroupOpen = false; this.createdGroup = null;
+    this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
+    this.resetAutoReply();
     this.healthRequest += 1;
     this.userSecurityAction = null;
   }
@@ -186,6 +208,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       this.createUserOpen = false;
       this.createdUser = null; this.createUserBusy = false;
       this.createGroupOpen = false; this.createdGroup = null;
+      this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
+      this.resetAutoReply();
       this.detailRecord = null;
       this.detailRequest += 1;
       this.userVerificationRequest += 1;
@@ -222,6 +246,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.createUserOpen = false;
     this.createdUser = null; this.createUserBusy = false;
     this.createGroupOpen = false; this.createdGroup = null; this.createGroupUsers = null; this.createGroupBusy = false;
+    this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
+    this.resetAutoReply();
     this.detailRecord = null;
     this.expandedRowId = null;
     this.visibleColumns = [];
@@ -240,6 +266,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.membershipAction = 'add';
     this.membershipConfirmed = false;
     this.groupNameDraft = '';
+    this.forwardingRequest += 1; this.forwardingError = ''; this.forwardingMessage = ''; this.forwardingNeedsRefresh = false;
     this.userDraft = {};
     this.filter = '';
     this.directoryScope = 'users'; this.directoryExclusions.clear(); this.directoryExclusionsReady = false; this.directoryExclusionError = ''; this.directoryPreferenceRequest += 1;
@@ -399,6 +426,9 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.detail = row;
     this.detailKind = this.resource === 'users' ? 'user' : this.resource === 'groups' ? 'group' : 'read';
     this.detailRecord = null;
+    this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
+    this.resetAutoReply();
+    this.forwardingError = ''; this.forwardingMessage = ''; this.forwardingNeedsRefresh = false;
     this.userVerificationRequest += 1;
     this.userSecurityRequest += 1;
     this.globalAdminRequest += 1;
@@ -571,6 +601,9 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const id = this.returnFocus;
     this.detail = null;
     this.detailRecord = null;
+    this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
+    this.resetAutoReply();
+    this.forwardingError = ''; this.forwardingMessage = ''; this.forwardingNeedsRefresh = false;
     this.detailRequest += 1;
     this.userVerificationRequest += 1;
     this.userSecurityRequest += 1;
@@ -925,6 +958,161 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     } finally { if (generation === this.generation && context === this.contextValue) { this.busy = false; this.render(); } }
   }
 
+  private resetAutoReply(): void {
+    this.autoReplyRequest += 1; this.autoReplyOpen = false; this.autoReply = null;
+    this.autoReplyLoading = false; this.autoReplyError = ''; this.autoReplyMessage = ''; this.autoReplyNeedsRefresh = false;
+  }
+  private openAutoReply(): void {
+    if (this.detailKind !== 'user' || !this.detail || !this.canRead()) return;
+    this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
+    this.autoReplyOpen = true; this.autoReply = null; this.autoReplyError = ''; this.autoReplyMessage = ''; this.autoReplyNeedsRefresh = false;
+    this.render(); void this.loadAutoReply();
+  }
+  private replyLocalTime(value: string | null): string {
+    if (!value) return '';
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? '' : new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  }
+  private async loadAutoReply(): Promise<void> {
+    const mailboxId = this.detail?.id;
+    if (!this.autoReplyOpen || !mailboxId) return;
+    const generation = this.generation; const context = this.contextValue; const request = ++this.autoReplyRequest;
+    this.autoReplyLoading = true; this.autoReply = null; this.autoReplyError = ''; this.autoReplyMessage = ''; this.render();
+    try {
+      const data = await this.request<AutoReplyState>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'mailbox.autoreply.get', mailboxId }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || request !== this.autoReplyRequest || this.detail?.id !== mailboxId) return;
+      if (data.mailboxId !== mailboxId) throw new Error('Mailbox identity did not match the selected user.');
+      this.autoReply = data;
+      this.autoReplyDraft = { state: data.state, message: data.internalMessage,
+        start: this.replyLocalTime(data.start), end: this.replyLocalTime(data.end) };
+      this.autoReplyNeedsRefresh = false;
+    } catch (error) {
+      if (generation !== this.generation || context !== this.contextValue || request !== this.autoReplyRequest || this.detail?.id !== mailboxId) return;
+      this.autoReplyError = error instanceof Error ? error.message : 'Could not load automatic replies.';
+    } finally {
+      if (generation === this.generation && context === this.contextValue && request === this.autoReplyRequest && this.detail?.id === mailboxId) {
+        this.autoReplyLoading = false; this.render();
+      }
+    }
+  }
+  private async saveAutoReply(): Promise<void> {
+    const mailboxId = this.detail?.id;
+    if (!this.connection?.canManage || !this.autoReplyOpen || !this.autoReply || !mailboxId || this.autoReplyLoading || this.autoReplyNeedsRefresh) return;
+    const { state, message, start: localStart, end: localEnd } = this.autoReplyDraft;
+    let start: string | null = null; let end: string | null = null;
+    if (state === 'Scheduled') {
+      if (!localStart || !localEnd || Number.isNaN(Date.parse(localStart)) || Number.isNaN(Date.parse(localEnd)) || Date.parse(localEnd) <= Date.parse(localStart)) {
+        this.autoReplyError = 'Choose valid start and end times; end must be after start.'; this.render(); return;
+      }
+      start = new Date(localStart).toISOString(); end = new Date(localEnd).toISOString();
+    }
+    const generation = this.generation; const context = this.contextValue; const request = ++this.autoReplyRequest;
+    this.autoReplyLoading = true; this.autoReplyError = ''; this.autoReplyMessage = ''; this.render();
+    try {
+      const data = await this.request<AutoReplyState & { accepted: true; verified: boolean }>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'mailbox.autoreply.set', mailboxId, state, message, start, end }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || request !== this.autoReplyRequest || this.detail?.id !== mailboxId) return;
+      this.autoReplyNeedsRefresh = true;
+      this.autoReplyMessage = data.verified ? 'Automatic reply saved and verified. Refresh to make another change.' : 'Microsoft accepted the reply, but readback did not confirm it. Refresh before another change.';
+    } catch (error) {
+      if (generation !== this.generation || context !== this.contextValue || request !== this.autoReplyRequest || this.detail?.id !== mailboxId) return;
+      this.autoReplyNeedsRefresh = true;
+      this.autoReplyError = `${error instanceof Error ? error.message : 'Automatic reply outcome is uncertain.'} Refresh current replies before trying again.`;
+    } finally {
+      if (generation === this.generation && context === this.contextValue && request === this.autoReplyRequest && this.detail?.id === mailboxId) {
+        this.autoReplyLoading = false; this.render();
+      }
+    }
+  }
+  private renderAutoReply(canManage: boolean): string {
+    if (!this.autoReplyOpen) return '<button class="secondary compact" id="autoreply-open">Out of office</button>';
+    const state = this.autoReply; const busy = this.autoReplyLoading;
+    const disabled = busy || !canManage || this.autoReplyNeedsRefresh;
+    const feedback = this.autoReplyError ? `<p class="status" data-error="true" role="alert">${esc(this.autoReplyError)}</p>` : this.autoReplyMessage ? `<p class="status" role="status">${esc(this.autoReplyMessage)}</p>` : '';
+    const controls = state ? `<label>Status<select id="autoreply-state" ${disabled ? 'disabled' : ''}><option value="Disabled" ${this.autoReplyDraft.state === 'Disabled' ? 'selected' : ''}>Disabled</option><option value="Enabled" ${this.autoReplyDraft.state === 'Enabled' ? 'selected' : ''}>Enabled</option><option value="Scheduled" ${this.autoReplyDraft.state === 'Scheduled' ? 'selected' : ''}>Scheduled</option></select></label>${this.autoReplyDraft.state === 'Scheduled' ? `<label>Start (your time)<input id="autoreply-start" type="datetime-local" value="${esc(this.autoReplyDraft.start)}" ${disabled ? 'disabled' : ''}></label><label>End (your time)<input id="autoreply-end" type="datetime-local" value="${esc(this.autoReplyDraft.end)}" ${disabled ? 'disabled' : ''}></label>` : ''}<label>Reply<textarea id="autoreply-message" maxlength="8192" ${disabled ? 'disabled' : ''}>${esc(this.autoReplyDraft.message)}</textarea></label><p class="meta">One reply is sent internally and externally. Enabled stays on without dates.</p>${state.internalMessage !== state.externalMessage ? '<p class="meta">The current external reply differs. Saving will replace it with this one reply.</p>' : ''}${canManage ? `<button class="secondary compact" id="autoreply-save" ${disabled ? 'disabled' : ''}>Save reply</button>` : ''}` : '';
+    return `<div class="autoreply-panel"><div class="actions"><button class="secondary compact" id="autoreply-refresh" ${busy ? 'disabled' : ''}>Refresh</button><button class="secondary compact" id="autoreply-close">Close</button></div>${busy ? '<p class="meta">Loading automatic replies…</p>' : controls}${feedback}</div>`;
+  }
+  private openForwarding(): void {
+    if (this.detailKind !== 'user' || !this.detail || !this.canRead()) return;
+    this.resetAutoReply();
+    this.forwardingOpen = true;
+    this.forwarding = null;
+    this.forwardingError = '';
+    this.forwardingMessage = '';
+    this.forwardingNeedsRefresh = false;
+    this.render();
+    void this.loadForwarding();
+  }
+  private async loadForwarding(): Promise<void> {
+    const mailboxId = this.detail?.id;
+    if (!this.forwardingOpen || !mailboxId) return;
+    const generation = this.generation; const context = this.contextValue;
+    const request = ++this.forwardingRequest;
+    this.forwardingLoading = true; this.forwarding = null;
+    this.forwardingError = ''; this.forwardingMessage = '';
+    this.render();
+    try {
+      const data = await this.request<ForwardingState>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'mailbox.forwarding.get', mailboxId }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || request !== this.forwardingRequest || this.detail?.id !== mailboxId) return;
+      if (data.mailboxId !== mailboxId) throw new Error('Mailbox identity did not match the selected user.');
+      this.forwarding = data;
+      this.forwardingAddress = data.smtpAddress ?? '';
+      this.forwardingKeepCopy = data.keepCopy;
+      this.forwardingNeedsRefresh = false;
+    } catch (error) {
+      if (generation !== this.generation || context !== this.contextValue || request !== this.forwardingRequest || this.detail?.id !== mailboxId) return;
+      this.forwardingError = error instanceof Error ? error.message : 'Could not load forwarding.';
+    } finally {
+      if (generation === this.generation && context === this.contextValue && request === this.forwardingRequest && this.detail?.id === mailboxId) {
+        this.forwardingLoading = false; this.render();
+      }
+    }
+  }
+  private async saveForwarding(turnOff = false): Promise<void> {
+    const mailboxId = this.detail?.id;
+    if (!this.connection?.canManage || !this.forwardingOpen || !this.forwarding || !mailboxId ||
+      this.forwardingLoading || this.forwardingNeedsRefresh || this.forwarding.internalRecipient) return;
+    const smtpAddress = turnOff ? null : this.forwardingAddress.trim();
+    if (smtpAddress !== null && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(smtpAddress)) {
+      this.forwardingError = 'Enter a valid forwarding email address.'; this.render(); return;
+    }
+    const generation = this.generation; const context = this.contextValue;
+    const request = ++this.forwardingRequest;
+    this.forwardingLoading = true; this.forwardingError = ''; this.forwardingMessage = '';
+    this.render();
+    try {
+      const data = await this.request<ForwardingState & { accepted: true; verified: boolean }>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'mailbox.forwarding.set', mailboxId, smtpAddress, keepCopy: this.forwardingKeepCopy }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || request !== this.forwardingRequest || this.detail?.id !== mailboxId) return;
+      this.forwardingNeedsRefresh = true;
+      this.forwardingMessage = data.verified ? 'Forwarding saved and verified. Refresh to make another change.' : 'Microsoft accepted the change, but readback is pending. Refresh before another change.';
+    } catch (error) {
+      if (generation !== this.generation || context !== this.contextValue || request !== this.forwardingRequest || this.detail?.id !== mailboxId) return;
+      this.forwardingNeedsRefresh = true;
+      this.forwardingError = `${error instanceof Error ? error.message : 'Forwarding outcome is uncertain.'} Refresh current forwarding before trying again.`;
+    } finally {
+      if (generation === this.generation && context === this.contextValue && request === this.forwardingRequest && this.detail?.id === mailboxId) {
+        this.forwardingLoading = false; this.render();
+      }
+    }
+  }
+  private renderForwarding(canManage: boolean): string {
+    if (!this.forwardingOpen) return '<button class="secondary compact" id="forwarding-open">Manage forwarding</button>';
+    const state = this.forwarding;
+    const busy = this.forwardingLoading;
+    const feedback = this.forwardingError ? `<p class="status" data-error="true" role="alert">${esc(this.forwardingError)}</p>` : this.forwardingMessage ? `<p class="status" role="status">${esc(this.forwardingMessage)}</p>` : '';
+    const controls = state ? `<p class="meta">Current forwarding: ${state.internalRecipient ? `internal recipient ${esc(state.internalRecipient)}` : state.smtpAddress ? esc(state.smtpAddress) : 'Off'}</p>${state.internalRecipient ? '<p class="meta">An internal forwarding recipient is configured. Change it in Exchange administration before editing SMTP forwarding here.</p>' : `<label>Forward to<input id="forwarding-address" type="email" maxlength="320" value="${esc(this.forwardingAddress)}" placeholder="person@example.com" ${busy || !canManage || this.forwardingNeedsRefresh ? 'disabled' : ''}></label><label class="check"><input id="forwarding-keep-copy" type="checkbox" ${this.forwardingKeepCopy ? 'checked' : ''} ${busy || !canManage || this.forwardingNeedsRefresh ? 'disabled' : ''}> Keep a copy in this mailbox</label>${canManage ? `<div class="actions"><button class="secondary compact" id="forwarding-save" ${busy || this.forwardingNeedsRefresh ? 'disabled' : ''}>Save forwarding</button><button class="secondary compact" id="forwarding-off" ${busy || this.forwardingNeedsRefresh || !state.smtpAddress ? 'disabled' : ''}>Turn off</button></div>` : ''}`}` : '';
+    return `<div class="forwarding-panel"><div class="actions"><button class="secondary compact" id="forwarding-refresh" ${busy ? 'disabled' : ''}>Refresh</button><button class="secondary compact" id="forwarding-close">Close</button></div>${busy ? '<p class="meta">Loading forwarding…</p>' : controls}${feedback}<p class="meta">External forwarding may be blocked by tenant policy.</p></div>`;
+  }
   private renderDrawer(canManage: boolean): string {
     const detail = this.detail!;
     const record = this.detailRecord;
@@ -948,7 +1136,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       const securityConfirmation = this.userSecurityAction ? `<div class="security-confirmation" role="group" aria-label="Confirm security action"><p>${this.userSecurityAction === 'reset-password' ? 'Microsoft will set a new temporary password and require the user to change it at next sign-in.' : this.userSecurityAction === 'revoke-sessions' ? 'Microsoft will invalidate refresh tokens and browser session cookies. Users may need to sign in again; revocation can take a few minutes.' : this.userSecurityAction === 'block-sign-in' ? 'Microsoft will block this account from signing in.' : 'Microsoft will allow this account to sign in again.'}</p><label class="check"><input id="user-security-confirm" type="checkbox" ${this.userSecurityConfirmed ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> I confirm this security action</label><div class="actions"><button class="secondary" id="user-security-cancel" ${this.busy ? 'disabled' : ''}>Cancel</button><button id="user-security-submit" ${this.busy ? 'disabled' : ''}>${this.userSecurityAction === 'reset-password' ? 'Reset password' : this.userSecurityAction === 'revoke-sessions' ? 'Sign out all sessions' : this.userSecurityAction === 'block-sign-in' ? 'Block sign-in' : 'Restore sign-in'}</button></div></div>` : '';
       const passwordDisplay = this.temporaryPassword ? `<div class="one-time-secret" role="status"><strong>Temporary password</strong><code id="temporary-password">${esc(this.temporaryPassword)}</code><p>It is shown only in this drawer. Copy it now; closing the drawer clears it.</p><button class="secondary compact" id="copy-temporary-password">Copy password</button><button class="secondary compact" id="hide-temporary-password">Hide password</button></div>` : '';
       const globalAdmin = this.globalAdminLoading ? '<p class="meta" data-testid="global-admin-status">Loading Global Administrator status…</p>' : this.globalAdminStatus === null ? `<p class="meta" data-testid="global-admin-status">Global Administrator status unavailable${this.globalAdminError ? `: ${esc(this.globalAdminError)}` : ''}</p>` : canManage ? `<div class="role-field"><label class="check"><input id="global-admin-enabled" type="checkbox" ${this.globalAdminDraft ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> Global Administrator</label>${this.globalAdminDraft !== this.globalAdminStatus ? `<label>Type GLOBAL_ADMIN to confirm<input id="global-admin-confirmation" value="${esc(this.globalAdminConfirmation)}" autocomplete="off" ${this.busy ? 'disabled' : ''}></label><button class="secondary compact" id="global-admin-save" ${this.busy ? 'disabled' : ''}>Save role</button>` : ''}</div>` : `<p class="meta" data-testid="global-admin-status">Global Administrator: ${this.globalAdminStatus ? 'Enabled' : 'Not assigned'}</p>`;
-      content = `<div class="drawer-body"><section class="drawer-section"><h3>Account</h3><div class="field-grid">${field('displayName', 'Name')}</div><div class="role-field">${globalAdmin}</div></section>${canManage ? `<section class="drawer-section"><h3>Security</h3><div class="actions"><button class="secondary" id="user-password-reset-start" ${this.busy ? 'disabled' : ''}>Reset password</button><button class="secondary" id="user-sessions-revoke-start" ${this.busy ? 'disabled' : ''}>Sign out of all sessions</button></div>${securityConfirmation}${passwordDisplay}</section>` : ''}</div><footer class="drawer-footer">${canManage ? '' : '<p class="read-only">An organization administrator can edit this user.</p>'}${feedback}</footer>`;
+      content = `<div class="drawer-body"><section class="drawer-section"><h3>Account</h3><div class="field-grid">${field('displayName', 'Name')}</div><div class="role-field">${globalAdmin}</div></section>${canManage ? `<section class="drawer-section"><h3>Security</h3><div class="actions"><button class="secondary" id="user-password-reset-start" ${this.busy ? 'disabled' : ''}>Reset password</button><button class="secondary" id="user-sessions-revoke-start" ${this.busy ? 'disabled' : ''}>Sign out of all sessions</button></div>${securityConfirmation}${passwordDisplay}</section>` : ''}<section class="drawer-section"><h3>Mailbox</h3>${this.renderForwarding(canManage)}${this.renderAutoReply(canManage)}<p class="meta">Mailbox delegation is not available yet.</p></section></div><footer class="drawer-footer">${canManage ? '' : '<p class="read-only">An organization administrator can edit this user.</p>'}${feedback}</footer>`;
       }
     } else {
       const query = this.membershipSearch.trim().toLowerCase();
@@ -1000,7 +1188,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       const action = this.resource === 'users' ? `<button class="secondary compact" data-testid="row-${esc(row.id)}" data-expand="${esc(row.id)}" aria-expanded="${expanded}">${canManage ? 'Account' : 'View account'} <span aria-hidden="true">${expanded ? '⌃' : '⌄'}</span></button>` : `<button class="secondary compact" data-testid="row-${esc(row.id)}" data-detail="${esc(row.id)}">${this.resource === 'groups' ? 'Manage members' : 'View details'}</button>`;
       const signInAction: UserSecurityAction = row.values.accountEnabled === false ? 'restore-sign-in' : 'block-sign-in';
       const excluded = this.directoryExclusions.get(row.id) === true;
-      const expandedRow = this.resource === 'users' && expanded ? `<tr class="row-actions"><td colspan="${columns.length + 1}"><div class="actionline"><span>Account</span><button class="secondary compact" data-detail="${esc(row.id)}">${canManage ? 'Edit account' : 'View account'}</button><button class="secondary compact" data-directory-exclude="${esc(row.id)}" data-excluded="${!excluded}" ${!canManage ? 'disabled' : ''}>${excluded ? 'Include user' : 'Exclude user'}</button><small>Add-to-group and delete workflows are unavailable.</small></div><div class="actionline"><span>Security</span><button class="secondary compact" data-row-security="reset-password" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>Reset password</button><button class="secondary compact" data-row-security="${signInAction}" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>${signInAction === 'block-sign-in' ? 'Block sign-in' : 'Restore sign-in'}</button><button class="secondary compact" data-row-security="revoke-sessions" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>Sign out of all sessions</button><button class="secondary compact" data-mfa="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>MFA</button></div><div class="actionline"><span>Mailbox</span><small>Mailbox delegation, forwarding, and out-of-office require an Exchange worker.</small></div></td></tr>` : '';
+      const expandedRow = this.resource === 'users' && expanded ? `<tr class="row-actions"><td colspan="${columns.length + 1}"><div class="actionline"><span>Account</span><button class="secondary compact" data-detail="${esc(row.id)}">${canManage ? 'Edit account' : 'View account'}</button><button class="secondary compact" data-directory-exclude="${esc(row.id)}" data-excluded="${!excluded}" ${!canManage ? 'disabled' : ''}>${excluded ? 'Include user' : 'Exclude user'}</button><small>Add-to-group and delete workflows are unavailable.</small></div><div class="actionline"><span>Security</span><button class="secondary compact" data-row-security="reset-password" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>Reset password</button><button class="secondary compact" data-row-security="${signInAction}" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>${signInAction === 'block-sign-in' ? 'Block sign-in' : 'Restore sign-in'}</button><button class="secondary compact" data-row-security="revoke-sessions" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>Sign out of all sessions</button><button class="secondary compact" data-mfa="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>MFA</button></div><div class="actionline"><span>Mailbox</span><button class="secondary compact" data-row-forwarding="${esc(row.id)}">Manage forwarding</button><button class="secondary compact" data-row-autoreply="${esc(row.id)}">Out of office</button><small>Mailbox delegation is not available yet.</small></div></td></tr>` : '';
       return `<tr class="${this.detail?.id === row.id || expanded ? 'selected-row' : ''}">${cells}<td class="row-control">${action}</td></tr>${expandedRow}`;
     }).join('');
     const exclusionUnavailable = this.resource === 'users' && this.directoryScope === 'exclude' && !!this.directoryExclusionError;
@@ -1086,6 +1274,33 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (row) void this.setDirectoryExcluded(row, button.dataset.excluded === 'true');
     }));
     this.root.querySelector('#detail-close')?.addEventListener('click', () => this.closeDetail());
+    this.root.querySelectorAll<HTMLButtonElement>('[data-row-forwarding]').forEach(button => button.addEventListener('click', () => {
+      const row = this.data?.items.find(item => item.id === button.dataset.rowForwarding);
+      if (row) { this.openDetail(row); this.openForwarding(); }
+    }));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-row-autoreply]').forEach(button => button.addEventListener('click', () => {
+      const row = this.data?.items.find(item => item.id === button.dataset.rowAutoreply);
+      if (row) { this.openDetail(row); this.openAutoReply(); }
+    }));
+    this.root.querySelector('#autoreply-open')?.addEventListener('click', () => this.openAutoReply());
+    this.root.querySelector('#autoreply-close')?.addEventListener('click', () => { this.resetAutoReply(); this.render(); });
+    this.root.querySelector('#autoreply-refresh')?.addEventListener('click', () => void this.loadAutoReply());
+    this.root.querySelector<HTMLSelectElement>('#autoreply-state')?.addEventListener('change', event => {
+      this.autoReplyDraft.state = (event.target as HTMLSelectElement).value as AutoReplyState['state']; this.render();
+    });
+    for (const [selector, field] of [['#autoreply-start', 'start'], ['#autoreply-end', 'end'], ['#autoreply-message', 'message']] as const) {
+      this.root.querySelector<HTMLInputElement | HTMLTextAreaElement>(selector)?.addEventListener('input', event => {
+        this.autoReplyDraft[field] = (event.target as HTMLInputElement | HTMLTextAreaElement).value;
+      });
+    }
+    this.root.querySelector('#autoreply-save')?.addEventListener('click', () => void this.saveAutoReply());
+    this.root.querySelector('#forwarding-open')?.addEventListener('click', () => this.openForwarding());
+    this.root.querySelector('#forwarding-close')?.addEventListener('click', () => { this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null; this.render(); });
+    this.root.querySelector('#forwarding-refresh')?.addEventListener('click', () => void this.loadForwarding());
+    this.root.querySelector<HTMLInputElement>('#forwarding-address')?.addEventListener('input', event => { this.forwardingAddress = (event.target as HTMLInputElement).value; });
+    this.root.querySelector<HTMLInputElement>('#forwarding-keep-copy')?.addEventListener('change', event => { this.forwardingKeepCopy = (event.target as HTMLInputElement).checked; });
+    this.root.querySelector('#forwarding-save')?.addEventListener('click', () => void this.saveForwarding());
+    this.root.querySelector('#forwarding-off')?.addEventListener('click', () => void this.saveForwarding(true));
     this.root.querySelectorAll<HTMLButtonElement>('[data-user-save]').forEach(button => button.addEventListener('click', () => {
       const field = button.dataset.userSave as (typeof USER_FIELDS)[number] | 'accountEnabled';
       void this.saveUserField(field);

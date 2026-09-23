@@ -2,7 +2,7 @@ import net, { type Socket } from 'node:net';
 import path from 'node:path';
 import type { ExchangeWorkerPort, ExchangeWorkerRequest } from './exchange-contract';
 
-const MAX_REQUEST_BYTES = 16 * 1024;
+const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 45_000;
 type SocketLike = Pick<Socket, 'write' | 'end' | 'destroy' | 'once' | 'on'>;

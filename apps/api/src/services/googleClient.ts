@@ -10,7 +10,9 @@
  *
  * The DWD grant in the customer's Admin console (Security > API controls >
  * Domain-wide delegation) must authorize this service account's client id for
- * exactly the scopes in DIRECTORY_SCOPES + GMAIL_USER_SCOPES.
+ * the scopes in ALL_DWD_SCOPES_CSV. Existing DWD grants may need updating
+ * when a new scope is introduced; a saved connection is not proof that every
+ * optional API is authorized.
  *
  * The service-account key JSON arrives DECRYPTED (caller decrypts via
  * secretCrypto). It is a domain god-key: never log it, never echo it back.
@@ -45,13 +47,26 @@ export const LICENSING_SCOPES = [
   'https://www.googleapis.com/auth/apps.licensing', // assign / list / remove Workspace license assignments
 ] as const;
 
+export const REPORTS_SCOPES = [
+  'https://www.googleapis.com/auth/admin.reports.usage.readonly',
+] as const;
+
 /** Comma-separated scope list for the operator's DWD setup instructions. */
 export const ALL_DWD_SCOPES_CSV = [
   ...DIRECTORY_SCOPES,
   ...GMAIL_USER_SCOPES,
   ...CALENDAR_SCOPES,
   ...LICENSING_SCOPES,
+  ...REPORTS_SCOPES,
 ].join(',');
+
+/** Admin Reports usage client; the DWD grant must include REPORTS_SCOPES. */
+export function getUsageReportsClient(decryptedKeyJson: string, adminEmail: string) {
+  const key = parseServiceAccountKey(decryptedKeyJson);
+  const auth = new adminAuth.JWT({ email: key.client_email, key: key.private_key,
+    scopes: [...REPORTS_SCOPES], subject: adminEmail });
+  return admin({ version: 'reports_v1', auth });
+}
 
 interface ServiceAccountKey {
   client_email: string;

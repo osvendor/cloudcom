@@ -12,6 +12,10 @@ function harness(opts: { access?: boolean; sites?: string[]; read?: boolean; wri
     connection: vi.fn(async () => ({ available: true, connected: true, enabled: true, canManage: true, customerDomain: 'example.test' })),
     directory: vi.fn(async () => ({ ok: true as const, items: [{ id: 'g1', name: 'Test User', email: 'test@example.test' }], nextPageToken: 'next' })),
     members: vi.fn(async () => ({ ok: true as const, items: [{ id: 'm1', email: 'member@example.test', role: 'OWNER' }], nextPageToken: 'next' })),
+    mailboxSettings: vi.fn(async () => ({ ok: true as const, email: 'test@example.test', forwardingEnabled: false, forwardingAddress: null,
+      forwardingDisposition: null, vacationEnabled: false, vacationSubject: null, vacationStartMs: null, vacationEndMs: null })),
+    storage: vi.fn(async (_request, date: string) => ({ ok: true as const, date, items: [{ email: 'test@example.test', gmailMb: 10, driveMb: null, totalMb: 20 }],
+      nextPageToken: null, partial: true, warning: 'Some usage data is unavailable.' })),
     auditSuspension: vi.fn(async () => { if (opts.auditFail) throw new Error('audit unavailable'); }),
     setSuspended: vi.fn(async () => ({ ok: true as const, userId: '123456', suspended: true })),
     auditProfile: vi.fn(async () => { if (opts.auditFail) throw new Error('audit unavailable'); }),
@@ -67,6 +71,50 @@ describe('Google native extension bridge', () => {
     expect((await allowed.app.request(`/google/groups/g1/members?orgId=${ORG}&pageToken=a&pageToken=b`)).status).toBe(400);
     expect((await allowed.app.request(`/google/groups/%2F/members?orgId=${ORG}`)).status).toBe(400);
     expect(allowed.google.members).not.toHaveBeenCalled();
+  });
+  it('reads fixed Gmail settings only for managers with MFA', async () => {
+    const h = harness();
+    const response = await h.app.request(`/google/users/u1/mailbox-settings?orgId=${ORG}`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(h.google.mailboxSettings).toHaveBeenCalledWith({ auth: h.auth, authorization: h.authorization, orgId: ORG }, 'u1');
+    for (const opts of [{ write: false }, { mfa: false }, { sites: [] }, { access: false }]) {
+      const denied = harness(opts);
+      expect((await denied.app.request(`/google/users/u1/mailbox-settings?orgId=${ORG}`)).status).toBe(403);
+      expect(denied.google.mailboxSettings).not.toHaveBeenCalled();
+    }
+  });
+  it('rejects invalid user IDs and extra Gmail query controls', async () => {
+    const h = harness();
+    expect((await h.app.request(`/google/users/%2F/mailbox-settings?orgId=${ORG}`)).status).toBe(400);
+    expect((await h.app.request(`/google/users/u1/mailbox-settings?orgId=${ORG}&email=other@example.test`)).status).toBe(400);
+    expect(h.google.mailboxSettings).not.toHaveBeenCalled();
+  });
+  it('reads one fixed storage report date through the authenticated org', async () => {
+    const h = harness();
+    const date = new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10);
+    const response = await h.app.request(`/google/reports/storage?orgId=${ORG}&date=${date}`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(await response.json()).toMatchObject({ partial: true, complete: false });
+    expect(h.google.storage).toHaveBeenCalledWith({ auth: h.auth, authorization: h.authorization, orgId: ORG }, date, null);
+  });
+  it('rejects invalid report dates and duplicate or arbitrary scope parameters', async () => {
+    const h = harness();
+    const date = new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10);
+    for (const suffix of ['&date=2026-02-30', `&date=${date}&date=${date}`, '&date=1900-01-01', `&date=${date}&pageToken=a&pageToken=b`, `&date=${date}&customerId=other`]) {
+      const query = suffix;
+      expect((await h.app.request(`/google/reports/storage?orgId=${ORG}${query}`)).status).toBe(400);
+    }
+    expect(h.google.storage).not.toHaveBeenCalled();
+  });
+  it('denies cross-scope storage reports before native provider access', async () => {
+    const date = new Date(Date.now() - 3 * 86400000).toISOString().slice(0, 10);
+    for (const opts of [{ access: false }, { read: false }, { sites: [] }]) {
+      const h = harness(opts);
+      expect((await h.app.request(`/google/reports/storage?orgId=${ORG}&date=${date}`)).status).toBe(403);
+      expect(h.google.storage).not.toHaveBeenCalled();
+    }
   });
   const suspension = { userId: '123456', email: 'test@example.test', expectedSuspended: false, suspended: true, confirmation: 'test@example.test' };
   const post = (app: ReturnType<typeof harness>['app'], body: unknown) => app.request(`/google/users/suspension?orgId=${ORG}`,

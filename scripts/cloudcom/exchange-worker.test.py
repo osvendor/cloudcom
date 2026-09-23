@@ -57,6 +57,27 @@ class ExchangeBrokerTests(unittest.TestCase):
         with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([], [], [])):
             result = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1').run(REQUEST)
         self.assertEqual(result['code'], 'provider_unreachable'); self.assertTrue(process.killed)
+    def test_forwarding_write_requires_fixed_fields_and_timeout_is_uncertain(self):
+        mailbox_id = '55555555-5555-4555-8555-555555555555'
+        forward = {**REQUEST, 'operation': 'mailbox.forwarding.set', 'parameters': {
+            'mailboxId': mailbox_id, 'smtpAddress': 'next@example.com', 'keepCopy': True}}
+        broker = worker.Broker('/unused', '/unused.ps1')
+        with patch.object(worker, 'read_config', return_value={REQUEST['tenantId']: DESCRIPTOR}), patch.object(worker, 'PersistentPowerShell') as process:
+            invalid = broker.execute({**forward, 'parameters': {**forward['parameters'], 'command': 'Remove-Mailbox'}})
+        self.assertEqual(invalid['code'], 'invalid_request'); process.assert_not_called()
+        process = FakeProcess('')
+        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([], [], [])):
+            result = worker.PersistentPowerShell(forward, DESCRIPTOR, '/unused.ps1').run(forward)
+        self.assertEqual(result['code'], 'unknown_write_outcome'); self.assertTrue(process.killed)
+    def test_auto_reply_schedule_and_body_are_bounded_before_provider(self):
+        reply = {**REQUEST, 'operation': 'mailbox.autoreply.set', 'parameters': {
+            'mailboxId': '55555555-5555-4555-8555-555555555555', 'state': 'Scheduled',
+            'message': 'Away', 'start': '2026-09-25T00:00:00Z', 'end': '2026-09-24T00:00:00Z'}}
+        broker = worker.Broker('/unused', '/unused.ps1')
+        with patch.object(worker, 'read_config', return_value={REQUEST['tenantId']: DESCRIPTOR}), patch.object(worker, 'PersistentPowerShell') as process:
+            invalid = broker.execute(reply)
+            too_large = broker.execute({**reply, 'parameters': {**reply['parameters'], 'message': 'x' * 8193}})
+        self.assertEqual(invalid['code'], 'invalid_request'); self.assertEqual(too_large['code'], 'invalid_request'); process.assert_not_called()
     def test_mailbox_response_cannot_exceed_contract_bound(self):
         oversized = {'requestId': REQUEST['requestId'], 'ok': True, 'data': {'records': [{}] * 201, 'partial': True, 'collectedAt': '2026-09-22T00:00:00Z'}}
         process = FakeProcess(json.dumps(oversized).encode('utf-8') + b'\n')

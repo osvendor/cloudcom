@@ -102,4 +102,9 @@ describe("GoogleWorkspaceIntegration", () => {
       screen.queryByTestId("google-workspace-not-enabled"),
     ).not.toBeInTheDocument();
   });
+  it("includes the Reports usage scope in the existing delegation setup", async () => {
+    fetchWithAuthMock.mockResolvedValue(makeResponse({ connected: false }));
+    render(<GoogleWorkspaceIntegration />);
+    await waitFor(() => expect(screen.getByText(/admin\.reports\.usage\.readonly/)).toBeInTheDocument());
+  });
 });

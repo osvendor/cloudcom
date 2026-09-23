@@ -1,6 +1,6 @@
 # Cloud Command Exchange worker contract
 
-Status: first read-only implementation slice exists in the Cloud Command extension. It is not deployed or enabled until the private sidecar, socket mount, descriptor mount, and Exchange app-only capability probe are validated.
+Status: the bounded mailbox inventory, external SMTP forwarding, and automatic-reply code paths exist in the Cloud Command extension. The worker is not deployed or enabled until the private sidecar, socket mount, descriptor mount, and Exchange app-only capability probe are validated. No live Exchange write has been tested.
 
 ## Purpose
 
@@ -16,7 +16,7 @@ Browser -> authenticated Breeze extension route -> organization-bound administra
 
 Each dispatch contains a server-issued request ID, the authorized organization ID, bound tenant ID, app ID, credential version and connection generation, a fixed operation name, and typed parameters. The browser can never supply an Exchange tenant, app, certificate path, cmdlet string or arbitrary PowerShell expression. The worker validates the target tenant and certificate binding against its host-only descriptor before connecting. The API checks the connection and actor permission immediately before dispatch and again before returning a result. A changed connection makes the result unusable and marks a dispatched write as uncertain.
 
-The worker should use a fixed registry rather than accepting the Cloud Command source's broad `command` string interface. Initial entries:
+The worker uses a fixed registry rather than accepting the Cloud Command source's broad `command` string interface. Only `mailbox.inventory`, `mailbox.forwarding.get/set`, and `mailbox.autoreply.get/set` below are implemented; the other entries are planned:
 
 | Operation | Permitted PowerShell action | Result |
 | --- | --- | --- |
@@ -27,6 +27,10 @@ The worker should use a fixed registry rather than accepting the Cloud Command s
 | `mailbox.delegation.get/set` | `Get/Add/Remove-MailboxPermission`, `Get/Add/Remove-RecipientPermission`, `Set-Mailbox -GrantSendOnBehalfTo` | Current delegates and per-right outcomes |
 | `mailbox.forwarding.get/set` | `Get/Set-Mailbox` forwarding properties | Current destination and keep-copy setting |
 | `mailbox.autoreply.get/set` | `Get/Set-MailboxAutoReplyConfiguration` | Current mode, schedule, internal/external replies |
+
+The forwarding path resolves the mailbox from its Entra object ID, rejects an existing internal forwarding recipient, saves only `ForwardingSmtpAddress` and `DeliverToMailboxAndForward`, then reads back the same mailbox. The automatic-reply path uses the same bound mailbox identity and the old Cloud Command's single internal/external reply, Disabled/Enabled/Scheduled states, optional scheduled dates, and `ExternalAudience All`. Both operations perform exact no-op checks before a write, report a lost write response as `unknown_write_outcome`, and require a fresh read before another edit. The compact directory drawer enables an action only after a successful current-state read; unavailable worker or Exchange permission errors are shown rather than treated as “off.” Existing different internal/external replies are flagged before a save replaces both. Mailbox delegation remains unavailable.
+
+The socket client and broker both cap request frames at 64 KiB so a bounded 8,192-character non-ASCII automatic reply fits. Both currently cap command execution near 45 seconds; cold Exchange connection and readback latency require a canary before enabling writes. Automatic reply text and dates are not logged in intent/outcome audit details. Exchange may transform reply HTML or normalize a schedule; if readback does not exactly match the submitted values, the UI reports pending verification instead of claiming completion.
 
 For writes, make an intent audit durable before worker submission and record one terminal outcome: verified success, definite rejection, or uncertain. Never automatically replay a request after a timeout or connection loss. A readback mismatch reports pending/uncertain and offers refresh; it does not treat acceptance as completion. Multi-step changes (such as delegation or mailbox preservation) need a durable job record with per-step checkpoints before being exposed.
 

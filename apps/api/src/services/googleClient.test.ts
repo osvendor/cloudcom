@@ -8,8 +8,10 @@ import {
   GMAIL_USER_SCOPES,
   CALENDAR_SCOPES,
   LICENSING_SCOPES,
+  REPORTS_SCOPES,
   getDirectoryClient,
   getGmailClient,
+  getUsageReportsClient,
 } from './googleClient';
 
 const VALID_KEY = JSON.stringify({
@@ -52,14 +54,15 @@ describe('normalizeGoogleError', () => {
 });
 
 describe('scopes', () => {
-  it('CSV is the union of directory + gmail + calendar + licensing scopes', () => {
+  it('CSV includes the bounded usage-report scope with existing services', () => {
     expect(ALL_DWD_SCOPES_CSV).toBe(
-      [...DIRECTORY_SCOPES, ...GMAIL_USER_SCOPES, ...CALENDAR_SCOPES, ...LICENSING_SCOPES].join(','),
+      [...DIRECTORY_SCOPES, ...GMAIL_USER_SCOPES, ...CALENDAR_SCOPES, ...LICENSING_SCOPES, ...REPORTS_SCOPES].join(','),
     );
     expect(ALL_DWD_SCOPES_CSV).toContain('admin.directory.user');
     expect(ALL_DWD_SCOPES_CSV).toContain('gmail.settings.sharing');
     expect(ALL_DWD_SCOPES_CSV).toContain('apps.licensing');
     expect(ALL_DWD_SCOPES_CSV).toContain('calendar.acls');
+    expect(ALL_DWD_SCOPES_CSV).toContain('admin.reports.usage.readonly');
   });
 });
 
@@ -71,5 +74,9 @@ describe('client construction (smoke)', () => {
   it('builds a gmail client without making a network call', () => {
     const client = getGmailClient(VALID_KEY, 'user@example.com');
     expect(typeof client.users.settings.updateVacation).toBe('function');
+  });
+  it('builds a usage-report client without making a network call', () => {
+    const client = getUsageReportsClient(VALID_KEY, 'admin@example.com');
+    expect(typeof client.userUsageReport.get).toBe('function');
   });
 });

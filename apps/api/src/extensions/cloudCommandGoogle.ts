@@ -5,7 +5,7 @@ import { googleWorkspaceConnections } from '../db/schema/google';
 import { dbAccessContextFromAuth, type AuthContext } from '../middleware/auth';
 import { GOOGLE_WORKSPACE_ENABLED } from '../config/env';
 import { decryptConnectionKey } from '../services/googleHelpers';
-import { getDirectoryClient } from '../services/googleClient';
+import { getDirectoryClient, getGmailClient, getUsageReportsClient } from '../services/googleClient';
 import { createAuditLog } from '../services/auditService';
 
 const denied = { ok: false as const, code: 'access_denied' as const, message: 'Google Workspace access is not permitted for this organization.' };
@@ -106,6 +106,99 @@ export const nativeGoogleServices: NativeGoogleServices = {
     } catch {
       return { ok: false, code: 'provider_failed', message: 'Google group members could not be loaded. Check the connection and delegation scopes.' };
     }
+  },
+  async mailboxSettings(input, userId) {
+    const auth = authorized(input);
+    if (!auth || !input.authorization.hasPermission('organizations', 'write') || !input.authorization.mfaSatisfied) return denied;
+    if (!GOOGLE_WORKSPACE_ENABLED) return disconnected;
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(userId)) return { ok: false, code: 'provider_failed', message: 'Invalid Google user.' };
+    const row = await load(auth, input.orgId);
+    if (!row || row.orgId !== input.orgId || row.status !== 'active') return disconnected;
+    try {
+      const key = decryptConnectionKey(row);
+      const directory = getDirectoryClient(key, row.adminEmail);
+      const user = (await directory.users.get({ userKey: userId, fields: 'id,primaryEmail,archived' })).data;
+      const email = user.primaryEmail?.toLowerCase();
+      if (user.id !== userId || !email?.endsWith(`@${row.customerDomain.toLowerCase()}`) || user.archived === true)
+        return { ok: false, code: 'state_changed', message: 'The Google mailbox changed. Refresh the directory before retrying.' };
+      const fresh = await load(auth, input.orgId);
+      if (!fresh || fresh.id !== row.id || fresh.status !== 'active' || fresh.customerDomain !== row.customerDomain
+        || fresh.adminEmail !== row.adminEmail || fresh.serviceAccountKey !== row.serviceAccountKey)
+        return { ok: false, code: 'state_changed', message: 'The Google connection changed. Refresh before retrying.' };
+      const gmail = getGmailClient(key, email);
+      const [forward, vacation] = await Promise.all([
+        gmail.users.settings.getAutoForwarding({ userId: 'me' }),
+        gmail.users.settings.getVacation({ userId: 'me' }),
+      ]);
+      return { ok: true, email, forwardingEnabled: bool(forward.data.enabled), forwardingAddress: scalar(forward.data.emailAddress),
+        forwardingDisposition: scalar(forward.data.disposition), vacationEnabled: bool(vacation.data.enableAutoReply),
+        vacationSubject: scalar(vacation.data.responseSubject), vacationStartMs: scalar(vacation.data.startTime), vacationEndMs: scalar(vacation.data.endTime) };
+    } catch {
+      return { ok: false, code: 'provider_failed', message: 'Gmail settings could not be loaded. Check mailbox licensing and domain-wide delegation scopes.' };
+    }
+  },
+  async storage(input, date, pageToken) {
+    const auth = authorized(input);
+    if (!auth) return denied;
+    if (!GOOGLE_WORKSPACE_ENABLED) return disconnected;
+    const time = /^\d{4}-\d{2}-\d{2}$/.test(date) ? Date.parse(`${date}T00:00:00Z`) : NaN;
+    if (!Number.isFinite(time) || new Date(time).toISOString().slice(0, 10) !== date || time > Date.now()
+      || Date.now() - time > 180 * 86400000 || (pageToken !== null && (pageToken.length > 2048 || !/^[A-Za-z0-9_\-./+=]+$/.test(pageToken))))
+      return { ok: false, code: 'provider_failed', message: 'Invalid storage report request.' };
+    const row = await load(auth, input.orgId);
+    if (!row || row.orgId !== input.orgId || row.status !== 'active') return disconnected;
+    let key: string;
+    let customerId: string | undefined;
+    try {
+      key = decryptConnectionKey(row);
+      const admin = (await getDirectoryClient(key, row.adminEmail).users.get({ userKey: row.adminEmail,
+        fields: 'customerId,primaryEmail' })).data;
+      customerId = admin.customerId ?? undefined;
+      if (!customerId || !/^[A-Za-z0-9_-]{1,128}$/.test(customerId)
+        || admin.primaryEmail?.toLowerCase() !== row.adminEmail.toLowerCase())
+        return { ok: false, code: 'provider_failed', message: 'Google customer ownership could not be verified.' };
+      const fresh = await load(auth, input.orgId);
+      if (!fresh || fresh.id !== row.id || fresh.status !== 'active' || fresh.customerDomain !== row.customerDomain
+        || fresh.adminEmail !== row.adminEmail || fresh.serviceAccountKey !== row.serviceAccountKey) return disconnected;
+    } catch {
+      return { ok: false, code: 'provider_failed', message: 'Google customer ownership could not be verified.' };
+    }
+    let data;
+    try {
+      data = (await getUsageReportsClient(key, row.adminEmail).userUsageReport.get({ userKey: 'all', date,
+        customerId, maxResults: 100, pageToken: pageToken ?? undefined,
+        parameters: 'accounts:drive_used_quota_in_mb,accounts:gmail_used_quota_in_mb,accounts:used_quota_in_mb',
+        fields: 'nextPageToken,warnings(code),usageReports(entity(customerId,userEmail),parameters(name,intValue))' })).data;
+    } catch (error) {
+      const status = (error as { response?: { status?: number }; status?: number }).response?.status
+        ?? (error as { status?: number }).status;
+      return status === 401 || status === 403
+        ? { ok: false, code: 'scope_required', message: 'Google usage-report access is unavailable. Update the existing domain-wide delegation grant to include admin.reports.usage.readonly and verify the administrator reporting privilege.' }
+        : { ok: false, code: 'provider_failed', message: 'Google usage report could not be loaded. The date may not be ready yet.' };
+    }
+    let omitted = false;
+    let missing = false;
+    const items = (data.usageReports ?? []).flatMap(report => {
+      const email = report.entity?.userEmail?.toLowerCase();
+      if (!email || report.entity?.customerId !== customerId || !email.endsWith(`@${row.customerDomain.toLowerCase()}`)) {
+        omitted = true; return [];
+      }
+      const metric = (name: string): number | null => {
+        const parameter = report.parameters?.find(item => item.name === name || item.name === `accounts:${name}`);
+        if (!parameter || !/^(0|[1-9]\d*)$/.test(parameter.intValue ?? '')) return null;
+        const value = Number(parameter.intValue);
+        return Number.isSafeInteger(value) ? value : null;
+      };
+      const gmailMb = metric('gmail_used_quota_in_mb');
+      const driveMb = metric('drive_used_quota_in_mb');
+      const totalMb = metric('used_quota_in_mb');
+      if (gmailMb === null || driveMb === null || totalMb === null) missing = true;
+      return [{ email, gmailMb, driveMb, totalMb }];
+    });
+    const partial = !!data.warnings?.length || omitted || missing || (!items.length && !data.nextPageToken);
+    const warning = omitted ? 'Only users in the configured Google domain are shown; other domains were omitted.'
+      : data.warnings?.length || missing || !items.length ? 'Google returned incomplete or unavailable usage data for this date.' : null;
+    return { ok: true, date, items, nextPageToken: data.nextPageToken ?? null, partial, warning };
   },
   async auditSuspension(input, userId, stage) {
     const auth = authorized(input);

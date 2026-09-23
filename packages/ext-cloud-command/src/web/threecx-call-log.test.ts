@@ -35,4 +35,25 @@ describe('3CX Call Log page', () => {
     expect(page.shadowRoot!.textContent).toContain('continuation is unavailable');
     expect(page.shadowRoot!.querySelector('#export')).toBeTruthy();
   });
+  it('filters only loaded events and disables export when nothing matches', async () => {
+    const rows = [
+      { CallId: 'call-1', StartTime: '2026-09-22', SourceDn: '100', DestinationDn: '200', Status: 'Answered', TalkingDuration: '0:01:00', Direction: 'Inbound', Answered: true },
+      { CallId: 'call-2', StartTime: '2026-09-22', SourceDn: '300', DestinationDn: '400', Status: 'Missed', TalkingDuration: '0:00:00', Direction: 'Outbound', Answered: false },
+    ];
+    const request = vi.fn(async () => Response.json({ scope: 'full_pbx', items: rows, nextSkip: null, truncated: true }));
+    const page = mount(request);
+    page.shadowRoot!.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flush();
+    const root = page.shadowRoot!;
+    const filter = root.querySelector<HTMLInputElement>('#filter')!;
+    filter.value = 'missed'; filter.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(root.querySelector<HTMLTableRowElement>('tr[data-call-index="0"]')!.hidden).toBe(true);
+    expect(root.querySelector<HTMLTableRowElement>('tr[data-call-index="1"]')!.hidden).toBe(false);
+    expect(root.querySelector('#filter-count')!.textContent).toBe('1 matching loaded events');
+    expect(root.textContent).toContain('Filtering and export include only the loaded page; more events may exist');
+    filter.value = 'not-present'; filter.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(root.querySelector<HTMLButtonElement>('#export')!.disabled).toBe(true);
+    expect(root.querySelector<HTMLElement>('#filter-empty')!.hidden).toBe(false);
+    expect(request).toHaveBeenCalledTimes(1);
+  });
 });

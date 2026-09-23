@@ -86,4 +86,39 @@ describe('Google directory page', () => {
     expect(page.shadowRoot!.textContent).toContain('OWNER');
     expect(page.shadowRoot!.textContent).toContain('Load more members');
   });
+  it('shows compact read-only Gmail settings without a message body', async () => {
+    const request = vi.fn(async (path: string) => Response.json(path === '/google/connection'
+      ? { available: true, connected: true, enabled: true, canManage: true }
+      : path === '/google/users/u1/mailbox-settings'
+        ? { ok: true, email: 'one@example.test', forwardingEnabled: true, forwardingAddress: 'target@example.test',
+          forwardingDisposition: 'leaveInInbox', vacationEnabled: true, vacationSubject: 'Away', vacationStartMs: null,
+          vacationEndMs: null, responseBodyHtml: '<b>private</b>' }
+        : { items: [{ id: 'u1', name: 'One', email: 'one@example.test', suspended: false, admin: false }], nextPageToken: null, complete: true }));
+    const page = new CloudCommandGooglePage(); page.context = context('org-a'); page.hostApi = { request }; document.body.append(page);
+    await flush(); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-mailbox="u1"]')!.click();
+    await flush();
+    expect(request).toHaveBeenCalledWith('/google/users/u1/mailbox-settings', undefined);
+    expect(page.shadowRoot!.textContent).toContain('target@example.test');
+    expect(page.shadowRoot!.textContent).toContain('Away');
+    expect(page.shadowRoot!.textContent).not.toContain('private');
+  });
+  it('shows a bounded storage report with missing metrics and partial coverage', async () => {
+    const request = vi.fn(async (path: string) => Response.json(path === '/google/connection'
+      ? { available: true, connected: true, enabled: true }
+      : path.startsWith('/google/reports/storage')
+        ? { date: '2026-09-20', items: [{ email: 'one@example.test', gmailMb: 0, driveMb: null, totalMb: 125 }],
+          nextPageToken: 'next', partial: true, warning: 'Google returned incomplete or unavailable usage data for this date.' }
+        : { items: [], nextPageToken: null, complete: true }));
+    const page = new CloudCommandGooglePage(); page.context = context('org-a'); page.hostApi = { request }; document.body.append(page);
+    await flush(); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#storage-tab')!.click();
+    await flush();
+    expect(request.mock.calls.some(([path]) => path.startsWith('/google/reports/storage?date='))).toBe(true);
+    expect(page.shadowRoot!.textContent).toContain('one@example.test');
+    expect(page.shadowRoot!.textContent).toContain('0 MB');
+    expect(page.shadowRoot!.textContent).toContain('Unavailable');
+    expect(page.shadowRoot!.textContent).toContain('Partial or unavailable data');
+    expect(page.shadowRoot!.textContent).toContain('Load more');
+  });
 });

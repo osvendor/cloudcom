@@ -86,6 +86,8 @@ const cloudCommandApiPaths = new Set([
   'apps/api/src/extensions/cloudCommandMicrosoft.test.ts',
   'apps/api/src/extensions/cloudCommandGoogle.ts',
   'apps/api/src/extensions/cloudCommandGoogle.test.ts',
+  'apps/api/src/services/googleClient.ts',
+  'apps/api/src/services/googleClient.test.ts',
   'apps/api/src/extensions/cloudCommandAdminRuntime.ts',
   'apps/api/src/extensions/cloudCommandAdminRuntime.test.ts',
   'apps/api/src/extensions/cloudCommandAdminAuthorization.ts',
@@ -109,6 +111,8 @@ const cloudCommandApiPaths = new Set([
   'pnpm-lock.yaml',
 ]);
 const cloudCommandWebPaths = new Set([
+  'apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx',
+  'apps/web/src/components/integrations/GoogleWorkspaceIntegration.test.tsx',
   'apps/web/src/components/extensions/ExtensionElementHost.tsx',
   'apps/web/src/components/extensions/ExtensionPageHost.test.tsx',
   'apps/web/src/components/extensions/ExtensionSlotHost.test.tsx',
@@ -150,7 +154,9 @@ const infraPaths = new Set([
   '.github/scripts/ci-build-reuse.test.mjs', '.github/scripts/classify-pr-paths.sh',
   '.github/scripts/classify-pr-paths.test.mjs', '.github/scripts/mobile-native-ci.test.mjs',
   '.github/scripts/prepare-ci-apt-sources.test.mjs', 'deploy/.env.example',
-  'deploy/docker-compose.prod.yml', 'scripts/check-guided-setup-systemd-unit.sh',
+  'deploy/docker-compose.prod.yml', 'deploy/cloudcom-exchange-worker/Dockerfile',
+  'deploy/cloudcom-exchange-worker/healthcheck.py', 'deploy/cloudcom-exchange-worker/README.md',
+  'scripts/check-guided-setup-systemd-unit.sh',
   'scripts/check-guided-setup-signed-image-floor.sh', 'scripts/prod/deploy.sh',
   'scripts/release/release-image-consumers.test.mjs', 'scripts/smoke-guided-setup.sh',
 ]);

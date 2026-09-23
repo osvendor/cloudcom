@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createExchangeMailboxInventoryClient, ExchangeWorkerError } from './exchange-contract';
+import { createExchangeAutoReplyClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, ExchangeWorkerError } from './exchange-contract';
 
 const binding = {
   organizationId: '11111111-1111-4111-8111-111111111111', tenantId: '22222222-2222-4222-8222-222222222222',
@@ -38,5 +38,46 @@ describe('Exchange worker contract', () => {
   it('rejects oversized or malformed results', async () => {
     const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: { records: Array.from({ length: 201 }, () => mailbox), partial: false, collectedAt: mailbox.collectedAt } }));
     await expect(createExchangeMailboxInventoryClient({ dispatch })(binding)).rejects.toEqual(expect.objectContaining({ code: 'provider_unreachable' }));
+  });
+});
+
+describe('Exchange forwarding contract', () => {
+  const mailboxId = mailbox.id;
+  it('sends only a bounded mailbox ID and forwarding settings', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true,
+      data: { mailboxId, smtpAddress: 'next@example.com', keepCopy: true, internalRecipient: null, accepted: true, verified: true } }));
+    const result = await createExchangeForwardingClient({ dispatch }).set(binding, { mailboxId, smtpAddress: 'next@example.com', keepCopy: true });
+    expect(result.verified).toBe(true);
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'mailbox.forwarding.set', parameters: { mailboxId, smtpAddress: 'next@example.com', keepCopy: true } }));
+    expect(JSON.stringify(dispatch.mock.calls)).not.toContain('certificate');
+  });
+  it('rejects injected settings and treats a lost write response as uncertain', async () => {
+    const dispatch = vi.fn(async () => { throw new Error('socket closed'); });
+    const client = createExchangeForwardingClient({ dispatch });
+    await expect(client.set(binding, { mailboxId, smtpAddress: 'next@example.com', keepCopy: true, command: 'Remove-Mailbox' } as never)).rejects.toThrow();
+    expect(dispatch).not.toHaveBeenCalled();
+    await expect(client.set(binding, { mailboxId, smtpAddress: null, keepCopy: false })).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+  });
+  it('does not accept mismatched mailbox state after a read', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true,
+      data: { mailboxId: binding.organizationId, smtpAddress: null, keepCopy: false, internalRecipient: null } }));
+    await expect(createExchangeForwardingClient({ dispatch }).get(binding, mailboxId)).rejects.toMatchObject({ code: 'provider_unreachable' });
+  });
+});
+
+describe('Exchange automatic reply contract', () => {
+  const mailboxId = mailbox.id;
+  it('sends one bounded reply and validated schedule', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: { mailboxId, state: 'Scheduled',
+      internalMessage: 'Away', externalMessage: 'Away', externalAudience: 'All', start: '2026-09-24T12:00:00.000Z', end: '2026-09-25T12:00:00.000Z', accepted: true, verified: true } }));
+    const client = createExchangeAutoReplyClient({ dispatch });
+    await expect(client.set(binding, { mailboxId, state: 'Scheduled', message: 'Away', start: '2026-09-24T12:00:00.000Z', end: '2026-09-25T12:00:00.000Z' })).resolves.toMatchObject({ verified: true });
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'mailbox.autoreply.set', parameters: expect.objectContaining({ message: 'Away' }) }));
+    await expect(client.set(binding, { mailboxId, state: 'Scheduled', message: 'Away', start: '2026-09-25T12:00:00.000Z', end: '2026-09-24T12:00:00.000Z' })).rejects.toThrow();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
+  it('treats a lost set response as uncertain', async () => {
+    const client = createExchangeAutoReplyClient({ dispatch: async () => { throw new Error('closed'); } });
+    await expect(client.set(binding, { mailboxId, state: 'Disabled', message: '', start: null, end: null })).rejects.toMatchObject({ code: 'unknown_write_outcome' });
   });
 });

@@ -28,6 +28,11 @@ test('classifies supported web, native, and explicit infrastructure changes', ()
   assert.deepEqual(classify(['packages/shared/src/types.ts']).unsupported, ['packages/shared/src/types.ts']);
   assert.deepEqual(classify(['apps/web/src/pages/index.astro']).unsupported, ['apps/web/src/pages/index.astro']);
   assert.equal(classify(['apps/api/src/config/envComposeParity.test.ts']).infra, true);
+  for (const path of ['deploy/cloudcom-exchange-worker/Dockerfile', 'deploy/cloudcom-exchange-worker/healthcheck.py', 'deploy/cloudcom-exchange-worker/README.md']) {
+    const result = classify([path]);
+    assert.equal(result.infra, true);
+    assert.deepEqual(result.unsupported, []);
+  }
 });
 
 test('skips a docs-only delta and rejects unsupported product surfaces', () => {
@@ -59,10 +64,14 @@ test('routes the bounded Google Workspace host bridge through Cloud Command vali
   for (const path of [
     'apps/api/src/extensions/cloudCommandGoogle.ts',
     'apps/api/src/extensions/cloudCommandGoogle.test.ts',
+    'apps/api/src/services/googleClient.ts',
+    'apps/api/src/services/googleClient.test.ts',
     'packages/ext-cloud-command/src/server/native-google.ts',
     'packages/ext-cloud-command/src/server/google.ts',
     'packages/ext-cloud-command/src/web/google.ts',
     'apps/web/src/components/extensions/useExtensionNavigation.ts',
+    'apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx',
+    'apps/web/src/components/integrations/GoogleWorkspaceIntegration.test.tsx',
   ]) {
     const result = classify([path]);
     assert.deepEqual(result.unsupported, []);

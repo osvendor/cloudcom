@@ -22,4 +22,14 @@ describe('Exchange Unix socket client', () => {
     const pending = port.dispatch(request); socket.emit('connect'); socket.emit('data', Buffer.from('{"ok":true}\nsecret'));
     await expect(pending).rejects.toThrow('exchange_invalid_response');
   });
+  it('accepts a bounded non-ASCII auto-reply body over the private socket', async () => {
+    const socket = new FakeSocket();
+    const port = createUnixSocketExchangeWorkerPort({ socketPath: '/run/cloudcom/exchange.sock', connect: () => socket as never });
+    const outbound: ExchangeWorkerRequest = { ...request, operation: 'mailbox.autoreply.set', parameters: {
+      mailboxId: '55555555-5555-4555-8555-555555555555', state: 'Enabled', message: 'é'.repeat(8192), start: null, end: null } };
+    const pending = port.dispatch(outbound); socket.emit('connect'); socket.emit('data', Buffer.from('{"ok":true}\n'));
+    await expect(pending).resolves.toEqual({ ok: true });
+    expect(socket.payload?.byteLength).toBeGreaterThan(16 * 1024);
+    expect(socket.payload?.byteLength).toBeLessThan(64 * 1024);
+  });
 });
