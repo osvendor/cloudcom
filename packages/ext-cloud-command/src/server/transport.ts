@@ -33,6 +33,12 @@ export function createProvider(fetch: GuardedFetch) {
     return { origin, headers: { Authorization: `Bearer ${result.access_token}` } };
   }
   return {
+    async systemStatus(credentials: Credentials) {
+      const signal = AbortSignal.timeout(30000);
+      const { origin, headers } = await session(credentials, signal);
+      const query = new URLSearchParams({ '$select': 'Version,CallsActive,MaxSimCalls,ExtensionsRegistered,ExtensionsTotal,TrunksRegistered,TrunksTotal,HasNotRunningServices,BackupScheduled,LastBackupDateTime,FreeDiskSpace,TotalDiskSpace' });
+      return json(`${origin}/xapi/v1/SystemStatus?${query}`, { headers }, signal);
+    },
     async groups(credentials: Credentials) {
       const signal = AbortSignal.timeout(30000);
       const { origin, headers } = await session(credentials, signal);

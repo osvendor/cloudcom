@@ -102,6 +102,31 @@ function client(expectedRoutes = routes(), limits: Record<string, number> = {}) 
 }
 
 describe('MicrosoftGraphClient', () => {
+  it('follows only the documented OneDrive report download host without forwarding the bearer token and projects no report identifiers', async () => {
+    const csv = [
+      'Report Refresh Date,Site URL,Owner Display Name,Is Deleted,Last Activity Date,File Count,Active File Count,Storage Used (Byte),Storage Allocated (Byte),Owner Principal Name,Report Period',
+      '2026-09-22,https://tenant-my.sharepoint.com/personal/ada,Ada,false,2026-09-21,3,2,1073741824,5368709120,ada@example.test,7',
+    ].join('\n');
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 302, headers: { location: 'https://reports.office.com/data/download/opaque' } }))
+      .mockResolvedValueOnce(new Response(csv, { status: 200 }));
+    const graph = createMicrosoftGraphClient({ applicationId: APPLICATION_ID }, { fetch: fetchImpl as typeof fetch });
+    await expect(graph.readOneDriveUsageReport!({ accessToken: ACCESS_TOKEN })).resolves.toEqual({
+      items: [{ ownerPrincipalName: 'ada@example.test', storageUsedBytes: 1073741824, storageAllocatedBytes: 5368709120, lastActivityDate: '2026-09-21' }], truncated: false,
+    });
+    expect(fetchImpl.mock.calls[0]![0]).toContain("/reports/getOneDriveUsageAccountDetail(period='D7')");
+    expect(fetchImpl.mock.calls[0]![1]).toMatchObject({ redirect: 'manual', headers: { authorization: `Bearer ${ACCESS_TOKEN}` } });
+    expect(fetchImpl.mock.calls[1]![0]).toBe('https://reports.office.com/data/download/opaque');
+    expect(fetchImpl.mock.calls[1]![1]).toMatchObject({ method: 'GET', redirect: 'error' });
+    expect((fetchImpl.mock.calls[1]![1] as RequestInit).headers).toBeUndefined();
+  });
+
+  it('refuses an unexpected report redirect and never follows it', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(null, { status: 302, headers: { location: 'https://evil.example.test/download' } }));
+    const graph = createMicrosoftGraphClient({ applicationId: APPLICATION_ID }, { fetch: fetchImpl as typeof fetch });
+    await expect(graph.readOneDriveUsageReport!({ accessToken: ACCESS_TOKEN })).rejects.toMatchObject({ code: 'graph_response_invalid' });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
   it('uses only the four fixed GET families and returns tenant/application proof plus canonical grants', async () => {
     const { graph, fetch, assertComplete } = client();
 

@@ -84,6 +84,8 @@ const cloudCommandApiPaths = new Set([
   'apps/api/src/extensions/builtinRegistry.ts',
   'apps/api/src/extensions/cloudCommandMicrosoft.ts',
   'apps/api/src/extensions/cloudCommandMicrosoft.test.ts',
+  'apps/api/src/extensions/cloudCommandGoogle.ts',
+  'apps/api/src/extensions/cloudCommandGoogle.test.ts',
   'apps/api/src/extensions/cloudCommandAdminRuntime.ts',
   'apps/api/src/extensions/cloudCommandAdminRuntime.test.ts',
   'apps/api/src/extensions/cloudCommandAdminAuthorization.ts',
@@ -123,6 +125,14 @@ const cloudCommandWebPaths = new Set([
 const cloudCommandSharedPaths = new Set([
   'packages/extension-web-sdk/src/hostApi.ts',
   'packages/extension-web-sdk/src/index.ts',
+  'packages/shared/src/m365/readActions.ts',
+  'packages/shared/src/m365/readActions.test.ts',
+]);
+const cloudCommandReportExecutorPaths = new Set([
+  'apps/m365-graph-read-executor/src/microsoft/graphClient.ts',
+  'apps/m365-graph-read-executor/src/microsoft/graphClient.test.ts',
+  'apps/m365-graph-read-executor/src/microsoft/readActions.ts',
+  'apps/m365-graph-read-executor/src/microsoft/readActions.test.ts',
 ]);
 // The UniFi sync lock-order fix changes a background worker and its
 // organization-lock helper.  It has a dedicated real-Postgres proof in the
@@ -192,7 +202,7 @@ export function classify(paths) {
       result.api = true;
       continue;
     }
-    if (cloudCommandApiPaths.has(path) || /^packages\/ext-cloud-command\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/(?:2026-09-21-threecx-connections|2026-09-22-microsoft-connections|2026-09-22-native-admin-connections)\.sql|src\/(?:server|threecx|web)\/.+)$/u.test(path)) {
+    if (cloudCommandApiPaths.has(path) || /^packages\/ext-cloud-command\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/(?:2026-09-21-threecx-connections|2026-09-22-microsoft-connections|2026-09-22-native-admin-connections|2026-09-22-microsoft-directory-preferences)\.sql|src\/(?:server|threecx|web)\/.+)$/u.test(path)) {
       result.api = true;
       result.web = true;
       continue;
@@ -202,6 +212,11 @@ export function classify(paths) {
       continue;
     }
     if (cloudCommandSharedPaths.has(path)) {
+      result.shared = true;
+      continue;
+    }
+    if (cloudCommandReportExecutorPaths.has(path)) {
+      result.api = true;
       result.shared = true;
       continue;
     }

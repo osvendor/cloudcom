@@ -41,6 +41,16 @@
         "id": "microsoft",
         "path": "/microsoft",
         "element": "cloudcommand-microsoft-page"
+      },
+      {
+        "id": "google",
+        "path": "/google",
+        "element": "cloudcommand-google-page"
+      },
+      {
+        "id": "threecx-dashboard",
+        "path": "/threecx-dashboard",
+        "element": "cloudcommand-threecx-dashboard-page"
       }
     ],
     "navigation": [
@@ -70,7 +80,8 @@
       "cloudcommand_threecx_connections",
       "cloudcommand_microsoft_connections",
       "cloudcommand_microsoft_admin_connections",
-      "cloudcommand_microsoft_admin_consent"
+      "cloudcommand_microsoft_admin_consent",
+      "cloudcommand_microsoft_directory_preferences"
     ],
     "deviceCascadeDeleteTables": [],
     "deviceOrgDenormalizedTables": [],
@@ -126,6 +137,17 @@
           "created_at",
           "updated_at"
         ]
+      },
+      "cloudcommand_microsoft_directory_preferences": {
+        "include": [
+          "org_id",
+          "actor_id",
+          "microsoft_user_id",
+          "excluded",
+          "created_at",
+          "updated_at"
+        ],
+        "exclude": []
       },
       "cloudcommand_microsoft_admin_consent": {
         "exclude": [

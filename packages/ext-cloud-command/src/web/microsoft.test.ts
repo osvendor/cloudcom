@@ -211,13 +211,13 @@ describe('CloudCommandMicrosoftPage', () => {
     expect(page.shadowRoot!.querySelector('table')!.textContent).toContain('Ada Byron');
   });
 
-  it('sends only the account-enabled field when changing sign-in access', async () => {
-    let enabled = false;
+  it('blocks sign-in through a confirmed, field-scoped update and verifies readback', async () => {
+    let enabled = true;
     const user = { id: 'user-1', displayName: 'Ada', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '' };
     const request = vi.fn(async (path: string, init?: RequestInit) => {
       if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
       if (path === '/threecx/connection') return Response.json({ connected: false });
-      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada', userPrincipalName: 'ada@example.test', accountEnabled: enabled } }], columns: [{ key: 'displayName', label: 'User' }, { key: 'userPrincipalName', label: 'Sign-in name' }, { key: 'accountEnabled', label: 'Account state' }], complete: true, checkedAt: 'now' });
       if (path === '/microsoft/administration') {
         const body = JSON.parse(String(init?.body));
         if (body.type === 'user.get') return Response.json({ ...user, accountEnabled: enabled });
@@ -225,16 +225,17 @@ describe('CloudCommandMicrosoftPage', () => {
       }
       throw new Error(`Unexpected ${path}`);
     });
-    const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush();
-    page.shadowRoot!.querySelector<HTMLInputElement>('#user-account-enabled')!.checked = true;
-    page.shadowRoot!.querySelector<HTMLInputElement>('#user-account-enabled')!.dispatchEvent(new Event('change', { bubbles: true }));
-    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-user-save="accountEnabled"]')!.click(); await flush(); await flush(); await flush();
+    const page = mount(request); await flush(); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-expand="user-1"]')!.click();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-row-security="block-sign-in"]')!.click(); await flush(); await flush();
+    page.shadowRoot!.querySelector<HTMLInputElement>('#user-security-confirm')!.click();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-security-submit')!.click(); await flush(); await flush(); await flush();
     const update = request.mock.calls.map(([, init]) => init?.body).find(body => String(body).includes('user.update'));
-    expect(JSON.parse(String(update))).toEqual({ type: 'user.update', id: 'user-1', update: { accountEnabled: true } });
-    expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('saved and verified');
+    expect(JSON.parse(String(update))).toEqual({ type: 'user.update', id: 'user-1', update: { accountEnabled: false } });
+    expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('Sign-in blocked and verified');
   });
 
-  it('saves independently edited profile fields in separate requests', async () => {
+  it('saves only the MSP-relevant account name field and omits generic profile fields', async () => {
     const user = { id: 'user-1', displayName: 'Ada', givenName: '', surname: '', department: 'Research', jobTitle: '', officeLocation: '', accountEnabled: true };
     const request = vi.fn(async (path: string, init?: RequestInit) => {
       if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
@@ -249,18 +250,17 @@ describe('CloudCommandMicrosoftPage', () => {
     });
     const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush();
     editUserField(page, 'displayName', 'Ada Byron');
-    editUserField(page, 'department', 'Analytical Engine');
     const root = page.shadowRoot!;
+    expect(root.querySelector('#user-department')).toBeNull();
+    expect(root.querySelector('#user-jobTitle')).toBeNull();
+    expect(root.querySelector('#user-officeLocation')).toBeNull();
     root.querySelector<HTMLButtonElement>('[data-user-save="displayName"]')!.click(); await flush(); await flush();
     const updates = request.mock.calls.map(([, init]) => init?.body).filter(body => String(body).includes('user.update'))
       .map(body => JSON.parse(String(body)).update);
     expect(updates).toEqual([{ displayName: 'Ada Byron' }]);
-    expect(root.querySelector<HTMLInputElement>('#user-department')!.value).toBe('Analytical Engine');
-    expect(root.querySelector<HTMLButtonElement>('[data-user-save="department"]')!.disabled).toBe(false);
-    root.querySelector<HTMLButtonElement>('[data-user-save="department"]')!.click(); await flush(); await flush();
     const finalUpdates = request.mock.calls.map(([, init]) => init?.body).filter(body => String(body).includes('user.update'))
       .map(body => JSON.parse(String(body)).update);
-    expect(finalUpdates).toEqual([{ displayName: 'Ada Byron' }, { department: 'Analytical Engine' }]);
+    expect(finalUpdates).toEqual([{ displayName: 'Ada Byron' }]);
   });
 
   it('reports an uncertain result after bounded readback retries without repeating the mutation', async () => {
@@ -335,11 +335,100 @@ describe('CloudCommandMicrosoftPage', () => {
     expect(page.shadowRoot!.textContent).not.toContain('saved and verified');
   });
 
+  it('saves Global Administrator independently after explicit confirmation and verified readback', async () => {
+    let globalAdmin = false;
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada' } }], columns: [{ key: 'displayName', label: 'User' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration') {
+        const body = JSON.parse(String(init?.body));
+        if (body.type === 'user.get') return Response.json({ id: 'user-1', displayName: 'Ada', accountEnabled: true });
+        if (body.type === 'user.globalAdmin.get') return Response.json({ enabled: globalAdmin });
+        if (body.type === 'user.globalAdmin.set') { globalAdmin = body.enabled; return Response.json({ accepted: true, changed: true, enabled: globalAdmin }); }
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush(); await flush();
+    const root = page.shadowRoot!;
+    const enabled = root.querySelector<HTMLInputElement>('#global-admin-enabled')!;
+    expect(enabled.checked).toBe(false);
+    enabled.click();
+    root.querySelector<HTMLButtonElement>('#global-admin-save')!.click(); await flush();
+    expect(request.mock.calls.some(([, init]) => String(init?.body).includes('user.globalAdmin.set'))).toBe(false);
+    const confirmation = root.querySelector<HTMLInputElement>('#global-admin-confirmation')!;
+    confirmation.value = 'GLOBAL_ADMIN'; confirmation.dispatchEvent(new Event('input'));
+    root.querySelector<HTMLButtonElement>('#global-admin-save')!.click(); await flush(); await flush();
+    const writes = request.mock.calls.map(([, init]) => init?.body).filter(body => String(body).includes('user.globalAdmin.set'));
+    expect(writes).toHaveLength(1);
+    expect(JSON.parse(String(writes[0]))).toEqual({ type: 'user.globalAdmin.set', id: 'user-1', enabled: true, confirmation: 'GLOBAL_ADMIN' });
+    expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.globalAdmin.get'))).toHaveLength(2);
+    expect(root.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('enabled and verified');
+  });
+
+  it('does not infer Global Administrator status when its independent read fails', async () => {
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada' } }], columns: [{ key: 'displayName', label: 'User' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration') {
+        const type = JSON.parse(String(init?.body)).type;
+        if (type === 'user.get') return Response.json({ id: 'user-1', displayName: 'Ada', accountEnabled: true });
+        if (type === 'user.globalAdmin.get') return new Response(JSON.stringify({ error: 'Role lookup denied' }), { status: 403 });
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush(); await flush();
+    const root = page.shadowRoot!;
+    expect(root.querySelector('#global-admin-enabled')).toBeNull();
+    expect(root.querySelector('[data-testid="global-admin-status"]')!.textContent).toContain('unavailable');
+    expect(root.querySelector<HTMLInputElement>('#user-displayName')?.disabled).toBe(false);
+  });
+
+  it('shows sanitized MFA methods and removes one only after confirmation and readback', async () => {
+    let methods = [
+      { id: 'method-phone', type: 'phone', detail: 'mobile ending 4567', removable: true },
+      { id: 'method-authenticator', type: 'microsoftAuthenticator', detail: 'Microsoft Authenticator', removable: false },
+      { type: 'fido2', removable: false },
+      { type: 'password', removable: false },
+    ];
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: 'Ada' } }], columns: [{ key: 'displayName', label: 'User' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration') {
+        const body = JSON.parse(String(init?.body));
+        if (body.type === 'user.get') return Response.json({ id: 'user-1', displayName: 'Ada', accountEnabled: true });
+        if (body.type === 'user.globalAdmin.get') return Response.json({ enabled: false });
+        if (body.type === 'user.mfa.methods.list') return Response.json({ items: methods });
+        if (body.type === 'user.mfa.method.remove') { methods = methods.filter(method => method.id !== body.methodId); return Response.json({ accepted: true }); }
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush();
+    const root = page.shadowRoot!;
+    root.querySelector<HTMLButtonElement>('[data-expand="user-1"]')!.click();
+    root.querySelector<HTMLButtonElement>('[data-mfa="user-1"]')!.click(); await flush(); await flush();
+    expect(root.textContent).toContain('mobile ending 4567');
+    expect(root.textContent).toContain('Microsoft Authenticator');
+    expect(root.textContent).toContain('Security key');
+    expect(root.textContent).toContain('Password');
+    expect(root.textContent).toContain('Save phone, recovery email, re-registration, and per-user MFA state are unavailable');
+    root.querySelector<HTMLButtonElement>('[data-mfa-remove="method-phone"]')!.click();
+    root.querySelector<HTMLButtonElement>('#mfa-removal-submit')!.click(); await flush();
+    expect(request.mock.calls.some(([, init]) => String(init?.body).includes('user.mfa.method.remove'))).toBe(false);
+    const confirmation = root.querySelector<HTMLInputElement>('#mfa-removal-confirmation')!;
+    confirmation.value = 'REMOVE_AUTH_METHOD'; confirmation.dispatchEvent(new Event('input'));
+    root.querySelector<HTMLButtonElement>('#mfa-removal-submit')!.click(); await flush(); await flush();
+    const write = request.mock.calls.map(([, init]) => init?.body).find(body => String(body).includes('user.mfa.method.remove'));
+    expect(JSON.parse(String(write))).toEqual({ type: 'user.mfa.method.remove', id: 'user-1', kind: 'phone', methodId: 'method-phone', confirmation: 'REMOVE_AUTH_METHOD' });
+    expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.mfa.methods.list'))).toHaveLength(2);
+    expect(root.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('removed and verified');
+    expect(root.textContent).not.toContain('method-phone');
+  });
+
   it('requires explicit confirmation before sending a bounded group membership change', async () => {
     const request = vi.fn(async (path: string, init?: RequestInit) => {
       if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
       if (path === '/threecx/connection') return Response.json({ connected: false });
-      if (path === '/microsoft/resources/users') return emptyResource();
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-9', values: { displayName: 'Ada Lovelace', userPrincipalName: 'ada@example.test' } }], columns: [{ key: 'displayName', label: 'User' }, { key: 'userPrincipalName', label: 'Sign-in name' }], complete: true, checkedAt: 'now' });
       if (path === '/microsoft/resources/groups') return Response.json({ items: [{ id: 'group-1', values: { displayName: 'Operators' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
       if (path === '/microsoft/administration') {
         const type = JSON.parse(String(init?.body)).type;
@@ -349,8 +438,13 @@ describe('CloudCommandMicrosoftPage', () => {
       throw new Error(`Unexpected ${path}`);
     });
     const page = mount(request); await flush(); window.location.hash = 'groups'; window.dispatchEvent(new HashChangeEvent('hashchange')); await flush(); await flush();
-    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="group-1"]')!.click(); await flush();
-    const root = page.shadowRoot!; root.querySelector<HTMLInputElement>('#group-member-user-id')!.value = 'user-9'; (root.querySelector<HTMLSelectElement>('#group-member-action')!).value = 'remove';
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="group-1"]')!.click(); await flush(); await flush();
+    const root = page.shadowRoot!;
+    expect(root.querySelector('#group-member-user-id')).toBeNull();
+    expect(root.textContent).toContain('Ada Lovelace');
+    root.querySelector<HTMLInputElement>('#group-member-search')!.value = 'ada'; root.querySelector<HTMLInputElement>('#group-member-search')!.dispatchEvent(new Event('input'));
+    await flush(); root.querySelector<HTMLButtonElement>('[data-member-user="user-9"]')!.click();
+    (root.querySelector<HTMLSelectElement>('#group-member-action')!).value = 'remove';
     root.querySelector<HTMLButtonElement>('#group-member-submit')!.click(); await flush();
     expect(request.mock.calls.some(([, init]) => String(init?.body).includes('group.member.remove'))).toBe(false);
     root.querySelector<HTMLInputElement>('#group-member-confirm')!.checked = true; root.querySelector<HTMLButtonElement>('#group-member-submit')!.click(); await flush();
@@ -400,7 +494,7 @@ describe('CloudCommandMicrosoftPage', () => {
     root.querySelector<HTMLInputElement>('#user-security-confirm')!.click();
     root.querySelector<HTMLButtonElement>('#user-security-submit')!.click(); await flush();
     expect(root.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('Password reset.');
-    expect(root.querySelectorAll('[data-user-save]').length).toBeGreaterThan(1);
+    expect(root.querySelectorAll('[data-user-save]').length).toBe(1);
     expect(root.querySelector<HTMLButtonElement>('[data-user-save="displayName"]')!.disabled).toBe(true);
     root.querySelector<HTMLButtonElement>('[data-user-save="displayName"]')!.click(); await flush();
 

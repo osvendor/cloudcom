@@ -120,12 +120,19 @@ jobs:
           pnpm --filter @cloudcom/ext-cloud-command test
           pnpm --filter @cloudcom/ext-cloud-command test:server
           pnpm --filter @cloudcom/ext-cloud-command test:web
+      - name: Verify the private Cloud Command Exchange broker
+        if: needs.delta.outputs.api == 'true' || needs.delta.outputs.infra == 'true'
+        run: python3 scripts/cloudcom/exchange-worker.test.py
       - name: Run API tests and build when API or shared code changed
         if: needs.delta.outputs.api == 'true' || needs.delta.outputs.shared == 'true'
         run: |
+          pnpm --filter @breeze/shared exec vitest run src/m365/readActions.test.ts
+          pnpm --filter @breeze/m365-graph-read-executor exec tsc --noEmit
+          pnpm --filter @breeze/m365-graph-read-executor exec vitest run src/microsoft/graphClient.test.ts src/microsoft/readActions.test.ts
+          pnpm --filter @breeze/m365-graph-read-executor build
           pnpm --filter @breeze/api exec vitest run src/services/monitors/monitorCompiler.test.ts src/services/monitors/monitorCompiler.w04.test.ts src/services/automationReferenceAuthorization.test.ts src/jobs/automationWorker.monitorBinding.test.ts
           pnpm --filter @breeze/api exec vitest run src/services/cloudcom/remoteAccessOptions.test.ts src/routes/devices/cloudcomRemoteAccess.test.ts src/services/remoteAccessLauncher.test.ts src/services/remoteAccessProviders.test.ts src/routes/devices/core.remoteAccessLaunch.test.ts
-          pnpm --filter @breeze/api exec vitest run src/extensions/builtinExtensions.test.ts src/extensions/builtinRegistry.test.ts src/extensions/cloudCommandMicrosoft.test.ts src/extensions/cloudCommandAdminRuntime.test.ts src/extensions/cloudCommandAdminAuthorization.test.ts src/services/m365ControlPlane/readActionService.test.ts src/services/m365ControlPlane/readActionService.syncRoute.test.ts src/extensions/webRegistry.test.ts src/extensions/webAssets.test.ts src/extensions/stageExtension.test.ts src/extensions/gateway.test.ts src/services/urlSafety.test.ts src/services/urlSafety.tripwire.test.ts src/routes/extensionsWeb.test.ts
+          pnpm --filter @breeze/api exec vitest run src/extensions/builtinExtensions.test.ts src/extensions/builtinRegistry.test.ts src/extensions/cloudCommandMicrosoft.test.ts src/extensions/cloudCommandGoogle.test.ts src/extensions/cloudCommandAdminRuntime.test.ts src/extensions/cloudCommandAdminAuthorization.test.ts src/services/m365ControlPlane/readActionService.test.ts src/services/m365ControlPlane/readActionService.syncRoute.test.ts src/extensions/webRegistry.test.ts src/extensions/webAssets.test.ts src/extensions/stageExtension.test.ts src/extensions/gateway.test.ts src/services/urlSafety.test.ts src/services/urlSafety.tripwire.test.ts src/routes/extensionsWeb.test.ts
           pnpm --filter @breeze/api build
       - name: Prove Cloud Command 3CX migration and RLS boundaries
         if: needs.delta.outputs.api == 'true' || needs.delta.outputs.shared == 'true'

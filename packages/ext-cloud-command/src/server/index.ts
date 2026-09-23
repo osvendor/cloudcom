@@ -8,11 +8,18 @@ import { createProvider, ProviderError, type GuardedFetch } from './transport';
 import type { NativeMicrosoftServices } from './native-microsoft';
 export type { NativeMicrosoftServices, MicrosoftRequest, MicrosoftResource } from './native-microsoft';
 import { mountMicrosoftRoutes } from './microsoft';
+import { mountDirectoryPreferenceRoutes } from './directory-preferences';
+import { mountGoogleRoutes } from './google';
+import type { NativeGoogleServices } from './native-google';
+export type { NativeGoogleServices, GoogleRequest, GoogleDirectoryKind } from './native-google';
 import { mountThreeCxDetails, ThreeCxDetailError } from './threecx-details';
+import { mountThreeCxDashboard } from './threecx-dashboard';
 import type { AdministrationRuntime } from './admin-runtime';
 import { createAdministrationServices } from './admin-services';
 export type { AdministrationRuntime } from './admin-runtime';
 export { createAdministrationTokenProvider } from './admin-token-provider';
+export { createUnixSocketExchangeWorkerPort } from './exchange-socket-client';
+export type { ExchangeDescriptorRegistry } from './exchange-services';
 
 const table = 'cloudcommand_threecx_connections';
 export type ThreeCxConnection = { id: string; org_id: string; origin: string; client_id: string; secret_ciphertext: string;
@@ -40,11 +47,11 @@ function summary(row: Row, canManage: boolean) {
 }
 
 /** Only the statically compiled host can provide this public-egress transport. */
-export function createCloudCommandExtension(fetch: GuardedFetch, microsoft?: NativeMicrosoftServices, administration?: AdministrationRuntime): BreezeExtensionV1 {
-  return { register(registrar, context) { registrar.mountRoute(createRoutes(context, fetch, microsoft, administration) as unknown as Hono); } };
+export function createCloudCommandExtension(fetch: GuardedFetch, microsoft?: NativeMicrosoftServices, administration?: AdministrationRuntime, google?: NativeGoogleServices): BreezeExtensionV1 {
+  return { register(registrar, context) { registrar.mountRoute(createRoutes(context, fetch, microsoft, administration, google) as unknown as Hono); } };
 }
 
-export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFetch, microsoft?: NativeMicrosoftServices, administration?: AdministrationRuntime) {
+export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFetch, microsoft?: NativeMicrosoftServices, administration?: AdministrationRuntime, google?: NativeGoogleServices) {
   const app = new Hono<{ Variables: Variables }>();
   const provider = createProvider(fetch);
   async function connection(orgId: string) {
@@ -142,6 +149,9 @@ export function createRoutes(context: ExtensionRuntimeContext, fetch: GuardedFet
     return c.json(await service.listExtensions(scope, row.id, skip));
   });
   mountThreeCxDetails(app, { connection, credentials: row => ({ origin: row.origin, clientId: row.client_id, secret: secret(row) }), provider, context });
+  mountThreeCxDashboard(app, { connection, credentials: row => ({ origin: row.origin, clientId: row.client_id, secret: secret(row) }), provider, context });
   mountMicrosoftRoutes(app, administration ? createAdministrationServices(context, fetch, administration) : microsoft);
+  mountGoogleRoutes(app, google);
+  mountDirectoryPreferenceRoutes(app, context);
   return app;
 }

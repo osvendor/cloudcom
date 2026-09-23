@@ -230,6 +230,12 @@ export async function executeGraphReadAction(
         }, fields);
       }
 
+      case 'm365.report.onedrive.usage.list': {
+        if (!graphClient.readOneDriveUsageReport) throw new GraphClientError('graph_permission_missing');
+        const report = await graphClient.readOneDriveUsageReport({ accessToken });
+        return { success: true, kind: 'collection', items: report.items.map(item => project(item, fields)), truncated: report.truncated };
+      }
+
       case 'm365.sites.list': {
         const pageSize = DEFAULT_PAGE_SIZE;
         const query = selectQuery(fields, pageSize);

@@ -3,6 +3,9 @@ import { randomInt } from 'node:crypto';
 import type { GuardedFetch } from './transport';
 
 const ORIGIN = 'https://graph.microsoft.com/v1.0';
+// Microsoft Entra built-in Global Administrator role template. This is a fixed server-side
+// constant so a browser cannot select another privileged directory role.
+const GLOBAL_ADMINISTRATOR_ROLE_DEFINITION_ID = '62e90394-69f5-4237-9190-012177145e10';
 const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i).transform(value => value.toLowerCase());
 const text = z.string().max(256);
 const user = z.object({
@@ -19,15 +22,27 @@ const license = z.object({
   id: z.string().max(128), skuId: uuid, skuPartNumber: text, consumedUnits: z.number().int().nonnegative(),
   capabilityStatus: text, prepaidUnits: z.object({ enabled: z.number().int(), suspended: z.number().int(), warning: z.number().int() }),
 });
+const directoryRoleAssignment = z.object({
+  id: uuid,
+  principalId: uuid,
+  roleDefinitionId: z.literal(GLOBAL_ADMINISTRATOR_ROLE_DEFINITION_ID),
+  directoryScopeId: z.literal('/'),
+});
 export const adminUserUpdateSchema = z.object({
   displayName: text.min(1).optional(), givenName: text.nullable().optional(), surname: text.nullable().optional(),
   department: text.nullable().optional(), jobTitle: text.nullable().optional(), officeLocation: text.nullable().optional(),
   accountEnabled: z.boolean().optional(),
 }).strict().refine(value => Object.keys(value).length > 0);
 export type AdminUserUpdate = z.infer<typeof adminUserUpdateSchema>;
+export const adminUserCreateSchema = z.object({
+  displayName: z.string().trim().min(1).max(256),
+  userPrincipalName: z.string().trim().min(3).max(320).regex(/^[A-Za-z0-9'.!#^~_-]+@[A-Za-z0-9.-]+$/),
+}).strict();
+export type AdminUserCreate = z.infer<typeof adminUserCreateSchema>;
 export type AdminGraphErrorCode = 'invalid_input' | 'credential_unavailable' | 'tenant_identity_mismatch'
   | 'invalid_provider_response' | 'provider_access_denied' | 'provider_rate_limited' | 'provider_rejected'
-  | 'provider_unreachable' | 'unknown_write_outcome' | 'unsupported_group';
+  | 'provider_unreachable' | 'unknown_write_outcome' | 'unsupported_group'
+  | 'role_assignment_state_unknown' | 'last_global_administrator';
 export class AdminGraphError extends Error {
   constructor(public readonly code: AdminGraphErrorCode) { super(code); }
 }
@@ -67,7 +82,7 @@ export function createAdminGraphProvider(options: {
   acquireToken: (tenantId: string) => Promise<string>;
 }) {
   const tenantId = parse(uuid, options.tenantId, 'invalid_input');
-  async function request(token: string, path: string, method = 'GET', body?: unknown) {
+  async function request(token: string, path: string, method = 'GET', body?: unknown, responseBody = false) {
     const mutation = method !== 'GET';
     try {
       const result = await options.fetch(`${ORIGIN}${path}`, {
@@ -79,7 +94,7 @@ export function createAdminGraphProvider(options: {
       if (result.status === 429) throw new AdminGraphError('provider_rate_limited');
       if (result.status >= 500 && mutation) throw new AdminGraphError('unknown_write_outcome');
       if (!result.ok || result.status >= 300) throw new AdminGraphError('provider_rejected');
-      if (mutation) return undefined;
+      if (mutation && !responseBody) return undefined;
       return await result.json() as unknown;
     } catch (error) {
       if (error instanceof AdminGraphError) throw error;
@@ -130,7 +145,51 @@ export function createAdminGraphProvider(options: {
     else await request(token, `/groups/${groupId}/members/$ref`, 'POST', { '@odata.id': `${ORIGIN}/directoryObjects/${userId}` });
     return { accepted: true as const };
   }
+  async function globalAdministratorAssignments(token: string) {
+    // Do not follow a provider-controlled nextLink here. Removing a role is only safe when
+    // the complete tenant-scope assignment set is known; a partial response fails closed.
+    const result = parse(z.object({ value: z.array(directoryRoleAssignment).max(100), '@odata.nextLink': z.string().optional() }),
+      await request(token, `/roleManagement/directory/roleAssignments?$filter=roleDefinitionId%20eq%20${GLOBAL_ADMINISTRATOR_ROLE_DEFINITION_ID}&$select=id,principalId,roleDefinitionId,directoryScopeId&$top=100`),
+      'invalid_provider_response');
+    if (result['@odata.nextLink']) throw new AdminGraphError('role_assignment_state_unknown');
+    return result.value;
+  }
   return {
+    async listVerifiedUserDomains() {
+      const token = await session();
+      const organization = parse(z.object({ value: z.array(z.object({
+        id: uuid, verifiedDomains: z.array(z.object({ name: z.string().min(1).max(255), isVerified: z.boolean() })).max(256),
+      })).length(1) }), await request(token, '/organization?$select=id,verifiedDomains'), 'invalid_provider_response');
+      if (organization.value[0]!.id !== tenantId) throw new AdminGraphError('tenant_identity_mismatch');
+      return { domains: organization.value[0]!.verifiedDomains.filter(domain => domain.isVerified).map(domain => domain.name.toLowerCase()) };
+    },
+    async createUser(input: AdminUserCreate, authorize?: () => Promise<void>) {
+      const value = parse(adminUserCreateSchema, input, 'invalid_input');
+      const [localPart, domain] = value.userPrincipalName.split('@');
+      if (!localPart || localPart.length > 64 || !domain) throw new AdminGraphError('invalid_input');
+      const token = await session();
+      requireAppRole(token, 'User.ReadWrite.All');
+      const organization = parse(z.object({ value: z.array(z.object({
+        id: uuid, verifiedDomains: z.array(z.object({ name: z.string().min(1).max(255), isVerified: z.boolean() })).max(256),
+      })).length(1) }), await request(token, '/organization?$select=id,verifiedDomains'), 'invalid_provider_response');
+      if (organization.value[0]!.id !== tenantId) throw new AdminGraphError('tenant_identity_mismatch');
+      if (!organization.value[0]!.verifiedDomains.some(entry => entry.isVerified && entry.name.toLowerCase() === domain.toLowerCase()))
+        throw new AdminGraphError('invalid_input');
+      await authorize?.();
+      const temporaryPassword = createTemporaryPassword();
+      const result = await request(token, '/users', 'POST', {
+        accountEnabled: true, displayName: value.displayName, mailNickname: localPart,
+        userPrincipalName: value.userPrincipalName,
+        passwordProfile: { password: temporaryPassword, forceChangePasswordNextSignIn: true },
+      }, true);
+      let created: { id: string; userPrincipalName: string };
+      try { created = z.object({ id: uuid, userPrincipalName: z.string().min(3).max(320) }).parse(result); }
+      catch { throw new AdminGraphError('unknown_write_outcome'); }
+      if (created.userPrincipalName.toLowerCase() !== value.userPrincipalName.toLowerCase())
+        throw new AdminGraphError('unknown_write_outcome');
+      return { accepted: true as const, id: created.id, userPrincipalName: created.userPrincipalName,
+        temporaryPassword, forceChangePasswordNextSignIn: true as const };
+    },
     listUsers: () => collection(`/users?$select=${userSelect}&$top=100`, user),
     listGroups: () => collection(`/groups?$select=${groupSelect}&$top=100`, group),
     listLicenses: () => collection(`/subscribedSkus?$select=${licenseSelect}`, license),
@@ -163,6 +222,43 @@ export function createAdminGraphProvider(options: {
       await authorize?.();
       await request(token, `/users/${id}/revokeSignInSessions`, 'POST');
       return { accepted: true as const };
+    },
+    async getGlobalAdministrator(id: string) {
+      id = parse(uuid, id, 'invalid_input');
+      const token = await session();
+      await resource(token, '/users', id, user, userSelect);
+      const assignments = await globalAdministratorAssignments(token);
+      return { enabled: assignments.some(assignment => assignment.principalId === id) };
+    },
+    async setGlobalAdministrator(id: string, enabled: boolean, authorize?: () => Promise<void>) {
+      id = parse(uuid, id, 'invalid_input');
+      if (typeof enabled !== 'boolean') throw new AdminGraphError('invalid_input');
+      const token = await session();
+      requireAppRole(token, 'RoleManagement.ReadWrite.Directory');
+      await authorize?.();
+      await resource(token, '/users', id, user, userSelect);
+      await authorize?.();
+      const before = await globalAdministratorAssignments(token);
+      const targetAssignments = before.filter(assignment => assignment.principalId === id);
+      if (targetAssignments.length > 1) throw new AdminGraphError('role_assignment_state_unknown');
+      if (enabled) {
+        if (targetAssignments.length === 1) return { accepted: true as const, changed: false as const, enabled: true as const };
+        await authorize?.();
+        await request(token, '/roleManagement/directory/roleAssignments', 'POST', {
+          principalId: id, roleDefinitionId: GLOBAL_ADMINISTRATOR_ROLE_DEFINITION_ID, directoryScopeId: '/',
+        });
+      } else {
+        if (targetAssignments.length === 0) return { accepted: true as const, changed: false as const, enabled: false as const };
+        // Count distinct principals so duplicate malformed rows cannot permit removal.
+        if (new Set(before.map(assignment => assignment.principalId)).size <= 1)
+          throw new AdminGraphError('last_global_administrator');
+        await authorize?.();
+        await request(token, `/roleManagement/directory/roleAssignments/${targetAssignments[0]!.id}`, 'DELETE');
+      }
+      const after = await globalAdministratorAssignments(token);
+      const enabledAfter = after.some(assignment => assignment.principalId === id);
+      if (enabledAfter !== enabled) throw new AdminGraphError('unknown_write_outcome');
+      return { accepted: true as const, changed: true as const, enabled };
     },
     addGroupMember: (groupId: string, userId: string) => membership(groupId, userId, false),
     removeGroupMember: (groupId: string, userId: string) => membership(groupId, userId, true),

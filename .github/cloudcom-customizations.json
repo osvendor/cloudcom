@@ -156,6 +156,89 @@
       ]
     },
     {
+      "id": "cloud-command-microsoft-parity",
+      "requiredFiles": [
+        "packages/ext-cloud-command/src/server/admin-execution.ts",
+        "packages/ext-cloud-command/src/server/admin-graph-provider.ts",
+        "packages/ext-cloud-command/src/server/admin-auth-methods.ts",
+        "packages/ext-cloud-command/src/server/admin-auth-methods.test.ts",
+        "packages/ext-cloud-command/src/server/exchange-contract.ts",
+        "packages/ext-cloud-command/src/server/exchange-socket-client.ts",
+        "packages/ext-cloud-command/src/server/exchange-contract.test.ts",
+        "packages/ext-cloud-command/src/server/exchange-socket-client.test.ts",
+        "packages/ext-cloud-command/src/server/directory-preferences.ts",
+        "packages/ext-cloud-command/src/server/directory-preferences.test.ts",
+        "packages/ext-cloud-command/src/server/directory-preferences.migration.test.ts",
+        "apps/m365-graph-read-executor/src/microsoft/graphClient.ts",
+        "apps/m365-graph-read-executor/src/microsoft/graphClient.test.ts",
+        "apps/m365-graph-read-executor/src/microsoft/readActions.ts",
+        "apps/m365-graph-read-executor/src/microsoft/readActions.test.ts",
+        "packages/ext-cloud-command/migrations/2026-09-22-microsoft-directory-preferences.sql",
+        "scripts/cloudcom/exchange-worker.py",
+        "scripts/cloudcom/exchange-worker.test.py",
+        "scripts/cloudcom/exchange-persistent.ps1",
+        "docs/cloudcom-microsoft-exchange-worker.md"
+      ],
+      "hooks": [
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "python3 scripts/cloudcom/exchange-worker.test.py"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "src/m365/readActions.test.ts"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "@breeze/m365-graph-read-executor exec vitest run"
+        },
+        {
+          "file": ".github/scripts/cloudcom-delta.mjs",
+          "contains": "packages/shared/src/m365/readActions.ts"
+        },
+        {
+          "file": ".github/scripts/cloudcom-delta.mjs",
+          "contains": "cloudCommandReportExecutorPaths"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand_microsoft_directory_preferences"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/server/index.ts",
+          "contains": "mountDirectoryPreferenceRoutes(app, context)"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/web/microsoft.ts",
+          "contains": "data-directory-scope=\"exclude\""
+        },
+        {
+          "file": "apps/api/src/__tests__/integration/cloudCommandThreeCx.integration.test.ts",
+          "contains": "isolates Microsoft directory exclusions"
+        }
+      ]
+    },
+    {
+      "id": "cloud-command-google-directory",
+      "requiredFiles": [
+        "apps/api/src/extensions/cloudCommandGoogle.ts",
+        "apps/api/src/extensions/cloudCommandGoogle.test.ts",
+        "packages/ext-cloud-command/src/server/native-google.ts",
+        "packages/ext-cloud-command/src/server/google.ts",
+        "packages/ext-cloud-command/src/server/google.test.ts",
+        "packages/ext-cloud-command/src/web/google.ts",
+        "packages/ext-cloud-command/src/web/google.test.ts",
+        "apps/web/src/components/extensions/useExtensionNavigation.ts"
+      ],
+      "hooks": [
+        { "file": "packages/ext-cloud-command/src/server/index.ts", "contains": "mountGoogleRoutes(app, google)" },
+        { "file": "packages/ext-cloud-command/src/web/index.ts", "contains": "import './google'" },
+        { "file": "packages/ext-cloud-command/manifest.json", "contains": "cloudcommand-google-page" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.directory" },
+        { "file": ".github/workflows/cloudcom-ci.yml", "contains": "cloudCommandGoogle.test.ts" }
+      ]
+    },
+    {
       "id": "unifi-sync-lock-order",
       "requiredFiles": [
         "apps/api/src/services/unifi/unifiSyncLocks.ts",

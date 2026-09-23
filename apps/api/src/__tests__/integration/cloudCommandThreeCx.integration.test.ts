@@ -12,6 +12,35 @@ import { createAdministrationStore, type ConsentAttempt } from '../../../../../p
 import type { ExtensionRuntimeContext } from '@breeze/extension-sdk';
 
 describe('Cloud Command 3CX database boundary', () => {
+  it('isolates Microsoft directory exclusions by organization and technician under forced RLS', async () => {
+    const admin = getTestDb();
+    const [partner] = await admin.insert(partners).values({ name: 'Directory preference isolation', slug: `pref-${crypto.randomUUID()}`, type: 'msp' }).returning();
+    const [orgA, orgB] = await admin.insert(organizations).values(['a', 'b'].map(suffix => ({
+      partnerId: partner!.id, name: `Preference ${suffix}`, slug: `pref-${suffix}-${crypto.randomUUID()}`, currencyCode: 'USD',
+    }))).returning();
+    const [actorA, actorB] = await admin.insert(users).values(['a', 'b'].map(suffix => ({
+      partnerId: partner!.id, name: `Technician ${suffix}`, email: `${crypto.randomUUID()}@example.test`, status: 'active' as const,
+    }))).returning();
+    const target = crypto.randomUUID();
+    const state = await admin.execute(sql`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = 'cloudcommand_microsoft_directory_preferences'::regclass`);
+    expect(state[0]).toMatchObject({ relrowsecurity: true, relforcerowsecurity: true });
+    const access = (orgId: string, userId: string) => ({ scope: 'organization' as const, orgId,
+      partnerId: partner!.id, accessibleOrgIds: [orgId], userId });
+    const insert = (orgId: string, actorId: string) => sql`INSERT INTO cloudcommand_microsoft_directory_preferences
+      (org_id, actor_id, microsoft_user_id, excluded) VALUES (${orgId}::uuid, ${actorId}::uuid, ${target}::uuid, true)`;
+    await withDbAccessContext(access(orgA!.id, actorA!.id), async () => {
+      const [rlsContext] = await db.execute(sql`SELECT breeze_current_user_id() AS actor_id, breeze_has_org_access(${orgA!.id}::uuid) AS org_access`);
+      expect(rlsContext).toMatchObject({ actor_id: actorA!.id, org_access: true });
+      await db.execute(insert(orgA!.id, actorA!.id));
+      expect((await db.execute(sql`SELECT actor_id FROM cloudcommand_microsoft_directory_preferences`)).map(row => row.actor_id)).toEqual([actorA!.id]);
+    });
+    await withDbAccessContext(access(orgA!.id, actorB!.id), async () => {
+      expect(await db.execute(sql`SELECT actor_id FROM cloudcommand_microsoft_directory_preferences`)).toHaveLength(0);
+    });
+    await expect(withDbAccessContext(access(orgA!.id, actorB!.id), () => db.execute(insert(orgA!.id, actorA!.id)))).rejects.toThrow();
+    await expect(withDbAccessContext(access(orgB!.id, actorA!.id), () => db.execute(insert(orgA!.id, actorA!.id)))).rejects.toThrow();
+    expect(await getAppDb().execute(sql`SELECT * FROM cloudcommand_microsoft_directory_preferences`)).toHaveLength(0);
+  });
   it.each(['cloudcommand_microsoft_admin_connections', 'cloudcommand_microsoft_admin_consent'])(
     'enforces native administration RLS for %s', async table => {
       const admin = getTestDb();

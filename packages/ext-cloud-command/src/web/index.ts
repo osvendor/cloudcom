@@ -1,6 +1,8 @@
 import './overview';
 import './microsoft';
 import './connect';
+import './google';
+import './threecx-dashboard';
 import { bindThreeCxDetail, detailStyles, detailTab, isDirty, renderThreeCxDetail, type DetailTab } from './threecx-detail';
 import { hasForwardingChanges, mountForwardingEditors } from './threecx-detail-forwarding';
 import type { ThreeCxDetail, ThreeCxDetailChanges } from '../threecx/detail-contract';

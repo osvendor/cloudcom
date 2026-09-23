@@ -4,6 +4,7 @@ import type { ExtensionRuntimeContext } from '@breeze/extension-sdk';
 import type { AdministrationRuntime } from './admin-runtime';
 import { createAdministrationStore } from './admin-store';
 import { createAdministrationExecutor, type AdministrationConnection } from './admin-execution';
+import { createExchangeMailboxInventoryService } from './exchange-services';
 import type { MicrosoftRequest, NativeMicrosoftServices } from './native-microsoft';
 import type { GuardedFetch } from './transport';
 
@@ -39,7 +40,12 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
       resourceId: request.orgId, details, result: 'success' });
   }
   const execute = createAdministrationExecutor<MicrosoftRequest>({
-    authorize: (request, orgId, operation) => runtime.authorize(request, orgId, operation === 'user.update' || operation.startsWith('group.member.')),
+    authorize: (request, orgId, operation) => runtime.authorize(request, orgId,
+      operation === 'user.create' || operation === 'user.update' || operation === 'user.password.reset'
+      || operation === 'user.sessions.revoke' || operation === 'user.globalAdmin.get'
+      || operation === 'user.globalAdmin.set'
+      || operation === 'user.mfa.methods.list' || operation === 'user.mfa.method.remove'
+      || operation.startsWith('group.member.')),
     loadConnection: async (_request, orgId) => {
       const row = await store.load(orgId);
       if (!row) return null;
@@ -52,6 +58,23 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
       result: event.outcome === 'rejected' || event.outcome === 'unknown' ? 'failure' : 'success',
       details: { executionId: event.executionId, targets: event.targets, changedFields: event.changedFields, outcome: event.outcome ?? 'pending' } }),
   });
+  const mailboxInventory = z.object({ type: z.literal('mailbox.inventory'), pageSize: z.number().int().min(1).max(200).optional() }).strict();
+  async function exchangeService() {
+    const bridge = await runtime.exchange?.();
+    if (!bridge) throw new AdministrationSetupError('exchange_unavailable');
+    return createExchangeMailboxInventoryService<MicrosoftRequest>({
+      authorize: async (request, organizationId) => runtime.authorize(request, organizationId, false),
+      loadConnection: async (_request, organizationId) => {
+        const row = await store.load(organizationId);
+        if (!row) return null;
+        const { tenantName: _tenantName, verifiedAt: _verifiedAt, ...value } = row;
+        return value;
+      },
+      registry: bridge.registry, worker: bridge.worker,
+      audit: event => runtime.audit({ orgId: event.organizationId, actorId: event.actorId, action: event.action,
+        resourceId: event.details.connectionId as string ?? event.organizationId, details: event.details, result: event.result }),
+    });
+  }
   async function probe(connection: Pick<AdministrationConnection, 'tenantId' | 'clientId' | 'credentialVersion'>) {
     const token = await runtime.acquireToken(connection);
     // Token is obtained only from the fixed Microsoft token endpoint using the bound certificate.
@@ -93,6 +116,8 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
       async status(request, recheck) {
         const connection = await services.connection(request);
         const row = await store.load(request.orgId);
+        let exchangeReady = false;
+        try { exchangeReady = !!await runtime.exchange?.(); } catch { /* capability remains pending */ }
         let verified = false;
         if (recheck && connection.enabled && row) {
           await authorize(request, true);
@@ -108,7 +133,7 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
           capabilities: [
             { id: 'inventory', label: 'Directory inventory', status: connection.enabled ? 'ready' : 'pending', message: verified ? 'Tenant and application permissions verified.' : undefined },
             { id: 'administration', label: 'User and group administration', status: connection.enabled ? 'ready' : 'pending' },
-            { id: 'exchange', label: 'Exchange administration', status: 'pending', message: 'Uses this same connection; service implementation is pending.' },
+            { id: 'exchange', label: 'Exchange administration', status: 'pending', message: exchangeReady ? 'Worker configured; mailbox inventory requires a successful provider check.' : 'Exchange worker is not configured in this host.' },
             { id: 'collaboration', label: 'Teams, SharePoint and OneDrive', status: 'pending', message: 'Uses this same connection; service implementation is pending.' },
             { id: 'content-search', label: 'Basic content search and export', status: 'pending', message: 'Search and export API support is still being validated.' },
           ] };
@@ -155,15 +180,26 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
         const tenantName = await probe({ tenantId: attempt.tenant_id, clientId: attempt.client_id, credentialVersion: attempt.credential_version });
         await audit(request, 'consent.verified', { tenantId: verified.tenantId, administratorObjectId: verified.administratorObjectId });
         if (!await store.save(attempt, tenantName)) throw new AdministrationSetupError('connection_changed');
+        // Exchange is provisioned from this one saved connection when its host sidecar exists.
+        // A worker configuration gap must not invalidate otherwise successful Graph Connect.
+        try {
+          const saved = await store.load(request.orgId);
+          if (saved) await (await exchangeService()).provision((({ tenantName: _name, verifiedAt: _verifiedAt, ...value }) => value)(saved));
+        } catch { /* inventory will retry provisioning only after its own authorization/fence */ }
         await store.finish(request.orgId, digest(data.state));
         return { success: true };
       },
-      async execute(request, input) { return execute(request, request.orgId, input); },
+      async execute(request, input) {
+        const exchange = mailboxInventory.safeParse(input);
+        if (exchange.success) return (await exchangeService()).inventory(request, request.orgId, { pageSize: exchange.data.pageSize });
+        return execute(request, request.orgId, input);
+      },
       async disconnect(request, input) {
         await authorize(request, true);
         const data = z.object({ version: z.number().int().positive() }).strict().parse(input);
         await audit(request, 'disconnect');
         if (!await store.disable(request.orgId, data.version)) throw new AdministrationSetupError('connection_changed');
+        try { await (await exchangeService()).revoke(request.orgId); } catch { /* disabled generation fences all future dispatches */ }
         return { success: true };
       },
     },

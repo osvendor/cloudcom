@@ -253,7 +253,12 @@ export const BUILTINS: readonly BuiltinExtension[] = [
       acquireToken: async connection => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.acquireToken(connection),
       verifyAuthorization: async input => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.verifyAuthorization(input),
       audit: async event => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.audit(event),
+      exchange: async () => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.exchange(),
       authorize: async (request, orgId, mutation) => (await import('./cloudCommandAdminAuthorization')).authorizeCloudCommandAdministration(request, orgId, mutation),
+    }, {
+      version: 1,
+      connection: async request => (await import('./cloudCommandGoogle')).nativeGoogleServices.connection(request),
+      directory: async (request, kind, pageToken) => (await import('./cloudCommandGoogle')).nativeGoogleServices.directory(request, kind, pageToken),
     }),
     name: 'cloudcommand',
     packageDir: 'packages/ext-cloud-command',

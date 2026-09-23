@@ -3,6 +3,7 @@ import { createAdminGraphProvider } from './admin-graph-provider';
 
 const TENANT = '11111111-1111-4111-8111-111111111111';
 const USER = '22222222-2222-4222-8222-222222222222';
+const OTHER_ADMIN = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const GROUP = '33333333-3333-4333-8333-333333333333';
 const ORIGIN = 'https://graph.microsoft.com/v1.0';
 function response(body: unknown, status = 200) { return new Response(JSON.stringify(body), { status }); }
@@ -15,6 +16,37 @@ const staticGroup = { id: GROUP, securityEnabled: true, mailEnabled: false, grou
 afterEach(() => vi.useRealTimers());
 
 describe('bounded Microsoft administration provider', () => {
+  it('creates one user only in a verified tenant domain and returns a one-time password', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ value: [{ id: TENANT, verifiedDomains: [{ name: 'example.test', isVerified: true }, { name: 'unverified.test', isVerified: false }] }] }))
+      .mockResolvedValueOnce(response({ id: USER, userPrincipalName: 'new@example.test', passwordProfile: { password: 'do-not-echo' } }, 201));
+    const fence = vi.fn(async () => {});
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    const result = await provider.createUser({ displayName: 'New User', userPrincipalName: 'new@example.test' }, fence);
+    expect(result).toMatchObject({ accepted: true, id: USER, userPrincipalName: 'new@example.test', forceChangePasswordNextSignIn: true });
+    expect(result.temporaryPassword).toHaveLength(32);
+    expect(fence).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
+    const body = JSON.parse(fetch.mock.calls[2]![1].body);
+    expect(body).toEqual({ accountEnabled: true, displayName: 'New User', mailNickname: 'new', userPrincipalName: 'new@example.test', passwordProfile: { password: result.temporaryPassword, forceChangePasswordNextSignIn: true } });
+    expect(JSON.stringify(result)).not.toContain('do-not-echo');
+  });
+
+  it('rejects unverified domains, missing create permission, and arbitrary create properties without writing', async () => {
+    for (const [input, roles] of [
+      [{ displayName: 'New User', userPrincipalName: 'new@unverified.test' }, ['User.ReadWrite.All']],
+      [{ displayName: 'New User', userPrincipalName: 'new@example.test' }, []],
+      [{ displayName: 'New User', userPrincipalName: 'new@example.test', isAdmin: true }, ['User.ReadWrite.All']],
+    ] as const) {
+      const token = `h.${Buffer.from(JSON.stringify({ roles })).toString('base64url')}.s`;
+      const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+        .mockResolvedValueOnce(response({ value: [{ id: TENANT, verifiedDomains: [{ name: 'example.test', isVerified: true }] }] }));
+      const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+      await expect(provider.createUser(input as never)).rejects.toBeTruthy();
+      expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(0);
+    }
+  });
   it.each(['common', 'organizations', '../users', `${TENANT}?evil=1`])('rejects invalid tenant %s', tenantId => {
     const fetch = vi.fn();
     expect(() => createAdminGraphProvider({ tenantId, fetch, acquireToken: vi.fn() })).toThrow('invalid_input');
@@ -106,6 +138,76 @@ describe('bounded Microsoft administration provider', () => {
     const h = harness();
     await expect(h.provider.revokeUserSessions(USER)).rejects.toMatchObject({ code: 'provider_access_denied' });
     expect(h.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('sets only the fixed Global Administrator role, requires its app role, and verifies the result', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['RoleManagement.ReadWrite.Directory'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ id: USER, displayName: 'Fixture' }))
+      .mockResolvedValueOnce(response({ value: [{ id: OTHER_ADMIN, principalId: OTHER_ADMIN, roleDefinitionId: '62e90394-69f5-4237-9190-012177145e10', directoryScopeId: '/' }] }))
+      .mockResolvedValueOnce(response({ id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' }, 201))
+      .mockResolvedValueOnce(response({ value: [
+        { id: OTHER_ADMIN, principalId: OTHER_ADMIN, roleDefinitionId: '62e90394-69f5-4237-9190-012177145e10', directoryScopeId: '/' },
+        { id: USER, principalId: USER, roleDefinitionId: '62e90394-69f5-4237-9190-012177145e10', directoryScopeId: '/' },
+      ] }));
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    expect(await provider.setGlobalAdministrator(USER, true)).toEqual({ accepted: true, changed: true, enabled: true });
+    expect(fetch.mock.calls[3]).toEqual([`${ORIGIN}/roleManagement/directory/roleAssignments`, expect.objectContaining({
+      method: 'POST', body: JSON.stringify({ principalId: USER, roleDefinitionId: '62e90394-69f5-4237-9190-012177145e10', directoryScopeId: '/' }),
+    })]);
+    expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
+  });
+
+  it('requires the role-management app permission before reading a Global Administrator target', async () => {
+    const h = harness();
+    await expect(h.provider.setGlobalAdministrator(USER, true)).rejects.toMatchObject({ code: 'provider_access_denied' });
+    expect(h.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('reads a Global Administrator assignment without requiring the write app permission', async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ id: USER, displayName: 'Fixture' }))
+      .mockResolvedValueOnce(response({ value: [{ id: USER, principalId: USER, roleDefinitionId: '62e90394-69f5-4237-9190-012177145e10', directoryScopeId: '/' }] }));
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => 'read-only-token' });
+    await expect(provider.getGlobalAdministrator(USER)).resolves.toEqual({ enabled: true });
+    expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(0);
+  });
+
+  it('refuses to remove the last Global Administrator without dispatching a write', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['RoleManagement.ReadWrite.Directory'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ id: USER, displayName: 'Fixture' }))
+      .mockResolvedValueOnce(response({ value: [{ id: USER, principalId: USER, roleDefinitionId: '62e90394-69f5-4237-9190-012177145e10', directoryScopeId: '/' }] }));
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    await expect(provider.setGlobalAdministrator(USER, false)).rejects.toMatchObject({ code: 'last_global_administrator' });
+    expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(0);
+  });
+
+  it('removes only the target tenant-scope assignment and verifies it is gone', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['RoleManagement.ReadWrite.Directory'] })).toString('base64url')}.s`;
+    const targetAssignment = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ id: USER, displayName: 'Fixture' }))
+      .mockResolvedValueOnce(response({ value: [
+        { id: targetAssignment, principalId: USER, roleDefinitionId: '62e90394-69f5-4237-9190-012177145e10', directoryScopeId: '/' },
+        { id: OTHER_ADMIN, principalId: OTHER_ADMIN, roleDefinitionId: '62e90394-69f5-4237-9190-012177145e10', directoryScopeId: '/' },
+      ] }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(response({ value: [{ id: OTHER_ADMIN, principalId: OTHER_ADMIN, roleDefinitionId: '62e90394-69f5-4237-9190-012177145e10', directoryScopeId: '/' }] }));
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    expect(await provider.setGlobalAdministrator(USER, false)).toEqual({ accepted: true, changed: true, enabled: false });
+    expect(fetch.mock.calls[3]).toEqual([`${ORIGIN}/roleManagement/directory/roleAssignments/${targetAssignment}`, expect.objectContaining({ method: 'DELETE' })]);
+    expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
+  });
+
+  it('fails closed when Global Administrator assignment inventory is partial', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['RoleManagement.ReadWrite.Directory'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ id: USER, displayName: 'Fixture' }))
+      .mockResolvedValueOnce(response({ value: [], '@odata.nextLink': `${ORIGIN}/roleManagement/directory/roleAssignments?$skiptoken=untrusted` }));
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    await expect(provider.setGlobalAdministrator(USER, false)).rejects.toMatchObject({ code: 'role_assignment_state_unknown' });
+    expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(0);
   });
 
   it('does not follow hostile pagination links and explicitly marks partial collections', async () => {
