@@ -96,6 +96,7 @@ describe('Microsoft directory interaction', () => {
       if (path === '/microsoft/administration') {
         const operation = JSON.parse(String(init?.body));
         if (operation.type === 'user.domains.list') return Response.json({ domains: ['example.test'] });
+        if (operation.type === 'licenses.list') return Response.json({ items: [], partial: false });
         if (operation.type === 'user.create') return Response.json({ accepted: true, id: '11111111-1111-4111-8111-111111111111', userPrincipalName: operation.user.userPrincipalName, temporaryPassword: 'temporary-secret' });
       }
       if (path === '/microsoft/resources/users') return Response.json({ items: [], columns: [], complete: true, checkedAt: 'now' });
@@ -113,8 +114,65 @@ describe('Microsoft directory interaction', () => {
     await flush(); await flush();
     expect(request.mock.calls.some(([, init]) => JSON.parse(String(init?.body || '{}')).type === 'user.create')).toBe(true);
     expect(root.querySelector<HTMLInputElement>('[aria-label="Temporary password"]')?.value).toBe('temporary-secret');
-    expect(root.textContent).toContain('They were not applied during creation');
+    expect(root.textContent).toContain('MFA enrollment, aliases, and group membership remain separate actions');
     expect(root.querySelector<HTMLButtonElement>('#create-user-close')).toBeTruthy();
+    expect(root.querySelector('#create-user-submit')).toBeNull();
+  });
+  it.each([true, false])('keeps the temporary password visible when Business Standard assignment verification is %s', async verified => {
+    const { root, request } = await mount();
+    request.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/administration') {
+        const operation = JSON.parse(String(init?.body));
+        if (operation.type === 'user.domains.list') return Response.json({ domains: ['example.test'] });
+        if (operation.type === 'licenses.list') return Response.json({ items: [
+          { skuId: '11111111-1111-4111-8111-111111111111', skuPartNumber: 'O365_BUSINESS_PREMIUM', capabilityStatus: 'Enabled', consumedUnits: 1, prepaidUnits: { enabled: 2 } },
+          { skuId: '22222222-2222-4222-8222-222222222222', skuPartNumber: 'AAD_PREMIUM_P2', capabilityStatus: 'Enabled', consumedUnits: 0, prepaidUnits: { enabled: 2 } },
+        ], partial: false });
+        if (operation.type === 'user.create') return Response.json({ accepted: true, id: '33333333-3333-4333-8333-333333333333', userPrincipalName: operation.user.userPrincipalName, temporaryPassword: 'one-time-secret' });
+        if (operation.type === 'user.license.assign') return Response.json({ accepted: true, changed: true, verified });
+      }
+      if (path === '/microsoft/resources/users') return Response.json({ items: [], columns: [], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/directory/exclusions') return Response.json({ items: [] });
+      throw new Error(`Unexpected ${path}`);
+    });
+    root.querySelector<HTMLButtonElement>('#create-user')!.click(); await flush(); await flush();
+    expect(root.querySelectorAll<HTMLSelectElement>('#create-user-license option')).toHaveLength(2);
+    expect(root.textContent).not.toContain('AAD_PREMIUM_P2');
+    root.querySelector<HTMLInputElement>('#create-user-name')!.value = 'New User';
+    root.querySelector<HTMLInputElement>('#create-user-local')!.value = 'new';
+    root.querySelector<HTMLInputElement>('#create-user-location')!.value = 'GB';
+    root.querySelector<HTMLSelectElement>('#create-user-license')!.value = '11111111-1111-4111-8111-111111111111';
+    root.querySelector<HTMLButtonElement>('#create-user-submit')!.click(); await flush(); await flush();
+    const mutations = request.mock.calls.map(([, init]) => JSON.parse(String(init?.body || '{}'))).filter(op => op.type === 'user.create' || op.type === 'user.license.assign');
+    expect(mutations).toEqual([
+      { type: 'user.create', user: { displayName: 'New User', userPrincipalName: 'new@example.test', usageLocation: 'GB' } },
+      { type: 'user.license.assign', id: '33333333-3333-4333-8333-333333333333', license: { skuId: '11111111-1111-4111-8111-111111111111' } },
+    ]);
+    expect(root.querySelector<HTMLInputElement>('[aria-label="Temporary password"]')?.value).toBe('one-time-secret');
+    expect(root.textContent).toContain(verified ? 'Business Standard assigned and verified.' : 'Microsoft accepted the license assignment. Refresh the user to verify it appears.');
+  });
+  it('keeps the created account and password visible when the separate license step fails', async () => {
+    const { root, request } = await mount();
+    request.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/administration') {
+        const operation = JSON.parse(String(init?.body));
+        if (operation.type === 'user.domains.list') return Response.json({ domains: ['example.test'] });
+        if (operation.type === 'licenses.list') return Response.json({ items: [{ skuId: '11111111-1111-4111-8111-111111111111', skuPartNumber: 'O365_BUSINESS_PREMIUM', capabilityStatus: 'Enabled', consumedUnits: 0, prepaidUnits: { enabled: 1 } }], partial: false });
+        if (operation.type === 'user.create') return Response.json({ accepted: true, id: '33333333-3333-4333-8333-333333333333', userPrincipalName: operation.user.userPrincipalName, temporaryPassword: 'one-time-secret' });
+        if (operation.type === 'user.license.assign') return Response.json({ error: 'Seat was taken' }, { status: 409 });
+      }
+      if (path === '/microsoft/resources/users') return Response.json({ items: [], columns: [], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/directory/exclusions') return Response.json({ items: [] });
+      throw new Error(`Unexpected ${path}`);
+    });
+    root.querySelector<HTMLButtonElement>('#create-user')!.click(); await flush(); await flush();
+    root.querySelector<HTMLInputElement>('#create-user-name')!.value = 'New User';
+    root.querySelector<HTMLInputElement>('#create-user-local')!.value = 'new';
+    root.querySelector<HTMLInputElement>('#create-user-location')!.value = 'CA';
+    root.querySelector<HTMLSelectElement>('#create-user-license')!.value = '11111111-1111-4111-8111-111111111111';
+    root.querySelector<HTMLButtonElement>('#create-user-submit')!.click(); await flush(); await flush();
+    expect(root.querySelector<HTMLInputElement>('[aria-label="Temporary password"]')?.value).toBe('one-time-secret');
+    expect(root.textContent).toContain('User created; license assignment was not confirmed.');
     expect(root.querySelector('#create-user-submit')).toBeNull();
   });
 

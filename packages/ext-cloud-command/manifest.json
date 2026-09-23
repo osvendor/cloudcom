@@ -51,6 +51,11 @@
         "id": "threecx-dashboard",
         "path": "/threecx-dashboard",
         "element": "cloudcommand-threecx-dashboard-page"
+      },
+      {
+        "id": "threecx-call-log",
+        "path": "/threecx-call-log",
+        "element": "cloudcommand-threecx-call-log-page"
       }
     ],
     "navigation": [

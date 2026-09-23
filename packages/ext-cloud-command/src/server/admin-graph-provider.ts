@@ -22,6 +22,15 @@ const license = z.object({
   id: z.string().max(128), skuId: uuid, skuPartNumber: text, consumedUnits: z.number().int().nonnegative(),
   capabilityStatus: text, prepaidUnits: z.object({ enabled: z.number().int(), suspended: z.number().int(), warning: z.number().int() }),
 });
+const serviceHealthIssue = z.object({
+  id: z.string().min(1).max(128), title: z.string().max(512).nullable().optional(),
+  impactDescription: z.string().max(8192).nullable().optional(),
+  status: z.string().max(128).nullable().optional(), lastModifiedDateTime: z.string().max(64).nullable().optional(),
+});
+const serviceHealth = z.object({
+  id: z.string().min(1).max(256), service: z.string().min(1).max(256), status: z.string().max(128),
+  issues: z.array(serviceHealthIssue).max(100).optional(),
+});
 const directoryRoleAssignment = z.object({
   id: uuid,
   principalId: uuid,
@@ -37,12 +46,15 @@ export type AdminUserUpdate = z.infer<typeof adminUserUpdateSchema>;
 export const adminUserCreateSchema = z.object({
   displayName: z.string().trim().min(1).max(256),
   userPrincipalName: z.string().trim().min(3).max(320).regex(/^[A-Za-z0-9'.!#^~_-]+@[A-Za-z0-9.-]+$/),
+  usageLocation: z.string().regex(/^[A-Z]{2}$/).optional(),
 }).strict();
 export type AdminUserCreate = z.infer<typeof adminUserCreateSchema>;
+export const adminLicenseAssignSchema = z.object({ skuId: uuid }).strict();
+export type AdminLicenseAssign = z.infer<typeof adminLicenseAssignSchema>;
 export type AdminGraphErrorCode = 'invalid_input' | 'credential_unavailable' | 'tenant_identity_mismatch'
   | 'invalid_provider_response' | 'provider_access_denied' | 'provider_rate_limited' | 'provider_rejected'
   | 'provider_unreachable' | 'unknown_write_outcome' | 'unsupported_group'
-  | 'role_assignment_state_unknown' | 'last_global_administrator';
+  | 'role_assignment_state_unknown' | 'last_global_administrator' | 'usage_location_required' | 'license_not_available';
 export class AdminGraphError extends Error {
   constructor(public readonly code: AdminGraphErrorCode) { super(code); }
 }
@@ -65,6 +77,12 @@ function requireAppRole(token: string, role: string): void {
   try {
     const payload = JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString());
     if (!Array.isArray(payload.roles) || !payload.roles.includes(role)) throw new Error();
+  } catch { throw new AdminGraphError('provider_access_denied'); }
+}
+function requireAnyAppRole(token: string, roles: readonly string[]): void {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString());
+    if (!Array.isArray(payload.roles) || !roles.some(role => payload.roles.includes(role))) throw new Error();
   } catch { throw new AdminGraphError('provider_access_denied'); }
 }
 const userSelect = Object.keys(user.shape).join(',');
@@ -155,6 +173,15 @@ export function createAdminGraphProvider(options: {
     return result.value;
   }
   return {
+    async serviceHealth() {
+      const token = await session();
+      requireAppRole(token, 'ServiceHealth.Read.All');
+      const result = parse(z.object({ value: z.array(serviceHealth).max(100), '@odata.nextLink': z.string().optional() }),
+        await request(token, '/admin/serviceAnnouncement/healthOverviews?$expand=issues'), 'invalid_provider_response');
+      // A page boundary or nextLink means the view is incomplete. Never fetch a provider-supplied URL.
+      return { services: result.value, partial: Boolean(result['@odata.nextLink']) || result.value.length === 100,
+        checkedAt: new Date().toISOString() };
+    },
     async listVerifiedUserDomains() {
       const token = await session();
       const organization = parse(z.object({ value: z.array(z.object({
@@ -180,6 +207,7 @@ export function createAdminGraphProvider(options: {
       const result = await request(token, '/users', 'POST', {
         accountEnabled: true, displayName: value.displayName, mailNickname: localPart,
         userPrincipalName: value.userPrincipalName,
+        ...(value.usageLocation ? { usageLocation: value.usageLocation } : {}),
         passwordProfile: { password: temporaryPassword, forceChangePasswordNextSignIn: true },
       }, true);
       let created: { id: string; userPrincipalName: string };
@@ -189,6 +217,36 @@ export function createAdminGraphProvider(options: {
         throw new AdminGraphError('unknown_write_outcome');
       return { accepted: true as const, id: created.id, userPrincipalName: created.userPrincipalName,
         temporaryPassword, forceChangePasswordNextSignIn: true as const };
+    },
+    async assignUserLicense(id: string, input: AdminLicenseAssign, authorize?: () => Promise<void>) {
+      id = parse(uuid, id, 'invalid_input');
+      const { skuId } = parse(adminLicenseAssignSchema, input, 'invalid_input');
+      const token = await session();
+      requireAnyAppRole(token, ['LicenseAssignment.ReadWrite.All', 'User.ReadWrite.All', 'Directory.ReadWrite.All']);
+      const current = parse(z.object({ id: uuid, usageLocation: z.string().nullable().optional(),
+        assignedLicenses: z.array(z.object({ skuId: uuid })).max(256) }),
+      await request(token, `/users/${id}?$select=id,usageLocation,assignedLicenses`), 'invalid_provider_response');
+      if (current.id !== id) throw new AdminGraphError('invalid_provider_response');
+      if (current.assignedLicenses.some(assigned => assigned.skuId === skuId))
+        return { accepted: true as const, changed: false as const, verified: true as const };
+      if (!current.usageLocation || !/^[A-Z]{2}$/.test(current.usageLocation)) throw new AdminGraphError('usage_location_required');
+      const subscribed = parse(z.object({ value: z.array(license).max(100), '@odata.nextLink': z.string().optional() }),
+        await request(token, `/subscribedSkus?$select=${licenseSelect}`), 'invalid_provider_response');
+      if (subscribed['@odata.nextLink'] || subscribed.value.length === 100) throw new AdminGraphError('invalid_provider_response');
+      const selected = subscribed.value.find(item => item.skuId === skuId);
+      if (!selected || selected.capabilityStatus !== 'Enabled' || selected.prepaidUnits.enabled <= selected.consumedUnits)
+        throw new AdminGraphError('license_not_available');
+      await authorize?.();
+      await request(token, `/users/${id}/assignLicense`, 'POST', { addLicenses: [{ skuId }], removeLicenses: [] });
+      // Graph may accept the write before the user read model converges. Never resend
+      // the mutation because a readback was late; report acceptance separately.
+      let verified = false;
+      try {
+        const after = parse(z.object({ id: uuid, assignedLicenses: z.array(z.object({ skuId: uuid })).max(256) }),
+          await request(token, `/users/${id}?$select=id,assignedLicenses`), 'invalid_provider_response');
+        verified = after.id === id && after.assignedLicenses.some(item => item.skuId === skuId);
+      } catch { /* accepted write; caller must refresh to reconcile */ }
+      return { accepted: true as const, changed: true as const, verified };
     },
     listUsers: () => collection(`/users?$select=${userSelect}&$top=100`, user),
     listGroups: () => collection(`/groups?$select=${groupSelect}&$top=100`, group),

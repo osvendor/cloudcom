@@ -27,12 +27,14 @@ function setup() {
 function attempt() { return { org_id: org, actor_id: actor, tenant_id: tenant, client_id: client, credential_version: 'cert-1',
   expected_generation: null, nonce: 'nonce', verifier_ciphertext: 'enc:v3:opaque', state_hash: 'hashed', stage: 'processing' }; }
 describe('unified administration onboarding', () => {
-  it.each(['user.update', 'user.password.reset', 'user.sessions.revoke', 'user.globalAdmin.get', 'user.globalAdmin.set',
+  it.each(['user.create', 'user.license.assign', 'user.update', 'user.password.reset', 'user.sessions.revoke', 'user.globalAdmin.get', 'user.globalAdmin.set',
     'user.mfa.methods.list', 'user.mfa.method.remove', 'group.member.add'])(
     'requires manager authorization for %s before credential access', async type => {
       const h = setup();
       h.runtime.authorize.mockImplementation(async (_request, _orgId, mutation) => mutation ? null : { actorId: actor });
-      const input = type === 'user.update' ? { type, id: actor, update: { displayName: 'Changed' } }
+      const input = type === 'user.create' ? { type, user: { displayName: 'New User', userPrincipalName: 'new@example.test' } }
+        : type === 'user.license.assign' ? { type, id: actor, license: { skuId: actor } }
+        : type === 'user.update' ? { type, id: actor, update: { displayName: 'Changed' } }
         : type === 'user.globalAdmin.set' ? { type, id: actor, enabled: true, confirmation: 'GLOBAL_ADMIN' }
         : type === 'user.mfa.methods.list' || type === 'user.globalAdmin.get' ? { type, id: actor }
         : type === 'user.mfa.method.remove' ? { type, id: actor, kind: 'phone', methodId: actor, confirmation: 'REMOVE_AUTH_METHOD' }

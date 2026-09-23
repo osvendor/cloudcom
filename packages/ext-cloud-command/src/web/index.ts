@@ -3,6 +3,7 @@ import './microsoft';
 import './connect';
 import './google';
 import './threecx-dashboard';
+import './threecx-call-log';
 import { bindThreeCxDetail, detailStyles, detailTab, isDirty, renderThreeCxDetail, type DetailTab } from './threecx-detail';
 import { hasForwardingChanges, mountForwardingEditors } from './threecx-detail-forwarding';
 import type { ThreeCxDetail, ThreeCxDetailChanges } from '../threecx/detail-contract';
@@ -486,7 +487,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
       <style>${styles}${detailStyles}${this.mode === 'configuration' ? ':host([data-display-mode="configuration"]) main{max-width:none;margin:0;padding:0}' : ''}</style>
       <main aria-labelledby="${detail || this.detailId !== null ? 'detail-title' : 'title'}">
         ${detail ? renderThreeCxDetail(detail, this.detailTab, this.detailDraft, this.busy, this.statusMessage, this.statusIsError) : this.detailId !== null ? `<section class="threecx-detail" aria-labelledby="detail-title"><button class="secondary compact" id="detail-back" type="button">Back to extensions</button><h2 id="detail-title">Extension details</h2><p class="status" data-status data-error="${this.statusIsError}" aria-live="polite">${escapeHtml(this.statusMessage || 'Loading extension details…')}</p><button class="secondary" id="detail-retry" type="button">Retry</button></section>` : `<header><div><p class="eyebrow">Cloud Command</p><h1 id="title">${showConfiguration && !showDirectory ? 'Connect 3CX' : '3CX extensions'}</h1><p class="subtle">${showConfiguration && !showDirectory ? 'Connect one organization’s 3CX PBX and select its access scope.' : 'Review extensions from the configured 3CX scope.'}</p></div><span class="badge ${connected && connectionEnabled ? 'ok' : connected ? 'disabled' : ''}">${connected ? (connectionEnabled ? 'Connected' : 'Disabled') : 'Not connected'}</span></header>
-        <nav aria-label="Cloud Command providers">${this.microsoftNavigationVisible ? '<button class="secondary compact" id="go-microsoft" type="button">Microsoft 365</button>' : ''}</nav>
+        <nav aria-label="Cloud Command providers">${showDirectory ? '<button class="secondary compact" id="go-dashboard" type="button">Dashboard</button><button class="secondary compact" id="go-call-log" type="button">Call Log</button>' : ''}${this.microsoftNavigationVisible ? '<button class="secondary compact" id="go-microsoft" type="button">Microsoft 365</button>' : ''}</nav>
         <p class="status" data-status data-error="${this.statusIsError}" aria-live="polite">${escapeHtml(this.statusMessage)}</p>
         ${showConfiguration ? `<section class="card" aria-labelledby="connection-heading">
           <div class="section-title"><div><h2 id="connection-heading">Connection</h2><p>${canManage ? 'Credentials are encrypted server-side. The secret is never returned to this page.' : 'You have read-only access to this organization’s 3CX connection.'}</p></div></div>
@@ -515,6 +516,8 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     this.root.querySelector('#save')?.addEventListener('click', () => void this.saveConnection());
     this.root.querySelector('#refresh-users')?.addEventListener('click', () => void this.loadUsers(true));
     this.root.querySelector('#more-users')?.addEventListener('click', () => void this.loadUsers(false));
+    this.root.querySelector('#go-dashboard')?.addEventListener('click', () => dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path: '/extensions/cloudcommand/threecx-dashboard' }));
+    this.root.querySelector('#go-call-log')?.addEventListener('click', () => dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path: '/extensions/cloudcommand/threecx-call-log' }));
     this.root.querySelectorAll<HTMLButtonElement>('[data-detail-index]').forEach((button) => button.addEventListener('click', () => this.openDetails(Number(button.dataset.detailIndex))));
     if (detail) bindThreeCxDetail(this.root, { back: () => this.closeDetails(), discard: () => this.discardDetail(), save: () => void this.saveDetail(), tab: (tab) => { this.detailTab = tab; if (this.detailId !== null) window.location.hash = `extension=${this.detailId}&tab=${tab}`; this.render(); }, change: (key, value) => this.changeDetail(key, value) });
     if (detail && this.detailTab === 'forwarding') {

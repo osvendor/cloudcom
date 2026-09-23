@@ -147,6 +147,10 @@ restored afterward. The proof used no production or customer identifiers. It doe
 not establish atomic stale-write protection, ETag support, or deployment readiness.
 The profile compatibility fix shipped in PR #22. Live detail loading and narrow save/restore checks passed on the authorized test extension.
 
+## Call Log candidate
+
+The extension has a read-only Call Log candidate for connections explicitly scoped to the full PBX. It uses a fixed 3CX report function, validates a range of no more than 31 days, reads at most the first 100 events, projects only approved call metadata, audits the scoped read, and labels CSV export as loaded results. It does not load call events until the operator searches. A department-scoped connection receives `report_scope_unverified` before decrypting a credential or calling the provider: the retained Cloud Command report query had no explicit department predicate, so provider role constraints alone must not be assumed to isolate customer call records. PBX server-driven continuation semantics are unverified; an apparent next page is labeled incomplete and never followed or converted into an invented `$skip` query. This new path has local tests but no live PBX report proof or deployment claim. Any future department support requires a demonstrated provider-side boundary or verified row filter before the gate is relaxed.
+
 ## Extension menu design
 
 The [proposed device-style detail menu](cloudcom-threecx-menu-design.md) prioritizes General, Call Forwarding, IP Phone, BLF and Voicemail. It maps the observed PBX API schema to future controls. This is a design, not a claim that PBX editing is implemented.

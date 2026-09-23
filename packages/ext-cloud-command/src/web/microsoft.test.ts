@@ -32,6 +32,50 @@ afterEach(() => {
 });
 
 describe('CloudCommandMicrosoftPage', () => {
+  it('shows service health to readers and preserves stale detail on refresh error', async () => {
+    let healthCalls = 0;
+    const request = vi.fn(async (path: string, init?: RequestInit) => path === '/microsoft/connection'
+      ? Response.json({ available: true, connected: true, enabled: true, canManage: false, tenantName: 'Contoso' })
+      : path === '/microsoft/administration' && init?.method === 'POST'
+        ? ++healthCalls === 1
+          ? Response.json({ services: [{ id: 'Exchange Online', service: 'Exchange Online', status: 'serviceDegradation', issues: [{ id: 'EX123', title: 'Mail delay', impactDescription: 'Some mail is delayed' }] }], partial: false, checkedAt: '2026-09-22T12:00:00Z' })
+          : Response.json({ error: 'provider_access_denied' }, { status: 403 })
+        : emptyResource());
+    const page = mount(request);
+    await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#health-open')!.click();
+    await flush();
+    expect(page.shadowRoot!.textContent).toContain('Some services have issues');
+    expect(page.shadowRoot!.textContent).toContain('Mail delay');
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#health-refresh')!.click();
+    await flush();
+    expect(page.shadowRoot!.textContent).toContain('Refresh failed');
+    expect(page.shadowRoot!.textContent).toContain('ServiceHealth.Read.All');
+    expect(page.shadowRoot!.textContent).toContain('Mail delay');
+  });
+  it('does not present a partial or empty service-health response as healthy', async () => {
+    const page = mount(async path => path === '/microsoft/connection'
+      ? Response.json({ available: true, connected: true, enabled: true, canManage: false })
+      : path === '/microsoft/administration'
+        ? Response.json({ services: [], partial: true, checkedAt: '2026-09-22T12:00:00Z' }) : emptyResource());
+    await flush(); page.shadowRoot!.querySelector<HTMLButtonElement>('#health-open')!.click(); await flush();
+    expect(page.shadowRoot!.textContent).toContain('Status unavailable');
+    expect(page.shadowRoot!.textContent).not.toContain('No known service issues');
+  });
+  it('discards old-organization service health and disables it for a disconnected organization', async () => {
+    let resolveOld!: (response: Response) => void;
+    let connections = 0;
+    const page = mount(async path => path === '/microsoft/connection'
+      ? Response.json({ available: true, connected: ++connections === 1, enabled: true, canManage: false })
+      : path === '/microsoft/administration'
+        ? new Promise<Response>(resolve => { resolveOld = resolve; }) : emptyResource());
+    await flush(); page.shadowRoot!.querySelector<HTMLButtonElement>('#health-open')!.click();
+    page.context = { contractVersion: 1, extensionName: 'cloudcommand', path: '/extensions/cloudcommand/microsoft', organizationId: 'org-b' };
+    resolveOld(Response.json({ services: [{ id: 'private', service: 'Old tenant private service', status: 'serviceInterruption' }], partial: false, checkedAt: '2026-09-22T12:00:00Z' }));
+    await flush();
+    expect(page.shadowRoot!.textContent).not.toContain('Old tenant private service');
+    expect(page.shadowRoot!.querySelector<HTMLButtonElement>('#health-open')?.disabled).toBe(true);
+  });
   it('uses sidebar navigation and omits redundant connected setup and routine success text', async () => {
     const request = vi.fn(async (path: string) => path === '/microsoft/connection'
       ? Response.json({ available: true, connected: true, enabled: true, canManage: true, tenantName: 'Contoso' })

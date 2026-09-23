@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { adminUserCreateSchema, adminUserUpdateSchema, AdminGraphError, createAdminGraphProvider } from './admin-graph-provider';
+import { adminLicenseAssignSchema, adminUserCreateSchema, adminUserUpdateSchema, AdminGraphError, createAdminGraphProvider } from './admin-graph-provider';
 import { AuthenticationMethodError, createAuthenticationMethodsProvider } from './admin-auth-methods';
 import type { GuardedFetch } from './transport';
 
@@ -9,8 +9,10 @@ const operation = z.discriminatedUnion('type', [
   z.object({ type: z.literal('users.list') }).strict(),
   z.object({ type: z.literal('user.domains.list') }).strict(),
   z.object({ type: z.literal('user.create'), user: adminUserCreateSchema }).strict(),
+  z.object({ type: z.literal('user.license.assign'), id: uuid, license: adminLicenseAssignSchema }).strict(),
   z.object({ type: z.literal('groups.list') }).strict(),
   z.object({ type: z.literal('licenses.list') }).strict(),
+  z.object({ type: z.literal('service.health.get') }).strict(),
   z.object({ type: z.literal('user.get'), id: uuid }).strict(),
   z.object({ type: z.literal('user.globalAdmin.get'), id: uuid }).strict(),
   z.object({ type: z.literal('group.get'), id: uuid }).strict(),
@@ -39,7 +41,7 @@ type Audit = {
   executionId: string;
   orgId: string; actorId: string; connectionId: string; operation: AdministrationOperation['type'];
   phase: 'intent' | 'outcome'; outcome?: 'success' | 'rejected' | 'unknown';
-  targets: { userId?: string; groupId?: string; methodKind?: 'phone' | 'microsoftAuthenticator'; methodId?: string };
+  targets: { userId?: string; groupId?: string; methodKind?: 'phone' | 'microsoftAuthenticator'; methodId?: string; licenseSkuId?: string };
   changedFields: string[];
 };
 export class AdministrationExecutionError extends Error {
@@ -70,7 +72,7 @@ export function createAdministrationExecutor<Request>(ports: {
     if (!initial.success || initial.data.orgId !== orgId) throw new AdministrationExecutionError('connection_not_ready');
     const snapshot = Object.freeze(initial.data);
     const fields = Object.keys(connectionSchema.shape) as (keyof AdministrationConnection)[];
-    const mutation = op.type === 'user.create' || op.type === 'user.update' || op.type === 'user.password.reset'
+    const mutation = op.type === 'user.create' || op.type === 'user.license.assign' || op.type === 'user.update' || op.type === 'user.password.reset'
       || op.type === 'user.sessions.revoke' || op.type === 'user.mfa.method.remove'
       || op.type === 'user.globalAdmin.set' || op.type.startsWith('group.member.');
     let dispatched = false;
@@ -89,12 +91,15 @@ export function createAdministrationExecutor<Request>(ports: {
         throw error;
       }
     }
-    const targets = op.type === 'user.mfa.method.remove'
+    const targets = op.type === 'user.license.assign'
+      ? { userId: op.id, licenseSkuId: op.license.skuId }
+      : op.type === 'user.mfa.method.remove'
       ? { userId: op.id, methodKind: op.kind, methodId: op.methodId }
       : 'groupId' in op ? { groupId: op.groupId, userId: op.userId }
       : 'id' in op ? (op.type === 'group.get' ? { groupId: op.id } : { userId: op.id }) : {};
     const event = { executionId: randomUUID(), orgId, actorId: principal.actorId, connectionId: snapshot.id,
-      operation: op.type, targets, changedFields: op.type === 'user.create' ? ['displayName', 'userPrincipalName', 'passwordProfile']
+      operation: op.type, targets, changedFields: op.type === 'user.create' ? ['displayName', 'userPrincipalName', 'passwordProfile', ...(op.user.usageLocation ? ['usageLocation'] : [])]
+        : op.type === 'user.license.assign' ? ['assignedLicenses']
         : op.type === 'user.update' ? Object.keys(op.update)
         : op.type === 'user.password.reset' ? ['passwordProfile']
           : op.type === 'user.sessions.revoke' ? ['signInSessions']
@@ -146,8 +151,10 @@ export function createAdministrationExecutor<Request>(ports: {
         case 'users.list': result = await provider.listUsers(); break;
         case 'user.domains.list': result = await provider.listVerifiedUserDomains(); break;
         case 'user.create': result = await provider.createUser(op.user, fence); break;
+        case 'user.license.assign': result = await provider.assignUserLicense(op.id, op.license, fence); break;
         case 'groups.list': result = await provider.listGroups(); break;
         case 'licenses.list': result = await provider.listLicenses(); break;
+        case 'service.health.get': result = await provider.serviceHealth(); break;
         case 'user.get': result = await provider.getUser(op.id); break;
         case 'user.globalAdmin.get': result = await provider.getGlobalAdministrator(op.id); break;
         case 'group.get': result = await provider.getGroup(op.id); break;
@@ -170,7 +177,8 @@ export function createAdministrationExecutor<Request>(ports: {
       if (error instanceof AdministrationExecutionError || error instanceof AdminGraphError || error instanceof AuthenticationMethodError) throw error;
       throw new AdministrationExecutionError('provider_failed');
     }
-    await audit('outcome', 'success');
+    await audit('outcome', op.type === 'user.license.assign' && typeof result === 'object' && result !== null
+      && 'verified' in result && result.verified === false ? 'unknown' : 'success');
     return result;
   };
 }

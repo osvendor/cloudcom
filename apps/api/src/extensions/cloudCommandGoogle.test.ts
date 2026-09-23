@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 const { dbMocks, googleMocks } = vi.hoisted(() => ({
   dbMocks: { results: [] as unknown[][], select: vi.fn() },
-  googleMocks: { users: vi.fn(), groups: vi.fn(), decrypt: vi.fn() },
+  googleMocks: { users: vi.fn(), userGet: vi.fn(), userUpdate: vi.fn(), groups: vi.fn(), decrypt: vi.fn(), audit: vi.fn() },
 }));
 vi.mock('../db', () => ({
   db: { select: () => { dbMocks.select(); return { from: () => ({ where: () => ({ limit: async () => dbMocks.results.shift() ?? [] }) }) }; } },
@@ -11,7 +11,8 @@ vi.mock('../db/schema/google', () => ({ googleWorkspaceConnections: { orgId: 'or
 vi.mock('../middleware/auth', () => ({ dbAccessContextFromAuth: () => ({}) }));
 vi.mock('../config/env', () => ({ GOOGLE_WORKSPACE_ENABLED: true }));
 vi.mock('../services/googleHelpers', () => ({ decryptConnectionKey: googleMocks.decrypt }));
-vi.mock('../services/googleClient', () => ({ getDirectoryClient: () => ({ users: { list: googleMocks.users }, groups: { list: googleMocks.groups } }) }));
+vi.mock('../services/auditService', () => ({ createAuditLog: googleMocks.audit }));
+vi.mock('../services/googleClient', () => ({ getDirectoryClient: () => ({ users: { list: googleMocks.users, get: googleMocks.userGet, update: googleMocks.userUpdate }, groups: { list: googleMocks.groups } }) }));
 import { nativeGoogleServices } from './cloudCommandGoogle';
 
 const ORG = '11111111-1111-4111-8111-111111111111';
@@ -39,10 +40,11 @@ describe('native Google Workspace bridge', () => {
   });
   it('uses the configured domain, bounded page and fixed user projection', async () => {
     dbMocks.results.push([row]);
-    googleMocks.users.mockResolvedValue({ data: { users: [{ id: 'u1', primaryEmail: 'one@example.test', name: { fullName: 'One' }, suspended: false, isAdmin: false, secret: 'provider-secret' }], nextPageToken: 'next' } });
+    googleMocks.users.mockResolvedValue({ data: { users: [{ id: 'u1', primaryEmail: 'one@example.test', name: { fullName: 'One Person', givenName: 'One', familyName: 'Person' }, suspended: false, isAdmin: false, secret: 'provider-secret' }], nextPageToken: 'next' } });
     const result = await nativeGoogleServices.directory(request(), 'users', 'token');
     expect(googleMocks.users).toHaveBeenCalledWith(expect.objectContaining({ domain: 'example.test', maxResults: 100, pageToken: 'token' }));
     expect(result).toMatchObject({ ok: true, nextPageToken: 'next' });
+    expect(result).toMatchObject({ items: [{ givenName: 'One', familyName: 'Person' }] });
     expect(JSON.stringify(result)).not.toContain('provider-secret');
   });
   it('keeps provider error bodies out of browser errors', async () => {
@@ -51,5 +53,81 @@ describe('native Google Workspace bridge', () => {
     const result = await nativeGoogleServices.directory(request(), 'groups', null);
     expect(result).toMatchObject({ ok: false, code: 'provider_failed' });
     expect(JSON.stringify(result)).not.toContain('private provider body');
+  });
+  const action = { userId: '123456', email: 'user@example.test', expectedSuspended: false, suspended: true, confirmation: 'user@example.test' };
+  const current = { id: '123456', primaryEmail: 'user@example.test', suspended: false, archived: false, isAdmin: false };
+  it('rechecks account and credential state before a bounded suspension, then verifies the result', async () => {
+    dbMocks.results.push([row], [row]);
+    googleMocks.userGet.mockResolvedValueOnce({ data: current }).mockResolvedValueOnce({ data: { ...current, suspended: true } });
+    googleMocks.userUpdate.mockResolvedValue({ data: {} });
+    expect(await nativeGoogleServices.setSuspended(request(), action)).toMatchObject({ ok: true, userId: '123456', suspended: true });
+    expect(dbMocks.select).toHaveBeenCalledTimes(2);
+    expect(googleMocks.userUpdate).toHaveBeenCalledWith({ userKey: '123456', requestBody: { suspended: true } });
+  });
+  it('denies suspension without host write permission or MFA before loading a credential', async () => {
+    const deniedWrite = { ...request(), authorization: { allowedSiteIds: undefined, hasPermission: (_resource: string, action: string) => action === 'read', mfaSatisfied: true } } as never;
+    expect(await nativeGoogleServices.setSuspended(deniedWrite, action)).toMatchObject({ code: 'access_denied' });
+    const deniedMfa = { ...request(), authorization: { allowedSiteIds: undefined, hasPermission: () => true, mfaSatisfied: false } } as never;
+    expect(await nativeGoogleServices.setSuspended(deniedMfa, action)).toMatchObject({ code: 'access_denied' });
+    expect(dbMocks.select).not.toHaveBeenCalled();
+  });
+  it('uses a synchronous audit write with valid results before and after a mutation', async () => {
+    await nativeGoogleServices.auditSuspension(request(), '123456', 'intent');
+    await nativeGoogleServices.auditSuspension(request(), '123456', 'failure');
+    expect(googleMocks.audit).toHaveBeenNthCalledWith(1, expect.objectContaining({ action: 'cloudcommand.google.user.suspension.intent', result: 'success' }));
+    expect(googleMocks.audit).toHaveBeenNthCalledWith(2, expect.objectContaining({ action: 'cloudcommand.google.user.suspension', result: 'failure' }));
+  });
+  it('protects connected administrator and other admin users', async () => {
+    dbMocks.results.push([row]);
+    expect(await nativeGoogleServices.setSuspended(request(), { ...action, email: 'admin@example.test', confirmation: 'admin@example.test' })).toMatchObject({ code: 'protected_account' });
+    expect(googleMocks.decrypt).not.toHaveBeenCalled();
+    dbMocks.results.push([row]);
+    googleMocks.userGet.mockResolvedValue({ data: { ...current, isAdmin: true } });
+    expect(await nativeGoogleServices.setSuspended(request(), action)).toMatchObject({ code: 'protected_account' });
+    expect(googleMocks.userUpdate).not.toHaveBeenCalled();
+  });
+  it('rejects changed account or credential state before writing', async () => {
+    dbMocks.results.push([row]);
+    googleMocks.userGet.mockResolvedValue({ data: { ...current, suspended: true } });
+    expect(await nativeGoogleServices.setSuspended(request(), action)).toMatchObject({ code: 'state_changed' });
+    expect(googleMocks.userUpdate).not.toHaveBeenCalled();
+    dbMocks.results.push([row], [{ ...row, serviceAccountKey: 'rotated' }]);
+    googleMocks.userGet.mockResolvedValue({ data: current });
+    expect(await nativeGoogleServices.setSuspended(request(), action)).toMatchObject({ code: 'state_changed' });
+    expect(googleMocks.userUpdate).not.toHaveBeenCalled();
+  });
+  it('labels an uncertain provider update outcome without retrying', async () => {
+    dbMocks.results.push([row], [row]);
+    googleMocks.userGet.mockResolvedValue({ data: current });
+    googleMocks.userUpdate.mockRejectedValue(new Error('private provider body'));
+    const result = await nativeGoogleServices.setSuspended(request(), action);
+    expect(result).toMatchObject({ code: 'unknown_write_outcome' });
+    expect(JSON.stringify(result)).not.toContain('private provider body');
+    expect(googleMocks.userUpdate).toHaveBeenCalledTimes(1);
+  });
+  const profile = { userId: '123456', email: 'user@example.test', expectedGivenName: 'Old', expectedFamilyName: 'Person', givenName: 'New', familyName: 'Person' };
+  it('updates only the two name fields after fresh account/credential checks and readback', async () => {
+    dbMocks.results.push([row], [row]);
+    googleMocks.userGet.mockResolvedValueOnce({ data: { ...current, name: { givenName: 'Old', familyName: 'Person' } } })
+      .mockResolvedValueOnce({ data: { ...current, name: { givenName: 'New', familyName: 'Person' } } });
+    googleMocks.userUpdate.mockResolvedValue({ data: {} });
+    expect(await nativeGoogleServices.updateProfile(request(), profile)).toMatchObject({ ok: true, givenName: 'New' });
+    expect(googleMocks.userUpdate).toHaveBeenCalledWith({ userKey: '123456', requestBody: { name: { givenName: 'New', familyName: 'Person' } } });
+  });
+  it('rejects stale profile and rotated credential before provider mutation', async () => {
+    dbMocks.results.push([row]);
+    googleMocks.userGet.mockResolvedValue({ data: { ...current, name: { givenName: 'Changed', familyName: 'Person' } } });
+    expect(await nativeGoogleServices.updateProfile(request(), profile)).toMatchObject({ code: 'state_changed' });
+    expect(googleMocks.userUpdate).not.toHaveBeenCalled();
+    dbMocks.results.push([row], [{ ...row, serviceAccountKey: 'rotated' }]);
+    googleMocks.userGet.mockResolvedValue({ data: { ...current, name: { givenName: 'Old', familyName: 'Person' } } });
+    expect(await nativeGoogleServices.updateProfile(request(), profile)).toMatchObject({ code: 'state_changed' });
+    expect(googleMocks.userUpdate).not.toHaveBeenCalled();
+  });
+  it('writes a synchronous profile audit with valid result values', async () => {
+    await nativeGoogleServices.auditProfile(request(), '123456', 'intent');
+    await nativeGoogleServices.auditProfile(request(), '123456', 'success');
+    expect(googleMocks.audit).toHaveBeenNthCalledWith(1, expect.objectContaining({ action: 'cloudcommand.google.user.profile.intent', result: 'success' }));
+    expect(googleMocks.audit).toHaveBeenNthCalledWith(2, expect.objectContaining({ action: 'cloudcommand.google.user.profile', result: 'success' }));
   });
 });

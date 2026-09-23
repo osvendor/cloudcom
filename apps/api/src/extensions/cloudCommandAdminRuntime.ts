@@ -130,6 +130,36 @@ export function createCloudCommandAdminRuntime(dependencies: Dependencies = {}):
   async function certificate(config: Descriptor): Promise<{ certificatePem: string; privateKeyPem: string }> {
     try { return { certificatePem: await read(config.certificatePath, 'utf8'), privateKeyPem: await read(config.privateKeyPath, 'utf8') }; } catch { throw unavailable(); }
   }
+  async function acquireBoundToken(connection: CloudCommandAdminConnection): Promise<string> {
+    const config = await requiredDescriptor();
+    const { tenantId } = requireBoundConnection(connection, config);
+    const provider = createAdministrationTokenProvider({
+      clientId: config.clientId, credentialVersion: config.credentialVersion, fetch: fetchImpl,
+      loadCertificate: async version => {
+        if (version !== config.credentialVersion) throw unavailable();
+        const material = await certificate(config);
+        return { clientId: config.clientId, credentialVersion: config.credentialVersion, ...material };
+      },
+    });
+    try { return await provider(tenantId); } catch { throw tokenUnavailable(); }
+  }
+  async function initialExchangeDomain(connection: CloudCommandAdminConnection): Promise<string> {
+    const token = await acquireBoundToken(connection);
+    let data: Record<string, unknown>;
+    try {
+      data = await boundedJson(await fetchImpl('https://graph.microsoft.com/v1.0/organization?$select=id,verifiedDomains', {
+        method: 'GET', headers: { Authorization: `Bearer ${token}` }, redirect: 'error',
+        signal: AbortSignal.timeout(15_000), timeoutMs: 15_000, maxBytes: 128 * 1024,
+      }));
+    } catch { throw unavailable(); }
+    const parsed = z.object({ value: z.array(z.object({ id: UUID,
+      verifiedDomains: z.array(z.object({ name: z.string().min(1).max(255), isInitial: z.boolean() }).passthrough()).max(256),
+    }).passthrough()).length(1) }).passthrough().safeParse(data);
+    if (!parsed.success || parsed.data.value[0]!.id !== connection.tenantId) throw unavailable();
+    const initial = parsed.data.value[0]!.verifiedDomains.filter(domain => domain.isInitial);
+    if (initial.length !== 1 || !/^[a-z0-9-]+\.onmicrosoft\.com$/i.test(initial[0]!.name)) throw unavailable();
+    return initial[0]!.name.toLowerCase();
+  }
   let exchangeWrites = Promise.resolve();
   async function exchangeBridge() {
     const descriptorPath = environment[EXCHANGE_DESCRIPTOR_ENV], socketPath = environment[EXCHANGE_SOCKET_ENV];
@@ -161,13 +191,15 @@ export function createCloudCommandAdminRuntime(dependencies: Dependencies = {}):
       async provision(binding) {
         const tenantId = UUID.parse(binding.tenantId), organizationId = UUID.parse(binding.organizationId), clientId = UUID.parse(binding.clientId);
         if (clientId !== config.clientId || binding.credentialVersion !== config.credentialVersion || !Number.isSafeInteger(binding.connectionGeneration) || binding.connectionGeneration < 1) throw unavailable();
+        // Exchange PowerShell requires the initial onmicrosoft.com domain, not a tenant GUID.
+        // Resolve it from the same tenant-bound Graph application credential and fail closed.
+        const exchangeOrganization = await initialExchangeDomain(binding);
         await mutate(tenants => {
           for (const [existingTenantId, descriptor] of Object.entries(tenants)) {
             if (descriptor.organizationId === organizationId && existingTenantId !== tenantId) delete tenants[existingTenantId];
           }
           tenants[tenantId] = { enabled: true, organizationId, tenantId, clientId, credentialVersion: binding.credentialVersion, connectionGeneration: binding.connectionGeneration,
-          // Exchange accepts the tenant identity at connection time; a live capability probe remains required before enabling writes.
-          exchangeOrganization: tenantId, certificatePath: config.certificatePath, privateKeyPath: config.privateKeyPath }; });
+          exchangeOrganization, certificatePath: config.certificatePath, privateKeyPath: config.privateKeyPath }; });
       },
       async revoke(organizationId) {
         organizationId = UUID.parse(organizationId);
@@ -178,19 +210,7 @@ export function createCloudCommandAdminRuntime(dependencies: Dependencies = {}):
   }
   return {
     async configuration() { const config = await descriptor(); return config && { clientId: config.clientId, credentialVersion: config.credentialVersion, redirectUri: config.redirectUri }; },
-    async acquireToken(connection) {
-      const config = await requiredDescriptor();
-      const { tenantId } = requireBoundConnection(connection, config);
-      const provider = createAdministrationTokenProvider({
-        clientId: config.clientId, credentialVersion: config.credentialVersion, fetch: fetchImpl,
-        loadCertificate: async version => {
-          if (version !== config.credentialVersion) throw unavailable();
-          const material = await certificate(config);
-          return { clientId: config.clientId, credentialVersion: config.credentialVersion, ...material };
-        },
-      });
-      try { return await provider(tenantId); } catch { throw tokenUnavailable(); }
-    },
+    acquireToken: acquireBoundToken,
     async verifyAuthorization(input) {
       const config = await requiredDescriptor();
       const { tenantId } = requireBoundConnection(input, config);

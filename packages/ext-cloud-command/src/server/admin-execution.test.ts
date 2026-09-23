@@ -27,6 +27,21 @@ function setup() {
   };
 }
 describe('organization-bound Microsoft administration execution', () => {
+  it('fences and audits read-only service health without dispatching writes', async () => {
+    const s = setup();
+    s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['ServiceHealth.Read.All'] })).toString('base64url')}.s`);
+    s.fetch.mockImplementation(async url => url.includes('/organization?')
+      ? Response.json({ value: [{ id: tenantId }] })
+      : Response.json({ value: [{ id: 'Exchange Online', service: 'Exchange Online', status: 'serviceOperational' }] }));
+    await expect(s.run(request, orgId, { type: 'service.health.get' }))
+      .resolves.toMatchObject({ services: [{ service: 'Exchange Online' }], partial: false });
+    expect(s.authorize).toHaveBeenCalledWith(request, orgId, 'service.health.get');
+    expect(s.audit.mock.calls.map(([event]) => event)).toEqual([
+      expect.objectContaining({ phase: 'intent', operation: 'service.health.get', changedFields: [] }),
+      expect.objectContaining({ phase: 'outcome', operation: 'service.health.get', outcome: 'success' }),
+    ]);
+    expect(s.fetch.mock.calls.every(([, init]) => init.method === 'GET')).toBe(true);
+  });
   it('creates a user with manager authorization, audit fencing, and no password in audit events', async () => {
     const s = setup();
     s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`);
@@ -51,6 +66,49 @@ describe('organization-bound Microsoft administration execution', () => {
     await expect(s.run(request, orgId, { type: 'user.create', user: { displayName: 'A', userPrincipalName: 'a@example.test', roles: ['admin'] } }))
       .rejects.toMatchObject({ code: 'invalid_operation' });
     expect(s.authorize).not.toHaveBeenCalled();
+  });
+  it('audits a separate license assignment with the same org and connection fences', async () => {
+    const s = setup();
+    const skuId = '55555555-5555-4555-8555-555555555555';
+    s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['LicenseAssignment.ReadWrite.All'] })).toString('base64url')}.s`);
+    s.fetch.mockImplementation(async (url, init) => {
+      if (url.includes('/organization?')) return Response.json({ value: [{ id: tenantId }] });
+      if (url.includes('/subscribedSkus?')) return Response.json({ value: [{ id: 'sku', skuId, skuPartNumber: 'O365_BUSINESS_PREMIUM', consumedUnits: 0, capabilityStatus: 'Enabled', prepaidUnits: { enabled: 1, suspended: 0, warning: 0 } }] });
+      if (url.includes('/assignLicense')) return Response.json({ id });
+      if (url.includes('?$select=id,assignedLicenses') && init.method === 'GET') return Response.json({ id, assignedLicenses: [{ skuId }] });
+      if (url.includes('?$select=id,usageLocation,assignedLicenses')) return Response.json({ id, usageLocation: 'GB', assignedLicenses: [] });
+      throw new Error(`Unexpected ${url}`);
+    });
+    await expect(s.run(request, orgId, { type: 'user.license.assign', id, license: { skuId } }))
+      .resolves.toEqual({ accepted: true, changed: true, verified: true });
+    expect(s.audit.mock.calls.map(([event]) => event)).toEqual([
+      expect.objectContaining({ phase: 'intent', operation: 'user.license.assign', targets: { userId: id, licenseSkuId: skuId }, changedFields: ['assignedLicenses'] }),
+      expect.objectContaining({ phase: 'outcome', outcome: 'success', changedFields: ['assignedLicenses'] }),
+    ]);
+    expect(s.fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
+  });
+  it('rejects arbitrary license assignment data before authorization', async () => {
+    const s = setup();
+    await expect(s.run(request, orgId, { type: 'user.license.assign', id, license: { skuId: id, disabledPlans: [] } }))
+      .rejects.toMatchObject({ code: 'invalid_operation' });
+    expect(s.authorize).not.toHaveBeenCalled();
+  });
+  it('audits accepted but unverified license assignment as unknown without a second write', async () => {
+    const s = setup();
+    const skuId = '55555555-5555-4555-8555-555555555555';
+    s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`);
+    s.fetch.mockImplementation(async (url, init) => {
+      if (url.includes('/organization?')) return Response.json({ value: [{ id: tenantId }] });
+      if (url.includes('?$select=id,usageLocation,assignedLicenses')) return Response.json({ id, usageLocation: 'CA', assignedLicenses: [] });
+      if (url.includes('/subscribedSkus?')) return Response.json({ value: [{ id: 'sku', skuId, skuPartNumber: 'O365_BUSINESS_PREMIUM', consumedUnits: 0, capabilityStatus: 'Enabled', prepaidUnits: { enabled: 1, suspended: 0, warning: 0 } }] });
+      if (url.includes('/assignLicense')) return Response.json({ id });
+      if (url.includes('?$select=id,assignedLicenses')) return Response.json({ id, assignedLicenses: [] });
+      throw new Error(`Unexpected ${init.method} ${url}`);
+    });
+    await expect(s.run(request, orgId, { type: 'user.license.assign', id, license: { skuId } }))
+      .resolves.toEqual({ accepted: true, changed: true, verified: false });
+    expect(s.audit).toHaveBeenLastCalledWith(expect.objectContaining({ outcome: 'unknown' }));
+    expect(s.fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
   });
   it('binds credentials to the server snapshot and passes the authenticated request to authorization', async () => {
     const s = setup();

@@ -22,9 +22,10 @@ export function mountMicrosoftRoutes(app: Hono<{ Variables: Variables }>, servic
     }
     catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : 'invalid_or_failed_request';
-      const allowed = new Set(['access_denied', 'invalid_operation', 'connection_not_ready', 'connection_changed', 'audit_unavailable', 'unknown_write_outcome', 'provider_failed', 'provider_rejected', 'provider_unreachable', 'worker_busy', 'exchange_unavailable', 'consent_expired_or_used', 'consent_rejected', 'tenant_verification_failed', 'administration_permissions_missing', 'provider_access_denied', 'provider_rate_limited', 'unsupported_group', 'role_assignment_state_unknown', 'last_global_administrator', 'method_not_removable']);
+      const allowed = new Set(['access_denied', 'invalid_operation', 'connection_not_ready', 'connection_changed', 'audit_unavailable', 'unknown_write_outcome', 'provider_failed', 'provider_rejected', 'provider_unreachable', 'worker_busy', 'exchange_unavailable', 'consent_expired_or_used', 'consent_rejected', 'tenant_verification_failed', 'administration_permissions_missing', 'provider_access_denied', 'provider_rate_limited', 'unsupported_group', 'role_assignment_state_unknown', 'last_global_administrator', 'method_not_removable', 'usage_location_required', 'license_not_available']);
       const operation = method === 'execute' ? await c.req.json().catch(() => null) as { type?: unknown } | null : null;
       const optionalRole = operation?.type === 'user.password.reset' ? 'User-PasswordProfile.ReadWrite.All'
+        : operation?.type === 'user.license.assign' ? 'LicenseAssignment.ReadWrite.All or User.ReadWrite.All'
         : operation?.type === 'user.sessions.revoke' ? 'User.RevokeSessions.All'
           : operation?.type === 'user.globalAdmin.set' ? 'RoleManagement.ReadWrite.Directory'
             : operation?.type === 'user.mfa.methods.list' ? 'UserAuthenticationMethod.Read.All'
@@ -37,6 +38,10 @@ export function mountMicrosoftRoutes(app: Hono<{ Variables: Variables }>, servic
           ? 'The last Global Administrator cannot be removed.'
         : code === 'role_assignment_state_unknown'
           ? 'Microsoft returned an incomplete Global Administrator assignment list. No change was made.'
+        : code === 'usage_location_required'
+          ? 'Set a two-letter usage location on this user before assigning a license.'
+        : code === 'license_not_available'
+          ? 'This license is no longer available. Refresh the tenant license inventory before trying again.'
         : code === 'method_not_removable'
           ? 'This authentication method is not available for removal. Refresh the user before trying again.'
         : code === 'provider_access_denied' && optionalRole

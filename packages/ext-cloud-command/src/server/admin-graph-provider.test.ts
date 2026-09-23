@@ -5,6 +5,7 @@ const TENANT = '11111111-1111-4111-8111-111111111111';
 const USER = '22222222-2222-4222-8222-222222222222';
 const OTHER_ADMIN = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const GROUP = '33333333-3333-4333-8333-333333333333';
+const SKU = '55555555-5555-4555-8555-555555555555';
 const ORIGIN = 'https://graph.microsoft.com/v1.0';
 function response(body: unknown, status = 200) { return new Response(JSON.stringify(body), { status }); }
 function harness() {
@@ -16,6 +17,36 @@ const staticGroup = { id: GROUP, securityEnabled: true, mailEnabled: false, grou
 afterEach(() => vi.useRealTimers());
 
 describe('bounded Microsoft administration provider', () => {
+  it('reads only the fixed service-health endpoint for the verified tenant and strips provider extras', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['ServiceHealth.Read.All'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ value: [{ id: 'Exchange Online', service: 'Exchange Online', status: 'serviceDegradation',
+        issues: [{ id: 'EX123', title: 'Mail delay', impactDescription: 'Some mail is delayed', status: 'investigating', lastModifiedDateTime: '2026-09-22T12:00:00Z', secret: 'never-return' }], secret: 'never-return' }] }));
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    const result = await provider.serviceHealth();
+    expect(result).toMatchObject({ partial: false, services: [{ service: 'Exchange Online', status: 'serviceDegradation', issues: [{ id: 'EX123' }] }] });
+    expect(JSON.stringify(result)).not.toContain('never-return');
+    expect(fetch.mock.calls[1]![0]).toBe(`${ORIGIN}/admin/serviceAnnouncement/healthOverviews?$expand=issues`);
+    expect(fetch.mock.calls.every(([, init]) => init.method === 'GET')).toBe(true);
+  });
+  it('fails service health closed on missing permission or wrong tenant, and marks pagination incomplete', async () => {
+    for (const [roles, identity, code] of [
+      [[], TENANT, 'provider_access_denied'],
+      [['ServiceHealth.Read.All'], USER, 'tenant_identity_mismatch'],
+    ] as const) {
+      const token = `h.${Buffer.from(JSON.stringify({ roles })).toString('base64url')}.s`;
+      const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: identity }] }));
+      const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+      await expect(provider.serviceHealth()).rejects.toMatchObject({ code });
+      expect(fetch).toHaveBeenCalledTimes(1);
+    }
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['ServiceHealth.Read.All'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ value: [], '@odata.nextLink': 'https://attacker.example/next' }));
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    await expect(provider.serviceHealth()).resolves.toMatchObject({ partial: true, services: [] });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
   it('creates one user only in a verified tenant domain and returns a one-time password', async () => {
     const token = `h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`;
     const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
@@ -23,13 +54,13 @@ describe('bounded Microsoft administration provider', () => {
       .mockResolvedValueOnce(response({ id: USER, userPrincipalName: 'new@example.test', passwordProfile: { password: 'do-not-echo' } }, 201));
     const fence = vi.fn(async () => {});
     const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
-    const result = await provider.createUser({ displayName: 'New User', userPrincipalName: 'new@example.test' }, fence);
+    const result = await provider.createUser({ displayName: 'New User', userPrincipalName: 'new@example.test', usageLocation: 'GB' }, fence);
     expect(result).toMatchObject({ accepted: true, id: USER, userPrincipalName: 'new@example.test', forceChangePasswordNextSignIn: true });
     expect(result.temporaryPassword).toHaveLength(32);
     expect(fence).toHaveBeenCalledTimes(1);
     expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
     const body = JSON.parse(fetch.mock.calls[2]![1].body);
-    expect(body).toEqual({ accountEnabled: true, displayName: 'New User', mailNickname: 'new', userPrincipalName: 'new@example.test', passwordProfile: { password: result.temporaryPassword, forceChangePasswordNextSignIn: true } });
+    expect(body).toEqual({ accountEnabled: true, displayName: 'New User', mailNickname: 'new', userPrincipalName: 'new@example.test', usageLocation: 'GB', passwordProfile: { password: result.temporaryPassword, forceChangePasswordNextSignIn: true } });
     expect(JSON.stringify(result)).not.toContain('do-not-echo');
   });
 
@@ -46,6 +77,43 @@ describe('bounded Microsoft administration provider', () => {
       await expect(provider.createUser(input as never)).rejects.toBeTruthy();
       expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(0);
     }
+  });
+  it('assigns only an available subscribed SKU to a user with usage location and verifies readback', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['LicenseAssignment.ReadWrite.All'] })).toString('base64url')}.s`;
+    const sku = { id: 'fixture', skuId: SKU, skuPartNumber: 'O365_BUSINESS_PREMIUM', consumedUnits: 2, capabilityStatus: 'Enabled', prepaidUnits: { enabled: 3, suspended: 0, warning: 0 } };
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ id: USER, usageLocation: 'GB', assignedLicenses: [] }))
+      .mockResolvedValueOnce(response({ value: [sku] }))
+      .mockResolvedValueOnce(response({ id: USER }, 200))
+      .mockResolvedValueOnce(response({ id: USER, assignedLicenses: [{ skuId: SKU }] }));
+    const fence = vi.fn(async () => {});
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    await expect(provider.assignUserLicense(USER, { skuId: SKU }, fence)).resolves.toEqual({ accepted: true, changed: true, verified: true });
+    expect(fence).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls[3]).toEqual([`${ORIGIN}/users/${USER}/assignLicense`, expect.objectContaining({ method: 'POST', body: JSON.stringify({ addLicenses: [{ skuId: SKU }], removeLicenses: [] }) })]);
+    expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
+  });
+  it('fails closed before assignment when usage location or seat is unavailable', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`;
+    for (const location of [null, 'GB']) {
+      const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+        .mockResolvedValueOnce(response({ id: USER, usageLocation: location, assignedLicenses: [] }))
+        .mockResolvedValueOnce(response({ value: [{ id: 'fixture', skuId: SKU, skuPartNumber: 'O365_BUSINESS_PREMIUM', consumedUnits: 3, capabilityStatus: 'Enabled', prepaidUnits: { enabled: 3, suspended: 0, warning: 0 } }] }));
+      const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+      await expect(provider.assignUserLicense(USER, { skuId: SKU })).rejects.toMatchObject({ code: location ? 'license_not_available' : 'usage_location_required' });
+      expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(0);
+    }
+  });
+  it('does not retry a license write when readback has not converged', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ id: USER, usageLocation: 'CA', assignedLicenses: [] }))
+      .mockResolvedValueOnce(response({ value: [{ id: 'fixture', skuId: SKU, skuPartNumber: 'O365_BUSINESS_PREMIUM', consumedUnits: 0, capabilityStatus: 'Enabled', prepaidUnits: { enabled: 1, suspended: 0, warning: 0 } }] }))
+      .mockResolvedValueOnce(response({ id: USER }))
+      .mockResolvedValueOnce(response({ id: USER, assignedLicenses: [] }));
+    const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token });
+    await expect(provider.assignUserLicense(USER, { skuId: SKU })).resolves.toEqual({ accepted: true, changed: true, verified: false });
+    expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
   });
   it.each(['common', 'organizations', '../users', `${TENANT}?evil=1`])('rejects invalid tenant %s', tenantId => {
     const fetch = vi.fn();

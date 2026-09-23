@@ -119,6 +119,38 @@
       ]
     },
     {
+      "id": "cloud-command-threecx-call-log",
+      "requiredFiles": [
+        "packages/ext-cloud-command/src/server/threecx-call-log.ts",
+        "packages/ext-cloud-command/src/server/threecx-call-log.test.ts",
+        "packages/ext-cloud-command/src/web/threecx-call-log.ts",
+        "packages/ext-cloud-command/src/web/threecx-call-log.test.ts",
+        "packages/ext-cloud-command/src/server/transport.ts",
+        "packages/ext-cloud-command/src/server/index.ts",
+        "packages/ext-cloud-command/src/web/index.ts",
+        "packages/ext-cloud-command/manifest.json",
+        "docs/cloudcom-threecx.md"
+      ],
+      "hooks": [
+        {
+          "file": "packages/ext-cloud-command/src/server/index.ts",
+          "contains": "mountThreeCxCallLog(app"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/web/index.ts",
+          "contains": "import './threecx-call-log'"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand-threecx-call-log-page"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/server/threecx-call-log.ts",
+          "contains": "report_scope_unverified"
+        }
+      ]
+    },
+    {
       "id": "cloud-command-microsoft365",
       "requiredFiles": [
         "packages/ext-cloud-command/src/server/native-microsoft.ts",
@@ -235,6 +267,10 @@
         { "file": "packages/ext-cloud-command/src/web/index.ts", "contains": "import './google'" },
         { "file": "packages/ext-cloud-command/manifest.json", "contains": "cloudcommand-google-page" },
         { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.directory" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.setSuspended" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.auditSuspension" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.updateProfile" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.auditProfile" },
         { "file": ".github/workflows/cloudcom-ci.yml", "contains": "cloudCommandGoogle.test.ts" }
       ]
     },

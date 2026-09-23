@@ -26,6 +26,14 @@ type UserSecurityAction = 'reset-password' | 'revoke-sessions' | 'block-sign-in'
 type MicrosoftRecord = Record<string, unknown>;
 type MfaMethodType = 'phone' | 'microsoftAuthenticator' | 'email' | 'fido2' | 'password' | 'softwareOath' | 'temporaryAccessPass' | 'windowsHelloForBusiness' | 'platformCredential' | 'other';
 type MfaMethod = { id?: string; type: MfaMethodType; detail?: string; removable: boolean };
+type LicenseOption = { skuId: string; skuPartNumber: string; capabilityStatus: string; consumedUnits: number; prepaidUnits: { enabled: number } };
+type HealthIssue = { id: string; title?: string | null; impactDescription?: string | null; status?: string | null; lastModifiedDateTime?: string | null };
+type HealthService = { id: string; service: string; status: string; issues?: HealthIssue[] };
+type HealthData = { services: HealthService[]; partial: boolean; checkedAt: string };
+const healthyStatuses = new Set(['serviceOperational', 'serviceRestored', 'postIncidentReviewPublished', 'resolved', 'resolvedExternal', 'falsePositive']);
+function healthTone(status: string): 'green' | 'yellow' | 'red' | 'unknown' {
+  return healthyStatuses.has(status) ? 'green' : status === 'serviceInterruption' ? 'red' : !status || status === 'unknownFutureValue' ? 'unknown' : 'yellow';
+}
 type RemovableMfaMethod = MfaMethod & { id: string; type: 'phone' | 'microsoftAuthenticator'; removable: true };
 type UserDraft = Partial<Record<(typeof USER_FIELDS)[number], string>> & { accountEnabled?: boolean };
 // Cloud Command's Edit account drawer saves the account name as one field. The
@@ -72,10 +80,14 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private detail: ResourceRow | null = null;
   private createUserOpen = false;
   private createUserDomains: string[] | null = null;
+  private createUserLicenses: LicenseOption[] | null = null;
+  private createLicenseCatalogError = '';
   private createUserError = '';
   private createUserBusy = false;
   private createdUser: { id: string; userPrincipalName: string; temporaryPassword: string } | null = null;
-  private createUserDraft = { name: '', local: '', domain: '' };
+  private createUserDraft = { name: '', local: '', domain: '', location: '', skuId: '' };
+  private createLicenseOutcome = '';
+  private createLicenseOutcomeError = false;
   private detailKind: DetailKind = 'read';
   private detailRecord: MicrosoftRecord | null = null;
   private detailRequest = 0;
@@ -114,6 +126,11 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private generation = 0;
   private busy = false;
   private resourceRequest = 0;
+  private health: HealthData | null = null;
+  private healthError = '';
+  private healthOpen = false;
+  private healthLoading = false;
+  private healthRequest = 0;
 
   set context(input: unknown) {
     const context = parseExtensionPageContextV1(input);
@@ -147,6 +164,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.mfaRequest += 1;
     this.temporaryPassword = null;
     this.createdUser = null;
+    this.healthRequest += 1;
     this.userSecurityAction = null;
   }
 
@@ -189,6 +207,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.resourceRequest += 1;
     this.busy = false;
     this.connection = null;
+    this.health = null; this.healthError = ''; this.healthOpen = false; this.healthLoading = false; this.healthRequest += 1;
     this.data = null;
     this.detail = null;
     this.createUserOpen = false;
@@ -262,6 +281,40 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
         this.render();
       }
     }
+  }
+  private async loadHealth(): Promise<void> {
+    if (!this.canRead() || this.healthLoading) return;
+    const generation = this.generation; const context = this.contextValue; const request = ++this.healthRequest;
+    this.healthLoading = true; this.healthError = ''; this.render();
+    try {
+      const raw = await this.request<HealthData>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'service.health.get' }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || request !== this.healthRequest) return;
+      if (!raw || !Array.isArray(raw.services) || typeof raw.partial !== 'boolean' || !Number.isFinite(Date.parse(raw.checkedAt))
+        || !raw.services.every(service => typeof service.id === 'string' && typeof service.service === 'string' && typeof service.status === 'string' && (!service.issues || Array.isArray(service.issues))))
+        throw new Error('Microsoft returned an invalid service-health response.');
+      this.health = raw;
+    } catch (error) {
+      if (generation === this.generation && context === this.contextValue && request === this.healthRequest)
+        this.healthError = error instanceof Error && error.message === 'provider_access_denied'
+          ? 'The connected application needs the ServiceHealth.Read.All permission with administrator consent.'
+          : error instanceof Error ? error.message : 'Service health could not be refreshed.';
+    } finally {
+      if (generation === this.generation && context === this.contextValue && request === this.healthRequest) { this.healthLoading = false; this.render(); }
+    }
+  }
+  private renderHealth(): string {
+    const data = this.health;
+    const affected = data?.services.filter(service => healthTone(service.status) !== 'green') ?? [];
+    const tone = !data || data.partial || !data.services.length || this.healthError ? 'unknown'
+      : affected.some(service => healthTone(service.status) === 'red') ? 'red'
+      : affected.some(service => healthTone(service.status) === 'yellow') ? 'yellow'
+      : affected.length ? 'unknown' : 'green';
+    const headline = tone === 'red' ? 'Service interruption reported' : tone === 'yellow' ? 'Some services have issues'
+      : tone === 'green' ? 'No known service issues' : 'Status unavailable';
+    const serviceRows = affected.map(service => `<details class="health-service"><summary><span class="health-dot ${healthTone(service.status)}"></span>${esc(service.service)}</summary><p class="meta">${esc(service.status)}</p>${service.issues?.length ? service.issues.map(issue => `<article class="health-issue"><strong>${esc(issue.title || 'Service advisory')}</strong><p>${esc(issue.impactDescription || 'Microsoft has not published an impact description yet.')}</p><small>${esc(issue.id)} · ${esc(issue.status || 'Microsoft update')}${issue.lastModifiedDateTime ? ` · Updated ${esc(this.formatCheckedAt(issue.lastModifiedDateTime))}` : ''}</small></article>`).join('') : '<p class="meta">Microsoft reports a service issue, but no further details were returned.</p>'}</details>`).join('');
+    return `<section class="health-panel" aria-label="Microsoft service health"><div class="health-heading"><div><h2>Client service status</h2><p class="meta">Microsoft-reported status for the selected tenant</p></div><button class="secondary compact" id="health-close">Close</button></div><p class="health-headline"><span class="health-dot ${tone}"></span>${headline}</p>${this.healthError ? `<p role="alert" class="status" data-error="true">Refresh failed. ${esc(this.healthError)}${data ? ' Showing the last saved result.' : ''}</p>` : ''}${data?.partial ? '<p role="status" class="meta">Microsoft returned only part of the service list. Overall status is unknown.</p>' : ''}<p class="meta">Last checked: ${data ? esc(this.formatCheckedAt(data.checkedAt)) : 'Not available'} · ${data ? `${affected.length} affected of ${data.services.length} services` : 'No verified status yet'}</p><div class="health-actions"><button class="secondary compact" id="health-refresh" ${this.healthLoading ? 'disabled' : ''}>${this.healthLoading ? 'Refreshing…' : 'Refresh status'}</button></div>${serviceRows}${data && !affected.length && !data.partial && data.services.length ? `<p class="meta">${data.services.length} services have no known issues.</p>` : ''}</section>`;
   }
   private async loadResource(): Promise<void> {
     if (!this.canRead()) return;
@@ -361,10 +414,13 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     if (!this.connection?.canManage || this.resource !== 'users') return;
     this.createUserOpen = true;
     this.createUserDomains = null; this.createUserError = ''; this.createdUser = null;
-    this.createUserDraft = { name: '', local: '', domain: '' };
+    this.createUserLicenses = null; this.createLicenseCatalogError = '';
+    this.createUserDraft = { name: '', local: '', domain: '', location: '', skuId: '' };
+    this.createLicenseOutcome = ''; this.createLicenseOutcomeError = false;
     this.render();
     queueMicrotask(() => this.root.querySelector<HTMLButtonElement>('#create-user-close')?.focus());
     void this.loadCreateUserDomains();
+    void this.loadCreateUserLicenses();
   }
   private closeCreateUser(): void {
     if (this.createUserBusy) return;
@@ -390,25 +446,66 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     }
     this.render();
   }
+  private async loadCreateUserLicenses(): Promise<void> {
+    const generation = this.generation, context = this.contextValue;
+    try {
+      const result = await this.request<{ items: LicenseOption[]; partial: boolean }>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'licenses.list' }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen) return;
+      if (!Array.isArray(result.items) || result.partial || !result.items.every(item => typeof item.skuId === 'string' && typeof item.skuPartNumber === 'string'
+        && typeof item.consumedUnits === 'number' && typeof item.prepaidUnits?.enabled === 'number')) throw new Error('Complete license inventory is unavailable.');
+      this.createUserLicenses = result.items.filter(item => item.skuPartNumber === 'O365_BUSINESS_PREMIUM'
+        && item.capabilityStatus === 'Enabled' && item.prepaidUnits.enabled > item.consumedUnits);
+    } catch (error) {
+      if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen) return;
+      this.createLicenseCatalogError = error instanceof Error ? error.message : 'Could not load license inventory.';
+      this.createUserLicenses = [];
+    }
+    this.render();
+  }
   private async createUser(): Promise<void> {
     if (!this.connection?.canManage || this.createUserBusy || this.createdUser || !this.createUserDomains?.length) return;
     const name = this.root.querySelector<HTMLInputElement>('#create-user-name')?.value.trim() ?? '';
     const local = this.root.querySelector<HTMLInputElement>('#create-user-local')?.value.trim() ?? '';
     const domain = this.root.querySelector<HTMLSelectElement>('#create-user-domain')?.value ?? '';
-    this.createUserDraft = { name, local, domain };
+    const location = this.root.querySelector<HTMLInputElement>('#create-user-location')?.value.trim().toUpperCase() ?? '';
+    const skuId = this.root.querySelector<HTMLSelectElement>('#create-user-license')?.value ?? '';
+    this.createUserDraft = { name, local, domain, location, skuId };
     if (!name || !/^[A-Za-z0-9'.!#^~_-]+$/.test(local) || !this.createUserDomains.includes(domain)) {
       this.createUserError = 'Enter a name and valid sign-in name using a verified domain.'; this.render(); return;
+    }
+    if ((location && !/^[A-Z]{2}$/.test(location)) || (skuId && (!location || !this.createUserLicenses?.some(item => item.skuId === skuId)))) {
+      this.createUserError = 'A Business Standard license needs an available seat and a two-letter usage location.'; this.render(); return;
     }
     const generation = this.generation, context = this.contextValue;
     this.createUserBusy = true; this.createUserError = ''; this.render();
     try {
       const result = await this.request<{ accepted: boolean; id: string; userPrincipalName: string; temporaryPassword: string }>(this.path('/administration'), {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ type: 'user.create', user: { displayName: name, userPrincipalName: `${local}@${domain}` } }),
+        body: JSON.stringify({ type: 'user.create', user: { displayName: name, userPrincipalName: `${local}@${domain}`, ...(location ? { usageLocation: location } : {}) } }),
       });
       if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen) return;
       if (!result.accepted || !result.id || !result.temporaryPassword) throw new Error('Creation outcome is uncertain. Refresh the directory before trying again.');
       this.createdUser = { id: result.id, userPrincipalName: result.userPrincipalName, temporaryPassword: result.temporaryPassword };
+      this.render();
+      if (skuId) {
+        try {
+          const assignment = await this.request<{ accepted: boolean; verified: boolean }>(this.path('/administration'), {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ type: 'user.license.assign', id: result.id, license: { skuId } }),
+          });
+          if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen) return;
+          this.createLicenseOutcome = assignment.accepted
+            ? assignment.verified ? 'Business Standard assigned and verified.' : 'Microsoft accepted the license assignment. Refresh the user to verify it appears.'
+            : 'License assignment was not confirmed. Review the user before retrying.';
+          this.createLicenseOutcomeError = !assignment.accepted || !assignment.verified;
+        } catch (error) {
+          if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen) return;
+          this.createLicenseOutcome = `User created; license assignment was not confirmed. ${error instanceof Error ? error.message : 'Review the user before retrying.'}`;
+          this.createLicenseOutcomeError = true;
+        }
+      }
       void this.loadResource();
     } catch (error) {
       if (generation === this.generation && context === this.contextValue && this.createUserOpen)
@@ -803,8 +900,11 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private renderCreateUserDrawer(): string {
     const domains = this.createUserDomains;
     const done = this.createdUser;
+    const licenseOptions = this.createUserLicenses?.map(item => `<option value="${esc(item.skuId)}" ${item.skuId === this.createUserDraft.skuId ? 'selected' : ''}>Business Standard · ${item.prepaidUnits.enabled - item.consumedUnits} available</option>`).join('') ?? '';
+    const licenseForm = `<section class="drawer-section"><h3>Assignments</h3><label>Usage location (ISO country code)<input id="create-user-location" aria-label="Usage location" maxlength="2" autocomplete="off" value="${esc(this.createUserDraft.location)}" placeholder="US, GB, CA…" ${this.createUserBusy ? 'disabled' : ''}></label><label>License<select id="create-user-license" aria-label="License" ${this.createUserBusy || this.createUserLicenses === null ? 'disabled' : ''}><option value="">No license</option>${licenseOptions}</select></label>${this.createLicenseCatalogError ? `<p class="meta">${esc(this.createLicenseCatalogError)} You can create the user without a license.</p>` : this.createUserLicenses === null ? '<p class="meta">Loading available Business Standard seats…</p>' : !this.createUserLicenses.length ? '<p class="meta">No Business Standard seats are available.</p>' : ''}<p class="meta">MFA enrollment, aliases, and group membership remain separate actions after creation.</p></section>`;
+    const licenseStatus = this.createLicenseOutcome ? `<p class="status" data-error="${this.createLicenseOutcomeError}" role="status">${esc(this.createLicenseOutcome)}</p>` : '';
     const status = this.createUserError ? `<p class="status" data-error="true" role="alert">${esc(this.createUserError)}</p>` : '';
-    const content = done ? `<div class="drawer-body"><section class="drawer-section"><h3>Created account</h3><p>${esc(done.userPrincipalName)}</p><label>Temporary password<input aria-label="Temporary password" type="text" readonly value="${esc(done.temporaryPassword)}"></label><p class="meta">Copy this password now. It is shown only in this drawer; the user must change it at next sign-in. It may take a moment to appear in the directory.</p></section><section class="drawer-section"><h3>Next assignments</h3><p class="meta">License, MFA enrollment, aliases, and group membership must be configured separately. They were not applied during creation.</p></section></div>` : `<div class="drawer-body"><section class="drawer-section"><h3>Account</h3><label>Name<input id="create-user-name" aria-label="Name" maxlength="256" value="${esc(this.createUserDraft.name)}" placeholder="Full name" ${this.createUserBusy ? 'disabled' : ''}></label><label>Sign-in name<div class="upn-field"><input id="create-user-local" aria-label="Sign-in name" maxlength="64" value="${esc(this.createUserDraft.local)}" placeholder="name" ${this.createUserBusy ? 'disabled' : ''}><span>@</span><select id="create-user-domain" aria-label="Domain" ${!domains?.length || this.createUserBusy ? 'disabled' : ''}>${domains?.length ? domains.map(domain => `<option value="${esc(domain)}" ${domain === this.createUserDraft.domain ? 'selected' : ''}>${esc(domain)}</option>`).join('') : '<option>Loading verified domains…</option>'}</select></div></label></section><section class="drawer-section"><h3>Sign-in</h3><p class="meta">A temporary password is generated securely when the user is created.</p><label class="check"><input type="checkbox" checked disabled> Force change password at next sign-in</label></section><section class="drawer-section"><h3>Assignments</h3><p class="meta">License, MFA enrollment, aliases, and group membership are separate actions after creation.</p></section></div>`;
+    const content = done ? `<div class="drawer-body"><section class="drawer-section"><h3>Created account</h3><p>${esc(done.userPrincipalName)}</p><label>Temporary password<input aria-label="Temporary password" type="text" readonly value="${esc(done.temporaryPassword)}"></label><p class="meta">Copy this password now. It is shown only in this drawer; the user must change it at next sign-in. It may take a moment to appear in the directory.</p></section><section class="drawer-section"><h3>Next assignments</h3>${licenseStatus}<p class="meta">MFA enrollment, aliases, and group membership remain separate actions; they were not applied during creation.</p></section></div>` : `<div class="drawer-body"><section class="drawer-section"><h3>Account</h3><label>Name<input id="create-user-name" aria-label="Name" maxlength="256" value="${esc(this.createUserDraft.name)}" placeholder="Full name" ${this.createUserBusy ? 'disabled' : ''}></label><label>Sign-in name<div class="upn-field"><input id="create-user-local" aria-label="Sign-in name" maxlength="64" value="${esc(this.createUserDraft.local)}" placeholder="name" ${this.createUserBusy ? 'disabled' : ''}><span>@</span><select id="create-user-domain" aria-label="Domain" ${!domains?.length || this.createUserBusy ? 'disabled' : ''}>${domains?.length ? domains.map(domain => `<option value="${esc(domain)}" ${domain === this.createUserDraft.domain ? 'selected' : ''}>${esc(domain)}</option>`).join('') : '<option>Loading verified domains…</option>'}</select></div></label></section><section class="drawer-section"><h3>Sign-in</h3><p class="meta">A temporary password is generated securely when the user is created.</p><label class="check"><input type="checkbox" checked disabled> Force change password at next sign-in</label></section>${licenseForm}</div>`;
     return `<div class="backdrop" data-create-user-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="create-user-title"><div class="heading drawer-heading"><div><h2 id="create-user-title">Add user</h2><p class="subtle">${done ? 'Account created' : 'Create a Microsoft 365 user'}</p></div><button class="secondary compact" id="create-user-close" ${this.createUserBusy ? 'disabled' : ''}>Close</button></div>${status}${content}<footer class="drawer-footer"><div class="actions">${done ? '' : `<button id="create-user-submit" ${!domains?.length || this.createUserBusy ? 'disabled' : ''}>Create user</button>`}</div></footer></aside></div>`;
   }
 
@@ -835,11 +935,19 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     }).join('');
     const exclusionUnavailable = this.resource === 'users' && this.directoryScope === 'exclude' && !!this.directoryExclusionError;
     const inventory = !canRead ? `<div class="empty">${connection?.connected && connection.enabled === false ? 'Enable this connection before loading inventory.' : 'Connect Microsoft 365 in Extensions > Connect before loading inventory.'}</div>` : !this.data ? `<div class="empty">${this.error ? `Could not load ${labels[this.resource].toLowerCase()}. Use Refresh to try again.` : `Loading current ${labels[this.resource].toLowerCase()}…`}</div>` : exclusionUnavailable ? `<div class="empty">Could not load directory exclusions. Refresh before reviewing excluded users.</div>` : !filtered.length ? `<div class="empty">${this.filter ? 'No rows match this search.' : `No ${labels[this.resource].toLowerCase()} are available for this tenant.`}</div>` : `<div class="table-wrap"><table><thead><tr>${columns.map(column => `<th>${esc(column.label)}</th>`).join('')}<th><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div>`;
-    this.root.innerHTML = `<style>${styles}${createUserStyles}</style><main><header><div><p class="eyebrow">Microsoft 365</p><h1>Directory</h1><p class="subtle">${esc(tenant)} · ${labels[this.resource]}: ${loadedCount}</p></div><div class="header-actions">${createControl}<span class="badge ${canRead ? 'ok' : ''}">${connection?.available === false ? 'Unavailable' : connection?.connected ? (connection.enabled === false ? 'Disabled' : 'Connected') : 'Not configured'}</span></div></header>${this.message ? `<p class="status" data-testid="status" data-error="${this.error}" aria-live="polite">${esc(this.message)}</p>` : '<p class="status" data-testid="status" aria-live="polite"></p>'}<section class="directory"><div class="directory-top">${canRead ? `<label class="filter"><span class="sr-only">Search ${labels[this.resource]}</span><input id="filter" data-testid="filter" value="${esc(this.filter)}" placeholder="${this.resource === 'users' ? 'Search name or email' : `Search ${labels[this.resource].toLowerCase()}`}"></label>` : ''}<nav class="resource-nav" role="tablist" aria-label="Microsoft directory resources">${tabs}</nav><button class="secondary compact" id="refresh-resource" ${!canRead ? 'disabled' : ''}>Refresh</button></div>${canRead ? `${chips}${this.data ? `<p class="meta">${this.data.complete ? 'Complete inventory' : 'Partial inventory'} · checked ${esc(this.formatCheckedAt(this.data.checkedAt))}</p>` : ''}${inventory}` : inventory}</section>${this.detail ? this.renderDrawer(canManage) : ''}${this.createUserOpen ? this.renderCreateUserDrawer() : ''}</main>`;
+    this.root.innerHTML = `<style>${styles}${createUserStyles}${healthStyles}</style><main><header><div><p class="eyebrow">Microsoft 365</p><h1>Directory</h1><p class="subtle">${esc(tenant)} · ${labels[this.resource]}: ${loadedCount}</p></div><div class="header-actions">${createControl}<button class="secondary compact" id="health-open" aria-expanded="${this.healthOpen}" ${!canRead ? 'disabled' : ''}>Service health</button><span class="badge ${canRead ? 'ok' : ''}">${connection?.available === false ? 'Unavailable' : connection?.connected ? (connection.enabled === false ? 'Disabled' : 'Connected') : 'Not configured'}</span></div></header>${this.healthOpen && canRead ? this.renderHealth() : ''}${this.message ? `<p class="status" data-testid="status" data-error="${this.error}" aria-live="polite">${esc(this.message)}</p>` : '<p class="status" data-testid="status" aria-live="polite"></p>'}<section class="directory"><div class="directory-top">${canRead ? `<label class="filter"><span class="sr-only">Search ${labels[this.resource]}</span><input id="filter" data-testid="filter" value="${esc(this.filter)}" placeholder="${this.resource === 'users' ? 'Search name or email' : `Search ${labels[this.resource].toLowerCase()}`}"></label>` : ''}<nav class="resource-nav" role="tablist" aria-label="Microsoft directory resources">${tabs}</nav><button class="secondary compact" id="refresh-resource" ${!canRead ? 'disabled' : ''}>Refresh</button></div>${canRead ? `${chips}${this.data ? `<p class="meta">${this.data.complete ? 'Complete inventory' : 'Partial inventory'} · checked ${esc(this.formatCheckedAt(this.data.checkedAt))}</p>` : ''}${inventory}` : inventory}</section>${this.detail ? this.renderDrawer(canManage) : ''}${this.createUserOpen ? this.renderCreateUserDrawer() : ''}</main>`;
+    this.root.querySelector('#health-open')?.addEventListener('click', () => { this.healthOpen = !this.healthOpen; this.render(); if (this.healthOpen && !this.health) void this.loadHealth(); });
+    this.root.querySelector('#health-close')?.addEventListener('click', () => { this.healthOpen = false; this.render(); });
+    this.root.querySelector('#health-refresh')?.addEventListener('click', () => void this.loadHealth());
     this.root.querySelector('#refresh-resource')?.addEventListener('click', () => void this.loadResource());
     this.root.querySelector('#create-user')?.addEventListener('click', () => this.openCreateUser());
     this.root.querySelector('#create-user-close')?.addEventListener('click', () => this.closeCreateUser());
     this.root.querySelector('#create-user-submit')?.addEventListener('click', () => void this.createUser());
+    for (const [id, field] of [['create-user-name', 'name'], ['create-user-local', 'local'], ['create-user-location', 'location'], ['create-user-domain', 'domain'], ['create-user-license', 'skuId']] as const) {
+      this.root.querySelector<HTMLInputElement | HTMLSelectElement>(`#${id}`)?.addEventListener('input', event => {
+        this.createUserDraft[field] = (event.target as HTMLInputElement | HTMLSelectElement).value;
+      });
+    }
     this.root.querySelector('[data-create-user-backdrop]')?.addEventListener('click', event => { if (event.target === event.currentTarget) this.closeCreateUser(); });
     this.root
       .querySelectorAll<HTMLButtonElement>('[data-resource]')
@@ -1023,5 +1131,6 @@ function parseMfaMethods(input: unknown): MfaMethod[] {
   return methods.map(item => item as MfaMethod);
 }
 const createUserStyles = `.upn-field{display:flex;align-items:center;gap:.45rem;min-width:0}.upn-field input{flex:1;min-width:0}.upn-field select{min-width:0;max-width:55%}@media(max-width:600px){.upn-field{flex-wrap:wrap}.upn-field select{max-width:100%;flex:1}}`;
+const healthStyles = `.header-actions{align-items:center;display:flex;flex-wrap:wrap;gap:.5rem}.health-panel{background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);margin-top:1rem;padding:.85rem 1rem}.health-heading{align-items:flex-start;display:flex;gap:.75rem;justify-content:space-between}.health-headline{align-items:center;display:flex;font-weight:700;gap:.5rem;margin-top:.8rem}.health-dot{background:hsl(var(--muted-foreground));border-radius:50%;display:inline-block;flex:none;height:.7rem;width:.7rem}.health-dot.green{background:hsl(var(--success))}.health-dot.yellow{background:#d9a441}.health-dot.red{background:hsl(var(--destructive))}.health-actions{margin:.65rem 0}.health-service{border-top:1px solid hsl(var(--border));padding:.55rem 0}.health-service summary{align-items:center;cursor:pointer;display:flex;gap:.55rem;font-weight:600}.health-service .meta{margin-left:1.25rem}.health-issue{border-left:2px solid hsl(var(--border));margin:.55rem 0 .55rem 1.25rem;padding:.15rem .65rem}.health-issue p{margin:.3rem 0;overflow-wrap:anywhere}.health-issue small{color:hsl(var(--muted-foreground))}@media(max-width:600px){.health-heading{align-items:flex-start}.header-actions{justify-content:flex-start}}`;
 const styles = `:host{display:block;color:hsl(var(--foreground));font-family:var(--font-sans,system-ui)}*{box-sizing:border-box}main{max-width:1200px;margin:auto;padding:1.5rem}header,.directory-top,.heading,.actions{align-items:flex-start;display:flex;gap:1rem;justify-content:space-between}h1,h2,h3,p{margin:0}h1{font-size:1.55rem}h2{font-size:1.1rem}h3{font-size:.9rem}.eyebrow{color:hsl(var(--primary));font-size:.75rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.subtle,.read-only,.meta{color:hsl(var(--muted-foreground));font-size:.875rem;margin-top:.35rem}.status{color:hsl(var(--muted-foreground));min-height:1.4rem;margin-top:.75rem}.status:empty{display:none}.status[data-error="true"],.drawer-feedback.error{color:hsl(var(--destructive))}.badge,.state{background:hsl(var(--muted));border-radius:999px;font-size:.8rem;font-weight:700;padding:.25rem .6rem}.badge.ok,.state.on{background:hsl(var(--success) / .16);color:hsl(var(--success))}.directory{border-top:1px solid hsl(var(--border));margin-top:1.25rem;padding-top:.8rem}.resource-nav{display:flex;gap:.15rem}.resource-tab{background:transparent;border-radius:0;color:hsl(var(--muted-foreground));min-height:2.45rem;padding:.45rem .8rem}.resource-tab[aria-selected="true"]{border-bottom:2px solid hsl(var(--primary));color:hsl(var(--foreground))}label{display:grid;gap:.4rem;font-size:.875rem;font-weight:600;margin-top:1rem}select,input{background:hsl(var(--background));border:1px solid hsl(var(--input));border-radius:calc(var(--radius,.5rem) - 2px);color:inherit;font:inherit;min-height:2.25rem;padding:.4rem .55rem}.filter{margin:0;flex:1;max-width:420px;min-width:180px}.directory-top{align-items:center;flex-wrap:wrap}.directory-top .resource-nav{margin-right:auto}.column-tools{align-items:center;display:flex;flex-wrap:wrap;gap:.4rem;margin-top:1rem}.column-tools>span{color:hsl(var(--muted-foreground));font-size:.8rem;font-weight:700;margin-right:.15rem}.column-chip{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground));font-size:.78rem;min-height:2rem;padding:.25rem .55rem}.column-chip[aria-pressed="false"]{background:transparent;border:1px solid hsl(var(--border));color:hsl(var(--muted-foreground))}.check{align-items:center;display:flex;gap:.5rem}.check input{min-height:auto;width:1rem}.actions{justify-content:flex-end;margin-top:1rem}button{background:hsl(var(--primary));border:0;border-radius:calc(var(--radius,.5rem) - 2px);color:hsl(var(--primary-foreground));cursor:pointer;font:inherit;font-weight:700;min-height:2.25rem;padding:.4rem .7rem}button.secondary{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground))}button.compact{font-size:.8rem;min-height:1.9rem;padding:.25rem .55rem}button:disabled{cursor:not-allowed;opacity:.6}button:focus,input:focus,select:focus{outline:2px solid hsl(var(--ring));outline-offset:2px}.table-wrap{margin-top:1rem;overflow:auto}table{border-collapse:collapse;color:hsl(var(--foreground));min-width:700px;width:100%}th,td{border-bottom:1px solid hsl(var(--border));padding:.75rem;text-align:left;vertical-align:middle}th{color:hsl(var(--muted-foreground));font-size:.75rem;text-transform:uppercase}.identity strong,.identity span{display:block}.identity span{color:hsl(var(--muted-foreground));font-size:.84rem;margin-top:.15rem}.row-control{text-align:right}.selected-row td{background:hsl(var(--accent) / .42)}.row-actions td{background:hsl(var(--accent) / .28)}.row-actions td>div{align-items:center;display:flex;gap:.7rem}.empty{border:1px dashed hsl(var(--border));border-radius:var(--radius,.5rem);color:hsl(var(--muted-foreground));margin-top:1rem;padding:1.25rem;text-align:center}.sr-only{clip:rect(0,0,0,0);height:1px;margin:-1px;overflow:hidden;position:absolute;width:1px}.backdrop{background:hsl(var(--background) / .64);display:flex;inset:0;justify-content:flex-end;position:fixed;z-index:20}.drawer{background:hsl(var(--card));box-shadow:-8px 0 24px hsl(var(--foreground) / .16);display:flex;flex-direction:column;height:100%;max-width:min(100%,40rem);width:100%}.drawer-heading{border-bottom:1px solid hsl(var(--border));flex:0 0 auto;padding:.85rem 1.1rem}.drawer-body{flex:1;min-height:0;overflow:auto;padding:.9rem 1.1rem}.drawer-section{margin-top:.9rem}.security-confirmation,.one-time-secret{background:hsl(var(--muted) / .28);border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);margin-top:1rem;padding:1rem}.security-confirmation p,.one-time-secret p{color:hsl(var(--muted-foreground));margin-bottom:.75rem}.one-time-secret code{display:block;background:hsl(var(--background));border-radius:.35rem;font-size:1rem;margin:.5rem 0;overflow-wrap:anywhere;padding:.65rem;user-select:all}.field-grid{display:grid;gap:.55rem;grid-template-columns:1fr}.user-field{align-items:end;display:grid;gap:.5rem;grid-template-columns:minmax(0,1fr) auto}.user-field label{align-items:center;display:grid;grid-template-columns:112px minmax(0,1fr);margin:0}.user-field label.check{display:flex;justify-content:flex-start}.field-grid .user-field label{margin:0}.drawer-footer{border-top:1px solid hsl(var(--border));flex:0 0 auto;padding:.7rem 1.1rem}.drawer-footer .actions{margin-top:0}.drawer-feedback{margin-top:.75rem;min-height:1.4rem}dl{margin:0}dl div{border-bottom:1px solid hsl(var(--border));padding:.75rem 0}dt{color:hsl(var(--muted-foreground));font-size:.75rem;font-weight:700}dd{margin:.25rem 0 0;overflow-wrap:anywhere}@media(max-width:600px){main{padding:1rem}.directory-top,.heading{flex-direction:column}.field-grid .user-field label{align-items:stretch;grid-template-columns:1fr}.drawer-heading{padding:1rem}.drawer-body,.drawer-footer{padding-left:1rem;padding-right:1rem}}`;
 if (!customElements.get(ELEMENT)) customElements.define(ELEMENT, CloudCommandMicrosoftPage);

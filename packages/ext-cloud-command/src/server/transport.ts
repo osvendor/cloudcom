@@ -33,6 +33,15 @@ export function createProvider(fetch: GuardedFetch) {
     return { origin, headers: { Authorization: `Bearer ${result.access_token}` } };
   }
   return {
+    async callLog(credentials: Credentials, start: string, end: string, skip: number) {
+      const signal = AbortSignal.timeout(30000);
+      const { origin, headers } = await session(credentials, signal);
+      // This fixed XAPI function is not a general OData path supplied by the browser.
+      const period = (value: string) => value.replace(/\.000Z$/, 'Z');
+      const path = `ReportCallLogData/Pbx.GetCallLogData(periodFrom=${period(start)},periodTo=${period(end)},sourceType=0,sourceFilter='',destinationType=0,destinationFilter='',callsType=0,callTimeFilterType=0,callTimeFilterFrom='0:00:0',callTimeFilterTo='0:00:0',hidePcalls=true)`;
+      const query = new URLSearchParams({ '$top': '100', '$skip': String(skip) });
+      return json(`${origin}/xapi/v1/${path}?${query}`, { headers }, signal);
+    },
     async systemStatus(credentials: Credentials) {
       const signal = AbortSignal.timeout(30000);
       const { origin, headers } = await session(credentials, signal);
