@@ -150,7 +150,7 @@ const unifiSyncLockPaths = new Set([
   'apps/api/src/__tests__/integration/unifiSyncLockOrder.integration.test.ts',
 ]);
 const infraPaths = new Set([
-  'AGENTS.md', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',
+  'AGENTS.md', '.dockerignore', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',
   '.github/scripts/check-cloudcom-runner.sh', '.github/scripts/ci-area-gating.test.mjs',
   '.github/scripts/ci-build-reuse.test.mjs', '.github/scripts/classify-pr-paths.sh',
   '.github/scripts/classify-pr-paths.test.mjs', '.github/scripts/mobile-native-ci.test.mjs',
