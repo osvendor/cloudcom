@@ -21,6 +21,8 @@ test('baseline accepts a valid release fixture and rejects an arbitrary reposito
 });
 
 test('classifies supported web, native, and explicit infrastructure changes', () => {
+  assert.deepEqual(classify(['.dockerignore']).unsupported, []);
+  assert.equal(classify(['.dockerignore']).infra, true);
   assert.deepEqual(classify(['apps/web/src/components/remote/RemoteToolsPage.tsx', 'agent/main.go', 'deploy/docker-compose.prod.yml']), {
     api: false, web: true, shared: false, native: true, infra: true, portalRemote: false, unifiSyncLock: false, unsupported: [], docsOnly: false,
   });
@@ -28,6 +30,11 @@ test('classifies supported web, native, and explicit infrastructure changes', ()
   assert.deepEqual(classify(['packages/shared/src/types.ts']).unsupported, ['packages/shared/src/types.ts']);
   assert.deepEqual(classify(['apps/web/src/pages/index.astro']).unsupported, ['apps/web/src/pages/index.astro']);
   assert.equal(classify(['apps/api/src/config/envComposeParity.test.ts']).infra, true);
+  for (const path of ['deploy/cloudcom-exchange-worker/Dockerfile', 'deploy/cloudcom-exchange-worker/healthcheck.py', 'deploy/cloudcom-exchange-worker/README.md']) {
+    const result = classify([path]);
+    assert.equal(result.infra, true);
+    assert.deepEqual(result.unsupported, []);
+  }
 });
 
 test('skips a docs-only delta and rejects unsupported product surfaces', () => {
@@ -43,6 +50,35 @@ test('requires API validation for the explicit remote tool module and its mount'
     assert.deepEqual(result.unsupported, []);
   }
   assert.deepEqual(classify(['apps/api/src/routes/portal/devices.ts']).unsupported, ['apps/api/src/routes/portal/devices.ts']);
+});
+
+test('routes the bounded Microsoft directory Graph projection through shared validation', () => {
+  for (const path of ['packages/shared/src/m365/readActions.ts', 'packages/shared/src/m365/readActions.test.ts']) {
+    const result = classify([path]);
+    assert.equal(result.shared, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+  assert.deepEqual(classify(['packages/shared/src/m365/otherAction.ts']).unsupported,
+    ['packages/shared/src/m365/otherAction.ts']);
+});
+
+test('routes the bounded Google Workspace host bridge through Cloud Command validation', () => {
+  for (const path of [
+    'apps/api/src/extensions/cloudCommandGoogle.ts',
+    'apps/api/src/extensions/cloudCommandGoogle.test.ts',
+    'apps/api/src/services/googleClient.ts',
+    'apps/api/src/services/googleClient.test.ts',
+    'packages/ext-cloud-command/src/server/native-google.ts',
+    'packages/ext-cloud-command/src/server/google.ts',
+    'packages/ext-cloud-command/src/web/google.ts',
+    'apps/web/src/components/extensions/useExtensionNavigation.ts',
+    'apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx',
+    'apps/web/src/components/integrations/GoogleWorkspaceIntegration.test.tsx',
+  ]) {
+    const result = classify([path]);
+    assert.deepEqual(result.unsupported, []);
+    assert.equal(result.api || result.web, true);
+  }
 });
 
 test('routes the enumerated customer portal remote surface to focused real-DB coverage', () => {
@@ -136,6 +172,20 @@ test('requires API and web validation for the native Microsoft host bridge', () 
   assert.deepEqual(result.unsupported, []);
 });
 
+test('routes the fixed OneDrive reporting executor to API and shared validation', () => {
+  for (const path of [
+    'apps/m365-graph-read-executor/src/microsoft/graphClient.ts',
+    'apps/m365-graph-read-executor/src/microsoft/graphClient.test.ts',
+    'apps/m365-graph-read-executor/src/microsoft/readActions.ts',
+    'apps/m365-graph-read-executor/src/microsoft/readActions.test.ts',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.api, true);
+    assert.equal(result.shared, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+});
+
 test('classifies the bounded Microsoft administration runtime, authorization, and additive migration', () => {
   for (const path of [
     'apps/api/src/extensions/cloudCommandAdminRuntime.ts',
@@ -146,6 +196,8 @@ test('classifies the bounded Microsoft administration runtime, authorization, an
     'packages/ext-cloud-command/src/server/admin-services.ts',
     'packages/ext-cloud-command/src/server/admin-store.ts',
     'packages/ext-cloud-command/migrations/2026-09-22-native-admin-connections.sql',
+    'packages/ext-cloud-command/migrations/2026-09-22-microsoft-directory-preferences.sql',
+    'packages/ext-cloud-command/src/server/directory-preferences.ts',
   ]) {
     const result = classify([path]);
     assert.equal(result.api, true);

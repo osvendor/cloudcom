@@ -83,6 +83,10 @@ export interface MicrosoftGraphClient {
     maxItems: number;
     maxPages: number;
   }): Promise<{ items: Record<string, unknown>[]; truncated: boolean }>;
+  /** Fixed Reports API collector. The report redirect is followed only to its documented host without a bearer token. */
+  readOneDriveUsageReport?(input: {
+    accessToken: OpaqueAccessToken;
+  }): Promise<{ items: Record<string, unknown>[]; truncated: boolean }>;
   readSyncCollection(input: {
     accessToken: OpaqueAccessToken;
     path: string;                   // '/users' — also the expected nextLink path
@@ -222,6 +226,56 @@ function graphUrl(path: string, query?: Record<string, string>): string {
   return url.href;
 }
 
+const REPORT_DOWNLOAD_HOST = 'reports.office.com';
+const ONEDRIVE_USAGE_HEADERS = ['Report Refresh Date', 'Site URL', 'Owner Display Name', 'Is Deleted', 'Last Activity Date', 'File Count', 'Active File Count', 'Storage Used (Byte)', 'Storage Allocated (Byte)', 'Owner Principal Name', 'Report Period'];
+const ONEDRIVE_USAGE_MAX_ROWS = 10_000;
+
+function reportDownloadUrl(location: string): string {
+  let url: URL;
+  try { url = new URL(location); } catch { throw failure('graph_response_invalid'); }
+  if (url.protocol !== 'https:' || url.hostname !== REPORT_DOWNLOAD_HOST || url.port || url.username || url.password || url.hash
+    || !url.pathname.startsWith('/data/download/')) throw failure('graph_response_invalid');
+  return url.href;
+}
+function csvRows(csv: string): string[][] {
+  const rows: string[][] = [];
+  let field = '', row: string[] = [], quoted = false;
+  for (let index = 0; index < csv.length; index += 1) {
+    const char = csv[index]!;
+    if (quoted) {
+      if (char === '"' && csv[index + 1] === '"') { field += '"'; index += 1; }
+      else if (char === '"') quoted = false;
+      else field += char;
+    } else if (char === '"') quoted = true;
+    else if (char === ',') { row.push(field); field = ''; }
+    else if (char === '\n') { row.push(field.replace(/\r$/, '')); rows.push(row); row = []; field = ''; }
+    else field += char;
+  }
+  if (quoted) throw failure('graph_response_invalid');
+  if (field || row.length) { row.push(field.replace(/\r$/, '')); rows.push(row); }
+  return rows;
+}
+function parsedOneDriveUsage(csv: string): { items: Record<string, unknown>[]; truncated: boolean } {
+  const rows = csvRows(csv);
+  const [headers, ...data] = rows;
+  if (headers?.[0]?.startsWith('\uFEFF')) headers[0] = headers[0].slice(1);
+  if (!headers || headers.length !== ONEDRIVE_USAGE_HEADERS.length || headers.some((value, index) => value !== ONEDRIVE_USAGE_HEADERS[index]))
+    throw failure('graph_response_invalid');
+  const items: Record<string, unknown>[] = [];
+  let truncated = false;
+  for (const row of data) {
+    if (row.length !== headers.length) throw failure('graph_response_invalid');
+    if (items.length >= ONEDRIVE_USAGE_MAX_ROWS) { truncated = true; break; }
+    const ownerPrincipalName = row[9]!.trim();
+    const storageUsedBytes = Number(row[7]);
+    const storageAllocatedBytes = Number(row[8]);
+    if (!ownerPrincipalName || ownerPrincipalName.length > 320 || !Number.isSafeInteger(storageUsedBytes) || storageUsedBytes < 0
+      || !Number.isSafeInteger(storageAllocatedBytes) || storageAllocatedBytes < 0) continue;
+    items.push({ ownerPrincipalName, storageUsedBytes, storageAllocatedBytes, lastActivityDate: row[4] || null });
+  }
+  return { items, truncated };
+}
+
 const LICENSE_ERROR_CODE = 'Authentication_RequestFromNonPremiumTenantOrB2CTenant';
 
 function retryAfterSecondsFromHeader(response: Response): number {
@@ -328,6 +382,36 @@ export function createMicrosoftGraphClient(
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  async function oneDriveUsageReport(accessToken: OpaqueAccessToken): Promise<{ items: Record<string, unknown>[]; truncated: boolean }> {
+    const budget: RequestBudget = { bytes: 0, requests: 0, items: 0 };
+    if (budget.requests >= maxRequestCount) throw failure('graph_response_too_large');
+    budget.requests += 1;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const report = await fetchImpl(graphUrl("/reports/getOneDriveUsageAccountDetail(period='D7')"), {
+        method: 'GET', redirect: 'manual', headers: { authorization: `Bearer ${accessToken}` }, signal: controller.signal,
+      });
+      if (report.status !== 302) {
+        const body = await readBoundedBody(report, budget, maxResponseBytes);
+        if (!report.ok) throw readFailure(report, body);
+        throw failure('graph_response_invalid');
+      }
+      const download = report.headers.get('location');
+      if (!download) throw failure('graph_response_invalid');
+      if (budget.requests >= maxRequestCount) throw failure('graph_response_too_large');
+      budget.requests += 1;
+      const response = await fetchImpl(reportDownloadUrl(download), { method: 'GET', redirect: 'error', signal: controller.signal });
+      const csv = await readBoundedBody(response, budget, maxResponseBytes);
+      if (!response.ok) throw failure('graph_provider_rejected');
+      return parsedOneDriveUsage(csv);
+    } catch (error) {
+      if (error instanceof GraphClientError) throw error;
+      if (controller.signal.aborted) throw failure('graph_request_timeout');
+      throw failure('graph_transport_failed');
+    } finally { clearTimeout(timer); }
   }
 
   const nowMs = dependencies.now ?? (() => Date.now());
@@ -627,6 +711,11 @@ export function createMicrosoftGraphClient(
           : fixedCollectionNextLink(page.nextLink, expectedPath);
       }
       return { items, truncated };
+    },
+
+    async readOneDriveUsageReport(input) {
+      if (!configValid || typeof input.accessToken !== 'string' || !input.accessToken) throw failure('graph_request_invalid');
+      return oneDriveUsageReport(input.accessToken);
     },
 
     async readSyncCollection(input) {

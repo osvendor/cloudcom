@@ -36,9 +36,9 @@ describe('organization provider overview', () => {
   const pending: Array<(response:Response)=>void> = [];
   const page = mount(() => new Promise<Response>(resolve => pending.push(resolve)));
   page.context = context('org-b');
-  pending.slice(2).forEach(resolve => resolve(Response.json({ connected:false, canManage:false, available:true })));
+  pending.slice(3).forEach(resolve => resolve(Response.json({ connected:false, canManage:false, available:true })));
   await flush();
-  pending.slice(0,2).forEach(resolve => resolve(Response.json({ connected:true, enabled:true, available:true })));
+  pending.slice(0,3).forEach(resolve => resolve(Response.json({ connected:true, enabled:true, available:true })));
   await flush();
   expect(page.shadowRoot!.querySelector('[data-provider]')).toBeNull();
   expect(page.shadowRoot!.textContent).toContain('No enabled services');

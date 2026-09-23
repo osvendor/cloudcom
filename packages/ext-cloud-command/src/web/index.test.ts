@@ -58,6 +58,33 @@ describe('CloudCommandThreeCxPage', () => {
     expect(request.mock.calls.filter(([path]) => path === '/threecx/users?skip=0')).toHaveLength(1);
   });
 
+  it('separates registration, current profile, and account state and searches only loaded extensions', async () => {
+    const users = [
+      { Id: 1, Number: '100', FirstName: 'Ada', LastName: 'Lovelace', EmailAddress: 'ada@example.com', Enabled: true, IsRegistered: true, CurrentProfileName: 'Available' },
+      { Id: 2, Number: '101', FirstName: 'Grace', LastName: 'Hopper', EmailAddress: 'grace@example.com', Enabled: false, IsRegistered: false, CurrentProfileName: 'Away' },
+    ];
+    const request = vi.fn(async (path: string) => path === '/threecx/users?skip=0'
+      ? Response.json({ items: users, nextSkip: 100, truncated: true })
+      : Response.json({ connected: true, canManage: false, enabled: true }));
+    const page = mount({ request });
+    await flush(); await flush();
+    const root = page.shadowRoot!;
+    expect([...root.querySelectorAll('th')].map((node) => node.textContent)).toEqual([
+      'User', 'Extension', 'Email', 'Registration', 'Status', 'Account', 'Details',
+    ]);
+    expect(root.querySelector<HTMLTableRowElement>('tr[data-user-index="0"]')!.textContent).toContain('Registered');
+    expect(root.querySelector<HTMLTableRowElement>('tr[data-user-index="0"]')!.textContent).toContain('Available');
+    expect(root.querySelector<HTMLTableRowElement>('tr[data-user-index="1"]')!.textContent).toContain('Disabled');
+    const search = root.querySelector<HTMLInputElement>('#search-users')!;
+    search.value = 'grace';
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(root.querySelector<HTMLTableRowElement>('tr[data-user-index="0"]')!.hidden).toBe(true);
+    expect(root.querySelector<HTMLTableRowElement>('tr[data-user-index="1"]')!.hidden).toBe(false);
+    expect(root.querySelector('#search-count')!.textContent).toBe('1 matching loaded extensions');
+    expect(root.textContent).toContain('Search covers loaded extensions only');
+    expect(request.mock.calls.filter(([path]) => path === '/threecx/users?skip=0')).toHaveLength(1);
+  });
+
   it('does not read extensions from a configuration-only view', async () => {
     const request = vi.fn(async (_path: string) => Response.json({ connected: true, canManage: true, enabled: true }));
     const page = new CloudCommandThreeCxPage();

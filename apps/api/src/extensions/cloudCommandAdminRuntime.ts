@@ -1,15 +1,17 @@
 import { createHash, createPrivateKey, randomUUID, X509Certificate } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { chmod, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { importPKCS8, SignJWT, createRemoteJWKSet, jwtVerify, type CryptoKey, type JWTPayload, type KeyObject } from 'jose';
 import { z } from 'zod';
-import { createAdministrationTokenProvider } from '@cloudcom/ext-cloud-command';
+import { createAdministrationTokenProvider, createUnixSocketExchangeWorkerPort, type ExchangeDescriptorRegistry } from '@cloudcom/ext-cloud-command';
 import { safeFetch } from '../services/urlSafety';
 import { runOutsideDbContext } from '../db';
 
 const UUID = z.string().uuid().transform(value => value.toLowerCase());
 const VERSION = z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/);
 const CONFIG_ENV = 'CLOUDCOM_MICROSOFT_ADMIN_CONFIG_FILE';
+const EXCHANGE_DESCRIPTOR_ENV = 'CLOUDCOM_EXCHANGE_DESCRIPTOR_FILE';
+const EXCHANGE_SOCKET_ENV = 'CLOUDCOM_EXCHANGE_SOCKET_PATH';
 const CALLBACK_PATH = '/extensions/cloudcommand/connect';
 const LOGIN_ORIGIN = 'https://login.microsoftonline.com';
 const JWKS = createRemoteJWKSet(new URL(`${LOGIN_ORIGIN}/common/discovery/v2.0/keys`), { cacheMaxAge: 600_000, cooldownDuration: 30_000 });
@@ -23,6 +25,7 @@ export interface CloudCommandAdminRuntime {
   acquireToken(connection: CloudCommandAdminConnection): Promise<string>;
   verifyAuthorization(input: CloudCommandAdminConnection & { code: string; codeVerifier: string; nonce: string }): Promise<{ tenantId: string; administratorObjectId: string }>;
   audit(event: CloudCommandAdminAuditEvent): Promise<void>;
+  exchange(): Promise<{ registry: ExchangeDescriptorRegistry; worker: ReturnType<typeof createUnixSocketExchangeWorkerPort> } | null>;
 }
 
 type Descriptor = CloudCommandAdminConfiguration & { certificatePath: string; privateKeyPath: string };
@@ -33,6 +36,9 @@ type Dependencies = {
   fetch?: GuardedFetch;
   verificationKey?: CryptoKey | KeyObject;
   auditWrite?: (event: CloudCommandAdminAuditEvent) => Promise<void>;
+  writeFile?: typeof writeFile;
+  rename?: typeof rename;
+  chmod?: typeof chmod;
 };
 
 function unavailable(): Error { return new Error('microsoft_administration_unavailable'); }
@@ -110,6 +116,9 @@ async function verifyIdentity(idToken: string, expected: { tenantId: string; cli
 /** Host-only Microsoft administration credential runtime. It never accepts descriptor paths from a browser request. */
 export function createCloudCommandAdminRuntime(dependencies: Dependencies = {}): CloudCommandAdminRuntime {
   const read = dependencies.readFile ?? readFile;
+  const write = dependencies.writeFile ?? writeFile;
+  const move = dependencies.rename ?? rename;
+  const setMode = dependencies.chmod ?? chmod;
   const fetchImpl: GuardedFetch = dependencies.fetch ?? ((url, init) => runOutsideDbContext(() => safeFetch(url, init)));
   const environment = dependencies.env ?? process.env;
   async function descriptor(): Promise<Descriptor | null> {
@@ -121,21 +130,87 @@ export function createCloudCommandAdminRuntime(dependencies: Dependencies = {}):
   async function certificate(config: Descriptor): Promise<{ certificatePem: string; privateKeyPem: string }> {
     try { return { certificatePem: await read(config.certificatePath, 'utf8'), privateKeyPem: await read(config.privateKeyPath, 'utf8') }; } catch { throw unavailable(); }
   }
+  async function acquireBoundToken(connection: CloudCommandAdminConnection): Promise<string> {
+    const config = await requiredDescriptor();
+    const { tenantId } = requireBoundConnection(connection, config);
+    const provider = createAdministrationTokenProvider({
+      clientId: config.clientId, credentialVersion: config.credentialVersion, fetch: fetchImpl,
+      loadCertificate: async version => {
+        if (version !== config.credentialVersion) throw unavailable();
+        const material = await certificate(config);
+        return { clientId: config.clientId, credentialVersion: config.credentialVersion, ...material };
+      },
+    });
+    try { return await provider(tenantId); } catch { throw tokenUnavailable(); }
+  }
+  async function initialExchangeDomain(connection: CloudCommandAdminConnection): Promise<string> {
+    const token = await acquireBoundToken(connection);
+    let data: Record<string, unknown>;
+    try {
+      data = await boundedJson(await fetchImpl('https://graph.microsoft.com/v1.0/organization?$select=id,verifiedDomains', {
+        method: 'GET', headers: { Authorization: `Bearer ${token}` }, redirect: 'error',
+        signal: AbortSignal.timeout(15_000), timeoutMs: 15_000, maxBytes: 128 * 1024,
+      }));
+    } catch { throw unavailable(); }
+    const parsed = z.object({ value: z.array(z.object({ id: UUID,
+      verifiedDomains: z.array(z.object({ name: z.string().min(1).max(255), isInitial: z.boolean() }).passthrough()).max(256),
+    }).passthrough()).length(1) }).passthrough().safeParse(data);
+    if (!parsed.success || parsed.data.value[0]!.id !== connection.tenantId) throw unavailable();
+    const initial = parsed.data.value[0]!.verifiedDomains.filter(domain => domain.isInitial);
+    if (initial.length !== 1 || !/^[a-z0-9-]+\.onmicrosoft\.com$/i.test(initial[0]!.name)) throw unavailable();
+    return initial[0]!.name.toLowerCase();
+  }
+  let exchangeWrites = Promise.resolve();
+  async function exchangeBridge() {
+    const descriptorPath = environment[EXCHANGE_DESCRIPTOR_ENV], socketPath = environment[EXCHANGE_SOCKET_ENV];
+    if (!descriptorPath || !socketPath || !path.isAbsolute(descriptorPath) || !path.isAbsolute(socketPath)) return null;
+    const config = await requiredDescriptor();
+    const worker = createUnixSocketExchangeWorkerPort({ socketPath });
+    const mutate = async (apply: (tenants: Record<string, Record<string, unknown>>) => void) => {
+      // Serialize mutations in this API process. The deployment must provide a single shared,
+      // private descriptor mount; no browser request chooses its location or contents.
+      const previous = exchangeWrites;
+      let release!: () => void; exchangeWrites = new Promise<void>(resolve => { release = resolve; });
+      await previous;
+      try {
+        let raw: unknown = { tenants: {} };
+        try { raw = JSON.parse(await read(descriptorPath, 'utf8')); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw unavailable();
+          // First provision creates the private descriptor file.
+        }
+        const parsed = z.object({ tenants: z.record(z.string(), z.record(z.string(), z.unknown())) }).strict().safeParse(raw);
+        if (!parsed.success) throw unavailable();
+        const tenants = parsed.data.tenants; apply(tenants);
+        const temporary = `${descriptorPath}.${randomUUID()}.tmp`;
+        await write(temporary, JSON.stringify({ tenants }), { encoding: 'utf8', mode: 0o600 });
+        await setMode(temporary, 0o600); await move(temporary, descriptorPath); await setMode(descriptorPath, 0o600);
+      } finally { release(); }
+    };
+    const registry: ExchangeDescriptorRegistry = {
+      async provision(binding) {
+        const tenantId = UUID.parse(binding.tenantId), organizationId = UUID.parse(binding.organizationId), clientId = UUID.parse(binding.clientId);
+        if (clientId !== config.clientId || binding.credentialVersion !== config.credentialVersion || !Number.isSafeInteger(binding.connectionGeneration) || binding.connectionGeneration < 1) throw unavailable();
+        // Exchange PowerShell requires the initial onmicrosoft.com domain, not a tenant GUID.
+        // Resolve it from the same tenant-bound Graph application credential and fail closed.
+        const exchangeOrganization = await initialExchangeDomain(binding);
+        await mutate(tenants => {
+          for (const [existingTenantId, descriptor] of Object.entries(tenants)) {
+            if (descriptor.organizationId === organizationId && existingTenantId !== tenantId) delete tenants[existingTenantId];
+          }
+          tenants[tenantId] = { enabled: true, organizationId, tenantId, clientId, credentialVersion: binding.credentialVersion, connectionGeneration: binding.connectionGeneration,
+          exchangeOrganization, certificatePath: config.certificatePath, privateKeyPath: config.privateKeyPath }; });
+      },
+      async revoke(organizationId) {
+        organizationId = UUID.parse(organizationId);
+        await mutate(tenants => { for (const [tenantId, descriptor] of Object.entries(tenants)) if (descriptor.organizationId === organizationId) delete tenants[tenantId]; });
+      },
+    };
+    return { registry, worker };
+  }
   return {
     async configuration() { const config = await descriptor(); return config && { clientId: config.clientId, credentialVersion: config.credentialVersion, redirectUri: config.redirectUri }; },
-    async acquireToken(connection) {
-      const config = await requiredDescriptor();
-      const { tenantId } = requireBoundConnection(connection, config);
-      const provider = createAdministrationTokenProvider({
-        clientId: config.clientId, credentialVersion: config.credentialVersion, fetch: fetchImpl,
-        loadCertificate: async version => {
-          if (version !== config.credentialVersion) throw unavailable();
-          const material = await certificate(config);
-          return { clientId: config.clientId, credentialVersion: config.credentialVersion, ...material };
-        },
-      });
-      try { return await provider(tenantId); } catch { throw tokenUnavailable(); }
-    },
+    acquireToken: acquireBoundToken,
     async verifyAuthorization(input) {
       const config = await requiredDescriptor();
       const { tenantId } = requireBoundConnection(input, config);
@@ -156,6 +231,7 @@ export function createCloudCommandAdminRuntime(dependencies: Dependencies = {}):
       const { createAuditLog } = await import('../services/auditService');
       await createAuditLog({ orgId: event.orgId, actorId: event.actorId, action: event.action, resourceType: 'microsoft_administration', resourceId: event.resourceId, details: event.details ?? {}, result: event.result });
     },
+    exchange: exchangeBridge,
   };
 }
 

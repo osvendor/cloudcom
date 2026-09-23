@@ -84,6 +84,11 @@ const cloudCommandApiPaths = new Set([
   'apps/api/src/extensions/builtinRegistry.ts',
   'apps/api/src/extensions/cloudCommandMicrosoft.ts',
   'apps/api/src/extensions/cloudCommandMicrosoft.test.ts',
+  'apps/api/src/extensions/cloudCommandGoogle.ts',
+  'apps/api/src/extensions/cloudCommandGoogleTrace.ts',
+  'apps/api/src/extensions/cloudCommandGoogle.test.ts',
+  'apps/api/src/services/googleClient.ts',
+  'apps/api/src/services/googleClient.test.ts',
   'apps/api/src/extensions/cloudCommandAdminRuntime.ts',
   'apps/api/src/extensions/cloudCommandAdminRuntime.test.ts',
   'apps/api/src/extensions/cloudCommandAdminAuthorization.ts',
@@ -107,6 +112,8 @@ const cloudCommandApiPaths = new Set([
   'pnpm-lock.yaml',
 ]);
 const cloudCommandWebPaths = new Set([
+  'apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx',
+  'apps/web/src/components/integrations/GoogleWorkspaceIntegration.test.tsx',
   'apps/web/src/components/extensions/ExtensionElementHost.tsx',
   'apps/web/src/components/extensions/ExtensionPageHost.test.tsx',
   'apps/web/src/components/extensions/ExtensionSlotHost.test.tsx',
@@ -123,6 +130,14 @@ const cloudCommandWebPaths = new Set([
 const cloudCommandSharedPaths = new Set([
   'packages/extension-web-sdk/src/hostApi.ts',
   'packages/extension-web-sdk/src/index.ts',
+  'packages/shared/src/m365/readActions.ts',
+  'packages/shared/src/m365/readActions.test.ts',
+]);
+const cloudCommandReportExecutorPaths = new Set([
+  'apps/m365-graph-read-executor/src/microsoft/graphClient.ts',
+  'apps/m365-graph-read-executor/src/microsoft/graphClient.test.ts',
+  'apps/m365-graph-read-executor/src/microsoft/readActions.ts',
+  'apps/m365-graph-read-executor/src/microsoft/readActions.test.ts',
 ]);
 // The UniFi sync lock-order fix changes a background worker and its
 // organization-lock helper.  It has a dedicated real-Postgres proof in the
@@ -135,14 +150,23 @@ const unifiSyncLockPaths = new Set([
   'apps/api/src/__tests__/integration/unifiSyncLockOrder.integration.test.ts',
 ]);
 const infraPaths = new Set([
-  'AGENTS.md', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',
+  'AGENTS.md', '.dockerignore', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',
   '.github/scripts/check-cloudcom-runner.sh', '.github/scripts/ci-area-gating.test.mjs',
   '.github/scripts/ci-build-reuse.test.mjs', '.github/scripts/classify-pr-paths.sh',
   '.github/scripts/classify-pr-paths.test.mjs', '.github/scripts/mobile-native-ci.test.mjs',
   '.github/scripts/prepare-ci-apt-sources.test.mjs', 'deploy/.env.example',
-  'deploy/docker-compose.prod.yml', 'scripts/check-guided-setup-systemd-unit.sh',
+  'deploy/docker-compose.prod.yml', 'deploy/cloudcom-exchange-worker/Dockerfile',
+  'deploy/cloudcom-exchange-worker/healthcheck.py', 'deploy/cloudcom-exchange-worker/README.md',
+  'scripts/check-guided-setup-systemd-unit.sh',
   'scripts/check-guided-setup-signed-image-floor.sh', 'scripts/prod/deploy.sh',
-  'scripts/release/release-image-consumers.test.mjs', 'scripts/smoke-guided-setup.sh',
+  'scripts/release/release-image-consumers.test.mjs',
+  '.github/workflows/cloudcom-candidate.yml',
+  'scripts/release/cloudcom-candidate-workflow.test.mjs',
+  'scripts/cloudcom/exchange-worker-release.mjs',
+  'scripts/cloudcom/exchange-worker-release.test.mjs',
+  'deploy/cloudcom-exchange-worker/compose.overlay.candidate.yml',
+  'deploy/cloudcom-exchange-worker/verify-compose-candidate.py',
+  'scripts/smoke-guided-setup.sh',
 ]);
 
 export function readBaseline(text = readFileSync(baselinePath, 'utf8')) {
@@ -192,7 +216,7 @@ export function classify(paths) {
       result.api = true;
       continue;
     }
-    if (cloudCommandApiPaths.has(path) || /^packages\/ext-cloud-command\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/(?:2026-09-21-threecx-connections|2026-09-22-microsoft-connections|2026-09-22-native-admin-connections)\.sql|src\/(?:server|threecx|web)\/.+)$/u.test(path)) {
+    if (cloudCommandApiPaths.has(path) || /^packages\/ext-cloud-command\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/(?:2026-09-21-threecx-connections|2026-09-22-microsoft-connections|2026-09-22-native-admin-connections|2026-09-22-microsoft-directory-preferences)\.sql|src\/(?:server|threecx|web)\/.+)$/u.test(path)) {
       result.api = true;
       result.web = true;
       continue;
@@ -202,6 +226,11 @@ export function classify(paths) {
       continue;
     }
     if (cloudCommandSharedPaths.has(path)) {
+      result.shared = true;
+      continue;
+    }
+    if (cloudCommandReportExecutorPaths.has(path)) {
+      result.api = true;
       result.shared = true;
       continue;
     }

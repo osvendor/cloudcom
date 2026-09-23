@@ -120,12 +120,19 @@ jobs:
           pnpm --filter @cloudcom/ext-cloud-command test
           pnpm --filter @cloudcom/ext-cloud-command test:server
           pnpm --filter @cloudcom/ext-cloud-command test:web
+      - name: Verify the private Cloud Command Exchange broker
+        if: needs.delta.outputs.api == 'true' || needs.delta.outputs.infra == 'true'
+        run: python3 scripts/cloudcom/exchange-worker.test.py
       - name: Run API tests and build when API or shared code changed
         if: needs.delta.outputs.api == 'true' || needs.delta.outputs.shared == 'true'
         run: |
+          pnpm --filter @breeze/shared exec vitest run src/m365/readActions.test.ts
+          pnpm --filter @breeze/m365-graph-read-executor exec tsc --noEmit
+          pnpm --filter @breeze/m365-graph-read-executor exec vitest run src/microsoft/graphClient.test.ts src/microsoft/readActions.test.ts
+          pnpm --filter @breeze/m365-graph-read-executor build
           pnpm --filter @breeze/api exec vitest run src/services/monitors/monitorCompiler.test.ts src/services/monitors/monitorCompiler.w04.test.ts src/services/automationReferenceAuthorization.test.ts src/jobs/automationWorker.monitorBinding.test.ts
           pnpm --filter @breeze/api exec vitest run src/services/cloudcom/remoteAccessOptions.test.ts src/routes/devices/cloudcomRemoteAccess.test.ts src/services/remoteAccessLauncher.test.ts src/services/remoteAccessProviders.test.ts src/routes/devices/core.remoteAccessLaunch.test.ts
-          pnpm --filter @breeze/api exec vitest run src/extensions/builtinExtensions.test.ts src/extensions/builtinRegistry.test.ts src/extensions/cloudCommandMicrosoft.test.ts src/extensions/cloudCommandAdminRuntime.test.ts src/extensions/cloudCommandAdminAuthorization.test.ts src/services/m365ControlPlane/readActionService.test.ts src/services/m365ControlPlane/readActionService.syncRoute.test.ts src/extensions/webRegistry.test.ts src/extensions/webAssets.test.ts src/extensions/stageExtension.test.ts src/extensions/gateway.test.ts src/services/urlSafety.test.ts src/services/urlSafety.tripwire.test.ts src/routes/extensionsWeb.test.ts
+          pnpm --filter @breeze/api exec vitest run src/extensions/builtinExtensions.test.ts src/extensions/builtinRegistry.test.ts src/extensions/cloudCommandMicrosoft.test.ts src/extensions/cloudCommandGoogle.test.ts src/services/googleClient.test.ts src/extensions/cloudCommandAdminRuntime.test.ts src/extensions/cloudCommandAdminAuthorization.test.ts src/services/m365ControlPlane/readActionService.test.ts src/services/m365ControlPlane/readActionService.syncRoute.test.ts src/extensions/webRegistry.test.ts src/extensions/webAssets.test.ts src/extensions/stageExtension.test.ts src/extensions/gateway.test.ts src/services/urlSafety.test.ts src/services/urlSafety.tripwire.test.ts src/routes/extensionsWeb.test.ts
           pnpm --filter @breeze/api build
       - name: Prove Cloud Command 3CX migration and RLS boundaries
         if: needs.delta.outputs.api == 'true' || needs.delta.outputs.shared == 'true'
@@ -166,13 +173,15 @@ jobs:
           pnpm --filter @breeze/web exec vitest run src/components/cloudcom/browserDesktop src/components/remote/ConnectDesktopButton.browser.test.tsx
           pnpm --filter @breeze/viewer exec vitest run src/lib/answerPoll.test.ts src/lib/revocationLease.test.ts src/lib/keymap.test.ts src/lib/api.test.ts
           pnpm --filter @breeze/web exec vitest run src/components/cloudcom/RemoteAccessAlternatives.test.tsx src/components/remote/ConnectDesktopButton.test.tsx src/components/remote/ConnectDesktopButton.denied.test.tsx src/components/remote/ConnectDesktopButton.revoked.test.tsx src/components/remote/ConnectDesktopButton.teardownPending.test.tsx src/components/remote/RemoteToolsPage.test.tsx src/components/remote/RemoteToolsPage.liveDesktopAccess.test.tsx
-          pnpm --filter @breeze/web exec vitest run src/components/layout/Sidebar src/lib/extensions/hostApi.test.ts src/lib/extensions/registry.test.ts src/components/extensions/ExtensionElementHost.test.tsx src/components/extensions/ExtensionSlotHost.test.tsx src/components/extensions/ExtensionPageHost.test.tsx src/components/extensions/useExtensionNavigation.test.tsx
+          pnpm --filter @breeze/web exec vitest run src/components/layout/Sidebar src/lib/extensions/hostApi.test.ts src/lib/extensions/registry.test.ts src/components/extensions/ExtensionElementHost.test.tsx src/components/extensions/ExtensionSlotHost.test.tsx src/components/extensions/ExtensionPageHost.test.tsx src/components/extensions/useExtensionNavigation.test.tsx src/components/integrations/GoogleWorkspaceIntegration.test.tsx
           pnpm --filter @breeze/web build
       - name: Run fork infrastructure contracts
         if: needs.delta.outputs.infra == 'true'
         run: |
           pnpm --filter @breeze/api exec vitest run src/config/envComposeParity.test.ts
           node --test scripts/release/release-image-consumers.test.mjs
+          node --test scripts/release/cloudcom-candidate-workflow.test.mjs scripts/cloudcom/exchange-worker-release.test.mjs
+          python3 scripts/cloudcom/verify-exchange-worker-oci.test.py
           bash scripts/check-guided-setup-systemd-unit.sh
           node --test scripts/cloudcom/update-upstream.test.mjs
           node --test scripts/cloudcom/customization-contract.test.mjs

@@ -1,6 +1,9 @@
 import './overview';
 import './microsoft';
 import './connect';
+import './google';
+import './threecx-dashboard';
+import './threecx-call-log';
 import { bindThreeCxDetail, detailStyles, detailTab, isDirty, renderThreeCxDetail, type DetailTab } from './threecx-detail';
 import { hasForwardingChanges, mountForwardingEditors } from './threecx-detail-forwarding';
 import type { ThreeCxDetail, ThreeCxDetailChanges } from '../threecx/detail-contract';
@@ -73,6 +76,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
   /** Keeps an empty completed directory distinct from a directory not yet read. */
   private usersLoaded = false;
   private nextSkip: number | null = null;
+  private userSearch = '';
   private detailId: number | null = null;
   private detail: ThreeCxDetail | null = null;
   private detailTab: DetailTab = 'general';
@@ -117,6 +121,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
       this.users = [];
       this.usersLoaded = false;
       this.nextSkip = null;
+      this.userSearch = '';
       this.clearDetail();
       this.focusReturnIndex = null;
       this.busy = false;
@@ -467,6 +472,24 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     };
   }
 
+  private filterLoadedUsers(): void {
+    const query = this.userSearch.trim().toLocaleLowerCase();
+    let visible = 0;
+    this.root.querySelectorAll<HTMLTableRowElement>('tr[data-user-index]').forEach((row) => {
+      const user = this.users[Number(row.dataset.userIndex)];
+      if (!user) return;
+      const haystack = [user.Number, user.FirstName, user.LastName, user.EmailAddress,
+        user.CurrentProfileName, user.IsRegistered === true ? 'registered' : user.IsRegistered === false ? 'unregistered' : '',
+        user.Enabled ? 'enabled' : 'disabled'].filter(Boolean).join(' ').toLocaleLowerCase();
+      row.hidden = Boolean(query) && !haystack.includes(query);
+      if (!row.hidden) visible += 1;
+    });
+    const count = this.root.querySelector<HTMLElement>('#search-count');
+    if (count) count.textContent = query ? `${visible} matching loaded extensions` : `${this.users.length} loaded extensions`;
+    const empty = this.root.querySelector<HTMLElement>('#search-empty');
+    if (empty) empty.hidden = visible !== 0 || !query;
+  }
+
   private render(captureCurrentDraft = true): void {
     if (captureCurrentDraft) this.captureDraft();
     const connected = this.connection.connected === true;
@@ -481,10 +504,10 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     const groups = groupsMatchDraft ? this.groups : typeof this.connection.departmentId === 'number' && this.connection.origin === draft.origin && this.connection.clientId === draft.clientId ? [{ id: this.connection.departmentId, name: `Department ${this.connection.departmentId}` }] : [];
     const detail = this.detail;
     this.root.innerHTML = `
-      <style>${styles}${detailStyles}${this.mode === 'configuration' ? ':host([data-display-mode="configuration"]) main{max-width:none;margin:0;padding:0}' : ''}</style>
+      <style>${styles}${detailStyles}${directoryStyles}${this.mode === 'configuration' ? ':host([data-display-mode="configuration"]) main{max-width:none;margin:0;padding:0}' : ''}</style>
       <main aria-labelledby="${detail || this.detailId !== null ? 'detail-title' : 'title'}">
         ${detail ? renderThreeCxDetail(detail, this.detailTab, this.detailDraft, this.busy, this.statusMessage, this.statusIsError) : this.detailId !== null ? `<section class="threecx-detail" aria-labelledby="detail-title"><button class="secondary compact" id="detail-back" type="button">Back to extensions</button><h2 id="detail-title">Extension details</h2><p class="status" data-status data-error="${this.statusIsError}" aria-live="polite">${escapeHtml(this.statusMessage || 'Loading extension details…')}</p><button class="secondary" id="detail-retry" type="button">Retry</button></section>` : `<header><div><p class="eyebrow">Cloud Command</p><h1 id="title">${showConfiguration && !showDirectory ? 'Connect 3CX' : '3CX extensions'}</h1><p class="subtle">${showConfiguration && !showDirectory ? 'Connect one organization’s 3CX PBX and select its access scope.' : 'Review extensions from the configured 3CX scope.'}</p></div><span class="badge ${connected && connectionEnabled ? 'ok' : connected ? 'disabled' : ''}">${connected ? (connectionEnabled ? 'Connected' : 'Disabled') : 'Not connected'}</span></header>
-        <nav aria-label="Cloud Command providers">${this.microsoftNavigationVisible ? '<button class="secondary compact" id="go-microsoft" type="button">Microsoft 365</button>' : ''}</nav>
+        <nav aria-label="Cloud Command providers">${showDirectory ? '<button class="secondary compact" id="go-dashboard" type="button">Dashboard</button><button class="secondary compact" id="go-call-log" type="button">Call Log</button>' : ''}${this.microsoftNavigationVisible ? '<button class="secondary compact" id="go-microsoft" type="button">Microsoft 365</button>' : ''}</nav>
         <p class="status" data-status data-error="${this.statusIsError}" aria-live="polite">${escapeHtml(this.statusMessage)}</p>
         ${showConfiguration ? `<section class="card" aria-labelledby="connection-heading">
           <div class="section-title"><div><h2 id="connection-heading">Connection</h2><p>${canManage ? 'Credentials are encrypted server-side. The secret is never returned to this page.' : 'You have read-only access to this organization’s 3CX connection.'}</p></div></div>
@@ -503,7 +526,7 @@ export class CloudCommandThreeCxPage extends HTMLElement {
         </section>` : ''}
         ${showDirectory ? `<section class="card" aria-labelledby="extensions-heading">
           <div class="section-title"><div><h2 id="extensions-heading">Extensions</h2><p>Read-only view from the configured 3CX scope.</p></div><button class="secondary" id="refresh-users" type="button" ${!canReadUsers || this.busy ? 'disabled' : ''}>Refresh</button></div>
-          ${this.users.length ? `<div class="table-wrap"><table><thead><tr><th>Extension</th><th>Name</th><th>Email</th><th>Status</th><th><span class="sr-only">Details</span></th></tr></thead><tbody>${this.users.map((user, index) => `<tr><td>${escapeHtml(user.Number)}</td><td>${escapeHtml([user.FirstName, user.LastName].filter(Boolean).join(' ') || '—')}</td><td>${escapeHtml(user.EmailAddress || '—')}</td><td><span class="state ${user.Enabled ? 'on' : ''}">${user.Enabled ? 'Enabled' : 'Disabled'}</span></td><td><button class="secondary compact" type="button" data-detail-index="${index}">View details</button></td></tr>`).join('')}</tbody></table></div>` : `<div class="empty">${connected ? connectionEnabled ? this.usersLoaded ? 'No extensions found.' : 'No extensions loaded yet.' : 'This connection is disabled.' : 'Save a connection to view extensions.'}</div>`}
+          ${this.users.length ? `<div class="directory-tools"><label>Search loaded extensions<input id="search-users" type="search" value="${escapeAttr(this.userSearch)}" placeholder="Name, extension, email, or status"></label><span id="search-count" aria-live="polite"></span></div><div class="table-wrap"><table><thead><tr><th>User</th><th>Extension</th><th>Email</th><th>Registration</th><th>Status</th><th>Account</th><th><span class="sr-only">Details</span></th></tr></thead><tbody>${this.users.map((user, index) => `<tr data-user-index="${index}"><td>${escapeHtml([user.FirstName, user.LastName].filter(Boolean).join(' ') || '—')}</td><td>${escapeHtml(user.Number)}</td><td>${escapeHtml(user.EmailAddress || '—')}</td><td>${user.IsRegistered === true ? 'Registered' : user.IsRegistered === false ? 'Unregistered' : 'Unknown'}</td><td>${escapeHtml(user.CurrentProfileName || '—')}</td><td><span class="state ${user.Enabled ? 'on' : ''}">${user.Enabled ? 'Enabled' : 'Disabled'}</span></td><td><button class="secondary compact" type="button" data-detail-index="${index}">View details</button></td></tr>`).join('')}</tbody></table></div><p id="search-empty" class="empty" hidden>No matching extensions in loaded results.</p>${this.nextSkip !== null ? '<p class="hint">Search covers loaded extensions only. Load more to include additional records.</p>' : ''}` : `<div class="empty">${connected ? connectionEnabled ? this.usersLoaded ? 'No extensions found.' : 'No extensions loaded yet.' : 'This connection is disabled.' : 'Save a connection to view extensions.'}</div>`}
           ${this.nextSkip !== null ? `<button class="secondary more" id="more-users" type="button" ${!canReadUsers || this.busy ? 'disabled' : ''}>Load more</button>` : ''}
         </section>` : ''}
         `}
@@ -513,6 +536,10 @@ export class CloudCommandThreeCxPage extends HTMLElement {
     this.root.querySelector('#save')?.addEventListener('click', () => void this.saveConnection());
     this.root.querySelector('#refresh-users')?.addEventListener('click', () => void this.loadUsers(true));
     this.root.querySelector('#more-users')?.addEventListener('click', () => void this.loadUsers(false));
+    this.root.querySelector<HTMLInputElement>('#search-users')?.addEventListener('input', (event) => { this.userSearch = (event.currentTarget as HTMLInputElement).value; this.filterLoadedUsers(); });
+    this.filterLoadedUsers();
+    this.root.querySelector('#go-dashboard')?.addEventListener('click', () => dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path: '/extensions/cloudcommand/threecx-dashboard' }));
+    this.root.querySelector('#go-call-log')?.addEventListener('click', () => dispatchExtensionHostEvent(this, { version: 1, type: 'navigate', path: '/extensions/cloudcommand/threecx-call-log' }));
     this.root.querySelectorAll<HTMLButtonElement>('[data-detail-index]').forEach((button) => button.addEventListener('click', () => this.openDetails(Number(button.dataset.detailIndex))));
     if (detail) bindThreeCxDetail(this.root, { back: () => this.closeDetails(), discard: () => this.discardDetail(), save: () => void this.saveDetail(), tab: (tab) => { this.detailTab = tab; if (this.detailId !== null) window.location.hash = `extension=${this.detailId}&tab=${tab}`; this.render(); }, change: (key, value) => this.changeDetail(key, value) });
     if (detail && this.detailTab === 'forwarding') {
@@ -533,6 +560,8 @@ export class CloudCommandThreeCxPage extends HTMLElement {
 
 function escapeHtml(value: string): string { return value.replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]!); }
 function escapeAttr(value: string): string { return escapeHtml(value); }
+
+const directoryStyles = `.directory-tools{display:flex;align-items:end;gap:1rem;margin-top:.8rem;flex-wrap:wrap}.directory-tools label{min-width:min(100%,18rem)}.directory-tools input{min-height:2.25rem}.directory-tools span{color:hsl(var(--muted-foreground));font-size:.8rem;padding-bottom:.55rem}.table-wrap table{min-width:800px;font-size:.84rem}.table-wrap th,.table-wrap td{padding:.55rem .6rem}.table-wrap tr[hidden],#search-empty[hidden]{display:none}`;
 
 // CSS custom properties inherit through a shadow root. Every colour here is a
 // Breeze global token, so light/dark themes and customer appearance settings

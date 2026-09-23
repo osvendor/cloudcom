@@ -36,6 +36,7 @@ const CLOUD_COMMAND_OVERVIEW_HREF = '/extensions/cloudcommand/overview';
 const CLOUD_COMMAND_CHILDREN = [
   { name: '3CX', href: '/extensions/cloudcommand/threecx', pagePath: '/threecx' },
   { name: 'Microsoft 365', href: '/extensions/cloudcommand/microsoft', pagePath: '/microsoft' },
+  { name: 'Google Workspace', href: '/extensions/cloudcommand/google', pagePath: '/google' },
 ] as const;
 
 // Mirrors packages/extension-sdk/src/manifest.ts NAME_RE — kept as a literal
@@ -140,6 +141,8 @@ function enabledMicrosoft(value: unknown): boolean {
   return status?.available === true && status.connected === true && status.enabled === true;
 }
 
+const enabledGoogle = enabledMicrosoft;
+
 type NavigationState = { links: ExtensionNavLink[]; connectionOrgId: string | null; sessionKey: string | null };
 
 /**
@@ -194,7 +197,7 @@ export function useExtensionNavigation(): ExtensionNavLink[] {
 
         setState({ links: decorateCloudCommandOverview(links, registry, [], true), connectionOrgId: organizationId, sessionKey });
         const pages = cloudCommandPages(registry);
-        if (!pages.has('/threecx') && !pages.has('/microsoft')) {
+        if (!pages.has('/threecx') && !pages.has('/microsoft') && !pages.has('/google')) {
           setState({ links: decorateCloudCommandOverview(links, registry, [], false), connectionOrgId: organizationId, sessionKey });
           return;
         }
@@ -208,11 +211,13 @@ export function useExtensionNavigation(): ExtensionNavLink[] {
         void Promise.all([
           pages.has('/threecx') ? status('/threecx/connection').then(enabledThreeCx).catch(() => false) : Promise.resolve(false),
           pages.has('/microsoft') ? status('/microsoft/connection').then(enabledMicrosoft).catch(() => false) : Promise.resolve(false),
-        ]).then(([threeCx, microsoft]) => {
+          pages.has('/google') ? status('/google/connection').then(enabledGoogle).catch(() => false) : Promise.resolve(false),
+        ]).then(([threeCx, microsoft, google]) => {
           if (cancelled) return;
           const children = [
             ...(threeCx ? [{ name: CLOUD_COMMAND_CHILDREN[0].name, href: CLOUD_COMMAND_CHILDREN[0].href }] : []),
             ...(microsoft ? [{ name: CLOUD_COMMAND_CHILDREN[1].name, href: CLOUD_COMMAND_CHILDREN[1].href }] : []),
+            ...(google ? [{ name: CLOUD_COMMAND_CHILDREN[2].name, href: CLOUD_COMMAND_CHILDREN[2].href }] : []),
           ];
           setState({ links: decorateCloudCommandOverview(links, registry, children, false), connectionOrgId: organizationId, sessionKey });
         });
