@@ -42,6 +42,7 @@ const GOOGLE_DWD_SCOPES_CSV = [
   "https://www.googleapis.com/auth/calendar.acls",
   "https://www.googleapis.com/auth/apps.licensing",
   "https://www.googleapis.com/auth/admin.reports.usage.readonly",
+  "https://www.googleapis.com/auth/admin.reports.audit.readonly",
 ].join(",");
 
 export default function GoogleWorkspaceIntegration() {

@@ -158,7 +158,14 @@ const infraPaths = new Set([
   'deploy/cloudcom-exchange-worker/healthcheck.py', 'deploy/cloudcom-exchange-worker/README.md',
   'scripts/check-guided-setup-systemd-unit.sh',
   'scripts/check-guided-setup-signed-image-floor.sh', 'scripts/prod/deploy.sh',
-  'scripts/release/release-image-consumers.test.mjs', 'scripts/smoke-guided-setup.sh',
+  'scripts/release/release-image-consumers.test.mjs',
+  '.github/workflows/cloudcom-candidate.yml',
+  'scripts/release/cloudcom-candidate-workflow.test.mjs',
+  'scripts/cloudcom/exchange-worker-release.mjs',
+  'scripts/cloudcom/exchange-worker-release.test.mjs',
+  'deploy/cloudcom-exchange-worker/compose.overlay.candidate.yml',
+  'deploy/cloudcom-exchange-worker/verify-compose-candidate.py',
+  'scripts/smoke-guided-setup.sh',
 ]);
 
 export function readBaseline(text = readFileSync(baselinePath, 'utf8')) {

@@ -14,7 +14,10 @@ MAX_REQUEST = 64 * 1024
 MAX_RESPONSE = 1024 * 1024
 MAX_PAGE_SIZE = 200
 COMMAND_TIMEOUT_SECONDS = 45
-ALLOWED_OPERATIONS = frozenset(('mailbox.inventory', 'mailbox.forwarding.get', 'mailbox.forwarding.set', 'mailbox.autoreply.get', 'mailbox.autoreply.set'))
+ALLOWED_OPERATIONS = frozenset(('mailbox.inventory', 'mailbox.forwarding.get', 'mailbox.forwarding.set',
+    'mailbox.autoreply.get', 'mailbox.autoreply.set', 'mailbox.addresses.get', 'mailbox.primary.set',
+    'mailbox.alias.add', 'mailbox.alias.remove', 'mailbox.delegation.get', 'mailbox.delegation.set'))
+def is_write(operation): return operation.endswith(('.set', '.add', '.remove'))
 SAFE_FAILURES = frozenset(('access_denied', 'connection_mismatch', 'credential_unavailable', 'invalid_request',
                             'provider_access_denied', 'provider_rejected', 'provider_unreachable', 'response_too_large', 'worker_busy', 'unknown_write_outcome'))
 PEERCRED = getattr(socket, 'SO_PEERCRED', 17) # Linux value; main rejects non-Linux runtimes.
@@ -45,7 +48,7 @@ def valid_success_response(result, request_id, operation):
         if data['internalRecipient'] is not None and (not isinstance(data['internalRecipient'], str) or len(data['internalRecipient']) > 320): return 'provider_unreachable'
         if type(data['keepCopy']) is not bool: return 'provider_unreachable'
         if operation == 'mailbox.forwarding.set' and (data['accepted'] is not True or type(data['verified']) is not bool): return 'provider_unreachable'
-    else:
+    elif operation.startswith('mailbox.autoreply.'):
         expected = {'mailboxId', 'state', 'internalMessage', 'externalMessage', 'externalAudience', 'start', 'end'}
         if operation == 'mailbox.autoreply.set': expected.update(('accepted', 'verified'))
         if not isinstance(data, dict) or set(data) != expected: return 'provider_unreachable'
@@ -55,6 +58,26 @@ def valid_success_response(result, request_id, operation):
         if not all(isinstance(data[key], str) and len(data[key]) <= 16384 for key in ('internalMessage', 'externalMessage')): return 'provider_unreachable'
         if not all(data[key] is None or isinstance(data[key], str) and len(data[key]) <= 64 for key in ('start', 'end')): return 'provider_unreachable'
         if operation == 'mailbox.autoreply.set' and (data['accepted'] is not True or type(data['verified']) is not bool): return 'provider_unreachable'
+    elif operation.startswith('mailbox.delegation.'):
+        expected = {'mailboxId', 'delegateId', 'delegateAddress', 'fullAccess', 'sendAs', 'sendOnBehalf'}
+        if is_write(operation): expected.update(('accepted', 'verified'))
+        if not isinstance(data, dict) or set(data) != expected: return 'provider_unreachable'
+        try: normalized_uuid(data['mailboxId']); normalized_uuid(data['delegateId'])
+        except Exception: return 'provider_unreachable'
+        if data['mailboxId'] == data['delegateId']: return 'provider_unreachable'
+        if not isinstance(data['delegateAddress'], str) or len(data['delegateAddress']) > 320 or '@' not in data['delegateAddress']: return 'provider_unreachable'
+        if any(type(data[key]) is not bool for key in ('fullAccess', 'sendAs', 'sendOnBehalf')): return 'provider_unreachable'
+        if is_write(operation) and (data['accepted'] is not True or type(data['verified']) is not bool): return 'provider_unreachable'
+    else:
+        expected = {'mailboxId', 'primarySmtpAddress', 'aliases', 'policyEnabled'}
+        if is_write(operation): expected.update(('accepted', 'verified'))
+        if not isinstance(data, dict) or set(data) != expected: return 'provider_unreachable'
+        try: normalized_uuid(data['mailboxId'])
+        except Exception: return 'provider_unreachable'
+        if not isinstance(data['primarySmtpAddress'], str) or len(data['primarySmtpAddress']) > 320 or '@' not in data['primarySmtpAddress']: return 'provider_unreachable'
+        if not isinstance(data['aliases'], list) or len(data['aliases']) > 500 or any(not isinstance(a, str) or len(a) > 320 or '@' not in a for a in data['aliases']): return 'provider_unreachable'
+        if type(data['policyEnabled']) is not bool: return 'provider_unreachable'
+        if is_write(operation) and (data['accepted'] is not True or type(data['verified']) is not bool): return 'provider_unreachable'
     return None
 def read_config(path):
     secure_file(path)
@@ -83,7 +106,7 @@ def validate_request(value, tenants):
             address = params['smtpAddress']
             if address is not None and (not isinstance(address, str) or len(address) > 320 or '@' not in address or any(c.isspace() for c in address)): raise ValueError()
             if type(params['keepCopy']) is not bool: raise ValueError()
-    else:
+    elif operation.startswith('mailbox.autoreply.'):
         if set(params) != ({'mailboxId'} if operation == 'mailbox.autoreply.get' else {'mailboxId', 'state', 'message', 'start', 'end'}): raise ValueError()
         normalized_uuid(params['mailboxId'])
         if operation == 'mailbox.autoreply.set':
@@ -95,6 +118,17 @@ def validate_request(value, tenants):
                     if start.tzinfo is None or end.tzinfo is None or end <= start: raise ValueError()
                 except (AttributeError, TypeError, ValueError): raise ValueError()
             elif params['start'] is not None or params['end'] is not None: raise ValueError()
+    elif operation.startswith('mailbox.delegation.'):
+        if set(params) != ({'mailboxId', 'delegateId'} if operation == 'mailbox.delegation.get' else {'mailboxId', 'delegateId', 'right', 'enabled'}): raise ValueError()
+        mailbox_id, delegate_id = normalized_uuid(params['mailboxId']), normalized_uuid(params['delegateId'])
+        if mailbox_id == delegate_id: raise ValueError()
+        if operation == 'mailbox.delegation.set' and (params['right'] not in ('FullAccess', 'SendAs', 'SendOnBehalf') or type(params['enabled']) is not bool): raise ValueError()
+    else:
+        if set(params) != ({'mailboxId'} if operation == 'mailbox.addresses.get' else {'mailboxId', 'address'}): raise ValueError()
+        normalized_uuid(params['mailboxId'])
+        if operation != 'mailbox.addresses.get':
+            address = params['address']
+            if not isinstance(address, str) or not 3 <= len(address) <= 320 or '@' not in address or any(c.isspace() for c in address): raise ValueError()
     descriptor = tenants.get(tenant_id)
     if not isinstance(descriptor, dict) or descriptor.get('enabled') is not True: return request_id, None
     # All values below are compared to host-only configuration. A browser cannot substitute them.
@@ -122,20 +156,20 @@ class PersistentPowerShell:
                 while b'\n' not in self.buffer:
                     remaining = deadline - time.monotonic()
                     ready, _, _ = select.select([self.process.stdout.fileno()], [], [], max(remaining, 0))
-                    if not ready: self.close(); return fail(request['requestId'], 'unknown_write_outcome' if request['operation'].endswith('.set') else 'provider_unreachable')
+                    if not ready: self.close(); return fail(request['requestId'], 'unknown_write_outcome' if is_write(request['operation']) else 'provider_unreachable')
                     chunk = os.read(self.process.stdout.fileno(), min(8192, MAX_RESPONSE + 1 - len(self.buffer)))
-                    if not chunk: self.close(); return fail(request['requestId'], 'unknown_write_outcome' if request['operation'].endswith('.set') else 'provider_unreachable')
+                    if not chunk: self.close(); return fail(request['requestId'], 'unknown_write_outcome' if is_write(request['operation']) else 'provider_unreachable')
                     self.buffer += chunk
-                    if len(self.buffer) > MAX_RESPONSE: self.close(); return fail(request['requestId'], 'unknown_write_outcome' if request['operation'].endswith('.set') else 'response_too_large')
+                    if len(self.buffer) > MAX_RESPONSE: self.close(); return fail(request['requestId'], 'unknown_write_outcome' if is_write(request['operation']) else 'response_too_large')
                 line, self.buffer = self.buffer.split(b'\n', 1)
                 result = json.loads(line.decode('utf-8')); self.used = time.monotonic()
                 if not isinstance(result, dict) or result.get('requestId') != request['requestId'] or result.get('ok') not in (True, False): return fail(request['requestId'], 'provider_unreachable')
                 if result.get('ok') is False: return fail(request['requestId'], result.get('code'))
                 invalid = valid_success_response(result, request['requestId'], request['operation'])
-                if invalid: return fail(request['requestId'], 'unknown_write_outcome' if request['operation'].endswith('.set') else invalid)
+                if invalid: return fail(request['requestId'], 'unknown_write_outcome' if is_write(request['operation']) else invalid)
                 return result
             except Exception:
-                self.close(); return fail(request['requestId'], 'unknown_write_outcome' if request['operation'].endswith('.set') else 'provider_unreachable')
+                self.close(); return fail(request['requestId'], 'unknown_write_outcome' if is_write(request['operation']) else 'provider_unreachable')
 
 class Broker:
     def __init__(self, config, script): self.config, self.script, self.pool, self.lock = config, script, {}, threading.Lock()

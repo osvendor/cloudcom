@@ -39,6 +39,38 @@ function AutoReply-State([string]$MailboxId, $Config) {
      externalAudience = [string]$Config.ExternalAudience;
      start = $(AutoReply-Date $Config.StartTime); end = $(AutoReply-Date $Config.EndTime) }
 }
+function Addresses-State([string]$MailboxId, $Mailbox) {
+  $primary = [string]$Mailbox.PrimarySmtpAddress
+  $aliases = [System.Collections.Generic.List[string]]::new()
+  foreach ($proxy in $Mailbox.EmailAddresses) {
+    $text = [string]$proxy
+    if ($text -match '^smtp:(.+)$') {
+      $address = [string]$Matches[1]
+      if ($address -ine $primary -and -not $aliases.Contains($address)) { $aliases.Add($address) }
+    }
+  }
+  @{ mailboxId = $MailboxId; primarySmtpAddress = $primary; aliases = @($aliases.ToArray());
+     policyEnabled = [bool]$Mailbox.EmailAddressPolicyEnabled }
+}
+function Delegation-State([string]$MailboxId, [string]$DelegateId, $Mailbox, $Delegate) {
+  $mailAddress = [string]$Mailbox.PrimarySmtpAddress
+  $delegateAddress = [string]$Delegate.PrimarySmtpAddress
+  $full = @(Get-MailboxPermission -Identity $mailAddress -User $delegateAddress -ErrorAction Stop |
+    Where-Object { -not $_.Deny -and -not $_.IsInherited -and @($_.AccessRights) -contains 'FullAccess' }).Count -gt 0
+  $sendAs = @(Get-RecipientPermission -Identity $mailAddress -Trustee $delegateAddress -AccessRights SendAs -ErrorAction Stop |
+    Where-Object { -not $_.Deny -and @($_.AccessRights) -contains 'SendAs' }).Count -gt 0
+  $recipient = Get-Recipient -Identity $delegateAddress -ErrorAction Stop
+  if (-not $recipient -or [string]$recipient.ExternalDirectoryObjectId -ine $DelegateId -or -not $recipient.DistinguishedName) { throw 'delegate identity mismatch' }
+  $delegateDn = [string]$recipient.DistinguishedName
+  $behalf = $false
+  foreach ($entry in @($Mailbox.GrantSendOnBehalfTo)) {
+    if (-not $entry) { continue }
+    if (-not $entry.DistinguishedName) { throw 'unresolved send-on-behalf entry' }
+    if ([string]$entry.DistinguishedName -ieq $delegateDn) { $behalf = $true }
+  }
+  @{ mailboxId = $MailboxId; delegateId = $DelegateId; delegateAddress = $delegateAddress;
+     fullAccess = [bool]$full; sendAs = [bool]$sendAs; sendOnBehalf = [bool]$behalf }
+}
 
 while ($null -ne ($line = [Console]::In.ReadLine())) {
   $requestId = '00000000-0000-4000-8000-000000000000'
@@ -46,7 +78,9 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   try {
     $request = $line | ConvertFrom-Json -AsHashtable
     $requestId = [string]$request.requestId
-    if ($request.operation -notin @('mailbox.inventory','mailbox.forwarding.get','mailbox.forwarding.set','mailbox.autoreply.get','mailbox.autoreply.set')) { throw 'invalid request' }
+    if ($request.operation -notin @('mailbox.inventory','mailbox.forwarding.get','mailbox.forwarding.set','mailbox.autoreply.get','mailbox.autoreply.set',
+      'mailbox.addresses.get','mailbox.primary.set','mailbox.alias.add','mailbox.alias.remove',
+      'mailbox.delegation.get','mailbox.delegation.set')) { throw 'invalid request' }
     if ($request.operation -eq 'mailbox.inventory') {
       if ($request.parameters.Keys.Count -ne 1 -or -not $request.parameters.ContainsKey('pageSize')) { throw 'invalid request' }
       $pageSize = [int]$request.parameters.pageSize
@@ -56,6 +90,9 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
       if ($mailboxId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { throw 'invalid request' }
       if ($request.operation -eq 'mailbox.forwarding.set' -and ($request.parameters.Keys.Count -ne 3 -or -not $request.parameters.ContainsKey('smtpAddress') -or -not $request.parameters.ContainsKey('keepCopy'))) { throw 'invalid request' }
       if ($request.operation -eq 'mailbox.autoreply.set' -and ($request.parameters.Keys.Count -ne 5 -or -not $request.parameters.ContainsKey('state') -or -not $request.parameters.ContainsKey('message') -or -not $request.parameters.ContainsKey('start') -or -not $request.parameters.ContainsKey('end'))) { throw 'invalid request' }
+      if ($request.operation -in @('mailbox.primary.set','mailbox.alias.add','mailbox.alias.remove') -and ($request.parameters.Keys.Count -ne 2 -or -not $request.parameters.ContainsKey('address'))) { throw 'invalid request' }
+      if ($request.operation -eq 'mailbox.delegation.get' -and ($request.parameters.Keys.Count -ne 2 -or -not $request.parameters.ContainsKey('delegateId'))) { throw 'invalid request' }
+      if ($request.operation -eq 'mailbox.delegation.set' -and ($request.parameters.Keys.Count -ne 4 -or -not $request.parameters.ContainsKey('delegateId') -or -not $request.parameters.ContainsKey('right') -or -not $request.parameters.ContainsKey('enabled'))) { throw 'invalid request' }
     }
     if ($boundTenant -and $boundTenant -ne $request.tenantId) { Send-Failure $requestId 'connection_mismatch'; continue }
     if (-not $boundTenant) {
@@ -66,6 +103,64 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     }
     if ($request.operation -ne 'mailbox.inventory') {
       $mailbox = Get-BoundMailbox $mailboxId
+      if ($request.operation -in @('mailbox.delegation.get','mailbox.delegation.set')) {
+        $delegateId = [string]$request.parameters.delegateId
+        if ($delegateId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or $delegateId -ieq $mailboxId) { throw 'invalid delegate' }
+        $delegate = Get-BoundMailbox $delegateId
+        $before = Delegation-State $mailboxId $delegateId $mailbox $delegate
+        if ($request.operation -eq 'mailbox.delegation.get') { Send-Forwarding $requestId $before; continue }
+        $right = [string]$request.parameters.right
+        if ($right -notin @('FullAccess','SendAs','SendOnBehalf') -or $request.parameters.enabled -isnot [bool]) { throw 'invalid delegation' }
+        $field = $(if ($right -eq 'FullAccess') { 'fullAccess' } elseif ($right -eq 'SendAs') { 'sendAs' } else { 'sendOnBehalf' })
+        $enabled = [bool]$request.parameters.enabled
+        if ($before[$field] -eq $enabled) { $before.accepted = $true; $before.verified = $true; Send-Forwarding $requestId $before; continue }
+        $targetAddress = [string]$mailbox.PrimarySmtpAddress
+        $delegateAddress = [string]$delegate.PrimarySmtpAddress
+        $writeDispatched = $true
+        if ($right -eq 'FullAccess') {
+          if ($enabled) { Add-MailboxPermission -Identity $targetAddress -User $delegateAddress -AccessRights FullAccess -InheritanceType All -ErrorAction Stop | Out-Null }
+          else { Remove-MailboxPermission -Identity $targetAddress -User $delegateAddress -AccessRights FullAccess -InheritanceType All -Confirm:$false -ErrorAction Stop | Out-Null }
+        } elseif ($right -eq 'SendAs') {
+          if ($enabled) { Add-RecipientPermission -Identity $targetAddress -Trustee $delegateAddress -AccessRights SendAs -Confirm:$false -ErrorAction Stop | Out-Null }
+          else { Remove-RecipientPermission -Identity $targetAddress -Trustee $delegateAddress -AccessRights SendAs -Confirm:$false -ErrorAction Stop | Out-Null }
+        } else {
+          if ($enabled) { Set-Mailbox -Identity $targetAddress -GrantSendOnBehalfTo @{ Add = $delegateAddress } -ErrorAction Stop }
+          else { Set-Mailbox -Identity $targetAddress -GrantSendOnBehalfTo @{ Remove = $delegateAddress } -ErrorAction Stop }
+        }
+        $after = Delegation-State $mailboxId $delegateId (Get-BoundMailbox $mailboxId) (Get-BoundMailbox $delegateId)
+        $after.accepted = $true; $after.verified = ($after[$field] -eq $enabled)
+        Send-Forwarding $requestId $after
+        continue
+      }
+      if ($request.operation -in @('mailbox.addresses.get','mailbox.primary.set','mailbox.alias.add','mailbox.alias.remove')) {
+        $before = Addresses-State $mailboxId $mailbox
+        if ($request.operation -eq 'mailbox.addresses.get') { Send-Forwarding $requestId $before; continue }
+        $address = [string]$request.parameters.address
+        if ($address.Length -gt 320 -or $address -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw 'invalid address' }
+        if ($request.operation -eq 'mailbox.primary.set' -and $before.policyEnabled) { throw 'primary address is controlled by policy' }
+        if ($request.operation -eq 'mailbox.alias.remove' -and $address -ieq $before.primarySmtpAddress) { throw 'cannot remove primary address' }
+        $present = @($before.aliases | Where-Object { $_ -ieq $address }).Count -gt 0
+        $noChange = ($request.operation -eq 'mailbox.primary.set' -and $address -ieq $before.primarySmtpAddress) -or
+          ($request.operation -eq 'mailbox.alias.add' -and ($present -or $address -ieq $before.primarySmtpAddress)) -or
+          ($request.operation -eq 'mailbox.alias.remove' -and -not $present)
+        if ($noChange) { $before.accepted = $true; $before.verified = $true; Send-Forwarding $requestId $before; continue }
+        $writeDispatched = $true
+        if ($request.operation -eq 'mailbox.primary.set') {
+          Set-Mailbox -Identity ([string]$mailbox.PrimarySmtpAddress) -WindowsEmailAddress $address -ErrorAction Stop
+        } elseif ($request.operation -eq 'mailbox.alias.add') {
+          Set-Mailbox -Identity ([string]$mailbox.PrimarySmtpAddress) -EmailAddresses @{ Add = "smtp:$address" } -ErrorAction Stop
+        } else {
+          Set-Mailbox -Identity ([string]$mailbox.PrimarySmtpAddress) -EmailAddresses @{ Remove = "smtp:$address" } -ErrorAction Stop
+        }
+        $after = Addresses-State $mailboxId (Get-BoundMailbox $mailboxId)
+        $stillPresent = @($after.aliases | Where-Object { $_ -ieq $address }).Count -gt 0
+        $after.accepted = $true
+        $after.verified = $(if ($request.operation -eq 'mailbox.primary.set') { $after.primarySmtpAddress -ieq $address }
+          elseif ($request.operation -eq 'mailbox.alias.add') { $stillPresent -and $after.primarySmtpAddress -ieq $before.primarySmtpAddress }
+          else { -not $stillPresent -and $after.primarySmtpAddress -ieq $before.primarySmtpAddress })
+        Send-Forwarding $requestId $after
+        continue
+      }
       if ($request.operation -in @('mailbox.autoreply.get','mailbox.autoreply.set')) {
         $before = AutoReply-State $mailboxId (Get-MailboxAutoReplyConfiguration -Identity ([string]$mailbox.PrimarySmtpAddress) -ErrorAction Stop)
         if ($request.operation -eq 'mailbox.autoreply.get') { Send-Forwarding $requestId $before; continue }

@@ -262,6 +262,7 @@ export const BUILTINS: readonly BuiltinExtension[] = [
       members: async (request, groupId, pageToken) => (await import('./cloudCommandGoogle')).nativeGoogleServices.members(request, groupId, pageToken),
       mailboxSettings: async (request, userId) => (await import('./cloudCommandGoogle')).nativeGoogleServices.mailboxSettings(request, userId),
       storage: async (request, date, pageToken) => (await import('./cloudCommandGoogle')).nativeGoogleServices.storage(request, date, pageToken),
+      activity: async (request, source, days, pageToken, asOf) => (await import('./cloudCommandGoogle')).nativeGoogleServices.activity(request, source, days, pageToken, asOf),
       auditSuspension: async (request, userId, stage) => (await import('./cloudCommandGoogle')).nativeGoogleServices.auditSuspension(request, userId, stage),
       setSuspended: async (request, input) => (await import('./cloudCommandGoogle')).nativeGoogleServices.setSuspended(request, input),
       auditProfile: async (request, userId, stage) => (await import('./cloudCommandGoogle')).nativeGoogleServices.auditProfile(request, userId, stage),

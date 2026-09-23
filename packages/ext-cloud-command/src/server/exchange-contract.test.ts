@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createExchangeAutoReplyClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, ExchangeWorkerError } from './exchange-contract';
+import { createExchangeAddressesClient, createExchangeAutoReplyClient, createExchangeDelegationClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, ExchangeWorkerError } from './exchange-contract';
 
 const binding = {
   organizationId: '11111111-1111-4111-8111-111111111111', tenantId: '22222222-2222-4222-8222-222222222222',
@@ -79,5 +79,41 @@ describe('Exchange automatic reply contract', () => {
   it('treats a lost set response as uncertain', async () => {
     const client = createExchangeAutoReplyClient({ dispatch: async () => { throw new Error('closed'); } });
     await expect(client.set(binding, { mailboxId, state: 'Disabled', message: '', start: null, end: null })).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+  });
+});
+
+describe('Exchange mailbox address contract', () => {
+  const mailboxId = mailbox.id;
+  it('dispatches only fixed primary and alias operations', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: {
+      mailboxId, primarySmtpAddress: 'new@example.com', aliases: ['old@example.com'], policyEnabled: false, accepted: true, verified: true } }));
+    const client = createExchangeAddressesClient({ dispatch });
+    await expect(client.write(binding, 'mailbox.primary.set', { mailboxId, address: 'new@example.com' })).resolves.toMatchObject({ verified: true });
+    await expect(client.write(binding, 'mailbox.alias.add', { mailboxId, address: 'old@example.com' })).resolves.toMatchObject({ accepted: true });
+    await expect(client.write(binding, 'mailbox.alias.remove', { mailboxId, address: 'old@example.com' })).resolves.toMatchObject({ accepted: true });
+    expect(dispatch.mock.calls.map(([request]) => request.operation)).toEqual(['mailbox.primary.set', 'mailbox.alias.add', 'mailbox.alias.remove']);
+    expect(JSON.stringify(dispatch.mock.calls)).not.toContain('certificate');
+  });
+  it('rejects extra input before dispatch and treats a lost alias response as uncertain', async () => {
+    const dispatch = vi.fn(async () => { throw new Error('closed'); });
+    const client = createExchangeAddressesClient({ dispatch });
+    await expect(client.write(binding, 'mailbox.alias.add', { mailboxId, address: 'a@example.com', command: 'Remove-Mailbox' } as never)).rejects.toThrow();
+    expect(dispatch).not.toHaveBeenCalled();
+    await expect(client.write(binding, 'mailbox.alias.add', { mailboxId, address: 'a@example.com' })).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+  });
+});
+
+describe('Exchange delegation contract', () => {
+  const mailboxId = mailbox.id, delegateId = '66666666-6666-4666-8666-666666666666';
+  it('dispatches one typed right per write and verifies both mailbox identities', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true,
+      data: { mailboxId, delegateId, delegateAddress: 'delegate@example.com', fullAccess: true,
+        sendAs: false, sendOnBehalf: false, accepted: true, verified: true } }));
+    const client = createExchangeDelegationClient({ dispatch });
+    await expect(client.set(binding, { mailboxId, delegateId, right: 'FullAccess', enabled: true })).resolves.toMatchObject({ verified: true });
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'mailbox.delegation.set',
+      parameters: { mailboxId, delegateId, right: 'FullAccess', enabled: true } }));
+    await expect(client.set(binding, { mailboxId, delegateId: mailboxId, right: 'SendAs', enabled: true })).rejects.toThrow();
+    expect(dispatch).toHaveBeenCalledTimes(1);
   });
 });

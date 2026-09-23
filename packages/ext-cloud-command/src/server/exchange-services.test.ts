@@ -88,3 +88,43 @@ describe('Exchange automatic reply administration', () => {
     expect(s.audit.mock.calls.map(([event]) => event.action)).toEqual(['cloudcommand.microsoft.exchange.autoreply.set.intent', 'cloudcommand.microsoft.exchange.autoreply.set.outcome']);
   });
 });
+
+describe('Exchange mailbox address administration', () => {
+  const mailboxId = '66666666-6666-4666-8666-666666666666';
+  it('requires manager authorization and audits a field-scoped alias write', async () => {
+    const s = setup();
+    s.worker.dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,
+      data: { mailboxId, primarySmtpAddress: 'owner@example.com', aliases: ['new@example.com'], policyEnabled: false, accepted: true, verified: true } }));
+    await expect(s.service.addressWrite({}, org, 'mailbox.alias.add', { mailboxId, address: 'new@example.com' })).resolves.toMatchObject({ verified: true });
+    expect(s.authorize).toHaveBeenCalledWith({}, org, true);
+    expect(s.worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'mailbox.alias.add', parameters: { mailboxId, address: 'new@example.com' } }));
+    expect(s.audit.mock.calls.map(([event]) => event.action)).toEqual(['cloudcommand.microsoft.exchange.mailbox.alias.add.intent', 'cloudcommand.microsoft.exchange.mailbox.alias.add.outcome']);
+  });
+  it('refuses an invalid address and a stale connection before dispatch', async () => {
+    const s = setup();
+    await expect(s.service.addressWrite({}, org, 'mailbox.primary.set', { mailboxId, address: 'bad' })).rejects.toMatchObject({ code: 'invalid_operation' });
+    s.registry.provision.mockImplementation(async () => { s.change({ generation: 5 }); });
+    await expect(s.service.addressWrite({}, org, 'mailbox.alias.remove', { mailboxId, address: 'old@example.com' })).rejects.toMatchObject({ code: 'connection_changed' });
+    expect(s.worker.dispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('Exchange mailbox delegation administration', () => {
+  const mailboxId = '66666666-6666-4666-8666-666666666666', delegateId = '77777777-7777-4777-8777-777777777777';
+  it('requires manager authorization and audits one right without raw provider details', async () => {
+    const s = setup();
+    s.worker.dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,
+      data: { mailboxId, delegateId, delegateAddress: 'delegate@example.com', fullAccess: true,
+        sendAs: false, sendOnBehalf: false, accepted: true, verified: true } }));
+    await expect(s.service.delegationSet({}, org, { mailboxId, delegateId, right: 'FullAccess', enabled: true })).resolves.toMatchObject({ verified: true });
+    expect(s.authorize).toHaveBeenCalledWith({}, org, true);
+    expect(s.worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'mailbox.delegation.set',
+      parameters: { mailboxId, delegateId, right: 'FullAccess', enabled: true } }));
+    expect(s.audit.mock.calls.map(([event]) => event.action)).toEqual(['cloudcommand.microsoft.exchange.delegation.set.intent', 'cloudcommand.microsoft.exchange.delegation.set.outcome']);
+  });
+  it('rejects self-delegation before worker dispatch', async () => {
+    const s = setup();
+    await expect(s.service.delegationSet({}, org, { mailboxId, delegateId: mailboxId, right: 'SendAs', enabled: true })).rejects.toMatchObject({ code: 'invalid_operation' });
+    expect(s.worker.dispatch).not.toHaveBeenCalled();
+  });
+});

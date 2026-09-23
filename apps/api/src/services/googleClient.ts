@@ -50,6 +50,9 @@ export const LICENSING_SCOPES = [
 export const REPORTS_SCOPES = [
   'https://www.googleapis.com/auth/admin.reports.usage.readonly',
 ] as const;
+export const AUDIT_REPORTS_SCOPES = [
+  'https://www.googleapis.com/auth/admin.reports.audit.readonly',
+] as const;
 
 /** Comma-separated scope list for the operator's DWD setup instructions. */
 export const ALL_DWD_SCOPES_CSV = [
@@ -58,7 +61,16 @@ export const ALL_DWD_SCOPES_CSV = [
   ...CALENDAR_SCOPES,
   ...LICENSING_SCOPES,
   ...REPORTS_SCOPES,
+  ...AUDIT_REPORTS_SCOPES,
 ].join(',');
+
+/** Separate read-only token for the Admin Reports activity API. */
+export function getAuditReportsClient(decryptedKeyJson: string, adminEmail: string) {
+  const key = parseServiceAccountKey(decryptedKeyJson);
+  const auth = new adminAuth.JWT({ email: key.client_email, key: key.private_key,
+    scopes: [...AUDIT_REPORTS_SCOPES], subject: adminEmail });
+  return admin({ version: 'reports_v1', auth });
+}
 
 /** Admin Reports usage client; the DWD grant must include REPORTS_SCOPES. */
 export function getUsageReportsClient(decryptedKeyJson: string, adminEmail: string) {

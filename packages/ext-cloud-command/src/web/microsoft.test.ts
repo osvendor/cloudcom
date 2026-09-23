@@ -32,6 +32,75 @@ afterEach(() => {
 });
 
 describe('CloudCommandMicrosoftPage', () => {
+  it('loads direct rights for a selected tenant mailbox and confirms one delegation change', async () => {
+    const id = '66666666-6666-4666-8666-666666666666', delegateId = '77777777-7777-4777-8777-777777777777';
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [
+        { id, values: { displayName: 'Owner', userPrincipalName: 'owner@example.com' } },
+        { id: delegateId, values: { displayName: 'Delegate', userPrincipalName: 'delegate@example.com' } },
+      ], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration') {
+        const body = JSON.parse(String(init?.body));
+        if (body.type === 'user.get') return Response.json({ id, displayName: 'Owner' });
+        if (body.type === 'user.globalAdmin.get') return Response.json({ enabled: false });
+        if (body.type === 'mailbox.delegation.get') return Response.json({ mailboxId: id, delegateId,
+          delegateAddress: 'delegate@example.com', fullAccess: false, sendAs: false, sendOnBehalf: false });
+        if (body.type === 'mailbox.delegation.set') return Response.json({ mailboxId: id, delegateId,
+          delegateAddress: 'delegate@example.com', fullAccess: body.right === 'FullAccess', sendAs: false, sendOnBehalf: false,
+          accepted: true, verified: true });
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush(); openUser(page, id); await flush();
+    const root = page.shadowRoot!; root.querySelector<HTMLButtonElement>('#delegation-open')!.click(); await flush();
+    const select = root.querySelector<HTMLSelectElement>('#delegation-user')!;
+    select.value = delegateId; select.dispatchEvent(new Event('change', { bubbles: true })); await flush();
+    expect(root.querySelector<HTMLButtonElement>('[data-delegation-right="FullAccess"]')?.disabled).toBe(true);
+    const confirm = root.querySelector<HTMLInputElement>('#delegation-confirm')!;
+    confirm.checked = true; confirm.dispatchEvent(new Event('change', { bubbles: true }));
+    root.querySelector<HTMLButtonElement>('[data-delegation-right="FullAccess"]')!.click(); await flush();
+    const write = request.mock.calls.find(([path, init]) => path === '/microsoft/administration' && String(init?.body).includes('mailbox.delegation.set'));
+    expect(JSON.parse(String(write?.[1]?.body))).toEqual({ type: 'mailbox.delegation.set', mailboxId: id, delegateId, right: 'FullAccess', enabled: true });
+    expect(root.querySelector<HTMLButtonElement>('[data-delegation-right="FullAccess"]')?.disabled).toBe(true);
+  });
+  it('saves primary address and aliases independently after a mailbox read', async () => {
+    const id = '66666666-6666-4666-8666-666666666666';
+    let primary = 'ada@example.com'; const aliases: string[] = [];
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id, values: { displayName: 'Ada' } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration') {
+        const body = JSON.parse(String(init?.body));
+        if (body.type === 'user.get') return Response.json({ id, displayName: 'Ada' });
+        if (body.type === 'user.globalAdmin.get') return Response.json({ enabled: false });
+        if (body.type === 'mailbox.addresses.get') return Response.json({ mailboxId: id, primarySmtpAddress: primary, aliases, policyEnabled: false });
+        if (body.type === 'mailbox.primary.set' || body.type === 'mailbox.alias.add' || body.type === 'mailbox.alias.remove') {
+          if (body.type === 'mailbox.primary.set') primary = body.address;
+          if (body.type === 'mailbox.alias.add') aliases.push(body.address);
+          if (body.type === 'mailbox.alias.remove') aliases.splice(aliases.indexOf(body.address), 1);
+          return Response.json({ mailboxId: id, primarySmtpAddress: primary, aliases, policyEnabled: false, accepted: true, verified: true });
+        }
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush(); openUser(page, id); await flush();
+    const root = page.shadowRoot!; root.querySelector<HTMLButtonElement>('#addresses-open')!.click(); await flush();
+    const alias = root.querySelector<HTMLInputElement>('#addresses-alias')!;
+    alias.value = 'alias@example.com'; alias.dispatchEvent(new Event('input', { bubbles: true }));
+    root.querySelector<HTMLButtonElement>('#addresses-alias-add')!.click(); await flush();
+    expect(root.querySelector<HTMLButtonElement>('#addresses-alias-add')?.disabled).toBe(true);
+    root.querySelector<HTMLButtonElement>('#addresses-refresh')!.click(); await flush();
+    const input = root.querySelector<HTMLInputElement>('#addresses-primary')!;
+    input.value = 'new@example.com'; input.dispatchEvent(new Event('input', { bubbles: true }));
+    root.querySelector<HTMLButtonElement>('#addresses-primary-save')!.click(); await flush();
+    const writes = request.mock.calls.filter(([path, init]) => path === '/microsoft/administration' && /mailbox\.(alias|primary)\./.test(String(init?.body)))
+      .map(([, init]) => JSON.parse(String(init?.body)));
+    expect(writes).toEqual([
+      { type: 'mailbox.alias.add', mailboxId: id, address: 'alias@example.com' },
+      { type: 'mailbox.primary.set', mailboxId: id, address: 'new@example.com' },
+    ]);
+  });
   it('loads one internal/external reply and sends a scheduled save only for the selected mailbox', async () => {
     const id = '66666666-6666-4666-8666-666666666666';
     const request = vi.fn(async (path: string, init?: RequestInit) => {

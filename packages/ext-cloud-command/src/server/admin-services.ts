@@ -66,6 +66,13 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
   const autoReplyGet = z.object({ type: z.literal('mailbox.autoreply.get'), mailboxId: uuid }).strict();
   const autoReplySet = z.object({ type: z.literal('mailbox.autoreply.set'), mailboxId: uuid, state: z.enum(['Disabled', 'Enabled', 'Scheduled']),
     message: z.string().max(8192), start: z.string().datetime({ offset: true }).nullable(), end: z.string().datetime({ offset: true }).nullable() }).strict();
+  const addressesGet = z.object({ type: z.literal('mailbox.addresses.get'), mailboxId: uuid }).strict();
+  const primarySet = z.object({ type: z.literal('mailbox.primary.set'), mailboxId: uuid, address: z.string().email().max(320) }).strict();
+  const aliasAdd = z.object({ type: z.literal('mailbox.alias.add'), mailboxId: uuid, address: z.string().email().max(320) }).strict();
+  const aliasRemove = z.object({ type: z.literal('mailbox.alias.remove'), mailboxId: uuid, address: z.string().email().max(320) }).strict();
+  const delegationGet = z.object({ type: z.literal('mailbox.delegation.get'), mailboxId: uuid, delegateId: uuid }).strict();
+  const delegationSet = z.object({ type: z.literal('mailbox.delegation.set'), mailboxId: uuid, delegateId: uuid,
+    right: z.enum(['FullAccess', 'SendAs', 'SendOnBehalf']), enabled: z.boolean() }).strict();
   async function exchangeService() {
     const bridge = await runtime.exchange?.();
     if (!bridge) throw new AdministrationSetupError('exchange_unavailable');
@@ -207,8 +214,19 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
         if (readAutoReply.success) return (await exchangeService()).autoReplyGet(request, request.orgId, readAutoReply.data.mailboxId);
         const saveAutoReply = autoReplySet.safeParse(input);
         if (saveAutoReply.success) return (await exchangeService()).autoReplySet(request, request.orgId, saveAutoReply.data);
+        const readAddresses = addressesGet.safeParse(input);
+        if (readAddresses.success) return (await exchangeService()).addressesGet(request, request.orgId, readAddresses.data.mailboxId);
+        for (const schema of [primarySet, aliasAdd, aliasRemove] as const) {
+          const parsed = schema.safeParse(input);
+          if (parsed.success) return (await exchangeService()).addressWrite(request, request.orgId, parsed.data.type, parsed.data);
+        }
+        const readDelegation = delegationGet.safeParse(input);
+        if (readDelegation.success) return (await exchangeService()).delegationGet(request, request.orgId, readDelegation.data.mailboxId, readDelegation.data.delegateId);
+        const saveDelegation = delegationSet.safeParse(input);
+        if (saveDelegation.success) return (await exchangeService()).delegationSet(request, request.orgId, saveDelegation.data);
         if (typeof input === 'object' && input !== null && 'type' in input &&
-          typeof input.type === 'string' && (input.type.startsWith('mailbox.forwarding.') || input.type.startsWith('mailbox.autoreply.')))
+          typeof input.type === 'string' && (input.type.startsWith('mailbox.forwarding.') || input.type.startsWith('mailbox.autoreply.') ||
+            input.type.startsWith('mailbox.addresses.') || input.type.startsWith('mailbox.primary.') || input.type.startsWith('mailbox.alias.') || input.type.startsWith('mailbox.delegation.')))
           throw new AdministrationSetupError('invalid_operation');
         return execute(request, request.orgId, input);
       },

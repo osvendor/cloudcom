@@ -1,11 +1,11 @@
 import { eq } from 'drizzle-orm';
-import type { GoogleProfileInput, GoogleRequest, GoogleSuspendInput, NativeGoogleServices } from '@cloudcom/ext-cloud-command';
+import type { GoogleActivitySource, GoogleProfileInput, GoogleRequest, GoogleSuspendInput, NativeGoogleServices } from '@cloudcom/ext-cloud-command';
 import { db, withDbAccessContext } from '../db';
 import { googleWorkspaceConnections } from '../db/schema/google';
 import { dbAccessContextFromAuth, type AuthContext } from '../middleware/auth';
 import { GOOGLE_WORKSPACE_ENABLED } from '../config/env';
 import { decryptConnectionKey } from '../services/googleHelpers';
-import { getDirectoryClient, getGmailClient, getUsageReportsClient } from '../services/googleClient';
+import { getAuditReportsClient, getDirectoryClient, getGmailClient, getUsageReportsClient } from '../services/googleClient';
 import { createAuditLog } from '../services/auditService';
 
 const denied = { ok: false as const, code: 'access_denied' as const, message: 'Google Workspace access is not permitted for this organization.' };
@@ -170,8 +170,8 @@ export const nativeGoogleServices: NativeGoogleServices = {
         parameters: 'accounts:drive_used_quota_in_mb,accounts:gmail_used_quota_in_mb,accounts:used_quota_in_mb',
         fields: 'nextPageToken,warnings(code),usageReports(entity(customerId,userEmail),parameters(name,intValue))' })).data;
     } catch (error) {
-      const status = (error as { response?: { status?: number }; status?: number }).response?.status
-        ?? (error as { status?: number }).status;
+      const status = (error as { response?: { status?: number }; status?: number; code?: number }).response?.status
+        ?? (error as { status?: number; code?: number }).status ?? (error as { code?: number }).code;
       return status === 401 || status === 403
         ? { ok: false, code: 'scope_required', message: 'Google usage-report access is unavailable. Update the existing domain-wide delegation grant to include admin.reports.usage.readonly and verify the administrator reporting privilege.' }
         : { ok: false, code: 'provider_failed', message: 'Google usage report could not be loaded. The date may not be ready yet.' };
@@ -199,6 +199,70 @@ export const nativeGoogleServices: NativeGoogleServices = {
     const warning = omitted ? 'Only users in the configured Google domain are shown; other domains were omitted.'
       : data.warnings?.length || missing || !items.length ? 'Google returned incomplete or unavailable usage data for this date.' : null;
     return { ok: true, date, items, nextPageToken: data.nextPageToken ?? null, partial, warning };
+  },
+  async activity(input, source, days, pageToken, asOf) {
+    const auth = authorized(input);
+    if (!auth || !input.authorization.hasPermission('organizations', 'write') || !input.authorization.mfaSatisfied) return denied;
+    if (!GOOGLE_WORKSPACE_ENABLED) return disconnected;
+    if (!['login', 'admin', 'drive', 'token'].includes(source) || ![1, 7, 30].includes(days)
+      || (pageToken !== null && (pageToken.length > 2048 || !/^[A-Za-z0-9_\-./+=]+$/.test(pageToken)))
+      || !!pageToken !== !!asOf || (asOf !== null && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(asOf)
+        || !Number.isFinite(Date.parse(asOf)) || Date.parse(asOf) > Date.now() || Date.now() - Date.parse(asOf) > 3600000)))
+      return { ok: false, code: 'provider_failed', message: 'Invalid activity report request.' };
+    const row = await load(auth, input.orgId);
+    if (!row || row.orgId !== input.orgId || row.status !== 'active') return disconnected;
+    let key: string;
+    let customerId: string;
+    try {
+      key = decryptConnectionKey(row);
+      const admin = (await getDirectoryClient(key, row.adminEmail).users.get({ userKey: row.adminEmail,
+        fields: 'customerId,primaryEmail' })).data;
+      if (!admin.customerId || !/^[A-Za-z0-9_-]{1,128}$/.test(admin.customerId)
+        || admin.primaryEmail?.toLowerCase() !== row.adminEmail.toLowerCase())
+        return { ok: false, code: 'provider_failed', message: 'Google customer ownership could not be verified.' };
+      customerId = admin.customerId;
+      const fresh = await load(auth, input.orgId);
+      if (!fresh || fresh.id !== row.id || fresh.status !== 'active' || fresh.customerDomain !== row.customerDomain
+        || fresh.adminEmail !== row.adminEmail || fresh.serviceAccountKey !== row.serviceAccountKey) return disconnected;
+    } catch {
+      return { ok: false, code: 'provider_failed', message: 'Google customer ownership could not be verified.' };
+    }
+    const end = asOf ? new Date(asOf) : new Date();
+    const start = new Date(end.getTime() - days * 86400000);
+    let data;
+    try {
+      data = (await getAuditReportsClient(key, row.adminEmail).activities.list({ userKey: 'all', applicationName: source,
+        customerId, startTime: start.toISOString(), endTime: end.toISOString(), maxResults: 100,
+        pageToken: pageToken ?? undefined,
+        fields: 'nextPageToken,items(id(time,uniqueQualifier,applicationName,customerId),actor(email),ipAddress,events(name,type))' })).data;
+    } catch (error) {
+      const status = (error as { response?: { status?: number }; status?: number; code?: number }).response?.status
+        ?? (error as { status?: number; code?: number }).status ?? (error as { code?: number }).code;
+      return status === 401 || status === 403
+        ? { ok: false, code: 'scope_required', message: 'Google activity access is unavailable. Update the existing delegation grant with admin.reports.audit.readonly and verify the administrator reporting privilege.' }
+        : { ok: false, code: 'provider_failed', message: 'Google activity report could not be loaded for this source and window.' };
+    }
+    let omitted = false;
+    const items = (data.items ?? []).flatMap(item => {
+      const id = item.id;
+      const at = id?.time;
+      const eventSource = id?.applicationName;
+      const rawId = id?.uniqueQualifier;
+      if (id?.customerId !== customerId || eventSource !== source || !at || !Number.isFinite(Date.parse(at))
+        || Date.parse(at) < start.getTime() || Date.parse(at) > end.getTime()
+        || !rawId || !/^[A-Za-z0-9_-]{1,128}$/.test(rawId) || item.events?.length === 0) {
+        omitted = true; return [];
+      }
+      const names = (item.events ?? []).slice(0, 5).map(event => event.name ?? event.type).filter((name): name is string => !!name)
+        .map(name => name.slice(0, 120));
+      if (!names.length) { omitted = true; return []; }
+      if ((item.events?.length ?? 0) > 5) omitted = true;
+      return [{ id: rawId, at: new Date(at).toISOString(), source: eventSource as GoogleActivitySource,
+        actor: scalar(item.actor?.email)?.slice(0, 320) ?? null, ip: scalar(item.ipAddress)?.slice(0, 64) ?? null,
+        events: names }];
+    });
+    return { ok: true, source, days, asOf: end.toISOString(), items, nextPageToken: data.nextPageToken ?? null, partial: omitted,
+      warning: omitted ? 'Some Google activity records were omitted or shortened because their tenant or fields could not be verified.' : null };
   },
   async auditSuspension(input, userId, stage) {
     const auth = authorized(input);

@@ -16,6 +16,7 @@ function harness(opts: { access?: boolean; sites?: string[]; read?: boolean; wri
       forwardingDisposition: null, vacationEnabled: false, vacationSubject: null, vacationStartMs: null, vacationEndMs: null })),
     storage: vi.fn(async (_request, date: string) => ({ ok: true as const, date, items: [{ email: 'test@example.test', gmailMb: 10, driveMb: null, totalMb: 20 }],
       nextPageToken: null, partial: true, warning: 'Some usage data is unavailable.' })),
+    activity: vi.fn(async (_request, source, days) => ({ ok: true as const, source, days, asOf: new Date().toISOString(), items: [], nextPageToken: 'next', partial: false, warning: null })),
     auditSuspension: vi.fn(async () => { if (opts.auditFail) throw new Error('audit unavailable'); }),
     setSuspended: vi.fn(async () => ({ ok: true as const, userId: '123456', suspended: true })),
     auditProfile: vi.fn(async () => { if (opts.auditFail) throw new Error('audit unavailable'); }),
@@ -117,6 +118,28 @@ describe('Google native extension bridge', () => {
     }
   });
   const suspension = { userId: '123456', email: 'test@example.test', expectedSuspended: false, suspended: true, confirmation: 'test@example.test' };
+  it('routes a bounded security activity read only for managers with MFA', async () => {
+    const h = harness();
+    const response = await h.app.request(`/google/reports/activity?orgId=${ORG}&source=login&days=7`);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(h.google.activity).toHaveBeenCalledWith({ auth: h.auth, authorization: h.authorization, orgId: ORG }, 'login', 7, null, null);
+    const asOf = new Date().toISOString();
+    const next = await h.app.request(`/google/reports/activity?orgId=${ORG}&source=login&days=7&pageToken=next&asOf=${encodeURIComponent(asOf)}`);
+    expect(next.status).toBe(200);
+    expect(h.google.activity).toHaveBeenLastCalledWith(expect.any(Object), 'login', 7, 'next', asOf);
+    for (const opts of [{ write: false }, { mfa: false }, { access: false }, { sites: [] }]) {
+      const denied = harness(opts);
+      expect((await denied.app.request(`/google/reports/activity?orgId=${ORG}&source=login&days=7`)).status).toBe(403);
+      expect(denied.google.activity).not.toHaveBeenCalled();
+    }
+  });
+  it('rejects expanded activity queries and duplicate scope', async () => {
+    const h = harness();
+    for (const extra of ['&source=login', '&days=90', '&customerId=other', '&orgId=' + PARTNER, '&pageToken=a&pageToken=b', '&pageToken=a'])
+      expect((await h.app.request(`/google/reports/activity?orgId=${ORG}&source=login&days=7${extra}`)).status).toBe(400);
+    expect(h.google.activity).not.toHaveBeenCalled();
+  });
   const post = (app: ReturnType<typeof harness>['app'], body: unknown) => app.request(`/google/users/suspension?orgId=${ORG}`,
     { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   it.each([{ write: false }, { mfa: false }, { sites: [] }, { access: false }])('denies suspension before provider access: %j', async opts => {

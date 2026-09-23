@@ -180,6 +180,7 @@ jobs:
         run: |
           pnpm --filter @breeze/api exec vitest run src/config/envComposeParity.test.ts
           node --test scripts/release/release-image-consumers.test.mjs
+          node --test scripts/release/cloudcom-candidate-workflow.test.mjs scripts/cloudcom/exchange-worker-release.test.mjs
           bash scripts/check-guided-setup-systemd-unit.sh
           node --test scripts/cloudcom/update-upstream.test.mjs
           node --test scripts/cloudcom/customization-contract.test.mjs

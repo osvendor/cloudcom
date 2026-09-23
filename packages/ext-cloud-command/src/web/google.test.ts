@@ -4,6 +4,24 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 const context = (organizationId: string) => ({ contractVersion: 1, extensionName: 'cloudcommand', path: '/extensions/cloudcommand/google', organizationId });
 afterEach(() => document.body.replaceChildren());
 describe('Google directory page', () => {
+  it('shows bounded security activity without provider parameter values', async () => {
+    const request = vi.fn(async (path: string) => Response.json(path === '/google/connection'
+      ? { available: true, connected: true, enabled: true, canManage: true }
+      : path.startsWith('/google/reports/activity')
+        ? { asOf: '2026-09-22T11:00:00.000Z', items: [{ id: 'a1', at: '2026-09-22T10:00:00Z', source: 'login', actor: 'one@example.test', ip: null, events: ['login_success'] }], nextPageToken: 'next', partial: false, warning: null }
+        : { items: [], nextPageToken: null, complete: true }));
+    const page = new CloudCommandGooglePage(); page.context = context('org-a'); page.hostApi = { request }; document.body.append(page);
+    await flush(); await flush();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#activity-tab')!.click();
+    await flush();
+    expect(request.mock.calls.some(([path]) => path === '/google/reports/activity?source=login&days=7')).toBe(true);
+    expect(page.shadowRoot!.textContent).toContain('login_success');
+    expect(page.shadowRoot!.textContent).toContain('More pages available');
+    expect(page.shadowRoot!.textContent).toContain('an empty page does not prove no activity');
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#more-activity')!.click();
+    await flush();
+    expect(request.mock.calls.some(([path]) => path.includes('pageToken=next&asOf=2026-09-22T11%3A00%3A00.000Z'))).toBe(true);
+  });
   it('shows native connection state and a bounded user page', async () => {
     const request = vi.fn(async (path: string) => Response.json(path === '/google/connection'
       ? { available: true, connected: true, enabled: true, customerDomain: 'example.test' }

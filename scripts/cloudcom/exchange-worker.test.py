@@ -78,6 +78,26 @@ class ExchangeBrokerTests(unittest.TestCase):
             invalid = broker.execute(reply)
             too_large = broker.execute({**reply, 'parameters': {**reply['parameters'], 'message': 'x' * 8193}})
         self.assertEqual(invalid['code'], 'invalid_request'); self.assertEqual(too_large['code'], 'invalid_request'); process.assert_not_called()
+    def test_address_write_rejects_injected_parameters_and_lost_alias_result_is_uncertain(self):
+        address = {**REQUEST, 'operation': 'mailbox.alias.add', 'parameters': {
+            'mailboxId': '55555555-5555-4555-8555-555555555555', 'address': 'alias@example.com'}}
+        broker = worker.Broker('/unused', '/unused.ps1')
+        with patch.object(worker, 'read_config', return_value={REQUEST['tenantId']: DESCRIPTOR}), patch.object(worker, 'PersistentPowerShell') as process:
+            invalid = broker.execute({**address, 'parameters': {**address['parameters'], 'command': 'Remove-Mailbox'}})
+        self.assertEqual(invalid['code'], 'invalid_request'); process.assert_not_called()
+        process = FakeProcess('')
+        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([], [], [])):
+            result = worker.PersistentPowerShell(address, DESCRIPTOR, '/unused.ps1').run(address)
+        self.assertEqual(result['code'], 'unknown_write_outcome'); self.assertTrue(process.killed)
+    def test_delegation_requires_two_different_mailbox_ids_and_one_right(self):
+        delegated = {**REQUEST, 'operation': 'mailbox.delegation.set', 'parameters': {
+            'mailboxId': '55555555-5555-4555-8555-555555555555', 'delegateId': '66666666-6666-4666-8666-666666666666',
+            'right': 'SendAs', 'enabled': True}}
+        broker = worker.Broker('/unused', '/unused.ps1')
+        with patch.object(worker, 'read_config', return_value={REQUEST['tenantId']: DESCRIPTOR}), patch.object(worker, 'PersistentPowerShell') as process:
+            self_delegate = broker.execute({**delegated, 'parameters': {**delegated['parameters'], 'delegateId': delegated['parameters']['mailboxId']}})
+            injected = broker.execute({**delegated, 'parameters': {**delegated['parameters'], 'command': 'Remove-Mailbox'}})
+        self.assertEqual(self_delegate['code'], 'invalid_request'); self.assertEqual(injected['code'], 'invalid_request'); process.assert_not_called()
     def test_mailbox_response_cannot_exceed_contract_bound(self):
         oversized = {'requestId': REQUEST['requestId'], 'ok': True, 'data': {'records': [{}] * 201, 'partial': True, 'collectedAt': '2026-09-22T00:00:00Z'}}
         process = FakeProcess(json.dumps(oversized).encode('utf-8') + b'\n')

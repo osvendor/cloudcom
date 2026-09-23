@@ -33,6 +33,9 @@ type HealthData = { services: HealthService[]; partial: boolean; checkedAt: stri
 type ForwardingState = { mailboxId: string; smtpAddress: string | null; keepCopy: boolean; internalRecipient: string | null };
 type AutoReplyState = { mailboxId: string; state: 'Disabled' | 'Enabled' | 'Scheduled'; internalMessage: string; externalMessage: string;
   externalAudience: 'None' | 'Known' | 'All'; start: string | null; end: string | null };
+type AddressesState = { mailboxId: string; primarySmtpAddress: string; aliases: string[]; policyEnabled: boolean };
+type DelegationState = { mailboxId: string; delegateId: string; delegateAddress: string;
+  fullAccess: boolean; sendAs: boolean; sendOnBehalf: boolean };
 const healthyStatuses = new Set(['serviceOperational', 'serviceRestored', 'postIncidentReviewPublished', 'resolved', 'resolvedExternal', 'falsePositive']);
 function healthTone(status: string): 'green' | 'yellow' | 'red' | 'unknown' {
   return healthyStatuses.has(status) ? 'green' : status === 'serviceInterruption' ? 'red' : !status || status === 'unknownFutureValue' ? 'unknown' : 'yellow';
@@ -115,6 +118,25 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private autoReplyMessage = '';
   private autoReplyNeedsRefresh = false;
   private autoReplyRequest = 0;
+  private addressesOpen = false;
+  private addresses: AddressesState | null = null;
+  private primaryDraft = '';
+  private aliasDraft = '';
+  private addressesLoading = false;
+  private addressesError = '';
+  private addressesMessage = '';
+  private addressesNeedsRefresh = false;
+  private addressesRequest = 0;
+  private delegationOpen = false;
+  private delegationUsers: ResourceData | null = null;
+  private delegationSelectedId = '';
+  private delegation: DelegationState | null = null;
+  private delegationLoading = false;
+  private delegationError = '';
+  private delegationMessage = '';
+  private delegationNeedsRefresh = false;
+  private delegationConfirmed = false;
+  private delegationRequest = 0;
   private detailKind: DetailKind = 'read';
   private detailRecord: MicrosoftRecord | null = null;
   private detailRequest = 0;
@@ -193,7 +215,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.createdUser = null;
     this.createGroupOpen = false; this.createdGroup = null;
     this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
-    this.resetAutoReply();
+    this.resetAutoReply(); this.resetAddresses(); this.resetDelegation();
     this.healthRequest += 1;
     this.userSecurityAction = null;
   }
@@ -209,7 +231,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       this.createdUser = null; this.createUserBusy = false;
       this.createGroupOpen = false; this.createdGroup = null;
       this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
-      this.resetAutoReply();
+      this.resetAutoReply(); this.resetAddresses(); this.resetDelegation();
       this.detailRecord = null;
       this.detailRequest += 1;
       this.userVerificationRequest += 1;
@@ -247,7 +269,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.createdUser = null; this.createUserBusy = false;
     this.createGroupOpen = false; this.createdGroup = null; this.createGroupUsers = null; this.createGroupBusy = false;
     this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
-    this.resetAutoReply();
+    this.resetAutoReply(); this.resetAddresses(); this.resetDelegation();
     this.detailRecord = null;
     this.expandedRowId = null;
     this.visibleColumns = [];
@@ -427,7 +449,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.detailKind = this.resource === 'users' ? 'user' : this.resource === 'groups' ? 'group' : 'read';
     this.detailRecord = null;
     this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
-    this.resetAutoReply();
+    this.resetAutoReply(); this.resetAddresses(); this.resetDelegation();
     this.forwardingError = ''; this.forwardingMessage = ''; this.forwardingNeedsRefresh = false;
     this.userVerificationRequest += 1;
     this.userSecurityRequest += 1;
@@ -602,7 +624,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.detail = null;
     this.detailRecord = null;
     this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
-    this.resetAutoReply();
+    this.resetAutoReply(); this.resetAddresses(); this.resetDelegation();
     this.forwardingError = ''; this.forwardingMessage = ''; this.forwardingNeedsRefresh = false;
     this.detailRequest += 1;
     this.userVerificationRequest += 1;
@@ -958,6 +980,164 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     } finally { if (generation === this.generation && context === this.contextValue) { this.busy = false; this.render(); } }
   }
 
+  private resetDelegation(): void {
+    this.delegationRequest += 1; this.delegationOpen = false; this.delegationUsers = null; this.delegationSelectedId = '';
+    this.delegation = null; this.delegationLoading = false; this.delegationError = ''; this.delegationMessage = '';
+    this.delegationNeedsRefresh = false; this.delegationConfirmed = false;
+  }
+  private openDelegation(): void {
+    if (this.detailKind !== 'user' || !this.detail || !this.canRead()) return;
+    this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
+    this.resetAutoReply(); this.resetAddresses();
+    this.delegationOpen = true; this.delegationError = ''; this.delegationMessage = '';
+    this.render(); void this.loadDelegationUsers();
+  }
+  private async loadDelegationUsers(): Promise<void> {
+    const mailboxId = this.detail?.id;
+    if (!this.delegationOpen || !mailboxId) return;
+    const generation = this.generation; const context = this.contextValue; const request = ++this.delegationRequest;
+    this.delegationLoading = true; this.delegationUsers = null; this.delegation = null; this.delegationError = ''; this.render();
+    try {
+      const users = parseResourceData(await this.request<unknown>(this.path('/resources/users')));
+      if (generation !== this.generation || context !== this.contextValue || request !== this.delegationRequest || this.detail?.id !== mailboxId) return;
+      this.delegationUsers = users;
+    } catch (error) {
+      if (generation !== this.generation || context !== this.contextValue || request !== this.delegationRequest || this.detail?.id !== mailboxId) return;
+      this.delegationError = error instanceof Error ? error.message : 'Could not load tenant users.';
+    } finally {
+      if (generation === this.generation && context === this.contextValue && request === this.delegationRequest && this.detail?.id === mailboxId) {
+        this.delegationLoading = false; this.render();
+      }
+    }
+  }
+  private async loadDelegation(): Promise<void> {
+    const mailboxId = this.detail?.id; const delegateId = this.delegationSelectedId;
+    if (!this.delegationOpen || !mailboxId || !delegateId || !this.delegationUsers?.items.some(row => row.id === delegateId)) return;
+    const generation = this.generation; const context = this.contextValue; const request = ++this.delegationRequest;
+    this.delegationLoading = true; this.delegation = null; this.delegationError = ''; this.delegationMessage = ''; this.delegationConfirmed = false; this.render();
+    try {
+      const data = await this.request<DelegationState>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'mailbox.delegation.get', mailboxId, delegateId }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || request !== this.delegationRequest || this.detail?.id !== mailboxId || this.delegationSelectedId !== delegateId) return;
+      if (data.mailboxId !== mailboxId || data.delegateId !== delegateId) throw new Error('Delegation identity did not match the selected users.');
+      this.delegation = data; this.delegationNeedsRefresh = false;
+    } catch (error) {
+      if (generation !== this.generation || context !== this.contextValue || request !== this.delegationRequest || this.detail?.id !== mailboxId || this.delegationSelectedId !== delegateId) return;
+      this.delegationError = error instanceof Error ? error.message : 'Could not load direct mailbox rights.';
+    } finally {
+      if (generation === this.generation && context === this.contextValue && request === this.delegationRequest && this.detail?.id === mailboxId && this.delegationSelectedId === delegateId) {
+        this.delegationLoading = false; this.render();
+      }
+    }
+  }
+  private async setDelegation(right: 'FullAccess' | 'SendAs' | 'SendOnBehalf', enabled: boolean): Promise<void> {
+    const mailboxId = this.detail?.id; const delegateId = this.delegationSelectedId;
+    if (!this.connection?.canManage || !this.delegationOpen || !this.delegation || !mailboxId || !delegateId ||
+      !this.delegationConfirmed || this.delegationLoading || this.delegationNeedsRefresh) return;
+    const generation = this.generation; const context = this.contextValue; const request = ++this.delegationRequest;
+    this.delegationLoading = true; this.delegationError = ''; this.delegationMessage = ''; this.render();
+    try {
+      const data = await this.request<DelegationState & { accepted: true; verified: boolean }>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'mailbox.delegation.set', mailboxId, delegateId, right, enabled }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || request !== this.delegationRequest || this.detail?.id !== mailboxId || this.delegationSelectedId !== delegateId) return;
+      this.delegationNeedsRefresh = true; this.delegationConfirmed = false;
+      this.delegationMessage = data.verified ? 'Delegation change saved and verified. Refresh before another change.' : 'Microsoft accepted the delegation change, but readback is pending. Refresh before another change.';
+    } catch (error) {
+      if (generation !== this.generation || context !== this.contextValue || request !== this.delegationRequest || this.detail?.id !== mailboxId || this.delegationSelectedId !== delegateId) return;
+      this.delegationNeedsRefresh = true; this.delegationConfirmed = false;
+      this.delegationError = `${error instanceof Error ? error.message : 'Delegation outcome is uncertain.'} Refresh direct rights before trying again.`;
+    } finally {
+      if (generation === this.generation && context === this.contextValue && request === this.delegationRequest && this.detail?.id === mailboxId && this.delegationSelectedId === delegateId) {
+        this.delegationLoading = false; this.render();
+      }
+    }
+  }
+  private renderDelegation(canManage: boolean): string {
+    if (!this.delegationOpen) return '<button class="secondary compact" id="delegation-open">Delegate mailbox</button>';
+    const users = this.delegationUsers?.items.filter(row => row.id !== this.detail?.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row.id)) ?? [];
+    const options = users.map(row => `<option value="${esc(row.id)}" ${row.id === this.delegationSelectedId ? 'selected' : ''}>${esc(String(row.values.displayName ?? row.id))} · ${esc(String(row.values.userPrincipalName ?? row.values.mail ?? ''))}</option>`).join('');
+    const rights = this.delegation ? ([['FullAccess', 'fullAccess', 'Full Access'], ['SendAs', 'sendAs', 'Send As'], ['SendOnBehalf', 'sendOnBehalf', 'Send on Behalf']] as const)
+      .map(([right, field, label]) => `<div class="user-field"><span>${label}: ${this.delegation![field] ? 'Granted' : 'Not granted'}</span>${canManage ? `<button class="secondary compact" data-delegation-right="${right}" data-delegation-enabled="${!this.delegation![field]}" ${!this.delegationConfirmed || this.delegationLoading || this.delegationNeedsRefresh ? 'disabled' : ''}>${this.delegation![field] ? 'Remove' : 'Grant'}</button>` : ''}</div>`).join('') : '';
+    const feedback = this.delegationError ? `<p class="status" data-error="true" role="alert">${esc(this.delegationError)}</p>` : this.delegationMessage ? `<p class="status" role="status">${esc(this.delegationMessage)}</p>` : '';
+    return `<div class="delegation-panel"><div class="actions"><button class="secondary compact" id="delegation-refresh" ${!this.delegationSelectedId || this.delegationLoading ? 'disabled' : ''}>Refresh rights</button><button class="secondary compact" id="delegation-close">Close</button></div>${this.delegationUsers ? `<label>Delegate<select id="delegation-user" ${this.delegationLoading ? 'disabled' : ''}><option value="">Choose a tenant user</option>${options}</select></label>${!this.delegationUsers.complete ? '<p class="meta">This is a partial user inventory; some delegates may not appear.</p>' : ''}` : this.delegationLoading ? '<p class="meta">Loading tenant users…</p>' : ''}${this.delegationLoading && this.delegationSelectedId ? '<p class="meta">Loading direct rights…</p>' : ''}${this.delegation ? `<p class="meta">${esc(this.delegation.delegateAddress)} · Direct mailbox permissions only</p>${rights}${canManage ? `<label class="check"><input id="delegation-confirm" type="checkbox" ${this.delegationConfirmed ? 'checked' : ''} ${this.delegationLoading || this.delegationNeedsRefresh ? 'disabled' : ''}> Confirm this delegate permission change</label>` : ''}` : ''}${feedback}</div>`;
+  }
+  private resetAddresses(): void {
+    this.addressesRequest += 1; this.addressesOpen = false; this.addresses = null;
+    this.addressesLoading = false; this.addressesError = ''; this.addressesMessage = ''; this.addressesNeedsRefresh = false;
+  }
+  private openAddresses(): void {
+    if (this.detailKind !== 'user' || !this.detail || !this.canRead()) return;
+    this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
+    this.resetAutoReply(); this.resetDelegation();
+    this.addressesOpen = true; this.addresses = null; this.addressesError = ''; this.addressesMessage = ''; this.addressesNeedsRefresh = false;
+    this.render(); void this.loadAddresses();
+  }
+  private async loadAddresses(): Promise<void> {
+    const mailboxId = this.detail?.id;
+    if (!this.addressesOpen || !mailboxId) return;
+    const generation = this.generation; const context = this.contextValue; const request = ++this.addressesRequest;
+    this.addressesLoading = true; this.addresses = null; this.addressesError = ''; this.addressesMessage = ''; this.render();
+    try {
+      const data = await this.request<AddressesState>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'mailbox.addresses.get', mailboxId }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || request !== this.addressesRequest || this.detail?.id !== mailboxId) return;
+      if (data.mailboxId !== mailboxId) throw new Error('Mailbox identity did not match the selected user.');
+      this.addresses = data; this.primaryDraft = data.primarySmtpAddress; this.aliasDraft = ''; this.addressesNeedsRefresh = false;
+    } catch (error) {
+      if (generation !== this.generation || context !== this.contextValue || request !== this.addressesRequest || this.detail?.id !== mailboxId) return;
+      this.addressesError = error instanceof Error ? error.message : 'Could not load mailbox addresses.';
+    } finally {
+      if (generation === this.generation && context === this.contextValue && request === this.addressesRequest && this.detail?.id === mailboxId) {
+        this.addressesLoading = false; this.render();
+      }
+    }
+  }
+  private async writeAddress(action: 'mailbox.primary.set' | 'mailbox.alias.add' | 'mailbox.alias.remove', selected?: string): Promise<void> {
+    const mailboxId = this.detail?.id; const current = this.addresses;
+    if (!this.connection?.canManage || !this.addressesOpen || !current || !mailboxId || this.addressesLoading || this.addressesNeedsRefresh) return;
+    const address = (selected ?? (action === 'mailbox.primary.set' ? this.primaryDraft : this.aliasDraft)).trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address) || address.length > 320) {
+      this.addressesError = 'Enter a valid email address.'; this.render(); return;
+    }
+    if (action === 'mailbox.primary.set' && current.policyEnabled) {
+      this.addressesError = 'An email address policy controls this primary address.'; this.render(); return;
+    }
+    if (action === 'mailbox.alias.remove' && !current.aliases.some(value => value.toLowerCase() === address.toLowerCase())) return;
+    if (action === 'mailbox.alias.add' && (current.primarySmtpAddress.toLowerCase() === address.toLowerCase() || current.aliases.some(value => value.toLowerCase() === address.toLowerCase()))) {
+      this.addressesError = 'This address is already assigned to the mailbox.'; this.render(); return;
+    }
+    const generation = this.generation; const context = this.contextValue; const request = ++this.addressesRequest;
+    this.addressesLoading = true; this.addressesError = ''; this.addressesMessage = ''; this.render();
+    try {
+      const data = await this.request<AddressesState & { accepted: true; verified: boolean }>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: action, mailboxId, address }),
+      });
+      if (generation !== this.generation || context !== this.contextValue || request !== this.addressesRequest || this.detail?.id !== mailboxId) return;
+      this.addressesNeedsRefresh = true;
+      this.addressesMessage = data.verified ? 'Address change saved and verified. Refresh before another change.' : 'Microsoft accepted the address change, but readback is pending. Refresh before another change.';
+    } catch (error) {
+      if (generation !== this.generation || context !== this.contextValue || request !== this.addressesRequest || this.detail?.id !== mailboxId) return;
+      this.addressesNeedsRefresh = true;
+      this.addressesError = `${error instanceof Error ? error.message : 'Address change outcome is uncertain.'} Refresh mailbox addresses before trying again.`;
+    } finally {
+      if (generation === this.generation && context === this.contextValue && request === this.addressesRequest && this.detail?.id === mailboxId) {
+        this.addressesLoading = false; this.render();
+      }
+    }
+  }
+  private renderAddresses(canManage: boolean): string {
+    if (!this.addressesOpen) return '<button class="secondary compact" id="addresses-open">Manage email addresses</button>';
+    const data = this.addresses; const disabled = this.addressesLoading || this.addressesNeedsRefresh || !canManage;
+    const feedback = this.addressesError ? `<p class="status" data-error="true" role="alert">${esc(this.addressesError)}</p>` : this.addressesMessage ? `<p class="status" role="status">${esc(this.addressesMessage)}</p>` : '';
+    const aliases = data?.aliases.length ? `<ul class="address-aliases">${data.aliases.map(address => `<li><span>${esc(address)}</span>${canManage ? `<button class="secondary compact" data-alias-remove="${esc(address)}" ${disabled ? 'disabled' : ''}>Remove</button>` : ''}</li>`).join('')}</ul>` : '<p class="meta">No secondary SMTP aliases.</p>';
+    const controls = data ? `<div class="user-field"><label><span>Primary email</span><input id="addresses-primary" type="email" maxlength="320" value="${esc(this.primaryDraft)}" ${disabled || data.policyEnabled ? 'disabled' : ''}></label>${canManage ? `<button class="secondary compact" id="addresses-primary-save" ${disabled || data.policyEnabled || this.primaryDraft.toLowerCase() === data.primarySmtpAddress.toLowerCase() ? 'disabled' : ''}>Save email</button>` : ''}</div>${data.policyEnabled ? '<p class="meta">The primary address is controlled by an email address policy.</p>' : ''}<div class="user-field"><label><span>Optional alias</span><input id="addresses-alias" type="email" maxlength="320" value="${esc(this.aliasDraft)}" placeholder="alias@example.com" ${disabled ? 'disabled' : ''}></label>${canManage ? `<button class="secondary compact" id="addresses-alias-add" ${disabled || !this.aliasDraft.trim() ? 'disabled' : ''}>Add alias</button>` : ''}</div>${aliases}` : '';
+    return `<div class="addresses-panel"><div class="actions"><button class="secondary compact" id="addresses-refresh" ${this.addressesLoading ? 'disabled' : ''}>Refresh</button><button class="secondary compact" id="addresses-close">Close</button></div>${this.addressesLoading ? '<p class="meta">Loading mailbox addresses…</p>' : controls}${feedback}</div>`;
+  }
   private resetAutoReply(): void {
     this.autoReplyRequest += 1; this.autoReplyOpen = false; this.autoReply = null;
     this.autoReplyLoading = false; this.autoReplyError = ''; this.autoReplyMessage = ''; this.autoReplyNeedsRefresh = false;
@@ -965,6 +1145,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private openAutoReply(): void {
     if (this.detailKind !== 'user' || !this.detail || !this.canRead()) return;
     this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
+    this.resetAddresses(); this.resetDelegation();
     this.autoReplyOpen = true; this.autoReply = null; this.autoReplyError = ''; this.autoReplyMessage = ''; this.autoReplyNeedsRefresh = false;
     this.render(); void this.loadAutoReply();
   }
@@ -1038,7 +1219,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   }
   private openForwarding(): void {
     if (this.detailKind !== 'user' || !this.detail || !this.canRead()) return;
-    this.resetAutoReply();
+    this.resetAutoReply(); this.resetAddresses(); this.resetDelegation();
     this.forwardingOpen = true;
     this.forwarding = null;
     this.forwardingError = '';
@@ -1136,7 +1317,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       const securityConfirmation = this.userSecurityAction ? `<div class="security-confirmation" role="group" aria-label="Confirm security action"><p>${this.userSecurityAction === 'reset-password' ? 'Microsoft will set a new temporary password and require the user to change it at next sign-in.' : this.userSecurityAction === 'revoke-sessions' ? 'Microsoft will invalidate refresh tokens and browser session cookies. Users may need to sign in again; revocation can take a few minutes.' : this.userSecurityAction === 'block-sign-in' ? 'Microsoft will block this account from signing in.' : 'Microsoft will allow this account to sign in again.'}</p><label class="check"><input id="user-security-confirm" type="checkbox" ${this.userSecurityConfirmed ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> I confirm this security action</label><div class="actions"><button class="secondary" id="user-security-cancel" ${this.busy ? 'disabled' : ''}>Cancel</button><button id="user-security-submit" ${this.busy ? 'disabled' : ''}>${this.userSecurityAction === 'reset-password' ? 'Reset password' : this.userSecurityAction === 'revoke-sessions' ? 'Sign out all sessions' : this.userSecurityAction === 'block-sign-in' ? 'Block sign-in' : 'Restore sign-in'}</button></div></div>` : '';
       const passwordDisplay = this.temporaryPassword ? `<div class="one-time-secret" role="status"><strong>Temporary password</strong><code id="temporary-password">${esc(this.temporaryPassword)}</code><p>It is shown only in this drawer. Copy it now; closing the drawer clears it.</p><button class="secondary compact" id="copy-temporary-password">Copy password</button><button class="secondary compact" id="hide-temporary-password">Hide password</button></div>` : '';
       const globalAdmin = this.globalAdminLoading ? '<p class="meta" data-testid="global-admin-status">Loading Global Administrator status…</p>' : this.globalAdminStatus === null ? `<p class="meta" data-testid="global-admin-status">Global Administrator status unavailable${this.globalAdminError ? `: ${esc(this.globalAdminError)}` : ''}</p>` : canManage ? `<div class="role-field"><label class="check"><input id="global-admin-enabled" type="checkbox" ${this.globalAdminDraft ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> Global Administrator</label>${this.globalAdminDraft !== this.globalAdminStatus ? `<label>Type GLOBAL_ADMIN to confirm<input id="global-admin-confirmation" value="${esc(this.globalAdminConfirmation)}" autocomplete="off" ${this.busy ? 'disabled' : ''}></label><button class="secondary compact" id="global-admin-save" ${this.busy ? 'disabled' : ''}>Save role</button>` : ''}</div>` : `<p class="meta" data-testid="global-admin-status">Global Administrator: ${this.globalAdminStatus ? 'Enabled' : 'Not assigned'}</p>`;
-      content = `<div class="drawer-body"><section class="drawer-section"><h3>Account</h3><div class="field-grid">${field('displayName', 'Name')}</div><div class="role-field">${globalAdmin}</div></section>${canManage ? `<section class="drawer-section"><h3>Security</h3><div class="actions"><button class="secondary" id="user-password-reset-start" ${this.busy ? 'disabled' : ''}>Reset password</button><button class="secondary" id="user-sessions-revoke-start" ${this.busy ? 'disabled' : ''}>Sign out of all sessions</button></div>${securityConfirmation}${passwordDisplay}</section>` : ''}<section class="drawer-section"><h3>Mailbox</h3>${this.renderForwarding(canManage)}${this.renderAutoReply(canManage)}<p class="meta">Mailbox delegation is not available yet.</p></section></div><footer class="drawer-footer">${canManage ? '' : '<p class="read-only">An organization administrator can edit this user.</p>'}${feedback}</footer>`;
+      content = `<div class="drawer-body"><section class="drawer-section"><h3>Account</h3><div class="field-grid">${field('displayName', 'Name')}</div><div class="role-field">${globalAdmin}</div><div class="role-field">${this.renderAddresses(canManage)}</div></section>${canManage ? `<section class="drawer-section"><h3>Security</h3><div class="actions"><button class="secondary" id="user-password-reset-start" ${this.busy ? 'disabled' : ''}>Reset password</button><button class="secondary" id="user-sessions-revoke-start" ${this.busy ? 'disabled' : ''}>Sign out of all sessions</button></div>${securityConfirmation}${passwordDisplay}</section>` : ''}<section class="drawer-section"><h3>Mailbox</h3>${this.renderDelegation(canManage)}${this.renderForwarding(canManage)}${this.renderAutoReply(canManage)}</section></div><footer class="drawer-footer">${canManage ? '' : '<p class="read-only">An organization administrator can edit this user.</p>'}${feedback}</footer>`;
       }
     } else {
       const query = this.membershipSearch.trim().toLowerCase();
@@ -1188,7 +1369,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       const action = this.resource === 'users' ? `<button class="secondary compact" data-testid="row-${esc(row.id)}" data-expand="${esc(row.id)}" aria-expanded="${expanded}">${canManage ? 'Account' : 'View account'} <span aria-hidden="true">${expanded ? '⌃' : '⌄'}</span></button>` : `<button class="secondary compact" data-testid="row-${esc(row.id)}" data-detail="${esc(row.id)}">${this.resource === 'groups' ? 'Manage members' : 'View details'}</button>`;
       const signInAction: UserSecurityAction = row.values.accountEnabled === false ? 'restore-sign-in' : 'block-sign-in';
       const excluded = this.directoryExclusions.get(row.id) === true;
-      const expandedRow = this.resource === 'users' && expanded ? `<tr class="row-actions"><td colspan="${columns.length + 1}"><div class="actionline"><span>Account</span><button class="secondary compact" data-detail="${esc(row.id)}">${canManage ? 'Edit account' : 'View account'}</button><button class="secondary compact" data-directory-exclude="${esc(row.id)}" data-excluded="${!excluded}" ${!canManage ? 'disabled' : ''}>${excluded ? 'Include user' : 'Exclude user'}</button><small>Add-to-group and delete workflows are unavailable.</small></div><div class="actionline"><span>Security</span><button class="secondary compact" data-row-security="reset-password" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>Reset password</button><button class="secondary compact" data-row-security="${signInAction}" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>${signInAction === 'block-sign-in' ? 'Block sign-in' : 'Restore sign-in'}</button><button class="secondary compact" data-row-security="revoke-sessions" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>Sign out of all sessions</button><button class="secondary compact" data-mfa="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>MFA</button></div><div class="actionline"><span>Mailbox</span><button class="secondary compact" data-row-forwarding="${esc(row.id)}">Manage forwarding</button><button class="secondary compact" data-row-autoreply="${esc(row.id)}">Out of office</button><small>Mailbox delegation is not available yet.</small></div></td></tr>` : '';
+      const expandedRow = this.resource === 'users' && expanded ? `<tr class="row-actions"><td colspan="${columns.length + 1}"><div class="actionline"><span>Account</span><button class="secondary compact" data-detail="${esc(row.id)}">${canManage ? 'Edit account' : 'View account'}</button><button class="secondary compact" data-directory-exclude="${esc(row.id)}" data-excluded="${!excluded}" ${!canManage ? 'disabled' : ''}>${excluded ? 'Include user' : 'Exclude user'}</button><small>Add-to-group and delete workflows are unavailable.</small></div><div class="actionline"><span>Security</span><button class="secondary compact" data-row-security="reset-password" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>Reset password</button><button class="secondary compact" data-row-security="${signInAction}" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>${signInAction === 'block-sign-in' ? 'Block sign-in' : 'Restore sign-in'}</button><button class="secondary compact" data-row-security="revoke-sessions" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>Sign out of all sessions</button><button class="secondary compact" data-mfa="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>MFA</button></div><div class="actionline"><span>Mailbox</span><button class="secondary compact" data-row-forwarding="${esc(row.id)}">Manage forwarding</button><button class="secondary compact" data-row-autoreply="${esc(row.id)}">Out of office</button><button class="secondary compact" data-row-delegation="${esc(row.id)}">Delegate mailbox</button></div></td></tr>` : '';
       return `<tr class="${this.detail?.id === row.id || expanded ? 'selected-row' : ''}">${cells}<td class="row-control">${action}</td></tr>${expandedRow}`;
     }).join('');
     const exclusionUnavailable = this.resource === 'users' && this.directoryScope === 'exclude' && !!this.directoryExclusionError;
@@ -1274,6 +1455,45 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (row) void this.setDirectoryExcluded(row, button.dataset.excluded === 'true');
     }));
     this.root.querySelector('#detail-close')?.addEventListener('click', () => this.closeDetail());
+    this.root.querySelectorAll<HTMLButtonElement>('[data-row-delegation]').forEach(button => button.addEventListener('click', () => {
+      const row = this.data?.items.find(item => item.id === button.dataset.rowDelegation);
+      if (row) { this.openDetail(row); this.openDelegation(); }
+    }));
+    this.root.querySelector('#delegation-open')?.addEventListener('click', () => this.openDelegation());
+    this.root.querySelector('#delegation-close')?.addEventListener('click', () => { this.resetDelegation(); this.render(); });
+    this.root.querySelector('#delegation-refresh')?.addEventListener('click', () => void this.loadDelegation());
+    this.root.querySelector<HTMLSelectElement>('#delegation-user')?.addEventListener('change', event => {
+      this.delegationSelectedId = (event.target as HTMLSelectElement).value;
+      this.delegation = null; this.delegationError = ''; this.delegationMessage = ''; this.delegationNeedsRefresh = false;
+      this.delegationConfirmed = false; this.render();
+      if (this.delegationSelectedId) void this.loadDelegation();
+    });
+    this.root.querySelector<HTMLInputElement>('#delegation-confirm')?.addEventListener('change', event => {
+      this.delegationConfirmed = (event.target as HTMLInputElement).checked;
+      this.root.querySelectorAll<HTMLButtonElement>('[data-delegation-right]').forEach(button => { button.disabled = !this.delegationConfirmed; });
+    });
+    this.root.querySelectorAll<HTMLButtonElement>('[data-delegation-right]').forEach(button => button.addEventListener('click', () => {
+      const right = button.dataset.delegationRight;
+      if (right === 'FullAccess' || right === 'SendAs' || right === 'SendOnBehalf') void this.setDelegation(right, button.dataset.delegationEnabled === 'true');
+    }));
+    this.root.querySelector('#addresses-open')?.addEventListener('click', () => this.openAddresses());
+    this.root.querySelector('#addresses-close')?.addEventListener('click', () => { this.resetAddresses(); this.render(); });
+    this.root.querySelector('#addresses-refresh')?.addEventListener('click', () => void this.loadAddresses());
+    this.root.querySelector<HTMLInputElement>('#addresses-primary')?.addEventListener('input', event => {
+      this.primaryDraft = (event.target as HTMLInputElement).value;
+      const save = this.root.querySelector<HTMLButtonElement>('#addresses-primary-save');
+      if (save && this.addresses) save.disabled = !this.primaryDraft.trim() || this.primaryDraft.toLowerCase() === this.addresses.primarySmtpAddress.toLowerCase();
+    });
+    this.root.querySelector<HTMLInputElement>('#addresses-alias')?.addEventListener('input', event => {
+      this.aliasDraft = (event.target as HTMLInputElement).value;
+      const add = this.root.querySelector<HTMLButtonElement>('#addresses-alias-add');
+      if (add) add.disabled = !this.aliasDraft.trim();
+    });
+    this.root.querySelector('#addresses-primary-save')?.addEventListener('click', () => void this.writeAddress('mailbox.primary.set'));
+    this.root.querySelector('#addresses-alias-add')?.addEventListener('click', () => void this.writeAddress('mailbox.alias.add'));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-alias-remove]').forEach(button => button.addEventListener('click', () => {
+      if (button.dataset.aliasRemove) void this.writeAddress('mailbox.alias.remove', button.dataset.aliasRemove);
+    }));
     this.root.querySelectorAll<HTMLButtonElement>('[data-row-forwarding]').forEach(button => button.addEventListener('click', () => {
       const row = this.data?.items.find(item => item.id === button.dataset.rowForwarding);
       if (row) { this.openDetail(row); this.openForwarding(); }

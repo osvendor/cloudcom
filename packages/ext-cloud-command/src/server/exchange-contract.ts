@@ -17,6 +17,11 @@ const autoReplySetParameters = z.object({ mailboxId: uuid, state: autoReplyState
     if (value.state !== 'Scheduled' && (value.start !== null || value.end !== null))
       issue.addIssue({ code: 'custom', message: 'Only scheduled replies may include dates.' });
   });
+const addressesGetParameters = z.object({ mailboxId: uuid }).strict();
+const addressWriteParameters = z.object({ mailboxId: uuid, address: z.string().email().max(320) }).strict();
+const delegationGetParameters = z.object({ mailboxId: uuid, delegateId: uuid }).strict();
+const delegationSetParameters = z.object({ mailboxId: uuid, delegateId: uuid,
+  right: z.enum(['FullAccess', 'SendAs', 'SendOnBehalf']), enabled: z.boolean() }).strict().refine(value => value.mailboxId !== value.delegateId);
 const bindingSchema = z.object({
   organizationId: uuid,
   tenantId: uuid,
@@ -38,7 +43,20 @@ const autoReplyGetRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
   operation: z.literal('mailbox.autoreply.get'), parameters: autoReplyGetParameters }).strict();
 const autoReplySetRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
   operation: z.literal('mailbox.autoreply.set'), parameters: autoReplySetParameters }).strict();
-const request = z.discriminatedUnion('operation', [inventoryRequest, forwardingGetRequest, forwardingSetRequest, autoReplyGetRequest, autoReplySetRequest]);
+const addressesGetRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
+  operation: z.literal('mailbox.addresses.get'), parameters: addressesGetParameters }).strict();
+const primarySetRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
+  operation: z.literal('mailbox.primary.set'), parameters: addressWriteParameters }).strict();
+const aliasAddRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
+  operation: z.literal('mailbox.alias.add'), parameters: addressWriteParameters }).strict();
+const aliasRemoveRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
+  operation: z.literal('mailbox.alias.remove'), parameters: addressWriteParameters }).strict();
+const delegationGetRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
+  operation: z.literal('mailbox.delegation.get'), parameters: delegationGetParameters }).strict();
+const delegationSetRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
+  operation: z.literal('mailbox.delegation.set'), parameters: delegationSetParameters }).strict();
+const request = z.discriminatedUnion('operation', [inventoryRequest, forwardingGetRequest, forwardingSetRequest, autoReplyGetRequest, autoReplySetRequest,
+  addressesGetRequest, primarySetRequest, aliasAddRequest, aliasRemoveRequest, delegationGetRequest, delegationSetRequest]);
 
 const mailbox = z.object({
   id: uuid,
@@ -69,6 +87,14 @@ const autoReplyStateSchema = z.object({ mailboxId: uuid, state: autoReplyState,
   externalAudience: z.enum(['None', 'Known', 'All']), start: z.string().datetime({ offset: true }).nullable(), end: z.string().datetime({ offset: true }).nullable() }).strict();
 const autoReplyGetResponse = z.object({ requestId: uuid, ok: z.literal(true), data: autoReplyStateSchema }).strict();
 const autoReplySetResponse = z.object({ requestId: uuid, ok: z.literal(true), data: autoReplyStateSchema.extend({ accepted: z.literal(true), verified: z.boolean() }) }).strict();
+const addressesState = z.object({ mailboxId: uuid, primarySmtpAddress: z.string().email().max(320),
+  aliases: z.array(z.string().email().max(320)).max(500), policyEnabled: z.boolean() }).strict();
+const addressesGetResponse = z.object({ requestId: uuid, ok: z.literal(true), data: addressesState }).strict();
+const addressWriteResponse = z.object({ requestId: uuid, ok: z.literal(true), data: addressesState.extend({ accepted: z.literal(true), verified: z.boolean() }) }).strict();
+const delegationState = z.object({ mailboxId: uuid, delegateId: uuid, delegateAddress: z.string().email().max(320),
+  fullAccess: z.boolean(), sendAs: z.boolean(), sendOnBehalf: z.boolean() }).strict();
+const delegationGetResponse = z.object({ requestId: uuid, ok: z.literal(true), data: delegationState }).strict();
+const delegationSetResponse = z.object({ requestId: uuid, ok: z.literal(true), data: delegationState.extend({ accepted: z.literal(true), verified: z.boolean() }) }).strict();
 
 export type ExchangeConnectionBinding = z.infer<typeof bindingSchema>;
 export type ExchangeMailboxInventory = z.infer<typeof mailbox>;
@@ -78,10 +104,34 @@ export type ExchangeWorkerFailure = z.infer<typeof failure>;
 export type ExchangeForwardingState = z.infer<typeof forwardingState>;
 export type ExchangeForwardingSet = z.infer<typeof forwardingSetParameters>;
 export type ExchangeAutoReplySet = z.infer<typeof autoReplySetParameters>;
+export type ExchangeAddressWrite = z.infer<typeof addressWriteParameters>;
+export type ExchangeAddressAction = 'mailbox.primary.set' | 'mailbox.alias.add' | 'mailbox.alias.remove';
+export type ExchangeDelegationSet = z.infer<typeof delegationSetParameters>;
 
 /** A host-only port for the Unix-socket sidecar. Do not implement this with HTTP or expose it to browsers. */
 export interface ExchangeWorkerPort {
   dispatch(request: ExchangeWorkerRequest): Promise<unknown>;
+}
+/** One right per write avoids partial multi-right outcomes from the retained Cloud Command batch operation. */
+export function createExchangeDelegationClient(port: ExchangeWorkerPort) {
+  return {
+    async get(binding: ExchangeConnectionBinding, mailboxId: string, delegateId: string) {
+      const outbound = delegationGetRequest.parse({ ...bindingSchema.parse(binding), requestId: randomUUID(),
+        operation: 'mailbox.delegation.get', parameters: delegationGetParameters.parse({ mailboxId, delegateId }) });
+      const data = await forwardingDispatch(port, outbound, delegationGetResponse);
+      if (data.mailboxId !== outbound.parameters.mailboxId || data.delegateId !== outbound.parameters.delegateId)
+        throw new ExchangeWorkerError('provider_unreachable');
+      return data;
+    },
+    async set(binding: ExchangeConnectionBinding, input: ExchangeDelegationSet) {
+      const outbound = delegationSetRequest.parse({ ...bindingSchema.parse(binding), requestId: randomUUID(),
+        operation: 'mailbox.delegation.set', parameters: delegationSetParameters.parse(input) });
+      const data = await forwardingDispatch(port, outbound, delegationSetResponse);
+      if (data.mailboxId !== outbound.parameters.mailboxId || data.delegateId !== outbound.parameters.delegateId)
+        throw new ExchangeWorkerError('unknown_write_outcome');
+      return data;
+    },
+  };
 }
 
 export class ExchangeWorkerError extends Error {
@@ -90,16 +140,38 @@ export class ExchangeWorkerError extends Error {
 async function forwardingDispatch<T>(port: ExchangeWorkerPort, outbound: ExchangeWorkerRequest, schema: z.ZodType<{ requestId: string; ok: true; data: T }>): Promise<T> {
   let received: unknown;
   try { received = await port.dispatch(outbound); }
-  catch { throw new ExchangeWorkerError(outbound.operation.endsWith('.set') ? 'unknown_write_outcome' : 'provider_unreachable'); }
+  catch { throw new ExchangeWorkerError(outbound.operation.endsWith('.set') || outbound.operation.endsWith('.add') || outbound.operation.endsWith('.remove') ? 'unknown_write_outcome' : 'provider_unreachable'); }
   const rejected = failure.safeParse(received);
   if (rejected.success) {
-    if (rejected.data.requestId !== outbound.requestId) throw new ExchangeWorkerError(outbound.operation.endsWith('.set') ? 'unknown_write_outcome' : 'provider_unreachable');
+    if (rejected.data.requestId !== outbound.requestId) throw new ExchangeWorkerError(outbound.operation.endsWith('.set') || outbound.operation.endsWith('.add') || outbound.operation.endsWith('.remove') ? 'unknown_write_outcome' : 'provider_unreachable');
     throw new ExchangeWorkerError(rejected.data.code);
   }
   const parsed = schema.safeParse(received);
   if (!parsed.success || parsed.data.requestId !== outbound.requestId)
-    throw new ExchangeWorkerError(outbound.operation.endsWith('.set') ? 'unknown_write_outcome' : 'provider_unreachable');
+    throw new ExchangeWorkerError(outbound.operation.endsWith('.set') || outbound.operation.endsWith('.add') || outbound.operation.endsWith('.remove') ? 'unknown_write_outcome' : 'provider_unreachable');
   return parsed.data.data;
+}
+/** Address changes are fixed Exchange operations against a bound Entra mailbox ID. */
+export function createExchangeAddressesClient(port: ExchangeWorkerPort) {
+  return {
+    async get(binding: ExchangeConnectionBinding, mailboxId: string) {
+      const outbound = addressesGetRequest.parse({ ...bindingSchema.parse(binding), requestId: randomUUID(),
+        operation: 'mailbox.addresses.get', parameters: addressesGetParameters.parse({ mailboxId }) });
+      const data = await forwardingDispatch(port, outbound, addressesGetResponse);
+      if (data.mailboxId !== outbound.parameters.mailboxId) throw new ExchangeWorkerError('provider_unreachable');
+      return data;
+    },
+    async write(binding: ExchangeConnectionBinding, action: ExchangeAddressAction, input: ExchangeAddressWrite) {
+      const parameters = addressWriteParameters.parse(input);
+      const header = { ...bindingSchema.parse(binding), requestId: randomUUID(), parameters };
+      const outbound = action === 'mailbox.primary.set' ? primarySetRequest.parse({ ...header, operation: action })
+        : action === 'mailbox.alias.add' ? aliasAddRequest.parse({ ...header, operation: action })
+        : aliasRemoveRequest.parse({ ...header, operation: action });
+      const data = await forwardingDispatch(port, outbound, addressWriteResponse);
+      if (data.mailboxId !== outbound.parameters.mailboxId) throw new ExchangeWorkerError('unknown_write_outcome');
+      return data;
+    },
+  };
 }
 /** One reply for internal and external recipients, as retained Cloud Command exposed. */
 export function createExchangeAutoReplyClient(port: ExchangeWorkerPort) {

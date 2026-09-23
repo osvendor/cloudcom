@@ -212,12 +212,30 @@
         "deploy/cloudcom-exchange-worker/Dockerfile",
         "deploy/cloudcom-exchange-worker/healthcheck.py",
         "deploy/cloudcom-exchange-worker/README.md",
-        "docs/cloudcom-microsoft-exchange-worker.md"
+        "deploy/cloudcom-exchange-worker/compose.overlay.candidate.yml",
+        "deploy/cloudcom-exchange-worker/verify-compose-candidate.py",
+        "docs/cloudcom-microsoft-exchange-worker.md",
+        "scripts/cloudcom/exchange-worker-release.mjs",
+        "scripts/cloudcom/exchange-worker-release.test.mjs",
+        "scripts/release/cloudcom-candidate-workflow.test.mjs",
+        ".github/workflows/cloudcom-candidate.yml"
       ],
       "hooks": [
         {
           "file": ".github/workflows/cloudcom-ci.yml",
           "contains": "python3 scripts/cloudcom/exchange-worker.test.py"
+        },
+        {
+          "file": ".github/workflows/cloudcom-candidate.yml",
+          "contains": "cloudcom-candidate/"
+        },
+        {
+          "file": "scripts/cloudcom/exchange-worker-release.mjs",
+          "contains": "cloudcom.exchange-worker"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "exchange-worker-release.test.mjs"
         },
         {
           "file": ".github/workflows/cloudcom-ci.yml",
@@ -277,8 +295,11 @@
         { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.members" },
         { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.mailboxSettings" },
         { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.storage" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.activity" },
         { "file": "apps/api/src/services/googleClient.ts", "contains": "admin.reports.usage.readonly" },
+        { "file": "apps/api/src/services/googleClient.ts", "contains": "admin.reports.audit.readonly" },
         { "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx", "contains": "admin.reports.usage.readonly" },
+        { "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx", "contains": "admin.reports.audit.readonly" },
         { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.setSuspended" },
         { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.auditSuspension" },
         { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.updateProfile" },

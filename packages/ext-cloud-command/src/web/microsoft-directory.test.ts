@@ -83,10 +83,9 @@ describe('Microsoft directory interaction', () => {
     expect(root.textContent).toContain('Groups');
     expect(root.textContent).toContain('Exclude');
     root.querySelector<HTMLButtonElement>('[data-expand="u1"]')!.click();
-    expect(root.textContent).toContain('Mailbox delegation is not available yet.');
+    expect(root.textContent).toContain('Delegate mailbox');
     expect(root.querySelector('#user-password-reset-start')).toBeNull();
     expect(root.querySelector('[data-row-security="reset-password"]')).toBeTruthy();
-    expect(root.textContent).not.toContain('Delegate mailbox');
     expect(root.textContent).toContain('Manage forwarding');
   });
 

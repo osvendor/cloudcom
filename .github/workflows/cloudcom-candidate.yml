@@ -76,6 +76,8 @@ jobs:
             dockerfile: apps/portal/Dockerfile
           - component: migration
             dockerfile: apps/api/Dockerfile
+          - component: exchange-worker
+            dockerfile: deploy/cloudcom-exchange-worker/Dockerfile
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -98,6 +100,7 @@ jobs:
             api) args+=(--build-arg "APP_VERSION=$BUILD_VERSION") ;;
             web) args+=(--build-arg "PUBLIC_APP_VERSION=$BUILD_VERSION" --build-arg 'PUBLIC_API_URL=') ;;
             portal) args+=(--build-arg 'PORTAL_BASE_PATH=/portal' --build-arg 'PUBLIC_API_URL=') ;;
+            exchange-worker) ;;
             *) echo "::error::Unknown component $COMPONENT"; exit 1 ;;
           esac
           docker build --pull --platform linux/amd64 --label "org.opencontainers.image.revision=$SOURCE_COMMIT" --file "$DOCKERFILE" --tag "$image" "${args[@]}" .

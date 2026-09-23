@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const { dbMocks, googleMocks } = vi.hoisted(() => ({
   dbMocks: { results: [] as unknown[][], select: vi.fn() },
   googleMocks: { users: vi.fn(), userGet: vi.fn(), userUpdate: vi.fn(), groups: vi.fn(), groupGet: vi.fn(), members: vi.fn(),
-    forwardGet: vi.fn(), vacationGet: vi.fn(), gmailSubject: vi.fn(), usageGet: vi.fn(), decrypt: vi.fn(), audit: vi.fn() },
+    forwardGet: vi.fn(), vacationGet: vi.fn(), gmailSubject: vi.fn(), usageGet: vi.fn(), activityList: vi.fn(), decrypt: vi.fn(), audit: vi.fn() },
 }));
 vi.mock('../db', () => ({
   db: { select: () => { dbMocks.select(); return { from: () => ({ where: () => ({ limit: async () => dbMocks.results.shift() ?? [] }) }) }; } },
@@ -19,6 +19,7 @@ vi.mock('../services/googleClient', () => ({
   getGmailClient: (_key: string, subject: string) => { googleMocks.gmailSubject(subject); return { users: { settings: {
     getAutoForwarding: googleMocks.forwardGet, getVacation: googleMocks.vacationGet } } }; },
   getUsageReportsClient: () => ({ userUsageReport: { get: googleMocks.usageGet } }),
+  getAuditReportsClient: () => ({ activities: { list: googleMocks.activityList } }),
 }));
 import { nativeGoogleServices } from './cloudCommandGoogle';
 
@@ -136,6 +137,31 @@ describe('native Google Workspace bridge', () => {
     expect(JSON.stringify(result)).not.toContain('private provider body');
   });
   const action = { userId: '123456', email: 'user@example.test', expectedSuspended: false, suspended: true, confirmation: 'user@example.test' };
+  it('returns a bounded activity projection and omits a different Google customer', async () => {
+    dbMocks.results.push([row], [row]);
+    googleMocks.userGet.mockResolvedValue({ data: { primaryEmail: 'admin@example.test', customerId: 'C123' } });
+    const at = new Date(Date.now() - 3600000).toISOString();
+    googleMocks.activityList.mockResolvedValue({ data: { items: [
+      { id: { customerId: 'C123', applicationName: 'login', time: at, uniqueQualifier: 'abc' }, actor: { email: 'one@example.test' }, events: [{ name: 'login_success', parameters: [{ name: 'secret', value: 'private' }] }] },
+      { id: { customerId: 'OTHER', applicationName: 'login', time: at, uniqueQualifier: 'other' }, events: [{ name: 'login_failure' }] },
+    ], nextPageToken: 'next' } });
+    const result = await nativeGoogleServices.activity(request(), 'login', 7, null, null);
+    expect(googleMocks.activityList).toHaveBeenCalledWith(expect.objectContaining({ customerId: 'C123', applicationName: 'login', maxResults: 100 }));
+    expect(result).toMatchObject({ asOf: expect.any(String) });
+    expect(result).toMatchObject({ ok: true, partial: true, nextPageToken: 'next', items: [{ id: 'abc', events: ['login_success'] }] });
+    expect(JSON.stringify(result)).not.toContain('private');
+    expect(JSON.stringify(result)).not.toContain('OTHER');
+  });
+  it('fences activity before provider access and labels missing audit scope', async () => {
+    expect(await nativeGoogleServices.activity(request(OTHER), 'login', 7, null, null)).toMatchObject({ code: 'access_denied' });
+    expect(googleMocks.activityList).not.toHaveBeenCalled();
+    dbMocks.results.push([row], [row]);
+    googleMocks.userGet.mockResolvedValue({ data: { primaryEmail: 'admin@example.test', customerId: 'C123' } });
+    googleMocks.activityList.mockRejectedValue({ response: { status: 403, data: { secret: 'private' } } });
+    const result = await nativeGoogleServices.activity(request(), 'login', 7, null, null);
+    expect(result).toMatchObject({ code: 'scope_required' });
+    expect(JSON.stringify(result)).not.toContain('private');
+  });
   const current = { id: '123456', primaryEmail: 'user@example.test', suspended: false, archived: false, isAdmin: false };
   it('rechecks account and credential state before a bounded suspension, then verifies the result', async () => {
     dbMocks.results.push([row], [row]);
