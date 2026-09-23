@@ -595,7 +595,7 @@ func TestPamApplyAdmissionRequiresVerifiedEnabledPolicy(t *testing.T) {
 	}
 }
 
-func TestPamCommandAdmissionStaysClosedUntilReconcileFinishes(t *testing.T) {
+func TestPamCleanupAdmissionRemainsOpenDuringReconcile(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	manager := &fakePamLifetimeManager{reconcileStarted: started, reconcileRelease: release, available: true}
@@ -610,12 +610,15 @@ func TestPamCommandAdmissionStaysClosedUntilReconcileFinishes(t *testing.T) {
 		t.Fatalf("protocol during reconciliation = %d, want 0", got)
 	}
 
-	blocked := handlePamCleanupV2(h, Command{Payload: map[string]any{
+	cleanup := handlePamCleanupV2(h, Command{Payload: map[string]any{
 		"protocolVersion": 2, "actuationId": "10000000-0000-4000-8000-000000000001", "generation": 2,
 		"requestId": "10000000-0000-4000-8000-000000000002", "deviceId": "10000000-0000-4000-8000-000000000003", "orgId": "10000000-0000-4000-8000-000000000004",
 	}})
-	if blocked.Status != "failed" || manager.cleanupCalls != 0 {
-		t.Fatalf("command admitted during reconcile: result=%+v calls=%d", blocked, manager.cleanupCalls)
+	if cleanup.Status != "completed" || manager.cleanupCalls != 1 {
+		t.Fatalf("cleanup refused during reconcile: result=%+v calls=%d", cleanup, manager.cleanupCalls)
+	}
+	if apply := handlePamApplyV2(h, pamApplyV2TestCommand("10000000-0000-4000-8000-000000000001")); apply.Status != "failed" || manager.applyCalls != 0 {
+		t.Fatalf("apply admitted during reconcile: result=%+v calls=%d", apply, manager.applyCalls)
 	}
 	close(release)
 	<-done
@@ -626,7 +629,7 @@ func TestPamCommandAdmissionStaysClosedUntilReconcileFinishes(t *testing.T) {
 		"protocolVersion": 2, "actuationId": "10000000-0000-4000-8000-000000000001", "generation": 2,
 		"requestId": "10000000-0000-4000-8000-000000000002", "deviceId": "10000000-0000-4000-8000-000000000003", "orgId": "10000000-0000-4000-8000-000000000004",
 	}})
-	if manager.cleanupCalls != 1 {
+	if manager.cleanupCalls != 2 {
 		t.Fatalf("command not admitted after reconcile: calls=%d", manager.cleanupCalls)
 	}
 }
