@@ -18,10 +18,12 @@ import { getTestDb } from './setup';
 describe.runIf(!!process.env.DATABASE_URL_APP && process.env.PORTAL_STATE_BACKEND === 'redis')('native login with real Redis and portal identity', () => {
   const priorNativeFlag = process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED;
   const priorRemoteFlag = process.env.CLOUDCOM_REMOTE_ACCESS_ENABLED;
+  const priorCompanyGatewayFlag = process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED;
   let priorExtension: typeof installedExtensions.$inferSelect | undefined;
   beforeAll(async () => {
     process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED = 'true';
     process.env.CLOUDCOM_REMOTE_ACCESS_ENABLED = 'true';
+    process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED = 'false';
     [priorExtension] = await getTestDb().select().from(installedExtensions).where(eq(installedExtensions.name, 'rustdeskaccess'));
     await getTestDb().insert(installedExtensions).values({ name: 'rustdeskaccess', enabled: true,
       lifecycleState: 'active', configuredVersion: 'test', activeVersion: 'test' })
@@ -32,6 +34,8 @@ describe.runIf(!!process.env.DATABASE_URL_APP && process.env.PORTAL_STATE_BACKEN
     else process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED = priorNativeFlag;
     if (priorRemoteFlag === undefined) delete process.env.CLOUDCOM_REMOTE_ACCESS_ENABLED;
     else process.env.CLOUDCOM_REMOTE_ACCESS_ENABLED = priorRemoteFlag;
+    if (priorCompanyGatewayFlag === undefined) delete process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED;
+    else process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED = priorCompanyGatewayFlag;
     if (priorExtension) await getTestDb().update(installedExtensions).set(priorExtension).where(eq(installedExtensions.name, 'rustdeskaccess'));
     else await getTestDb().delete(installedExtensions).where(eq(installedExtensions.name, 'rustdeskaccess'));
   });
@@ -104,7 +108,8 @@ describe.runIf(!!process.env.DATABASE_URL_APP && process.env.PORTAL_STATE_BACKEN
       await admin.update(portalUsers).set({ accessMode: 'remote_only', authEpoch: user!.authEpoch + 1 })
         .where(eq(portalUsers.id, user!.id));
       expect((await app.request('/api/v1/portal/remote/devices', { headers })).status).toBe(401);
-      const loggedOutCode = await issueNativeLoginCode(principal, browserToken, request);
+      const loggedOutCode = await issueNativeLoginCode(principal, browserToken, request,
+        { orgId: org!.id, expiresAt: Date.now() + 6 * 3600_000 });
       await redis!.del(`portal:session:${browserToken}`);
       expect(await exchangeNativeLoginCode({ ...exchange,
         code: new URL(loggedOutCode.redirectUri).searchParams.get('code')!,

@@ -17,10 +17,13 @@ export type NativeLoginRequest = {
   state: string;
 };
 type Principal = { portalUserId: string; orgId: string; authEpoch: number };
+export type NativeCompanyContext = { orgId: string | null; expiresAt?: number };
 type StoredCode = NativeLoginRequest & Principal & {
   version: 1;
   expiresAt: number;
   parentSessionToken: string;
+  companyOrgId: string | null;
+  companyExpiresAt: number | null;
 };
 
 function canonical32(value: unknown): value is string {
@@ -49,16 +52,21 @@ function hash(value: string): string {
 /** Caller must already be an authenticated remote-only browser session, with
  * CSRF, account/tenant checks and request throttling. No password is handed off. */
 export async function issueNativeLoginCode(
-  principal: Principal, parentSessionToken: string, request: NativeLoginRequest,
+  principal: Principal, parentSessionToken: string, request: NativeLoginRequest, company: NativeCompanyContext,
 ): Promise<{ redirectUri: string; expiresIn: number }> {
   if (!validateNativeLoginRequest(request) || !validPrincipal(principal)
     || !/^[A-Za-z0-9_-]{20,128}$/.test(parentSessionToken)
-    || parentSessionToken.startsWith(NATIVE_SESSION_PREFIX)) throw new Error('Invalid native login request');
+    || parentSessionToken.startsWith(NATIVE_SESSION_PREFIX)
+    || (process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED === 'true'
+      && (company.orgId !== principal.orgId || !Number.isSafeInteger(company.expiresAt)
+        || company.expiresAt! <= Date.now() || company.expiresAt! > Date.now() + 86400_000))
+    || (company.orgId !== null && company.orgId !== principal.orgId)) throw new Error('Invalid native login request');
   const redis = getRedis();
   if (!redis) throw new Error('Native login unavailable');
   const code = randomBytes(32).toString('base64url');
   const record: StoredCode = { ...request, ...principal, version: 1,
-    parentSessionToken, expiresAt: Date.now() + CODE_SECONDS * 1000 };
+    parentSessionToken, expiresAt: Date.now() + CODE_SECONDS * 1000,
+    companyOrgId: company.orgId, companyExpiresAt: company.expiresAt ?? null };
   // This private record references the browser session for a live logout check.
   // It must never appear in audit/error output or be returned to the caller.
   const stored = await redis.set(CODE_PREFIX + hash(code), JSON.stringify(record), 'EX', CODE_SECONDS, 'NX');
@@ -82,7 +90,7 @@ return 1`;
  * expiry; the browser cookie is never returned. All malformed failures are equal. */
 export async function exchangeNativeLoginCode(request: {
   code: string; clientId: string; redirectUri: string; codeVerifier: string;
-}, requiredOrgId?: string): Promise<{ accessToken: string; tokenType: 'Bearer'; expiresIn: number } | null> {
+}): Promise<{ accessToken: string; tokenType: 'Bearer'; expiresIn: number } | null> {
   if (!canonical32(request.code) || typeof request.codeVerifier !== 'string'
     || !/^[A-Za-z0-9._~-]{43,128}$/.test(request.codeVerifier)) return null;
   const redis = getRedis();
@@ -91,10 +99,13 @@ export async function exchangeNativeLoginCode(request: {
     const raw = await redis.eval(CONSUME_CODE, 1, CODE_PREFIX + hash(request.code));
     if (typeof raw !== 'string') return null;
     const record = JSON.parse(raw) as StoredCode;
-    if (requiredOrgId !== undefined && record?.orgId !== requiredOrgId) return null;
     if (!record || record.version !== 1 || !validateNativeLoginRequest(record) || !validPrincipal(record)
       || !Number.isSafeInteger(record.expiresAt) || Date.now() >= record.expiresAt
       || record.expiresAt > Date.now() + CODE_SECONDS * 1000
+      || (process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED === 'true'
+        && (record.companyOrgId !== record.orgId || !Number.isSafeInteger(record.companyExpiresAt)
+          || record.companyExpiresAt! <= Date.now() || record.companyExpiresAt! > Date.now() + 86400_000))
+      || (record.companyOrgId !== null && record.companyOrgId !== record.orgId)
       || typeof record.parentSessionToken !== 'string' || !/^[A-Za-z0-9_-]{20,128}$/.test(record.parentSessionToken)
       || record.parentSessionToken.startsWith(NATIVE_SESSION_PREFIX)
       || request.clientId !== record.clientId || request.redirectUri !== record.redirectUri) return null;
@@ -107,15 +118,19 @@ export async function exchangeNativeLoginCode(request: {
     if (!parent || parent.portalUserId !== record.portalUserId || parent.orgId !== record.orgId
       || parent.authEpoch !== record.authEpoch || parent.nativeClientId !== undefined) return null;
     const accessToken = NATIVE_SESSION_PREFIX + randomBytes(32).toString('base64url');
+    const expiresIn = Math.min(NATIVE_SESSION_SECONDS,
+      record.companyExpiresAt === null ? NATIVE_SESSION_SECONDS : Math.floor((record.companyExpiresAt - Date.now()) / 1000));
+    if (expiresIn <= 0) return null;
     const session = JSON.stringify({ portalUserId: record.portalUserId, orgId: record.orgId,
       authEpoch: record.authEpoch, nativeClientId: NATIVE_CLIENT_ID,
-      nativeExpiresAt: Date.now() + NATIVE_SESSION_SECONDS * 1000 });
+      companyOrgId: record.companyOrgId, companyExpiresAt: record.companyExpiresAt,
+      nativeExpiresAt: Math.min(Date.now() + expiresIn * 1000, record.companyExpiresAt ?? Number.MAX_SAFE_INTEGER) });
     // Recheck the exact parent session inside the same operation that creates
     // the native session. Logout or replacement between the reads wins.
     const created = await redis.eval(CREATE_SESSION, 3, parentKey, `portal:session:${accessToken}`,
       `portal:user-sessions:${record.portalUserId}`, parentRaw, session, accessToken,
-      String(NATIVE_SESSION_SECONDS), String(48 * 60 * 60));
-    return created === 1 ? { accessToken, tokenType: 'Bearer', expiresIn: NATIVE_SESSION_SECONDS } : null;
+      String(expiresIn), String(48 * 60 * 60));
+    return created === 1 ? { accessToken, tokenType: 'Bearer', expiresIn } : null;
   } catch {
     return null;
   }
@@ -132,6 +147,12 @@ export function nativeSessionAllows(
     || !Number.isSafeInteger(session.nativeExpiresAt)
     || (session.nativeExpiresAt as number) <= Date.now()
     || (session.nativeExpiresAt as number) > Date.now() + NATIVE_SESSION_SECONDS * 1000) return false;
+  if (process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED === 'true'
+    && (session.companyOrgId !== session.orgId || !Number.isSafeInteger(session.companyExpiresAt)
+      || (session.companyExpiresAt as number) <= Date.now()
+      || (session.nativeExpiresAt as number) > (session.companyExpiresAt as number))) return false;
   return (method === 'POST' && path === '/api/v1/portal/auth/logout')
-    || (method === 'GET' && path === '/api/v1/portal/remote/devices');
+    || (method === 'GET' && path === '/api/v1/portal/remote/devices')
+    || (method === 'POST' && (path === '/api/v1/portal/remote/native/sessions'
+      || /^\/api\/v1\/portal\/remote\/native\/sessions\/[0-9a-f-]{36}\/(presence|end)$/.test(path)));
 }

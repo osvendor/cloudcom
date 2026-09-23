@@ -28,11 +28,11 @@ const configuration = z.union([
   const entries = value.mode === 'custom-claims' ? value.organizations : value.companies;
   for (const entry of entries) {
     if (organizations.has(entry.orgId)
-      || ('subject' in entry && subjects.has(entry.subject))) {
+      || ('subject' in entry && typeof entry.subject === 'string' && subjects.has(entry.subject))) {
       ctx.addIssue({ code: 'custom', message: 'Company mappings must be unique' });
     }
     organizations.add(entry.orgId);
-    if ('subject' in entry) subjects.add(entry.subject);
+    if ('subject' in entry && typeof entry.subject === 'string') subjects.add(entry.subject);
   }
 });
 
@@ -46,14 +46,14 @@ const companyClaims = z.object({
 }).strict();
 
 export type CompanyGatewayDecision =
-  | { ok: true; orgId: string | null }
+  | { ok: true; orgId: string | null; expiresAt?: number }
   | { ok: false; status: 403 | 503 };
 
 /** Rollout configuration, never customer-controlled issuer/JWKS/organization.
  * Re-read per check so disabling a mapping is not hidden by a claim cache.
  * The extension administration adapter must preserve this binding boundary.
  */
-export async function verifyPortalCompanyGateway(assertion: string | undefined): Promise<CompanyGatewayDecision> {
+export async function verifyPortalCompanyGateway(assertion: string | undefined, includeExpiry = false): Promise<CompanyGatewayDecision> {
   const enabled = process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED;
   if (enabled === undefined || enabled === 'false') return { ok: true, orgId: null };
   if (enabled !== 'true') return { ok: false, status: 503 };
@@ -74,10 +74,10 @@ export async function verifyPortalCompanyGateway(assertion: string | undefined):
       const custom = companyClaims.safeParse(claims.custom);
       if (!custom.success) return { ok: false, status: 403 };
       const company = config.organizations.find(item => item.enabled && item.orgId === custom.data.cloudcom_org_id);
-      return company ? { ok: true, orgId: company.orgId } : { ok: false, status: 403 };
+      return company ? { ok: true, orgId: company.orgId, ...(includeExpiry ? { expiresAt: claims.exp * 1000 } : {}) } : { ok: false, status: 403 };
     }
     const company = config.companies.find(item => item.enabled && item.subject === claims.sub);
-    return company ? { ok: true, orgId: company.orgId } : { ok: false, status: 403 };
+    return company ? { ok: true, orgId: company.orgId, ...(includeExpiry ? { expiresAt: claims.exp * 1000 } : {}) } : { ok: false, status: 403 };
   } catch (error) {
     return { ok: false, status: error instanceof CfAccessJwksUnavailableError ? 503 : 403 };
   }

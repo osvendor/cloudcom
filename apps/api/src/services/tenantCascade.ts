@@ -642,6 +642,8 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'portal_remote_settings',
   'portal_remote_assignments',
   'portal_remote_sessions',
+  'portal_native_admissions',
+  'portal_native_targets',
   'provision_credential_handles',
   'psa_connections',
   'quote_acceptances',

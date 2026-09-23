@@ -1,13 +1,16 @@
+import { portalNativeAdmissionRoutes } from './nativeAdmission';
 import { Hono } from 'hono';
 import { and, eq, gt, isNull, or } from 'drizzle-orm';
 import { bodyLimit } from 'hono/body-limit';
 import { portalDesktopRoutes } from './remoteDesktop';
 import { portalNativeAuthorizeRoutes } from './nativeLogin';
 import { db } from '../../db';
-import { devices, portalRemoteAssignments, portalRemoteSettings } from '../../db/schema';
+import { devices, portalNativeTargets, portalRemoteAssignments, portalRemoteSettings } from '../../db/schema';
 import { isPortalRemoteFeatureEnabled } from '../../services/portalRemoteFeature';
 import { authorizePortalRemote } from '../../services/portalRemoteAuthority';
 import { checkPortalCompanyGateway } from '../../services/portalCompanyGateway';
+import { NATIVE_SESSION_PREFIX } from '../../services/portalNativeLogin';
+import { nativeAdmissionEnabled } from '../../services/portalNativeAdmissionSchemas';
 
 
 export const portalRemoteRoutes = new Hono();
@@ -19,8 +22,14 @@ portalRemoteRoutes.use('/remote/*', async (c, next) => {
   if (auth.user.accessMode !== 'remote_only' || !Number.isSafeInteger(auth.user.authEpoch)) {
     return c.json({ error: 'Remote access is not enabled for this account' }, 403);
   }
-  const company = await checkPortalCompanyGateway(c.req.header('Cf-Access-Jwt-Assertion'), auth.user.orgId);
-  if (!company.ok) return c.json({ error: 'Company authentication is required' }, company.status);
+  // Native bearer sessions already carry the company claim verified during
+  // the browser authorization ceremony, and portalAuthMiddleware rechecks its
+  // expiry and organization on every request. All browser and other bearer
+  // sessions still need a fresh Cloudflare assertion here.
+  if (!(auth.authMethod === 'bearer' && auth.token.startsWith(NATIVE_SESSION_PREFIX))) {
+    const company = await checkPortalCompanyGateway(c.req.header('Cf-Access-Jwt-Assertion'), auth.user.orgId);
+    if (!company.ok) return c.json({ error: 'Company authentication is required' }, company.status);
+  }
   await next();
 });
 
@@ -46,8 +55,21 @@ portalRemoteRoutes.get('/remote/devices', async c => {
     const access = await authorizePortalRemote(principal, device.id, 'webrtc');
     const available = access.ok && access.device.revocationLeaseProtocolVersion === 1
       && access.device.desktopFenceProtocolVersion === 1;
+    let rustdesk: { available: false; reason: string } | { available: true; peerId: string } = {
+      available: false, reason: 'Managed RustDesk client is not ready on this computer',
+    };
+    if (nativeAdmissionEnabled()) {
+      const nativeAccess = await authorizePortalRemote(principal, device.id, 'rustdesk');
+      if (nativeAccess.ok) {
+        const [target] = await db.select({ rustdeskId: portalNativeTargets.rustdeskId })
+          .from(portalNativeTargets)
+          .where(and(eq(portalNativeTargets.orgId, user.orgId), eq(portalNativeTargets.deviceId, device.id),
+            eq(portalNativeTargets.enabled, true))).limit(1);
+        if (target?.rustdeskId) rustdesk = { available: true, peerId: target.rustdeskId };
+      }
+    }
     listed.push({ ...device, transports: {
-      rustdesk: { available: false, reason: 'Managed RustDesk client is not ready on this computer' },
+      rustdesk,
       webrtc: available ? { available: true } : { available: false, reason: 'Browser remote access is unavailable on this computer' },
     } });
   }
@@ -57,3 +79,4 @@ portalRemoteRoutes.get('/remote/devices', async c => {
 portalRemoteRoutes.use('/remote/*', bodyLimit({ maxSize: 70000 }));
 portalRemoteRoutes.route('/', portalDesktopRoutes);
 portalRemoteRoutes.route('/', portalNativeAuthorizeRoutes);
+portalRemoteRoutes.route('/', portalNativeAdmissionRoutes);

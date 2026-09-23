@@ -13,6 +13,7 @@ const verifier = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
 const request = { clientId: NATIVE_CLIENT_ID, redirectUri: 'http://127.0.0.1:49871/cloudcom/callback',
   codeChallengeMethod: 'S256' as const, codeChallenge: 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM',
   state: Buffer.alloc(32, 7).toString('base64url') };
+const company = () => ({ orgId: principal.orgId, expiresAt: Date.now() + 6 * 3600_000 });
 
 function store() {
   const values = new Map<string, string>([[`portal:session:${parentToken}`, JSON.stringify(principal)]]);
@@ -26,8 +27,8 @@ function store() {
     }),
   };
 }
-async function issue() {
-  const issued = await issueNativeLoginCode(principal, parentToken, request);
+async function issue(identity = company()) {
+  const issued = await issueNativeLoginCode(principal, parentToken, request, identity);
   const callback = new URL(issued.redirectUri);
   expect(callback.searchParams.get('state')).toBe(request.state);
   return { code: callback.searchParams.get('code')!, clientId: request.clientId,
@@ -39,11 +40,10 @@ afterEach(() => vi.useRealTimers());
 describe('native browser PKCE handoff', () => {
   it('denies a different company before creating a native session', async () => {
     const redis = store(); getRedisMock.mockReturnValue(redis);
-    const exchange = await issue();
-    expect(await exchangeNativeLoginCode(exchange, '33333333-3333-4333-8333-333333333333')).toBeNull();
+    await expect(issue({ orgId: '33333333-3333-4333-8333-333333333333', expiresAt: Date.now() + 3600_000 }))
+      .rejects.toThrow('Invalid native login request');
     expect([...redis.values.keys()].some(key => key.startsWith('portal:session:ccn1.'))).toBe(false);
-    expect(await exchangeNativeLoginCode(exchange, principal.orgId)).toBeNull();
-    expect(await exchangeNativeLoginCode(await issue(), principal.orgId)).not.toBeNull();
+    expect(await exchangeNativeLoginCode(await issue())).not.toBeNull();
   });
   it('accepts only the registered loopback client/path and S256 values', () => {
     expect(validateNativeLoginRequest(request)).toBe(true);
@@ -61,12 +61,14 @@ describe('native browser PKCE handoff', () => {
     const redis = store(); getRedisMock.mockReturnValue(redis);
     const exchange = await issue();
     const result = await exchangeNativeLoginCode(exchange);
-    expect(result).toMatchObject({ tokenType: 'Bearer', expiresIn: NATIVE_SESSION_SECONDS });
+    expect(result).toMatchObject({ tokenType: 'Bearer', expiresIn: 6 * 3600 });
     expect(result?.accessToken).toMatch(/^ccn1\.[A-Za-z0-9_-]{43}$/);
     expect(JSON.stringify(result)).not.toContain(parentToken);
     const session = JSON.parse(redis.values.get(`portal:session:${result!.accessToken}`)!);
     expect(session).toEqual({ ...principal, nativeClientId: NATIVE_CLIENT_ID,
-      nativeExpiresAt: Date.now() + NATIVE_SESSION_SECONDS * 1000 });
+      companyOrgId: principal.orgId, companyExpiresAt: session.companyExpiresAt,
+      nativeExpiresAt: session.companyExpiresAt });
+    expect(result!.expiresIn).toBe(6 * 3600);
     expect(await exchangeNativeLoginCode(exchange)).toBeNull();
   });
   it('burns wrong-client, wrong-redirect and wrong-verifier codes', async () => {
@@ -112,5 +114,32 @@ describe('native browser PKCE handoff', () => {
     expect(nativeSessionAllows(token, session, 'GET', '/api/v1/portal/remote/devices', true)).toBe(false);
     expect(nativeSessionAllows(parentToken, principal, 'GET', '/api/v1/portal/profile', false)).toBe(true);
     expect(nativeSessionAllows('ccn1_' + 'A'.repeat(43), principal, 'GET', '/api/v1/portal/profile', false)).toBe(true);
+  });
+  it('requires the browser-verified company claim and caps the native session at its expiry', async () => {
+    const previous = process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED;
+    process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED = 'true';
+    try {
+      const redis = store(); getRedisMock.mockReturnValue(redis);
+      const exchange = await issue({ orgId: principal.orgId, expiresAt: Date.now() + 60_000 });
+      const result = await exchangeNativeLoginCode(exchange);
+      expect(result?.expiresIn).toBe(60);
+      const session = JSON.parse(redis.values.get(`portal:session:${result!.accessToken}`)!);
+      expect(session.companyOrgId).toBe(principal.orgId);
+      expect(session.nativeExpiresAt).toBe(session.companyExpiresAt);
+      expect(nativeSessionAllows(result!.accessToken, session, 'GET', '/api/v1/portal/remote/devices', true)).toBe(true);
+      expect(nativeSessionAllows(result!.accessToken, { ...session, companyOrgId: '33333333-3333-4333-8333-333333333333' },
+        'GET', '/api/v1/portal/remote/devices', true)).toBe(false);
+      expect(nativeSessionAllows(result!.accessToken, { ...session, companyExpiresAt: Date.now() - 1 },
+        'GET', '/api/v1/portal/remote/devices', true)).toBe(false);
+      const missingCompany = await issue();
+      const codeKey = 'portal:native:code:' + createHash('sha256').update(missingCompany.code).digest('hex');
+      const codeRecord = JSON.parse(redis.values.get(codeKey)!);
+      delete codeRecord.companyOrgId; delete codeRecord.companyExpiresAt;
+      redis.values.set(codeKey, JSON.stringify(codeRecord));
+      expect(await exchangeNativeLoginCode(missingCompany)).toBeNull();
+    } finally {
+      if (previous === undefined) delete process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED;
+      else process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED = previous;
+    }
   });
 });

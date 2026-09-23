@@ -1764,6 +1764,7 @@ func bootstrapThenListenWithRetry(ctx context.Context, bootstrap func() error, l
 }
 
 func (h *Heartbeat) Start() {
+	go h.reconcileNativeRustDeskTarget()
 	h.startPamReconciliationRetryLoop()
 
 	// Issue #2621 — before the first heartbeat, finish any credential rotation

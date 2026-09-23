@@ -28,6 +28,23 @@ const remoteAccessApiPaths = new Set([
 // Redis stack, real portal-login and authorization tests, plus the RLS coverage
 // contract; unknown portal or schema work must still fail closed.
 const portalRemoteApiPaths = new Set([
+  'apps/api/src/db/schema/portalNative.ts',
+  'apps/api/migrations/2026-09-22-native-admission.sql',
+  'apps/api/src/services/portalNativeAdmission.ts',
+  'apps/api/src/services/portalNativeAdmissionSchemas.ts',
+  'apps/api/src/services/portalNativeAdmissionSchemas.test.ts',
+  'apps/api/src/services/portalNativeOperator.ts',
+  'apps/api/src/services/portalNativeOperator.test.ts',
+  'apps/api/src/services/portalNativeTarget.ts',
+  'apps/api/src/routes/nativeTarget.ts',
+  'apps/api/src/routes/nativeTarget.test.ts',
+  'apps/api/src/routes/agents/nativeTarget.ts',
+  'apps/api/src/routes/agents/nativeTarget.test.ts',
+  'apps/api/src/routes/portal/nativeAdmission.ts',
+  'apps/api/src/routes/portal/nativeAdmission.test.ts',
+  'apps/api/src/routes/agents/index.ts',
+  'apps/api/src/__tests__/integration/portalNativeAdmission.integration.test.ts',
+
   'apps/api/src/routes/orgPortalUsers.ts', 'apps/api/src/routes/orgPortalUsers.test.ts',
   'apps/api/src/routes/portal/acceptInvite.test.ts',
   'apps/api/src/services/portalCompanyGateway.ts', 'apps/api/src/services/portalCompanyGateway.test.ts',

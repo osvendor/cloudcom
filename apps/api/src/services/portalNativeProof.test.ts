@@ -1,6 +1,6 @@
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
-import { encodeNativeAdmission, hashNativeTicket, verifyNativeAdmissionProof, type NativeAdmissionBinding } from './portalNativeProof';
+import { encodeNativeAdmissionV2, verifyNativeAdmissionProofV2, encodeNativeAdmission, hashNativeTicket, verifyNativeAdmissionProof, type NativeAdmissionBinding } from './portalNativeProof';
 
 const key = generateKeyPairSync('ed25519');
 const rawKey = key.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url');
@@ -64,5 +64,26 @@ describe('native admission proof', () => {
     for (const bad of ['', bytes(0) + '=', bytes(0).slice(1), '!'.repeat(43)]) {
       expect(() => hashNativeTicket(bad)).toThrow();
     }
+  });
+});
+
+
+describe('native admission v2 authenticated TCP binding', () => {
+  it('appends the exact exporter under a new domain and rejects v1 or channel substitution', () => {
+    const value = { ...binding(), channelBinding: bytes(9) };
+    const encoded = encodeNativeAdmissionV2(value);
+    const signature = sign(null, encoded, key.privateKey).toString('base64url');
+    expect(encoded.length).toBe(261);
+    expect(encoded.subarray(0,29).toString('ascii')).toBe('CloudCom/native/admission/v2\0');
+    expect(encoded.subarray(229)).toEqual(Buffer.alloc(32,9));
+    expect(verifyNativeAdmissionProofV2(value,signature)).toBe(true);
+    expect(verifyNativeAdmissionProofV2({ ...value,channelBinding:bytes(10) },signature)).toBe(false);
+    expect(verifyNativeAdmissionProofV2(value,sign(null,encodeNativeAdmission(value),key.privateKey).toString('base64url'))).toBe(false);
+    const fixed = encodeNativeAdmissionV2({ ...binding(),operatorPublicKey:bytes(7),channelBinding:bytes(9) });
+    expect(fixed.toString('hex')).toBe(Buffer.concat([
+      Buffer.from('CloudCom/native/admission/v2\0','ascii'),
+      Buffer.from('111111111111411181111111111111112222222222224222822222222222222233333333333343338333333333333333444444444444444484444444444444440000000000000001','hex'),
+      ...[5,6,7,8,9].map(value => Buffer.alloc(32,value)),
+    ]).toString('hex'));
   });
 });

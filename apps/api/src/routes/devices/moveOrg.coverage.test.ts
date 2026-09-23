@@ -35,6 +35,8 @@ import { TICKET_ORG_DENORMALIZED_TABLES } from '../../services/ticketOrgMoveLock
 const INTENTIONALLY_NO_ORG_ID: ReadonlySet<string> = new Set([
   // Customer grants/history remain source-owned; their composite tenant FKs
   // and immutable grant identity prevent organization moves while they exist.
+  'portal_native_admissions',
+  'portal_native_targets',
   'portal_remote_sessions',
   'portal_remote_assignments',
   // Has org_id, but it is intentionally NOT re-stamped on move: agent-run
