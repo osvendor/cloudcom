@@ -77,11 +77,13 @@ const portalRemoteWebPaths = new Set([
 const rustdeskExtensionPaths = /^(?:packages\/ext-rustdesk-access\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/README\.md|src\/(?:authorization(?:\.test)?\.mjs|server\/index(?:\.test)?\.ts|web\/index(?:\.test)?\.ts))|packages\/ext-rustdesk-access\/README\.md)$/u;
 const cloudCommandApiPaths = new Set([
   'apps/api/src/routes/google.ts',
+  'apps/api/src/routes/google.test.ts',
   'apps/api/src/routes/cloudCommandGoogleOAuth.ts',
   'apps/api/src/routes/cloudCommandGoogleOAuth.test.ts',
   'apps/api/src/extensions/cloudCommandGoogleOAuthReads.ts',
   'apps/api/src/extensions/cloudCommandGoogleOAuthReads.test.ts',
   'apps/api/src/__tests__/integration/cloudCommandGoogleOAuth.integration.test.ts',
+  'apps/api/src/services/secretCrypto.test.ts',
   'apps/api/src/routes/extensionsWeb.test.ts',
   'apps/api/src/routes/extensionsWeb.ts',
   'apps/api/src/extensions/builtinExtensions.test.ts',

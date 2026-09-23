@@ -84,11 +84,13 @@ test('routes the bounded Google Workspace host bridge through Cloud Command vali
 test('routes only the reviewed Google OAuth connection and adapter files', () => {
   const paths = [
     'apps/api/src/routes/google.ts',
+    'apps/api/src/routes/google.test.ts',
     'apps/api/src/routes/cloudCommandGoogleOAuth.ts',
     'apps/api/src/routes/cloudCommandGoogleOAuth.test.ts',
     'apps/api/src/extensions/cloudCommandGoogleOAuthReads.ts',
     'apps/api/src/extensions/cloudCommandGoogleOAuthReads.test.ts',
     'apps/api/src/__tests__/integration/cloudCommandGoogleOAuth.integration.test.ts',
+    'apps/api/src/services/secretCrypto.test.ts',
     'packages/ext-cloud-command/migrations/2026-09-23-google-oauth-connections.sql',
     'packages/ext-cloud-command/src/server/google-oauth.migration.test.ts',
   ];

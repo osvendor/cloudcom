@@ -330,15 +330,20 @@
         "packages/ext-cloud-command/src/server/google-oauth.migration.test.ts",
         "apps/api/src/routes/cloudCommandGoogleOAuth.ts",
         "apps/api/src/routes/cloudCommandGoogleOAuth.test.ts",
+        "apps/api/src/routes/google.test.ts",
         "apps/api/src/extensions/cloudCommandGoogleOAuthReads.ts",
         "apps/api/src/extensions/cloudCommandGoogleOAuthReads.test.ts",
-        "apps/api/src/__tests__/integration/cloudCommandGoogleOAuth.integration.test.ts"
+        "apps/api/src/__tests__/integration/cloudCommandGoogleOAuth.integration.test.ts",
+        "apps/api/src/services/secretCrypto.test.ts",
+        "docs/cloudcom-upstream-maintenance.md"
       ],
       "hooks": [
         { "file": "apps/api/src/routes/google.ts", "contains": "googleRoutes.route('/', cloudCommandGoogleOAuthRoutes)" },
         { "file": "apps/api/src/extensions/cloudCommandGoogle.ts", "contains": "loadGoogleOAuth(auth, input.orgId)" },
         { "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx", "contains": "Authorize Google Workspace" },
-        { "file": "packages/ext-cloud-command/manifest.json", "contains": "cloudcommand_google_oauth_connections" }
+        { "file": "packages/ext-cloud-command/manifest.json", "contains": "cloudcommand_google_oauth_connections" },
+        { "file": ".github/workflows/cloudcom-ci.yml", "contains": "src/routes/cloudCommandGoogleOAuth.test.ts" },
+        { "file": "scripts/cloudcom/test-threecx-rls.sh", "contains": "cloudCommandGoogleOAuth.integration.test.ts" }
       ]
     },
     {
