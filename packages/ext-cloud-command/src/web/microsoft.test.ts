@@ -8,6 +8,11 @@ function openUser(page: CloudCommandMicrosoftPage, id: string) {
   if (expand.getAttribute('aria-expanded') !== 'true') expand.click();
   page.shadowRoot!.querySelector<HTMLButtonElement>(`[data-detail="${id}"]`)!.click();
 }
+function editUserField(page: CloudCommandMicrosoftPage, field: string, value: string) {
+  const input = page.shadowRoot!.querySelector<HTMLInputElement>(`#user-${field}`)!;
+  input.value = value;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
 function mount(request: (path: string, init?: RequestInit) => Promise<Response>, org = 'org-a') {
   const page = new CloudCommandMicrosoftPage();
   page.context = {
@@ -195,9 +200,9 @@ describe('CloudCommandMicrosoftPage', () => {
     });
     const page = mount(request); await flush(); await flush();
     openUser(page, 'user-1'); await flush();
-    const name = page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!; name.value = 'Ada Byron';
+    editUserField(page, 'displayName', 'Ada Byron');
     vi.useFakeTimers();
-    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await vi.runAllTimersAsync();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-user-save="displayName"]')!.click(); await vi.runAllTimersAsync();
     const update = request.mock.calls.map(([, init]) => init?.body).find(body => String(body).includes('user.update'));
     expect(JSON.parse(String(update))).toEqual({ type: 'user.update', id: 'user-1', update: { displayName: 'Ada Byron' } });
     expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
@@ -222,10 +227,40 @@ describe('CloudCommandMicrosoftPage', () => {
     });
     const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush();
     page.shadowRoot!.querySelector<HTMLInputElement>('#user-account-enabled')!.checked = true;
-    page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush(); await flush(); await flush();
+    page.shadowRoot!.querySelector<HTMLInputElement>('#user-account-enabled')!.dispatchEvent(new Event('change', { bubbles: true }));
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-user-save="accountEnabled"]')!.click(); await flush(); await flush(); await flush();
     const update = request.mock.calls.map(([, init]) => init?.body).find(body => String(body).includes('user.update'));
     expect(JSON.parse(String(update))).toEqual({ type: 'user.update', id: 'user-1', update: { accountEnabled: true } });
     expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('saved and verified');
+  });
+
+  it('saves independently edited profile fields in separate requests', async () => {
+    const user = { id: 'user-1', displayName: 'Ada', givenName: '', surname: '', department: 'Research', jobTitle: '', officeLocation: '', accountEnabled: true };
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === '/microsoft/connection') return Response.json({ available: true, connected: true, enabled: true, canManage: true });
+      if (path === '/threecx/connection') return Response.json({ connected: false });
+      if (path === '/microsoft/resources/users') return Response.json({ items: [{ id: 'user-1', values: { displayName: user.displayName } }], columns: [{ key: 'displayName', label: 'Name' }], complete: true, checkedAt: 'now' });
+      if (path === '/microsoft/administration') {
+        const body = JSON.parse(String(init?.body));
+        if (body.type === 'user.get') return Response.json({ ...user });
+        if (body.type === 'user.update') { Object.assign(user, body.update); return Response.json({ accepted: true }); }
+      }
+      throw new Error(`Unexpected ${path}`);
+    });
+    const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush();
+    editUserField(page, 'displayName', 'Ada Byron');
+    editUserField(page, 'department', 'Analytical Engine');
+    const root = page.shadowRoot!;
+    root.querySelector<HTMLButtonElement>('[data-user-save="displayName"]')!.click(); await flush(); await flush();
+    const updates = request.mock.calls.map(([, init]) => init?.body).filter(body => String(body).includes('user.update'))
+      .map(body => JSON.parse(String(body)).update);
+    expect(updates).toEqual([{ displayName: 'Ada Byron' }]);
+    expect(root.querySelector<HTMLInputElement>('#user-department')!.value).toBe('Analytical Engine');
+    expect(root.querySelector<HTMLButtonElement>('[data-user-save="department"]')!.disabled).toBe(false);
+    root.querySelector<HTMLButtonElement>('[data-user-save="department"]')!.click(); await flush(); await flush();
+    const finalUpdates = request.mock.calls.map(([, init]) => init?.body).filter(body => String(body).includes('user.update'))
+      .map(body => JSON.parse(String(body)).update);
+    expect(finalUpdates).toEqual([{ displayName: 'Ada Byron' }, { department: 'Analytical Engine' }]);
   });
 
   it('reports an uncertain result after bounded readback retries without repeating the mutation', async () => {
@@ -244,7 +279,7 @@ describe('CloudCommandMicrosoftPage', () => {
     });
     const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush();
     vi.useFakeTimers();
-    page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!.value = 'Changed'; page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await vi.runAllTimersAsync();
+    editUserField(page, 'displayName', 'Changed'); page.shadowRoot!.querySelector<HTMLButtonElement>('[data-user-save="displayName"]')!.click(); await vi.runAllTimersAsync();
     expect(page.shadowRoot!.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('did not confirm');
     expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
     expect(verifyReads).toBe(15);
@@ -266,7 +301,7 @@ describe('CloudCommandMicrosoftPage', () => {
       throw new Error(`Unexpected ${path}`);
     });
     const page = mount(request); await flush(); await flush(); openUser(page, 'user-1'); await flush();
-    page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!.value = 'Changed'; page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush();
+    editUserField(page, 'displayName', 'Changed'); page.shadowRoot!.querySelector<HTMLButtonElement>('[data-user-save="displayName"]')!.click(); await flush();
     page.context = { contractVersion: 1, extensionName: 'cloudcommand', path: '/extensions/cloudcommand/microsoft', organizationId: 'org-b' };
     verify(Response.json({ displayName: 'Changed', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '', accountEnabled: true })); await flush();
     expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
@@ -291,10 +326,10 @@ describe('CloudCommandMicrosoftPage', () => {
     });
     const page = mount(request); await flush(); await flush();
     openUser(page, 'user-1'); await flush();
-    page.shadowRoot!.querySelector<HTMLInputElement>('#user-displayName')!.value = 'Changed'; page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush();
+    editUserField(page, 'displayName', 'Changed'); page.shadowRoot!.querySelector<HTMLButtonElement>('[data-user-save="displayName"]')!.click(); await flush();
     page.shadowRoot!.querySelector<HTMLButtonElement>('#detail-close')!.click();
     openUser(page, 'user-1'); await flush();
-    expect(page.shadowRoot!.querySelector<HTMLButtonElement>('#user-save')!.disabled).toBe(false);
+    expect(page.shadowRoot!.querySelector<HTMLButtonElement>('[data-user-save="displayName"]')!.disabled).toBe(true);
     verify(Response.json({ displayName: 'Changed', givenName: '', surname: '', department: '', jobTitle: '', officeLocation: '', accountEnabled: true })); await flush();
     expect(request.mock.calls.filter(([, init]) => String(init?.body).includes('user.update'))).toHaveLength(1);
     expect(page.shadowRoot!.textContent).not.toContain('saved and verified');
@@ -365,9 +400,9 @@ describe('CloudCommandMicrosoftPage', () => {
     root.querySelector<HTMLInputElement>('#user-security-confirm')!.click();
     root.querySelector<HTMLButtonElement>('#user-security-submit')!.click(); await flush();
     expect(root.querySelector('[data-testid="detail-mutation-feedback"]')!.textContent).toContain('Password reset.');
-    expect(root.querySelector<HTMLButtonElement>('#user-save')!.textContent).toContain('Save profile changes');
-
-    root.querySelector<HTMLButtonElement>('#user-save')!.click(); await flush();
+    expect(root.querySelectorAll('[data-user-save]').length).toBeGreaterThan(1);
+    expect(root.querySelector<HTMLButtonElement>('[data-user-save="displayName"]')!.disabled).toBe(true);
+    root.querySelector<HTMLButtonElement>('[data-user-save="displayName"]')!.click(); await flush();
 
     const operations = request.mock.calls.filter(([, init]) => init?.method === 'POST').map(([, init]) => JSON.parse(String(init?.body)).type);
     expect(operations.filter(type => type === 'user.password.reset')).toHaveLength(1);
