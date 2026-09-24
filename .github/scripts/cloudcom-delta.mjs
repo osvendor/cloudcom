@@ -43,6 +43,7 @@ const portalRemoteApiPaths = new Set([
   'apps/api/src/routes/portal/nativeAdmission.ts',
   'apps/api/src/routes/portal/nativeAdmission.test.ts',
   'apps/api/src/routes/agents/index.ts',
+  'apps/api/src/index.ts', // Native target route mount; portal remote job validates the API entrypoint.
   'apps/api/src/__tests__/integration/portalNativeAdmission.integration.test.ts',
 
   'apps/api/src/routes/orgPortalUsers.ts', 'apps/api/src/routes/orgPortalUsers.test.ts',
