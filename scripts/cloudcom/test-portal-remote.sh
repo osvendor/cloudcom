@@ -35,10 +35,13 @@ pnpm --filter @breeze/api exec vitest run \
   src/services/portalNativeLogin.test.ts src/routes/portal/nativeLogin.test.ts \
   src/routes/portal/accessMode.test.ts src/routes/portal/auth.test.ts src/routes/portal/authOrgStatusGate.test.ts \
   src/routes/portal/remote.test.ts src/routes/portal/remoteDesktop.test.ts src/routes/portal/remoteRateLimit.test.ts \
+  src/services/portalNativeAdmissionSchemas.test.ts src/services/portalNativeOperator.test.ts \
+  src/routes/nativeTarget.test.ts src/routes/agents/nativeTarget.test.ts src/routes/portal/nativeAdmission.test.ts \
   src/services/portalNativeProof.test.ts src/services/portalRemoteAgent.test.ts src/services/portalRemoteLease.test.ts \
   src/services/portalRemoteSessionAuth.test.ts src/services/portalRemoteSessionStore.test.ts src/routes/agentWs.test.ts \
   src/routes/devices/cascadeDelete.test.ts src/routes/devices/moveOrg.coverage.test.ts src/routes/devices/moveOrg.test.ts
 pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts \
+  src/__tests__/integration/portalNativeAdmission.integration.test.ts \
   src/__tests__/integration/portalRemoteAccess.integration.test.ts src/__tests__/integration/portalRemoteLogin.integration.test.ts \
   src/__tests__/integration/orgMergeRegistry.integration.test.ts src/__tests__/integration/tenantCascade.integration.test.ts \
   src/__tests__/integration/tenant-export-policy.integration.test.ts src/__tests__/integration/tenantExportErasureRoundtrip.integration.test.ts

@@ -1188,7 +1188,7 @@ moveOrgRoutes.post(
       });
     } catch (err) {
       const pgNode = pgErrorNode(err);
-      if (pgNode && ['portal_remote_assignment_identity_guard', 'portal_remote_assignment_device_org_fk']
+      if (pgNode && ['portal_remote_assignment_identity_guard', 'portal_remote_assignment_device_org_fk', 'portal_native_target_device_fk', 'portal_native_target_identity_guard']
         .includes(String(pgNode.constraint_name))) {
         writeRouteAudit(c, {
           orgId: sourceOrgId, action: 'device.move_org.failed', resourceType: 'device',

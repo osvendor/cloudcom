@@ -42,6 +42,14 @@ portalNativeAuthorizeRoutes.post('/remote/native/authorize', zValidator('json', 
   if (auth.authMethod !== 'cookie' || auth.user.accessMode !== 'remote_only') {
     return c.json({ error: 'Sign in using your browser to continue' }, 403);
   }
+  const company = await verifyPortalCompanyGateway(c.req.header('Cf-Access-Jwt-Assertion'), true);
+  const companyGatewayEnabled = process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED === 'true';
+  if (!company.ok || (company.orgId !== null && company.orgId !== auth.user.orgId)
+    || (companyGatewayEnabled && (company.orgId !== auth.user.orgId || !company.configFingerprint
+      || !Number.isSafeInteger(company.expiresAt)
+      || company.expiresAt! <= Date.now() || company.expiresAt! > Date.now() + 86400_000))) {
+    return c.json({ error: 'Company authentication is required' }, company.ok ? 403 : company.status);
+  }
   const csrf = validatePortalCookieCsrfRequest(c);
   if (csrf) return c.json({ error: csrf }, 403);
   const request = c.req.valid('json');
@@ -53,7 +61,8 @@ portalNativeAuthorizeRoutes.post('/remote/native/authorize', zValidator('json', 
   if (!limit.allowed) { c.header('Retry-After', '3600'); return c.json({ error: 'Too many sign-in attempts' }, 429); }
   try {
     const result = await issueNativeLoginCode({ portalUserId: auth.user.id, orgId: auth.user.orgId,
-      authEpoch: auth.user.authEpoch! }, auth.token, request);
+      authEpoch: auth.user.authEpoch! }, auth.token, request,
+    { orgId: company.orgId, expiresAt: company.expiresAt, configFingerprint: company.configFingerprint });
     await writeAuditEventAsync(c, { orgId: auth.user.orgId, actorType: 'user', actorId: auth.user.id,
       action: 'portal.native.authorize', resourceType: 'portal_auth', resourceId: auth.user.id,
       result: 'success', details: { principalType: 'portal_user', clientId: NATIVE_CLIENT_ID } });
@@ -69,8 +78,6 @@ portalNativeExchangeRoutes.post('/auth/native/exchange', zValidator('json', z.ob
 }).strict()), async c => {
   const limit = await rateLimiter(getRedis(), `portal_native_exchange:${rateLimitIpKey(getClientIp(c))}`, 30, 60);
   if (!limit.allowed) { c.header('Retry-After', '60'); return c.json({ error: 'Too many sign-in attempts' }, 429); }
-  const company = await verifyPortalCompanyGateway(c.req.header('Cf-Access-Jwt-Assertion'));
-  if (!company.ok) return c.json({ error: 'Company authentication is required' }, company.status);
-  const result = await exchangeNativeLoginCode(c.req.valid('json'), company.orgId ?? undefined);
+  const result = await exchangeNativeLoginCode(c.req.valid('json'));
   return result ? c.json(result) : c.json({ error: 'Invalid or expired sign-in code' }, 401);
 });

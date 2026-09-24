@@ -90,23 +90,23 @@ describe.runIf(!!process.env.DATABASE_URL_APP)('portal remote list through real 
     };
 
     const assignedHeaders = await login(assignedUser!.email);
-    const assignedList = await app.request('/api/v1/portal/remote/devices', { headers: assignedHeaders });
+    const assignedList = await app.request('/api/v1/portal/remote/browser/devices', { headers: assignedHeaders });
     expect(assignedList.status).toBe(200);
     expect((await assignedList.json()).devices.map((row: { id: string }) => row.id)).toEqual([assignedDevice!.id]);
     expect((await app.request('/api/v1/portal/devices', { headers: assignedHeaders })).status).toBe(403);
 
     const sameOrgHeaders = await login(sameOrgUser!.email);
-    const sameOrgList = await app.request('/api/v1/portal/remote/devices', { headers: sameOrgHeaders });
+    const sameOrgList = await app.request('/api/v1/portal/remote/browser/devices', { headers: sameOrgHeaders });
     expect(sameOrgList.status).toBe(200);
     expect((await sameOrgList.json()).devices).toEqual([]);
 
     await admin.update(portalRemoteAssignments).set({ enabled: false }).where(eq(portalRemoteAssignments.id, assignment!.id));
-    const removed = await app.request('/api/v1/portal/remote/devices', { headers: assignedHeaders });
+    const removed = await app.request('/api/v1/portal/remote/browser/devices', { headers: assignedHeaders });
     expect(removed.status).toBe(200);
     expect((await removed.json()).devices).toEqual([]);
 
     await admin.update(portalUsers).set({ authEpoch: sql`${portalUsers.authEpoch} + 1` }).where(eq(portalUsers.id, assignedUser!.id));
-    expect((await app.request('/api/v1/portal/remote/devices', { headers: assignedHeaders })).status).toBe(401);
+    expect((await app.request('/api/v1/portal/remote/browser/devices', { headers: assignedHeaders })).status).toBe(401);
     expect(unassignedDevice).toBeDefined();
   });
 });

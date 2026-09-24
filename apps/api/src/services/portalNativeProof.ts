@@ -67,3 +67,18 @@ export function verifyNativeAdmissionProof(binding: NativeAdmissionBinding, sign
 export function hashNativeTicket(ticket: string): string {
   return createHash('sha256').update(fixedBytes(ticket, 32)).digest('base64url');
 }
+
+
+export type NativeAdmissionBindingV2 = NativeAdmissionBinding & { channelBinding: string };
+/** TCP-only managed admission binds possession to the authenticated stream key. */
+export function encodeNativeAdmissionV2(binding: NativeAdmissionBindingV2): Buffer {
+  const legacy = encodeNativeAdmission(binding);
+  return Buffer.concat([Buffer.from('CloudCom/native/admission/v2\0', 'ascii'),
+    legacy.subarray(DOMAIN.length), fixedBytes(binding.channelBinding, 32)]);
+}
+export function verifyNativeAdmissionProofV2(binding: NativeAdmissionBindingV2, signature: string): boolean {
+  try {
+    const key = createPublicKey({ key: Buffer.concat([ED25519_SPKI, fixedBytes(binding.operatorPublicKey, 32)]), format: 'der', type: 'spki' });
+    return verify(null, encodeNativeAdmissionV2(binding), key, fixedBytes(signature, 64));
+  } catch { return false; }
+}

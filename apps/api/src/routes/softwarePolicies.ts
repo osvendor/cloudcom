@@ -191,7 +191,7 @@ export async function cleanupSoftwarePolicyElevations(
   tx: SoftwarePolicyTx,
   policyId: string,
 ): Promise<number> {
-  const result = await tx.execute<{ id: string }>(sql`
+  const result = await tx.execute<{ id: string; metadata: Record<string, unknown> | null }>(sql`
     WITH matching AS (
       SELECT id
       FROM elevation_requests
@@ -207,10 +207,12 @@ export async function cleanupSoftwarePolicyElevations(
     FROM matching
     WHERE request.id = matching.id
       AND request.status IN ('approved', 'auto_approved', 'actuating')
-    RETURNING request.id
+    RETURNING request.id, request.metadata
   `);
-  const rows = (result as { rows?: Array<{ id: string }> }).rows ?? [];
+  const rows = (result as { rows?: Array<{ id: string; metadata?: Record<string, unknown> | null }> }).rows ?? [];
   for (const row of rows) {
+    if (row.metadata?.local_decision_required === true
+        && row.metadata.local_decision !== 'approved') continue;
     await requestPamCleanup(tx, {
       elevationRequestId: row.id,
       cause: 'policy_removed',

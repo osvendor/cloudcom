@@ -130,8 +130,10 @@ async function cleanupPamRuleActuations(
   tx: PamRouteTx,
   input: { ruleId: string; orgId: string },
 ): Promise<number> {
-  const result = await tx.execute<Record<string, unknown> & { id: string }>(sql`
-    SELECT id
+  const result = await tx.execute<Record<string, unknown> & {
+    id: string; metadata: Record<string, unknown> | null
+  }>(sql`
+    SELECT id, metadata
     FROM elevation_requests
     WHERE org_id = ${input.orgId}
       AND status IN ('approved', 'auto_approved', 'actuating')
@@ -139,13 +141,16 @@ async function cleanupPamRuleActuations(
     ORDER BY id
     FOR UPDATE
   `);
-  const rows = ((result as { rows?: Array<{ id: string }> }).rows ?? result) as Array<{ id: string }>;
+  const rows = ((result as { rows?: Array<{ id: string; metadata?: Record<string, unknown> | null }> }).rows ?? result) as Array<{ id: string; metadata?: Record<string, unknown> | null }>;
   for (const row of rows) {
     await tx
       .update(elevationRequests)
       .set({ status: 'revoked', revokedAt: new Date(), revokedReason: 'PAM rule removed', updatedAt: new Date() })
       .where(and(eq(elevationRequests.id, row.id), inArray(elevationRequests.status, [...ACTIVE_STATUSES])));
-    await requestPamCleanup(tx, { elevationRequestId: row.id, cause: 'policy_removed' });
+    if (row.metadata?.local_decision_required !== true
+        || row.metadata.local_decision === 'approved') {
+      await requestPamCleanup(tx, { elevationRequestId: row.id, cause: 'policy_removed' });
+    }
   }
   return rows.length;
 }
@@ -841,6 +846,7 @@ pamRoutes.post(
           deviceId: elevationRequests.deviceId,
           flowType: elevationRequests.flowType,
           status: elevationRequests.status,
+          metadata: elevationRequests.metadata,
         })
         .from(elevationRequests)
         .where(eq(elevationRequests.id, id))
@@ -883,10 +889,14 @@ pamRoutes.post(
         occurredAt: now,
       });
 
-      const actuation = await requestPamCleanup(tx, {
-        elevationRequestId: row.id,
-        cause: 'revoked',
-      });
+      const localGate = row.metadata as Record<string, unknown> | null;
+      const actuation = localGate?.local_decision_required === true
+        && localGate.local_decision !== 'approved'
+        ? null
+        : await requestPamCleanup(tx, {
+          elevationRequestId: row.id,
+          cause: 'revoked',
+        });
 
       return { kind: 'ok' as const, row, actuation };
     });
@@ -932,7 +942,7 @@ pamRoutes.post(
       success: true,
       id: result.row.id,
       status: 'revoked',
-      enforcementStatus: 'cleanup_pending',
+      enforcementStatus: result.actuation ? 'cleanup_pending' : 'not_required',
     });
   },
 );

@@ -176,3 +176,5 @@ export * from './topologyOperations';
 export * from './topologyTemplates';
 export * from './emailSendingDomains';
 export * from './portalRemote';
+
+export * from './portalNative';

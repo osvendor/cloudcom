@@ -4,7 +4,7 @@ vi.mock('./cfAccessJwt', async original => ({
   ...await original<typeof import('./cfAccessJwt')>(), verifyCfAccessJwt: mocks.verify,
 }));
 import { CfAccessJwksUnavailableError } from './cfAccessJwt';
-import { checkPortalCompanyGateway, verifyPortalCompanyGateway } from './portalCompanyGateway';
+import { checkPortalCompanyGateway, currentCompanyGatewayFingerprint, verifyPortalCompanyGateway } from './portalCompanyGateway';
 
 const orgId = '11111111-1111-4111-8111-111111111111';
 const otherOrg = '22222222-2222-4222-8222-222222222222';
@@ -40,6 +40,18 @@ describe('company gateway is separate from individual identity', () => {
     expect(await verifyPortalCompanyGateway('token')).toEqual({ ok: false, status: 403 });
     configure({ ...config, companies: [{ ...config.companies[0], enabled: false }] });
     expect(await verifyPortalCompanyGateway('token')).toEqual({ ok: false, status: 403 });
+  });
+  it('invalidates a native configuration fingerprint when a company is disabled or remapped', async () => {
+    const oldFingerprint = currentCompanyGatewayFingerprint();
+    expect(oldFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    const decision = await verifyPortalCompanyGateway('token', true);
+    expect(decision).toMatchObject({ ok: true, orgId, configFingerprint: oldFingerprint });
+    configure({ ...config, companies: [{ ...config.companies[0], enabled: false }] });
+    expect(currentCompanyGatewayFingerprint()).not.toBe(oldFingerprint);
+    configure({ ...config, companies: [{ ...config.companies[0], orgId: otherOrg }] });
+    expect(currentCompanyGatewayFingerprint()).not.toBe(oldFingerprint);
+    vi.stubEnv('CLOUDCOM_COMPANY_GATEWAY_CONFIG', '{invalid');
+    expect(currentCompanyGatewayFingerprint()).toBeNull();
   });
   it.each([undefined, '', 'x'.repeat(16385)])('denies absent or oversized assertion', async assertion => {
     expect(await verifyPortalCompanyGateway(assertion)).toEqual({ ok: false, status: 403 });

@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 
 const m = vi.hoisted(() => ({
   selectLimit: vi.fn(), execute: vi.fn(), contextEvents: [] as string[], authorize: vi.fn(), create: vi.fn(),
-  commit: vi.fn(), end: vi.fn(), lease: vi.fn(), touch: vi.fn(), policy: vi.fn(), prompt: vi.fn(), dispatch: vi.fn(), audit: vi.fn(),
+  commit: vi.fn(), end: vi.fn(), lease: vi.fn(), touch: vi.fn(), policy: vi.fn(), prompt: vi.fn(), dispatch: vi.fn(), audit: vi.fn(), expire: vi.fn(),
 }));
 vi.mock('../../db', () => ({
   withDbAccessContext: async (_ctx: unknown, fn: () => Promise<unknown>) => { m.contextEvents.push('tx-open'); try { return await fn(); } finally { m.contextEvents.push('tx-close'); } },
@@ -15,6 +15,7 @@ vi.mock('../../db', () => ({
 vi.mock('../../db/schema', () => ({ portalRemoteSessions: { id: 's.id', portalUserId: 's.user', orgId: 's.org', authEpoch: 's.epoch', deviceId: 's.device' }, devices: { id: 'd.id', orgId: 'd.org', agentId: 'd.agent', hostname: 'd.host' } }));
 vi.mock('../../services/portalRemoteAuthority', () => ({ authorizePortalRemote: m.authorize }));
 vi.mock('../../services/portalRemoteSessionStore', () => ({ createPortalDesktopSession: m.create, commitPortalDesktopStartIntent: m.commit, endPortalDesktopSession: m.end, PORTAL_DESKTOP_START_TIMEOUT_MS: 120000 }));
+vi.mock('../../services/portalNativeAdmission', () => ({ expireStaleNativeSessionsForDevice: m.expire }));
 vi.mock('../../services/portalRemoteLease', () => ({ preparePortalRemoteLease: m.lease, touchPortalRemoteViewer: m.touch }));
 vi.mock('../../services/remoteAccessPolicy', () => ({ resolveDesktopSessionPolicy: m.policy }));
 vi.mock('../../services/agentCommandRelay', () => ({ dispatchCommandToAgent: (...a: unknown[]) => { m.contextEvents.push('dispatch'); return m.dispatch(...a); } }));
@@ -36,6 +37,7 @@ function request(path: string, init: RequestInit = {}) { return app().request(pa
 beforeEach(() => {
   vi.clearAllMocks(); m.contextEvents.length = 0;
   m.selectLimit.mockResolvedValue([row()]); m.execute.mockResolvedValue([]);
+  m.expire.mockResolvedValue(undefined);
   m.authorize.mockResolvedValue({ ok: true, device: { revocationLeaseProtocolVersion: 1, desktopFenceProtocolVersion: 1 } });
   m.create.mockResolvedValue({ ok: true, session: { id: SESSION, status: 'pending' } });
   m.commit.mockImplementation(async () => { m.contextEvents.push('commit'); return { ok: true, generation: 2n }; });
@@ -46,6 +48,12 @@ beforeEach(() => {
 });
 
 describe('portal desktop routes', () => {
+  it('expires unusable native sessions before the busy check and WebRTC start', async () => {
+    const response = await request('/remote/sessions', { method: 'POST', body: JSON.stringify({ deviceId: DEVICE, transport: 'webrtc' }) });
+    expect(response.status).toBe(201);
+    expect(m.expire).toHaveBeenCalledWith(principal.orgId, DEVICE);
+    expect(m.expire.mock.invocationCallOrder[0]).toBeLessThan(m.create.mock.invocationCallOrder[0]!);
+  });
   it.each(['owner mismatch', 'wrong organization', 'stale auth epoch'])('denies %s without invoking start services', async () => {
     m.selectLimit.mockResolvedValue([]);
     const response = await request(`/remote/sessions/${SESSION}/offer`, { method: 'POST', body: JSON.stringify({ offer: 'v=0' }) });
