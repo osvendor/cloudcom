@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { and, eq } from 'drizzle-orm';
-import { db } from '../db';
+import { and, eq, sql } from 'drizzle-orm';
+import { db, hasDbAccessContext } from '../db';
 import { portalNativeTargets, portalNativeAdmissions, portalRemoteSessions } from '../db/schema';
 import { authorizePortalRemote } from './portalRemoteAuthority';
 import { resolveRemoteSessionPromptConfig } from '../routes/remote/helpers';
@@ -11,6 +11,20 @@ import { NativeAdmissionError, type NativeConsume, type NativeOperator, type Nat
 
 export const NATIVE_LEASE_MS = 60_000;
 export const NATIVE_RENEW_SECONDS = 20;
+/** Retire native rows whose ticket or fail-closed lease is no longer usable.
+ * Called under the device's WebRTC start lock so a disconnected native client
+ * cannot reserve the computer until its much later hard deadline. */
+export async function expireStaleNativeSessionsForDevice(orgId: string, deviceId: string): Promise<void> {
+  if (!hasDbAccessContext()) throw new Error('Native session expiry requires a DB access transaction');
+  await db.execute(sql`UPDATE portal_remote_sessions AS s SET status='disconnected', ended_at=now()
+    WHERE s.org_id=${orgId}::uuid AND s.device_id=${deviceId}::uuid AND s.transport='rustdesk'
+      AND s.status IN ('pending','connecting','active')
+      AND (s.hard_deadline<=now() OR EXISTS (
+        SELECT 1 FROM portal_native_admissions AS a WHERE a.session_id=s.id
+          AND (a.presence_until<=now()
+            OR (a.consumed_at IS NULL AND a.ticket_expires_at<=now())
+            OR (a.consumed_at IS NOT NULL AND a.lease_expires_at<=now()))))`);
+}
 const randomSecret = () => randomBytes(32).toString('base64url');
 export const nativeSessionHash = (token: string) => createHash('sha256').update(token, 'utf8').digest('base64url');
 function validDeadline(expiresAt: number) {

@@ -7,7 +7,7 @@ import { db,withDbAccessContext } from '../../db';
 import { partners,organizations,sites,devices,users,portalUsers,portalRemoteSettings,portalRemoteAssignments,
   portalRemoteSessions,portalNativeTargets,portalNativeAdmissions } from '../../db/schema';
 import { enrollNativeTarget,authenticateNativeTarget } from '../../services/portalNativeTarget';
-import { issueNativeAdmission,consumeNativeAdmission,renewNativeAdmission,touchNativePresence,endNativeAdmission,nativeSessionHash } from '../../services/portalNativeAdmission';
+import { issueNativeAdmission,consumeNativeAdmission,renewNativeAdmission,touchNativePresence,endNativeAdmission,nativeSessionHash,expireStaleNativeSessionsForDevice } from '../../services/portalNativeAdmission';
 import { encodeNativeAdmissionV2,hashNativeTicket } from '../../services/portalNativeProof';
 import type { AgentAuthContext } from '../../middleware/agentAuth';
 import type { NativeTarget } from '../../services/portalNativeAdmissionSchemas';
@@ -47,6 +47,23 @@ async function fixture() {
  return {admin,a:a!,b:b!,da:da!,dbb:dbb!,alice:alice!,bob:bob!,grant:grant!,context,scoped,agent,enrollment,target,operator,issue,proof,publicKey};
 }
 describe('native admission real SQL boundaries',()=>{
+ it('retires an expired native lease without disconnecting a live session on the same device',async()=>{
+  const f=await fixture();
+  const expired=await f.issue(),expiredInput=f.proof(expired);
+  await f.scoped(()=>consumeNativeAdmission(f.target,expiredInput));
+  const live=await f.issue(),liveInput=f.proof(live);
+  await f.scoped(()=>consumeNativeAdmission(f.target,liveInput));
+  await f.admin.update(portalNativeAdmissions).set({presenceUntil:new Date(0),leaseExpiresAt:new Date(0)})
+    .where(eq(portalNativeAdmissions.sessionId,expired.sessionId));
+  await f.scoped(()=>expireStaleNativeSessionsForDevice(f.a.id,f.da.id));
+  const [staleRow]=await f.admin.select({status:portalRemoteSessions.status,endedAt:portalRemoteSessions.endedAt})
+    .from(portalRemoteSessions).where(eq(portalRemoteSessions.id,expired.sessionId));
+  const [liveRow]=await f.admin.select({status:portalRemoteSessions.status,endedAt:portalRemoteSessions.endedAt})
+    .from(portalRemoteSessions).where(eq(portalRemoteSessions.id,live.sessionId));
+  expect(staleRow).toMatchObject({status:'disconnected'});
+  expect(staleRow!.endedAt).not.toBeNull();
+  expect(liveRow).toMatchObject({status:'active',endedAt:null});
+ });
  it('is idempotent only for exact enrollment, and revokes old target credentials on explicit rotation',async()=>{
   const f=await fixture();
   expect(await f.scoped(()=>enrollNativeTarget(f.agent,f.enrollment))).toMatchObject({targetGeneration:1,targetId:f.target.id});
