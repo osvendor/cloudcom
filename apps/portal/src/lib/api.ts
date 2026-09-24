@@ -795,7 +795,7 @@ function mapPaginatedData<T>(
 
 export const portalApi = {
   getRemoteDevices: (config: ApiRequestConfig = {}): Promise<ApiResponse<{ devices: RemoteDevice[] }>> =>
-    apiGet<{ devices: RemoteDevice[] }>('/portal/remote/devices', config),
+    apiGet<{ devices: RemoteDevice[] }>('/portal/remote/browser/devices', config),
 
   createRemoteSession: (
     deviceId: string,

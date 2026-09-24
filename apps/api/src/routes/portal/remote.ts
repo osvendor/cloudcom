@@ -33,8 +33,19 @@ portalRemoteRoutes.use('/remote/*', async (c, next) => {
   await next();
 });
 
-portalRemoteRoutes.get('/remote/devices', async c => {
-  const { user } = c.get('portalAuth');
+// Cloudflare bypasses its browser challenge on the native path. Keep the
+// cookie-based portal list on a separate, Access-protected path so it always
+// receives the company assertion. Never allow either credential on the other
+// transport's path.
+portalRemoteRoutes.on('GET', ['/remote/devices', '/remote/browser/devices'], async c => {
+  const auth = c.get('portalAuth');
+  const browserPath = c.req.path.endsWith('/remote/browser/devices');
+  if (browserPath
+    ? auth.authMethod !== 'cookie'
+    : auth.authMethod !== 'bearer' || !auth.token.startsWith(NATIVE_SESSION_PREFIX)) {
+    return c.json({ error: 'Remote session is not valid for this endpoint' }, 403);
+  }
+  const { user } = auth;
   // The organization-wide /devices route is deliberately never called here.
   const rows = await db.select({ id: devices.id, hostname: devices.hostname,
     displayName: devices.displayName, status: devices.status,

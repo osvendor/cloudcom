@@ -48,7 +48,7 @@ function app(auth: { token?: string; authMethod?: 'bearer' | 'cookie' } = {}) {
   const app = new Hono();
   app.use('*', async (c, next) => {
     c.set('portalAuth', { user: principal, token: auth.token ?? 'test-token',
-      authMethod: auth.authMethod ?? 'bearer', timezone: 'UTC' });
+      authMethod: auth.authMethod ?? 'cookie', timezone: 'UTC' });
     await next();
   });
   app.route('/', portalRemoteRoutes);
@@ -72,28 +72,36 @@ beforeEach(() => {
   mocks.company.mockResolvedValue({ ok: true, orgId: principal.orgId });
 });
 
-describe('GET /remote/devices WebRTC availability', () => {
+describe('separate browser and native remote device lists', () => {
   it('denies a company mismatch before reading devices', async () => {
     mocks.company.mockResolvedValue({ ok: false, status: 403 });
-    const response = await app().request('/remote/devices', { headers: { 'Cf-Access-Jwt-Assertion': 'test-assertion' } });
+    const response = await app().request('/remote/browser/devices', { headers: { 'Cf-Access-Jwt-Assertion': 'test-assertion' } });
     expect(response.status).toBe(403);
     expect(mocks.company).toHaveBeenCalledWith('test-assertion', principal.orgId);
     expect(mocks.authorize).not.toHaveBeenCalled();
   });
-  it('uses the browser-bound company claim for a native bearer and still gates browser sessions', async () => {
-    const native = await app({ token: 'ccn1.' + 'A'.repeat(43) }).request('/remote/devices');
+  it('keeps the native bearer on its bypass path and requires a company assertion for browser sessions', async () => {
+    const native = await app({ token: 'ccn1.' + 'A'.repeat(43), authMethod: 'bearer' }).request('/remote/devices');
     expect(native.status).toBe(200);
     expect(mocks.company).not.toHaveBeenCalled();
 
     mocks.company.mockResolvedValue({ ok: false, status: 403 });
-    const browser = await app({ token: 'browser-session', authMethod: 'cookie' }).request('/remote/devices');
+    const browser = await app({ token: 'browser-session', authMethod: 'cookie' }).request('/remote/browser/devices');
     expect(browser.status).toBe(403);
     expect(mocks.company).toHaveBeenCalledWith(undefined, principal.orgId);
+  });
+  it('rejects a browser cookie on the native bypass and a native bearer on the browser path', async () => {
+    const browserOnBypass = await app().request('/remote/devices');
+    const nativeOnBrowser = await app({ token: 'ccn1.' + 'A'.repeat(43), authMethod: 'bearer' })
+      .request('/remote/browser/devices');
+    expect(browserOnBypass.status).toBe(403);
+    expect(nativeOnBrowser.status).toBe(403);
+    expect(mocks.authorize).not.toHaveBeenCalled();
   });
   it('uses the authenticated portal principal for every assigned device', async () => {
     mocks.rows = [device(), device('33333333-3333-4333-8333-333333333333')];
 
-    const response = await app().request('/remote/devices');
+    const response = await app().request('/remote/browser/devices');
 
     expect(response.status).toBe(200);
     expect(mocks.authorize).toHaveBeenNthCalledWith(1,
@@ -109,7 +117,7 @@ describe('GET /remote/devices WebRTC availability', () => {
     mocks.rows = [device()];
     mocks.authorize.mockResolvedValue({ ok: false, reason });
 
-    const response = await app().request('/remote/devices');
+    const response = await app().request('/remote/browser/devices');
     const body = await response.json() as { devices: Array<{ transports: { webrtc: { available: boolean } } }> };
 
     expect(response.status).toBe(200);
@@ -125,7 +133,7 @@ describe('GET /remote/devices WebRTC availability', () => {
     mocks.rows = [device()];
     mocks.authorize.mockResolvedValue(capable(lease, fence));
 
-    const response = await app().request('/remote/devices');
+    const response = await app().request('/remote/browser/devices');
     const body = await response.json() as { devices: Array<{ transports: { webrtc: { available: boolean } } }> };
 
     expect(body.devices[0]!.transports.webrtc.available).toBe(false);
@@ -134,7 +142,7 @@ describe('GET /remote/devices WebRTC availability', () => {
   it('advertises WebRTC only for an authorized fence-capable device and keeps native unavailable', async () => {
     mocks.rows = [device()];
 
-    const response = await app().request('/remote/devices');
+    const response = await app().request('/remote/browser/devices');
     const body = await response.json() as { devices: Array<{ transports: { webrtc: { available: boolean }; rustdesk: { available: boolean } } }> };
 
     expect(body.devices[0]!.transports.webrtc).toEqual({ available: true });
@@ -146,7 +154,7 @@ describe('GET /remote/devices WebRTC availability', () => {
     mocks.rows = [device()];
     mocks.targets = [{ rustdeskId: '48660403' }];
 
-    const response = await app().request('/remote/devices');
+    const response = await app().request('/remote/browser/devices');
     const body = await response.json() as { devices: Array<{ transports: { rustdesk: { available: boolean; peerId?: string } } }> };
 
     expect(response.status).toBe(200);
@@ -162,7 +170,7 @@ describe('GET /remote/devices WebRTC availability', () => {
     mocks.authorize.mockImplementation(async (_principal, _deviceId, transport) =>
       transport === 'rustdesk' ? { ok: false, reason: 'transport_disabled' } : capable());
 
-    const response = await app().request('/remote/devices');
+    const response = await app().request('/remote/browser/devices');
     const body = await response.json() as { devices: Array<{ transports: { rustdesk: { available: boolean; peerId?: string } } }> };
 
     expect(body.devices[0]!.transports.rustdesk.available).toBe(false);
@@ -177,7 +185,7 @@ describe('GET /remote/devices WebRTC availability', () => {
       return capable();
     });
 
-    const response = await app().request('/remote/devices');
+    const response = await app().request('/remote/browser/devices');
     const body = await response.json() as { devices: Array<{ transports: {
       webrtc: { available: boolean }; rustdesk: { available: boolean; peerId?: string },
     } }> };
@@ -188,7 +196,7 @@ describe('GET /remote/devices WebRTC availability', () => {
   });
 
   it('returns an empty list without calling authority when there are no grants', async () => {
-    const response = await app().request('/remote/devices');
+    const response = await app().request('/remote/browser/devices');
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ devices: [] });
