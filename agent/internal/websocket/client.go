@@ -37,11 +37,12 @@ const (
 	// tunnel_data ~1.33MB, scripts 1MB, terminal input 256KB, desktop SDP
 	// 64KB) is far smaller. 16MB ≈ 2.8x the largest legit frame; the
 	// relationship is pinned by TestMaxMessageSizeCoversLargestLegitimateFrame.
-	maxMessageSize = 16 * 1024 * 1024
-	initialBackoff = 1 * time.Second
-	maxBackoff     = 60 * time.Second
-	backoffFactor  = 2.0
-	jitterFactor   = 0.3
+	maxMessageSize           = 16 * 1024 * 1024
+	initialBackoff           = 1 * time.Second
+	maxBackoff               = 60 * time.Second
+	backoffFactor            = 2.0
+	jitterFactor             = 0.3
+	stableConnectionDuration = 30 * time.Second
 )
 
 const capabilityTerminalOutputBase64 = "terminal_output_base64"
@@ -343,12 +344,25 @@ func (c *Client) connect() error {
 	headers := http.Header{
 		"Authorization": {"Bearer " + c.config.AuthToken.Reveal()},
 	}
-	conn, _, err := dialer.Dial(wsURL, headers)
+	conn, response, err := dialer.Dial(wsURL, headers)
 	if err != nil {
+		if response != nil {
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
+			return fmt.Errorf("failed to connect: websocket handshake failed: HTTP %d", response.StatusCode)
+		}
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
 	c.connMu.Lock()
+	select {
+	case <-c.done:
+		c.connMu.Unlock()
+		_ = conn.Close()
+		return fmt.Errorf("client is stopped")
+	default:
+	}
 	c.conn = conn
 	c.connMu.Unlock()
 
@@ -387,24 +401,10 @@ func (c *Client) reconnectLoop() {
 
 		if err := c.connect(); err != nil {
 			log.Warn("connection failed", "error", err.Error())
-
-			jitter := time.Duration(float64(backoff) * jitterFactor * (rand.Float64()*2 - 1))
-			sleep := backoff + jitter
-			if sleep < 0 {
-				sleep = backoff
-			}
-
-			log.Info("retrying", "delay", sleep)
-			select {
-			case <-c.done:
+			if !c.waitForRetry(backoff) {
 				return
-			case <-time.After(sleep):
 			}
-
-			backoff = time.Duration(float64(backoff) * backoffFactor)
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
+			backoff = nextBackoff(backoff)
 			continue
 		}
 
@@ -418,11 +418,17 @@ func (c *Client) reconnectLoop() {
 		<-writerDone
 		c.closeCurrentConn(false)
 
-		// Only reset backoff if connection was stable (lasted > 30s).
+		// Only reset backoff if connection was stable (lasted at least 30s).
 		// Immediate disconnects (e.g. auth rejection) keep exponential backoff
 		// so a misconfigured agent doesn't flood the server.
-		if time.Since(connStart) > 30*time.Second {
+		if time.Since(connStart) >= stableConnectionDuration {
 			backoff = initialBackoff
+		} else {
+			log.Warn("connection closed before becoming stable")
+			if !c.waitForRetry(backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff)
 		}
 
 		// Check if we should stop
@@ -433,6 +439,40 @@ func (c *Client) reconnectLoop() {
 			return
 		}
 	}
+}
+
+func (c *Client) waitForRetry(backoff time.Duration) bool {
+	delay := retryDelay(backoff)
+	log.Info("retrying", "delay", delay)
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-c.done:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func retryDelay(backoff time.Duration) time.Duration {
+	jitter := time.Duration(float64(backoff) * jitterFactor * (rand.Float64()*2 - 1))
+	delay := backoff + jitter
+	if delay < 0 {
+		delay = 0
+	}
+	if delay > maxBackoff {
+		delay = maxBackoff
+	}
+	return delay
+}
+
+func nextBackoff(backoff time.Duration) time.Duration {
+	next := time.Duration(float64(backoff) * backoffFactor)
+	if next > maxBackoff {
+		return maxBackoff
+	}
+	return next
 }
 
 func (c *Client) readPump() {

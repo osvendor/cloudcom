@@ -2,6 +2,9 @@ package websocket
 
 import (
 	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -167,6 +170,201 @@ func TestReconnectLoop_StopsDuringBackoff(t *testing.T) {
 		// good — loop exited
 	case <-time.After(5 * time.Second):
 		t.Fatal("reconnectLoop did not exit after Stop during backoff")
+	}
+}
+
+func TestReconnectLoop_BacksOffAfterShortLivedConnections(t *testing.T) {
+	tests := []struct {
+		name  string
+		close func(*websocket.Conn)
+	}{
+		{
+			name: "clean close",
+			close: func(conn *websocket.Conn) {
+				_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+				_ = conn.Close()
+			},
+		},
+		{
+			name: "abrupt close",
+			close: func(conn *websocket.Conn) {
+				_ = conn.UnderlyingConn().Close()
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			connectedAt := make(chan time.Time, 3)
+			srv := newTestServer(t, func(conn *websocket.Conn) {
+				select {
+				case connectedAt <- time.Now():
+				default:
+				}
+				tt.close(conn)
+			})
+			defer srv.Close()
+
+			c := newTestClient(srv.URL, noopHandler)
+			t.Cleanup(c.Stop)
+			done := make(chan struct{})
+			go func() {
+				c.Start()
+				close(done)
+			}()
+
+			var first time.Time
+			select {
+			case first = <-connectedAt:
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for initial connection")
+			}
+			var second time.Time
+			select {
+			case second = <-connectedAt:
+				gap := second.Sub(first)
+				if gap < 650*time.Millisecond {
+					t.Fatalf("reconnect gap = %v, want at least 650ms", gap)
+				}
+				if gap > 3*time.Second {
+					t.Fatalf("reconnect gap = %v, want bounded retry", gap)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for reconnect")
+			}
+			select {
+			case third := <-connectedAt:
+				if gap := third.Sub(second); gap < 1300*time.Millisecond {
+					t.Fatalf("second reconnect gap = %v, want at least 1.3s", gap)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for second reconnect")
+			}
+
+			c.Stop()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("reconnect loop did not stop")
+			}
+		})
+	}
+}
+
+func TestReconnectLoop_RetriesHTTPFailuresUntilUpgrade(t *testing.T) {
+	statuses := []int{http.StatusForbidden, http.StatusBadGateway}
+	var attempts atomic.Int32
+	connected := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempt := int(attempts.Add(1))
+		if attempt <= len(statuses) {
+			http.Error(w, "server detail that must not reach the client log", statuses[attempt-1])
+			return
+		}
+
+		conn, err := testUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		select {
+		case connected <- struct{}{}:
+		default:
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv.URL, noopHandler)
+	t.Cleanup(c.Stop)
+	done := make(chan struct{})
+	go func() {
+		c.Start()
+		close(done)
+	}()
+
+	select {
+	case <-connected:
+	case <-time.After(6 * time.Second):
+		t.Fatalf("only %d connection attempts; client never upgraded", attempts.Load())
+	}
+	if got := attempts.Load(); got != int32(len(statuses)+1) {
+		t.Fatalf("connection attempts = %d, want %d", got, len(statuses)+1)
+	}
+
+	c.Stop()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reconnect loop did not stop after successful retry")
+	}
+}
+
+func TestReconnectLoop_RecoversAfterNetworkFailureAndServerURLUpdate(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	deadURL := "http://" + listener.Addr().String()
+	firstAttempt := make(chan struct{}, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		select {
+		case firstAttempt <- struct{}{}:
+		default:
+		}
+		_ = conn.Close()
+	}()
+
+	connected := make(chan struct{}, 1)
+	srv := newTestServer(t, func(conn *websocket.Conn) {
+		select {
+		case connected <- struct{}{}:
+		default:
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer srv.Close()
+
+	c := newTestClient(deadURL, noopHandler)
+	t.Cleanup(c.Stop)
+	done := make(chan struct{})
+	go func() {
+		c.Start()
+		close(done)
+	}()
+
+	select {
+	case <-firstAttempt:
+	case <-time.After(time.Second):
+		t.Fatal("client did not attempt the original server URL")
+	}
+	c.SetServerURL(srv.URL)
+
+	select {
+	case <-connected:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client did not recover after server URL update")
+	}
+
+	c.Stop()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reconnect loop did not stop after URL recovery")
 	}
 }
 
