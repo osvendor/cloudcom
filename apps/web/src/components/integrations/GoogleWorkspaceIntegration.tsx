@@ -23,7 +23,7 @@ type Connection = {
   status?: string;
   lastVerifiedAt?: string | null;
 };
-type OAuthConnection = { connected: boolean; customerDomain?: string; authorizedEmail?: string;
+type OAuthConnection = { connected: boolean; available?: boolean; customerDomain?: string; authorizedEmail?: string;
   grantedScopes?: string[]; verifiedAt?: string | null; status?: string };
 
 type SaveState = {
@@ -304,7 +304,7 @@ export default function GoogleWorkspaceIntegration() {
         </div>
       )}
 
-      <section className="rounded-xl border bg-card p-4 text-sm shadow-xs" aria-label="Google OAuth connection">
+      {(oauthConnection?.available || oauthConnected) && <section className="rounded-xl border bg-card p-4 text-sm shadow-xs" aria-label="Google OAuth connection">
         <h2 className="font-semibold">Connect with Google</h2>
         {oauthConnected ? (
           <div className="mt-2 flex flex-wrap items-center gap-3">
@@ -327,7 +327,7 @@ export default function GoogleWorkspaceIntegration() {
         {oauthError && <p className="mt-2 text-red-600" role="alert">{oauthError}</p>}
         {typeof window !== "undefined" && new URLSearchParams(window.location.search).get("google") === "connect-failed" &&
           <p className="mt-2 text-red-600" role="alert">Google authorization could not be completed. Check the administrator and customer domain, then retry.</p>}
-      </section>
+      </section>}
 
       {/* Existing service-account mode remains available for per-user Gmail settings. */}
       {!oauthConnected && <div className="rounded-xl border bg-card p-6 shadow-xs">

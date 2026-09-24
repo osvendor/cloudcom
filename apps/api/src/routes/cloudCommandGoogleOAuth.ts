@@ -74,9 +74,10 @@ cloudCommandGoogleOAuthRoutes.get('/oauth/connection',
       verified_at: Date; status: string }>(await db.execute(sql`SELECT customer_domain, authorized_email,
         granted_scopes, verified_at, status FROM cloudcommand_google_oauth_connections
         WHERE org_id = ${orgId}::uuid LIMIT 1`))[0];
-    return c.json(row ? { connected: true, customerDomain: row.customer_domain,
+    const available = Boolean(config());
+    return c.json(row ? { connected: true, available, customerDomain: row.customer_domain,
       authorizedEmail: row.authorized_email, grantedScopes: row.granted_scopes.split(/\s+/),
-      verifiedAt: row.verified_at, status: row.status } : { connected: false });
+      verifiedAt: row.verified_at, status: row.status } : { connected: false, available });
   });
 cloudCommandGoogleOAuthRoutes.delete('/oauth/connection',
   requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action), requireMfa(), async c => {

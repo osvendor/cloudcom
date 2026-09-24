@@ -41,6 +41,16 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 
 describe('Cloud Command Google OAuth Connect', () => {
+  it('reports whether OAuth can be started without exposing client credentials', async () => {
+    const configured = await app().request('/google/oauth/connection');
+    expect(configured.status).toBe(200);
+    expect(await configured.json()).toEqual({ connected: false, available: true });
+
+    vi.stubEnv('CLOUDCOMMAND_GOOGLE_OAUTH_CLIENT_SECRET', '');
+    const unavailable = await app().request('/google/oauth/connection');
+    expect(unavailable.status).toBe(200);
+    expect(await unavailable.json()).toEqual({ connected: false, available: false });
+  });
   it('mounts the public callback ahead of the legacy Google auth middleware', async () => {
     const callback = await mountedApp().request('/api/v1/google/oauth/callback?state=invalid&code=code');
     expect(callback.status).toBe(302);
