@@ -259,7 +259,7 @@ func nativeTargetOrigin(raw string) (string, error) {
 }
 
 func nativeTargetEnrollmentURL(origin, agentID string) (string, error) {
-	if !isCanonicalNativeUUID(agentID) {
+	if !isCanonicalNativeAgentID(agentID) {
 		return "", errors.New("agent ID is invalid")
 	}
 	return origin + "/api/v1/agents/" + url.PathEscape(agentID) + "/native-target/enroll", nil

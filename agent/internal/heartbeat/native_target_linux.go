@@ -140,7 +140,7 @@ func (h *Heartbeat) enrollNativeRustDeskTargetLinux() error {
 		return err
 	}
 	defer zeroBytes(requestBody)
-	if !isCanonicalNativeUUID(h.config.AgentID) || !isCanonicalNativeUUID(h.config.DeviceID) {
+	if !isCanonicalNativeAgentID(h.config.AgentID) || !isCanonicalNativeUUID(h.config.DeviceID) {
 		return errors.New("Breeze device identity is invalid")
 	}
 	endpoint := origin + "/api/v1/agents/" + url.PathEscape(h.config.AgentID) + "/native-target/enroll"

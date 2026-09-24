@@ -5,6 +5,7 @@ package heartbeat
 import (
 	"bytes"
 	"encoding/base64"
+	"strings"
 	"testing"
 )
 
@@ -66,6 +67,11 @@ func TestNativeTargetRequestAndSeedValidation(t *testing.T) {
 	}
 	if _, err := nativeTargetEnrollmentURL("https://breeze.example", "../../devices"); err == nil {
 		t.Fatal("invalid agent ID accepted")
+	}
+	legacyID := strings.Repeat("ab", 32)
+	legacyEndpoint, err := nativeTargetEnrollmentURL("https://breeze.example", legacyID)
+	if err != nil || legacyEndpoint != "https://breeze.example/api/v1/agents/"+legacyID+"/native-target/enroll" {
+		t.Fatalf("legacy agent enrollment URL = %q, %v", legacyEndpoint, err)
 	}
 	seed := nativeTargetSeed{Version: 2, InstallationID: agentID,
 		TargetPublicKey: base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32)),
