@@ -35,4 +35,5 @@ for migration in packages/ext-cloud-command/migrations/*.sql; do
   done
 done
 pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts src/__tests__/integration/cloudCommandThreeCx.integration.test.ts
+pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts src/__tests__/integration/cloudCommandGoogleOAuth.integration.test.ts
 pnpm --filter @breeze/api exec vitest run --config vitest.config.rls-coverage.ts

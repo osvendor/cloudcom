@@ -310,6 +310,24 @@ describe('secretCrypto', () => {
       expect(decryptSecret(encrypted, { aad: 'webhooks.secret' })).toBe('hello');
     });
 
+    it('round-trips Google OAuth verifier and refresh token only for their bound organization', async () => {
+      const { encryptSecret, decryptSecret, decryptForColumn } = await loadSecretCrypto({
+        APP_ENCRYPTION_KEY: 'google-oauth-test-key-material', APP_ENCRYPTION_KEY_ID: 'google-oauth-test',
+      });
+      const orgA = '11111111-1111-4111-8111-111111111111';
+      const orgB = '22222222-2222-4222-8222-222222222222';
+      const verifierAad = `cloudcommand_google_oauth_attempts.verifier_ciphertext:${orgA}`;
+      const verifier = encryptSecret('pkce-verifier', { aad: verifierAad });
+      expect(verifier).toMatch(/^enc:v3:google-oauth-test:/);
+      expect(decryptSecret(verifier, { aad: verifierAad })).toBe('pkce-verifier');
+      expect(() => decryptSecret(verifier, { aad: `cloudcommand_google_oauth_attempts.verifier_ciphertext:${orgB}` })).toThrow();
+      const token = encryptSecret('refresh-token', {
+        aad: `cloudcommand_google_oauth_connections.refresh_token:${orgA}`,
+      });
+      expect(decryptForColumn('cloudcommand_google_oauth_connections', `refresh_token:${orgA}`, token)).toBe('refresh-token');
+      expect(() => decryptForColumn('cloudcommand_google_oauth_connections', `refresh_token:${orgB}`, token)).toThrow();
+    });
+
     it('refuses to decrypt with a different aad', async () => {
       const { encryptSecret, decryptSecret } = await loadSecretCrypto({
         APP_ENCRYPTION_KEY: 'current-key-material',

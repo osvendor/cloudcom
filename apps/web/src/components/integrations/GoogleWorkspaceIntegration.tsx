@@ -10,6 +10,7 @@ import {
   Users,
 } from "lucide-react";
 import { fetchWithAuth } from "../../stores/auth";
+import { runAction } from "../../lib/runAction";
 import { formatDateTime } from "@/lib/dateTimeFormat";
 import { useTranslation } from "react-i18next";
 import "@/lib/i18n";
@@ -22,6 +23,8 @@ type Connection = {
   status?: string;
   lastVerifiedAt?: string | null;
 };
+type OAuthConnection = { connected: boolean; available?: boolean; customerDomain?: string; authorizedEmail?: string;
+  grantedScopes?: string[]; verifiedAt?: string | null; status?: string };
 
 type SaveState = {
   status: "idle" | "saving" | "saved" | "error";
@@ -51,6 +54,9 @@ export default function GoogleWorkspaceIntegration() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [notEnabled, setNotEnabled] = useState(false);
   const [connection, setConnection] = useState<Connection | null>(null);
+  const [oauthConnection, setOAuthConnection] = useState<OAuthConnection | null>(null);
+  const [oauthBusy, setOAuthBusy] = useState(false);
+  const [oauthError, setOAuthError] = useState<string | null>(null);
 
   const [customerDomain, setCustomerDomain] = useState("");
   const [adminEmail, setAdminEmail] = useState("");
@@ -60,6 +66,7 @@ export default function GoogleWorkspaceIntegration() {
   const [saveState, setSaveState] = useState<SaveState>({ status: "idle" });
 
   const isConnected = !!connection?.connected;
+  const oauthConnected = !!oauthConnection?.connected;
   // When already connected the key may be left blank to keep the stored one;
   // a fresh connection requires all three fields.
   const canSave =
@@ -97,7 +104,42 @@ export default function GoogleWorkspaceIntegration() {
         `Failed to load connection: ${err instanceof Error ? err.message : "Network error"}`,
       );
     }
+    try {
+      const res = await fetchWithAuth("/google/oauth/connection");
+      if (res.ok) {
+        const oauth = await res.json() as OAuthConnection;
+        setOAuthConnection(oauth);
+        if (oauth.connected && oauth.customerDomain) setCustomerDomain(oauth.customerDomain);
+      }
+    } catch { /* DWD status remains independently available. */ }
   }, []);
+
+  const startOAuth = async () => {
+    setOAuthBusy(true);
+    setOAuthError(null);
+    try {
+      const result = await runAction<{ url: string }>({
+        request: () => fetchWithAuth("/google/oauth/start", { method: "POST",
+          body: JSON.stringify({ customerDomain: customerDomain.trim() }) }),
+        errorFallback: "Google authorization could not be started.",
+      });
+      const url = new URL(result.url);
+      if (url.origin !== "https://accounts.google.com") throw new Error("Invalid Google authorization address.");
+      window.location.assign(url.toString());
+    } catch (error) { setOAuthError(error instanceof Error ? error.message : "Google authorization failed."); }
+    finally { setOAuthBusy(false); }
+  };
+
+  const disconnectOAuth = async () => {
+    setOAuthBusy(true);
+    setOAuthError(null);
+    try {
+      await runAction({ request: () => fetchWithAuth("/google/oauth/connection", { method: "DELETE" }),
+        errorFallback: "Could not disconnect Google Workspace.", successMessage: "Google Workspace disconnected." });
+      setOAuthConnection({ connected: false });
+    } catch (error) { setOAuthError(error instanceof Error ? error.message : "Could not disconnect Google Workspace."); }
+    finally { setOAuthBusy(false); }
+  };
 
   useEffect(() => {
     const load = async () => {
@@ -245,7 +287,7 @@ export default function GoogleWorkspaceIntegration() {
             )}
           </p>
         </div>
-        {isConnected ? (
+        {isConnected || oauthConnected ? (
           <span className="ml-auto inline-flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs text-emerald-700">
             <CheckCircle2 className="h-3.5 w-3.5" /> {t("common:states.active")}
           </span>
@@ -262,8 +304,33 @@ export default function GoogleWorkspaceIntegration() {
         </div>
       )}
 
-      {/* Connection card */}
-      <div className="rounded-xl border bg-card p-6 shadow-xs">
+      {(oauthConnection?.available || oauthConnected) && <section className="rounded-xl border bg-card p-4 text-sm shadow-xs" aria-label="Google OAuth connection">
+        <h2 className="font-semibold">Connect with Google</h2>
+        {oauthConnected ? (
+          <div className="mt-2 flex flex-wrap items-center gap-3">
+            <span>Connected: {oauthConnection?.customerDomain} · {oauthConnection?.authorizedEmail}</span>
+            <button type="button" className="h-9 rounded-md border px-3" disabled={oauthBusy}
+              onClick={disconnectOAuth}>Disconnect</button>
+          </div>
+        ) : !isConnected ? (
+          <div className="mt-2 flex flex-wrap items-end gap-2">
+            <label className="block">Workspace domain
+              <input type="text" value={customerDomain} onChange={e => setCustomerDomain(e.target.value)}
+                placeholder="example.com" className="mt-1 block h-9 w-64 max-w-full rounded-md border bg-background px-3" />
+            </label>
+            <button type="button" onClick={startOAuth} disabled={!customerDomain.trim() || oauthBusy}
+              className="h-9 rounded-md bg-primary px-3 text-primary-foreground disabled:opacity-50">
+              Authorize Google Workspace</button>
+          </div>
+        ) : <p className="mt-1 text-muted-foreground">A service-account connection is already active for this organization.</p>}
+        <p className="mt-2 text-muted-foreground">Google authorization connects Directory and approved reports. Per-user Gmail settings require domain-wide delegation.</p>
+        {oauthError && <p className="mt-2 text-red-600" role="alert">{oauthError}</p>}
+        {typeof window !== "undefined" && new URLSearchParams(window.location.search).get("google") === "connect-failed" &&
+          <p className="mt-2 text-red-600" role="alert">Google authorization could not be completed. Check the administrator and customer domain, then retry.</p>}
+      </section>}
+
+      {/* Existing service-account mode remains available for per-user Gmail settings. */}
+      {!oauthConnected && <div className="rounded-xl border bg-card p-6 shadow-xs">
         <h2 className="text-lg font-semibold">
           {t("googleWorkspaceIntegration.connection")}
         </h2>
@@ -446,7 +513,7 @@ export default function GoogleWorkspaceIntegration() {
             </span>
           )}
         </div>
-      </div>
+      </div>}
 
       {/* Status card */}
       {isConnected && (

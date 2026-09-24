@@ -86,12 +86,22 @@
       "cloudcommand_microsoft_connections",
       "cloudcommand_microsoft_admin_connections",
       "cloudcommand_microsoft_admin_consent",
-      "cloudcommand_microsoft_directory_preferences"
+      "cloudcommand_microsoft_directory_preferences",
+      "cloudcommand_google_oauth_connections",
+      "cloudcommand_google_oauth_attempts"
     ],
     "deviceCascadeDeleteTables": [],
     "deviceOrgDenormalizedTables": [],
     "nonTenantTables": [],
     "orgExportColumns": {
+      "cloudcommand_google_oauth_connections": {
+        "include": ["id", "org_id", "customer_id", "customer_domain", "authorized_email", "granted_scopes", "status", "created_by", "verified_at", "created_at", "updated_at"],
+        "exclude": ["refresh_token"]
+      },
+      "cloudcommand_google_oauth_attempts": {
+        "include": ["org_id", "actor_id", "expected_domain", "status", "expires_at", "created_at"],
+        "exclude": ["state_hash", "browser_hash", "verifier_ciphertext"]
+      },
       "cloudcommand_threecx_connections": {
         "include": [
           "id",

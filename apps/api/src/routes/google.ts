@@ -10,9 +10,10 @@
  */
 
 import { Hono } from 'hono';
+import { cloudCommandGoogleOAuthRoutes } from './cloudCommandGoogleOAuth';
 import { zValidator } from '../lib/validation';
 import { z } from 'zod';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { db } from '../db';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
 import { googleWorkspaceConnections } from '../db/schema/google';
@@ -26,6 +27,7 @@ import { GOOGLE_WORKSPACE_ENABLED } from '../config/env';
 import { getDirectoryClient, parseServiceAccountKey, normalizeGoogleError } from '../services/googleClient';
 
 export const googleRoutes = new Hono();
+googleRoutes.route('/', cloudCommandGoogleOAuthRoutes);
 
 const requireOrgsRead = requirePermission(PERMISSIONS.ORGS_READ.resource, PERMISSIONS.ORGS_READ.action);
 const requireOrgsWrite = requirePermission(PERMISSIONS.ORGS_WRITE.resource, PERMISSIONS.ORGS_WRITE.action);
@@ -129,9 +131,15 @@ googleRoutes.post(
     if (!encryptedKey) return c.json({ error: 'Failed to encrypt the service-account key' }, 500);
 
     const now = new Date();
-    const [row] = await db
-      .insert(googleWorkspaceConnections)
-      .values({
+    // Both credential modes lock the same organization row before checking the
+    // other table and writing. This serializes a DWD POST racing an OAuth
+    // callback, including when neither connection existed at request start.
+    const saved = await db.transaction(async tx => {
+      await tx.execute(sql`SELECT id FROM organizations WHERE id = ${orgId}::uuid FOR UPDATE`);
+      const oauth = await tx.execute(sql`SELECT id FROM cloudcommand_google_oauth_connections
+        WHERE org_id = ${orgId}::uuid LIMIT 1`);
+      if (oauth.length) return { conflict: true as const, row: null };
+      const [row] = await tx.insert(googleWorkspaceConnections).values({
         orgId,
         customerDomain: payload.customerDomain,
         adminEmail: payload.adminEmail,
@@ -142,8 +150,7 @@ googleRoutes.post(
         lastVerifiedAt: now,
         createdAt: now,
         updatedAt: now,
-      })
-      .onConflictDoUpdate({
+      }).onConflictDoUpdate({
         target: googleWorkspaceConnections.orgId,
         set: {
           customerDomain: payload.customerDomain,
@@ -154,8 +161,12 @@ googleRoutes.post(
           lastVerifiedAt: now,
           updatedAt: now,
         },
-      })
-      .returning();
+      }).returning();
+      return { conflict: false as const, row: row ?? null };
+    });
+
+    if (saved.conflict) return c.json({ error: 'Disconnect the OAuth connection before switching credential modes' }, 409);
+    const row = saved.row;
 
     if (!row) {
       captureException(new Error('google_workspace_connection upsert returned no row'), c);

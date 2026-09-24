@@ -40,6 +40,7 @@ export interface NativeGoogleServices {
   version: 1;
   connection(request: GoogleRequest): Promise<{
     available: boolean; connected: boolean; enabled: boolean; canManage: boolean;
+    canReadReports?: boolean;
     customerDomain?: string; lastVerifiedAt?: string | null;
   }>;
   directory(request: GoogleRequest, kind: GoogleDirectoryKind, pageToken: string | null): Promise<GoogleDirectoryResult>;

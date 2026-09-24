@@ -5,6 +5,7 @@ import { Hono } from 'hono';
 let selectRows: unknown[] = [];
 let insertRows: unknown[] = [];
 let deleteRows: unknown[] = [];
+let oauthRows: unknown[] = [];
 let parseThrows = false;
 let dirGetThrows = false;
 
@@ -46,13 +47,17 @@ vi.mock('../services/googleClient', () => ({
   })),
   normalizeGoogleError: vi.fn((e: any) => ({ code: 'google_error', message: e?.message ?? String(e) })),
 }));
-vi.mock('../db', () => ({
-  db: {
+vi.mock('../db', () => {
+  const db = {
     select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({ limit: vi.fn(async () => selectRows) })) })) })),
     insert: vi.fn(() => ({ values: vi.fn(() => ({ onConflictDoUpdate: vi.fn(() => ({ returning: vi.fn(async () => insertRows) })) })) })),
     delete: vi.fn(() => ({ where: vi.fn(() => ({ returning: vi.fn(async () => deleteRows) })) })),
-  },
-}));
+    execute: vi.fn(async () => oauthRows),
+    transaction: vi.fn(),
+  };
+  db.transaction.mockImplementation((fn: (tx: typeof db) => Promise<unknown>) => fn(db));
+  return { db };
+});
 
 import { googleRoutes } from './google';
 import { authMiddleware } from '../middleware/auth';
@@ -79,7 +84,7 @@ const validBody = { customerDomain: 'example.com', adminEmail: 'admin@example.co
 beforeEach(() => {
   vi.clearAllMocks();
   authOverrides.current = null;
-  selectRows = []; insertRows = []; deleteRows = [];
+  selectRows = []; insertRows = []; deleteRows = []; oauthRows = [];
   parseThrows = false; dirGetThrows = false;
 });
 
@@ -112,6 +117,15 @@ describe('google connection routes', () => {
     expect(body.connected).toBe(true);
     expect(JSON.stringify(body)).not.toContain('service_account');
     expect(JSON.stringify(body)).not.toContain('ENCRYPTED-KEY');
+  });
+
+  it('POST /connection rejects an existing OAuth grant before writing a DWD key', async () => {
+    oauthRows = [{ id: 'oauth-1' }];
+    const res = await app().request('/google/connection', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(validBody),
+    });
+    expect(res.status).toBe(409);
+    expect(db.insert).not.toHaveBeenCalled();
   });
 
   it('POST /connection returns 400 with a hint when the live Directory verify fails (bad DWD)', async () => {
