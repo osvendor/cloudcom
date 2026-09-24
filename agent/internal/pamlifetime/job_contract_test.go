@@ -275,6 +275,7 @@ func (f *fakeWindowsPrimitives) CloseJob(job jobOwnership) {
 
 type fakeAccountLifecycle struct {
 	order            *[]string
+	promoteErr       error
 	deprovision      elevaccount.AccountEvidence
 	deprovisionErr   error
 	verified         elevaccount.AccountEvidence
@@ -285,6 +286,9 @@ type fakeAccountLifecycle struct {
 
 func (f *fakeAccountLifecycle) Promote(context.Context) (elevaccount.Credential, error) {
 	*f.order = append(*f.order, "promote dormant account")
+	if f.promoteErr != nil {
+		return elevaccount.Credential{}, f.promoteErr
+	}
 	return elevaccount.Credential{Username: elevaccount.AccountName, Password: "ephemeral"}, nil
 }
 
@@ -359,6 +363,61 @@ func TestApplyOwnsSuspendedProcessInNonEscapableJobBeforeResume(t *testing.T) {
 	}
 	if win.launchSpec.creationFlags&createSuspended == 0 || win.launchSpec.creationFlags&createBreakawayFromJob != 0 {
 		t.Fatalf("creation flags = %#x, want suspended without breakaway", win.launchSpec.creationFlags)
+	}
+}
+
+func TestApplyPromotionFailurePersistsFailureAndCleanupEvidence(t *testing.T) {
+	tests := []struct {
+		name           string
+		privileged     bool
+		wantAvailable  bool
+		wantCleanupErr string
+	}{
+		{name: "verified cleanup", wantAvailable: true},
+		{name: "token remains", privileged: true, wantAvailable: false, wantCleanupErr: "privileged_token_verification_failed"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var order []string
+			clean := elevaccount.AccountEvidence{Enabled: false, InAdministrators: false}
+			store := NewStore(filepath.Join(t.TempDir(), "ledger.json"))
+			win := &fakeWindowsPrimitives{order: &order, privilegedToken: tc.privileged}
+			account := &fakeAccountLifecycle{order: &order, promoteErr: errors.New("promotion rejected"), deprovision: clean, verified: clean}
+			manager := newLifecycleManager(store, win, account, nil)
+
+			result := manager.Apply(context.Background(), validApply(1))
+			if result.State != ResultFailed || result.FailureCode != "account_promotion_failed" || result.Evidence.FailureStage != "account_promotion" {
+				t.Fatalf("apply result = %+v", result)
+			}
+			entry, ok := store.Entry(testActuationID)
+			if !ok || entry.DesiredState != DesiredCleanup || entry.Generation != 2 || entry.LastFailureCode != "account_promotion_failed" || entry.LastFailureStage != "account_promotion" || entry.LastFailureAt == nil {
+				t.Fatalf("durable failure record = %+v, present=%v", entry, ok)
+			}
+			if entry.PID != 0 || entry.ProcessCreationTime != nil || entry.JobName != "" || entry.BootID != "" {
+				t.Fatalf("pre-launch failure fabricated a process identity: %+v", entry)
+			}
+			if manager.Available() != tc.wantAvailable {
+				t.Fatalf("manager Available()=%v, want %v", manager.Available(), tc.wantAvailable)
+			}
+			if tc.wantAvailable {
+				if result.Evidence.AccountEnabled == nil || *result.Evidence.AccountEnabled || result.Evidence.AccountInAdministrators == nil || *result.Evidence.AccountInAdministrators || result.Evidence.PrivilegedTokenPresent == nil || *result.Evidence.PrivilegedTokenPresent {
+					t.Fatalf("missing verified cleanup evidence: %+v", result.Evidence)
+				}
+				if entry.LastCleanupFailureCode != "" {
+					t.Fatalf("successful cleanup recorded a cleanup error: %+v", entry)
+				}
+			} else {
+				if result.Evidence.CleanupFailureCode != tc.wantCleanupErr || entry.LastCleanupFailureCode != tc.wantCleanupErr {
+					t.Fatalf("cleanup failure missing from result/ledger: result=%+v entry=%+v", result.Evidence, entry)
+				}
+				if result.Evidence.PrivilegedTokenPresent != nil && !*result.Evidence.PrivilegedTokenPresent {
+					t.Fatalf("unverified token absence was claimed: %+v", result.Evidence)
+				}
+			}
+			if win.cleanupJobName != "" || win.cleanupProcess.PID != 0 {
+				t.Fatalf("promotion failure attempted cleanup against a fabricated process: job=%q process=%+v", win.cleanupJobName, win.cleanupProcess)
+			}
+		})
 	}
 }
 
