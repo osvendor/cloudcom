@@ -185,6 +185,8 @@ const PREDICATE_CHECK_EXCEPTIONS = new Set(['tenant_variables']);
  * silently writes the old value back — equally fatal, and quieter.
  */
 const ORG_ID_BLOCKING_TRIGGERS: Readonly<Record<string, string>> = {
+  'portal_native_targets.portal_native_target_generation':
+    'RAISEs 23514 when org_id changes; a native enrollment cannot move to another organization',
   'portal_remote_assignments.portal_remote_assignment_version':
     'RAISEs 23514 on org or principal/device identity changes; remote grants never transfer between organizations',
   'offline_transition_effects.offline_effect_source_guard': 'RAISEs iff immutable source org_id changes; historical intents remain with source until erasure',

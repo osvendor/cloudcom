@@ -51,6 +51,9 @@ func TestLinuxNativeTargetOriginAndSeedValidation(t *testing.T) {
 }
 
 func TestLinuxNativeTargetDirectoryRejectsLooseModesAndLinks(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root-owned enrollment directory requires root; covered by the root-run Linux acceptance suite")
+	}
 	parent := t.TempDir()
 	private := filepath.Join(parent, "private")
 	if err := os.Mkdir(private, 0o700); err != nil {
