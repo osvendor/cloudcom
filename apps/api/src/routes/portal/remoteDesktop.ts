@@ -13,6 +13,7 @@ import { dispatchCommandToAgent } from '../../services/agentCommandRelay';
 import { createDesktopStartCommandId, getIceServers, resolveRemoteSessionPromptConfig } from '../remote/helpers';
 import { validatePortalCookieCsrfRequest, writePortalAudit } from './helpers';
 import { portalRemoteStartRateLimit } from './remoteRateLimit';
+import { expireStaleNativeSessionsForDevice } from '../../services/portalNativeAdmission';
 
 export const portalDesktopRoutes = new Hono();
 portalDesktopRoutes.post('/remote/sessions', portalRemoteStartRateLimit);
@@ -63,7 +64,8 @@ portalDesktopRoutes.post('/remote/sessions', zValidator('json', z.object({ devic
     await db.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${input.deviceId}, 0))`);
     // An abandoned landing page must not reserve a computer for twelve hours.
     // Pending rows have never published a start command, so expiry is confirmed.
-    await db.execute(sql`UPDATE portal_remote_sessions SET status='disconnected',ended_at=now(),desktop_start_generation=1,terminal_generation=1,termination_phase='confirmed' WHERE device_id=${input.deviceId}::uuid AND status='pending' AND desktop_start_generation=0 AND created_at <= now() - interval '120 seconds'`);
+    await db.execute(sql`UPDATE portal_remote_sessions SET status='disconnected',ended_at=now(),desktop_start_generation=1,terminal_generation=1,termination_phase='confirmed' WHERE device_id=${input.deviceId}::uuid AND transport='webrtc' AND status='pending' AND desktop_start_generation=0 AND created_at <= now() - interval '120 seconds'`);
+    await expireStaleNativeSessionsForDevice(p.orgId, input.deviceId);
     const busy = await db.execute(sql`SELECT id FROM remote_sessions WHERE device_id=${input.deviceId}::uuid AND type='desktop' AND status IN ('pending','connecting','active') UNION ALL SELECT id FROM portal_remote_sessions WHERE device_id=${input.deviceId}::uuid AND status IN ('pending','connecting','active') AND hard_deadline>now() LIMIT 1`);
     if (busy.length) return { ok: false as const, reason: 'busy' };
     return createPortalDesktopSession(p, input.deviceId);
