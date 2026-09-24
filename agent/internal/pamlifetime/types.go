@@ -69,9 +69,11 @@ type ResultEvidence struct {
 	// independent endpoint evidence after the named Job Object had already
 	// disappeared (agent crash during an active grant, #4196). It lets the
 	// audit trail distinguish a crash-recovered cleanup from a normal one.
-	JobObjectAbsent *bool  `json:"jobObjectAbsent,omitempty"`
-	TargetHash      string `json:"targetHash,omitempty"`
-	BootID          string `json:"bootId,omitempty"`
+	JobObjectAbsent    *bool  `json:"jobObjectAbsent,omitempty"`
+	TargetHash         string `json:"targetHash,omitempty"`
+	BootID             string `json:"bootId,omitempty"`
+	FailureStage       string `json:"failureStage,omitempty"`
+	CleanupFailureCode string `json:"cleanupFailureCode,omitempty"`
 }
 
 type Result struct {

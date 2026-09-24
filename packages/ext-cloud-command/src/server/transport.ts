@@ -8,6 +8,22 @@ export interface Credentials { origin: string; clientId: string; secret: string 
 
 /** The host supplies DNS-pinned public-only HTTPS transport. Never use global fetch. */
 export function createProvider(fetch: GuardedFetch) {
+  function callLogNextSkip(nextLink: unknown, requestUrl: string, skip: number): number | null {
+    if (typeof nextLink !== 'string' || nextLink.length > 4096) return null;
+    let next: URL;
+    try { next = new URL(nextLink, requestUrl); } catch { return null; }
+    const current = new URL(requestUrl);
+    if (next.origin !== current.origin || next.pathname !== current.pathname || next.username || next.password || next.hash) return null;
+    const expected = new URLSearchParams(current.search);
+    const actual = new URLSearchParams(next.search);
+    if (actual.size !== expected.size || actual.getAll('$skip').length !== 1) return null;
+    for (const [key, value] of expected) {
+      if (key === '$skip') continue;
+      if (actual.getAll(key).length !== 1 || actual.get(key) !== value) return null;
+    }
+    const offset = actual.get('$skip');
+    return offset === String(skip + 100) && skip < 100000 ? skip + 100 : null;
+  }
   async function json(url: string, init: RequestInit, signal: AbortSignal) {
     try {
       const response = await fetch(url, { ...init, signal, redirect: 'error', timeoutMs: 15000, maxBytes: 2 * 1024 * 1024 });
@@ -40,7 +56,9 @@ export function createProvider(fetch: GuardedFetch) {
       const period = (value: string) => value.replace(/\.000Z$/, 'Z');
       const path = `ReportCallLogData/Pbx.GetCallLogData(periodFrom=${period(start)},periodTo=${period(end)},sourceType=0,sourceFilter='',destinationType=0,destinationFilter='',callsType=0,callTimeFilterType=0,callTimeFilterFrom='0:00:0',callTimeFilterTo='0:00:0',hidePcalls=true)`;
       const query = new URLSearchParams({ '$top': '100', '$skip': String(skip) });
-      return json(`${origin}/xapi/v1/${path}?${query}`, { headers }, signal);
+      const url = `${origin}/xapi/v1/${path}?${query}`;
+      const result = await json(url, { headers }, signal);
+      return Object.assign(result, { verifiedNextSkip: callLogNextSkip(result['@odata.nextLink'], url, skip) });
     },
     async systemStatus(credentials: Credentials) {
       const signal = AbortSignal.timeout(30000);

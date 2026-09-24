@@ -1,3 +1,4 @@
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { Hono } from 'hono';
 import type { ExtensionRuntimeContext } from '@breeze/extension-sdk';
 import type { Variables, ThreeCxConnection } from './index';
@@ -35,6 +36,8 @@ export function mountThreeCxCallLog(app: Hono<{ Variables: Variables }>, deps: {
   provider: Provider;
   context: ExtensionRuntimeContext;
 }) {
+  const cursorSignature = (secret: string, row: ThreeCxConnection, start: string, end: string, skip: number, expires: string) =>
+    createHmac('sha256', secret).update(JSON.stringify([row.id, row.org_id, row.version, start, end, skip, expires])).digest('hex');
   app.get('/threecx/call-log', async c => {
     const scope = c.get('scope');
     const row = await deps.connection(scope.organizationId);
@@ -46,18 +49,32 @@ export function mountThreeCxCallLog(app: Hono<{ Variables: Variables }>, deps: {
     const start = time(c.req.query('start'));
     const end = time(c.req.query('end'));
     const skipText = c.req.query('skip') ?? '0';
-    if (!start || !end || !/^\d{1,6}$/.test(skipText)) return c.json({ error: 'Invalid report range', code: 'invalid_report_range' }, 400);
+    if (!start || !end || !/^(0|[1-9]\d{0,5})$/.test(skipText)) return c.json({ error: 'Invalid report range', code: 'invalid_report_range' }, 400);
     const skip = Number(skipText);
     const duration = new Date(end).getTime() - new Date(start).getTime();
     if (duration <= 0 || duration > 31 * 86400000) return c.json({ error: 'Invalid report range', code: 'invalid_report_range' }, 400);
-    if (skip !== 0) return c.json({ error: 'Report pagination is unavailable until PBX continuation semantics are verified.', code: 'report_pagination_unverified' }, 409);
-    const result = await deps.provider.callLog(deps.credentials(row), start, end, skip);
+    if (skip > 100000 || skip % 100 !== 0) return c.json({ error: 'Invalid report page', code: 'invalid_report_page' }, 400);
+    const credentials = deps.credentials(row);
+    if (skip > 0) {
+      const cursor = c.req.query('cursor') ?? '';
+      const match = /^(\d{13})\.([a-f0-9]{64})$/.exec(cursor);
+      const expires = match?.[1] ?? '';
+      const validTime = Number(expires) > Date.now() && Number(expires) < Date.now() + 600001;
+      const expected = cursorSignature(credentials.secret, row, start, end, skip, expires);
+      if (!match || !validTime || !timingSafeEqual(Buffer.from(match[2], 'hex'), Buffer.from(expected, 'hex')))
+        return c.json({ error: 'Report page expired; search again.', code: 'invalid_report_cursor' }, 409);
+    }
+    const result = await deps.provider.callLog(credentials, start, end, skip);
     if (!Array.isArray(result.value) || result.value.length > 100) throw new ProviderError('invalid_provider_response');
     const items = result.value.map(projectCallLog);
-    // The PBX may return an opaque server-driven nextLink. Never invent a $skip continuation,
-    // follow a bearer-bearing URL, or imply this first page is the complete report.
+    // A continuation is usable only when the provider's nextLink has the exact same
+    // origin, function path and fixed query, and advances by one page. The transport
+    // validates it but never follows a provider-supplied bearer-bearing URL.
+    const nextSkip = items.length > 0 ? result.verifiedNextSkip : null;
+    const nextExpires = String(Date.now() + 600000);
+    const nextCursor = nextSkip === null ? null : `${nextExpires}.${cursorSignature(credentials.secret, row, start, end, nextSkip, nextExpires)}`;
     const more = Boolean(result['@odata.nextLink']) || result.value.length === 100;
-    await deps.context.audit({ orgId: scope.organizationId, actorId: scope.actorId, actorType: 'user', action: 'cloudcommand.threecx.call_log.read', resourceType: 'integration', resourceId: row.id, result: 'success', details: { returned: items.length, truncated: more } });
-    return c.json({ items, nextSkip: null, truncated: more, scope: 'full_pbx', start, end });
+    await deps.context.audit({ orgId: scope.organizationId, actorId: scope.actorId, actorType: 'user', action: 'cloudcommand.threecx.call_log.read', resourceType: 'integration', resourceId: row.id, result: 'success', details: { returned: items.length, truncated: more, offset: skip } });
+    return c.json({ items, nextSkip, nextCursor, truncated: more, scope: 'full_pbx', start, end });
   });
 }

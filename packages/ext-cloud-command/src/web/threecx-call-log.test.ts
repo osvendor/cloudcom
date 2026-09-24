@@ -50,7 +50,7 @@ describe('3CX Call Log page', () => {
     expect(root.querySelector<HTMLTableRowElement>('tr[data-call-index="0"]')!.hidden).toBe(true);
     expect(root.querySelector<HTMLTableRowElement>('tr[data-call-index="1"]')!.hidden).toBe(false);
     expect(root.querySelector('#filter-count')!.textContent).toBe('1 matching loaded events');
-    expect(root.textContent).toContain('Filtering and export include only the loaded page; more events may exist');
+    expect(root.textContent).toContain('Filtering and export include only 2 loaded events; more events may exist');
     filter.value = 'not-present'; filter.dispatchEvent(new Event('input', { bubbles: true }));
     expect(root.querySelector<HTMLButtonElement>('#export')!.disabled).toBe(true);
     expect(root.querySelector<HTMLElement>('#filter-empty')!.hidden).toBe(false);
@@ -73,5 +73,22 @@ describe('3CX Call Log page', () => {
     expect(details.textContent).toContain('200 · Customer');
     expect(details.textContent).toContain('0:00:05');
     expect(details.textContent).toContain('Outbound');
+  });
+  it('loads only a confirmed next page and appends results for export', async () => {
+    const request = vi.fn(async (path: string) => Response.json(path.includes('skip=100')
+      ? { scope: 'full_pbx', items: [{ CallId: 'second', Answered: false }], nextSkip: null, truncated: false }
+      : { scope: 'full_pbx', items: [{ CallId: 'first', Answered: true }], nextSkip: 100, nextCursor: `${'1'.repeat(13)}.${'a'.repeat(64)}`, truncated: true }));
+    const page = mount(request);
+    page.shadowRoot!.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await flush();
+    expect(page.shadowRoot!.querySelector('#more')).toBeTruthy();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('#more')!.click();
+    await flush();
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request.mock.calls[1]![0]).toContain(`cursor=${'1'.repeat(13)}.${'a'.repeat(64)}`);
+    expect(page.shadowRoot!.textContent).toContain('2 events loaded');
+    expect(page.shadowRoot!.textContent).toContain('first');
+    expect(page.shadowRoot!.textContent).toContain('second');
+    expect(page.shadowRoot!.querySelector('#more')).toBeNull();
   });
 });

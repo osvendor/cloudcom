@@ -35,6 +35,8 @@ type lifetimeStore interface {
 	PrepareCleanup(CleanupCommand) (Decision, error)
 	BindProcess(string, uint64, ProcessIdentity) error
 	ClearProcessIdentity(string, uint64) error
+	RecordApplyFailure(string, uint64, string, string) error
+	RecordCleanupFailure(string, uint64, string) error
 	Entry(string) (LedgerEntry, bool)
 	Entries() []LedgerEntry
 	// LoadError reports a ledger that could not be read. Entries() returns an
@@ -178,7 +180,7 @@ func (m *lifecycleManager) apply(ctx context.Context, cmd ApplyCommand, handoff 
 
 	credential, err := m.account.Promote(ctx)
 	if err != nil {
-		return m.failed(cmd.ActuationID, cmd.Generation, bootID, "account_promotion_failed")
+		return m.compensateApplyFailure(ctx, cmd, bootID, "account_promotion", "account_promotion_failed")
 	}
 	deprovisionOnFailure := true
 	defer func() {
@@ -274,6 +276,41 @@ func (m *lifecycleManager) Cleanup(ctx context.Context, cmd CleanupCommand) Resu
 	return result
 }
 
+// compensateApplyFailure records why an apply stopped before a process was
+// created, then uses the regular cleanup verifier. It never fabricates process
+// identity; readiness is restored only when cleanup returns cleaned.
+func (m *lifecycleManager) compensateApplyFailure(ctx context.Context, cmd ApplyCommand, bootID, stage, code string) Result {
+	if err := m.store.RecordApplyFailure(cmd.ActuationID, cmd.Generation, stage, code); err != nil {
+		result := m.failed(cmd.ActuationID, cmd.Generation, bootID, storeFailureCode(err))
+		result.Evidence.FailureStage = stage
+		m.markUnresolved(cmd.ActuationID, cmd.Generation)
+		return result
+	}
+	entry, ok := m.store.Entry(cmd.ActuationID)
+	if !ok {
+		result := m.failed(cmd.ActuationID, cmd.Generation, bootID, "ledger_unavailable")
+		result.Evidence.FailureStage = stage
+		m.markUnresolved(cmd.ActuationID, cmd.Generation)
+		return result
+	}
+	cleanup := m.cleanupLocked(ctx, cleanupCommandFromEntry(entry, cmd.Generation+1))
+	result := m.failed(cmd.ActuationID, cmd.Generation, bootID, code)
+	result.Evidence = cleanup.Evidence
+	result.Evidence.FailureStage = stage
+	if cleanup.State == ResultCleaned {
+		m.recordCleanupOutcome(cmd.ActuationID, cleanup)
+		return result
+	}
+	if cleanup.FailureCode != "" {
+		result.Evidence.CleanupFailureCode = cleanup.FailureCode
+		if err := m.store.RecordCleanupFailure(cmd.ActuationID, cleanup.Generation, cleanup.FailureCode); err != nil {
+			result.Evidence.CleanupFailureCode = storeFailureCode(err)
+		}
+	}
+	m.recordCleanupOutcome(cmd.ActuationID, cleanup)
+	return result
+}
+
 func (m *lifecycleManager) cleanupLocked(ctx context.Context, cmd CleanupCommand) Result {
 	bootID, bootErr := m.currentBootID(ctx)
 	if bootErr != nil {
@@ -333,7 +370,12 @@ func (m *lifecycleManager) cleanupLocked(ctx context.Context, cmd CleanupCommand
 	}
 	verified, err := m.account.VerifyClean(ctx)
 	if err != nil || verified.Enabled || verified.InAdministrators || deprovisioned.Enabled || deprovisioned.InAdministrators {
-		return m.failed(cmd.ActuationID, cmd.Generation, bootID, "account_verification_failed")
+		result := m.failed(cmd.ActuationID, cmd.Generation, bootID, "account_verification_failed")
+		if err == nil {
+			result.Evidence.AccountEnabled = boolPtr(verified.Enabled || deprovisioned.Enabled)
+			result.Evidence.AccountInAdministrators = boolPtr(verified.InAdministrators || deprovisioned.InAdministrators)
+		}
+		return result
 	}
 	// Windows can retain a terminated process token briefly after the Job
 	// Object reports zero members. Wait for that teardown to finish, but never
@@ -350,7 +392,13 @@ func (m *lifecycleManager) cleanupLocked(ctx context.Context, cmd CleanupCommand
 		privileged, err = m.windows.VerifyNoPrivilegedToken(ctx, elevaccount.AccountName)
 	}
 	if err != nil || privileged {
-		return m.failed(cmd.ActuationID, cmd.Generation, bootID, "privileged_token_verification_failed")
+		result := m.failed(cmd.ActuationID, cmd.Generation, bootID, "privileged_token_verification_failed")
+		result.Evidence.AccountEnabled = boolPtr(verified.Enabled)
+		result.Evidence.AccountInAdministrators = boolPtr(verified.InAdministrators)
+		if err == nil {
+			result.Evidence.PrivilegedTokenPresent = boolPtr(privileged)
+		}
+		return result
 	}
 	evidence := evidenceFromEntry(entry)
 	evidence.BootID = bootID
