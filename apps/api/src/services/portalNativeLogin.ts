@@ -1,5 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { getRedis } from './redis';
+import { currentCompanyGatewayFingerprint } from './portalCompanyGateway';
 
 export const NATIVE_CLIENT_ID = 'cloudcom-rustdesk-v1';
 // The dot cannot occur in existing nanoid browser-session tokens.
@@ -17,13 +18,14 @@ export type NativeLoginRequest = {
   state: string;
 };
 type Principal = { portalUserId: string; orgId: string; authEpoch: number };
-export type NativeCompanyContext = { orgId: string | null; expiresAt?: number };
+export type NativeCompanyContext = { orgId: string | null; expiresAt?: number; configFingerprint?: string };
 type StoredCode = NativeLoginRequest & Principal & {
   version: 1;
   expiresAt: number;
   parentSessionToken: string;
   companyOrgId: string | null;
   companyExpiresAt: number | null;
+  companyConfigFingerprint: string | null;
 };
 
 function canonical32(value: unknown): value is string {
@@ -58,7 +60,8 @@ export async function issueNativeLoginCode(
     || !/^[A-Za-z0-9_-]{20,128}$/.test(parentSessionToken)
     || parentSessionToken.startsWith(NATIVE_SESSION_PREFIX)
     || (process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED === 'true'
-      && (company.orgId !== principal.orgId || !Number.isSafeInteger(company.expiresAt)
+      && (company.orgId !== principal.orgId || company.configFingerprint !== currentCompanyGatewayFingerprint()
+        || !/^[0-9a-f]{64}$/.test(company.configFingerprint ?? '') || !Number.isSafeInteger(company.expiresAt)
         || company.expiresAt! <= Date.now() || company.expiresAt! > Date.now() + 86400_000))
     || (company.orgId !== null && company.orgId !== principal.orgId)) throw new Error('Invalid native login request');
   const redis = getRedis();
@@ -66,7 +69,8 @@ export async function issueNativeLoginCode(
   const code = randomBytes(32).toString('base64url');
   const record: StoredCode = { ...request, ...principal, version: 1,
     parentSessionToken, expiresAt: Date.now() + CODE_SECONDS * 1000,
-    companyOrgId: company.orgId, companyExpiresAt: company.expiresAt ?? null };
+    companyOrgId: company.orgId, companyExpiresAt: company.expiresAt ?? null,
+    companyConfigFingerprint: company.configFingerprint ?? null };
   // This private record references the browser session for a live logout check.
   // It must never appear in audit/error output or be returned to the caller.
   const stored = await redis.set(CODE_PREFIX + hash(code), JSON.stringify(record), 'EX', CODE_SECONDS, 'NX');
@@ -103,7 +107,10 @@ export async function exchangeNativeLoginCode(request: {
       || !Number.isSafeInteger(record.expiresAt) || Date.now() >= record.expiresAt
       || record.expiresAt > Date.now() + CODE_SECONDS * 1000
       || (process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED === 'true'
-        && (record.companyOrgId !== record.orgId || !Number.isSafeInteger(record.companyExpiresAt)
+        && (record.companyOrgId !== record.orgId
+          || record.companyConfigFingerprint !== currentCompanyGatewayFingerprint()
+          || !/^[0-9a-f]{64}$/.test(record.companyConfigFingerprint ?? '')
+          || !Number.isSafeInteger(record.companyExpiresAt)
           || record.companyExpiresAt! <= Date.now() || record.companyExpiresAt! > Date.now() + 86400_000))
       || (record.companyOrgId !== null && record.companyOrgId !== record.orgId)
       || typeof record.parentSessionToken !== 'string' || !/^[A-Za-z0-9_-]{20,128}$/.test(record.parentSessionToken)
@@ -124,6 +131,7 @@ export async function exchangeNativeLoginCode(request: {
     const session = JSON.stringify({ portalUserId: record.portalUserId, orgId: record.orgId,
       authEpoch: record.authEpoch, nativeClientId: NATIVE_CLIENT_ID,
       companyOrgId: record.companyOrgId, companyExpiresAt: record.companyExpiresAt,
+      companyConfigFingerprint: record.companyConfigFingerprint,
       nativeExpiresAt: Math.min(Date.now() + expiresIn * 1000, record.companyExpiresAt ?? Number.MAX_SAFE_INTEGER) });
     // Recheck the exact parent session inside the same operation that creates
     // the native session. Logout or replacement between the reads wins.
@@ -147,10 +155,12 @@ export function nativeSessionAllows(
     || !Number.isSafeInteger(session.nativeExpiresAt)
     || (session.nativeExpiresAt as number) <= Date.now()
     || (session.nativeExpiresAt as number) > Date.now() + NATIVE_SESSION_SECONDS * 1000) return false;
-  if (process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED === 'true'
-    && (session.companyOrgId !== session.orgId || !Number.isSafeInteger(session.companyExpiresAt)
+  if (process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED !== 'true'
+    || session.companyOrgId !== session.orgId || !Number.isSafeInteger(session.companyExpiresAt)
+      || session.companyConfigFingerprint !== currentCompanyGatewayFingerprint()
+      || !/^[0-9a-f]{64}$/.test(String(session.companyConfigFingerprint ?? ''))
       || (session.companyExpiresAt as number) <= Date.now()
-      || (session.nativeExpiresAt as number) > (session.companyExpiresAt as number))) return false;
+      || (session.nativeExpiresAt as number) > (session.companyExpiresAt as number)) return false;
   return (method === 'POST' && path === '/api/v1/portal/auth/logout')
     || (method === 'GET' && path === '/api/v1/portal/remote/devices')
     || (method === 'POST' && (path === '/api/v1/portal/remote/native/sessions'

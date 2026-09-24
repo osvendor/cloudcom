@@ -169,6 +169,24 @@ describe('GET /remote/devices WebRTC availability', () => {
     expect(body.devices[0]!.transports.rustdesk).not.toHaveProperty('peerId');
   });
 
+  it('keeps an authorized WebRTC device visible when native availability fails', async () => {
+    vi.stubEnv('CLOUDCOM_NATIVE_ADMISSION_ENABLED', 'true');
+    mocks.rows = [device()];
+    mocks.authorize.mockImplementation(async (_principal, _deviceId, transport) => {
+      if (transport === 'rustdesk') throw new Error('native lookup unavailable');
+      return capable();
+    });
+
+    const response = await app().request('/remote/devices');
+    const body = await response.json() as { devices: Array<{ transports: {
+      webrtc: { available: boolean }; rustdesk: { available: boolean; peerId?: string },
+    } }> };
+    expect(response.status).toBe(200);
+    expect(body.devices[0]!.transports.webrtc).toEqual({ available: true });
+    expect(body.devices[0]!.transports.rustdesk.available).toBe(false);
+    expect(body.devices[0]!.transports.rustdesk).not.toHaveProperty('peerId');
+  });
+
   it('returns an empty list without calling authority when there are no grants', async () => {
     const response = await app().request('/remote/devices');
 

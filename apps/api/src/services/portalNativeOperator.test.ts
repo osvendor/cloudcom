@@ -1,14 +1,16 @@
 import { afterEach,beforeEach,describe,it,expect,vi } from 'vitest';
 import type { PortalAuthContext } from '../routes/portal/schemas';
-const mocks=vi.hoisted(()=>({get:vi.fn()}));
+const mocks=vi.hoisted(()=>({get:vi.fn(),fingerprint:vi.fn(()=> 'a'.repeat(64))}));
 vi.mock('../db',()=>({runOutsideDbContext:(fn:()=>unknown)=>fn()}));
 vi.mock('./redis',()=>({getRedis:()=>({get:mocks.get})}));
 vi.mock('./portalNativeAdmission',()=>({nativeSessionHash:()=> 'session-hash'}));
+vi.mock('./portalCompanyGateway',()=>({currentCompanyGatewayFingerprint:mocks.fingerprint}));
 import { authenticateNativeOperator } from './portalNativeOperator';
 import { NATIVE_CLIENT_ID } from './portalNativeLogin';
 const auth={authMethod:'bearer',token:'ccn1.'+'A'.repeat(43),user:{id:'user',orgId:'org',authEpoch:2,accessMode:'remote_only'}} as PortalAuthContext;
 const native=()=>({portalUserId:'user',orgId:'org',authEpoch:2,nativeClientId:NATIVE_CLIENT_ID,
- companyOrgId:'org',companyExpiresAt:Date.now()+30000,nativeExpiresAt:Date.now()+20000});
+ companyOrgId:'org',companyExpiresAt:Date.now()+30000,nativeExpiresAt:Date.now()+20000,
+ companyConfigFingerprint:'a'.repeat(64)});
 beforeEach(()=>{vi.stubEnv('CLOUDCOM_COMPANY_GATEWAY_ENABLED','true');mocks.get.mockResolvedValue(JSON.stringify(native()));});
 afterEach(()=>vi.unstubAllEnvs());
 describe('native operator still requires personal and company authentication',()=>{
@@ -23,6 +25,10 @@ describe('native operator still requires personal and company authentication',()
   await expect(authenticateNativeOperator(auth)).rejects.toThrow();
  });
  it('never uses the company-disabled shortcut',async()=>{vi.stubEnv('CLOUDCOM_COMPANY_GATEWAY_ENABLED','false');await expect(authenticateNativeOperator(auth)).rejects.toThrow();});
+ it('denies a company configuration change during an existing session',async()=>{
+  mocks.fingerprint.mockReturnValueOnce('b'.repeat(64));
+  await expect(authenticateNativeOperator(auth)).rejects.toThrow();
+ });
  it.each([{portalUserId:'other'},{orgId:'other'},{authEpoch:1},{nativeExpiresAt:0},{nativeClientId:'other'}])('rejects revoked or rebound native identity',async changes=>{
   mocks.get.mockResolvedValue(JSON.stringify({...native(),...changes}));await expect(authenticateNativeOperator(auth)).rejects.toThrow();
  });

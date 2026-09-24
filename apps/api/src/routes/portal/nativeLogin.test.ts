@@ -22,7 +22,8 @@ beforeEach(() => { vi.clearAllMocks(); process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED
   mocks.redis.mockReturnValue({}); mocks.csrf.mockReturnValue(null); mocks.limit.mockResolvedValue({ allowed: true });
   mocks.settings.mockResolvedValue([{ enabled: true }]); mocks.issue.mockResolvedValue({ redirectUri: input.redirectUri, expiresIn: 60 });
   mocks.exchange.mockResolvedValue(null); mocks.company.mockResolvedValue({ ok: true,
-    orgId: '22222222-2222-4222-8222-222222222222', expiresAt: Date.now() + 3600_000 }); });
+    orgId: '22222222-2222-4222-8222-222222222222', expiresAt: Date.now() + 3600_000,
+    configFingerprint: 'a'.repeat(64) }); });
 afterEach(() => {
   if (prior === undefined) delete process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED; else process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED = prior;
   if (priorCompany === undefined) delete process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED;
@@ -46,7 +47,8 @@ describe('native sign-in HTTP boundary', () => {
     expect(authorized.status).toBe(200);
     expect(mocks.company).toHaveBeenCalledWith('verified-company-token', true);
     expect(mocks.issue).toHaveBeenCalledWith(expect.objectContaining({ orgId }),
-      'browser_session_1234567890', input, { orgId, expiresAt: expect.any(Number) });
+      'browser_session_1234567890', input, { orgId, expiresAt: expect.any(Number),
+        configFingerprint: 'a'.repeat(64) });
 
     const body = { clientId: input.clientId, redirectUri: input.redirectUri,
       code: Buffer.alloc(32, 9).toString('base64url'), codeVerifier: 'x'.repeat(43) };

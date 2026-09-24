@@ -59,13 +59,19 @@ portalRemoteRoutes.get('/remote/devices', async c => {
       available: false, reason: 'Managed RustDesk client is not ready on this computer',
     };
     if (nativeAdmissionEnabled()) {
-      const nativeAccess = await authorizePortalRemote(principal, device.id, 'rustdesk');
-      if (nativeAccess.ok) {
-        const [target] = await db.select({ rustdeskId: portalNativeTargets.rustdeskId })
-          .from(portalNativeTargets)
-          .where(and(eq(portalNativeTargets.orgId, user.orgId), eq(portalNativeTargets.deviceId, device.id),
-            eq(portalNativeTargets.enabled, true))).limit(1);
-        if (target?.rustdeskId) rustdesk = { available: true, peerId: target.rustdeskId };
+      try {
+        const nativeAccess = await authorizePortalRemote(principal, device.id, 'rustdesk');
+        if (nativeAccess.ok) {
+          const [target] = await db.select({ rustdeskId: portalNativeTargets.rustdeskId })
+            .from(portalNativeTargets)
+            .where(and(eq(portalNativeTargets.orgId, user.orgId), eq(portalNativeTargets.deviceId, device.id),
+              eq(portalNativeTargets.enabled, true))).limit(1);
+          if (target?.rustdeskId) rustdesk = { available: true, peerId: target.rustdeskId };
+        }
+      } catch {
+        // Native availability is advisory. Its failure must not hide an
+        // otherwise authorized browser remote connection.
+        rustdesk = { available: false, reason: 'Managed RustDesk availability is temporarily unavailable' };
       }
     }
     listed.push({ ...device, transports: {

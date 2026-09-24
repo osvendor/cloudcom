@@ -45,7 +45,8 @@ portalNativeAuthorizeRoutes.post('/remote/native/authorize', zValidator('json', 
   const company = await verifyPortalCompanyGateway(c.req.header('Cf-Access-Jwt-Assertion'), true);
   const companyGatewayEnabled = process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED === 'true';
   if (!company.ok || (company.orgId !== null && company.orgId !== auth.user.orgId)
-    || (companyGatewayEnabled && (company.orgId !== auth.user.orgId || !Number.isSafeInteger(company.expiresAt)
+    || (companyGatewayEnabled && (company.orgId !== auth.user.orgId || !company.configFingerprint
+      || !Number.isSafeInteger(company.expiresAt)
       || company.expiresAt! <= Date.now() || company.expiresAt! > Date.now() + 86400_000))) {
     return c.json({ error: 'Company authentication is required' }, company.ok ? 403 : company.status);
   }
@@ -61,7 +62,7 @@ portalNativeAuthorizeRoutes.post('/remote/native/authorize', zValidator('json', 
   try {
     const result = await issueNativeLoginCode({ portalUserId: auth.user.id, orgId: auth.user.orgId,
       authEpoch: auth.user.authEpoch! }, auth.token, request,
-    { orgId: company.orgId, expiresAt: company.expiresAt });
+    { orgId: company.orgId, expiresAt: company.expiresAt, configFingerprint: company.configFingerprint });
     await writeAuditEventAsync(c, { orgId: auth.user.orgId, actorType: 'user', actorId: auth.user.id,
       action: 'portal.native.authorize', resourceType: 'portal_auth', resourceId: auth.user.id,
       result: 'success', details: { principalType: 'portal_user', clientId: NATIVE_CLIENT_ID } });

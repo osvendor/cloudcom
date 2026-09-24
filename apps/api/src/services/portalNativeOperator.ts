@@ -2,6 +2,7 @@ import type { PortalAuthContext } from '../routes/portal/schemas';
 import { runOutsideDbContext } from '../db';
 import { getRedis } from './redis';
 import { NATIVE_CLIENT_ID } from './portalNativeLogin';
+import { currentCompanyGatewayFingerprint } from './portalCompanyGateway';
 import { nativeSessionHash } from './portalNativeAdmission';
 import { NativeAdmissionError, type NativeOperator } from './portalNativeAdmissionSchemas';
 
@@ -19,6 +20,8 @@ export async function authenticateNativeOperator(auth: PortalAuthContext): Promi
     || value.orgId !== auth.user.orgId || value.authEpoch !== auth.user.authEpoch || !Number.isSafeInteger(value.nativeExpiresAt)
     || (value.nativeExpiresAt as number) <= Date.now() || (value.nativeExpiresAt as number) > Date.now() + 12 * 3600_000
     || value.companyOrgId !== auth.user.orgId || !Number.isSafeInteger(value.companyExpiresAt)
+    || value.companyConfigFingerprint !== currentCompanyGatewayFingerprint()
+    || !/^[0-9a-f]{64}$/.test(String(value.companyConfigFingerprint ?? ''))
     || (value.companyExpiresAt as number) <= Date.now() || (value.nativeExpiresAt as number) > (value.companyExpiresAt as number)) {
     throw new NativeAdmissionError(401);
   }
