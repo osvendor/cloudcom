@@ -498,6 +498,7 @@ export const DEVICE_SITE_DENORMALIZED_TABLES = [
 const CORE_DEVICE_CASCADE_DELETE_TABLES = [
   // A permanent device purge removes session children before their grants.
   // Organization moves must not reparent customer identities or their history.
+  'portal_native_admissions', 'portal_native_targets',
   'portal_remote_sessions', 'portal_remote_assignments',
   'topology_node_bindings',
   'bare_metal_recoveries',

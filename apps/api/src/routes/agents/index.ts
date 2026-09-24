@@ -1,3 +1,4 @@
+import { nativeTargetEnrollmentRoutes } from './nativeTarget';
 import { Hono } from 'hono';
 import { agentAuthMiddleware } from '../../middleware/agentAuth';
 import { downloadRoutes } from './download';
@@ -77,6 +78,7 @@ agentRoutes.route('/', inventoryRoutes);
 agentRoutes.route('/', stateRoutes);
 agentRoutes.route('/', sessionsRoutes);
 agentRoutes.route('/', tokenRoutes);
+agentRoutes.route('/', nativeTargetEnrollmentRoutes);
 agentRoutes.route('/', patchesRoutes);
 agentRoutes.route('/', connectionsRoutes);
 agentRoutes.route('/', eventLogsRoutes);
