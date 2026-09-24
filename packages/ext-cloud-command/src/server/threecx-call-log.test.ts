@@ -9,7 +9,7 @@ const PARTNER = '22222222-2222-4222-8222-222222222222';
 const row = (department: number | null) => ({ id: '33333333-3333-4333-8333-333333333333', org_id: ORG, origin: 'https://pbx.example.test', client_id: 'client', secret_ciphertext: 'cipher', department_id: department, enabled: true, version: 1, last_verified_at: null });
 const range = 'start=2026-09-21T00%3A00%3A00.000Z&end=2026-09-22T00%3A00%3A00.000Z';
 function harness(department: number | null, access = true) {
-  const queue = [[{ partner_id: PARTNER }], [row(department)]];
+  const queue = [[{ partner_id: PARTNER }], [row(department)], [{ partner_id: PARTNER }], [row(department)]];
   const db = { execute: vi.fn(async () => queue.shift() ?? []) };
   const secrets = { decryptForColumn: vi.fn(() => 'plain-secret'), encryptForColumn: vi.fn() };
   const fetch = vi.fn();
@@ -46,11 +46,11 @@ describe('3CX call log', () => {
     expect((await read(h.app, query)).status).toBe(400);
     expect(h.fetch).not.toHaveBeenCalled();
   });
-  it('refuses invented offset continuation because server-driven paging is unverified', async () => {
+  it('rejects unbounded or misaligned offsets before contacting the PBX', async () => {
     const h = harness(null);
-    const response = await read(h.app, `${range}&skip=100`);
-    expect(response.status).toBe(409);
-    expect(await response.json()).toMatchObject({ code: 'report_pagination_unverified' });
+    const response = await read(h.app, `${range}&skip=101`);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'invalid_report_page' });
     expect(h.fetch).not.toHaveBeenCalled();
   });
   it('uses one fixed PBX function and returns only allowlisted call metadata', async () => {
@@ -65,7 +65,50 @@ describe('3CX call log', () => {
     expect(url).toContain('/xapi/v1/ReportCallLogData/Pbx.GetCallLogData(');
     expect(url).toContain('%24top=100');
     expect(url).not.toContain('must-not-leak');
-    expect(h.audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'cloudcommand.threecx.call_log.read', result: 'success', details: { returned: 1, truncated: false } }));
+    expect(h.audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'cloudcommand.threecx.call_log.read', result: 'success', details: { returned: 1, truncated: false, offset: 0 } }));
+  });
+  it('permits only provider-confirmed same-function offset continuation', async () => {
+    const h = harness(null);
+    h.fetch.mockImplementation(async (url: string) => {
+      if (url.endsWith('/connect/token')) return Response.json({ access_token: 'token' });
+      const next = new URL(url);
+      next.searchParams.set('$skip', '100');
+      return Response.json({ value: [{ CallId: 'one' }], '@odata.nextLink': next.toString() });
+    });
+    const first = await (await read(h.app)).json();
+    expect(first).toMatchObject({ nextSkip: 100, truncated: true });
+    const second = await (await read(h.app, `${range}&skip=100&cursor=${encodeURIComponent(first.nextCursor)}`)).json();
+    expect(second).toMatchObject({ nextSkip: null, truncated: true });
+  });
+  it('rejects an invented or altered page cursor before PBX access', async () => {
+    const h = harness(null);
+    const response = await read(h.app, `${range}&skip=100&cursor=${'0'.repeat(13)}.${'a'.repeat(64)}`);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: 'invalid_report_cursor' });
+    expect(h.fetch).not.toHaveBeenCalled();
+  });
+  it('ignores a provider continuation that changes the function query', async () => {
+    const h = harness(null);
+    h.fetch.mockImplementation(async (url: string) => {
+      if (url.endsWith('/connect/token')) return Response.json({ access_token: 'token' });
+      const next = new URL(url);
+      next.searchParams.set('$skip', '100');
+      next.searchParams.set('$top', '1000');
+      return Response.json({ value: [{ CallId: 'one' }], '@odata.nextLink': next.toString() });
+    });
+    expect(await (await read(h.app)).json()).toMatchObject({ nextSkip: null, truncated: true });
+  });
+  it('ignores a provider continuation that changes the report path', async () => {
+    const h = harness(null);
+    h.fetch.mockImplementation(async (url: string) => {
+      if (url.endsWith('/connect/token')) return Response.json({ access_token: 'token' });
+      const next = new URL(url);
+      next.pathname = '/xapi/v1/Users';
+      next.searchParams.set('$skip', '100');
+      return Response.json({ value: [{ CallId: 'one' }], '@odata.nextLink': next.toString() });
+    });
+    expect(await (await read(h.app)).json()).toMatchObject({ nextSkip: null, truncated: true });
+    expect(h.fetch).toHaveBeenCalledTimes(2);
   });
   it('labels provider continuation as incomplete and never returns an offset cursor', async () => {
     const h = harness(null);
