@@ -7,7 +7,7 @@ import { Loader2, AlertCircle } from 'lucide-react';
 import { portalLogin, usePortalAuth } from '@/lib/auth';
 import { cn } from '@/lib/utils';
 import { navigateTo } from '@/lib/navigation';
-import { safeNextPath } from '@/lib/nextPath';
+import { postLoginPath } from '@/lib/nextPath';
 import { BTN_PRIMARY, INPUT } from './ui';
 
 const loginSchema = z.object({
@@ -42,8 +42,8 @@ export function LoginForm() {
       // invoice/proposal links are the main way into this portal, and the
       // login wall used to discard them and land everyone on /devices — a
       // technician's inventory, which is not why a customer is here.
-      const next = safeNextPath(new URLSearchParams(window.location.search).get('next'));
-      await navigateTo(next ?? '/', { replace: true });
+      const next = postLoginPath(new URLSearchParams(window.location.search).get('next'), result.user.accessMode);
+      await navigateTo(next, { replace: true });
     } else {
       setError(result.error || 'That email and password don\'t match our records. Try again, or reset your password.');
     }

@@ -19,6 +19,8 @@ import { portalBackupRoutes } from './backups';
 import { portalReportRoutes } from './reports';
 import { portalServiceRoutes } from './service';
 import { portalDocumentRoutes } from './documents';
+import { portalRemoteRoutes } from './remote';
+import { portalNativeExchangeRoutes } from './nativeLogin';
 
 export const portalRoutes = new Hono();
 
@@ -31,6 +33,7 @@ const documentBytesGate = createPortalFeatureGateAny('enableDocuments', 'enableS
 
 // Public routes (no auth required)
 portalRoutes.route('/', authRoutes);
+portalRoutes.route('/', portalNativeExchangeRoutes);
 // Exact `/branding` requires auth (Task 3.3 — org-scoped projection with the
 // five visibility flags); `/branding/:domain` stays public below it because
 // this exact-path middleware does not match the wildcard segment.
@@ -38,6 +41,7 @@ portalRoutes.use('/branding', portalAuthMiddleware);
 portalRoutes.route('/', brandingRoutes);
 
 // Protected routes
+portalRoutes.use('/remote/*', portalAuthMiddleware);
 portalRoutes.use('/devices/*', portalAuthMiddleware);
 portalRoutes.use('/devices/*', portalDevicesEnabledMiddleware);
 portalRoutes.use('/assets/*', portalAuthMiddleware);
@@ -105,3 +109,4 @@ portalRoutes.route('/', portalBackupRoutes);
 portalRoutes.route('/', portalReportRoutes);
 portalRoutes.route('/', portalServiceRoutes);
 portalRoutes.route('/', portalDocumentRoutes);
+portalRoutes.route('/', portalRemoteRoutes);

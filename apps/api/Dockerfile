@@ -24,6 +24,8 @@ COPY packages/extension-sdk/package.json ./packages/extension-sdk/
 COPY packages/extension-web-sdk/package.json ./packages/extension-web-sdk/
 COPY packages/extension-testkit/package.json ./packages/extension-testkit/
 COPY ee/workspace/package.json ./ee/workspace/
+COPY packages/ext-rustdesk-access/package.json ./packages/ext-rustdesk-access/
+COPY packages/ext-cloud-command/package.json ./packages/ext-cloud-command/
 
 # Install all dependencies
 RUN pnpm install --frozen-lockfile --prefer-offline
@@ -51,6 +53,8 @@ COPY tsconfig.json ./
 # no separate build step here -- the API's own tsup build (below) bundles
 # @breeze/ext-workspace source directly via noExternal: [/^@breeze\//].
 RUN pnpm --filter @breeze/ext-workspace build:web
+RUN pnpm --filter @cloudcom/ext-rustdesk-access build:web
+RUN pnpm --filter @cloudcom/ext-cloud-command build:web
 
 # Build the API
 WORKDIR /app/apps/api
@@ -61,6 +65,8 @@ RUN pnpm build
 FROM scratch AS release-dist
 COPY --from=builder /app/apps/api/dist /apps/api/dist
 COPY --from=builder /app/ee/workspace/dist /ee/workspace/dist
+COPY --from=builder /app/packages/ext-rustdesk-access/dist /packages/ext-rustdesk-access/dist
+COPY --from=builder /app/packages/ext-cloud-command/dist /packages/ext-cloud-command/dist
 
 # Runtime source and workspace dependencies do not require compilation. Keeping
 # them separate lets release packaging skip builder when release-dist is supplied.
@@ -105,11 +111,13 @@ COPY --from=runtime-source --chown=hono:nodejs /app/packages ./packages
 # process.cwd() -- so the copy destination must be apps/api/ee, not /app/ee.
 COPY --from=runtime-source --chown=hono:nodejs /app/ee ./apps/api/ee
 COPY --from=release-dist --chown=hono:nodejs /ee/workspace/dist ./apps/api/ee/workspace/dist
+COPY --from=release-dist --chown=hono:nodejs /packages/ext-rustdesk-access/dist ./packages/ext-rustdesk-access/dist
+COPY --from=release-dist --chown=hono:nodejs /packages/ext-cloud-command/dist ./packages/ext-cloud-command/dist
 
 # Copy migration files for auto-migrate on startup
 COPY --from=runtime-source --chown=hono:nodejs /app/apps/api/migrations ./apps/api/migrations
 # Document theme assets (vendored OFL font files for proposal/quote PDF
-# rendering — see apps/api/src/services/documentThemes.ts). FONT_DIR resolves
+# rendering â€” see apps/api/src/services/documentThemes.ts). FONT_DIR resolves
 # from process.cwd(), and this runner's cwd ends at /app/apps/api (WORKDIR
 # below), so the destination mirrors the migrations copy above.
 COPY --from=runtime-source --chown=hono:nodejs /app/apps/api/assets ./apps/api/assets

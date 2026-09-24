@@ -1,0 +1,177 @@
+{
+  "apiVersion": "breeze.extensions/v1",
+  "name": "cloudcommand",
+  "version": "0.1.0",
+  "routeNamespace": "cloud-command",
+  "requires": {
+    "breeze": ">=0.1.0 <0.2.0",
+    "serverSdk": "^1.0.0",
+    "webSdk": "^1.0.0",
+    "capabilities": [
+      "server.routes.v1",
+      "web.pages.v1",
+      "web.navigation.v1",
+      "server.db.rls.v1",
+      "server.secrets.v1",
+      "server.audit.v1"
+    ]
+  },
+  "server": {
+    "entry": "server/index.cjs"
+  },
+  "web": {
+    "entry": "web/index.js",
+    "pages": [
+      {
+        "id": "overview",
+        "path": "/overview",
+        "element": "cloudcommand-overview-page"
+      },
+      {
+        "id": "connect",
+        "path": "/connect",
+        "element": "cloudcommand-connect-page"
+      },
+      {
+        "id": "threecx",
+        "path": "/threecx",
+        "element": "cloudcommand-threecx-page"
+      },
+      {
+        "id": "microsoft",
+        "path": "/microsoft",
+        "element": "cloudcommand-microsoft-page"
+      },
+      {
+        "id": "google",
+        "path": "/google",
+        "element": "cloudcommand-google-page"
+      },
+      {
+        "id": "threecx-dashboard",
+        "path": "/threecx-dashboard",
+        "element": "cloudcommand-threecx-dashboard-page"
+      },
+      {
+        "id": "threecx-call-log",
+        "path": "/threecx-call-log",
+        "element": "cloudcommand-threecx-call-log-page"
+      }
+    ],
+    "navigation": [
+      {
+        "id": "overview",
+        "label": "Cloud Command",
+        "path": "/overview",
+        "order": 100
+      },
+      {
+        "id": "connect",
+        "label": "Connect",
+        "path": "/connect",
+        "order": 101
+      }
+    ],
+    "slots": []
+  },
+  "migrationsDir": "migrations",
+  "schemaCompatibilityFloor": "0.1.0",
+  "publicRoutes": [],
+  "agentRoutes": false,
+  "jobs": [],
+  "aiTools": [],
+  "tenancy": {
+    "orgCascadeDeleteTables": [
+      "cloudcommand_threecx_connections",
+      "cloudcommand_microsoft_connections",
+      "cloudcommand_microsoft_admin_connections",
+      "cloudcommand_microsoft_admin_consent",
+      "cloudcommand_microsoft_directory_preferences"
+    ],
+    "deviceCascadeDeleteTables": [],
+    "deviceOrgDenormalizedTables": [],
+    "nonTenantTables": [],
+    "orgExportColumns": {
+      "cloudcommand_threecx_connections": {
+        "include": [
+          "id",
+          "org_id",
+          "origin",
+          "client_id",
+          "department_id",
+          "enabled",
+          "version",
+          "last_verified_at",
+          "created_at",
+          "updated_at"
+        ],
+        "exclude": [
+          "secret_ciphertext"
+        ]
+      },
+      "cloudcommand_microsoft_connections": {
+        "include": [
+          "id",
+          "org_id",
+          "tenant_id",
+          "tenant_domain",
+          "tenant_name",
+          "enabled",
+          "version",
+          "created_at",
+          "updated_at"
+        ],
+        "exclude": [
+          "backend_identity"
+        ]
+      },
+      "cloudcommand_microsoft_admin_connections": {
+        "exclude": [
+          "credential_version"
+        ],
+        "include": [
+          "id",
+          "org_id",
+          "tenant_id",
+          "tenant_name",
+          "client_id",
+          "permission_manifest_version",
+          "enabled",
+          "generation",
+          "verified_at",
+          "created_at",
+          "updated_at"
+        ]
+      },
+      "cloudcommand_microsoft_directory_preferences": {
+        "include": [
+          "org_id",
+          "actor_id",
+          "microsoft_user_id",
+          "excluded",
+          "created_at",
+          "updated_at"
+        ],
+        "exclude": []
+      },
+      "cloudcommand_microsoft_admin_consent": {
+        "exclude": [
+          "state_hash",
+          "credential_version",
+          "verifier_ciphertext",
+          "nonce"
+        ],
+        "include": [
+          "org_id",
+          "actor_id",
+          "tenant_id",
+          "client_id",
+          "expected_generation",
+          "stage",
+          "expires_at",
+          "created_at"
+        ]
+      }
+    }
+  }
+}

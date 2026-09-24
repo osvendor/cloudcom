@@ -25,6 +25,8 @@ jobs:
       shared: ${{ steps.delta.outputs.shared }}
       native: ${{ steps.delta.outputs.native }}
       infra: ${{ steps.delta.outputs.infra }}
+      portal_remote: ${{ steps.delta.outputs.portalRemote }}
+      unifi_sync_lock: ${{ steps.delta.outputs.unifiSyncLock }}
       unsupported: ${{ steps.delta.outputs.unsupported }}
       baseline_commit: ${{ steps.delta.outputs.baseline_commit }}
     steps:
@@ -110,23 +112,97 @@ jobs:
           node-version-file: .node-version
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Typecheck and test the Cloud Command extension package
+        if: needs.delta.outputs.api == 'true' || needs.delta.outputs.web == 'true' || needs.delta.outputs.shared == 'true'
+        run: |
+          pnpm --filter @cloudcom/ext-cloud-command typecheck
+          pnpm --filter @cloudcom/ext-cloud-command build:web
+          pnpm --filter @cloudcom/ext-cloud-command test
+          pnpm --filter @cloudcom/ext-cloud-command test:server
+          pnpm --filter @cloudcom/ext-cloud-command test:web
+      - name: Verify the private Cloud Command Exchange broker
+        if: needs.delta.outputs.api == 'true' || needs.delta.outputs.infra == 'true'
+        run: python3 scripts/cloudcom/exchange-worker.test.py
       - name: Run API tests and build when API or shared code changed
         if: needs.delta.outputs.api == 'true' || needs.delta.outputs.shared == 'true'
         run: |
-          pnpm --filter @breeze/api test:run
+          pnpm --filter @breeze/shared exec vitest run src/m365/readActions.test.ts
+          pnpm --filter @breeze/m365-graph-read-executor exec tsc --noEmit
+          pnpm --filter @breeze/m365-graph-read-executor exec vitest run src/microsoft/graphClient.test.ts src/microsoft/readActions.test.ts
+          pnpm --filter @breeze/m365-graph-read-executor build
+          pnpm --filter @breeze/api exec vitest run src/services/monitors/monitorCompiler.test.ts src/services/monitors/monitorCompiler.w04.test.ts src/services/automationReferenceAuthorization.test.ts src/jobs/automationWorker.monitorBinding.test.ts
+          pnpm --filter @breeze/api exec vitest run src/services/cloudcom/remoteAccessOptions.test.ts src/routes/devices/cloudcomRemoteAccess.test.ts src/services/remoteAccessLauncher.test.ts src/services/remoteAccessProviders.test.ts src/routes/devices/core.remoteAccessLaunch.test.ts
+          pnpm --filter @breeze/api exec vitest run src/extensions/builtinExtensions.test.ts src/extensions/builtinRegistry.test.ts src/extensions/cloudCommandMicrosoft.test.ts src/extensions/cloudCommandGoogle.test.ts src/services/googleClient.test.ts src/extensions/cloudCommandAdminRuntime.test.ts src/extensions/cloudCommandAdminAuthorization.test.ts src/services/m365ControlPlane/readActionService.test.ts src/services/m365ControlPlane/readActionService.syncRoute.test.ts src/extensions/webRegistry.test.ts src/extensions/webAssets.test.ts src/extensions/stageExtension.test.ts src/extensions/gateway.test.ts src/services/urlSafety.test.ts src/services/urlSafety.tripwire.test.ts src/routes/extensionsWeb.test.ts
           pnpm --filter @breeze/api build
+      - name: Prove Cloud Command 3CX migration and RLS boundaries
+        if: needs.delta.outputs.api == 'true' || needs.delta.outputs.shared == 'true'
+        run: bash scripts/cloudcom/test-threecx-rls.sh
+      - name: Prove UniFi sync organization lock ordering
+        if: needs.delta.outputs.unifi_sync_lock == 'true'
+        env:
+          BREEZE_TEST_PG_PORT: 127.0.0.1:55434
+          BREEZE_TEST_REDIS_PORT: 127.0.0.1:56381
+          BREEZE_TEST_PG_CONTAINER: cloudcom-unifi-ci-postgres
+          BREEZE_TEST_REDIS_CONTAINER: cloudcom-unifi-ci-redis
+          BREEZE_TEST_NETWORK: cloudcom-unifi-ci-network
+          NODE_ENV: test
+          DATABASE_URL: postgresql://breeze_test:breeze_test@localhost:55434/breeze_test
+          DATABASE_URL_APP: postgresql://breeze_app:breeze_test@localhost:55434/breeze_test
+          BREEZE_TEST_DB_URL: postgresql://breeze_test:breeze_test@localhost:55434/breeze_test
+          BREEZE_APP_DB_PASSWORD: breeze_test
+          POSTGRES_PASSWORD: breeze_test
+          REDIS_URL: redis://localhost:56381
+          JWT_SECRET: test-jwt-secret-must-be-at-least-32-characters-long
+          APP_ENCRYPTION_KEY: test-app-encryption-key-at-least-32-chars-long!!
+          APP_ENCRYPTION_KEY_ID: test-key-1
+        run: |
+          set -euo pipefail
+          project="cloudcom-unifi-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() { docker compose --project-name "$project" -f docker-compose.test.yml down -v --remove-orphans; }
+          trap cleanup EXIT
+          docker compose --project-name "$project" -f docker-compose.test.yml up -d --wait
+          pnpm --filter @breeze/api exec vitest run src/jobs/unifiWorker.test.ts
+          pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts src/__tests__/integration/unifiSyncLockOrder.integration.test.ts
+      - name: Verify PAM cleanup recovery dispatch
+        if: needs.delta.outputs.api == 'true'
+        run: pnpm --filter @breeze/api exec vitest run src/jobs/pamActuationWorker.test.ts src/services/commandDispatch.test.ts
+      - name: Verify PAM local decision gate
+        if: needs.delta.outputs.api == 'true'
+        run: pnpm --filter @breeze/api exec vitest run src/routes/agents/elevationRequests.test.ts src/routes/pam.test.ts src/routes/softwarePolicies.test.ts src/jobs/pamJobs.test.ts
+      - name: Verify Windows release trust, routing, and canary selection
+        if: needs.delta.outputs.api == 'true'
+        run: pnpm --filter @breeze/api exec vitest run src/config/validate.test.ts src/services/releaseSource.test.ts src/services/binarySync.test.ts src/services/installerBuilder.test.ts src/routes/agents/download.test.ts src/routes/agents/heartbeat.test.ts
+      - name: Validate customer portal remote access and RLS boundaries
+        if: needs.delta.outputs.portal_remote == 'true'
+        run: bash scripts/cloudcom/test-portal-remote.sh
       - name: Run web tests and build when web or shared code changed
         if: needs.delta.outputs.web == 'true' || needs.delta.outputs.shared == 'true'
         run: |
-          pnpm --filter @breeze/web test --run
+          node scripts/cloudcom/sync-browser-viewer.mjs --check
+          pnpm --filter @breeze/web exec vitest run src/components/cloudcom/browserDesktop src/components/remote/ConnectDesktopButton.browser.test.tsx
+          pnpm --filter @breeze/viewer exec vitest run src/lib/answerPoll.test.ts src/lib/revocationLease.test.ts src/lib/keymap.test.ts src/lib/api.test.ts
+          pnpm --filter @breeze/web exec vitest run src/components/cloudcom/RemoteAccessAlternatives.test.tsx src/components/remote/ConnectDesktopButton.test.tsx src/components/remote/ConnectDesktopButton.denied.test.tsx src/components/remote/ConnectDesktopButton.revoked.test.tsx src/components/remote/ConnectDesktopButton.teardownPending.test.tsx src/components/remote/RemoteToolsPage.test.tsx src/components/remote/RemoteToolsPage.liveDesktopAccess.test.tsx
+          pnpm --filter @breeze/web exec vitest run src/components/layout/Sidebar src/lib/extensions/hostApi.test.ts src/lib/extensions/registry.test.ts src/components/extensions/ExtensionElementHost.test.tsx src/components/extensions/ExtensionSlotHost.test.tsx src/components/extensions/ExtensionPageHost.test.tsx src/components/extensions/useExtensionNavigation.test.tsx src/components/integrations/GoogleWorkspaceIntegration.test.tsx
           pnpm --filter @breeze/web build
       - name: Run fork infrastructure contracts
         if: needs.delta.outputs.infra == 'true'
         run: |
           pnpm --filter @breeze/api exec vitest run src/config/envComposeParity.test.ts
           node --test scripts/release/release-image-consumers.test.mjs
+          node --test scripts/release/cloudcom-candidate-workflow.test.mjs scripts/cloudcom/exchange-worker-release.test.mjs
+          python3 scripts/cloudcom/verify-exchange-worker-oci.test.py
           bash scripts/check-guided-setup-systemd-unit.sh
           node --test scripts/cloudcom/update-upstream.test.mjs
+          node --test scripts/cloudcom/customization-contract.test.mjs
+          node scripts/cloudcom/customization-contract.mjs
+      - name: Validate RustDesk deployment mutation boundaries
+        if: needs.delta.outputs.infra == 'true'
+        shell: pwsh
+        run: |
+          ./scripts/cloudcom/rustdesk/test-contract.ps1
+          Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -Repository PSGallery
+          Import-Module Pester -RequiredVersion 5.7.1
+          Invoke-Pester ./scripts/cloudcom/rustdesk/repair.Tests.ps1 -Output Detailed -CI
       - name: Verify the CloudCom delta classifier
         run: node --test .github/scripts/cloudcom-delta.test.mjs
 
@@ -146,6 +222,8 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: agent/go.mod
+      - name: Install native packet capture headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpcap-dev
       - working-directory: agent
         run: go test -race ./...
 

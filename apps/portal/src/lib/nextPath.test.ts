@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { safeNextPath } from './nextPath';
+import { postLoginPath, safeNextPath } from './nextPath';
 
 describe('safeNextPath', () => {
   it.each([
@@ -8,6 +8,8 @@ describe('safeNextPath', () => {
     ['/quotes/abc-123', '/quotes/abc-123'],
     ['/tickets/9', '/tickets/9'],
     ['/profile', '/profile'],
+    ['/remote', '/remote'],
+    ['/remote/approved-session', '/remote/approved-session'],
     ['/invoices/abc?paid=1', '/invoices/abc?paid=1'],
   ])('accepts in-app route %j', (input, expected) => {
     expect(safeNextPath(input)).toBe(expected);
@@ -54,5 +56,20 @@ describe('safeNextPath', () => {
     '/reports',
   ])('accepts the protected portal path %s', (path) => {
     expect(safeNextPath(path)).toBe(path);
+  });
+});
+
+describe('postLoginPath', () => {
+  it('takes remote-only customers to assigned computers and keeps supported deep links', () => {
+    expect(postLoginPath(null, 'remote_only')).toBe('/remote');
+    expect(postLoginPath('/invoices/123', 'remote_only')).toBe('/remote');
+    expect(postLoginPath('/remote/session', 'remote_only')).toBe('/remote/session');
+    expect(postLoginPath('/profile', 'remote_only')).toBe('/profile');
+    expect(postLoginPath('//other.example/remote', 'remote_only')).toBe('/remote');
+    expect(postLoginPath('/remotefake', 'remote_only')).toBe('/remote');
+  });
+  it('preserves ordinary portal landing behavior', () => {
+    expect(postLoginPath(null, 'standard')).toBe('/');
+    expect(postLoginPath('/invoices/123', 'standard')).toBe('/invoices/123');
   });
 });

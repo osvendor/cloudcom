@@ -221,9 +221,16 @@ x-api-env: &api-env
   M365_GRAPH_ACTIONS_EXECUTOR_SIGNING_PRIVATE_JWK_FILE: /run/secrets/m365_graph_actions_executor_signing_private_jwk
   APP_VERSION: ${BREEZE_VERSION:?Set BREEZE_VERSION in .env}
   BREEZE_VERSION: ${BREEZE_VERSION:?Set BREEZE_VERSION in .env}
+  # Temporary exact-device PAM local-decision gate for a legacy agent.
+  PAM_LEGACY_LOCAL_GATE_DEVICE_IDS: ${PAM_LEGACY_LOCAL_GATE_DEVICE_IDS:-}
   BINARY_SOURCE: github
   RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: ${RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS:?Set RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS in .env}
   BINARY_GITHUB_REPOSITORY: ${BINARY_GITHUB_REPOSITORY:-}
+  BINARY_WINDOWS_GITHUB_REPOSITORY: ${BINARY_WINDOWS_GITHUB_REPOSITORY:-}
+  BINARY_WINDOWS_VERSION: ${BINARY_WINDOWS_VERSION:-}
+  BINARY_WINDOWS_CANARY_DEVICE_ID: ${BINARY_WINDOWS_CANARY_DEVICE_ID:-}
+  BINARY_WINDOWS_INSTALLER_ENABLED: ${BINARY_WINDOWS_INSTALLER_ENABLED:-false}
+  BINARY_WINDOWS_PROMOTE_ENABLED: ${BINARY_WINDOWS_PROMOTE_ENABLED:-false}
   # Binary edition served by this deployment: self-host (default,
   # unchanged behavior) or hosted (production requires
   # BINARY_SOURCE=local + a manifest trust root — not compatible with the
@@ -256,6 +263,8 @@ x-api-env: &api-env
   # available on the managed Postgres in DATABASE_URL — see the note beside
   # this variable in deploy/.env.example.
   BREEZE_WORKSPACE_ENABLED: ${BREEZE_WORKSPACE_ENABLED:-false}
+  CLOUDCOM_REMOTE_ACCESS_ENABLED: ${CLOUDCOM_REMOTE_ACCESS_ENABLED:-false}
+  CLOUDCOM_NATIVE_LOGIN_ENABLED: ${CLOUDCOM_NATIVE_LOGIN_ENABLED:-false}
   TRUST_PROXY_HEADERS: "true"
   TRUSTED_PROXY_CIDRS: "${TRUSTED_PROXY_CIDRS:-172.30.0.11/32}"
   # This reference stack is fronted by Cloudflare (cloudflared → Caddy), so

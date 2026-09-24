@@ -122,6 +122,11 @@ function buildFollowsParentEntries(): Record<string, OrgMergePolicy> {
 }
 
 const SPECIAL: Record<string, OrgMergePolicy> = {
+  portal_native_targets: { kind: 'blocks-merge', note: 'Native enrollment belongs to the original device and organization; revoke and remove before merging.' },
+  portal_native_admissions: { kind: 'blocks-merge', note: 'Native admission identity and session history must not move across organizations.' },
+  portal_remote_settings: { kind: 'blocks-merge', note: 'Explicitly disable and remove remote access configuration before merging customer identities; assignments never transfer authority between organizations.' },
+  portal_remote_assignments: { kind: 'blocks-merge', note: 'Remote approvals are bound to the original customer organization; revoke and remove assignments before merging.' },
+  portal_remote_sessions: { kind: 'blocks-merge', note: 'Remote session identity and audit history remain bound to the original customer organization.' },
   organizations: { kind: 'loser-shell' },
 
   // Track A durable authorization bindings copy both the automation owner and

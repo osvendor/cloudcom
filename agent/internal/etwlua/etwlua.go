@@ -136,6 +136,10 @@ type Event struct {
 
 	// ObservedAt is when the agent saw the event (UTC, RFC3339 in JSON).
 	ObservedAt time.Time `json:"observed_at"`
+
+	// LocalDecisionProtocol=1 asks the server to hold auto-approved actuation
+	// until this agent reports the interactive user's decision.
+	LocalDecisionProtocol int `json:"local_decision_protocol,omitempty"`
 }
 
 // ElevationStatus is the server's ingest decision for a uac_intercept request.
@@ -154,8 +158,9 @@ const (
 // "auto_approved", "denied", or "ignored". RequestID is empty when the
 // server suppressed the request (status "ignored", id null).
 type ElevationOutcome struct {
-	RequestID string
-	Status    ElevationStatus
+	RequestID             string
+	Status                ElevationStatus
+	LocalDecisionRequired bool
 }
 
 // Subscriber abstracts the ETW event source. Real Windows builds use

@@ -1,3 +1,4 @@
+import { nativeTargetRoutes } from './routes/nativeTarget';
 import { config as loadDotenv } from 'dotenv';
 loadDotenv({ quiet: true });
 // Canonicalize NODE_ENV before any module reads it (some routes/services gate
@@ -817,6 +818,7 @@ api.route('/auth', authRoutes);
 api.route('/config', configRoutes);
 api.route('/', externalServicesRoutes);
 api.route('/agents', agentRoutes);
+api.route('/native-target', nativeTargetRoutes);
 api.route('/devices', deviceRoutes);
 api.route('/pam', pamRoutes);
 api.route('/scripts', scriptRoutes);

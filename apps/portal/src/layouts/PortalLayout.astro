@@ -10,6 +10,7 @@ import { buildPortalCustomCss } from '../lib/customCss';
 
 interface Props {
   title: string;
+  remoteOnly?: boolean;
   /** Partner brand accent for a document rendered on this page (proposal or
    *  invoice), emitted below as a nonced <style> element (lib/docAccent.ts). */
   docAccent?: string | null;
@@ -27,7 +28,7 @@ interface Props {
 // for titles and money, Hanken Grotesk elsewhere, statuses as a dot plus
 // uppercase tracked text, 12px surfaces. FIRST VIEWPORT: quiet left rail with
 // the firm's name; serif page title + one line of service copy; the ledger.
-const { title, docAccent, sheet = true } = Astro.props;
+const { title, docAccent, sheet = true, remoteOnly = false } = Astro.props;
 // Astro.url.pathname includes the base (e.g. /c/devices); strip it so the
 // active-nav comparison below stays base-agnostic.
 const pathname = stripBase(Astro.url.pathname);
@@ -36,7 +37,7 @@ const profile = await loadPortalProfile(Astro.request);
 // #2345 — Tickets is hidden when the org's branding has enableTickets: false.
 // Fail-open when the flag is absent (shared-domain portals get no branding row);
 // the API's 403 gate on /portal/tickets/* is the real enforcement.
-const navItems = buildPortalNavItems(branding);
+const navItems = remoteOnly ? [] : buildPortalNavItems(branding);
 
 const accentCss = buildDocAccentCss(docAccent ?? branding.primaryColor);
 // Org-authored portal styling (#5940) — saved via the branding editor and
@@ -210,7 +211,7 @@ const isActive = (href: string) => {
             {/* The one quick action a customer reaches for from anywhere:
                 start a ticket. Gated like the nav entry (#2345): hidden only
                 when branding explicitly disables ticketing. */}
-            {branding.enableTickets !== false && (
+            {!remoteOnly && branding.enableTickets !== false && (
               <a
                 href={withBase('/tickets/new')}
                 data-testid="quick-new-ticket"

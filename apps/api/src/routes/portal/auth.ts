@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import { checkPortalCompanyGateway } from '../../services/portalCompanyGateway';
 import type { Context, Next } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { and, eq, sql } from 'drizzle-orm';
@@ -51,6 +52,8 @@ import {
 import { isSelfManagedDbContextRoute } from '../../middleware/selfManagedDbContextRoutes';
 import { purgeClientAiSessionsForUsers } from '../../services/clientAiSessionStore';
 import { ANONYMOUS_ACTOR_ID, writeAuditEventAsync } from '../../services/auditEvents';
+import { portalAccessModeAllows } from './accessMode';
+import { nativeSessionAllows, NATIVE_SESSION_PREFIX } from '../../services/portalNativeLogin';
 
 export const authRoutes = new Hono();
 const ALLOW_IN_MEMORY_PORTAL_STATE = !PORTAL_USE_REDIS;
@@ -166,6 +169,7 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
             && typeof parsed.orgId === 'string'
             && Number.isSafeInteger(parsed.authEpoch)
             && parsed.authEpoch > 0
+            && nativeSessionAllows(token, parsed, c.req.method, c.req.path, authMethod === 'bearer')
           ) {
             sessionData = {
               portalUserId: parsed.portalUserId,
@@ -181,6 +185,7 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
   }
 
   if (!sessionData && ALLOW_IN_MEMORY_PORTAL_STATE) {
+    if (token.startsWith(NATIVE_SESSION_PREFIX)) return c.json({ error: 'Invalid or expired session' }, 401);
     const session = portalSessions.get(token);
     if (session && session.expiresAt.getTime() > Date.now()) {
       sessionData = {
@@ -221,6 +226,7 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
         receiveNotifications: portalUsers.receiveNotifications,
         status: portalUsers.status,
         authEpoch: portalUsers.authEpoch,
+        accessMode: portalUsers.accessMode,
       })
       .from(portalUsers)
       .where(and(eq(portalUsers.id, sessionData.portalUserId), eq(portalUsers.orgId, sessionData.orgId)))
@@ -231,6 +237,9 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
   // Browser portal sessions are password-ceremony sessions. Entra JIT uses a
   // separate Client-AI session and must never inherit browser access merely
   // because a historical recovery/invite path populated password_hash.
+  if (token.startsWith(NATIVE_SESSION_PREFIX) && user?.accessMode !== 'remote_only') {
+    return c.json({ error: 'Native remote access is not enabled for this account' }, 403);
+  }
   if (!user || user.authMethod !== 'password') {
     if (PORTAL_USE_REDIS) {
       const redis = getRedis();
@@ -321,12 +330,16 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
     return c.json({ error: 'Organization is not available' }, 403);
   }
 
+  if (!portalAccessModeAllows(user.accessMode, c.req.method, c.req.path)) {
+    return c.json({ error: 'This account is limited to assigned remote computers', code: 'PORTAL_REMOTE_ONLY' }, 403);
+  }
+
   // Resolve only after the durable session checks. A stale/legacy generation
   // must not trigger even a secondary tenant read, much less route work.
   const timezone = await withSystemDbAccessContext(() => resolveOrgTimezone(sessionData.orgId));
 
   // Sliding session timeout: any authenticated activity pushes expiry forward.
-  if (PORTAL_USE_REDIS) {
+  if (PORTAL_USE_REDIS && !token.startsWith(NATIVE_SESSION_PREFIX)) {
     const redis = getRedis();
     if (redis) {
       try {
@@ -426,6 +439,7 @@ authRoutes.post('/auth/login', zValidator('json', loginSchema), async (c) => {
         name: portalUsers.name,
         passwordHash: portalUsers.passwordHash,
         authMethod: portalUsers.authMethod,
+        accessMode: portalUsers.accessMode,
         receiveNotifications: portalUsers.receiveNotifications,
         status: portalUsers.status,
         authEpoch: portalUsers.authEpoch,
@@ -458,6 +472,11 @@ authRoutes.post('/auth/login', zValidator('json', loginSchema), async (c) => {
 
   if (user.status !== 'active') {
     return c.json({ error: 'Account is not active' }, 403);
+  }
+
+  if (user.accessMode === 'remote_only') {
+    const company = await checkPortalCompanyGateway(c.req.header('Cf-Access-Jwt-Assertion'), user.orgId);
+    if (!company.ok) return c.json({ error: 'Company authentication is required' }, company.status);
   }
 
   const now = new Date();
@@ -784,6 +803,7 @@ authRoutes.post('/auth/accept-invite', zValidator('json', acceptInviteSchema), a
         name: portalUsers.name,
         passwordHash: portalUsers.passwordHash,
         authMethod: portalUsers.authMethod,
+        accessMode: portalUsers.accessMode,
         receiveNotifications: portalUsers.receiveNotifications,
         status: portalUsers.status,
         authEpoch: portalUsers.authEpoch,

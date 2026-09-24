@@ -1,0 +1,32 @@
+# Review candidate only. Never apply without the signed worker image and live preflight.
+services:
+  api:
+    environment:
+      CLOUDCOM_EXCHANGE_DESCRIPTOR_FILE: /run/cloudcom-exchange-private/tenants.json
+      CLOUDCOM_EXCHANGE_SOCKET_PATH: /run/cloudcom-exchange-private/exchange.sock
+    volumes:
+      - type: bind
+        source: ${CLOUDCOM_EXCHANGE_PRIVATE_DIR:?Set a UID 1001 private host directory}
+        target: /run/cloudcom-exchange-private
+  cloudcom-exchange-worker:
+    image: ${CLOUDCOM_EXCHANGE_WORKER_IMAGE:?Set a verified digest-pinned worker image}
+    container_name: cloudcom-exchange-worker
+    user: "1001:1001"
+    read_only: true
+    init: true
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    tmpfs:
+      - /tmp:rw,nosuid,size=64m
+    networks:
+      breeze: {}
+    volumes:
+      - type: bind
+        source: ${CLOUDCOM_EXCHANGE_PRIVATE_DIR:?Set a UID 1001 private host directory}
+        target: /run/cloudcom-exchange-private
+      - type: bind
+        source: /opt/cloudcom/deployment/microsoft-admin
+        target: /run/cloudcom-microsoft
+        read_only: true

@@ -49,7 +49,7 @@ describe('ConnectDesktopButton — user-denied state', () => {
     // GET /remote/sessions/sess-denied (poll) — returns denied
     fetchMock.mockResolvedValueOnce(jsonRes({ status: 'denied' }));
 
-    render(<ConnectDesktopButton deviceId="dev-denied" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-denied" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {
@@ -71,7 +71,7 @@ describe('ConnectDesktopButton — user-denied state', () => {
     // Poll returns denied
     fetchMock.mockResolvedValueOnce(jsonRes({ status: 'denied' }));
 
-    render(<ConnectDesktopButton deviceId="dev-denied-2" />);
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-denied-2" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
 
     await waitFor(() => {

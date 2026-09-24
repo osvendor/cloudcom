@@ -71,6 +71,29 @@ test('refuses dirty checkouts and release history rollback', (t) => {
   assert.equal(git('status', '--porcelain'), '');
 });
 
+test('aborts a conflict-free upstream update that removes a registered attachment', t => {
+  const { cwd, git, write, baseline } = fixture(t);
+  // Extend baseline on a new upstream branch, then fork only the declaration.
+  git('switch', '-c', 'contract-base', baseline.commit);
+  write('host.ts', 'mount(customModule);\n');
+  git('add', 'host.ts'); git('commit', '-m', 'shared attachment');
+  const base = { commit: git('rev-parse', 'HEAD') };
+  git('switch', '-c', 'contract-upstream');
+  write('host.ts', 'mount(upstreamModule);\n');
+  git('add', 'host.ts'); git('commit', '-m', 'upstream removes attachment');
+  const release = git('rev-parse', 'HEAD');
+  git('switch', '-c', 'contract-fork', base.commit);
+  write('.github/cloudcom-customizations.json', JSON.stringify({ version: 1, customizations: [{
+    id: 'remote', requiredFiles: ['host.ts'], hooks: [{ file: 'host.ts', contains: 'mount(customModule)' }],
+  }] }));
+  git('add', '.'); git('commit', '-m', 'register customization');
+  const original = git('rev-parse', 'HEAD');
+  assert.throws(() => prepareMerge(cwd, release, base), /hook missing/);
+  assert.equal(git('rev-parse', 'HEAD'), original);
+  assert.equal(git('status', '--porcelain'), '');
+  assert.equal(readFileSync(join(cwd, 'host.ts'), 'utf8'), 'mount(customModule);\n');
+});
+
 test('dispatches validation when only earlier heads have runs and avoids duplicate exact-head runs', () => {
   const calls = [];
   const gh = (...args) => {
@@ -103,3 +126,37 @@ test('validates baseline release provenance for lightweight and annotated tags a
   assert.throws(() => verifyBaseline(() => '', gh, { ...baseline, tag: '--invalid' }), /Invalid pinned/);
   assert.throws(() => verifyBaseline(() => '', () => JSON.stringify({ tag_name: baseline.tag, draft: true }), baseline), /published stable/);
 });
+
+for (const removal of ['helper', 'worker hook', 'classifier hook']) {
+  test(`UniFi contract rejects conflict-free upstream removal of ${removal}`, t => {
+    const registry = JSON.parse(readFileSync(new URL('../../.github/cloudcom-customizations.json', import.meta.url), 'utf8'));
+    const customization = registry.customizations.find(item => item.id === 'unifi-sync-lock-order');
+    assert.ok(customization, 'UniFi safeguard must remain registered');
+    const { cwd, git, write, baseline } = fixture(t);
+    git('switch', '-c', 'unifi-base', baseline.commit);
+    const files = new Set([...customization.requiredFiles, ...customization.hooks.map(hook => hook.file)]);
+    for (const file of files) write(file, readFileSync(new URL(`../../${file}`, import.meta.url), 'utf8'));
+    git('add', '.'); git('commit', '-m', 'shared UniFi implementation');
+    const base = { commit: git('rev-parse', 'HEAD') };
+    git('switch', '-c', 'unifi-upstream');
+    if (removal === 'helper') {
+      git('rm', 'apps/api/src/services/unifi/unifiSyncLocks.ts');
+    } else {
+      const file = removal === 'worker hook' ? 'apps/api/src/jobs/unifiWorker.ts' : '.github/scripts/cloudcom-delta.mjs';
+      const hook = customization.hooks.find(item => item.file === file);
+      assert.ok(hook);
+      write(file, readFileSync(join(cwd, file), 'utf8').replace(hook.contains, '// upstream replacement'));
+    }
+    git('add', '.'); git('commit', '-m', 'upstream removes safeguard');
+    const release = git('rev-parse', 'HEAD');
+    git('switch', '-c', 'unifi-fork', base.commit);
+    write('.github/cloudcom-customizations.json', JSON.stringify({ version: 1, customizations: [customization] }));
+    git('add', '.'); git('commit', '-m', 'register UniFi safeguard');
+    const original = git('rev-parse', 'HEAD');
+    assert.throws(() => prepareMerge(cwd, release, base), /Customization unifi-sync-lock-order .*manual integration required/);
+    assert.equal(git('rev-parse', 'HEAD'), original);
+    assert.equal(git('status', '--porcelain'), '');
+    assert.equal(existsSync(join(cwd, '.git/MERGE_HEAD')), false);
+    for (const file of files) assert.equal(readFileSync(join(cwd, file), 'utf8'), readFileSync(new URL(`../../${file}`, import.meta.url), 'utf8'));
+  });
+}

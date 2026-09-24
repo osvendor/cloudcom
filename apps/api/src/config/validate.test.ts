@@ -885,6 +885,41 @@ describe('validateConfig', () => {
     });
   });
 
+  describe('Windows-only self-host release configuration', () => {
+    const windowsEnv = {
+      ...validEnv,
+      BINARY_WINDOWS_GITHUB_REPOSITORY: 'example/windows-signing',
+      BINARY_WINDOWS_VERSION: '0.115.1',
+      BINARY_WINDOWS_CANARY_DEVICE_ID: '123e4567-e89b-42d3-a456-426614174000',
+      BINARY_WINDOWS_INSTALLER_ENABLED: 'false',
+      BINARY_WINDOWS_PROMOTE_ENABLED: 'false',
+    };
+
+    it('accepts a Windows canary without changing the primary release source', () => {
+      withEnv(windowsEnv, () => expect(() => validateConfig()).not.toThrow());
+    });
+
+    it('requires the alternate release key in production', () => {
+      const prod = { ...windowsEnv, NODE_ENV: 'production', CORS_ALLOWED_ORIGINS: 'https://app.example.com', TRUST_PROXY_HEADERS: 'true' };
+      withEnv({ ...prod, RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: 'yzx8ftmcls6uBetFC5SYnZhBo+cbur3IX50TbBthTso=' }, () => {
+        expect(() => validateConfig()).toThrow(/Windows release source requires its own manifest public key/);
+      });
+      withEnv({ ...prod, RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: 'yzx8ftmcls6uBetFC5SYnZhBo+cbur3IX50TbBthTso=,kR2Ql8tXvN4mJ7cB1aZfP0sYuE6dW3gH9iL5nO8rT2A=' }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+
+    it.each([
+      [{ ...windowsEnv, BINARY_WINDOWS_VERSION: '' }, /BINARY_WINDOWS_VERSION/],
+      [{ ...windowsEnv, BINARY_WINDOWS_GITHUB_REPOSITORY: 'owner/..' }, /BINARY_WINDOWS_GITHUB_REPOSITORY/],
+      [{ ...windowsEnv, BINARY_WINDOWS_CANARY_DEVICE_ID: 'all' }, /BINARY_WINDOWS_CANARY_DEVICE_ID/],
+      [{ ...windowsEnv, BINARY_WINDOWS_INSTALLER_ENABLED: 'yes' }, /BINARY_WINDOWS_INSTALLER_ENABLED/],
+      [{ ...windowsEnv, BINARY_WINDOWS_PROMOTE_ENABLED: 'yes' }, /BINARY_WINDOWS_PROMOTE_ENABLED/],
+    ])('rejects an incomplete or broad Windows rollout configuration', (env, message) => {
+      withEnv(env, () => expect(() => validateConfig()).toThrow(message));
+    });
+  });
+
   describe('BINARY_EDITION (hosted fail-closed)', () => {
     const prodBase = {
       ...validEnv,

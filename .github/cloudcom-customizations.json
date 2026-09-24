@@ -1,0 +1,366 @@
+{
+  "version": 1,
+  "customizations": [
+    {
+      "id": "rustdesk-desired-state",
+      "requiredFiles": [
+        "scripts/cloudcom/rustdesk/common.ps1",
+        "scripts/cloudcom/rustdesk/probe.ps1",
+        "scripts/cloudcom/rustdesk/repair.ps1",
+        "scripts/cloudcom/rustdesk/build-upload.ps1",
+        "scripts/cloudcom/rustdesk/test-contract.ps1",
+        "scripts/cloudcom/rustdesk/repair.Tests.ps1",
+        "scripts/cloudcom/rustdesk/README.md"
+      ],
+      "hooks": [
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "Invoke-Pester ./scripts/cloudcom/rustdesk/repair.Tests.ps1"
+        },
+        {
+          "file": "scripts/cloudcom/rustdesk/common.ps1",
+          "contains": "$quiet = Get-CloudComRustDeskQuietState $exe"
+        },
+        {
+          "file": "scripts/cloudcom/rustdesk/repair.ps1",
+          "contains": "Set-CloudComRustDeskQuietMode $state.Exe"
+        }
+      ]
+    },
+    {
+      "id": "remote-access-alternatives",
+      "requiredFiles": [
+        "apps/api/src/routes/devices/cloudcomRemoteAccess.ts",
+        "apps/api/src/routes/devices/cloudcomRemoteAccess.test.ts",
+        "apps/api/src/services/cloudcom/remoteAccessOptions.ts",
+        "apps/api/src/services/cloudcom/remoteAccessOptions.test.ts",
+        "apps/web/src/components/cloudcom/RemoteAccessAlternatives.tsx",
+        "apps/web/src/components/cloudcom/RemoteAccessAlternatives.test.tsx",
+        "docs/cloudcom-rustdesk.md"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/routes/devices/index.ts",
+          "contains": "deviceRoutes.route('/', cloudcomRemoteAccessRoutes)"
+        },
+        {
+          "file": "apps/web/src/components/remote/RemoteToolsPage.tsx",
+          "contains": "<RemoteAccessAlternatives"
+        }
+      ]
+    },
+    {
+      "id": "browser-desktop",
+      "requiredFiles": [
+        "apps/web/src/components/cloudcom/browserDesktop/launch.tsx",
+        "apps/web/src/components/cloudcom/browserDesktop/browserFetch.ts",
+        "scripts/cloudcom/sync-browser-viewer.mjs",
+        "docs/cloudcom-browser-desktop.md"
+      ],
+      "hooks": [
+        {
+          "file": "apps/web/src/components/remote/ConnectDesktopButton.tsx",
+          "contains": "browserViewer.launchBrowserDesktop"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "sync-browser-viewer.mjs --check"
+        }
+      ]
+    },
+    {
+      "id": "monitor-response-reference-fix",
+      "requiredFiles": [
+        "apps/api/src/services/monitors/monitorCompiler.ts",
+        "apps/api/src/services/monitors/monitorCompiler.w04.test.ts"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/services/monitors/monitorCompiler.ts",
+          "contains": "const diagnosticReferences = buildDiagnosticScriptReferences(def)"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "src/services/monitors/monitorCompiler.w04.test.ts"
+        }
+      ]
+    },
+    {
+      "id": "cloud-command-threecx",
+      "requiredFiles": [
+        "packages/ext-cloud-command/manifest.json",
+        "packages/ext-cloud-command/src/server/index.ts",
+        "packages/ext-cloud-command/src/server/transport.ts",
+        "packages/ext-cloud-command/src/web/index.ts",
+        "packages/ext-cloud-command/src/web/connect.ts",
+        "packages/ext-cloud-command/src/web/connect.test.ts",
+        "packages/ext-cloud-command/migrations/2026-09-21-threecx-connections.sql",
+        "apps/web/src/lib/extensions/hostApi.ts",
+        "packages/extension-web-sdk/src/hostApi.ts",
+        "docs/cloudcom-threecx.md"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "enableEnvVar: 'CLOUDCOM_THREECX_ENABLED'"
+        },
+        {
+          "file": "apps/web/src/components/extensions/ExtensionElementHost.tsx",
+          "contains": "createExtensionHostApi"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "scripts/cloudcom/test-threecx-rls.sh"
+        },
+        {
+          "file": "apps/api/Dockerfile",
+          "contains": "@cloudcom/ext-cloud-command build:web"
+        }
+      ]
+    },
+    {
+      "id": "cloud-command-threecx-call-log",
+      "requiredFiles": [
+        "packages/ext-cloud-command/src/server/threecx-call-log.ts",
+        "packages/ext-cloud-command/src/server/threecx-call-log.test.ts",
+        "packages/ext-cloud-command/src/web/threecx-call-log.ts",
+        "packages/ext-cloud-command/src/web/threecx-call-log.test.ts",
+        "packages/ext-cloud-command/src/server/transport.ts",
+        "packages/ext-cloud-command/src/server/index.ts",
+        "packages/ext-cloud-command/src/web/index.ts",
+        "packages/ext-cloud-command/manifest.json",
+        "docs/cloudcom-threecx.md"
+      ],
+      "hooks": [
+        {
+          "file": "packages/ext-cloud-command/src/server/index.ts",
+          "contains": "mountThreeCxCallLog(app"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/web/index.ts",
+          "contains": "import './threecx-call-log'"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand-threecx-call-log-page"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/server/threecx-call-log.ts",
+          "contains": "report_scope_unverified"
+        }
+      ]
+    },
+    {
+      "id": "cloud-command-microsoft365",
+      "requiredFiles": [
+        "packages/ext-cloud-command/src/server/native-microsoft.ts",
+        "apps/api/src/extensions/cloudCommandMicrosoft.ts",
+        "packages/ext-cloud-command/src/server/microsoft.ts",
+        "packages/ext-cloud-command/src/web/microsoft.ts",
+        "packages/ext-cloud-command/migrations/2026-09-22-microsoft-connections.sql",
+        "docs/cloudcom-microsoft365.md",
+        "packages/ext-cloud-command/src/web/overview.ts",
+        "packages/ext-cloud-command/src/web/overview.test.ts",
+        "packages/ext-cloud-command/src/server/admin-services.ts",
+        "packages/ext-cloud-command/src/server/admin-store.ts",
+        "packages/ext-cloud-command/migrations/2026-09-22-native-admin-connections.sql",
+        "apps/api/src/extensions/cloudCommandAdminRuntime.ts",
+        "apps/api/src/extensions/cloudCommandAdminAuthorization.ts",
+        "packages/ext-cloud-command/src/web/microsoft-connect.ts"
+      ],
+      "hooks": [
+        {
+          "file": "packages/ext-cloud-command/src/server/index.ts",
+          "contains": "mountMicrosoftRoutes(app, administration ? createAdministrationServices(context, fetch, administration) : microsoft)"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/web/index.ts",
+          "contains": "import './microsoft'"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand-microsoft-page"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand-connect-page"
+        }
+      ]
+    },
+    {
+      "id": "cloud-command-microsoft-parity",
+      "requiredFiles": [
+        "packages/ext-cloud-command/src/server/admin-execution.ts",
+        "packages/ext-cloud-command/src/server/admin-graph-provider.ts",
+        "packages/ext-cloud-command/src/server/admin-auth-methods.ts",
+        "packages/ext-cloud-command/src/server/admin-auth-methods.test.ts",
+        "packages/ext-cloud-command/src/server/exchange-contract.ts",
+        "packages/ext-cloud-command/src/server/exchange-socket-client.ts",
+        "packages/ext-cloud-command/src/server/exchange-contract.test.ts",
+        "packages/ext-cloud-command/src/server/exchange-socket-client.test.ts",
+        "packages/ext-cloud-command/src/server/directory-preferences.ts",
+        "packages/ext-cloud-command/src/server/directory-preferences.test.ts",
+        "packages/ext-cloud-command/src/server/directory-preferences.migration.test.ts",
+        "apps/m365-graph-read-executor/src/microsoft/graphClient.ts",
+        "apps/m365-graph-read-executor/src/microsoft/graphClient.test.ts",
+        "apps/m365-graph-read-executor/src/microsoft/readActions.ts",
+        "apps/m365-graph-read-executor/src/microsoft/readActions.test.ts",
+        "packages/ext-cloud-command/migrations/2026-09-22-microsoft-directory-preferences.sql",
+        "scripts/cloudcom/exchange-worker.py",
+        "scripts/cloudcom/exchange-worker.test.py",
+        "scripts/cloudcom/exchange-persistent.ps1",
+        ".dockerignore",
+        "deploy/cloudcom-exchange-worker/Dockerfile",
+        "deploy/cloudcom-exchange-worker/healthcheck.py",
+        "deploy/cloudcom-exchange-worker/README.md",
+        "deploy/cloudcom-exchange-worker/compose.overlay.candidate.yml",
+        "deploy/cloudcom-exchange-worker/verify-compose-candidate.py",
+        "docs/cloudcom-microsoft-exchange-worker.md",
+        "scripts/cloudcom/exchange-worker-release.mjs",
+        "scripts/cloudcom/exchange-worker-release.test.mjs",
+        "scripts/cloudcom/verify-exchange-worker-oci.py",
+        "scripts/cloudcom/verify-exchange-worker-oci.test.py",
+        "scripts/release/cloudcom-candidate-workflow.test.mjs",
+        ".github/workflows/cloudcom-candidate.yml"
+      ],
+      "hooks": [
+        {
+          "file": ".dockerignore",
+          "contains": "!scripts/cloudcom/exchange-worker.py"
+        },
+        {
+          "file": ".dockerignore",
+          "contains": "!scripts/cloudcom/exchange-persistent.ps1"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "python3 scripts/cloudcom/exchange-worker.test.py"
+        },
+        {
+          "file": ".github/workflows/cloudcom-candidate.yml",
+          "contains": "cloudcom-candidate/"
+        },
+        {
+          "file": "scripts/cloudcom/exchange-worker-release.mjs",
+          "contains": "cloudcom.exchange-worker"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "exchange-worker-release.test.mjs"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "verify-exchange-worker-oci.test.py"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "src/m365/readActions.test.ts"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "@breeze/m365-graph-read-executor exec vitest run"
+        },
+        {
+          "file": ".github/scripts/cloudcom-delta.mjs",
+          "contains": "packages/shared/src/m365/readActions.ts"
+        },
+        {
+          "file": ".github/scripts/cloudcom-delta.mjs",
+          "contains": "cloudCommandReportExecutorPaths"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand_microsoft_directory_preferences"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/server/index.ts",
+          "contains": "mountDirectoryPreferenceRoutes(app, context)"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/web/microsoft.ts",
+          "contains": "data-directory-scope=\"exclude\""
+        },
+        {
+          "file": "apps/api/src/__tests__/integration/cloudCommandThreeCx.integration.test.ts",
+          "contains": "isolates Microsoft directory exclusions"
+        }
+      ]
+    },
+    {
+      "id": "cloud-command-google-directory",
+      "requiredFiles": [
+        "apps/api/src/extensions/cloudCommandGoogle.ts",
+        "apps/api/src/extensions/cloudCommandGoogleTrace.ts",
+        "apps/api/src/extensions/cloudCommandGoogle.test.ts",
+        "apps/api/src/services/googleClient.ts",
+        "apps/api/src/services/googleClient.test.ts",
+        "packages/ext-cloud-command/src/server/native-google.ts",
+        "packages/ext-cloud-command/src/server/google.ts",
+        "packages/ext-cloud-command/src/server/google.test.ts",
+        "packages/ext-cloud-command/src/web/google.ts",
+        "packages/ext-cloud-command/src/web/google.test.ts",
+        "apps/web/src/components/extensions/useExtensionNavigation.ts",
+        "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx",
+        "apps/web/src/components/integrations/GoogleWorkspaceIntegration.test.tsx"
+      ],
+      "hooks": [
+        { "file": "packages/ext-cloud-command/src/server/index.ts", "contains": "mountGoogleRoutes(app, google)" },
+        { "file": "packages/ext-cloud-command/src/web/index.ts", "contains": "import './google'" },
+        { "file": "packages/ext-cloud-command/manifest.json", "contains": "cloudcommand-google-page" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.directory" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.members" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.mailboxSettings" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.storage" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.activity" },
+        { "file": "apps/api/src/services/googleClient.ts", "contains": "admin.reports.usage.readonly" },
+        { "file": "apps/api/src/services/googleClient.ts", "contains": "admin.reports.audit.readonly" },
+        { "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx", "contains": "admin.reports.usage.readonly" },
+        { "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx", "contains": "admin.reports.audit.readonly" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.setSuspended" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.auditSuspension" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.updateProfile" },
+        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.auditProfile" },
+        { "file": ".github/workflows/cloudcom-ci.yml", "contains": "cloudCommandGoogle.test.ts" }
+      ]
+    },
+    {
+      "id": "unifi-sync-lock-order",
+      "requiredFiles": [
+        "apps/api/src/services/unifi/unifiSyncLocks.ts",
+        "apps/api/src/jobs/unifiWorker.ts",
+        "apps/api/src/jobs/unifiWorker.test.ts",
+        "apps/api/src/__tests__/integration/unifiSyncLockOrder.integration.test.ts"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/services/unifi/unifiSyncLocks.ts",
+          "contains": "SELECT public.breeze_partner_export_lock_orgs_exclusive(ARRAY("
+        },
+        {
+          "file": "apps/api/src/jobs/unifiWorker.ts",
+          "contains": "await lockUnifiSyncOrganizations(db, data.integrationId, prep.mappings);"
+        },
+        {
+          "file": ".github/scripts/cloudcom-delta.mjs",
+          "contains": "if (unifiSyncLockPaths.has(path))"
+        },
+        {
+          "file": ".github/scripts/cloudcom-delta.mjs",
+          "contains": "result.unifiSyncLock = true;"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "unifi_sync_lock: ${{ steps.delta.outputs.unifiSyncLock }}"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "pnpm --filter @breeze/api exec vitest run src/jobs/unifiWorker.test.ts"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts src/__tests__/integration/unifiSyncLockOrder.integration.test.ts"
+        }
+      ]
+    }
+  ]
+}

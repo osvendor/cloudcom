@@ -16,6 +16,8 @@ import {
 } from '@breeze/extension-sdk';
 import type { ExtensionTenancyDeclaration } from '@breeze/extension-sdk';
 import workspaceExtension from '@breeze/ext-workspace';
+import remoteAccessExtension from '@cloudcom/ext-rustdesk-access';
+import { createCloudCommandExtension } from '@cloudcom/ext-cloud-command';
 
 /** One statically-imported, first-party extension. */
 export interface BuiltinExtension {
@@ -237,6 +239,42 @@ export function defineBuiltin(spec: Omit<BuiltinExtension, 'manifest'>): Builtin
  */
 export const BUILTINS: readonly BuiltinExtension[] = [
   defineBuiltin({
+    module: createCloudCommandExtension(async (url, init) => {
+      // Lazy bridge keeps this registry acyclic. No outbound work during boot.
+      const { safeFetch } = await import('../services/urlSafety');
+      const { runOutsideDbContext } = await import('../db');
+      return runOutsideDbContext(() => safeFetch(url, { ...init, signal: init.signal ?? undefined, allowPrivateNetwork: false, allowCarrierNat: false }));
+    }, {
+      version: 1,
+      connection: async request => (await import('./cloudCommandMicrosoft')).nativeMicrosoftServices.connection(request),
+      read: async (request, resource) => (await import('./cloudCommandMicrosoft')).nativeMicrosoftServices.read(request, resource),
+    }, {
+      configuration: async () => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.configuration(),
+      acquireToken: async connection => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.acquireToken(connection),
+      verifyAuthorization: async input => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.verifyAuthorization(input),
+      audit: async event => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.audit(event),
+      exchange: async () => (await import('./cloudCommandAdminRuntime')).cloudCommandAdminRuntime.exchange(),
+      authorize: async (request, orgId, mutation) => (await import('./cloudCommandAdminAuthorization')).authorizeCloudCommandAdministration(request, orgId, mutation),
+    }, {
+      version: 1,
+      connection: async request => (await import('./cloudCommandGoogle')).nativeGoogleServices.connection(request),
+      directory: async (request, kind, pageToken) => (await import('./cloudCommandGoogle')).nativeGoogleServices.directory(request, kind, pageToken),
+      members: async (request, groupId, pageToken) => (await import('./cloudCommandGoogle')).nativeGoogleServices.members(request, groupId, pageToken),
+      mailboxSettings: async (request, userId) => (await import('./cloudCommandGoogle')).nativeGoogleServices.mailboxSettings(request, userId),
+      storage: async (request, date, pageToken) => (await import('./cloudCommandGoogle')).nativeGoogleServices.storage(request, date, pageToken),
+      activity: async (request, source, days, pageToken, asOf) => (await import('./cloudCommandGoogle')).nativeGoogleServices.activity(request, source, days, pageToken, asOf),
+      auditSuspension: async (request, userId, stage) => (await import('./cloudCommandGoogle')).nativeGoogleServices.auditSuspension(request, userId, stage),
+      setSuspended: async (request, input) => (await import('./cloudCommandGoogle')).nativeGoogleServices.setSuspended(request, input),
+      auditProfile: async (request, userId, stage) => (await import('./cloudCommandGoogle')).nativeGoogleServices.auditProfile(request, userId, stage),
+      updateProfile: async (request, input) => (await import('./cloudCommandGoogle')).nativeGoogleServices.updateProfile(request, input),
+    }),
+    name: 'cloudcommand',
+    packageDir: 'packages/ext-cloud-command',
+    packageName: '@cloudcom/ext-cloud-command',
+    helperRoutes: false,
+    enableEnvVar: 'CLOUDCOM_THREECX_ENABLED',
+  }),
+  defineBuiltin({
     module: workspaceExtension,
     name: 'workspace',
     packageDir: 'ee/workspace',
@@ -248,6 +286,9 @@ export const BUILTINS: readonly BuiltinExtension[] = [
     // which a stock `postgres:16-alpine` deployment does not have.
     enableEnvVar: 'BREEZE_WORKSPACE_ENABLED',
   }),
+  defineBuiltin({ module: remoteAccessExtension, name: 'rustdeskaccess',
+    packageDir: 'packages/ext-rustdesk-access', packageName: '@cloudcom/ext-rustdesk-access',
+    helperRoutes: false, enableEnvVar: 'CLOUDCOM_REMOTE_ACCESS_ENABLED' }),
 ];
 
 export const BUILTIN_EXTENSION_NAMES: ReadonlySet<string> = new Set(

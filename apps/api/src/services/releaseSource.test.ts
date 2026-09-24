@@ -5,6 +5,10 @@ import {
   getReleaseSourceApiBase,
   getReleaseSourceReleaseBase,
   getReleaseSourceRepository,
+  getWindowsReleaseSource,
+  getWindowsReleaseAssetUrl,
+  getWindowsReleaseCanaryVersion,
+  isWindowsReleasePromotionEnabled,
   isOfficialReleaseSource,
 } from './releaseSource';
 
@@ -15,6 +19,10 @@ describe('releaseSource', () => {
     process.env = { ...originalEnv };
     delete process.env.BINARY_GITHUB_REPOSITORY;
     delete process.env.GITHUB_REPO;
+    delete process.env.BINARY_WINDOWS_GITHUB_REPOSITORY;
+    delete process.env.BINARY_WINDOWS_VERSION;
+    delete process.env.BINARY_WINDOWS_CANARY_DEVICE_ID;
+    delete process.env.BINARY_WINDOWS_PROMOTE_ENABLED;
   });
 
   afterEach(() => {
@@ -113,5 +121,34 @@ describe('releaseSource', () => {
     expect(getReleaseDownloadUrl('v1.2.3', 'breeze-agent.msi')).toBe(
       'https://github.com/acme/breeze-selfhost-signing/releases/download/v1.2.3/breeze-agent.msi',
     );
+  });
+
+  it('scopes an alternate release to the exact Windows asset and pilot device', () => {
+    process.env.BINARY_WINDOWS_GITHUB_REPOSITORY = 'example/windows-signing';
+    process.env.BINARY_WINDOWS_VERSION = '0.115.1';
+    process.env.BINARY_WINDOWS_CANARY_DEVICE_ID = '123e4567-e89b-42d3-a456-426614174000';
+    expect(getWindowsReleaseSource()).toEqual({ repository: 'example/windows-signing', version: '0.115.1' });
+    expect(getWindowsReleaseAssetUrl('0.115.1', 'breeze-agent-windows-amd64.exe')).toBe(
+      'https://github.com/example/windows-signing/releases/download/v0.115.1/breeze-agent-windows-amd64.exe',
+    );
+    expect(getWindowsReleaseAssetUrl('0.115.0', 'breeze-agent-windows-amd64.exe')).toBeNull();
+    expect(getWindowsReleaseAssetUrl('0.115.1', 'breeze-agent-linux-amd64')).toBeNull();
+    expect(getWindowsReleaseAssetUrl('0.115.1', 'breeze-helper-windows-amd64.exe')).toBeNull();
+    expect(getWindowsReleaseCanaryVersion('123e4567-e89b-42d3-a456-426614174000', 'windows')).toBe('0.115.1');
+    expect(getWindowsReleaseCanaryVersion('00000000-0000-0000-0000-000000000000', 'windows')).toBeNull();
+    expect(getWindowsReleaseCanaryVersion('123e4567-e89b-42d3-a456-426614174000', 'linux')).toBeNull();
+    expect(isWindowsReleasePromotionEnabled()).toBe(false);
+    process.env.BINARY_WINDOWS_PROMOTE_ENABLED = 'true';
+    expect(isWindowsReleasePromotionEnabled()).toBe(true);
+  });
+
+  it('rejects incomplete or malformed Windows release configuration', () => {
+    process.env.BINARY_WINDOWS_GITHUB_REPOSITORY = 'example/windows-signing';
+    expect(() => getWindowsReleaseSource()).toThrow(/must both be set/);
+    process.env.BINARY_WINDOWS_VERSION = '../latest';
+    expect(() => getWindowsReleaseSource()).toThrow(/numeric release version/);
+    process.env.BINARY_WINDOWS_VERSION = '0.115.1';
+    process.env.BINARY_WINDOWS_CANARY_DEVICE_ID = 'not-a-uuid';
+    expect(() => getWindowsReleaseCanaryVersion('device', 'windows')).toThrow(/must be a UUID/);
   });
 });

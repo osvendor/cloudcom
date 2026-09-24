@@ -5,15 +5,25 @@ import {
   extensionNavLinksFromRegistry,
 } from './useExtensionNavigation';
 import type { RuntimeWebRegistry, RuntimeWebExtension } from '@/lib/extensions/registry';
+import { CLOUD_COMMAND_CONNECTIONS_CHANGED_EVENT } from '@/lib/extensions/cloudCommandNavigationEvents';
 
-const getExtensionRegistry = vi.fn();
+const { getExtensionRegistry, createExtensionHostApi, useOrgScope, useAuthStore } = vi.hoisted(() => ({
+  getExtensionRegistry: vi.fn(),
+  createExtensionHostApi: vi.fn(),
+  useOrgScope: vi.fn(),
+  useAuthStore: vi.fn(),
+}));
 vi.mock('@/lib/extensions/registry', () => ({
   getExtensionRegistry: (...a: unknown[]) => getExtensionRegistry(...a),
 }));
+vi.mock('@/lib/extensions/hostApi', () => ({ createExtensionHostApi: (...a: unknown[]) => createExtensionHostApi(...a) }));
+vi.mock('@/hooks/useOrgScope', () => ({ useOrgScope: () => useOrgScope() }));
+vi.mock('@/stores/auth', () => ({ useAuthStore: (selector: (state: unknown) => unknown) => useAuthStore(selector) }));
 
 function extension(over: Partial<RuntimeWebExtension> = {}): RuntimeWebExtension {
   return {
     name: 'demo',
+    routeNamespace: 'demo',
     version: '1.0.0',
     digest: 'abc123',
     moduleUrl: '/api/v1/extensions/assets/demo/abc123/index.js',
@@ -30,7 +40,26 @@ function registry(extensions: RuntimeWebExtension[]): RuntimeWebRegistry {
 
 beforeEach(() => {
   getExtensionRegistry.mockReset();
+  createExtensionHostApi.mockReset();
+  useOrgScope.mockReturnValue({ status: 'resolved', scope: 'all', orgId: null });
+  useAuthStore.mockImplementation((selector: (state: unknown) => unknown) => selector({ isAuthenticated: true, user: { id: 'user-a' } }));
 });
+
+function cloudCommand(): RuntimeWebExtension {
+  return extension({
+    name: 'cloudcommand',
+    routeNamespace: 'cloud-command',
+    pages: [
+      { id: 'overview', path: '/overview', element: 'cloudcommand-overview-page' },
+      { id: 'threecx', path: '/threecx', element: 'cloudcommand-threecx-page' },
+      { id: 'microsoft', path: '/microsoft', element: 'cloudcommand-microsoft-page' },
+    ],
+    navigation: [
+      { id: 'overview', label: 'Cloud Command', path: '/overview', order: 100 },
+      { id: 'connect', label: 'Connect', path: '/connect', order: 101 },
+    ],
+  });
+}
 
 describe('extensionNavLinksFromRegistry (pure projection)', () => {
   it('builds a namespaced href from the extension name and nav item path', () => {
@@ -133,5 +162,168 @@ describe('useExtensionNavigation', () => {
     const { result } = renderHook(() => useExtensionNavigation());
     await waitFor(() => expect(getExtensionRegistry).toHaveBeenCalled());
     expect(result.current).toEqual([]);
+  });
+
+  it('groups only enabled established Cloud Command providers under its declared overview page', async () => {
+    useOrgScope.mockReturnValue({ status: 'resolved', scope: 'org', orgId: 'org-a' });
+    getExtensionRegistry.mockResolvedValue(registry([cloudCommand()]));
+    const request = vi.fn(async (path: string) => Response.json(path === '/threecx/connection'
+      ? { connected: true, enabled: true }
+      : { available: true, connected: true, enabled: true }));
+    createExtensionHostApi.mockReturnValue({ hostApi: { request }, revoke: vi.fn() });
+
+    const { result } = renderHook(() => useExtensionNavigation());
+    await waitFor(() => expect(result.current).toEqual([
+      { name: 'Cloud Command', href: '/extensions/cloudcommand/overview', children: [
+        { name: '3CX', href: '/extensions/cloudcommand/threecx' },
+        { name: 'Microsoft 365', href: '/extensions/cloudcommand/microsoft' },
+      ], loading: false },
+      { name: 'Connect', href: '/extensions/cloudcommand/connect' },
+    ]));
+  });
+
+  it('shows Google only for an active native connection in the selected organization', async () => {
+    useOrgScope.mockReturnValue({ status: 'resolved', scope: 'org', orgId: 'org-a' });
+    const ext = cloudCommand();
+    getExtensionRegistry.mockResolvedValue(registry([{ ...ext, pages: [
+      ...ext.pages, { id: 'google', path: '/google', element: 'cloudcommand-google-page' },
+    ] }]));
+    const request = vi.fn(async (path: string) => Response.json(path === '/google/connection'
+      ? { available: true, connected: true, enabled: true }
+      : { available: false, connected: false, enabled: false }));
+    createExtensionHostApi.mockReturnValue({ hostApi: { request }, revoke: vi.fn() });
+    const { result } = renderHook(() => useExtensionNavigation());
+    await waitFor(() => expect(result.current[0]).toMatchObject({ children: [
+      { name: 'Google Workspace', href: '/extensions/cloudcommand/google' },
+    ], loading: false }));
+    expect(request).toHaveBeenCalledWith('/google/connection');
+  });
+
+  it('keeps an established provider when the other status request fails', async () => {
+    useOrgScope.mockReturnValue({ status: 'resolved', scope: 'org', orgId: 'org-a' });
+    getExtensionRegistry.mockResolvedValue(registry([cloudCommand()]));
+    const request = vi.fn(async (path: string) => path === '/threecx/connection'
+      ? Promise.reject(new Error('denied'))
+      : Response.json({ available: true, connected: true, enabled: true }));
+    createExtensionHostApi.mockReturnValue({ hostApi: { request }, revoke: vi.fn() });
+
+    const { result } = renderHook(() => useExtensionNavigation());
+    await waitFor(() => expect(result.current[0]).toEqual({
+      name: 'Cloud Command', href: '/extensions/cloudcommand/overview', children: [
+        { name: 'Microsoft 365', href: '/extensions/cloudcommand/microsoft' },
+      ], loading: false,
+    }));
+  });
+
+  it('does not include disabled connections even when their provider is otherwise available', async () => {
+    useOrgScope.mockReturnValue({ status: 'resolved', scope: 'org', orgId: 'org-a' });
+    getExtensionRegistry.mockResolvedValue(registry([cloudCommand()]));
+    const request = vi.fn(async (path: string) => Response.json(path === '/threecx/connection'
+      ? { connected: true, enabled: false }
+      : { available: true, connected: true, enabled: true }));
+    createExtensionHostApi.mockReturnValue({ hostApi: { request }, revoke: vi.fn() });
+
+    const { result } = renderHook(() => useExtensionNavigation());
+    await waitFor(() => expect(result.current[0]).toMatchObject({ children: [
+      { name: 'Microsoft 365', href: '/extensions/cloudcommand/microsoft' },
+    ], loading: false }));
+  });
+
+  it('hides old organization children before delayed responses can resolve', async () => {
+    let selectedOrg = 'org-a';
+    const resolvers: Array<(response: Response) => void> = [];
+    useOrgScope.mockImplementation(() => ({ status: 'resolved', scope: 'org', orgId: selectedOrg }));
+    getExtensionRegistry.mockResolvedValue(registry([cloudCommand()]));
+    createExtensionHostApi.mockImplementation(() => ({
+      hostApi: { request: () => new Promise<Response>((resolve) => resolvers.push(resolve)) },
+      revoke: vi.fn(),
+    }));
+
+    const { result, rerender } = renderHook(() => useExtensionNavigation());
+    await waitFor(() => expect(resolvers).toHaveLength(2));
+    selectedOrg = 'org-b';
+    rerender();
+    expect(result.current[0]).toMatchObject({ children: [], loading: true });
+    await waitFor(() => expect(resolvers).toHaveLength(4));
+    resolvers[0](Response.json({ connected: true, enabled: true }));
+    resolvers[1](Response.json({ available: true, connected: true, enabled: true }));
+    await Promise.resolve();
+    expect(result.current[0]).toMatchObject({ children: [], loading: true });
+    resolvers[2](Response.json({ connected: false, enabled: true }));
+    resolvers[3](Response.json({ available: true, connected: true, enabled: true }));
+    await waitFor(() => expect(result.current[0]).toMatchObject({ children: [
+      { name: 'Microsoft 365', href: '/extensions/cloudcommand/microsoft' },
+    ], loading: false }));
+  });
+
+  it('does not create an authenticated host API without a selected organization or declared Cloud Command pages', async () => {
+    getExtensionRegistry.mockResolvedValue(registry([extension({ name: 'cloudcommand', navigation: [{ id: 'overview', label: 'Cloud Command', path: '/overview', order: 1 }] })]));
+    renderHook(() => useExtensionNavigation());
+    await waitFor(() => expect(getExtensionRegistry).toHaveBeenCalled());
+    expect(createExtensionHostApi).not.toHaveBeenCalled();
+  });
+
+  it('does not retain pending children or start new reads after logout', async () => {
+    let authenticated = true;
+    const resolvers: Array<(response: Response) => void> = [];
+    useOrgScope.mockReturnValue({ status: 'resolved', scope: 'org', orgId: 'org-a' });
+    useAuthStore.mockImplementation((selector: (state: unknown) => unknown) => selector({ isAuthenticated: authenticated, user: authenticated ? { id: 'user-a' } : null }));
+    getExtensionRegistry.mockResolvedValue(registry([cloudCommand()]));
+    createExtensionHostApi.mockReturnValue({
+      hostApi: { request: () => new Promise<Response>((resolve) => resolvers.push(resolve)) },
+      revoke: vi.fn(),
+    });
+
+    const { result, rerender } = renderHook(() => useExtensionNavigation());
+    await waitFor(() => expect(resolvers).toHaveLength(2));
+    authenticated = false;
+    rerender();
+    expect(result.current[0]).toMatchObject({ children: [], loading: true });
+    resolvers.forEach((resolve) => resolve(Response.json({ connected: true, enabled: true, available: true })));
+    await Promise.resolve();
+    expect(result.current[0]).toMatchObject({ children: [] });
+    expect(createExtensionHostApi).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops a prior account response while the selected organization stays the same', async () => {
+    let accountId = 'user-a';
+    const resolvers: Array<(response: Response) => void> = [];
+    useOrgScope.mockReturnValue({ status: 'resolved', scope: 'org', orgId: 'org-a' });
+    useAuthStore.mockImplementation((selector: (state: unknown) => unknown) => selector({ isAuthenticated: true, user: { id: accountId } }));
+    getExtensionRegistry.mockResolvedValue(registry([cloudCommand()]));
+    createExtensionHostApi.mockImplementation(() => ({
+      hostApi: { request: () => new Promise<Response>((resolve) => resolvers.push(resolve)) },
+      revoke: vi.fn(),
+    }));
+
+    const { result, rerender } = renderHook(() => useExtensionNavigation());
+    await waitFor(() => expect(resolvers).toHaveLength(2));
+    accountId = 'user-b';
+    rerender();
+    expect(result.current[0]).toMatchObject({ children: [], loading: true });
+    await waitFor(() => expect(resolvers).toHaveLength(4));
+    resolvers[0](Response.json({ connected: true, enabled: true }));
+    resolvers[1](Response.json({ available: true, connected: true, enabled: true }));
+    await Promise.resolve();
+    expect(result.current[0]).toMatchObject({ children: [], loading: true });
+    resolvers[2](Response.json({ connected: false, enabled: true }));
+    resolvers[3](Response.json({ available: false, connected: false, enabled: false }));
+    await waitFor(() => expect(result.current[0]).toMatchObject({ children: [], loading: false }));
+  });
+
+  it('revalidates connection state after a matching successful host event, focus, and Astro swap', async () => {
+    useOrgScope.mockReturnValue({ status: 'resolved', scope: 'org', orgId: 'org-a' });
+    getExtensionRegistry.mockResolvedValue(registry([cloudCommand()]));
+    createExtensionHostApi.mockReturnValue({ hostApi: { request: async (path: string) => Response.json(path === '/threecx/connection'
+      ? { connected: false, enabled: true }
+      : { available: false, connected: false, enabled: false }) }, revoke: vi.fn() });
+    renderHook(() => useExtensionNavigation());
+    await waitFor(() => expect(createExtensionHostApi).toHaveBeenCalledTimes(1));
+    window.dispatchEvent(new CustomEvent(CLOUD_COMMAND_CONNECTIONS_CHANGED_EVENT, { detail: { organizationId: 'org-a' } }));
+    await waitFor(() => expect(createExtensionHostApi).toHaveBeenCalledTimes(2));
+    window.dispatchEvent(new Event('focus'));
+    await waitFor(() => expect(createExtensionHostApi).toHaveBeenCalledTimes(3));
+    document.dispatchEvent(new Event('astro:after-swap'));
+    await waitFor(() => expect(createExtensionHostApi).toHaveBeenCalledTimes(4));
   });
 });

@@ -716,6 +716,23 @@ export interface Profile {
   name: string | null;
   receiveNotifications: boolean;
   status: string;
+  accessMode?: 'standard' | 'remote_only' | string;
+}
+
+export interface RemoteDevice {
+  id: string;
+  hostname: string;
+  displayName: string;
+  status: string;
+  transports: {
+    rustdesk: { available: boolean; reason?: string };
+    webrtc: { available: boolean; reason?: string };
+  };
+}
+
+export interface RemoteSession {
+  session: { id: string; status: string; transport: 'webrtc' | 'rustdesk' };
+  launch?: { url: string };
 }
 
 export interface BrandingConfig {
@@ -777,6 +794,19 @@ function mapPaginatedData<T>(
 }
 
 export const portalApi = {
+  getRemoteDevices: (config: ApiRequestConfig = {}): Promise<ApiResponse<{ devices: RemoteDevice[] }>> =>
+    apiGet<{ devices: RemoteDevice[] }>('/portal/remote/browser/devices', config),
+
+  createRemoteSession: (
+    deviceId: string,
+    transport: 'webrtc' | 'rustdesk',
+    config: ApiRequestConfig = {},
+  ): Promise<ApiResponse<RemoteSession>> =>
+    apiPost<RemoteSession>('/portal/remote/sessions', { deviceId, transport }, config),
+  getRemoteSession: (id: string, config: ApiRequestConfig = {}) => apiGet<{ session: { id: string; status: string; hostname: string; webrtcAnswer: string | null; terminationPhase: string }; iceServers: RTCIceServer[] }>(`/portal/remote/sessions/${encodeURIComponent(id)}`, config),
+  submitRemoteOffer: (id: string, offer: string, config: ApiRequestConfig = {}) => apiPost<{ success: true }>(`/portal/remote/sessions/${encodeURIComponent(id)}/offer`, { offer }, config),
+  endRemoteSession: (id: string, config: ApiRequestConfig = {}) => apiPost<{ success: true; terminationPhase: string }>(`/portal/remote/sessions/${encodeURIComponent(id)}/end`, {}, config),
+
   getDevices: async (
     params: ListParams = {},
     config: ApiRequestConfig = {}

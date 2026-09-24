@@ -189,7 +189,9 @@ export async function claimPendingCommandsForDevice(
       unsupportedProtocolTypes.push('agent_rollback_v1');
     }
     if (targetRole === 'agent' && capabilities?.pamLifetimeProtocolVersion !== 2) {
-      unsupportedProtocolTypes.push('pam_apply_v2', 'pam_cleanup_v2');
+      // A cleanup can restore reconciliation when the agent reports 0.
+      // Never deliver an apply until the agent reports readiness again.
+      unsupportedProtocolTypes.push('pam_apply_v2');
     }
 
     const now = new Date();

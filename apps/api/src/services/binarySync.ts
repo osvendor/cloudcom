@@ -29,6 +29,10 @@ import {
   getReleaseSourceApiBase,
   getReleaseSourceRepository,
   isOfficialReleaseSource,
+  getWindowsReleaseSource,
+  OFFICIAL_RELEASE_REPOSITORY,
+  isValidReleaseSourceRepository,
+  isWindowsReleasePromotionEnabled,
 } from "./releaseSource";
 import { captureException } from "./sentry";
 import {
@@ -401,6 +405,7 @@ async function getReleaseAssetMetadata(args: {
   trustedManifest: TrustedReleaseManifest | null;
   fallbackChecksums: Map<string, string> | null;
   releaseTag: string;
+  repository?: string;
 }): Promise<{
   checksum: string;
   size: number;
@@ -421,7 +426,7 @@ async function getReleaseAssetMetadata(args: {
     assetName: args.asset.name,
     manifestBytes: args.trustedManifest.manifestBytes,
     signatureBytes: args.trustedManifest.signatureBytes,
-    expectedRepository: getReleaseSourceRepository(),
+    expectedRepository: args.repository ?? getReleaseSourceRepository(),
     expectedRelease: args.releaseTag,
   });
 
@@ -945,6 +950,14 @@ export async function syncBinaries(): Promise<void> {
     // reads APP_VERSION and explicitly fetches that tag if it's missing.
     // It's idempotent and cheap for non-RC releases (early-returns on hit).
     await ensureCurrentVersionRegistered();
+    const windowsRelease = getWindowsReleaseSource();
+    if (windowsRelease) {
+      await syncFromGitHub(`v${windowsRelease.version}`, {
+        repository: windowsRelease.repository,
+        windowsOnly: true,
+        autoPromote: isWindowsReleasePromotionEnabled(),
+      });
+    }
     return;
   }
 
@@ -1294,10 +1307,21 @@ export async function syncBinaries(): Promise<void> {
  */
 export async function syncFromGitHub(
   requestedVersion?: string,
+  options: { repository?: string; windowsOnly?: boolean; autoPromote?: boolean } = {},
 ): Promise<{ version: string; synced: string[]; failed: string[] }> {
+  const repository = options.repository ?? getReleaseSourceRepository();
+  if (!isValidReleaseSourceRepository(repository)) {
+    throw new Error('GitHub release repository is invalid');
+  }
+  if (options.windowsOnly && !requestedVersion) {
+    throw new Error('Windows-only release sync requires an exact version tag');
+  }
+  if (options.windowsOnly && !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(requestedVersion!)) {
+    throw new Error('Windows-only release sync requires a numeric v-prefixed tag');
+  }
   const ghUrl = requestedVersion
-    ? `${getReleaseSourceApiBase()}/releases/tags/${requestedVersion}`
-    : `${getReleaseSourceApiBase()}/releases/latest`;
+    ? `https://api.github.com/repos/${repository}/releases/tags/${requestedVersion}`
+    : `https://api.github.com/repos/${repository}/releases/latest`;
 
   // Authenticate the API call when a token is available. Unauthenticated
   // requests are capped at 60/hour per IP — fine for prod droplets where
@@ -1339,7 +1363,13 @@ export async function syncFromGitHub(
   };
 
   const version = release.tag_name.replace(/^v/, "");
+  if (options.windowsOnly && version !== requestedVersion?.replace(/^v/, '')) {
+    throw new Error('Windows-only release tag did not match the configured version');
+  }
   const trustedManifest = await fetchTrustedReleaseManifest(release.assets);
+  if (options.windowsOnly && !trustedManifest) {
+    throw new Error('Windows-only release requires a signed release artifact manifest and configured trust root');
+  }
   const fallbackChecksums = trustedManifest
     ? null
     : await parseChecksumsFallback(release.assets);
@@ -1376,8 +1406,18 @@ export async function syncFromGitHub(
     signedMetadata: UpsertMetadata;
   }[] = [];
 
+  const assertWindowsAssetUrl = (asset: GitHubReleaseAsset): void => {
+    if (!options.windowsOnly) return;
+    const expected = `https://github.com/${repository}/releases/download/${release.tag_name}/${asset.name}`;
+    if (asset.browser_download_url !== expected) {
+      throw new Error(`Windows release asset URL is not the configured repository/tag: ${asset.name}`);
+    }
+  };
+
   for (const { component, targets } of componentTargets) {
     for (const target of targets) {
+      if (options.windowsOnly && target.goos !== 'windows') continue;
+      if (!options.windowsOnly && target.goos === 'windows' && isWindowsReleasePromotionEnabled()) continue;
       const suffix = target.goos === "windows" ? ".exe" : "";
       const assetName =
         target.assetName ??
@@ -1385,12 +1425,14 @@ export async function syncFromGitHub(
       const asset = release.assets.find((a) => a.name === assetName);
       // Legitimate "this release predates that artifact" case — stay silent.
       if (!asset) continue;
+      assertWindowsAssetUrl(asset);
 
       const metadata = await getReleaseAssetMetadata({
         asset,
         trustedManifest,
         fallbackChecksums,
         releaseTag: release.tag_name,
+        repository,
       });
       if (!metadata) {
         // Different from `!asset`: the asset IS in the release but its checksum
@@ -1417,9 +1459,46 @@ export async function syncFromGitHub(
           platform,
           arch: target.goarch,
           downloadUrl: asset.browser_download_url,
+          repository,
         }),
       });
     }
+  }
+
+  if (options.windowsOnly) {
+    const requiredComponents = ['agent', 'user-helper', 'watchdog'];
+    for (const component of requiredComponents) {
+      if (!plan.some((entry) => entry.component === component && entry.platform === 'windows' && entry.arch === 'amd64')) {
+        throw new Error(`Windows release is missing verified ${component}/windows/amd64`);
+      }
+    }
+    const backupName = 'breeze-backup-windows-amd64.exe';
+    const backupAsset = release.assets.find((asset) => asset.name === backupName);
+    if (!backupAsset) throw new Error('Windows release is missing breeze-backup-windows-amd64.exe');
+    assertWindowsAssetUrl(backupAsset);
+    const backupMetadata = await getReleaseAssetMetadata({
+      asset: backupAsset,
+      trustedManifest,
+      fallbackChecksums,
+      releaseTag: release.tag_name,
+      repository,
+    });
+    if (!backupMetadata) throw new Error('Windows release backup metadata is missing');
+    plan.push({
+      component: 'backup',
+      platform: 'windows',
+      arch: 'amd64',
+      downloadUrl: backupAsset.browser_download_url,
+      signedMetadata: await applyDeploymentSigning({
+        metadata: backupMetadata,
+        version,
+        component: 'backup',
+        platform: 'windows',
+        arch: 'amd64',
+        downloadUrl: backupAsset.browser_download_url,
+        repository,
+      }),
+    });
   }
 
   // ------------------------------------------------------------------
@@ -1443,6 +1522,7 @@ export async function syncFromGitHub(
         entry.downloadUrl,
         entry.signedMetadata,
         release.body,
+        options.autoPromote,
       );
       synced.push(label);
     } catch (err) {
@@ -1466,12 +1546,16 @@ export async function syncFromGitHub(
       `GitHub sync registered 0 of ${plan.length} binaries for ${version}: ${failures.join("; ")}`,
     );
   }
+  if (options.windowsOnly && failures.length > 0) {
+    throw new Error(`Windows release registration incomplete for ${version}: ${failures.join('; ')}`);
+  }
 
   // Sync backup binaries. Same per-arch asset shape as the agent/watchdog.
   // Missing for any release predating the backup component being published —
   // the `release.assets.find` returns undefined and the loop body
   // short-circuits.
-  for (const target of BACKUP_TARGETS) {
+  for (const target of options.windowsOnly ? [] : BACKUP_TARGETS) {
+    if (target.goos === 'windows' && isWindowsReleasePromotionEnabled()) continue;
     const suffix = target.goos === "windows" ? ".exe" : "";
     const assetName = `breeze-backup-${target.goos}-${target.goarch}${suffix}`;
     const asset = release.assets.find((a) => a.name === assetName);
@@ -1481,6 +1565,7 @@ export async function syncFromGitHub(
       trustedManifest,
       fallbackChecksums,
       releaseTag: release.tag_name,
+      repository,
     });
     if (!metadata) {
       // See agent loop above: `!metadata` after `!asset` passed indicates an
@@ -1493,6 +1578,16 @@ export async function syncFromGitHub(
     const platform = GH_PLATFORM_MAP[target.goos];
     if (!platform) continue;
 
+    const signedMetadata = await applyDeploymentSigning({
+      metadata,
+      version,
+      component: 'backup',
+      platform,
+      arch: target.goarch,
+      downloadUrl: asset.browser_download_url,
+      repository,
+    });
+
     try {
       await upsertVersion(
         version,
@@ -1500,8 +1595,9 @@ export async function syncFromGitHub(
         target.goarch,
         "backup",
         asset.browser_download_url,
-        metadata,
+        signedMetadata,
         release.body,
+        options.autoPromote,
       );
       synced.push(`backup:${platform}/${target.goarch}`);
     } catch (err) {
@@ -1792,9 +1888,13 @@ async function applyDeploymentSigning(args: {
   platform: string;
   arch: string;
   downloadUrl: string;
+  repository?: string;
 }): Promise<UpsertMetadata> {
   const { metadata } = args;
-  if (isOfficialReleaseSource() || !metadata.releaseManifest) {
+  const sourceIsOfficial = args.repository
+    ? args.repository.toLowerCase() === OFFICIAL_RELEASE_REPOSITORY
+    : isOfficialReleaseSource();
+  if (sourceIsOfficial || !metadata.releaseManifest) {
     return metadata;
   }
 
@@ -1834,12 +1934,13 @@ async function upsertVersion(
   downloadUrl: string,
   signedMetadata: UpsertMetadata,
   releaseNotes?: string | null,
+  autoPromoteOverride?: boolean,
 ) {
   // Controlled fleet rollout (AGENT_AUTO_PROMOTE=false): register but do not
   // promote. Skip the demote UPDATE, insert isLatest:false, and OMIT isLatest
   // from the conflict `set` so an existing promoted row keeps its target.
   // When auto-promote is on (default) behavior is byte-for-byte unchanged.
-  const autoPromote = getAgentAutoPromote();
+  const autoPromote = autoPromoteOverride ?? getAgentAutoPromote();
   const edition = signedMetadata.edition;
   // #6098: own short system-scoped context around the write — the fetch that
   // produced signedMetadata already completed with no context held.

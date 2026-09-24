@@ -33,9 +33,11 @@ function createStubGraphClient(options: {
   client: MicrosoftGraphClient;
   readResourceCalls: ReadResourceCall[];
   readCollectionCalls: ReadCollectionCall[];
+  oneDriveUsageCalls: Array<{ accessToken: OpaqueAccessToken }>;
 } {
   const readResourceCalls: ReadResourceCall[] = [];
   const readCollectionCalls: ReadCollectionCall[] = [];
+  const oneDriveUsageCalls: Array<{ accessToken: OpaqueAccessToken }> = [];
   const client: MicrosoftGraphClient = {
     async probeTenant() {
       throw new Error('probeTenant is not used by readActions');
@@ -50,11 +52,16 @@ function createStubGraphClient(options: {
       if (options.throwError) throw options.throwError;
       return options.collection ?? { items: [{ id: 'stub-item-id' }], truncated: false };
     },
+    async readOneDriveUsageReport(input) {
+      oneDriveUsageCalls.push(input);
+      if (options.throwError) throw options.throwError;
+      return { items: options.collection?.items ?? [{ ownerPrincipalName: 'ada@contoso.com', storageUsedBytes: 1, storageAllocatedBytes: 2 }], truncated: options.collection?.truncated ?? false };
+    },
     async readSyncCollection() {
       throw new Error('readSyncCollection is not used by interactive readActions');
     },
   };
-  return { client, readResourceCalls, readCollectionCalls };
+  return { client, readResourceCalls, readCollectionCalls, oneDriveUsageCalls };
 }
 
 // One minimal valid action per id, and the exact fixed path each must hit.
@@ -69,6 +76,7 @@ const SAMPLE_ACTIONS: Record<M365InteractiveReadActionId, M365InteractiveReadAct
   'm365.group.members.list': { type: 'm365.group.members.list', groupId: GROUP_ID },
   'm365.org.get': { type: 'm365.org.get' },
   'm365.org.skus.list': { type: 'm365.org.skus.list' },
+  'm365.report.onedrive.usage.list': { type: 'm365.report.onedrive.usage.list' },
   'm365.sites.list': { type: 'm365.sites.list', search: 'intranet' },
   'm365.site.get': { type: 'm365.site.get', siteId: SITE_ID },
 };
@@ -84,6 +92,7 @@ const EXPECTED_PATH: Record<M365InteractiveReadActionId, string> = {
   'm365.group.members.list': `/groups/${encodeURIComponent(GROUP_ID)}/members`,
   'm365.org.get': '/organization',
   'm365.org.skus.list': '/subscribedSkus',
+  'm365.report.onedrive.usage.list': "/reports/getOneDriveUsageAccountDetail(period='D7')",
   'm365.sites.list': '/sites',
   'm365.site.get': `/sites/${encodeURIComponent(SITE_ID)}`,
 };
@@ -99,7 +108,7 @@ const RESOURCE_ACTION_IDS = new Set<M365InteractiveReadActionId>([
 ]);
 
 describe('executeGraphReadAction — dispatch table', () => {
-  it.each(M365_INTERACTIVE_READ_ACTION_IDS)('%s calls the fixed path with the full field allowlist as $select', async (actionId) => {
+  it.each(M365_INTERACTIVE_READ_ACTION_IDS.filter(id => id !== 'm365.report.onedrive.usage.list'))('%s calls the fixed path with the full field allowlist as $select', async (actionId) => {
     const { client, readResourceCalls, readCollectionCalls } = createStubGraphClient();
     const action = SAMPLE_ACTIONS[actionId];
     const fields = M365_READ_ACTION_FIELDS[actionId];
@@ -120,6 +129,16 @@ describe('executeGraphReadAction — dispatch table', () => {
       expect(readCollectionCalls[0]!.query['$select']).toBe(fields.join(','));
       expect(readCollectionCalls[0]!.accessToken).toBe(ACCESS_TOKEN);
     }
+  });
+
+  it('uses the fixed OneDrive report collector and projects only its scalar usage fields', async () => {
+    const { client, readResourceCalls, readCollectionCalls, oneDriveUsageCalls } = createStubGraphClient({ collection: {
+      items: [{ ownerPrincipalName: 'ada@contoso.com', storageUsedBytes: 1, storageAllocatedBytes: 2, siteUrl: 'never' }], truncated: true,
+    } });
+    await expect(executeGraphReadAction({ type: 'm365.report.onedrive.usage.list' }, { accessToken: ACCESS_TOKEN, graphClient: client }))
+      .resolves.toEqual({ success: true, kind: 'collection', items: [{ ownerPrincipalName: 'ada@contoso.com', storageUsedBytes: 1, storageAllocatedBytes: 2 }], truncated: true });
+    expect(oneDriveUsageCalls).toEqual([{ accessToken: ACCESS_TOKEN }]);
+    expect(readResourceCalls).toHaveLength(0); expect(readCollectionCalls).toHaveLength(0);
   });
 
   it('m365.user.list with search sets $search, $count, and consistencyLevelEventual', async () => {

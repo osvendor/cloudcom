@@ -335,7 +335,20 @@ func (m *lifecycleManager) cleanupLocked(ctx context.Context, cmd CleanupCommand
 	if err != nil || verified.Enabled || verified.InAdministrators || deprovisioned.Enabled || deprovisioned.InAdministrators {
 		return m.failed(cmd.ActuationID, cmd.Generation, bootID, "account_verification_failed")
 	}
+	// Windows can retain a terminated process token briefly after the Job
+	// Object reports zero members. Wait for that teardown to finish, but never
+	// claim cleanup if the token remains or any scan fails.
 	privileged, err := m.windows.VerifyNoPrivilegedToken(ctx, elevaccount.AccountName)
+	for attempt := 0; privileged && err == nil && attempt < 20; attempt++ {
+		timer := time.NewTimer(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return m.failed(cmd.ActuationID, cmd.Generation, bootID, "privileged_token_verification_failed")
+		case <-timer.C:
+		}
+		privileged, err = m.windows.VerifyNoPrivilegedToken(ctx, elevaccount.AccountName)
+	}
 	if err != nil || privileged {
 		return m.failed(cmd.ActuationID, cmd.Generation, bootID, "privileged_token_verification_failed")
 	}

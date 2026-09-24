@@ -69,7 +69,9 @@ export async function processPamActuationEvent(input: PamActuationJobData): Prom
       return 'blocked';
     }
 
-    if ((actuation.pam_lifetime_protocol_version ?? 0) < 2) {
+    // Cleanup must remain deliverable while reconciliation has temporarily
+    // lowered the reported capability to 0. Apply still requires readiness.
+    if (actuation.desired_state === 'active' && (actuation.pam_lifetime_protocol_version ?? 0) < 2) {
       await tx.execute(sql`
         UPDATE pam_actuations SET observed_state = 'failed',
           failure_code = 'pam_protocol_v2_unsupported', updated_at = now()

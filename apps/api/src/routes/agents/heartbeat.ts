@@ -66,6 +66,7 @@ import {
   type EditionWithheldContext as SharedEditionWithheldContext,
 } from '../../services/agentEditionCompat';
 import { recordAgentHealthObservation } from '../../services/agentHealthObservations';
+import { getWindowsReleaseCanaryVersion } from '../../services/releaseSource';
 
 /**
  * #1121 — pure collapse detector for the watchdogState tolerance gap.
@@ -728,7 +729,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
           component: 'watchdog',
           platform: device.osType,
           architecture: normalizedArch,
-          pin: versionPins.watchdog,
+          pin: getWindowsReleaseCanaryVersion(device.id, device.osType) ?? versionPins.watchdog,
           agentId,
         });
 
@@ -804,7 +805,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
           component: 'agent',
           platform: device.osType,
           architecture: normalizedArch,
-          pin: versionPins.agent,
+          pin: getWindowsReleaseCanaryVersion(device.id, device.osType) ?? versionPins.agent,
           agentId,
         });
 
@@ -1554,7 +1555,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         component: 'agent',
         platform: device.osType,
         architecture: normalizedArch,
-        pin: versionPins.agent,
+        pin: getWindowsReleaseCanaryVersion(device.id, device.osType) ?? versionPins.agent,
         agentId,
       });
 
@@ -1626,7 +1627,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         component: 'watchdog',
         platform: device.osType,
         architecture: normalizedArch,
-        pin: versionPins.watchdog,
+        pin: getWindowsReleaseCanaryVersion(device.id, device.osType) ?? versionPins.watchdog,
         agentId,
       });
 

@@ -13,6 +13,7 @@
  * of the generic outage copy (see authOrgStatusGate.test.ts for that half).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Hono } from 'hono';
 
 const { portalUserRow, activeOrgResult } = vi.hoisted(() => ({
   portalUserRow: { current: null as Record<string, unknown> | null },
@@ -20,6 +21,10 @@ const { portalUserRow, activeOrgResult } = vi.hoisted(() => ({
 }));
 
 const resolveOrgTimezone = vi.hoisted(() => vi.fn(async () => 'UTC'));
+const gateway = vi.hoisted(() => vi.fn());
+const passwordCheck = vi.hoisted(() => vi.fn());
+vi.mock('../../services/portalCompanyGateway', () => ({ checkPortalCompanyGateway: gateway }));
+vi.mock('../../services/password', () => ({ verifyPassword: passwordCheck, hashPassword: vi.fn(), isPasswordStrong: vi.fn() }));
 
 vi.mock('../../services/portal/timezone', () => ({
   resolveOrgTimezone,
@@ -37,6 +42,7 @@ function project(columns: Record<string, unknown>): Array<Record<string, unknown
 
 vi.mock('../../db', () => ({
   db: {
+    update: () => ({ set: () => ({ where: async () => undefined }) }),
     select: (columns: Record<string, unknown>) => ({
       from: () => ({
         where: () => ({ limit: () => Promise.resolve(project(columns)) }),
@@ -67,7 +73,7 @@ vi.mock('../../services/tenantStatus', () => ({
   invalidateAgentTenantCache: vi.fn(async () => undefined),
 }));
 
-import { authRoutes } from './auth';
+import { authRoutes, portalAuthMiddleware } from './auth';
 import { portalSessions } from './helpers';
 import {
   PORTAL_SESSION_COOKIE_NAME,
@@ -93,6 +99,8 @@ function seedSession() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  gateway.mockResolvedValue({ ok: true, orgId: ORG_ID });
+  passwordCheck.mockResolvedValue(true);
   portalSessions.clear();
   portalUserRow.current = {
     id: USER_ID,
@@ -104,8 +112,57 @@ beforeEach(() => {
     status: 'active',
     authMethod: 'password',
     authEpoch: 1,
+    accessMode: 'standard',
   };
   activeOrgResult.current = { orgId: ORG_ID, partnerId: 'partner-1' };
+});
+
+describe('two-step remote login', () => {
+  function login() {
+    const app = new Hono(); app.route('/', authRoutes);
+    return app.request('/auth/login', { method: 'POST', headers: {
+      'Content-Type': 'application/json', 'Cf-Access-Jwt-Assertion': 'company-assertion',
+    }, body: JSON.stringify({ email: 'cust@acme.example', password: 'synthetic-password' }) });
+  }
+  beforeEach(() => { portalUserRow.current!.passwordHash = 'synthetic-hash'; portalUserRow.current!.accessMode = 'remote_only'; });
+  it('does not issue a session when a correct individual password has the wrong company', async () => {
+    gateway.mockResolvedValue({ ok: false, status: 403 });
+    expect((await login()).status).toBe(403);
+    expect(gateway).toHaveBeenCalledWith('company-assertion', ORG_ID);
+    expect(portalSessions.size).toBe(0);
+  });
+  it('still requires the individual password before company authorization', async () => {
+    passwordCheck.mockResolvedValue(false);
+    expect((await login()).status).toBe(401);
+    expect(gateway).not.toHaveBeenCalled(); expect(portalSessions.size).toBe(0);
+  });
+  it('creates a remote-only session when both credentials pass', async () => {
+    const response = await login(); expect(response.status).toBe(200);
+    expect((await response.json()).user.accessMode).toBe('remote_only');
+    expect(portalSessions.size).toBe(1);
+  });
+});
+
+describe('remote-only middleware authorization', () => {
+  const app = new Hono();
+  app.use('/api/v1/portal/*', portalAuthMiddleware);
+  app.get('/api/v1/portal/*', c => c.json({ reachedHandler: true }));
+
+  it.each(['/devices', '/devices/export.csv', '/tickets', '/invoices', '/quotes', '/reports'])('blocks direct calls to %s', async path => {
+    seedSession();
+    portalUserRow.current!.accessMode = 'remote_only';
+    const result = await app.request(`/api/v1/portal${path}`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect(result.status).toBe(403);
+    expect(await result.json()).toMatchObject({ code: 'PORTAL_REMOTE_ONLY' });
+  });
+
+  it('allows remote handlers and preserves ordinary portal accounts', async () => {
+    seedSession();
+    portalUserRow.current!.accessMode = 'remote_only';
+    expect((await app.request('/api/v1/portal/remote/devices', { headers: { Authorization: `Bearer ${TOKEN}` } })).status).toBe(200);
+    portalUserRow.current!.accessMode = 'standard';
+    expect((await app.request('/api/v1/portal/devices', { headers: { Authorization: `Bearer ${TOKEN}` } })).status).toBe(200);
+  });
 });
 
 describe('POST /auth/logout — disabled portal user', () => {

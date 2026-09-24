@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const fetchWithAuthMock = vi.hoisted(() => vi.fn());
@@ -30,6 +30,7 @@ import Sidebar, { navSections, topLevelNav } from './Sidebar';
 beforeEach(() => {
   localStorage.clear();
   localStorage.setItem('sidebar-mode', 'open');
+  localStorage.setItem('sidebar-sections', JSON.stringify({ extensions: true }));
   fetchWithAuthMock.mockReset();
   fetchWithAuthMock.mockResolvedValue({ ok: false, status: 404, json: async () => ({}) } as Response);
   useExtensionNavigationMock.mockReset();
@@ -113,5 +114,81 @@ describe('Sidebar extension navigation', () => {
     const zetaIdx = links.indexOf('Zeta B');
     expect(alphaIdx).toBeGreaterThan(-1);
     expect(zetaIdx).toBeGreaterThan(alphaIdx);
+  });
+
+  it('renders grouped extension children behind an expandable button and keeps flat links as siblings', async () => {
+    useExtensionNavigationMock.mockReturnValue([
+      {
+        name: 'Cloud Command',
+        href: '/extensions/cloudcommand',
+        children: [
+          { name: '3CX', href: '/extensions/cloudcommand/threecx' },
+          { name: 'Microsoft 365', href: '/extensions/cloudcommand/microsoft' },
+        ],
+      },
+      { name: 'Connect', href: '/extensions/cloudcommand/connect' },
+    ]);
+
+    const { container } = render(<Sidebar currentPath="/" />);
+    const group = await screen.findByRole('button', { name: 'Cloud Command' });
+    expect(group).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('link', { name: '3CX' })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Connect' })).toHaveAttribute('href', '/extensions/cloudcommand/connect');
+
+    fireEvent.click(group);
+    expect(group).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('link', { name: '3CX' })).toHaveAttribute('href', '/extensions/cloudcommand/threecx');
+    expect(screen.getByRole('link', { name: 'Microsoft 365' })).toHaveAttribute('href', '/extensions/cloudcommand/microsoft');
+    expect(container.querySelector('a[href="/extensions/cloudcommand"]')).toBeNull();
+  });
+
+  it('auto-expands a group and highlights the active child', async () => {
+    useExtensionNavigationMock.mockReturnValue([
+      {
+        name: 'Cloud Command',
+        href: '/extensions/cloudcommand',
+        children: [{ name: '3CX', href: '/extensions/cloudcommand/threecx' }],
+      },
+    ]);
+
+    render(<Sidebar currentPath="/extensions/cloudcommand/threecx" />);
+    const group = await screen.findByRole('button', { name: 'Cloud Command' });
+    expect(group).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('link', { name: '3CX' })).toHaveClass('bg-primary');
+    expect(screen.getByRole('link', { name: '3CX' })).toHaveAttribute('aria-current', 'page');
+    fireEvent.click(group);
+    expect(group).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('exposes grouped navigation after expanding the collapsed sidebar', async () => {
+    useExtensionNavigationMock.mockReturnValue([
+      {
+        name: 'Cloud Command',
+        href: '/extensions/cloudcommand',
+        children: [{ name: '3CX', href: '/extensions/cloudcommand/threecx' }],
+      },
+    ]);
+    localStorage.setItem('sidebar-mode', 'collapsed');
+
+    render(<Sidebar currentPath="/" />);
+    fireEvent.click(screen.getByTitle(/expand/i));
+    const group = await screen.findByRole('button', { name: 'Cloud Command' });
+    fireEvent.click(group);
+
+    expect(await screen.findByRole('link', { name: '3CX' })).toBeInTheDocument();
+  });
+
+  it('shows setup text for an empty grouped extension and loading text while loading', async () => {
+    useExtensionNavigationMock.mockReturnValue([
+      { name: 'Cloud Command', href: '/extensions/cloudcommand', children: [] },
+    ]);
+    const { rerender } = render(<Sidebar currentPath="/" />);
+    expect(await screen.findByText('No connections. Set up services in Connect.')).toBeInTheDocument();
+
+    useExtensionNavigationMock.mockReturnValue([
+      { name: 'Cloud Command', href: '/extensions/cloudcommand', children: [], loading: true },
+    ]);
+    rerender(<Sidebar currentPath="/" />);
+    expect(await screen.findByText('Loading…')).toBeInTheDocument();
   });
 });

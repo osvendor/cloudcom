@@ -5,18 +5,220 @@ import { fileURLToPath } from 'node:url';
 const baselinePath = new URL('../cloudcom-baseline.json', import.meta.url);
 const docsPath = /^(?:docs\/|apps\/docs\/|scripts\/docs-review\/|README(?:\.[^/]+)?$|AGENTS\.md$|[^/]+\.mdx?$)/u;
 const supported = [
-  ['web', /^apps\/web\//u],
   ['native', /^agent\//u],
 ];
+const remoteAccessWebPaths = new Set([
+  'apps/web/src/components/remote/RemoteToolsPage.tsx',
+  'apps/web/src/components/cloudcom/RemoteAccessAlternatives.tsx',
+  'apps/web/src/components/cloudcom/RemoteAccessAlternatives.test.tsx',
+]);
+// Only this reviewed API surface has change-focused coverage below. Unknown
+// API, schema and portal changes continue to fail closed.
+const remoteAccessApiPaths = new Set([
+  'apps/api/src/services/monitors/monitorCompiler.ts',
+  'apps/api/src/services/monitors/monitorCompiler.w04.test.ts',
+  'apps/api/src/routes/devices/index.ts',
+  'apps/api/src/routes/devices/cloudcomRemoteAccess.ts',
+  'apps/api/src/routes/devices/cloudcomRemoteAccess.test.ts',
+  'apps/api/src/services/cloudcom/remoteAccessOptions.ts',
+  'apps/api/src/services/cloudcom/remoteAccessOptions.test.ts',
+]);
+// Customer portal remote access has its own bounded CI path. These entries are
+// deliberately enumerated because the validation uses a disposable Postgres /
+// Redis stack, real portal-login and authorization tests, plus the RLS coverage
+// contract; unknown portal or schema work must still fail closed.
+const portalRemoteApiPaths = new Set([
+  'apps/api/src/db/schema/portalNative.ts',
+  'apps/api/migrations/2026-09-22-native-admission.sql',
+  'apps/api/src/services/portalNativeAdmission.ts',
+  'apps/api/src/services/portalNativeAdmissionSchemas.ts',
+  'apps/api/src/services/portalNativeAdmissionSchemas.test.ts',
+  'apps/api/src/services/portalNativeOperator.ts',
+  'apps/api/src/services/portalNativeOperator.test.ts',
+  'apps/api/src/services/portalNativeTarget.ts',
+  'apps/api/src/routes/nativeTarget.ts',
+  'apps/api/src/routes/nativeTarget.test.ts',
+  'apps/api/src/routes/agents/nativeTarget.ts',
+  'apps/api/src/routes/agents/nativeTarget.test.ts',
+  'apps/api/src/routes/portal/nativeAdmission.ts',
+  'apps/api/src/routes/portal/nativeAdmission.test.ts',
+  'apps/api/src/routes/agents/index.ts',
+  'apps/api/src/index.ts', // Native target route mount; portal remote job validates the API entrypoint.
+  'apps/api/src/__tests__/integration/portalNativeAdmission.integration.test.ts',
+
+  'apps/api/src/routes/orgPortalUsers.ts', 'apps/api/src/routes/orgPortalUsers.test.ts',
+  'apps/api/src/routes/portal/acceptInvite.test.ts',
+  'apps/api/src/services/portalCompanyGateway.ts', 'apps/api/src/services/portalCompanyGateway.test.ts',
+  'apps/api/src/services/cfAccessJwt.ts', 'apps/api/src/services/cfAccessJwt.test.ts',
+  'apps/api/src/services/portalNativeLogin.ts', 'apps/api/src/services/portalNativeLogin.test.ts',
+  'apps/api/src/routes/portal/nativeLogin.ts', 'apps/api/src/routes/portal/nativeLogin.test.ts',
+  'apps/api/src/__tests__/integration/portalNativeLogin.integration.test.ts',
+  '.env.example', 'docker-compose.yml',
+  'apps/api/migrations/2026-09-21-portal-remote-access.sql',
+  'apps/api/migrations/2026-09-21-portal-remote-session-prompt.sql',
+  'apps/api/migrations/2026-09-22-portal-remote-assignment-identity.sql',
+  'apps/api/src/__tests__/integration/orgMergeRegistry.integration.test.ts',
+  'apps/api/src/__tests__/integration/portalRemoteAccess.integration.test.ts',
+  'apps/api/src/__tests__/integration/portalRemoteLogin.integration.test.ts',
+  'apps/api/src/db/schema/index.ts', 'apps/api/src/db/schema/portal.ts', 'apps/api/src/db/schema/portalRemote.ts',
+  'apps/api/src/extensions/builtinExtensions.test.ts', 'apps/api/src/extensions/builtinRegistry.test.ts', 'apps/api/src/extensions/builtinRegistry.ts',
+  'apps/api/src/middleware/selfManagedDbContextRoutes.test.ts', 'apps/api/src/middleware/selfManagedDbContextRoutes.ts',
+  'apps/api/src/routes/agentWs.test.ts', 'apps/api/src/routes/agentWs.ts',
+  'apps/api/src/routes/devices/cascadeDelete.test.ts', 'apps/api/src/routes/devices/core.ts',
+  'apps/api/src/routes/devices/moveOrg.coverage.test.ts', 'apps/api/src/routes/devices/moveOrg.test.ts', 'apps/api/src/routes/devices/moveOrg.ts',
+  'apps/api/src/routes/portal/accessMode.test.ts', 'apps/api/src/routes/portal/accessMode.ts',
+  'apps/api/src/routes/portal/auth.test.ts', 'apps/api/src/routes/portal/auth.ts', 'apps/api/src/routes/portal/authOrgStatusGate.test.ts',
+  'apps/api/src/routes/portal/helpers.ts', 'apps/api/src/routes/portal/index.ts', 'apps/api/src/routes/portal/profile.ts',
+  'apps/api/src/routes/portal/remote.test.ts', 'apps/api/src/routes/portal/remote.ts',
+  'apps/api/src/routes/portal/remoteDesktop.test.ts', 'apps/api/src/routes/portal/remoteDesktop.ts',
+  'apps/api/src/routes/portal/remoteRateLimit.test.ts', 'apps/api/src/routes/portal/remoteRateLimit.ts', 'apps/api/src/routes/portal/schemas.ts',
+  'apps/api/src/services/orgMergeRegistry.ts', 'apps/api/src/services/portalNativeProof.test.ts', 'apps/api/src/services/portalNativeProof.ts',
+  'apps/api/src/services/portalRemoteAgent.test.ts', 'apps/api/src/services/portalRemoteAgent.ts', 'apps/api/src/services/portalRemoteAuthority.ts',
+  'apps/api/src/services/portalRemoteFeature.ts', 'apps/api/src/services/portalRemoteLease.test.ts', 'apps/api/src/services/portalRemoteLease.ts',
+  'apps/api/src/services/portalRemoteSessionAuth.test.ts', 'apps/api/src/services/portalRemoteSessionAuth.ts',
+  'apps/api/src/services/portalRemoteSessionStore.test.ts', 'apps/api/src/services/portalRemoteSessionStore.ts',
+  'apps/api/src/services/remoteAccessLauncher.test.ts', 'apps/api/src/services/tenantCascade.ts', 'apps/api/src/services/tenantExportPolicyRegistry.ts',
+]);
+const portalRemoteWebPaths = new Set([
+  'apps/web/src/components/settings/OrgPortalUsersEditor.tsx', 'apps/web/src/components/settings/OrgPortalUsersEditor.test.tsx',
+  'apps/portal/src/pages/remote/native.astro', 'apps/portal/src/lib/nativeLogin.ts', 'apps/portal/src/lib/nativeLogin.test.ts',
+  'apps/portal/src/components/remote/NativeSignInPage.tsx', 'apps/portal/src/components/remote/NativeSignInPage.test.tsx',
+  'apps/portal/src/components/remote/NativeSignInConsent.tsx',
+  'apps/portal/src/components/portal/LoginForm.tsx', 'apps/portal/src/components/portal/RemotePage.tsx',
+  'apps/portal/src/components/portal/RemoteViewer.test.tsx', 'apps/portal/src/components/portal/RemoteViewer.tsx',
+  'apps/portal/src/layouts/PortalLayout.astro', 'apps/portal/src/lib/api.ts', 'apps/portal/src/lib/auth.ts',
+  'apps/portal/src/lib/landing.test.ts', 'apps/portal/src/lib/landing.ts', 'apps/portal/src/lib/nextPath.test.ts',
+  'apps/portal/src/lib/nextPath.ts', 'apps/portal/src/lib/protectedPaths.ts', 'apps/portal/src/lib/remoteInput.test.ts',
+  'apps/portal/src/lib/remoteInput.ts', 'apps/portal/src/middleware.test.ts', 'apps/portal/src/middleware.ts',
+  'apps/portal/src/pages/index.astro', 'apps/portal/src/pages/remote/[sessionId].astro', 'apps/portal/src/pages/remote/index.astro',
+]);
+const rustdeskExtensionPaths = /^(?:packages\/ext-rustdesk-access\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/README\.md|src\/(?:authorization(?:\.test)?\.mjs|server\/index(?:\.test)?\.ts|web\/index(?:\.test)?\.ts))|packages\/ext-rustdesk-access\/README\.md)$/u;
+const cloudCommandApiPaths = new Set([
+  'apps/api/src/routes/extensionsWeb.test.ts',
+  'apps/api/src/routes/extensionsWeb.ts',
+  'apps/api/src/extensions/builtinExtensions.test.ts',
+  'apps/api/src/extensions/builtinExtensions.ts',
+  'apps/api/src/extensions/builtinRegistry.test.ts',
+  'apps/api/src/extensions/builtinRegistry.ts',
+  'apps/api/src/extensions/cloudCommandMicrosoft.ts',
+  'apps/api/src/extensions/cloudCommandMicrosoft.test.ts',
+  'apps/api/src/extensions/cloudCommandGoogle.ts',
+  'apps/api/src/extensions/cloudCommandGoogleTrace.ts',
+  'apps/api/src/extensions/cloudCommandGoogle.test.ts',
+  'apps/api/src/services/googleClient.ts',
+  'apps/api/src/services/googleClient.test.ts',
+  'apps/api/src/extensions/cloudCommandAdminRuntime.ts',
+  'apps/api/src/extensions/cloudCommandAdminRuntime.test.ts',
+  'apps/api/src/extensions/cloudCommandAdminAuthorization.ts',
+  'apps/api/src/extensions/cloudCommandAdminAuthorization.test.ts',
+  'apps/api/src/extensions/webRegistry.test.ts',
+  'apps/api/src/extensions/webRegistry.ts',
+  'apps/api/src/extensions/webAssets.test.ts',
+  'apps/api/src/extensions/webAssets.ts',
+  'apps/api/src/extensions/stageExtension.test.ts',
+  'apps/api/src/extensions/stageExtension.ts',
+  'apps/api/src/extensions/gateway.test.ts',
+  'apps/api/src/extensions/gateway.ts',
+  'apps/api/src/services/urlSafety.test.ts',
+  'apps/api/src/services/urlSafety.tripwire.test.ts',
+  'apps/api/src/services/urlSafety.ts',
+  'apps/api/src/__tests__/integration/cloudCommandThreeCx.integration.test.ts',
+  'apps/api/package.json',
+  'apps/api/tsup.config.ts',
+  'apps/api/Dockerfile',
+  'docker/Dockerfile.api',
+  'pnpm-lock.yaml',
+]);
+const cloudCommandWebPaths = new Set([
+  'apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx',
+  'apps/web/src/components/integrations/GoogleWorkspaceIntegration.test.tsx',
+  'apps/web/src/components/extensions/ExtensionElementHost.tsx',
+  'apps/web/src/components/extensions/ExtensionPageHost.test.tsx',
+  'apps/web/src/components/extensions/ExtensionSlotHost.test.tsx',
+  'apps/web/src/components/extensions/useExtensionNavigation.test.tsx',
+  'apps/web/src/components/extensions/useExtensionNavigation.ts',
+  'apps/web/src/components/layout/Sidebar.tsx',
+  'apps/web/src/components/layout/Sidebar.extensions.test.tsx',
+  'apps/web/src/lib/extensions/cloudCommandNavigationEvents.ts',
+  'apps/web/src/lib/extensions/hostApi.test.ts',
+  'apps/web/src/lib/extensions/hostApi.ts',
+  'apps/web/src/lib/extensions/registry.test.ts',
+  'apps/web/src/lib/extensions/registry.ts',
+]);
+const cloudCommandSharedPaths = new Set([
+  'packages/extension-web-sdk/src/hostApi.ts',
+  'packages/extension-web-sdk/src/index.ts',
+  'packages/shared/src/m365/readActions.ts',
+  'packages/shared/src/m365/readActions.test.ts',
+]);
+const cloudCommandReportExecutorPaths = new Set([
+  'apps/m365-graph-read-executor/src/microsoft/graphClient.ts',
+  'apps/m365-graph-read-executor/src/microsoft/graphClient.test.ts',
+  'apps/m365-graph-read-executor/src/microsoft/readActions.ts',
+  'apps/m365-graph-read-executor/src/microsoft/readActions.test.ts',
+]);
+// The UniFi sync lock-order fix changes a background worker and its
+// organization-lock helper.  It has a dedicated real-Postgres proof in the
+// API validation job below; keep this list exact so unrelated UniFi work still
+// fails closed until it has its own reviewed coverage.
+const unifiSyncLockPaths = new Set([
+  'apps/api/src/services/unifi/unifiSyncLocks.ts',
+  'apps/api/src/jobs/unifiWorker.ts',
+  'apps/api/src/jobs/unifiWorker.test.ts',
+  'apps/api/src/__tests__/integration/unifiSyncLockOrder.integration.test.ts',
+]);
+// Cleanup dispatch is an agent recovery path. Keep the API allowlist exact;
+// native agent changes already select the Go race suite independently.
+const pamCleanupRecoveryPaths = new Set([
+  'apps/api/src/jobs/pamActuationWorker.ts',
+  'apps/api/src/jobs/pamActuationWorker.test.ts',
+  'apps/api/src/services/commandDispatch.ts',
+  'apps/api/src/services/commandDispatch.test.ts',
+]);
+const pamLocalDecisionPaths = new Set([
+  'apps/api/src/routes/agents/elevationRequests.ts',
+  'apps/api/src/routes/agents/elevationRequests.test.ts',
+  'apps/api/src/routes/pam.ts',
+  'apps/api/src/routes/pam.test.ts',
+  'apps/api/src/routes/softwarePolicies.ts',
+  'apps/api/src/routes/softwarePolicies.test.ts',
+  'apps/api/src/jobs/pamJobs.ts',
+  'apps/api/src/jobs/pamJobs.test.ts',
+]);
+// A Windows-only release source changes artifact trust, download routing and
+// canary update selection. Keep this surface exact and pair it with focused
+// release tests in the API CI job.
+const windowsReleasePaths = new Set([
+  'apps/api/src/config/validate.ts',
+  'apps/api/src/config/validate.test.ts',
+  'apps/api/src/routes/agents/download.ts',
+  'apps/api/src/routes/agents/download.test.ts',
+  'apps/api/src/routes/agents/heartbeat.ts',
+  'apps/api/src/services/binarySync.ts',
+  'apps/api/src/services/binarySync.test.ts',
+  'apps/api/src/services/installerBuilder.ts',
+  'apps/api/src/services/installerBuilder.test.ts',
+  'apps/api/src/services/releaseSource.ts',
+  'apps/api/src/services/releaseSource.test.ts',
+]);
 const infraPaths = new Set([
-  'AGENTS.md', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',
+  'AGENTS.md', '.dockerignore', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',
   '.github/scripts/check-cloudcom-runner.sh', '.github/scripts/ci-area-gating.test.mjs',
   '.github/scripts/ci-build-reuse.test.mjs', '.github/scripts/classify-pr-paths.sh',
   '.github/scripts/classify-pr-paths.test.mjs', '.github/scripts/mobile-native-ci.test.mjs',
   '.github/scripts/prepare-ci-apt-sources.test.mjs', 'deploy/.env.example',
-  'deploy/docker-compose.prod.yml', 'scripts/check-guided-setup-systemd-unit.sh',
+  'deploy/docker-compose.prod.yml', 'deploy/cloudcom-exchange-worker/Dockerfile',
+  'deploy/cloudcom-exchange-worker/healthcheck.py', 'deploy/cloudcom-exchange-worker/README.md',
+  'scripts/check-guided-setup-systemd-unit.sh',
   'scripts/check-guided-setup-signed-image-floor.sh', 'scripts/prod/deploy.sh',
-  'scripts/release/release-image-consumers.test.mjs', 'scripts/smoke-guided-setup.sh',
+  'scripts/release/release-image-consumers.test.mjs',
+  '.github/workflows/cloudcom-candidate.yml',
+  'scripts/release/cloudcom-candidate-workflow.test.mjs',
+  'scripts/cloudcom/exchange-worker-release.mjs',
+  'scripts/cloudcom/exchange-worker-release.test.mjs',
+  'deploy/cloudcom-exchange-worker/compose.overlay.candidate.yml',
+  'deploy/cloudcom-exchange-worker/verify-compose-candidate.py',
+  'scripts/smoke-guided-setup.sh',
 ]);
 
 export function readBaseline(text = readFileSync(baselinePath, 'utf8')) {
@@ -28,9 +230,84 @@ export function readBaseline(text = readFileSync(baselinePath, 'utf8')) {
 }
 
 export function classify(paths) {
-  const result = { api: false, web: false, shared: false, native: false, infra: false, unsupported: [] };
+  const result = { api: false, web: false, shared: false, native: false, infra: false, portalRemote: false, unifiSyncLock: false, unsupported: [] };
   for (const path of paths.filter(Boolean)) {
-    if (docsPath.test(path)) continue;
+    if (path === 'packages/shared/src/validators/portal.ts' || path === 'packages/shared/src/validators/portal.test.ts') {
+      result.shared = true;
+      result.api = true;
+      result.web = true;
+      result.portalRemote = true;
+      continue;
+    }
+    if (path === 'deploy/remote-identity/README.md') continue;
+    if (['deploy/remote-identity/compose.yml', 'deploy/remote-identity/.env.example', 'deploy/remote-identity/.gitignore',
+      'deploy/remote-identity/custom-templates/.gitkeep', 'deploy/remote-identity/secrets/.gitkeep',
+      'deploy/remote-identity/company-login.yaml'].includes(path)) {
+      result.infra = true;
+      continue;
+    }
+    if (docsPath.test(path) || path === 'packages/ext-cloud-command/README.md' || path === 'packages/ext-rustdesk-access/README.md') continue;
+    if (portalRemoteApiPaths.has(path)) {
+      result.api = true;
+      result.portalRemote = true;
+      if (path === '.env.example' || path === 'docker-compose.yml') result.infra = true;
+      continue;
+    }
+    if (portalRemoteWebPaths.has(path)) {
+      result.web = true;
+      result.portalRemote = true;
+      continue;
+    }
+    if (rustdeskExtensionPaths.test(path)) {
+      result.api = true;
+      result.web = true;
+      result.portalRemote = true;
+      continue;
+    }
+    if (remoteAccessApiPaths.has(path)) {
+      result.api = true;
+      continue;
+    }
+    if (cloudCommandApiPaths.has(path) || /^packages\/ext-cloud-command\/(?:manifest\.json|package\.json|tsconfig\.json|tsup\.web\.config\.ts|vitest\.web\.config\.ts|migrations\/(?:2026-09-21-threecx-connections|2026-09-22-microsoft-connections|2026-09-22-native-admin-connections|2026-09-22-microsoft-directory-preferences)\.sql|src\/(?:server|threecx|web)\/.+)$/u.test(path)) {
+      result.api = true;
+      result.web = true;
+      continue;
+    }
+    if (cloudCommandWebPaths.has(path)) {
+      result.web = true;
+      continue;
+    }
+    if (cloudCommandSharedPaths.has(path)) {
+      result.shared = true;
+      continue;
+    }
+    if (cloudCommandReportExecutorPaths.has(path)) {
+      result.api = true;
+      result.shared = true;
+      continue;
+    }
+    if (unifiSyncLockPaths.has(path)) {
+      result.api = true;
+      result.unifiSyncLock = true;
+      continue;
+    }
+    if (pamCleanupRecoveryPaths.has(path)) {
+      result.api = true;
+      continue;
+    }
+    if (pamLocalDecisionPaths.has(path)) {
+      result.api = true;
+      continue;
+    }
+    if (windowsReleasePaths.has(path)) {
+      result.api = true;
+      continue;
+    }
+    if (remoteAccessWebPaths.has(path) || path.startsWith('apps/web/src/components/cloudcom/browserDesktop/') ||
+        /^apps\/web\/src\/components\/remote\/ConnectDesktopButton(?:\.[\w]+)*\.tsx$/.test(path)) {
+      result.web = true;
+      continue;
+    }
     if (path === 'apps/api/src/config/envComposeParity.test.ts') {
       result.infra = true;
       continue;
@@ -86,6 +363,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     shared: classification.shared,
     native: classification.native,
     infra: classification.infra,
+    portalRemote: classification.portalRemote,
+    unifiSyncLock: classification.unifiSyncLock,
     docsOnly: classification.docsOnly,
     unsupported: classification.unsupported.length > 0,
   };

@@ -48,17 +48,12 @@ const (
 
 // RunPamFlow implements etwlua.PamRunner. Given the server's ingest decision
 // for a detected UAC prompt, it shows the user-desktop PAM dialog (when the
-// status warrants it), composes the decision, and either actuates locally
-// (end-user-allowed) or dismisses consent.exe (deny). The require-approval
-// path resolves remotely: the server issues an actuate_elevation command once
-// a technician approves.
+// status warrants it), composes the decision, and dismisses the original
+// consent.exe prompt from the requester's interactive session. Approved
+// requests are launched by the server's PAM v2 actuation in that session.
 func (h *Heartbeat) RunPamFlow(ctx context.Context, ev etwlua.Event, outcome etwlua.ElevationOutcome) {
-	// RunPamFlow runs on the etwlua loop goroutine and reaches raw SendInput
-	// syscalls via the actuator — unlike the remote actuate path, there is no
-	// worker-pool recover() above it. A syscall panic here would crash the
-	// whole agent. Contain it: the credential-zeroing/demote defers inside
-	// actuateElevation still run during unwinding, so this is purely
-	// availability hardening, not a correctness shortcut.
+	// RunPamFlow runs on the etwlua loop goroutine. Contain a broker/helper
+	// panic so a failed interactive prompt cannot crash the whole agent.
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("pam: panic in RunPamFlow; elevation flow aborted",
@@ -138,26 +133,31 @@ func (h *Heartbeat) RunPamFlow(ctx context.Context, ev etwlua.Event, outcome etw
 
 	switch sessionbroker.ComposePamDecision(verdict, dialog, nil) {
 	case sessionbroker.PamActionActuate:
-		// Bound the local actuation with a per-flow ceiling, mirroring the
-		// remote handler (handlers_actuate.go). Deriving from ctx (not
-		// context.Background) preserves agent-shutdown cancellation while
-		// adding a flow-scoped timeout so a stuck desktop can't pin the
-		// etwlua loop goroutine forever. Wrapped in a closure so defer cancel
-		// releases the timer even if actuateElevation panics (recovered above).
-		func() {
-			actCtx, cancel := context.WithTimeout(ctx, 2*defaultActuateTimeoutMs*time.Millisecond)
-			defer cancel()
-			res := h.actuateElevation(actCtx, outcome.RequestID, defaultActuateTimeoutMs,
-				pamTarget{Path: ev.TargetExecutablePath, CommandLine: ev.CommandLine, SubjectUsername: ev.SubjectUsername})
-			if res.Success {
-				log.Info("pam: local actuation complete", "elevationRequestId", outcome.RequestID, "success", true, "reason", res.Reason)
-			} else {
-				log.Warn("pam: local actuation failed", "elevationRequestId", outcome.RequestID, "reason", res.Reason, "message", res.DetailMessage)
+		// The service runs in Session 0. It cannot drive the requester's UAC
+		// desktop with OpenInputDesktop/SendInput. The SYSTEM PAM helper is in
+		// the interactive session; let it close the original prompt while the
+		// server's v2 actuation launches the approved target independently.
+		closed := h.dismissConsent(session, outcome.RequestID, "approved_v2", targetWinSession, false)
+		if outcome.LocalDecisionRequired {
+			decision := "denied"
+			if closed {
+				decision = "approved"
 			}
-		}()
+			if err := h.reportLocalPamDecision(outcome.RequestID, decision); err != nil {
+				log.Error("pam: local decision report failed; server launch remains blocked",
+					"elevationRequestId", outcome.RequestID, "decision", decision, "error", err.Error())
+			}
+		}
 	case sessionbroker.PamActionDeny:
+		if outcome.LocalDecisionRequired {
+			if err := h.reportLocalPamDecision(outcome.RequestID, "denied"); err != nil {
+				log.Error("pam: local deny report failed; server launch remains blocked",
+					"elevationRequestId", outcome.RequestID, "error", err.Error())
+			}
+		}
 		h.denyConsent(session, outcome.RequestID, dialog.Reason, targetWinSession)
 	case sessionbroker.PamActionAwaitRemote:
+		h.dismissConsent(session, outcome.RequestID, "awaiting_remote_approval", targetWinSession, false)
 		log.Info("pam: awaiting remote technician approval; server will issue actuate_elevation", "elevationRequestId", outcome.RequestID)
 	}
 }
@@ -166,18 +166,28 @@ func (h *Heartbeat) RunPamFlow(ctx context.Context, ev etwlua.Event, outcome etw
 // targetWinSession is retained so gate recovery can re-locate a capable helper
 // after the original session dies mid-dismiss.
 func (h *Heartbeat) denyConsent(session *sessionbroker.Session, requestID, reason, targetWinSession string) {
+	h.dismissConsent(session, requestID, reason, targetWinSession, true)
+}
+
+// dismissConsent uses the in-session SYSTEM helper for both denied requests
+// and approved requests whose original Windows prompt must be cancelled.
+func (h *Heartbeat) dismissConsent(session *sessionbroker.Session, requestID, reason, targetWinSession string, denied bool) bool {
+	operation := "consent dismissal"
+	if denied {
+		operation = "deny enforcement"
+	}
 	if session == nil {
-		log.Warn("pam: deny enforcement FAILED — no SYSTEM helper session; consent.exe may still be live",
-			"elevationRequestId", requestID, "reason", reason)
-		return
+		log.Warn("pam: consent dismissal FAILED — no SYSTEM helper session; consent.exe may still be live",
+			"elevationRequestId", requestID, "reason", reason, "operation", operation)
+		return false
 	}
 
 	dismiss := h.pamDismissConsent
 	if dismiss == nil {
 		if h.sessionBroker == nil {
-			log.Warn("pam: deny enforcement FAILED — dismissal IPC unavailable; consent.exe may still be live",
-				"elevationRequestId", requestID, "reason", reason)
-			return
+			log.Warn("pam: consent dismissal FAILED — dismissal IPC unavailable; consent.exe may still be live",
+				"elevationRequestId", requestID, "reason", reason, "operation", operation)
+			return false
 		}
 		dismiss = h.sessionBroker.DismissPamConsent
 	}
@@ -233,34 +243,37 @@ func (h *Heartbeat) denyConsent(session *sessionbroker.Session, requestID, reaso
 		// ACTUATION while fail-opening ENFORCEMENT, and recovery widens that
 		// window (permanently, if recovery exhausts). Error, not Warn — an
 		// unenforced policy deny is not routine.
-		log.Error("pam: deny NOT ENFORCED — a previous dismissal was never proven, so consent.exe is left live for the user to answer",
-			"elevationRequestId", requestID, "reason", reason)
-		return
+		log.Error("pam: consent dismissal NOT ENFORCED — a previous dismissal was never proven, so consent.exe is left live for the user to answer",
+			"elevationRequestId", requestID, "reason", reason, "operation", operation)
+		return false
 	}
 	if err != nil {
 		// The uncertain case already logged at Error with the gate context;
 		// don't repeat it at a lower severity.
 		var uncertain *sessionbroker.PamDismissUncertainError
 		if !errors.As(err, &uncertain) {
-			log.Warn("pam: deny enforcement FAILED — dismissal IPC error; consent.exe may still be live",
-				"elevationRequestId", requestID, "reason", reason, "error", err.Error())
+			log.Warn("pam: consent dismissal FAILED — dismissal IPC error; consent.exe may still be live",
+				"elevationRequestId", requestID, "reason", reason, "operation", operation, "error", err.Error())
 		}
-		return
+		return false
 	}
 
 	switch {
 	case res.Success:
-		log.Info("pam: denied elevation, dismissed consent prompt",
-			"elevationRequestId", requestID, "reason", reason, "dismiss_reason", res.Reason)
+		log.Info("pam: dismissed original consent prompt",
+			"elevationRequestId", requestID, "reason", reason, "operation", operation, "dismiss_reason", res.Reason)
+		return true
 	case res.Reason == pamactuator.ReasonNoConsentWindow:
 		// Prompt already gone (user closed it, self-timeout, or a prior dismiss) —
 		// the deny is satisfied, not a failure.
-		log.Info("pam: deny — consent prompt already closed",
-			"elevationRequestId", requestID, "reason", reason)
+		log.Info("pam: consent prompt already closed",
+			"elevationRequestId", requestID, "reason", reason, "operation", operation)
+		return false
 	default:
-		log.Warn("pam: deny enforcement FAILED — consent.exe may still be live",
-			"elevationRequestId", requestID, "reason", reason,
+		log.Warn("pam: consent dismissal FAILED — consent.exe may still be live",
+			"elevationRequestId", requestID, "reason", reason, "operation", operation,
 			"dismiss_reason", res.Reason, "dismiss_message", res.DetailMessage)
+		return false
 	}
 }
 
