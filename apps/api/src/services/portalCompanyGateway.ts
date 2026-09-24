@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { CfAccessJwksUnavailableError, verifyCfAccessJwt } from './cfAccessJwt';
 
@@ -28,11 +29,11 @@ const configuration = z.union([
   const entries = value.mode === 'custom-claims' ? value.organizations : value.companies;
   for (const entry of entries) {
     if (organizations.has(entry.orgId)
-      || ('subject' in entry && subjects.has(entry.subject))) {
+      || ('subject' in entry && typeof entry.subject === 'string' && subjects.has(entry.subject))) {
       ctx.addIssue({ code: 'custom', message: 'Company mappings must be unique' });
     }
     organizations.add(entry.orgId);
-    if ('subject' in entry) subjects.add(entry.subject);
+    if ('subject' in entry && typeof entry.subject === 'string') subjects.add(entry.subject);
   }
 });
 
@@ -46,20 +47,33 @@ const companyClaims = z.object({
 }).strict();
 
 export type CompanyGatewayDecision =
-  | { ok: true; orgId: string | null }
+  | { ok: true; orgId: string | null; expiresAt?: number; configFingerprint?: string }
   | { ok: false; status: 403 | 503 };
+
+/** Native sessions are invalidated when the operator changes any company
+ * binding, including disabling or remapping an organization. Invalid or
+ * disabled configuration never validates an existing native session. */
+export function currentCompanyGatewayFingerprint(): string | null {
+  if (process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED !== 'true') return null;
+  const raw = process.env.CLOUDCOM_COMPANY_GATEWAY_CONFIG ?? '';
+  if (raw.length > 2_000_000) return null;
+  try {
+    configuration.parse(JSON.parse(raw));
+    return createHash('sha256').update(raw).digest('hex');
+  } catch { return null; }
+}
 
 /** Rollout configuration, never customer-controlled issuer/JWKS/organization.
  * Re-read per check so disabling a mapping is not hidden by a claim cache.
  * The extension administration adapter must preserve this binding boundary.
  */
-export async function verifyPortalCompanyGateway(assertion: string | undefined): Promise<CompanyGatewayDecision> {
+export async function verifyPortalCompanyGateway(assertion: string | undefined, includeExpiry = false): Promise<CompanyGatewayDecision> {
   const enabled = process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED;
   if (enabled === undefined || enabled === 'false') return { ok: true, orgId: null };
   if (enabled !== 'true') return { ok: false, status: 503 };
   let config: z.infer<typeof configuration>;
+  const raw = process.env.CLOUDCOM_COMPANY_GATEWAY_CONFIG ?? '';
   try {
-    const raw = process.env.CLOUDCOM_COMPANY_GATEWAY_CONFIG ?? '';
     if (raw.length > 2_000_000) return { ok: false, status: 503 };
     config = configuration.parse(JSON.parse(raw));
   } catch { return { ok: false, status: 503 }; }
@@ -74,10 +88,14 @@ export async function verifyPortalCompanyGateway(assertion: string | undefined):
       const custom = companyClaims.safeParse(claims.custom);
       if (!custom.success) return { ok: false, status: 403 };
       const company = config.organizations.find(item => item.enabled && item.orgId === custom.data.cloudcom_org_id);
-      return company ? { ok: true, orgId: company.orgId } : { ok: false, status: 403 };
+      return company ? { ok: true, orgId: company.orgId, ...(includeExpiry ? {
+        expiresAt: claims.exp * 1000, configFingerprint: createHash('sha256').update(raw).digest('hex'),
+      } : {}) } : { ok: false, status: 403 };
     }
     const company = config.companies.find(item => item.enabled && item.subject === claims.sub);
-    return company ? { ok: true, orgId: company.orgId } : { ok: false, status: 403 };
+    return company ? { ok: true, orgId: company.orgId, ...(includeExpiry ? {
+      expiresAt: claims.exp * 1000, configFingerprint: createHash('sha256').update(raw).digest('hex'),
+    } : {}) } : { ok: false, status: 403 };
   } catch (error) {
     return { ok: false, status: error instanceof CfAccessJwksUnavailableError ? 503 : 403 };
   }

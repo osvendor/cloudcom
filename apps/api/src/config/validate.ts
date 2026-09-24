@@ -607,6 +607,11 @@ const envObjectSchema = z
     ),
     RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: z.string().optional(),
     BREEZE_RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS: z.string().optional(),
+    BINARY_WINDOWS_GITHUB_REPOSITORY: z.string().optional(),
+    BINARY_WINDOWS_VERSION: z.string().optional(),
+    BINARY_WINDOWS_CANARY_DEVICE_ID: z.string().optional(),
+    BINARY_WINDOWS_INSTALLER_ENABLED: z.string().optional(),
+    BINARY_WINDOWS_PROMOTE_ENABLED: z.string().optional(),
     IS_HOSTED: z.string().optional(),
     AGENT_BACKUP_SERVER_URL: z.string().optional(),
 
@@ -1001,6 +1006,47 @@ const envSchema = envObjectSchema
   // --- Cross-field refinements (insecure defaults for required secrets) -------
   .superRefine((data, ctx) => {
     const isProduction = data.NODE_ENV === 'production';
+
+    const windowsRepository = data.BINARY_WINDOWS_GITHUB_REPOSITORY?.trim();
+    const windowsVersion = data.BINARY_WINDOWS_VERSION?.trim();
+    const primaryRepository = (data.BINARY_GITHUB_REPOSITORY ?? data.GITHUB_REPO)?.trim().toLowerCase() || OFFICIAL_RELEASE_REPOSITORY;
+    if (windowsRepository || windowsVersion) {
+      if (!windowsRepository || !isValidReleaseSourceRepository(windowsRepository) ||
+          windowsRepository.toLowerCase() === primaryRepository) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['BINARY_WINDOWS_GITHUB_REPOSITORY'],
+          message: 'BINARY_WINDOWS_GITHUB_REPOSITORY must be a valid repository distinct from the primary release source.' });
+      }
+      if (!windowsVersion || !/^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(windowsVersion)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['BINARY_WINDOWS_VERSION'],
+          message: 'BINARY_WINDOWS_VERSION must be an exact numeric release version.' });
+      }
+      if (isProduction && hasOnlyOfficialReleaseManifestPublicKey(data)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS'],
+          message: 'The Windows release source requires its own manifest public key alongside the official release key.' });
+      }
+    }
+    if (data.BINARY_WINDOWS_CANARY_DEVICE_ID?.trim()) {
+      if (!windowsRepository || !windowsVersion ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(data.BINARY_WINDOWS_CANARY_DEVICE_ID.trim())) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['BINARY_WINDOWS_CANARY_DEVICE_ID'],
+          message: 'BINARY_WINDOWS_CANARY_DEVICE_ID requires a Windows release source and a UUID.' });
+      }
+    }
+    if (data.BINARY_WINDOWS_INSTALLER_ENABLED?.trim()) {
+      if (!['true', 'false'].includes(data.BINARY_WINDOWS_INSTALLER_ENABLED.trim().toLowerCase()) ||
+          (data.BINARY_WINDOWS_INSTALLER_ENABLED.trim().toLowerCase() === 'true' &&
+            (!windowsRepository || !windowsVersion || (data.BINARY_SOURCE ?? 'github').trim().toLowerCase() !== 'github'))) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['BINARY_WINDOWS_INSTALLER_ENABLED'],
+          message: 'BINARY_WINDOWS_INSTALLER_ENABLED must be true/false and requires a Windows release source when enabled.' });
+      }
+    }
+    if (data.BINARY_WINDOWS_PROMOTE_ENABLED?.trim()) {
+      if (!['true', 'false'].includes(data.BINARY_WINDOWS_PROMOTE_ENABLED.trim().toLowerCase()) ||
+          (data.BINARY_WINDOWS_PROMOTE_ENABLED.trim().toLowerCase() === 'true' && (!windowsRepository || !windowsVersion))) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['BINARY_WINDOWS_PROMOTE_ENABLED'],
+          message: 'BINARY_WINDOWS_PROMOTE_ENABLED must be true/false and requires a Windows release source when enabled.' });
+      }
+    }
 
     if (
       isProduction

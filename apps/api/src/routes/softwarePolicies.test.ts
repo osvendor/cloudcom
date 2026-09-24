@@ -123,6 +123,15 @@ describe('cleanupSoftwarePolicyElevations', () => {
     vi.mocked(requestPamCleanup).mockRejectedValueOnce(new Error('cleanup failed'));
     await expect(cleanupSoftwarePolicyElevations(tx, 'policy-1')).rejects.toThrow('cleanup failed');
   });
+
+  it('revokes an unapproved local gate without cleanup for an actuation never created', async () => {
+    const tx = { execute: vi.fn().mockResolvedValue({ rows: [{
+      id: 'local-gate', metadata: { local_decision_required: true },
+    }] }) } as any;
+    vi.mocked(requestPamCleanup).mockClear();
+    await expect(cleanupSoftwarePolicyElevations(tx, 'policy-1')).resolves.toBe(1);
+    expect(requestPamCleanup).not.toHaveBeenCalled();
+  });
 });
 
 function makeOrgAuth(orgId: string): AuthContext {

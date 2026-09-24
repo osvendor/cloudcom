@@ -410,6 +410,63 @@ describe('agent elevation-requests ingestion route', () => {
   });
 });
 
+describe('protocol-1 local decision gate', () => {
+  const requestId = '78449c54-f6e6-4373-bad5-ea65ad797a6b';
+  const makeRow = (status = 'auto_approved') => ({
+    id: requestId, org_id: 'org-1', device_id: 'device-1', status,
+    revision: 1, target_executable_path: 'C:\\Windows\\System32\\mmc.exe',
+    target_executable_hash: null, subject_username: 'alice',
+    expires_at: new Date(Date.now() + 15 * 60_000),
+    metadata: {
+      local_decision_required: true,
+      local_decision_deadline: new Date(Date.now() + 90_000).toISOString(),
+    },
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(db.insert).mockReturnValue({ values: vi.fn().mockResolvedValue([]) } as any);
+  });
+
+  it('denial records a terminal decision without creating an active intent', async () => {
+    const execute = vi.fn().mockResolvedValueOnce({ rows: [makeRow()] }).mockResolvedValue({ rows: [] });
+    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn({ execute, insert: db.insert }));
+    const response = await buildApp().request(`/agents/agent-123/elevation-requests/${requestId}/local-decision`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'denied' }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ status: 'denied' });
+    expect(lifecycleMocks.createPamDecisionIntent).not.toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
+  it('approval creates the only active intent after the local decision', async () => {
+    const execute = vi.fn().mockResolvedValueOnce({ rows: [makeRow()] }).mockResolvedValue({ rows: [] });
+    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn({ execute, insert: db.insert }));
+    lifecycleMocks.createPamDecisionIntent.mockResolvedValue({ desiredState: 'active' });
+    const response = await buildApp().request(`/agents/agent-123/elevation-requests/${requestId}/local-decision`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'approved' }),
+    });
+    expect(response.status).toBe(200);
+    expect(lifecycleMocks.createPamDecisionIntent).toHaveBeenCalledOnce();
+    expect(lifecycleMocks.createPamDecisionIntent).toHaveBeenCalledWith(expect.anything(),
+      expect.objectContaining({ requestRevision: 1, decision: 'auto_approved' }));
+  });
+
+  it('a revoked request cannot be approved by a delayed agent', async () => {
+    const execute = vi.fn().mockResolvedValue({ rows: [makeRow('revoked')] });
+    vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn({ execute, insert: db.insert }));
+    const response = await buildApp().request(`/agents/agent-123/elevation-requests/${requestId}/local-decision`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'approved' }),
+    });
+    expect(response.status).toBe(409);
+    expect(lifecycleMocks.createPamDecisionIntent).not.toHaveBeenCalled();
+  });
+});
+
 describe('ingest decisioning (#1163)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -485,6 +542,67 @@ describe('ingest decisioning (#1163)', () => {
       expect.objectContaining({ softwarePolicyId: 'pol-2' }),
       'pam-ingest',
     );
+  });
+
+  it('protocol-1 auto-approval waits for the local user before dispatch', async () => {
+    pamMocks.evaluatePamBridge.mockResolvedValue({
+      match: 'allowlist', policyId: 'pol-2', auditMatches: [],
+    });
+    const { values } = happyPathInsert([{ id: 'req-local', status: 'auto_approved' }]);
+    const response = await buildApp().request('/agents/agent-123/elevation-requests', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...goodPayload, local_decision_protocol: 1 }),
+    });
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({
+      id: 'req-local', status: 'auto_approved', localDecisionRequired: true,
+    });
+    expect(values).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'auto_approved', approvedAt: expect.any(Date),
+      metadata: expect.objectContaining({ local_decision_required: true }),
+    }));
+    expect(lifecycleMocks.createPamDecisionIntent).not.toHaveBeenCalled();
+  });
+
+  it('keeps a configured legacy device behind the local decision gate', async () => {
+    const previous = process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS;
+    process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS = 'other-device, device-1 ';
+    try {
+      pamMocks.evaluatePamBridge.mockResolvedValue({
+        match: 'allowlist', policyId: 'pol-2', auditMatches: [],
+      });
+      const { values } = happyPathInsert([{ id: 'req-legacy', status: 'auto_approved' }]);
+      const response = await post(buildApp());
+      expect(response.status).toBe(201);
+      expect(await response.json()).toEqual({
+        id: 'req-legacy', status: 'auto_approved', localDecisionRequired: true,
+      });
+      expect(values).toHaveBeenCalledWith(expect.objectContaining({
+        metadata: expect.objectContaining({ local_decision_required: true }),
+      }));
+      expect(lifecycleMocks.createPamDecisionIntent).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS;
+      else process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS = previous;
+    }
+  });
+
+  it('does not apply the legacy gate to a different device ID', async () => {
+    const previous = process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS;
+    process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS = 'device-10';
+    try {
+      pamMocks.evaluatePamBridge.mockResolvedValue({
+        match: 'allowlist', policyId: 'pol-2', auditMatches: [],
+      });
+      happyPathInsert([{ id: 'req-other', status: 'auto_approved' }]);
+      const response = await post(buildApp());
+      expect(response.status).toBe(201);
+      expect((await response.json()).localDecisionRequired).not.toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS;
+      else process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS = previous;
+    }
   });
 
   it('pam rule auto_deny (real engine) -> denied with rule metadata', async () => {

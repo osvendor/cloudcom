@@ -164,6 +164,15 @@ jobs:
           docker compose --project-name "$project" -f docker-compose.test.yml up -d --wait
           pnpm --filter @breeze/api exec vitest run src/jobs/unifiWorker.test.ts
           pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts src/__tests__/integration/unifiSyncLockOrder.integration.test.ts
+      - name: Verify PAM cleanup recovery dispatch
+        if: needs.delta.outputs.api == 'true'
+        run: pnpm --filter @breeze/api exec vitest run src/jobs/pamActuationWorker.test.ts src/services/commandDispatch.test.ts
+      - name: Verify PAM local decision gate
+        if: needs.delta.outputs.api == 'true'
+        run: pnpm --filter @breeze/api exec vitest run src/routes/agents/elevationRequests.test.ts src/routes/pam.test.ts src/routes/softwarePolicies.test.ts src/jobs/pamJobs.test.ts
+      - name: Verify Windows release trust, routing, and canary selection
+        if: needs.delta.outputs.api == 'true'
+        run: pnpm --filter @breeze/api exec vitest run src/config/validate.test.ts src/services/releaseSource.test.ts src/services/binarySync.test.ts src/services/installerBuilder.test.ts src/routes/agents/download.test.ts src/routes/agents/heartbeat.test.ts
       - name: Validate customer portal remote access and RLS boundaries
         if: needs.delta.outputs.portal_remote == 'true'
         run: bash scripts/cloudcom/test-portal-remote.sh
@@ -210,6 +219,8 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: agent/go.mod
+      - name: Install native packet capture headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpcap-dev
       - working-directory: agent
         run: go test -race ./...
 

@@ -11,6 +11,7 @@ import { CSRF_HEADER_NAME, PORTAL_CSRF_COOKIE_NAME } from '../../routes/portal/s
 import { hashPassword } from '../../services/password';
 import { getRedis } from '../../services/redis';
 import { issueNativeLoginCode, exchangeNativeLoginCode, NATIVE_CLIENT_ID } from '../../services/portalNativeLogin';
+import { currentCompanyGatewayFingerprint } from '../../services/portalCompanyGateway';
 import { getTestDb } from './setup';
 
 // The ordinary integration suite can use memory portal state. This contract
@@ -18,10 +19,13 @@ import { getTestDb } from './setup';
 describe.runIf(!!process.env.DATABASE_URL_APP && process.env.PORTAL_STATE_BACKEND === 'redis')('native login with real Redis and portal identity', () => {
   const priorNativeFlag = process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED;
   const priorRemoteFlag = process.env.CLOUDCOM_REMOTE_ACCESS_ENABLED;
+  const priorCompanyGatewayFlag = process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED;
+  const priorCompanyGatewayConfig = process.env.CLOUDCOM_COMPANY_GATEWAY_CONFIG;
   let priorExtension: typeof installedExtensions.$inferSelect | undefined;
   beforeAll(async () => {
     process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED = 'true';
     process.env.CLOUDCOM_REMOTE_ACCESS_ENABLED = 'true';
+    process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED = 'false';
     [priorExtension] = await getTestDb().select().from(installedExtensions).where(eq(installedExtensions.name, 'rustdeskaccess'));
     await getTestDb().insert(installedExtensions).values({ name: 'rustdeskaccess', enabled: true,
       lifecycleState: 'active', configuredVersion: 'test', activeVersion: 'test' })
@@ -32,6 +36,10 @@ describe.runIf(!!process.env.DATABASE_URL_APP && process.env.PORTAL_STATE_BACKEN
     else process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED = priorNativeFlag;
     if (priorRemoteFlag === undefined) delete process.env.CLOUDCOM_REMOTE_ACCESS_ENABLED;
     else process.env.CLOUDCOM_REMOTE_ACCESS_ENABLED = priorRemoteFlag;
+    if (priorCompanyGatewayFlag === undefined) delete process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED;
+    else process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED = priorCompanyGatewayFlag;
+    if (priorCompanyGatewayConfig === undefined) delete process.env.CLOUDCOM_COMPANY_GATEWAY_CONFIG;
+    else process.env.CLOUDCOM_COMPANY_GATEWAY_CONFIG = priorCompanyGatewayConfig;
     if (priorExtension) await getTestDb().update(installedExtensions).set(priorExtension).where(eq(installedExtensions.name, 'rustdeskaccess'));
     else await getTestDb().delete(installedExtensions).where(eq(installedExtensions.name, 'rustdeskaccess'));
   });
@@ -43,6 +51,10 @@ describe.runIf(!!process.env.DATABASE_URL_APP && process.env.PORTAL_STATE_BACKEN
       slug: crypto.randomUUID(), type: 'msp' }).returning();
     const [org] = await admin.insert(organizations).values({ partnerId: partner!.id,
       name: 'Native customer', slug: crypto.randomUUID(), currencyCode: 'USD' }).returning();
+    process.env.CLOUDCOM_COMPANY_GATEWAY_CONFIG = JSON.stringify({
+      teamDomain: 'test.cloudflareaccess.com', audience: 'native-integration',
+      companies: [{ subject: 'integration-company', orgId: org!.id, enabled: true }],
+    });
     const password = 'Synthetic-Native-Login-Test-583!';
     const [user] = await admin.insert(portalUsers).values({ orgId: org!.id,
       email: `native-${crypto.randomUUID()}@example.test`, passwordHash: await hashPassword(password),
@@ -58,6 +70,7 @@ describe.runIf(!!process.env.DATABASE_URL_APP && process.env.PORTAL_STATE_BACKEN
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ orgId: org!.id, email: user!.email, password }) });
     expect(login.status).toBe(200);
+    process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED = 'true';
     const browserCookie = login.headers.get('set-cookie')!.split(';', 1)[0]!;
     const browserToken = decodeURIComponent(browserCookie.slice(browserCookie.indexOf('=') + 1));
     const verifier = randomBytes(32).toString('base64url');
@@ -74,10 +87,15 @@ describe.runIf(!!process.env.DATABASE_URL_APP && process.env.PORTAL_STATE_BACKEN
       body: JSON.stringify(request) })).status).toBe(401);
     expect((await app.request(authorizePath, { method: 'POST', headers: { Cookie: browserCookie, 'Content-Type': 'application/json' },
       body: JSON.stringify(request) })).status).toBe(403);
-    const authorized = await app.request(authorizePath, { method: 'POST', headers: browserHeaders, body: JSON.stringify(request) });
-    expect(authorized.status).toBe(200);
-    expect(authorized.headers.get('Cache-Control')).toBe('no-store');
-    const issued = await authorized.json();
+    // Without a signed company assertion, the browser endpoint must fail.
+    // The real-Redis exchange contract starts from an already verified company
+    // context; the signed-assertion boundary has its own focused route tests.
+    expect((await app.request(authorizePath, { method: 'POST', headers: browserHeaders,
+      body: JSON.stringify(request) })).status).toBe(403);
+    const issued = await issueNativeLoginCode(principal, browserToken, request, {
+      orgId: org!.id, expiresAt: Date.now() + 6 * 3600_000,
+      configFingerprint: currentCompanyGatewayFingerprint()!,
+    });
     const code = new URL(issued.redirectUri).searchParams.get('code')!;
     const exchange = { code, clientId: request.clientId, redirectUri: request.redirectUri, codeVerifier: verifier };
     const results = await Promise.all(Array.from({ length: 8 }, () => app.request('/api/v1/portal/auth/native/exchange', {
@@ -104,7 +122,9 @@ describe.runIf(!!process.env.DATABASE_URL_APP && process.env.PORTAL_STATE_BACKEN
       await admin.update(portalUsers).set({ accessMode: 'remote_only', authEpoch: user!.authEpoch + 1 })
         .where(eq(portalUsers.id, user!.id));
       expect((await app.request('/api/v1/portal/remote/devices', { headers })).status).toBe(401);
-      const loggedOutCode = await issueNativeLoginCode(principal, browserToken, request);
+      const loggedOutCode = await issueNativeLoginCode(principal, browserToken, request,
+        { orgId: org!.id, expiresAt: Date.now() + 6 * 3600_000,
+          configFingerprint: currentCompanyGatewayFingerprint()! });
       await redis!.del(`portal:session:${browserToken}`);
       expect(await exchangeNativeLoginCode({ ...exchange,
         code: new URL(loggedOutCode.redirectUri).searchParams.get('code')!,

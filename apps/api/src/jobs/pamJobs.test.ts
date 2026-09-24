@@ -74,4 +74,15 @@ describe('enforceElevationExpiry', () => {
     expect(mocks.publishEvent).not.toHaveBeenCalled();
     expect(mocks.writeAuditEvent).not.toHaveBeenCalled();
   });
+
+  it('expires an unapproved local gate without a nonexistent cleanup actuation', async () => {
+    mocks.txExecute.mockResolvedValue({ rows: [{
+      ...expiredRow,
+      metadata: { local_decision_required: true },
+    }] });
+
+    await expect(enforceElevationExpiry()).resolves.toBe(1);
+    expect(mocks.requestPamCleanup).not.toHaveBeenCalled();
+    expect(mocks.txValues).toHaveBeenCalledOnce();
+  });
 });

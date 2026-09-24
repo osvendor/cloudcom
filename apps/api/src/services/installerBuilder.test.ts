@@ -58,14 +58,18 @@ function signedReleaseManifest(
   ]);
 }
 
-function signedReleaseManifestEntries(assets: Record<string, unknown>[]) {
+function signedReleaseManifestEntries(
+  assets: Record<string, unknown>[],
+  repository = 'lanternops/breeze',
+  release = 'v1.2.3',
+) {
   const { publicKey, privateKey } = generateKeyPairSync('ed25519');
   const publicDer = publicKey.export({ format: 'der', type: 'spki' }) as Buffer;
   const rawPublicKey = publicDer.subarray(publicDer.length - 32).toString('base64');
   const manifest = Buffer.from(JSON.stringify({
     schemaVersion: 1,
-    repository: 'lanternops/breeze',
-    release: 'v1.2.3',
+    repository,
+    release,
     assets,
   }));
 
@@ -138,6 +142,34 @@ describe('fetchRegularMsi', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await expect(fetchRegularMsi()).resolves.toEqual(asset);
+  });
+
+  it('fetches a verified Windows-only MSI only when the installer switch is enabled', async () => {
+    const asset = Buffer.from('windows-canary-msi');
+    const signed = signedReleaseManifestEntries([{
+      name: 'breeze-agent.msi',
+      sha256: createHash('sha256').update(asset).digest('hex'),
+      size: asset.length,
+      platformTrust: 'none',
+      edition: 'self-host',
+    }], 'example/windows-signing', 'v0.115.1');
+    process.env.BINARY_SOURCE = 'github';
+    process.env.BINARY_WINDOWS_GITHUB_REPOSITORY = 'example/windows-signing';
+    process.env.BINARY_WINDOWS_VERSION = '0.115.1';
+    process.env.BINARY_WINDOWS_INSTALLER_ENABLED = 'true';
+    process.env.RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS = signed.publicKey;
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.endsWith('/breeze-agent.msi')) return new Response(asset);
+      if (url.endsWith('/release-artifact-manifest.json')) return new Response(signed.manifest);
+      if (url.endsWith('/release-artifact-manifest.json.ed25519')) return new Response(signed.signature);
+      return new Response('not found', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(fetchRegularMsi()).resolves.toEqual(asset);
+    expect(safeFetchFollowingRedirectsMock).toHaveBeenCalledWith(
+      'https://github.com/example/windows-signing/releases/download/v0.115.1/breeze-agent.msi',
+      { maxBytes: asset.length },
+    );
   });
 
   it('rejects an unsigned MSI with no edition claim (today\'s behavior unchanged)', async () => {

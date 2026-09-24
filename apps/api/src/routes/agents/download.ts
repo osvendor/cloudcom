@@ -7,6 +7,7 @@ import { isS3Configured, getPresignedUrl, isS3NotFound } from '../../services/s3
 import { getBinarySource, getGithubReleaseVersion, getGithubAgentUrl, getGithubHelperUrl, getGithubUserHelperUrl, getGithubWatchdogUrl, getGithubBackupUrl, getGithubRecoveryIsoUrl, HELPER_FILENAMES } from '../../services/binarySource';
 import { getPromotedComponentVersion, getRegisteredComponentVersion, type PromotedComponent } from '../../services/promotedAgentVersion';
 import { fetchVerifiedMacosPkg } from '../../services/installerBuilder';
+import { getWindowsReleaseAssetUrl } from '../../services/releaseSource';
 
 export const downloadRoutes = new Hono();
 
@@ -156,7 +157,13 @@ function registerComponentDownloadRoute(config: ComponentDownloadConfig): void {
         // agent_versions.version has no format constraint. That is the same
         // "we cannot determine a release to serve" condition, so it belongs on
         // the same 503 rather than falling through to a bare 500.
-        redirectUrl = config.githubUrlFor(os, arch, resolvedVersion ?? undefined);
+        // The optional Windows self-host release is registered without fleet
+        // promotion. Resolve the row first, then use its exact configured
+        // repository only for that release; Linux/macOS keep the primary source.
+        redirectUrl = os === 'windows'
+          ? (getWindowsReleaseAssetUrl(resolvedVersion, filename) ??
+            config.githubUrlFor(os, arch, resolvedVersion ?? undefined))
+          : config.githubUrlFor(os, arch, resolvedVersion ?? undefined);
       } catch (err) {
         console.error(
           `[${config.logTag}] refusing to serve ${filename}: could not resolve a release to redirect to`,

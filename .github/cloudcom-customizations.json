@@ -147,6 +147,14 @@
         {
           "file": "packages/ext-cloud-command/src/server/threecx-call-log.ts",
           "contains": "report_scope_unverified"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/server/threecx-call-log.ts",
+          "contains": "cursorSignature"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/server/transport.ts",
+          "contains": "callLogNextSkip"
         }
       ]
     },

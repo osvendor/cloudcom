@@ -433,6 +433,41 @@ func TestPamCleanupV2AllowsReceivedObservationTransportBlocked(t *testing.T) {
 	}
 }
 
+func TestPamCleanupV2RecoversWhileReconciliationBlocksApply(t *testing.T) {
+	manager := &fakePamLifetimeManager{cleanupResult: pamlifetime.Result{
+		ProtocolVersion: 2, State: pamlifetime.ResultCleaned,
+	}}
+	h := readyPamApplyTestHeartbeat(manager, nil)
+	h.pamReconciled.Store(false)
+	h.pamReceivedObservationReady.Store(false)
+	h.pamVerificationAvailable.Store(false)
+	h.uacInterceptionEnabled.Store(false)
+
+	cleanup := Command{Payload: map[string]any{
+		"protocolVersion": 2,
+		"actuationId":     "30000000-0000-4000-8000-000000000001",
+		"generation":      2,
+		"requestId":       "40000000-0000-4000-8000-000000000001",
+		"deviceId":        h.config.DeviceID,
+		"orgId":           h.config.OrgID,
+	}}
+	result := handlePamCleanupV2(h, cleanup)
+	if result.Status != "completed" || manager.cleanupCalls != 1 {
+		t.Fatalf("cleanup result=%+v calls=%d", result, manager.cleanupCalls)
+	}
+	if got := h.pamLifetimeProtocolVersion(); got != 0 {
+		t.Fatalf("PAM protocol version=%d before reconciliation, want 0", got)
+	}
+	if apply := handlePamApplyV2(h, pamApplyV2TestCommand("60000000-0000-4000-8000-000000000001")); apply.Status != "failed" || manager.applyCalls != 0 {
+		t.Fatalf("apply result=%+v calls=%d", apply, manager.applyCalls)
+	}
+
+	cleanup.Payload["orgId"] = "50000000-0000-4000-8000-000000000005"
+	if foreign := handlePamCleanupV2(h, cleanup); foreign.Status != "failed" || manager.cleanupCalls != 1 {
+		t.Fatalf("foreign cleanup result=%+v calls=%d", foreign, manager.cleanupCalls)
+	}
+}
+
 func readyLegacyHeartbeat(manager *fakePamLifetimeManager) *Heartbeat {
 	manager.available = true
 	h := &Heartbeat{pamLifetimeManager: manager}
@@ -560,7 +595,7 @@ func TestPamApplyAdmissionRequiresVerifiedEnabledPolicy(t *testing.T) {
 	}
 }
 
-func TestPamCommandAdmissionStaysClosedUntilReconcileFinishes(t *testing.T) {
+func TestPamCleanupAdmissionRemainsOpenDuringReconcile(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	manager := &fakePamLifetimeManager{reconcileStarted: started, reconcileRelease: release, available: true}
@@ -575,12 +610,15 @@ func TestPamCommandAdmissionStaysClosedUntilReconcileFinishes(t *testing.T) {
 		t.Fatalf("protocol during reconciliation = %d, want 0", got)
 	}
 
-	blocked := handlePamCleanupV2(h, Command{Payload: map[string]any{
+	cleanup := handlePamCleanupV2(h, Command{Payload: map[string]any{
 		"protocolVersion": 2, "actuationId": "10000000-0000-4000-8000-000000000001", "generation": 2,
 		"requestId": "10000000-0000-4000-8000-000000000002", "deviceId": "10000000-0000-4000-8000-000000000003", "orgId": "10000000-0000-4000-8000-000000000004",
 	}})
-	if blocked.Status != "failed" || manager.cleanupCalls != 0 {
-		t.Fatalf("command admitted during reconcile: result=%+v calls=%d", blocked, manager.cleanupCalls)
+	if cleanup.Status != "completed" || manager.cleanupCalls != 1 {
+		t.Fatalf("cleanup refused during reconcile: result=%+v calls=%d", cleanup, manager.cleanupCalls)
+	}
+	if apply := handlePamApplyV2(h, pamApplyV2TestCommand("10000000-0000-4000-8000-000000000001")); apply.Status != "failed" || manager.applyCalls != 0 {
+		t.Fatalf("apply admitted during reconcile: result=%+v calls=%d", apply, manager.applyCalls)
 	}
 	close(release)
 	<-done
@@ -591,7 +629,7 @@ func TestPamCommandAdmissionStaysClosedUntilReconcileFinishes(t *testing.T) {
 		"protocolVersion": 2, "actuationId": "10000000-0000-4000-8000-000000000001", "generation": 2,
 		"requestId": "10000000-0000-4000-8000-000000000002", "deviceId": "10000000-0000-4000-8000-000000000003", "orgId": "10000000-0000-4000-8000-000000000004",
 	}})
-	if manager.cleanupCalls != 1 {
+	if manager.cleanupCalls != 2 {
 		t.Fatalf("command not admitted after reconcile: calls=%d", manager.cleanupCalls)
 	}
 }

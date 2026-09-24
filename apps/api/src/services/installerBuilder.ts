@@ -23,6 +23,7 @@ import {
 } from './releaseArtifactManifest';
 import { assertGithubFetchableEdition } from './releaseAssetTrust';
 import { getBinaryEdition } from './binaryEdition';
+import { getWindowsReleaseSource } from './releaseSource';
 import {
   InstallerFilenameHostError,
   isEncodedWindowsFilenameApiHost,
@@ -499,6 +500,23 @@ async function fetchVerifiedMacosPkgUncached(
 
 export async function fetchRegularMsi(): Promise<Buffer> {
   if (getBinarySource() === 'github') {
+    if (process.env.BINARY_WINDOWS_INSTALLER_ENABLED?.trim().toLowerCase() === 'true') {
+      const source = getWindowsReleaseSource();
+      if (!source) throw new Error('Windows installer release is enabled without a Windows release source');
+      const base = `https://github.com/${source.repository}/releases/download/v${source.version}`;
+      const result = await fetchVerifiedGithubReleaseArtifact({
+        assetName: 'breeze-agent.msi',
+        assetUrl: `${base}/breeze-agent.msi`,
+        manifestUrl: `${base}/release-artifact-manifest.json`,
+        signatureUrl: `${base}/release-artifact-manifest.json.ed25519`,
+        expectedRepository: source.repository,
+        expectedRelease: `v${source.version}`,
+        expectedEdition: 'self-host',
+        maxAssetBytes: 512 * 1024 * 1024,
+      });
+      if (!result.verified) throw new Error('Windows installer release manifest was not verified');
+      return result.buffer;
+    }
     const url = getGithubRegularMsiUrl();
     const resp = await fetch(url, { redirect: 'follow' });
     if (!resp.ok) throw new Error(`Failed to fetch regular MSI: ${resp.status}`);

@@ -119,6 +119,7 @@ test('routes the enumerated customer portal remote surface to focused real-DB co
     'apps/api/src/__tests__/integration/portalRemoteLogin.integration.test.ts',
     'apps/api/src/__tests__/integration/portalNativeLogin.integration.test.ts',
     'apps/api/src/routes/portal/nativeLogin.ts',
+    'apps/api/src/index.ts',
     'apps/api/src/services/portalNativeLogin.ts',
     'apps/api/src/services/portalCompanyGateway.ts',
     'apps/api/src/services/portalCompanyGateway.test.ts',
@@ -161,6 +162,60 @@ test('routes the bounded UniFi sync lock-order surface to API and real-Postgres 
     classify(['apps/api/src/services/unifi/unifiSyncService.ts']).unsupported,
     ['apps/api/src/services/unifi/unifiSyncService.ts'],
   );
+});
+
+test('routes only reviewed PAM cleanup recovery API files to focused validation', () => {
+  for (const path of [
+    'apps/api/src/jobs/pamActuationWorker.ts',
+    'apps/api/src/jobs/pamActuationWorker.test.ts',
+    'apps/api/src/services/commandDispatch.ts',
+    'apps/api/src/services/commandDispatch.test.ts',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.api, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+  assert.deepEqual(classify(['apps/api/src/services/pamOther.ts']).unsupported,
+    ['apps/api/src/services/pamOther.ts']);
+});
+
+test('routes the PAM local decision endpoint and regression test to API validation', () => {
+  for (const path of [
+    'apps/api/src/routes/agents/elevationRequests.ts',
+    'apps/api/src/routes/agents/elevationRequests.test.ts',
+    'apps/api/src/routes/pam.ts',
+    'apps/api/src/routes/pam.test.ts',
+    'apps/api/src/routes/softwarePolicies.ts',
+    'apps/api/src/routes/softwarePolicies.test.ts',
+    'apps/api/src/jobs/pamJobs.ts',
+    'apps/api/src/jobs/pamJobs.test.ts',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.api, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+});
+
+test('routes only the reviewed Windows release source and canary surface to API validation', () => {
+  for (const path of [
+    'apps/api/src/config/validate.ts',
+    'apps/api/src/config/validate.test.ts',
+    'apps/api/src/routes/agents/download.ts',
+    'apps/api/src/routes/agents/download.test.ts',
+    'apps/api/src/routes/agents/heartbeat.ts',
+    'apps/api/src/services/binarySync.ts',
+    'apps/api/src/services/binarySync.test.ts',
+    'apps/api/src/services/installerBuilder.ts',
+    'apps/api/src/services/installerBuilder.test.ts',
+    'apps/api/src/services/releaseSource.ts',
+    'apps/api/src/services/releaseSource.test.ts',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.api, true);
+    assert.deepEqual(result.unsupported, []);
+  }
+  assert.deepEqual(classify(['apps/api/src/services/unreviewedReleaseOverride.ts']).unsupported,
+    ['apps/api/src/services/unreviewedReleaseOverride.ts']);
 });
 
 test('classifies only the reviewed Cloud Command server, bridge, registry, and build surfaces', () => {

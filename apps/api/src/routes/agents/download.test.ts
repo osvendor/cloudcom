@@ -429,6 +429,8 @@ describe('component downloads honour an explicit ?version= pin (issue #5159)', (
   const ENV_VERSION = '0.108.0';
   const PROMOTED_VERSION = '0.108.0'; // the globally promoted agent_versions row
   const PINNED_VERSION = '0.110.0'; // an org agentVersionPins pilot, isLatest=false
+  const originalWindowsRepository = process.env.BINARY_WINDOWS_GITHUB_REPOSITORY;
+  const originalWindowsVersion = process.env.BINARY_WINDOWS_VERSION;
 
   const urlFor =
     (component: string) =>
@@ -446,6 +448,10 @@ describe('component downloads honour an explicit ?version= pin (issue #5159)', (
   });
 
   afterEach(() => {
+    if (originalWindowsRepository === undefined) delete process.env.BINARY_WINDOWS_GITHUB_REPOSITORY;
+    else process.env.BINARY_WINDOWS_GITHUB_REPOSITORY = originalWindowsRepository;
+    if (originalWindowsVersion === undefined) delete process.env.BINARY_WINDOWS_VERSION;
+    else process.env.BINARY_WINDOWS_VERSION = originalWindowsVersion;
     vi.mocked(getBinarySource).mockReturnValue('local');
     vi.mocked(getGithubReleaseVersion).mockReset();
     vi.mocked(getGithubReleaseVersion).mockReturnValue('latest');
@@ -475,6 +481,18 @@ describe('component downloads honour an explicit ?version= pin (issue #5159)', (
     );
     // The bug: 0.110.0 checksum, 0.108.0 bytes, forever "Updating".
     expect(res.headers.get('location')).not.toContain(PROMOTED_VERSION);
+  });
+
+  it('serves a registered Windows-only release from its own repository', async () => {
+    process.env.BINARY_WINDOWS_GITHUB_REPOSITORY = 'example/windows-signing';
+    process.env.BINARY_WINDOWS_VERSION = PINNED_VERSION;
+    const windows = await downloadRoutes.request(`/download/windows/amd64?version=${PINNED_VERSION}`);
+    expect(windows.status).toBe(302);
+    expect(windows.headers.get('location')).toBe(
+      `https://github.com/example/windows-signing/releases/download/v${PINNED_VERSION}/breeze-agent-windows-amd64.exe`,
+    );
+    const linux = await downloadRoutes.request(`/download/linux/amd64?version=${PINNED_VERSION}`);
+    expect(linux.headers.get('location')).toContain('github.test');
   });
 
   it.each([

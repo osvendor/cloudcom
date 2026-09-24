@@ -28,6 +28,24 @@ const remoteAccessApiPaths = new Set([
 // Redis stack, real portal-login and authorization tests, plus the RLS coverage
 // contract; unknown portal or schema work must still fail closed.
 const portalRemoteApiPaths = new Set([
+  'apps/api/src/db/schema/portalNative.ts',
+  'apps/api/migrations/2026-09-22-native-admission.sql',
+  'apps/api/src/services/portalNativeAdmission.ts',
+  'apps/api/src/services/portalNativeAdmissionSchemas.ts',
+  'apps/api/src/services/portalNativeAdmissionSchemas.test.ts',
+  'apps/api/src/services/portalNativeOperator.ts',
+  'apps/api/src/services/portalNativeOperator.test.ts',
+  'apps/api/src/services/portalNativeTarget.ts',
+  'apps/api/src/routes/nativeTarget.ts',
+  'apps/api/src/routes/nativeTarget.test.ts',
+  'apps/api/src/routes/agents/nativeTarget.ts',
+  'apps/api/src/routes/agents/nativeTarget.test.ts',
+  'apps/api/src/routes/portal/nativeAdmission.ts',
+  'apps/api/src/routes/portal/nativeAdmission.test.ts',
+  'apps/api/src/routes/agents/index.ts',
+  'apps/api/src/index.ts', // Native target route mount; portal remote job validates the API entrypoint.
+  'apps/api/src/__tests__/integration/portalNativeAdmission.integration.test.ts',
+
   'apps/api/src/routes/orgPortalUsers.ts', 'apps/api/src/routes/orgPortalUsers.test.ts',
   'apps/api/src/routes/portal/acceptInvite.test.ts',
   'apps/api/src/services/portalCompanyGateway.ts', 'apps/api/src/services/portalCompanyGateway.test.ts',
@@ -157,6 +175,40 @@ const unifiSyncLockPaths = new Set([
   'apps/api/src/jobs/unifiWorker.test.ts',
   'apps/api/src/__tests__/integration/unifiSyncLockOrder.integration.test.ts',
 ]);
+// Cleanup dispatch is an agent recovery path. Keep the API allowlist exact;
+// native agent changes already select the Go race suite independently.
+const pamCleanupRecoveryPaths = new Set([
+  'apps/api/src/jobs/pamActuationWorker.ts',
+  'apps/api/src/jobs/pamActuationWorker.test.ts',
+  'apps/api/src/services/commandDispatch.ts',
+  'apps/api/src/services/commandDispatch.test.ts',
+]);
+const pamLocalDecisionPaths = new Set([
+  'apps/api/src/routes/agents/elevationRequests.ts',
+  'apps/api/src/routes/agents/elevationRequests.test.ts',
+  'apps/api/src/routes/pam.ts',
+  'apps/api/src/routes/pam.test.ts',
+  'apps/api/src/routes/softwarePolicies.ts',
+  'apps/api/src/routes/softwarePolicies.test.ts',
+  'apps/api/src/jobs/pamJobs.ts',
+  'apps/api/src/jobs/pamJobs.test.ts',
+]);
+// A Windows-only release source changes artifact trust, download routing and
+// canary update selection. Keep this surface exact and pair it with focused
+// release tests in the API CI job.
+const windowsReleasePaths = new Set([
+  'apps/api/src/config/validate.ts',
+  'apps/api/src/config/validate.test.ts',
+  'apps/api/src/routes/agents/download.ts',
+  'apps/api/src/routes/agents/download.test.ts',
+  'apps/api/src/routes/agents/heartbeat.ts',
+  'apps/api/src/services/binarySync.ts',
+  'apps/api/src/services/binarySync.test.ts',
+  'apps/api/src/services/installerBuilder.ts',
+  'apps/api/src/services/installerBuilder.test.ts',
+  'apps/api/src/services/releaseSource.ts',
+  'apps/api/src/services/releaseSource.test.ts',
+]);
 const infraPaths = new Set([
   'AGENTS.md', '.dockerignore', '.github/actionlint.yaml', '.github/actions/load-smoke-images/action.yml',
   '.github/scripts/check-cloudcom-runner.sh', '.github/scripts/ci-area-gating.test.mjs',
@@ -245,6 +297,18 @@ export function classify(paths) {
     if (unifiSyncLockPaths.has(path)) {
       result.api = true;
       result.unifiSyncLock = true;
+      continue;
+    }
+    if (pamCleanupRecoveryPaths.has(path)) {
+      result.api = true;
+      continue;
+    }
+    if (pamLocalDecisionPaths.has(path)) {
+      result.api = true;
+      continue;
+    }
+    if (windowsReleasePaths.has(path)) {
+      result.api = true;
       continue;
     }
     if (remoteAccessWebPaths.has(path) || path.startsWith('apps/web/src/components/cloudcom/browserDesktop/') ||
