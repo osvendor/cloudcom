@@ -39,19 +39,23 @@ const (
 )
 
 type LedgerEntry struct {
-	ActuationID         string       `json:"actuationId"`
-	RequestID           string       `json:"requestId"`
-	DeviceID            string       `json:"deviceId"`
-	OrgID               string       `json:"orgId"`
-	Generation          uint64       `json:"generation"`
-	DesiredState        DesiredState `json:"desiredState"`
-	PID                 int          `json:"pid,omitempty"`
-	ProcessCreationTime *time.Time   `json:"processCreationTime,omitempty"`
-	JobName             string       `json:"jobName,omitempty"`
-	BootID              string       `json:"bootId,omitempty"`
-	CreatedAt           time.Time    `json:"createdAt"`
-	UpdatedAt           time.Time    `json:"updatedAt"`
-	BoundCommandDigest  string       `json:"boundCommandDigest,omitempty"`
+	ActuationID            string       `json:"actuationId"`
+	RequestID              string       `json:"requestId"`
+	DeviceID               string       `json:"deviceId"`
+	OrgID                  string       `json:"orgId"`
+	Generation             uint64       `json:"generation"`
+	DesiredState           DesiredState `json:"desiredState"`
+	PID                    int          `json:"pid,omitempty"`
+	ProcessCreationTime    *time.Time   `json:"processCreationTime,omitempty"`
+	JobName                string       `json:"jobName,omitempty"`
+	BootID                 string       `json:"bootId,omitempty"`
+	CreatedAt              time.Time    `json:"createdAt"`
+	UpdatedAt              time.Time    `json:"updatedAt"`
+	BoundCommandDigest     string       `json:"boundCommandDigest,omitempty"`
+	LastFailureStage       string       `json:"lastFailureStage,omitempty"`
+	LastFailureCode        string       `json:"lastFailureCode,omitempty"`
+	LastFailureAt          *time.Time   `json:"lastFailureAt,omitempty"`
+	LastCleanupFailureCode string       `json:"lastCleanupFailureCode,omitempty"`
 }
 
 type ProcessIdentity struct {
@@ -168,6 +172,9 @@ func (s *Store) PrepareCleanup(cmd CleanupCommand) (Decision, error) {
 		entry.ProcessCreationTime = previous.ProcessCreationTime
 		entry.JobName = previous.JobName
 		entry.BootID = previous.BootID
+		entry.LastFailureStage = previous.LastFailureStage
+		entry.LastFailureCode = previous.LastFailureCode
+		entry.LastFailureAt = previous.LastFailureAt
 	}
 	if err := s.replaceLocked(cmd.ActuationID, entry); err != nil {
 		return "", err
@@ -208,6 +215,41 @@ func (s *Store) ClearProcessIdentity(actuationID string, generation uint64) erro
 	entry.ProcessCreationTime = nil
 	entry.JobName = ""
 	entry.BootID = ""
+	entry.UpdatedAt = time.Now().UTC()
+	return s.replaceLocked(actuationID, entry)
+}
+
+// RecordApplyFailure durably records the stage and cause of an apply failure.
+// It preserves any process identity already bound for this generation.
+func (s *Store) RecordApplyFailure(actuationID string, generation uint64, stage, code string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loadErr != nil {
+		return s.loadErr
+	}
+	entry, ok := s.entries[actuationID]
+	if !ok || entry.Generation != generation {
+		return errors.New("cannot record failure for non-current generation")
+	}
+	now := time.Now().UTC()
+	entry.LastFailureStage = stage
+	entry.LastFailureCode = code
+	entry.LastFailureAt = &now
+	entry.UpdatedAt = now
+	return s.replaceLocked(actuationID, entry)
+}
+
+func (s *Store) RecordCleanupFailure(actuationID string, generation uint64, code string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loadErr != nil {
+		return s.loadErr
+	}
+	entry, ok := s.entries[actuationID]
+	if !ok || entry.Generation != generation || entry.DesiredState != DesiredCleanup {
+		return errors.New("cannot record cleanup failure for non-current cleanup generation")
+	}
+	entry.LastCleanupFailureCode = code
 	entry.UpdatedAt = time.Now().UTC()
 	return s.replaceLocked(actuationID, entry)
 }
