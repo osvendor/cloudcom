@@ -521,7 +521,18 @@ elevationRequestsRoutes.post(
       }
 
       const now = new Date();
-      const waitForLocalDecision = payload.local_decision_protocol === 1
+      // Keep a device-scoped compatibility gate for enrolled agents that predate
+      // local_decision_protocol. This only delays auto-approved actuation until
+      // the existing local-decision endpoint records the user's choice.
+      const legacyLocalGateDevices = new Set(
+        (process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS ?? '')
+          .split(',')
+          .map((id) => id.trim())
+          .filter(Boolean),
+      );
+      const waitForLocalDecision = (
+        payload.local_decision_protocol === 1 || legacyLocalGateDevices.has(device.id)
+      )
         && decision.kind === 'auto_approved';
       const status =
         decision.kind === 'auto_approved'
