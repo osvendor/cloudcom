@@ -565,6 +565,46 @@ describe('ingest decisioning (#1163)', () => {
     expect(lifecycleMocks.createPamDecisionIntent).not.toHaveBeenCalled();
   });
 
+  it('keeps a configured legacy device behind the local decision gate', async () => {
+    const previous = process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS;
+    process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS = 'other-device, device-1 ';
+    try {
+      pamMocks.evaluatePamBridge.mockResolvedValue({
+        match: 'allowlist', policyId: 'pol-2', auditMatches: [],
+      });
+      const { values } = happyPathInsert([{ id: 'req-legacy', status: 'auto_approved' }]);
+      const response = await post(buildApp());
+      expect(response.status).toBe(201);
+      expect(await response.json()).toEqual({
+        id: 'req-legacy', status: 'auto_approved', localDecisionRequired: true,
+      });
+      expect(values).toHaveBeenCalledWith(expect.objectContaining({
+        metadata: expect.objectContaining({ local_decision_required: true }),
+      }));
+      expect(lifecycleMocks.createPamDecisionIntent).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS;
+      else process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS = previous;
+    }
+  });
+
+  it('does not apply the legacy gate to a different device ID', async () => {
+    const previous = process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS;
+    process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS = 'device-10';
+    try {
+      pamMocks.evaluatePamBridge.mockResolvedValue({
+        match: 'allowlist', policyId: 'pol-2', auditMatches: [],
+      });
+      happyPathInsert([{ id: 'req-other', status: 'auto_approved' }]);
+      const response = await post(buildApp());
+      expect(response.status).toBe(201);
+      expect((await response.json()).localDecisionRequired).not.toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS;
+      else process.env.PAM_LEGACY_LOCAL_GATE_DEVICE_IDS = previous;
+    }
+  });
+
   it('pam rule auto_deny (real engine) -> denied with rule metadata', async () => {
     const rule = {
       id: 'rule-1',
