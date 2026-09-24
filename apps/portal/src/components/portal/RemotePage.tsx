@@ -5,8 +5,7 @@ import { withBase } from '@/lib/basePath';
 
 type LoadState = 'loading' | 'ready' | 'error';
 
-function isSafeLaunchUrl(url: string, transport: 'webrtc' | 'rustdesk'): boolean {
-  if (transport === 'rustdesk') return url.startsWith('rustdesk:');
+function isSafeLaunchUrl(url: string): boolean {
   try {
     const parsed = new URL(url, window.location.origin);
     const prefix = withBase('/remote/');
@@ -39,12 +38,12 @@ export function RemotePage() {
 
   useEffect(() => { void load(); }, []);
 
-  const connect = async (device: RemoteDevice, transport: 'webrtc' | 'rustdesk') => {
+  const connect = async (device: RemoteDevice) => {
     if (connecting) return;
-    setConnecting(`${device.id}:${transport}`);
-    const response = await portalApi.createRemoteSession(device.id, transport);
+    setConnecting(device.id);
+    const response = await portalApi.createRemoteSession(device.id, 'webrtc');
     setConnecting(null);
-    if (response.data?.launch?.url && isSafeLaunchUrl(response.data.launch.url, transport)) {
+    if (response.data?.launch?.url && isSafeLaunchUrl(response.data.launch.url)) {
       window.location.assign(response.data.launch.url);
       return;
     }
@@ -65,14 +64,11 @@ export function RemotePage() {
           <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{device.status}</span>
         </div>
         <div className="mt-5 flex flex-wrap gap-3">
-          {(['webrtc', 'rustdesk'] as const).map((transport) => {
-            const option = device.transports[transport];
-            const key = `${device.id}:${transport}`;
-            return <button key={transport} data-testid={`remote-connect-${transport}-${device.id}`} type="button" disabled={!option.available || connecting !== null} onClick={() => void connect(device, transport)} title={option.available ? undefined : option.reason} className="rounded-md border border-border px-4 py-2 text-sm font-semibold transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50">
-              {connecting === key ? 'Connecting…' : transport === 'webrtc' ? 'Open in browser' : 'Open with RustDesk'}
-            </button>;
-          })}
+          <button data-testid={`remote-connect-webrtc-${device.id}`} type="button" disabled={!device.transports.webrtc.available || connecting !== null} onClick={() => void connect(device)} title={device.transports.webrtc.available ? undefined : device.transports.webrtc.reason} className="rounded-md border border-border px-4 py-2 text-sm font-semibold transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50">
+            {connecting === device.id ? 'Connecting…' : 'Open in browser'}
+          </button>
         </div>
+        {device.transports.rustdesk.available && <p className="mt-3 text-sm text-muted-foreground">For RustDesk, open the managed app, sign in with your Breeze account, and choose this computer.</p>}
         {message && <p role="alert" className="mt-4 text-sm text-destructive">{message}</p>}
       </article>)}
     </div>}
