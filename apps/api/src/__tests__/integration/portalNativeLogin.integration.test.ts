@@ -25,7 +25,7 @@ describe.runIf(!!process.env.DATABASE_URL_APP && process.env.PORTAL_STATE_BACKEN
   beforeAll(async () => {
     process.env.CLOUDCOM_NATIVE_LOGIN_ENABLED = 'true';
     process.env.CLOUDCOM_REMOTE_ACCESS_ENABLED = 'true';
-    process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED = 'true';
+    process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED = 'false';
     [priorExtension] = await getTestDb().select().from(installedExtensions).where(eq(installedExtensions.name, 'rustdeskaccess'));
     await getTestDb().insert(installedExtensions).values({ name: 'rustdeskaccess', enabled: true,
       lifecycleState: 'active', configuredVersion: 'test', activeVersion: 'test' })
@@ -70,6 +70,7 @@ describe.runIf(!!process.env.DATABASE_URL_APP && process.env.PORTAL_STATE_BACKEN
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ orgId: org!.id, email: user!.email, password }) });
     expect(login.status).toBe(200);
+    process.env.CLOUDCOM_COMPANY_GATEWAY_ENABLED = 'true';
     const browserCookie = login.headers.get('set-cookie')!.split(';', 1)[0]!;
     const browserToken = decodeURIComponent(browserCookie.slice(browserCookie.indexOf('=') + 1));
     const verifier = randomBytes(32).toString('base64url');
