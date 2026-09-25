@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 const SHA = /^[0-9a-f]{40}$/;
 const TAG = /^v\d+\.\d+\.\d+$/;
@@ -27,7 +28,7 @@ export function requireUpstreamIntake(cwd, sourceCommit) {
   return { previous: previous.tag, current: current.tag };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
   try {
     const result = requireUpstreamIntake(process.cwd(), process.argv[2]);
     console.log(`Upstream intake confirmed: ${result.previous} -> ${result.current}`);

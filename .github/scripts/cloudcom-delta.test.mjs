@@ -108,6 +108,8 @@ test('routes the enumerated customer portal remote surface to focused real-DB co
   for (const path of [
     'apps/api/migrations/2026-09-21-portal-remote-access.sql',
     'apps/api/src/routes/portal/remote.ts',
+    'apps/api/src/routes/portal.test.ts',
+    'apps/api/src/routes/portal.compat.test.ts',
     'apps/api/src/services/portalRemoteSessionStore.ts',
     'apps/api/src/routes/orgPortalUsers.ts',
     'apps/api/src/routes/orgPortalUsers.test.ts',
@@ -136,6 +138,18 @@ test('routes the enumerated customer portal remote surface to focused real-DB co
   assert.equal(configuration.portalRemote, true);
   assert.equal(configuration.infra, true);
   assert.deepEqual(classify(['apps/api/src/routes/portal/reports.ts']).unsupported, ['apps/api/src/routes/portal/reports.ts']);
+});
+
+test('routes the intake guard and installer checksum through infrastructure checks', () => {
+  for (const path of [
+    'scripts/release/require-upstream-intake.mjs',
+    'scripts/release/require-upstream-intake.test.mjs',
+    'apps/web/public/scripts/SHA256SUMS',
+  ]) {
+    const result = classify([path]);
+    assert.equal(result.infra, true);
+    assert.deepEqual(result.unsupported, []);
+  }
 });
 
 test('requires focused API coverage for the monitor response binding fix', () => {

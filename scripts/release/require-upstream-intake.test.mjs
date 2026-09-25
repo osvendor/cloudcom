@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { requireUpstreamIntake } from './require-upstream-intake.mjs';
 
 test('allows the baseline-advancing intake commit and refuses later feature commits', () => {
@@ -28,6 +29,7 @@ test('allows the baseline-advancing intake commit and refuses later feature comm
     setBaseline('v0.116.0', secondUpstream);
     const intake = commit('import upstream release');
     assert.deepEqual(requireUpstreamIntake(cwd, intake), { previous: 'v0.115.0', current: 'v0.116.0' });
+    assert.match(execFileSync(process.execPath, [fileURLToPath(new URL('./require-upstream-intake.mjs', import.meta.url)), intake], { cwd, encoding: 'utf8' }), /Upstream intake confirmed/);
 
     writeFileSync(join(cwd, 'feature.txt'), 'routine change\n');
     const feature = commit('routine feature');
