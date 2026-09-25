@@ -25,6 +25,19 @@ type RecoveryConfig struct {
 	// snapshot advertising system state that failed to download it still
 	// reported StateApplied=false with status "completed" (D15/O10).
 	ExpectSystemState bool `json:"expectSystemState,omitempty"`
+
+	// FileIndex is derived from the recovery bootstrap payload (see
+	// session.go, RunRecoveryWithTokenContext), exactly like
+	// ExpectSystemState above — never set directly by a caller. It carries
+	// the server's verified-complete per-file index for this snapshot when
+	// the server granted the snapshot-file-membership-v1 capability and the
+	// snapshot has cross-snapshot references; nil otherwise (self-contained
+	// snapshot, or a server/agent too old to negotiate it).
+	// RunRecoveryContext's scope check (bmr.go, immediately after the
+	// manifest is downloaded and before any target write) passes it to
+	// ApplyManifestScope so a manifest with external references can never be
+	// honoured on an assumption.
+	FileIndex *FileIndexInfo `json:"-"`
 }
 
 type AuthenticatedProviderConfig struct {
@@ -34,16 +47,17 @@ type AuthenticatedProviderConfig struct {
 }
 
 type AuthenticatedDownloadDescriptor struct {
-	Type                string `json:"type"`
-	Method              string `json:"method"`
-	URL                 string `json:"url"`
-	TokenQueryParam     string `json:"tokenQueryParam,omitempty"`
-	TokenHeaderName     string `json:"tokenHeaderName,omitempty"`
-	TokenHeaderFormat   string `json:"tokenHeaderFormat,omitempty"`
-	PathQueryParam      string `json:"pathQueryParam"`
-	RequiresAuthSession bool   `json:"requiresAuthentication"`
-	PathPrefix          string `json:"pathPrefix"`
-	ExpiresAt           string `json:"expiresAt"`
+	Type                string   `json:"type"`
+	Method              string   `json:"method"`
+	URL                 string   `json:"url"`
+	TokenQueryParam     string   `json:"tokenQueryParam,omitempty"`
+	TokenHeaderName     string   `json:"tokenHeaderName,omitempty"`
+	TokenHeaderFormat   string   `json:"tokenHeaderFormat,omitempty"`
+	PathQueryParam      string   `json:"pathQueryParam"`
+	RequiresAuthSession bool     `json:"requiresAuthentication"`
+	PathPrefix          string   `json:"pathPrefix"`
+	ExpiresAt           string   `json:"expiresAt"`
+	Capabilities        []string `json:"capabilities,omitempty"`
 }
 
 type AuthenticatedSnapshot struct {
@@ -59,6 +73,23 @@ type AuthenticatedSnapshot struct {
 	// routes/backup/bmrRecoveries.ts). "system_image" alone is enough to
 	// expect system state — see SnapshotExpectsSystemState (#5412).
 	BackupType string `json:"backupType"`
+	// FileIndex is present only when the client negotiated
+	// CapabilitySnapshotFileMembershipV1 AND the snapshot's owning job
+	// reports referenced_files > 0 (Part 0 §1). Its Status is always
+	// "complete" by the time the agent sees it — the server refuses the
+	// authenticate/exchange call itself while hydration is pending
+	// (Part 0 §1 negotiateRecoveryCapabilities), so a non-complete
+	// FileIndexInfo can never legitimately reach the agent.
+	FileIndex *FileIndexInfo `json:"fileIndex,omitempty"`
+}
+
+// FileIndexInfo mirrors apps/api/src/services/recoveryBootstrap.ts's
+// buildAuthenticatedBootstrapPayload snapshot.fileIndex shape field-for-field.
+type FileIndexInfo struct {
+	Status            string   `json:"status"`
+	ManifestSHA256    string   `json:"manifestSha256"`
+	ExternalCount     int      `json:"externalCount"`
+	OriginSnapshotIDs []string `json:"originSnapshotIds"`
 }
 
 type AuthenticatedDevice struct {

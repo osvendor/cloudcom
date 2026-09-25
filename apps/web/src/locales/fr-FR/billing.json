@@ -1178,7 +1178,51 @@
       "shareLinkNewLinkOriginalLive": "Un NOUVEAU lien a été copié. Cette proposition est antérieure au suivi des liens : celui que le client possédait n'a pas pu être réutilisé; il fonctionne toujours en parallèle de celui-ci.",
       "shareLinkNewLinkOriginalDead": "Un NOUVEAU lien a été copié. Le lien précédent ne peut plus être ouvert; toute personne qui le détient doit utiliser celui-ci.",
       "currencyMismatch": "Ce devis est en {{documentCurrency}}, mais votre compte Stripe règle en {{accountCurrency}}. Stripe présentera {{documentCurrency}} au client et convertira lors du règlement — l'écart de change et les éventuels frais de conversion sont à votre charge.",
-      "currencyUnknown": "La devise de règlement de votre compte Stripe n'est pas encore en cache ; elle n'a donc pas pu être comparée à ce devis en {{documentCurrency}}. Actualisez les détails de votre compte Stripe dans Paramètres → Intégrations pour activer la vérification."
+      "currencyUnknown": "La devise de règlement de votre compte Stripe n'est pas encore en cache ; elle n'a donc pas pu être comparée à ce devis en {{documentCurrency}}. Actualisez les détails de votre compte Stripe dans Paramètres → Intégrations pour activer la vérification.",
+      "acceptOnBehalf": {
+        "button": "Accepter au nom du client",
+        "title": "Enregistrer l'acceptation du client",
+        "methodLabel": "Comment le client a-t-il donné son accord ?",
+        "method": {
+          "verbal": "Verbalement / par téléphone",
+          "email": "Par e-mail",
+          "signed_document": "Document signé",
+          "purchase_order": "Bon de commande",
+          "other": "Autre"
+        },
+        "referenceLabel": "Référence",
+        "referenceHelp": "Où un relecteur trouverait l'accord du client — un numéro de bon de commande, un e-mail daté ou un ticket.",
+        "signerNameLabel": "Qui a donné son accord",
+        "signerEmailLabel": "Son e-mail (facultatif)",
+        "consequenceInvoice": "Une facture de {{amount}} sera émise et numérotée maintenant.",
+        "consequenceContracts": "Les lignes récurrentes deviennent des contrats en brouillon que vous activez plus tard.",
+        "consequenceEmail": "La facture sera envoyée par e-mail au client.",
+        "consequenceDraft": "Cette proposition n'a jamais été envoyée. La facture sera la première chose que le client en verra.",
+        "submit": "Accepter et émettre la facture",
+        "success": "Proposition acceptée. Facture {{number}} émise.",
+        "error": "Impossible d'enregistrer l'acceptation.",
+        "successDraftInvoice": "Proposition acceptée. Facture créée en brouillon.",
+        "errorContractVariablesUnresolved": "Ce contrat a encore besoin de valeurs pour : {{names}}. Fermez cette boîte de dialogue, remplissez-les ci-dessous, puis réessayez.",
+        "errorContractVariablesUnresolvedGeneric": "Ce contrat contient des variables non résolues. Fermez cette boîte de dialogue, remplissez-les ci-dessous, puis réessayez.",
+        "errorDepositInvalid": "L'acompte ne peut pas être perçu tel qu'il est configuré. Fermez cette boîte de dialogue, corrigez les paramètres d'acompte ci-dessous, puis réessayez.",
+        "evidenceLabel": "Fichier justificatif (facultatif)",
+        "evidenceHelp": "PDF, PNG ou JPEG, jusqu'à 10 Mo — par exemple le bon de commande signé ou le document.",
+        "evidenceTooLarge": "Ce fichier dépasse 10 Mo. Choisissez un fichier plus petit.",
+        "evidenceAttached": "Justificatif joint.",
+        "evidenceError": "L'acceptation a été enregistrée, mais le fichier justificatif n'a pas pu être joint. Joignez-le depuis la page de la proposition."
+      },
+      "declineOnBehalf": {
+        "button": "Refuser pour le client",
+        "title": "Enregistrer le refus du client",
+        "methodLabel": "Comment a-t-il refusé ?",
+        "referenceLabel": "Référence",
+        "referenceHelp": "Où un vérificateur trouverait le refus du client : un e-mail et sa date, une note d'appel ou un ticket.",
+        "reasonLabel": "Son motif (facultatif)",
+        "consequence": "La proposition sera marquée comme refusée et ne pourra plus être acceptée. Révisez-la pour envoyer une nouvelle version au client.",
+        "submit": "Marquer comme refusée",
+        "success": "Proposition marquée comme refusée.",
+        "error": "Impossible d'enregistrer le refus."
+      }
     },
     "detail": {
       "addContentInEditor": "Ajouter du contenu dans l'Éditeur",
@@ -1303,6 +1347,18 @@
         "inProgressTitle": "Une révision de ce devis est en préparation — l'envoyer remplacera ce devis et désactivera le lien du client :",
         "revisionOfTitle": "Révision de",
         "untitled": "une version plus récente"
+      },
+      "acceptedOnBehalf": "Accepté au nom de {{signer}} par {{recorder}} le {{date}} · {{method}} · {{reference}}",
+      "deletedUser": "un utilisateur supprimé",
+      "evidence": {
+        "download": "Télécharger le justificatif",
+        "downloadTitle": "Télécharger {{filename}}",
+        "attach": "Joindre un justificatif",
+        "replace": "Remplacer le justificatif",
+        "attached": "Justificatif joint.",
+        "attachError": "Impossible de joindre le fichier justificatif.",
+        "downloadError": "Impossible de télécharger le fichier justificatif.",
+        "tooLarge": "Ce fichier dépasse 10 Mo. Choisissez un fichier plus petit."
       }
     },
     "currency": {
@@ -1952,6 +2008,8 @@
       "unitPrice": "Prix unitaire"
     },
     "terms": "Conditions générales",
+    "ticketHeader": "Ticket n° {{number}}",
+    "ticketWork": "Travail lié au ticket",
     "totals": {
       "amountDue": "Montant dû",
       "paid": "Payé",
@@ -2140,7 +2198,6 @@
     "saveSuccess": "Paramètres de facturation de l'organisation enregistrés",
     "tax": {
       "partnerDefault": "Valeur par défaut du partenaire",
-      "partnerDefaultWithValue": "{{pct}} % (valeur par défaut du partenaire)",
       "taxExempt": "Exonéré de taxe",
       "taxId": "Identifiant fiscal",
       "taxRate": "Taux de taxe (%)",
@@ -2171,6 +2228,8 @@
       "autoTaxHardwareHelp": "Le nouveau matériel importé est taxable par défaut.",
       "autoEmailInvoice": "Envoyer automatiquement la facture par e-mail à l'acceptation d'un devis",
       "autoEmailInvoiceHelp": "Lorsqu'un client accepte une proposition, la facture émise est envoyée immédiatement par e-mail avec un lien sécurisé pour consulter et payer — sans connexion.",
+      "notifyOnBehalfAcceptance": "Prévenir le client par e-mail lorsque vous enregistrez une acceptation en son nom",
+      "notifyOnBehalfAcceptanceHelp": "Lorsqu'un membre de votre équipe accepte un devis pour un client, celui-ci reçoit un court message indiquant qui l'a enregistrée et quand, avec le numéro de facture si une facture a été émise. Il peut répondre en cas d'erreur. Désactivé par défaut.",
       "currencyCode": "Code devise",
       "defaultMarkup": "Marge par défaut (%)",
       "defaultTaxRate": "Taux de taxe par défaut (%)",

@@ -30,6 +30,7 @@ docker compose --project-name "$project" -f docker-compose.test.yml up -d --wait
 pnpm --filter @breeze/api db:migrate
 
 pnpm --filter @breeze/api exec vitest run \
+  src/routes/portal.test.ts src/routes/portal.compat.test.ts \
   src/routes/orgPortalUsers.test.ts src/routes/portal/acceptInvite.test.ts \
   src/services/portalCompanyGateway.test.ts src/services/cfAccessJwt.test.ts \
   src/services/portalNativeLogin.test.ts src/routes/portal/nativeLogin.test.ts \

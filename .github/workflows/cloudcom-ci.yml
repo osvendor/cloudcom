@@ -191,6 +191,8 @@ jobs:
           pnpm --filter @breeze/api exec vitest run src/config/envComposeParity.test.ts
           node --test scripts/release/release-image-consumers.test.mjs
           node --test scripts/release/cloudcom-candidate-workflow.test.mjs scripts/cloudcom/exchange-worker-release.test.mjs
+          node --test scripts/release/require-upstream-intake.test.mjs
+          (cd apps/web/public/scripts && sha256sum -c SHA256SUMS)
           python3 scripts/cloudcom/verify-exchange-worker-oci.test.py
           bash scripts/check-guided-setup-systemd-unit.sh
           node --test scripts/cloudcom/update-upstream.test.mjs

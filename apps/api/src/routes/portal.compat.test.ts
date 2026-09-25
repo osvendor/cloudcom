@@ -103,7 +103,9 @@ const portalUser = {
   passwordHash: 'hash',
   authMethod: 'password',
   receiveNotifications: true,
-  status: 'active'
+  status: 'active',
+  authEpoch: 1,
+  accessMode: 'standard'
 };
 
 function mockSelectLimit(result: unknown) {

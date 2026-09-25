@@ -70,6 +70,11 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // when the route shipped, so the portal request tx was pinned across Stripe
   // (#3777 review F2).
   { method: 'POST', pattern: /^\/api\/v1\/portal\/quotes\/[^/]+\/pay\/?$/ },
+  // #6175 Network Visibility overview. Portal auth has already resolved the
+  // owning partner, so the handler opens one org-scoped context with
+  // currentPartnerId populated for SELECT-only partner-wide network_monitors
+  // access. No outer portal request transaction is held.
+  { method: 'GET', pattern: /^\/api\/v1\/portal\/network\/overview\/?$/ },
   // Stripe key verification — savePartnerStripeKey calls accounts.retrieve.
   { method: 'POST', pattern: /^\/api\/v1\/partner\/stripe-connect\/key\/?$/ },
   // Stripe cache lazy refresh — getPartnerStripeAccountSnapshot may call accounts.retrieve.
@@ -267,6 +272,15 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // item commits — the ambient request transaction it keeps holds no quote lock.
   { method: 'POST', pattern: /^\/api\/v1\/quotes\/[^/]+\/send\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/quotes\/[^/]+\/resend\/?$/ },
+  // Accept on behalf (spec 2026-09-21 §4). The handler runs the accept under
+  // runOutsideDbContext(withSystemDbAccessContext(...)) because
+  // partner_invoice_sequences is partner-axis and invisible to an org-scoped
+  // context (#1375), and the whole accept must be ONE transaction.
+  // runOutsideDbContext alone does NOT release the middleware's ambient
+  // transaction, so without this entry the request pins TWO pooled connections
+  // for the length of the accept. The handler opens its own short
+  // withAuthDbAccessContext for the org-scoped lookup instead.
+  { method: 'POST', pattern: /^\/api\/v1\/quotes\/[^/]+\/accept-on-behalf\/?$/ },
   // #3922 review round 2 — revision AUTHORING is the second network-touching
   // route on this surface, and the quieter one. `createRevision` runs
   // `validateBaseUrl` → `assertSafeUrl` on the operator-supplied base URL,
@@ -324,6 +338,28 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // uncommitted.
   { method: 'PUT', pattern: /^\/api\/v1\/monitoring\/assets\/[^/]+\/snmp\/?$/ },
   { method: 'PATCH', pattern: /^\/api\/v1\/monitoring\/assets\/[^/]+\/snmp\/?$/ },
+  // #6008 W01 — the three backup-provider routes that make a REAL Cove
+  // JSON-RPC call inside the handler (Login + EnumeratePartners, 30s timeout,
+  // against an OPERATOR-SUPPLIED host). Held inside the request transaction
+  // that pins a pooled connection idle-in-transaction for the whole round trip
+  // (#1105), and `safeFetch`'s own `assertOutsideHeldDbContext` tripwire throws
+  // in CI when it happens. Each handler wraps its reads and writes in short
+  // `withAuthDbAccessContext` blocks with the network call between them.
+  //
+  // `/connections/:id/sync` and DELETE `/connections/:id` are deliberately
+  // ABSENT: neither makes an outbound call (sync only enqueues), so both keep
+  // the ambient transaction — the same call as `push-bulk` above.
+  { method: 'POST', pattern: /^\/api\/v1\/backup\/providers\/connections\/?$/ },
+  { method: 'PATCH', pattern: /^\/api\/v1\/backup\/providers\/connections\/[^/]+\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/backup\/providers\/connections\/[^/]+\/test\/?$/ },
+  // Caller verification (#6354 W01): the three Graph-backed operations
+  // (directory picker search, authoritative sync, manual binding) each open
+  // short `withAuthDbAccessContext` phases around a Microsoft Graph read, so
+  // no request transaction is held across the outbound call. Ordinary
+  // verification reads/writes keep the ambient transaction.
+  { method: 'GET', pattern: /^\/api\/v1\/orgs\/[^/]+\/caller-verification-directory-users\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/orgs\/[^/]+\/caller-verification-directory-sync\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/orgs\/[^/]+\/contacts\/[^/]+\/caller-verification-bindings\/?$/ },
 ];
 
 /**

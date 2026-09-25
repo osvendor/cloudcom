@@ -176,6 +176,15 @@ const ORG_AXIS_POLICY_EXCLUDED_TABLES: ReadonlySet<string> = new Set<string>([
   // here keeps that generic check honest; PARENT_FK_JOIN_POLICY_TABLES is the
   // real assertion for this table's policy shape.
   'ticket_form_org_links',
+  // backup_provider_customers (#6008 W01): partner-axis (Shape 3) carrying a
+  // denormalized NULLABLE org_id — the MAPPING TARGET, not the tenancy axis.
+  // An unmapped customer has org_id NULL and must stay visible to the partner
+  // admin who has to map it, so breeze_has_org_access(org_id) is the wrong
+  // predicate here. Identical treatment to huntress_org_mappings /
+  // s1_org_mappings. Its sibling backup_provider_devices IS direct-org_id
+  // (Shape 1) and is deliberately NOT excluded — it is auto-discovered and
+  // must carry breeze_has_org_access(org_id) on all four commands.
+  'backup_provider_customers',
 ]);
 
 // Tables whose own `id` column is the tenant identifier (no `org_id`).
@@ -330,6 +339,21 @@ const PARTNER_TENANT_TABLES: ReadonlyMap<string, string> = new Map<string, strin
   // for cascadeDeletePartner's dynamic partner_id sweep.
   // Functional cross-partner forge proof: orgMergeEventsRls.integration.test.ts.
   ['org_merge_events', 'partner_id'],
+  // Backup Provider Integration (#6008 W01): the MSP registers one external
+  // backup vendor connection (Cove) and maps its discovered customers to
+  // Breeze orgs. Both tables are partner-axis (Shape 3), four per-command
+  // breeze_has_partner_access policies each, the customers table additionally
+  // re-checking its parent connection's partner_id in INSERT/UPDATE WITH
+  // CHECK. backup_provider_customers is ALSO in
+  // ORG_AXIS_POLICY_EXCLUDED_TABLES (dual-list trap — it has an org_id column
+  // that is not its tenancy axis). backup_provider_devices and
+  // backup_provider_device_history carry a NOT NULL org_id and are ordinary
+  // Shape 1 tables, auto-discovered — not listed here, and their denormalized
+  // partner_id is deliberately NOT a second RLS read branch.
+  // Functional cross-partner forge proof:
+  // backupProviderRls.integration.test.ts.
+  ['backup_provider_connections', 'partner_id'],
+  ['backup_provider_customers', 'partner_id'],
   // partner_sending_domains / partner_sender_identities (spec 2026-09-17,
   // partner sending domains W02): the MSP's custom outbound From domain and
   // one sender identity per (partner, mail stream). Partner-axis (Shape 3),
@@ -360,6 +384,11 @@ const PARTNER_TENANT_TABLES: ReadonlyMap<string, string> = new Map<string, strin
 // is the canonical case: a user row is visible if the caller has access
 // to the user's partner OR the user's org OR is the user themselves.
 const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
+  // caller_verification_policies (#6354 W01): org XOR partner via
+  // caller_verification_policies_one_owner_chk; SELECT-only partner-wide branch
+  // cv_policy_partner_select ships in 2026-10-26-170100. Functional forge
+  // proof: callerVerification.integration.test.ts.
+  'caller_verification_policies',
   'topology_config_templates',
   'topology_config_template_versions',
   // network_monitors (#5287 W04): reshaped from org-only to org XOR partner by
@@ -683,6 +712,14 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
   // policy gained the partner branch in the same migration. Functional
   // cross-partner forge proof: psaConnectionsPartnerRls.integration.test.ts.
   'psa_connections',
+  // #3198 W01: reports is org_id XOR partner_id (reports_one_owner_chk,
+  // 2026-10-27-130100). This entry registers reports for the FORCE-RLS and
+  // four-command dual-axis coverage checks — either helper satisfies those, so
+  // it does NOT prove the breeze_has_partner_access branch (an org-only policy
+  // would still pass). The partner branch is proven only by
+  // reportsPartnerRls.integration.test.ts. Deliberately NOT in
+  // XOR_OWNERSHIP_DUAL_AXIS_TABLES — see the exclusion note there.
+  'reports',
 ]);
 
 // Wave 4 of #4673: the subset of DUAL_AXIS_TENANT_TABLES whose ownership
@@ -708,7 +745,15 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
 // drives the partner-wide SELECT-branch assertions below — so nothing else
 // changes. If access_reviews ever gains a CHECK, this note has no examples
 // left and should be deleted rather than patched.
+//
+// … and `reports` (#3198 W01): org XOR partner by CHECK, but NOT a config
+// table — a partner-owned report is a partner-PRIVATE cross-org aggregate
+// (money, utilisation), and spec §2 forbids org-scope sessions from reading
+// it. The partner-wide SELECT branch this set asserts would grant exactly that
+// read, so reports must never carry one. Its partner branch is proven
+// functionally by reportsPartnerRls.integration.test.ts instead.
 const XOR_OWNERSHIP_DUAL_AXIS_TABLES: ReadonlySet<string> = new Set<string>([
+  'caller_verification_policies',
   'topology_config_templates',
   'topology_config_template_versions',
   // monitor_definitions_one_owner_chk ((org_id IS NULL) <> (partner_id IS
@@ -1008,11 +1053,11 @@ const USER_ID_SCOPED_TABLES: ReadonlySet<string> = new Set<string>([
 ]);
 
 // Platform bookkeeping tables that hold no tenant data and are not a tenancy
-// shape. Exactly one entry today. Adding here requires the same justification
-// as INTENTIONAL_UNSCOPED (a plan-doc entry per CLAUDE.md "Intentionally
-// system-scoped").
+// shape. Adding here requires the same justification as INTENTIONAL_UNSCOPED
+// (a plan-doc entry per CLAUDE.md "Intentionally system-scoped").
 const PLATFORM_INFRASTRUCTURE_TABLES: ReadonlySet<string> = new Set<string>([
   'breeze_migrations', // autoMigrate's applied-migration ledger (filename + checksum). No tenant data. See apps/api/src/db/autoMigrate.ts MIGRATION_TABLE.
+  'breeze_version_history', // #6605: API versions this deployment has booted (version, first_seen_at), written at boot over the migration connection; breeze_app is SELECT-only. Plan doc: docs/superpowers/plans/platform-ci/2026-09-22-upgrade-preflight-6605.md.
 ]);
 
 // Tables that carry NO tenancy classification in this catalog (most also

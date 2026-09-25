@@ -8,10 +8,21 @@
 // Rules (Part 0 §1 "Object-key contract" — do not relax any of these):
 //   - key matches ^snapshots/([A-Za-z0-9][A-Za-z0-9._-]{0,254})/(.+)$
 //   - group 2 (rest) is non-empty
-//   - no NUL byte anywhere in the key
-//   - no backslash anywhere in the key (POSIX-style keys only)
+//   - no NUL byte anywhere in the key; every OTHER byte (CR, LF, TAB, U+2028,
+//     …) is a legal filename byte and both parsers accept it verbatim
+//   - '/' is the ONLY separator. A backslash is an ordinary filename byte
+//     inside a rest segment (D-W09-2, #6491 KIT lab: every systemd Linux
+//     host ships `system-systemd\x2dcryptsetup.slice`; the agent writes the
+//     name into the key verbatim because filepath.ToSlash is a no-op on
+//     Linux, and a Windows name can never contain one). The snapshot-id
+//     segment's character class still excludes it, and a key that uses
+//     backslash AS a separator never matches `^snapshots/`. Stored objects
+//     already carry the literal byte and are compared verbatim on both
+//     sides, so this is the only backward-compatible reading — encoding it
+//     would re-point every existing key.
 //   - no path segment (split on '/') equal to '' (double slash), '.', or '..'
-//     ANYWHERE in the key, not just in rest
+//     ANYWHERE in the key, not just in rest. `..\x` is one literal segment,
+//     not a traversal.
 //   - rest must not end in '/'
 //   - the key is served/compared VERBATIM: no percent-decoding, no case
 //     folding, no trimming of a trailing .gz (a writer may legitimately
@@ -22,11 +33,16 @@ export const BACKUP_SNAPSHOT_FILE_MEMBERSHIP_CAPABILITY = 'snapshot-file-members
 
 export type ParsedBackupObjectKey = { snapshotId: string; rest: string };
 
-const KEY_PATTERN = /^snapshots\/([A-Za-z0-9][A-Za-z0-9._-]{0,254})\/(.+)$/;
+// The `s` (dotAll) flag matters for parity: JS `.` excludes \n, \r, \u2028
+// and \u2029 while RE2 `.` excludes only \n, so without it a Linux filename
+// carrying a CR or a Unicode line separator parsed on the agent and failed
+// closed here (manifest_key_invalid). Both sides now match every byte
+// except NUL (Go: `(?s)`); pinned by the \r / \n / \t / \u2028 vectors.
+const KEY_PATTERN = /^snapshots\/([A-Za-z0-9][A-Za-z0-9._-]{0,254})\/(.+)$/s;
 
 export function parseBackupObjectKey(key: string): ParsedBackupObjectKey | null {
   if (typeof key !== 'string' || key.length === 0) return null;
-  if (key.includes('\0') || key.includes('\\')) return null;
+  if (key.includes('\0')) return null;
 
   const match = KEY_PATTERN.exec(key);
   if (!match) return null;

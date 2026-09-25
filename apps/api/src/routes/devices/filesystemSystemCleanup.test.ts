@@ -90,7 +90,7 @@ const DEVICE_ID = '22222222-2222-4222-8222-222222222222';
 const COMMAND_ID = '33333333-3333-4333-8333-333333333333';
 const RUN_ID = '44444444-4444-4444-8444-444444444444';
 
-const modernDevice = { id: DEVICE_ID, orgId: 'org-1', hostname: 'LAB-1', agentVersion: '0.115.0' };
+const modernDevice = { id: DEVICE_ID, orgId: 'org-1', hostname: 'LAB-1', agentVersion: '0.116.0' };
 
 function app() {
   const instance = new Hono();
@@ -385,7 +385,7 @@ describe('system-cleanup access and poll failures', () => {
       .mockReturnValueOnce(selectReturning([{ result: { error: 'unknown command type: system_cleanup_run' } }]));
     const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/run/${RUN_ID}`);
     expect(res.status).toBe(409);
-    await expect(res.json()).resolves.toMatchObject({ error: 'agent_update_required', minAgentVersion: '0.115.0' });
+    await expect(res.json()).resolves.toMatchObject({ error: 'agent_update_required', minAgentVersion: '0.116.0' });
   });
   it('returns update-required from the persisted run error', async () => {
     selectMock.mockReturnValue(selectReturning([{ id: RUN_ID, status: 'failed', error: 'unknown command type: system_cleanup_run' }]));
@@ -396,5 +396,83 @@ describe('system-cleanup access and poll failures', () => {
     selectMock.mockReturnValue(selectReturning([{ status: 'cancelled', result: null }]));
     const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/list/${COMMAND_ID}`);
     await expect(res.json()).resolves.toMatchObject({ data: { status: 'failed' } });
+  });
+});
+
+// #6485 F-5: `POST /devices/:id/commands/:commandId/cancel` answers 409
+// "Command is not pending" the instant the agent claims the command (status
+// flips to `sent`), so a hung 60-min cleaner could not be cancelled from the
+// API at all — the operator had to wait out the stored deadline (up to 70
+// min). This route fails the RUN row and cancels the command atomically via
+// `failSystemCleanupRunAndCancelCommand`, regardless of whether the command
+// is still `pending` or already `sent`/in flight.
+describe('POST /devices/:id/filesystem/system-cleanup/run/:cleanupRunId/cancel', () => {
+  it('fails a running run and cancels its already-sent command', async () => {
+    selectMock.mockReturnValueOnce(selectReturning([{ id: RUN_ID, deviceId: DEVICE_ID, orgId: 'org-1', kind: 'system', status: 'running', commandId: COMMAND_ID }]));
+    updateReturning([{ id: RUN_ID, commandId: COMMAND_ID }], [{ id: COMMAND_ID }]);
+
+    const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/run/${RUN_ID}/cancel`, { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ success: true, data: { cleanupRunId: RUN_ID, status: 'failed' } });
+    // runs CAS-failed, then the sent/pending command cancelled — same atomic
+    // helper the lazy poll timeout uses, so there is one "this run is over".
+    expect(updateMock).toHaveBeenCalledTimes(2);
+    expect(updateMock.mock.calls[0]![0]).toMatchObject({ id: 'runs.id' });
+    expect(writeRouteAuditMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: 'device.filesystem.system_cleanup.cancel',
+    }));
+  });
+
+  it('404s when the run does not exist', async () => {
+    selectMock.mockReturnValue(selectReturning([]));
+    const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/run/${RUN_ID}/cancel`, { method: 'POST' });
+    expect(res.status).toBe(404);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it('409s a run that already finished — not "not pending", not the generic command cancel answer', async () => {
+    selectMock.mockReturnValue(selectReturning([{ id: RUN_ID, deviceId: DEVICE_ID, orgId: 'org-1', kind: 'system', status: 'executed', commandId: COMMAND_ID }]));
+    const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/run/${RUN_ID}/cancel`, { method: 'POST' });
+    expect(res.status).toBe(409);
+    await expect(res.json()).resolves.toMatchObject({ success: false, error: 'not_running', status: 'executed' });
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it('409s when a real result won the CAS race against the cancel, reporting what actually happened', async () => {
+    // The race winner is a genuine `executed` result, not a failure — the
+    // handler must re-read rather than assume `failed`, or a successful run
+    // gets misreported to the operator as having failed.
+    selectMock
+      .mockReturnValueOnce(selectReturning([{ id: RUN_ID, deviceId: DEVICE_ID, orgId: 'org-1', kind: 'system', status: 'running', commandId: COMMAND_ID }]))
+      .mockReturnValueOnce(selectReturning([{ status: 'executed' }]));
+    updateReturning([]); // the CAS `WHERE status = 'running'` matched nothing — a result landed first
+    const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/run/${RUN_ID}/cancel`, { method: 'POST' });
+    expect(res.status).toBe(409);
+    await expect(res.json()).resolves.toMatchObject({ success: false, error: 'not_running', status: 'executed' });
+  });
+
+  it('denies an inaccessible organization before touching the run row', async () => {
+    getDeviceWithOrgAndSiteCheckMock.mockResolvedValue(null);
+    const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/run/${RUN_ID}/cancel`, { method: 'POST' });
+    expect(res.status).toBe(404);
+    expect(selectMock).not.toHaveBeenCalled();
+  });
+
+  it('denies an excluded site', async () => {
+    getDeviceWithOrgAndSiteCheckMock.mockResolvedValue(Symbol.for('site-access-denied'));
+    const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/run/${RUN_ID}/cancel`, { method: 'POST' });
+    expect(res.status).toBe(403);
+    expect(selectMock).not.toHaveBeenCalled();
+  });
+
+  it('404s a file-kind run — the query filters kind = system, not just id + device', async () => {
+    // The real WHERE clause includes eq(deviceFilesystemCleanupRuns.kind,
+    // 'system'), so a file-kind run with this id never matches; simulated
+    // here the same way the GET run-status suite simulates it, by returning
+    // no row.
+    selectMock.mockReturnValue(selectReturning([]));
+    const res = await app().request(`/devices/${DEVICE_ID}/filesystem/system-cleanup/run/${RUN_ID}/cancel`, { method: 'POST' });
+    expect(res.status).toBe(404);
   });
 });

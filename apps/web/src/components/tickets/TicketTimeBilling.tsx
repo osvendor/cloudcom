@@ -25,6 +25,10 @@ interface BillingSummary {
     /** #4628 §3.5 contract-covered time; absent on an API predating W03. */
     includedMinutes?: number;
     billableAmounts: CurrencyAmount[];
+    /** #6466: count of billable entries with no hourly rate — those minutes are
+     *  counted in `billableMinutes` (the minimum/rounding SQL doesn't filter on
+     *  rate) but excluded from `billableAmounts`. Absent on an older API. */
+    missingRateCount?: number;
   };
   parts: { partsCount: number; billableTotals: CurrencyAmount[] };
   defaults?: (BillingOutcomeStamp & { workTypeId?: string | null }) | null;
@@ -251,6 +255,16 @@ export default function TicketTimeBilling({ ticketId }: { ticketId: string }) {
               <CurrencyAmounts amounts={summary.time.billableAmounts ?? []} testIdPrefix="ticket-billing-amount" empty={t('ticketTimeBilling.noAmount')} />
             </dd>
           </div>
+          {/* #6466/BQ-4: billableMinutes above already includes rate-less
+              entries (the minimum/rounding SQL doesn't filter on rate), so
+              the amount row above this note can be blank for a nonzero
+              billable-hours figure. Rendered BELOW the amount row it refers
+              to ("not counted in the amount above") — must stay below it. */}
+          {(summary.time.missingRateCount ?? 0) > 0 && (
+            <div className="flex justify-end text-xs text-muted-foreground" data-testid="ticket-billing-missing-rate">
+              {t('ticketTimeBilling.missingRateCount', { count: summary.time.missingRateCount })}
+            </div>
+          )}
           <div className="flex justify-end">
             <ApproximateMoneyLine byCurrency={toReportingGroups(summary.time.billableAmounts ?? [])} testId="ticket-labor-approx" />
           </div>

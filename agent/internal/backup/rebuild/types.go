@@ -190,6 +190,15 @@ type Result struct {
 	BytesRestored int64         `json:"bytesRestored"`
 	DurationMs    int64         `json:"durationMs"`
 	Resumed       bool          `json:"resumed"`
+	// FilesFailed is the total count of files the restore phase could not
+	// place. FailedFilesSample is a deterministic (sorted) prefix of those
+	// paths, capped at 50 entries so a mass-failure run never balloons the
+	// reported result; FailedFilesOmitted is how many more there were
+	// beyond the sample. The agent's internal failedFiles set (used by
+	// validate.go) is never truncated — only this reported summary is.
+	FilesFailed        int      `json:"filesFailed"`
+	FailedFilesSample  []string `json:"failedFilesSample,omitempty"`
+	FailedFilesOmitted int      `json:"failedFilesOmitted,omitempty"`
 	// StateManifestFound is true once preflight downloaded and verified
 	// system-state/manifest.json; StateApplied only once
 	// bmr.RestoreSystemStateOffline returned nil for it (persisted across
@@ -197,6 +206,131 @@ type Result struct {
 	// "completed" while StateApplied is false (#5412).
 	StateManifestFound bool `json:"stateManifestFound"`
 	StateApplied       bool `json:"stateApplied"`
+}
+
+// FailedFilesLen and CloneWithTrimmedFailedFiles satisfy bmr's
+// boundedFailures interface (bmr/progress.go) so BoundProgressUpdate can
+// trim a *Result's FailedFilesSample before posting progress, without bmr
+// importing rebuild (rebuild already imports bmr, so the reverse would be
+// a cycle). Both have nil-receiver-safe guards: a ProgressUpdate.Result
+// can carry a typed nil *Result (e.g. a caller passes a *Result variable
+// that was never assigned), and Go's type switch matches the concrete
+// type regardless of a nil pointer value, so BoundProgressUpdate's
+// `case boundedFailures:` branch would otherwise call these on a nil
+// receiver and panic (caught by cmd/breeze-backup's rebuild_cmd_test.go).
+func (r *Result) FailedFilesLen() int {
+	if r == nil {
+		return 0
+	}
+	return len(r.FailedFilesSample)
+}
+
+// Caps mirror the server schema and w09-part0.md's Global Constraint
+// "Bounded reporting" (agent-side caps mirror the server schema): warnings
+// <= 64 entries x 2000 chars, reason/error strings <= 2000 chars. Mirrored
+// independently from bmr's own maxProgress* constants (progress.go) —
+// rebuild cannot import bmr's unexported constants, and bmr cannot import
+// rebuild (rebuild already imports bmr, so the reverse would be a cycle).
+const (
+	maxResultWarnings     = 64
+	maxResultWarningRunes = 2000
+	maxResultReasonRunes  = 2000
+)
+
+func truncateResultRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
+}
+
+// CloneWithTrimmedFailedFiles returns a shallow copy of r with
+// FailedFilesSample trimmed to max entries (FailedFilesOmitted increased
+// to account for the newly-trimmed entries), Warnings trimmed to
+// maxResultWarnings entries of at most maxResultWarningRunes runes each,
+// and Error/Refusal capped to maxResultReasonRunes runes. r itself is
+// never mutated — trimmed slices/strings are always freshly built, never
+// aliased against r's own backing arrays. A nil receiver returns nil
+// unchanged (nothing to trim).
+//
+// Warnings is uncapped at every call site that populates it (restore.go
+// appends one entry per failed file placement; restore_tree.go forwards
+// that slice into Result.Warnings verbatim) — unlike FailedFilesSample,
+// which restore_tree.go already caps to 50 entries at construction. A
+// mass-failure restore (e.g. 98k files) can therefore carry ~98k
+// Warnings entries, which alone blows the 768 KiB progress body limit
+// even though FailedFilesSample stays small — this method is the only
+// place that bounds it (review finding #2, w09-part0.md R18).
+func (r *Result) CloneWithTrimmedFailedFiles(max int) any {
+	if r == nil {
+		return r
+	}
+	clone := *r
+
+	if n := len(clone.FailedFilesSample); n > max {
+		clone.FailedFilesOmitted += n - max
+		clone.FailedFilesSample = append([]string(nil), clone.FailedFilesSample[:max]...)
+	}
+
+	warnKeep := len(r.Warnings)
+	if warnKeep > maxResultWarnings {
+		warnKeep = maxResultWarnings
+	}
+	if warnKeep > 0 {
+		warnings := make([]string, warnKeep)
+		for i := 0; i < warnKeep; i++ {
+			warnings[i] = truncateResultRunes(r.Warnings[i], maxResultWarningRunes)
+		}
+		clone.Warnings = warnings
+	} else {
+		clone.Warnings = nil
+	}
+
+	clone.Error = truncateResultRunes(clone.Error, maxResultReasonRunes)
+	clone.Refusal = truncateResultRunes(clone.Refusal, maxResultReasonRunes)
+
+	return &clone
+}
+
+// SummaryFields satisfies bmr's resultSummaryFields seam (bmr/progress.go)
+// so the last-resort progress fallback — used when even the trimmed clone
+// from CloneWithTrimmedFailedFiles doesn't fit under the body limit — can
+// still surface filesFailed/failedFilesOmitted/error/refusal from a typed
+// *Result instead of degrading to a bare {"status","truncated":true} (the
+// map[string]any branch it previously only supported). A nil receiver
+// returns nil (nothing to summarize).
+func (r *Result) SummaryFields() map[string]any {
+	if r == nil {
+		return nil
+	}
+	m := map[string]any{}
+	if r.FilesFailed > 0 {
+		m["filesFailed"] = r.FilesFailed
+	}
+	if r.FailedFilesOmitted > 0 {
+		m["failedFilesOmitted"] = r.FailedFilesOmitted
+	}
+	if r.Error != "" {
+		m["error"] = r.Error
+	}
+	if r.Refusal != "" {
+		m["refusal"] = r.Refusal
+	}
+	return m
+}
+
+// ObjectAdmission is implemented by a token-mode recovery provider
+// (bmr.recoveryDownloadProvider) to let preflight refuse a manifest entry
+// the provider would refuse to download anyway — the belt to
+// bmr.ApplyManifestScope's braces (Options.Provider is already confined via
+// WidenScopeFromManifest/RunRecoveryContext's own scope check before
+// preflight runs; this is a second, independent check inside the engine
+// itself so provision can never run ahead of it on any call path). A
+// provider that does not implement it (plain S3/local) is never confined
+// here either — see preflight's type assertion.
+type ObjectAdmission interface {
+	Admits(key string) bool
 }
 
 // RefusalError carries an operator-facing reason; Run maps it to Status

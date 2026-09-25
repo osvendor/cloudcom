@@ -23,6 +23,7 @@ import { enqueueDiscoveryResults, type DiscoveredHostResult, type DeviceAdjacenc
 import { enqueueBackupResults } from '../jobs/backupWorker';
 import { enqueueSnmpPollResults, type SnmpMetricResult } from '../jobs/snmpWorker';
 import { enqueueMonitorCheckResult, recordMonitorCheckResult, type MonitorCheckResult } from '../jobs/monitorWorker';
+import { transitionDeviceOffline } from '../jobs/offlineDetector';
 import { getRedis, isRedisAvailable } from '../services/redis';
 import { isIP } from 'node:net';
 import { processDeviceIPHistoryUpdate } from '../services/deviceIpHistory';
@@ -2577,9 +2578,26 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
       // HTTP heartbeat claim (the agent heartbeats immediately on startup)
       // and executeCommand's direct per-command push while the socket is
       // live.
-      await runWithAgentDbAccess('agentWs.onOpen.markOnline', async () => {
-        await updateDeviceStatus(agentId, 'online');
-      });
+      //
+      // #6607: this MUST NOT be allowed to reject. It is the first DB call in
+      // onOpen, and the WS adapter drops the promise onOpen returns — an
+      // unguarded rejection (observed: a `DbAccessContextPrologueTimeoutError`
+      // during a 21-second Postgres stall) escaped as a process-level
+      // unhandled rejection AND skipped every side effect below: the device
+      // stayed 'offline' in the DB, no device.online event was published, and
+      // the agent never got a welcome frame or the ping loop on a socket that
+      // was nonetheless open and serving messages. Log, report, and continue:
+      // the HTTP heartbeat marks the device online within seconds, so this is
+      // self-healing, and the stall is the DB's problem — not the agent's, so
+      // the socket stays up.
+      try {
+        await runWithAgentDbAccess('agentWs.onOpen.markOnline', async () => {
+          await updateDeviceStatus(agentId, 'online');
+        });
+      } catch (err) {
+        console.error(`[AgentWs] agentWs.onOpen.markOnline failed for agent ${agentId}; heartbeat will correct status:`, err);
+        captureException(err instanceof Error ? err : new Error(String(err)));
+      }
 
       // Publish device.online event for real-time UI updates
       if (agentDb) {
@@ -3501,23 +3519,18 @@ onClose: async (_event: unknown, ws: WSContext) => {
                 console.log(`[AgentWs] Preserving 'updating' status for agent ${agentId} on disconnect`);
                 return;
               }
-              await updateDeviceStatus(agentId, 'offline');
-              publishEvent('device.offline', agentDb.orgId, {
-                deviceId: current.id,
-                hostname: current.hostname,
-              }, 'agent-ws', { siteId: current.siteId }).catch(err => {
-                console.error('[AgentWs] Failed to publish device.offline:', err);
-                captureException(err);
-              });
+              // No publishEvent('device.offline') here: when the row actually
+              // flips, transitionDeviceOffline persists an 'offline-event'
+              // effect whose worker publishes it (offlineTransitionEffects.ts).
+              // Publishing here too fired webhooks/automations twice (#6566).
+              await transitionDeviceOffline(agentId, ['online']);
             } catch (err) {
               console.error(`[AgentWs] Failed to check status for ${agentId} on disconnect, falling back to offline:`, err);
-              await updateDeviceStatus(agentId, 'offline');
-              publishEvent('device.offline', agentDb.orgId, {
-                deviceId: agentId,
-                hostname: '',
-              }, 'agent-ws').catch(pubErr => {
-                console.error('[AgentWs] Failed to publish device.offline:', pubErr);
-                captureException(pubErr);
+              captureException(err instanceof Error ? err : new Error(String(err)));
+              // The effect path publishes device.offline (see above).
+              await transitionDeviceOffline(agentId, ['online']).catch(fallbackErr => {
+                console.error(`[AgentWs] Failed to transition ${agentId} offline on fallback:`, fallbackErr);
+                captureException(fallbackErr instanceof Error ? fallbackErr : new Error(String(fallbackErr)));
               });
             }
           });
@@ -3562,9 +3575,10 @@ if (activeConnections.get(agentId)?.ws === ws) {
           } catch (err) {
             console.error(`[AgentWs] Failed to check status for ${agentId} on error disconnect, falling back to offline:`, err);
           }
-          await updateDeviceStatus(agentId, 'offline');
+          await transitionDeviceOffline(agentId, ['online']);
         }).catch((err) => {
           console.error(`[AgentWs] Failed to mark agent ${agentId} offline after error:`, err);
+          captureException(err instanceof Error ? err : new Error(String(err)));
         });
       }
     }

@@ -243,7 +243,11 @@ export const navSections: NavSection[] = [
     icon: BrainCircuit,
     items: [
       { name: 'Fleet Orchestration', labelKey: 'nav.fleetOrchestration', href: '/fleet', icon: BrainCircuit },
-      { name: 'AI Assistant', labelKey: 'nav.aiAssistant', href: '/workspace', icon: MessagesSquare },
+      // #6498: /workspace drives the own-session /ai/* routes, every one of
+      // which requires ai_sessions:use (#6396). Without this gate a role holding
+      // only devices:read saw the full AI Workspace and a bare "Permission
+      // denied" on send.
+      { name: 'AI Assistant', labelKey: 'nav.aiAssistant', href: '/workspace', icon: MessagesSquare, requiredPermission: { resource: 'ai_sessions', action: 'use' } },
       { name: 'AI Agents', labelKey: 'nav.aiAgents', href: '/settings/ai-agents', icon: Bot, requiredPermission: { resource: 'ai_agents', action: 'read' } },
       // Execution-trace runs list/detail (Wave 6 PR 1, #3828) — file-routed under
       // /ai-agents/runs (not /settings/*) since a run is fleet activity, not
@@ -288,6 +292,7 @@ export const navSections: NavSection[] = [
     // A billing-only role has no devices:read grant, so the whole section hides.
     items: [
       { name: 'Overview', labelKey: 'nav.securityOverview', href: '/security', icon: ShieldCheck, requiredPermission: { resource: 'devices', action: 'read' } },
+      { name: 'IOC Scans', labelKey: 'nav.securityScans', href: '/security/scans', icon: ScanSearch, requiredPermission: { resource: 'devices', action: 'read' } },
       ...(ENABLE_EDR_INTEGRATIONS
         ? [{ name: 'EDR', labelKey: 'nav.edr', href: '/security/edr', icon: ShieldAlert, requiredPermission: { resource: 'devices', action: 'read' } } satisfies NavItem]
         : []),

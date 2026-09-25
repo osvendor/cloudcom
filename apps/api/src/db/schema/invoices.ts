@@ -10,6 +10,7 @@ import {
   INVOICE_LINE_SOURCE_TYPES,
   PAYMENT_METHODS,
   INVOICE_LINE_DEVICE_COUNTED_AS,
+  type InvoiceStatus,
 } from '@breeze/shared';
 
 // Spread the readonly SSOT tuples into pgEnum's mutable `[string, ...string[]]`.
@@ -25,7 +26,25 @@ export const invoiceLineDeviceCountedAsEnum = pgEnum('invoice_line_device_counte
 function sqlNumberPresent(t: { invoiceNumber: unknown }): SQL {
   return sql`${t.invoiceNumber} IS NOT NULL`;
 }
-function sqlOpenForOverdue(t: { status: unknown }): SQL {
+/** Statuses an unpaid invoice can legitimately sit in (#3198 R3 AR aging).
+ *  `overdue` is here, and it is the reason this is NOT `sqlOpenForOverdue`'s
+ *  list: `runOverdueSweep` flips sent/partially_paid INTO 'overdue', so the
+ *  sweep's candidate set and the AR-open set are deliberately different.
+ *  Pinned against each other by invoices.arPredicates.test.ts. */
+export const AR_OPEN_STATUSES = ['sent', 'partially_paid', 'overdue'] as const satisfies readonly InvoiceStatus[];
+
+/** Every invoice with a live receivable. Literal SQL (not built from
+ *  AR_OPEN_STATUSES) so it reads like the predicate below; the test pins it to
+ *  the constant. */
+export function sqlOpenAr(t: { status: unknown }): SQL {
+  return sql`${t.status} IN ('sent','partially_paid','overdue')`;
+}
+
+/** Candidates for the daily overdue sweep: AR-open MINUS already-overdue. Also
+ *  the `invoices_due_overdue_idx` partial-index predicate — changing this text
+ *  is schema drift against migration 2026-06-15-a. Exported for #3198 R3 so the
+ *  sweep's status vocabulary keeps one home. */
+export function sqlOpenForOverdue(t: { status: unknown }): SQL {
   return sql`${t.status} IN ('sent','partially_paid')`;
 }
 function sqlPublicLinkHashPresent(t: { publicLinkTokenHash: unknown }): SQL {
@@ -142,6 +161,10 @@ export const invoiceLines = pgTable('invoice_lines', {
   customerVisible: boolean('customer_visible').notNull().default(true),
   lineTotal: numeric('line_total', { precision: 12, scale: 2 }).notNull().default('0'),
   isUnapprovedTime: boolean('is_unapproved_time').notNull().default(false),
+  // #6467: actual time worked for a time_entry-sourced line, for the
+  // worked-vs-billed disclosure note only — never for money. NULL for
+  // non-time-entry lines and for legacy rows predating this column.
+  workedMinutes: integer('worked_minutes'),
   sortOrder: integer('sort_order').notNull().default(0),
   createdAt: timestamp('created_at').defaultNow().notNull()
 }, (t) => [

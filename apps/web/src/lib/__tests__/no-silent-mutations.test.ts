@@ -205,6 +205,16 @@ const TARGET_GLOBS = [
   // routes through runAction (or a typed API wrapper), but these files were
   // never guarded, so a future bare mutation would ship with no CI signal.
   'src/components/billing/quotes/QuoteActions.tsx',
+  // Accept on behalf (spec 2026-09-21): the dialog lives in its own file
+  // because QuoteActions.tsx is already 1551 lines. It issues an invoice — a
+  // silent failure here is a tech who believes a deal is closed and is not.
+  'src/components/billing/quotes/AcceptOnBehalfDialog.tsx',
+  // Decline on behalf (#6634): a silent failure leaves the quote open while the
+  // tech believes the customer's "no" is on record.
+  'src/components/billing/quotes/DeclineOnBehalfDialog.tsx',
+  // Evidence attach/replace for an on-behalf acceptance (#6633): its own
+  // upload mutation, guarded from birth alongside its sibling dialog.
+  'src/components/billing/quotes/AcceptanceEvidenceControl.tsx',
   'src/components/billing/quotes/QuoteDocument.tsx',
   // W03 moved these three into the /agreements area; ContractDocumentsSection
   // was deleted (contract detail now embeds SignedAgreementsPage).
@@ -212,6 +222,12 @@ const TARGET_GLOBS = [
   'src/components/agreements/SignedAgreementsPage.tsx',
   'src/components/agreements/TemplatesPage.tsx',
   'src/components/settings/PartnerCompanyTab.tsx',
+  // DR plan create/edit + BMR token create (#6495): the DR plan editor's
+  // multi-request save (plan write + per-group writes/removals) and the BMR
+  // recovery token create both closed silently on success and toasted nothing
+  // on failure beyond an inline banner the operator could miss.
+  'src/components/dr/DRPlanEditor.tsx',
+  'src/components/backup/RecoveryBootstrapTab.tsx',
   // Invoice/quote money-moment hosts (issue / send / delete / title / line
   // mutations): every mutation already routes through runAction, but the files
   // sat outside the guarded set — a future bare mutation on the highest-stakes
@@ -368,6 +384,11 @@ const TARGET_GLOBS = [
   // runAction; a bare fetchWithAuth added for a fourth would silently swallow
   // a restore that never started.
   'src/components/backup/VMRestoreWizard.tsx',
+  // #6263 W01: these three were built but mounted on no page. /security/scans
+  // makes them reachable, so their mutations join the adopted set.
+  'src/components/security/SecurityScanManager.tsx',
+  'src/components/security/ThreatList.tsx',
+  'src/components/security/ThreatDetail.tsx',
 ];
 
 const absoluteFiles: string[] = TARGET_GLOBS.map((rel) => resolve(WEB_ROOT, '..', rel));
@@ -721,7 +742,13 @@ describe('no silent mutations in targeted set', () => {
     // Disk Cleanup v2 W03 adds filesystem/CleanupPanel.tsx: 151 → 152.
     // Disk Cleanup v2 W04 adds filesystem/SystemCleanupPanel.tsx: 152 → 153.
     // Billing profiles W02 adds Rates and the org assignment writer: 153 → 155.
-    expect(absoluteFiles.length).toBe(155);
+    // DR plan / BMR token create (#6495) adds DRPlanEditor.tsx and
+    // RecoveryBootstrapTab.tsx: 155 → 157.
+    // #6263 W01 adds SecurityScanManager.tsx, ThreatList.tsx, ThreatDetail.tsx: 157 → 160.
+    // Accept on behalf adds quotes/AcceptOnBehalfDialog.tsx: 160 → 161.
+    // Decline on behalf (#6634) adds quotes/DeclineOnBehalfDialog.tsx: 161 → 162.
+    // Accept-on-behalf evidence (#6633) adds quotes/AcceptanceEvidenceControl.tsx: 162 → 163.
+    expect(absoluteFiles.length).toBe(163);
     for (const f of absoluteFiles) {
       expect(() => statSync(f)).not.toThrow();
     }

@@ -357,7 +357,7 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceId'],
     definition: {
       name: 'disk_cleanup',
-      description: 'Preview or execute disk cleanup. Preview is read-only. Execute deletes approved safe candidates and reports reclaimed space.',
+      description: 'Preview or execute disk cleanup. Preview is read-only. Execute deletes approved safe candidates and reports reclaimed space. Actions: preview, execute.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -675,7 +675,7 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceId'],
     definition: {
       name: 'system_cleanup',
-      description: 'List, run or check OS-native maintenance cleaners on a device: Windows Disk Cleanup handlers and DISM component cleanup, macOS local snapshots and Homebrew, Linux package caches and journal. These reclaim space the file scanner cannot see. list is read-only and returns the device catalog with per-action "up to" estimates (waits up to 60 s; if it answers status "pending", call list again with the same commandId). run requires approval, starts the selected actions and returns immediately with a cleanupRunId — a run can take up to hours (DISM), so poll status with that cleanupRunId until it reports executed or failed; do not call run again. status is read-only.',
+      description: 'List, run or check OS-native cleaners (Windows Disk Cleanup/DISM, macOS snapshots/Homebrew, Linux cache/journal) beyond scanner reach. list is read-only; re-poll pending with commandId. run needs approval, returns cleanupRunId; poll status until executed/failed, do not re-run. status is read-only.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -789,7 +789,16 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
       if (!started.ok) {
         if (started.error === 'agent_update_required') return JSON.stringify(systemCleanupAgentUpdateRequired());
         if (started.status === 409 && started.error === 'run_in_progress') {
-          return JSON.stringify({ error: 'run_in_progress', cleanupRunId: started.cleanupRunId });
+          // #6485 F-4: a bare `{error, cleanupRunId}` reads like a success
+          // payload (there IS a run id), and the model narrated an R8 lab run
+          // as "approved and is now running". `refused: true` plus a sentence
+          // that says what to do instead removes the ambiguity.
+          return JSON.stringify({
+            error: 'run_in_progress',
+            refused: true,
+            cleanupRunId: started.cleanupRunId,
+            note: 'This run was refused: another system cleanup run is already in progress on this device. Do not start another run. Poll action "status" with the existing cleanupRunId instead.',
+          });
         }
         return JSON.stringify({ error: started.error });
       }

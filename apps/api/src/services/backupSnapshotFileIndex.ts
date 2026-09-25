@@ -85,15 +85,55 @@ const hydrationManifestSchema = z
           .object({
             sourcePath: z.string().min(1),
             originalPath: z.string().min(1).optional(),
-            backupPath: z.string().min(1),
+            // Empty ONLY on a content-less entry — see the refine below.
+            backupPath: z.string(),
+            // agent/internal/backup/snapshot.go SnapshotFile.Kind: "" (or
+            // omitted — the tag is omitempty) for a regular file whose
+            // bytes live at backupPath; "symlink" / "dir" for an entry
+            // that uploads nothing and so carries backupPath "". A plain
+            // string, not an enum: a newer agent adding a kind must not
+            // fail the whole manifest closed here — the refine below only
+            // lets the two known content-less kinds omit their object.
+            kind: z.string().optional(),
             size: z.number().nonnegative().optional(),
             modTime: z.string().optional(),
           })
-          .passthrough(),
+          .passthrough()
+          // D-W09-1 (#6491 KIT lab): a real manifest carries backupPath ""
+          // on every dir/symlink entry (8,220 of 107,636 on a stock Ubuntu
+          // 24.04 host), so a blanket .min(1) rejected every real agent
+          // manifest with manifest_invalid. Tighten by kind instead: a
+          // CONTENT entry (no kind) must still name its object — dropping
+          // the check for files would let a corrupt manifest hydrate a
+          // file with no key and only fail at restore time.
+          .refine((f) => f.backupPath.length > 0 || f.kind === 'symlink' || f.kind === 'dir', {
+            message: 'backupPath must be non-empty on a content entry (kind "" / omitted)',
+            path: ['backupPath'],
+          }),
       )
       .optional(),
   })
   .passthrough();
+
+// A ZodError's message is the JSON dump of EVERY issue, indexed by array
+// position (`files[41233].backupPath`). On a 100k-entry manifest that is a
+// multi-megabyte string a tech cannot map back to a file. Report the first
+// issue with the offending entry's sourcePath plus the total count instead.
+function summarizeManifestIssues(error: z.ZodError, json: unknown): string {
+  const issues = error.issues;
+  const first = issues[0];
+  if (!first) return 'manifest failed schema validation';
+  const where = first.path.map(String).join('.');
+  let entry = '';
+  if (first.path[0] === 'files' && typeof first.path[1] === 'number') {
+    const files = (json as { files?: unknown[] } | null)?.files;
+    const row = Array.isArray(files) ? files[first.path[1]] : undefined;
+    const sourcePath = row && typeof row === 'object' ? (row as { sourcePath?: unknown }).sourcePath : undefined;
+    if (typeof sourcePath === 'string') entry = ` (entry sourcePath ${JSON.stringify(sourcePath)})`;
+  }
+  const more = issues.length > 1 ? `; ${issues.length - 1} more issue(s)` : '';
+  return `${where || 'manifest'}: ${first.message}${entry}${more}`;
+}
 
 function defaultDeps(): HydrationDeps {
   return {
@@ -248,7 +288,11 @@ async function hydrateClaimedSnapshot(
       let parsed: z.infer<typeof hydrationManifestSchema>;
       try {
         const json = JSON.parse(Buffer.from(bytes).toString('utf8'));
-        parsed = hydrationManifestSchema.parse(json);
+        const result = hydrationManifestSchema.safeParse(json);
+        if (!result.success) {
+          return fail(snapshotDbId, 'manifest_invalid', summarizeManifestIssues(result.error, json));
+        }
+        parsed = result.data;
         if (parsed.id !== snapshot.snapshotId) {
           throw new Error(`manifest id ${parsed.id} does not match snapshot ${snapshot.snapshotId}`);
         }
@@ -262,6 +306,8 @@ async function hydrateClaimedSnapshot(
       const fileRows: Array<{ snapshotDbId: string; sourcePath: string; backupPath: string; size: number | null; modifiedAt: Date | null }> = [];
 
       for (const file of files) {
+        // Content-less entries (dir/symlink) upload nothing — the schema
+        // above guarantees an empty backupPath only ever appears on one.
         if (!file.backupPath) continue;
         const parsedKey = parseBackupObjectKey(file.backupPath);
         if (!parsedKey) {

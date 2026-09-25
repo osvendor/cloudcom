@@ -165,6 +165,41 @@ describe('remote-only middleware authorization', () => {
   });
 });
 
+describe('portalAuthMiddleware partner context', () => {
+  it('surfaces the active organization owning partner on portalAuth', async () => {
+    seedSession();
+    activeOrgResult.current = {
+      orgId: ORG_ID,
+      partnerId: 'partner-network-visibility',
+    };
+
+    const app = new Hono();
+
+    app.use('*', portalAuthMiddleware);
+
+    app.get('/protected', (c) => {
+      const auth = c.get('portalAuth');
+
+      return c.json({
+        orgId: auth.user.orgId,
+        partnerId: auth.partnerId,
+      });
+    });
+
+    const res = await app.request('/protected', {
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+      },
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      orgId: ORG_ID,
+      partnerId: 'partner-network-visibility',
+    });
+  });
+});
+
 describe('POST /auth/logout — disabled portal user', () => {
   it('succeeds and clears the session for a disabled portal user (bearer auth)', async () => {
     seedSession();

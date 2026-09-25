@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { and, or, eq, desc, lt, inArray, sql, count } from 'drizzle-orm';
-import { db, getCurrentDbAccessContext, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { and, or, eq, desc, lt, inArray, sql, count, getTableColumns, isNull } from 'drizzle-orm';
+import { assertInTransaction, db, getCurrentDbAccessContext, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { requestLikeFromSnapshot, writeAuditEvent } from './auditEvents';
 import {
   invoices, invoiceLines, invoiceLineDevices, invoicePayments, invoiceStripePayments, organizations, partners,
-  catalogBundleComponents, catalogItems, contracts, contractLines, timeEntries, ticketParts, tickets,
+  catalogBundleComponents, catalogItems, contracts, contractLines, timeEntries, ticketParts, tickets, ticketCategories,
   accountingEntityMappings, accountingConnections, portalBranding
 } from '../db/schema';
 import { getConnection } from './stripeConnectService';
@@ -125,6 +125,39 @@ async function lockDraftInvoice(tx: DbExecutor, invoiceId: string) {
   if (!rows[0]) throw new InvoiceServiceError('Invoice not found', 404, 'INVOICE_NOT_FOUND');
   assertDraft(rows[0]);
   return rows[0];
+}
+
+/**
+ * Invoice-first lock anchor for the interactive contract-line producer.
+ * The caller continues with the contract lock in the same ambient transaction,
+ * matching addContractLine's canonical invoice -> contract order. Exporting the
+ * narrow authorized wrapper keeps lockDraftInvoice itself private.
+ */
+async function lockContractLineDestinationAndSource(
+  tx: DbExecutor,
+  invoiceId: string,
+  contractId: string,
+  actor: InvoiceActor,
+) {
+  const inv = await lockDraftInvoice(tx, invoiceId);
+  requireInvoiceAccess(actor, inv);
+  const [contractRow] = await tx.select({
+    id: contracts.id, orgId: contracts.orgId, currencyCode: contracts.currencyCode,
+  }).from(contracts).where(eq(contracts.id, contractId)).limit(1).for('update');
+  if (!contractRow) throw new InvoiceServiceError('Contract not found', 404, 'INVALID_STATE');
+  if (contractRow.orgId !== inv.orgId) {
+    throw new InvoiceServiceError('Contract line is not available for this invoice', 404, 'INVALID_STATE');
+  }
+  return { invoice: inv, contract: contractRow };
+}
+
+export async function lockContractLineMaterializationSource(
+  invoiceId: string,
+  contractId: string,
+  actor: InvoiceActor,
+) {
+  assertInTransaction('lockContractLineMaterializationSource');
+  return lockContractLineDestinationAndSource(db, invoiceId, contractId, actor);
 }
 
 export async function createManualInvoice(input: { orgId: string; siteId?: string; notes?: string; termsAndConditions?: string; currencyCode?: string }, actor: InvoiceActor) {
@@ -382,8 +415,6 @@ export async function addContractLine(
   actor: InvoiceActor
 ): Promise<{ line: typeof invoiceLines.$inferSelect; pricedFrom: ContractLinePricedFrom }> {
   return db.transaction(async (tx) => {
-    const inv = await lockDraftInvoice(tx, invoiceId); requireInvoiceAccess(actor, inv);
-
     // Wave 6 (#3778): the contract id is not optional at the service layer.
     if (!input.contractId) {
       throw new InvoiceServiceError('contractId is required for a contract-sourced line', 500, 'INVALID_STATE');
@@ -394,13 +425,9 @@ export async function addContractLine(
     // `invoice -> contract` order. Without it, a concurrent ACTIVE-contract
     // restamp could commit between this read and this insert, leaving an
     // old-currency line on a live draft that eligibility never saw.
-    const [contractRow] = await tx.select({
-      id: contracts.id, orgId: contracts.orgId, currencyCode: contracts.currencyCode,
-    }).from(contracts).where(eq(contracts.id, input.contractId)).limit(1).for('update');
-    if (!contractRow) throw new InvoiceServiceError('Contract not found', 404, 'INVALID_STATE');
-    if (contractRow.orgId !== inv.orgId) {
-      throw new InvoiceServiceError('Contract belongs to a different organization', 400, 'INVALID_STATE');
-    }
+    const { invoice: inv, contract: contractRow } = await lockContractLineDestinationAndSource(
+      tx, invoiceId, input.contractId, actor,
+    );
 
     // B2 guard (spec §5): a contract-sourced line may only land on an invoice in
     // the SAME currency as its contract — no conversion, no silent restamp. This
@@ -702,7 +729,21 @@ async function getInvoiceAccountingSync(invoiceId: string, partnerId: string): P
 
 export async function getInvoice(invoiceId: string, actor: InvoiceActor) {
   const inv = await getOwnedInvoiceOr404(invoiceId); requireInvoiceAccess(actor, inv);
-  const lines = await db.select().from(invoiceLines).where(eq(invoiceLines.invoiceId, invoiceId)).orderBy(invoiceLines.sortOrder);
+  const rawLines = await db.select({
+    ...getTableColumns(invoiceLines),
+    ticketNumber: sql<string | null>`COALESCE(${tickets.ticketNumber}, ${tickets.internalNumber})`,
+    ticketSubject: tickets.subject,
+    ticketCategory: sql<string | null>`COALESCE(${ticketCategories.name}, ${tickets.category})`,
+  }).from(invoiceLines)
+    .leftJoin(tickets, and(
+      eq(invoiceLines.ticketId, tickets.id),
+      eq(tickets.orgId, inv.orgId),
+      isNull(tickets.deletedAt),
+    ))
+    .leftJoin(ticketCategories, eq(tickets.categoryId, ticketCategories.id))
+    .where(eq(invoiceLines.invoiceId, invoiceId))
+    .orderBy(invoiceLines.sortOrder);
+
   // #3205 W07 ruling 3: one grouped aggregate per invoice DETAIL view. Keep it
   // out of listInvoices and the customer projection.
   const evidenceCounts = await db
@@ -711,7 +752,7 @@ export async function getInvoice(invoiceId: string, actor: InvoiceActor) {
     .where(eq(invoiceLineDevices.invoiceId, invoiceId))
     .groupBy(invoiceLineDevices.invoiceLineId);
   const deviceCountByLine = new Map(evidenceCounts.map((row) => [row.lineId, Number(row.n)]));
-  const linesWithDeviceCount = lines.map((line) => ({
+  const linesWithDeviceCount = rawLines.map((line) => ({
     ...line,
     deviceCount: deviceCountByLine.get(line.id) ?? 0,
   }));
@@ -799,6 +840,7 @@ export async function getInvoice(invoiceId: string, actor: InvoiceActor) {
 
 export type CustomerInvoiceLine = {
   ticketNumber: string | null;
+  ticketCategory?: string | null;
   /**
    * Line title, mirroring invoice_lines.name (#3319). NULL for legacy lines
    * created before the name/description split, where `description` holds the
@@ -812,6 +854,10 @@ export type CustomerInvoiceLine = {
   unitPrice: string;
   taxable: boolean;
   lineTotal: string;
+  /** #6467: worked minutes for a time_entry line — the portal renders the
+   *  worked-vs-billed note from this, never from `description`. Null for
+   *  non-time-entry lines and legacy rows predating the column. */
+  workedMinutes: number | null;
 };
 
 type InvoiceRow = typeof invoices.$inferSelect;
@@ -837,19 +883,24 @@ export type CustomerInvoiceHeader = Pick<InvoiceRow,
 >;
 
 type CustomerInvoiceLineSource = {
+  ticketId?: string | null;
   ticketNumber?: string | null;
+  ticketSubject?: string | null;
+  ticketCategory?: string | null;
   name?: string | null;
   description?: string | null;
   quantity: string;
   unitPrice: string;
   taxable: boolean;
   lineTotal: string;
+  workedMinutes?: number | null;
 };
 
 /** Explicit serialization boundary: never spread an invoice_lines row here. */
 export function toCustomerInvoiceLine(line: CustomerInvoiceLineSource): CustomerInvoiceLine {
   return {
     ticketNumber: line.ticketNumber ?? null,
+    ticketCategory: line.ticketCategory ?? null,
     // Carry BOTH fields (#3319). This previously collapsed to
     // `description ?? name`, which is the INVERSE of the fallback every other
     // renderer uses, so a line with both set showed the customer only the
@@ -860,6 +911,7 @@ export function toCustomerInvoiceLine(line: CustomerInvoiceLineSource): Customer
     unitPrice: line.unitPrice,
     taxable: line.taxable,
     lineTotal: line.lineTotal,
+    workedMinutes: line.workedMinutes ?? null,
   };
 }
 
@@ -894,17 +946,23 @@ export async function getCustomerInvoice(
   // App-layer org guard (defense-in-depth over RLS). 404, not 403 — don't leak existence to the portal.
   if (orgId !== undefined && inv.orgId !== orgId) throw new InvoiceServiceError('Invoice not found', 404, 'INVOICE_NOT_FOUND');
   const rows = await db.select({
-    ticketNumber: tickets.ticketNumber,
+    ticketId: invoiceLines.ticketId,
+    ticketNumber: sql<string | null>`COALESCE(${tickets.ticketNumber}, ${tickets.internalNumber})`,
+    ticketSubject: tickets.subject,
+    ticketCategory: sql<string | null>`COALESCE(${ticketCategories.name}, ${tickets.category})`,
     name: invoiceLines.name,
     description: invoiceLines.description,
     quantity: invoiceLines.quantity,
     unitPrice: invoiceLines.unitPrice,
     taxable: invoiceLines.taxable,
     lineTotal: invoiceLines.lineTotal,
+    workedMinutes: invoiceLines.workedMinutes,
   }).from(invoiceLines).leftJoin(tickets, and(
     eq(tickets.id, invoiceLines.ticketId),
     eq(tickets.orgId, inv.orgId),
-  )).where(and(
+    isNull(tickets.deletedAt),
+  )).leftJoin(ticketCategories, eq(tickets.categoryId, ticketCategories.id))
+  .where(and(
     eq(invoiceLines.invoiceId, invoiceId),
     eq(invoiceLines.orgId, inv.orgId),
     eq(invoiceLines.customerVisible, true),
@@ -953,6 +1011,7 @@ export async function updatePartnerBillingSettings(
     invoiceTermsDays: number; defaultMarkupPercent?: number | null; autoTaxHardware?: boolean;
     invoiceDeviceAppendix?: boolean;
     autoEmailInvoiceOnQuoteAccept?: boolean;
+    notifyCustomerOnBehalfAcceptance?: boolean;
     catalogAiStyle?: string | null;
     invoiceFooter?: string | null;
     documentTheme?: 'classic' | 'condensed'; documentPageSize?: 'letter' | 'a4';
@@ -979,6 +1038,7 @@ export async function updatePartnerBillingSettings(
   if (patch.autoTaxHardware !== undefined) set.autoTaxHardware = patch.autoTaxHardware;
   if (patch.invoiceDeviceAppendix !== undefined) set.invoiceDeviceAppendix = patch.invoiceDeviceAppendix;
   if (patch.autoEmailInvoiceOnQuoteAccept !== undefined) set.autoEmailInvoiceOnQuoteAccept = patch.autoEmailInvoiceOnQuoteAccept;
+  if (patch.notifyCustomerOnBehalfAcceptance !== undefined) set.notifyCustomerOnBehalfAcceptance = patch.notifyCustomerOnBehalfAcceptance;
   if (patch.catalogAiStyle !== undefined) set.catalogAiStyle = patch.catalogAiStyle?.trim() || null;
   if (patch.invoiceFooter !== undefined) set.invoiceFooter = patch.invoiceFooter;
   if (patch.documentTheme !== undefined) set.documentTheme = patch.documentTheme;
@@ -996,6 +1056,7 @@ export async function updatePartnerBillingSettings(
     defaultMarkupPercent: partners.defaultMarkupPercent, autoTaxHardware: partners.autoTaxHardware,
     invoiceDeviceAppendix: partners.invoiceDeviceAppendix,
     autoEmailInvoiceOnQuoteAccept: partners.autoEmailInvoiceOnQuoteAccept,
+    notifyCustomerOnBehalfAcceptance: partners.notifyCustomerOnBehalfAcceptance,
     catalogAiStyle: partners.catalogAiStyle, invoiceFooter: partners.invoiceFooter,
     documentTheme: partners.documentTheme, documentPageSize: partners.documentPageSize,
   });
@@ -1150,7 +1211,7 @@ async function materializeLines(invoiceId: string, orgId: string, specs: DraftLi
     invoiceId, orgId, sourceType: s.sourceType, sourceId: s.sourceId, catalogItemId: s.catalogItemId,
     parentLineId: null, ticketId: s.ticketId, description: s.description, quantity: s.quantity,
     unitPrice: s.unitPrice, costBasis: s.costBasis, taxable: s.taxable, customerVisible: s.customerVisible,
-    lineTotal: s.lineTotal, isUnapprovedTime: s.isUnapprovedTime, sortOrder: sort++
+    lineTotal: s.lineTotal, isUnapprovedTime: s.isUnapprovedTime, workedMinutes: s.workedMinutes, sortOrder: sort++
   })));
 }
 
@@ -2204,7 +2265,7 @@ export async function voidInvoice(invoiceId: string, reason: string, opts: { rei
       sourceContractId: l.sourceContractId,
       parentLineId, ticketId: l.ticketId, name: l.name, description: l.description, quantity: l.quantity, unitPrice: l.unitPrice,
       costBasis: l.costBasis, revenueAllocation: l.revenueAllocation, taxable: l.taxable, customerVisible: l.customerVisible,
-      lineTotal: l.lineTotal, isUnapprovedTime: l.isUnapprovedTime, sortOrder: l.sortOrder
+      lineTotal: l.lineTotal, isUnapprovedTime: l.isUnapprovedTime, workedMinutes: l.workedMinutes, sortOrder: l.sortOrder
     });
     // Mint every new line id UP FRONT — parents AND children — so the map is
     // complete and order-independent before a single row is written.

@@ -14,9 +14,10 @@ import {
   type InvoiceLine,
   formatMoney,
   lineTitle,
+  lineWorkedVsBilledNote,
   computeInvoiceProfit,
 } from './invoiceTypes';
-import { toCents, fromCents, roundToCurrency } from '@breeze/shared';
+import { toCents, roundToCurrency } from '@breeze/shared';
 import CatalogItemPicker from '../catalog/CatalogItemPicker';
 import PolishButton from '../catalog/PolishButton';
 import { listCatalog, type CatalogItem } from '../../lib/api/catalog';
@@ -124,8 +125,12 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
   // lineTotal over customer-visible lines — bundle children persist
   // lineTotal '0.00', so recomputing qty×price here would double-count them —
   // then tax = taxable basis × the invoice's committed rate, one
-  // round-half-up at the cent boundary. Same inputs, same rounding: the
-  // optimistic figures can never settle different from the next GET.
+  // round-half-up at the cent boundary — and then each of subtotal/tax/total
+  // is rounded at the CURRENCY's minor unit (`roundToCurrency`), the total
+  // built from the already-rounded subtotal + tax. That last step is not
+  // decoration: dropping back to a 2-decimal-only `fromCents` is exactly the
+  // zero-decimal bug of #6441. Same inputs, same rounding: the optimistic
+  // figures can never settle different from the next GET.
   const optimisticTotals = useMemo(() => {
     if (pendingDeletedLineIds.size === 0 && flushedDeletedLineIds.size === 0) return null;
     let subtotalCents = 0;
@@ -137,13 +142,22 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
       if (l.taxable) taxableCents += c;
     }
     const rate = invoice.taxRate ? Number(invoice.taxRate) : 0;
+    // Tax rounds half-up at the classic cent boundary FIRST (rounding the
+    // major-unit float instead loses ties to FP noise), then the CURRENCY
+    // decides each figure's final boundary — and the total is built from the
+    // already-rounded subtotal + tax, exactly as computeInvoiceTotals does.
+    // `fromCents` alone never rounds at the currency's minor unit at all, so on
+    // a zero-decimal currency (JPY) it summed unrounded cents and landed the
+    // total a whole yen away from the next GET (#6441).
     const taxCents = Math.floor(taxableCents * rate + 0.5);
+    const subtotal = roundToCurrency(subtotalCents / 100, currency);
+    const taxTotal = roundToCurrency(taxCents / 100, currency);
     return {
-      subtotal: fromCents(subtotalCents),
-      taxTotal: fromCents(taxCents),
-      total: fromCents(subtotalCents + taxCents),
+      subtotal,
+      taxTotal,
+      total: roundToCurrency(Number(subtotal) + Number(taxTotal), currency),
     };
-  }, [pendingDeletedLineIds, flushedDeletedLineIds, lines, invoice.taxRate]);
+  }, [pendingDeletedLineIds, flushedDeletedLineIds, lines, invoice.taxRate, currency]);
   const railSubtotal = optimisticTotals?.subtotal ?? invoice.subtotal;
   const railTax = optimisticTotals?.taxTotal ?? invoice.taxTotal;
   const railTotal = optimisticTotals?.total ?? invoice.total;
@@ -996,6 +1010,10 @@ function LineRow({
   // Deliberately the PERSISTED name, not the live draft — an accessible name
   // that changes on every keystroke is itself SR churn.
   const rowLabelItem = (line.name ?? '').trim() || (line.description ?? '').trim() || t('invoiceEditor.fields.untitledLine');
+  // #6467: worked-vs-billed disclosure, read-only here — it is structured
+  // data (`workedMinutes`), not part of the description below, so editing
+  // that text can never erase it.
+  const workedVsBilledNote = lineWorkedVsBilledNote(line, t);
   const [name, setName] = useState(line.name ?? '');
   const [desc, setDesc] = useState(line.description ?? '');
   const [qty, setQty] = useState(line.quantity);
@@ -1117,6 +1135,25 @@ function LineRow({
     <>
       <tr className="border-t" data-testid={`invoice-line-${line.id}`}>
         <td className="px-3 py-2">
+          {(line.ticketNumber || line.ticketCategory) && (
+            <div className="mb-1 flex items-center gap-1.5 text-xs">
+              {line.ticketNumber && (
+                <a
+                  href={`/tickets#${line.ticketNumber}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center rounded bg-primary/10 px-1.5 py-0.5 font-medium text-primary hover:bg-primary/20 transition-colors"
+                >
+                  {line.ticketNumber}
+                </a>
+              )}
+              {line.ticketCategory && (
+                <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-muted-foreground font-medium">
+                  {line.ticketCategory}
+                </span>
+              )}
+            </div>
+          )}
           <input
             type="text" value={name} disabled={!canWrite || isPending(nameKey)}
             aria-label={t('invoiceEditor.fields.lineName')} placeholder={t('invoiceEditor.fields.name')}
@@ -1206,6 +1243,11 @@ function LineRow({
             className={`min-h-8 w-full resize-y overflow-hidden rounded-md border bg-background px-2 py-1 text-sm text-muted-foreground transition-colors focus:outline-hidden focus:ring-2 focus:ring-ring disabled:opacity-60 ${fieldRing(descDirty, saved)}`}
           />
           <UnsavedFieldHint id={unsavedHintId('invoice-line', line.id, 'desc')} show={descDirty} />
+          {workedVsBilledNote && (
+            <p className="mt-1 text-xs text-muted-foreground" data-testid={`invoice-line-worked-vs-billed-${line.id}`}>
+              {workedVsBilledNote}
+            </p>
+          )}
         </td>
       </tr>
       {children.map((ch) => (

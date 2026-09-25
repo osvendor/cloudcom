@@ -184,6 +184,7 @@ const portalUser = {
   receiveNotifications: true,
   status: 'active',
   authEpoch: 1,
+  accessMode: 'standard',
 };
 
 describe('portal routes', () => {

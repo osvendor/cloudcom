@@ -131,7 +131,7 @@ export async function resolveEmailRequester(
     // roles: [] — an emailing customer has demonstrated nothing except that
     // they email. 'portal' is claimed by the invite path, which is where
     // someone deliberately grants portal access.
-    const created = await createContact(db, { orgId, email: normalized, name, roles: [] }, { userId: null });
+    const created = await createContact(db, { orgId, email: normalized, name, roles: [] }, { userId: null, destinationSource: 'inbound_email' });
     return { kind: 'contact', contactId: created.id };
   }
   return found;
@@ -174,6 +174,10 @@ export interface PartnerInboundPolicy {
    * sender matching. Default false (preserves the quarantine-for-review behavior).
    */
   dropUnverifiedSenders: boolean;
+  // NB: fullMessageReply is deliberately NOT part of this policy. It is a purely
+  // outbound-notification concern, read from the partner settings by
+  // ticketNotifyWorker on its own send path; the ingest consumer of this policy
+  // (inboundEmailService) never uses it, so surfacing it here would be a dead field.
 }
 
 /**

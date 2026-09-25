@@ -1178,7 +1178,51 @@
       "shareLinkNewLinkOriginalLive": "Copiato un link NUOVO. Questa proposta precede il tracciamento dei link, quindi non è stato possibile riutilizzare quello che il cliente aveva già; continua a funzionare insieme a questo.",
       "shareLinkNewLinkOriginalDead": "Copiato un link NUOVO. Il link precedente non può più essere aperto: chi lo possiede deve usare questo.",
       "currencyMismatch": "Questo preventivo è in {{documentCurrency}}, ma il tuo account Stripe regola in {{accountCurrency}}. Stripe presenterà {{documentCurrency}} al cliente e convertirà al momento del regolamento: lo spread di cambio ed eventuali commissioni di conversione sono a tuo carico.",
-      "currencyUnknown": "La valuta di regolamento del tuo account Stripe non è ancora in cache, quindi non è stato possibile confrontarla con questo preventivo in {{documentCurrency}}. Aggiorna i dettagli dell'account Stripe in Impostazioni → Integrazioni per abilitare il controllo."
+      "currencyUnknown": "La valuta di regolamento del tuo account Stripe non è ancora in cache, quindi non è stato possibile confrontarla con questo preventivo in {{documentCurrency}}. Aggiorna i dettagli dell'account Stripe in Impostazioni → Integrazioni per abilitare il controllo.",
+      "acceptOnBehalf": {
+        "button": "Accetta per conto del cliente",
+        "title": "Registra l'accettazione del cliente",
+        "methodLabel": "Come ha dato il suo assenso?",
+        "method": {
+          "verbal": "A voce / per telefono",
+          "email": "Via e-mail",
+          "signed_document": "Documento firmato",
+          "purchase_order": "Ordine di acquisto",
+          "other": "Altro"
+        },
+        "referenceLabel": "Riferimento",
+        "referenceHelp": "Dove un revisore troverebbe l'assenso del cliente: un numero d'ordine, un'e-mail con data o un ticket.",
+        "signerNameLabel": "Chi ha dato l'assenso",
+        "signerEmailLabel": "La sua e-mail (facoltativa)",
+        "consequenceInvoice": "Verrà emessa e numerata subito una fattura di {{amount}}.",
+        "consequenceContracts": "Le righe ricorrenti diventano contratti in bozza da attivare in seguito.",
+        "consequenceEmail": "La fattura verrà inviata via e-mail al cliente.",
+        "consequenceDraft": "Questo preventivo non è mai stato inviato. La prima cosa che il cliente ne vedrà sarà la fattura.",
+        "submit": "Accetta ed emetti fattura",
+        "success": "Preventivo accettato. Fattura {{number}} emessa.",
+        "error": "Impossibile registrare l'accettazione.",
+        "successDraftInvoice": "Preventivo accettato. Fattura creata in bozza.",
+        "errorContractVariablesUnresolved": "Questo contratto ha ancora bisogno di valori per: {{names}}. Chiudi questa finestra, compilali qui sotto e riprova.",
+        "errorContractVariablesUnresolvedGeneric": "Questo contratto ha variabili non risolte. Chiudi questa finestra, compilale qui sotto e riprova.",
+        "errorDepositInvalid": "L'acconto non può essere riscosso con la configurazione attuale. Chiudi questa finestra, correggi le impostazioni dell'acconto qui sotto e riprova.",
+        "evidenceLabel": "File di prova (facoltativo)",
+        "evidenceHelp": "PDF, PNG o JPEG, fino a 10 MB — ad esempio l'ordine d'acquisto firmato o il documento.",
+        "evidenceTooLarge": "Questo file supera i 10 MB. Scegli un file più piccolo.",
+        "evidenceAttached": "Prova allegata.",
+        "evidenceError": "L'accettazione è stata registrata, ma non è stato possibile allegare il file di prova. Allegalo dalla pagina del preventivo."
+      },
+      "declineOnBehalf": {
+        "button": "Rifiuta per conto del cliente",
+        "title": "Registra il rifiuto del cliente",
+        "methodLabel": "Come ha rifiutato?",
+        "referenceLabel": "Riferimento",
+        "referenceHelp": "Dove un revisore troverebbe il rifiuto del cliente: un'email con la data, una nota di chiamata o un ticket.",
+        "reasonLabel": "Il suo motivo (facoltativo)",
+        "consequence": "Il preventivo verrà contrassegnato come rifiutato e non potrà più essere accettato. Revisionalo per inviare al cliente una nuova versione.",
+        "submit": "Segna come rifiutato",
+        "success": "Preventivo segnato come rifiutato.",
+        "error": "Impossibile registrare il rifiuto."
+      }
     },
     "detail": {
       "addContentInEditor": "Aggiungi contenuto nell'Editor",
@@ -1303,6 +1347,18 @@
         "inProgressTitle": "È in preparazione una revisione di questo preventivo: inviarla sostituirà questo preventivo e disattiverà il link del cliente:",
         "revisionOfTitle": "Revisione di",
         "untitled": "una versione più recente"
+      },
+      "acceptedOnBehalf": "Accettato per conto di {{signer}} da {{recorder}} il {{date}} · {{method}} · {{reference}}",
+      "deletedUser": "un utente eliminato",
+      "evidence": {
+        "download": "Scarica la prova",
+        "downloadTitle": "Scarica {{filename}}",
+        "attach": "Allega prova",
+        "replace": "Sostituisci prova",
+        "attached": "Prova allegata.",
+        "attachError": "Impossibile allegare il file di prova.",
+        "downloadError": "Impossibile scaricare il file di prova.",
+        "tooLarge": "Questo file supera i 10 MB. Scegli un file più piccolo."
       }
     },
     "currency": {
@@ -1952,6 +2008,8 @@
       "unitPrice": "Prezzo unitario"
     },
     "terms": "Termini e condizioni",
+    "ticketHeader": "Ticket n. {{number}}",
+    "ticketWork": "Lavoro relativo al ticket",
     "totals": {
       "amountDue": "Importo dovuto",
       "paid": "Pagato",
@@ -2140,7 +2198,6 @@
     "saveSuccess": "Impostazioni di fatturazione dell'organizzazione salvate",
     "tax": {
       "partnerDefault": "Predefinito partner",
-      "partnerDefaultWithValue": "{{pct}}% (predefinito partner)",
       "taxExempt": "Esente da imposta",
       "taxId": "ID fiscale",
       "taxRate": "Aliquota fiscale (%)",
@@ -2171,6 +2228,8 @@
       "autoTaxHardwareHelp": "I nuovi hardware importati sono imponibili per impostazione predefinita.",
       "autoEmailInvoice": "Invia automaticamente la fattura via email all'accettazione di un preventivo",
       "autoEmailInvoiceHelp": "Quando un cliente accetta una proposta, la fattura emessa viene inviata subito via email con un link sicuro per visualizzare e pagare — senza accesso.",
+      "notifyOnBehalfAcceptance": "Avvisa il cliente via email quando registri un'accettazione per suo conto",
+      "notifyOnBehalfAcceptanceHelp": "Quando qualcuno del tuo team accetta un preventivo per un cliente, il cliente riceve una breve nota che indica chi l'ha registrata e quando, con il numero di fattura se ne è stata emessa una. Può rispondere se qualcosa non è corretto. Disattivato per impostazione predefinita.",
       "currencyCode": "Codice valuta",
       "defaultMarkup": "Ricarico predefinito (%)",
       "defaultTaxRate": "Aliquota fiscale predefinita (%)",

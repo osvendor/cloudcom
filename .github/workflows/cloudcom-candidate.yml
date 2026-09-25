@@ -49,6 +49,9 @@ jobs:
             echo "::error::$SOURCE_COMMIT is not an ancestor of origin/$default_branch"
             exit 1
           }
+          # A routine CloudCom feature release reuses the intake runtime and
+          # ships verified application artifacts; it must not mint images.
+          node scripts/release/require-upstream-intake.mjs "$SOURCE_COMMIT"
           run_id="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/workflows/cloudcom-ci.yml/runs?event=push&status=completed&branch=$default_branch&head_sha=$SOURCE_COMMIT&per_page=100" --jq '.workflow_runs[] | select(.conclusion == "success") | .id' | head -n 1)"
           test -n "$run_id" || {
             echo "::error::No successful push-triggered CloudCom CI run exists for $SOURCE_COMMIT on $default_branch."

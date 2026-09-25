@@ -51,6 +51,36 @@ describe('DRPlanEditor step type', () => {
     expect(fetchMock.mock.calls.some(([url, init]) => String(url) === '/dr/plans' && (init as RequestInit | undefined)?.method === 'POST')).toBe(false);
   });
 
+  it('scrolls to the error banner on every repeat submit, even when the same validation error recurs', async () => {
+    fetchMock.mockResolvedValue(makeJsonResponse(deviceOptionsPayload));
+    // jsdom has no scrollIntoView implementation; stub it inline, and undo the
+    // stub afterward — a global HTMLElement.prototype mutation left in place
+    // leaks into every later test in this file (order-dependent pollution).
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+    try {
+      render(<DRPlanEditor open planId={null} onClose={vi.fn()} onSaved={vi.fn()} />);
+      const save = screen.getByText('Save plan').closest('button')!;
+      await waitFor(() => expect(save).not.toBeDisabled());
+
+      // First submit with an empty plan name: handleSave sets the error from
+      // undefined -> 'Plan name is required.', a genuine transition, so this
+      // scroll has always worked.
+      fireEvent.click(save);
+      expect(await screen.findByText('Plan name is required.')).toBeInTheDocument();
+      await waitFor(() => expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalledTimes(1));
+
+      // Second submit still has an empty name: handleSave calls setError(undefined)
+      // then setError('Plan name is required.') in the same handler — React
+      // batches those into one commit, so useScrollToError never observes the
+      // transition through `undefined` and must not skip the re-scroll.
+      fireEvent.click(save);
+      await waitFor(() => expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalledTimes(2));
+    } finally {
+      // @ts-expect-error restoring jsdom's actual lack of scrollIntoView
+      delete HTMLElement.prototype.scrollIntoView;
+    }
+  });
+
   it('serialises BARE_METAL_REBUILD options into restoreConfig on save', async () => {
     const onSaved = vi.fn();
     fetchMock.mockImplementation(async (input, init) => {
@@ -222,6 +252,34 @@ describe('DRPlanEditor save atomicity (#6382)', () => {
           String(url) === '/dr/plans/plan-1' && (init as RequestInit | undefined)?.method === 'PATCH'
       )
     ).toBe(false);
+  });
+
+  it('scrolls the error banner into view and focuses it on validation failure (#6494)', async () => {
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (url.startsWith('/devices/options')) return makeJsonResponse(deviceOptionsPayload);
+      if (url === '/dr/plans/plan-1' && method === 'GET') return makeJsonResponse(editablePlanPayload);
+      return makeJsonResponse({}, false, 404);
+    });
+
+    // jsdom has no scrollIntoView implementation; stub it inline (not
+    // through a separately-typed variable, which loses the prototype's own
+    // call signature and fails astro check's ts(2322)).
+    HTMLElement.prototype.scrollIntoView = vi.fn();
+
+    const { save } = await renderEditor();
+    fireEvent.change(screen.getByLabelText('Plan name'), { target: { value: 'Renamed plan' } });
+    fireEvent.change(screen.getByTestId('dr-group-rebuild-output-dir'), {
+      target: { value: 'relative/out' },
+    });
+    fireEvent.click(save);
+
+    const banner = await screen.findByText(/output directory must be an absolute path/i);
+    await waitFor(() =>
+      expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' })
+    );
+    await waitFor(() => expect(banner).toHaveFocus());
   });
 
   it('refuses an over-long rebuild output dir before issuing any write', async () => {

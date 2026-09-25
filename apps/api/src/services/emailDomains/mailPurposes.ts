@@ -34,7 +34,8 @@ export type MailPurposePolicy =
        * ALWAYS. It preserves what each send site does TODAY:
        *   'default'              → the bare EMAIL_FROM.
        *   'partner_display_name' → `"<Partner> via Breeze" <EMAIL_FROM address>`.
-       * Only quote.sent and invoice.sent, the two sites that do this now.
+       * Only quote.sent and invoice.sent, plus quote.acceptance_recorded
+       * (#6635) — the customer notice that rides alongside the same quote.
        */
       fallbackFrom: 'default' | 'partner_display_name';
     };
@@ -49,6 +50,9 @@ export const MAIL_PURPOSES = {
   'auth.staff_invite': { lane: 'platform' },
   'auth.account_locked': { lane: 'platform' },
   'security.mfa_enrollment': { lane: 'platform' },
+  // Caller verification (#6354): a caller answered "This is not me" —
+  // security reviewers of the org are told to review the incident.
+  'security.caller_rejection': { lane: 'platform' },
   'account.deletion_requested': { lane: 'platform' },
   'account.deletion_declined': { lane: 'platform' },
   'account.purge_warning': { lane: 'platform' },
@@ -74,6 +78,10 @@ export const MAIL_PURPOSES = {
   'portal.invite': { lane: 'partner', stream: 'support', fallbackFrom: 'default' },
   'portal.password_reset': { lane: 'partner', stream: 'support', fallbackFrom: 'default' },
   'quote.sent': { lane: 'partner', stream: 'billing', fallbackFrom: 'partner_display_name' },
+  // #6635: "your provider recorded your acceptance" — sent to the customer
+  // when a tech accepts on their behalf. Same envelope as the quote itself;
+  // its own purpose so delivery history never reports it as a quote send.
+  'quote.acceptance_recorded': { lane: 'partner', stream: 'billing', fallbackFrom: 'partner_display_name' },
   'invoice.sent': { lane: 'partner', stream: 'billing', fallbackFrom: 'partner_display_name' },
   'report.delivery': { lane: 'partner', stream: 'general', fallbackFrom: 'default' },
 } as const satisfies Record<string, MailPurposePolicy>;

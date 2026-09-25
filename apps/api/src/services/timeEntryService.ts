@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, or, sql, type AnyColumn, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, or, sql, type SQL } from 'drizzle-orm';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { timeEntries, ticketParts, tickets, ticketCategories, organizations, partners, users, ticketComments } from '../db/schema';
 import { workTypes } from '../db/schema/workTypes';
@@ -6,9 +6,13 @@ import { emitTimeEntryEvent } from './timeEntryEvents';
 import { loadCardsForOrg } from './billingProfileService';
 import { resolveBillingRule, type BillingRule } from './billingRuleResolver';
 import { getActiveWorkType } from './workTypeService';
-import { computeBillableMinutes, billableMinutesSql } from './billableMinutes';
+import { computeBillableMinutes, billableMinutesSql, BILLABLE_MINUTES_CHECK_NAME } from './billableMinutes';
+import { pgErrorCode, pgErrorConstraint } from '../utils/pgErrors';
+import { captureException } from './sentry';
 import { readOrgStampingDefaults } from './orgCurrencyCore';
-import { CURRENCY_CODES, isZeroDecimal, isRepresentableInCurrency, minorUnitExponent, roundToCurrency, multiplyToCurrency, toMinorUnits, fromMinorUnits } from '@breeze/shared';
+import { minorUnitScaleSql } from './currencySql';
+import { isMissingRateGap } from './invoiceAssembly';
+import { isRepresentableInCurrency, minorUnitExponent, roundToCurrency, multiplyToCurrency, toMinorUnits, fromMinorUnits } from '@breeze/shared';
 import type { CreateTimeEntryInput, UpdateTimeEntryInput, TicketPartInput, BillingStatus, TimeEntrySource } from '@breeze/shared';
 
 export type TimeEntryServiceErrorCode =
@@ -51,7 +55,22 @@ export type TimeEntryServiceErrorCode =
   /** 400 — a caller-supplied work_type_id that is not an ACTIVE row of the acting partner. */
   | 'WORK_TYPE_NOT_FOUND'
   | 'RATE_REQUIRES_BILLABLE'
-  | 'MANAGE_BILLING_REQUIRED';
+  | 'MANAGE_BILLING_REQUIRED'
+  /** 409 — UPDATE ... RETURNING matched zero rows (entry re-pointed/deleted between the read and the write). */
+  | 'ENTRY_UPDATE_LOST'
+  /** 409 — UPDATE ... RETURNING matched zero rows (part re-pointed/deleted between the read and the write). */
+  | 'PART_UPDATE_LOST'
+  /** 409 — DELETE ... RETURNING matched zero rows (part re-pointed between the lock-read and the delete). */
+  | 'PART_DELETE_LOST'
+  /**
+   * 422 — `time_entries_billable_minutes_chk` rejected the write (#6463): the
+   * TypeScript `computeBillableMinutes()` and the SQL `billableMinutesSql()`
+   * disagree about this row's billed quantity. A server-side defect, not the
+   * caller's payload — but it is deterministic for the offending row, so it is
+   * reported as a verdict rather than a retryable fault (see
+   * {@link refuseBillableMinutesDrift}).
+   */
+  | 'BILLABLE_MINUTES_DRIFT';
 
 export class TimeEntryServiceError extends Error {
   constructor(
@@ -61,6 +80,107 @@ export class TimeEntryServiceError extends Error {
   ) {
     super(message);
     this.name = 'TimeEntryServiceError';
+  }
+}
+
+/**
+ * #6463 — the missing half of the #4628 W03 contract.
+ *
+ * W03's premise is that a disagreement between `computeBillableMinutes()` (TS)
+ * and `billableMinutesSql()` (SQL) becomes a `23514` on
+ * `time_entries_billable_minutes_chk` rather than a wrong invoice. That was
+ * honoured at the database and nowhere above it: `handleServiceError` rethrows
+ * anything that is not a `TimeEntryServiceError`, so the violation escaped as a
+ * bare postgres error — no report, no code, and nothing telling the technician
+ * their stop did not land while the timer kept running.
+ *
+ * Wraps a statement that writes `billable_minutes` and converts ONLY that
+ * constraint's 23514 into a typed refusal. Every other error (including a
+ * 23514 from a different CHECK on the same table) propagates untouched.
+ *
+ * Reporting is `captureException`, NOT console alone. `handleServiceError`
+ * answers a `TimeEntryServiceError` with `c.json(...)` instead of rethrowing,
+ * so this error never reaches Hono's `app.onError` — and `Sentry.init` here
+ * installs no `captureConsoleIntegration`, so a `console.error` would page
+ * nobody. Reporting from inside the catch is the only thing that makes a real
+ * drift visible without waiting for a technician to phone it in. The original
+ * error travels with it: postgres's own message/detail for a CHECK on a
+ * computed expression is the single most useful diagnostic here.
+ *
+ * Status is 422, deliberately, and not the 500 this class of defect would
+ * usually earn. The drift is deterministic for the offending row, and
+ * `apps/mobile/src/services/timeEntryQueue.ts` parks only
+ * `PERMANENT_STATUSES = {400, 404, 409, 422}` in needs-attention — a 5xx is
+ * read as transient and retried forever, wedging every write queued behind it
+ * and losing far more billable work than the one row.
+ *
+ * The CHECK is IMMEDIATE (see the 2026-10-24-210000 migration), so the error is
+ * raised by the offending statement itself rather than substituted at COMMIT.
+ */
+type BillableMinutesDriftContext = {
+  op: 'createTimeEntry' | 'stopRunningEntry' | 'updateTimeEntry';
+  entryId: string | null;
+  /** Tenant + actor identity: the first triage question on a multi-tenant drift. */
+  userId: string;
+  partnerId: string | null;
+  orgId: string | null;
+  /**
+   * `'computed-in-sql'` on the plain-stop path, where the minute count lives
+   * only inside the UPDATE's own expression (see `durationExpr`). `at` is
+   * logged alongside so that row is still findable without an id.
+   */
+  durationMinutes: number | 'computed-in-sql' | null;
+  minimumMinutes: number | null;
+  roundingIncrementMinutes: number | null;
+  at?: string;
+};
+
+/** Per-op wording: only `createTimeEntry`/`stopRunningEntry` lose the whole entry. */
+const BILLABLE_MINUTES_DRIFT_MESSAGE: Record<BillableMinutesDriftContext['op'], string> = {
+  createTimeEntry:
+    'This time entry could not be recorded — the billed-minutes calculation disagrees with the database. '
+    + 'Your work was not saved; report this to support.',
+  stopRunningEntry:
+    'Your timer could not be stopped — the billed-minutes calculation disagrees with the database. '
+    + 'The timer is still running; report this to support.',
+  updateTimeEntry:
+    'This change could not be saved — the billed-minutes calculation disagrees with the database. '
+    + 'The entry itself is unchanged; report this to support.',
+};
+
+async function refuseBillableMinutesDrift<T>(
+  context: BillableMinutesDriftContext,
+  write: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await write();
+  } catch (err) {
+    if (pgErrorCode(err) !== '23514' || pgErrorConstraint(err) !== BILLABLE_MINUTES_CHECK_NAME) throw err;
+    const detail = {
+      constraint: BILLABLE_MINUTES_CHECK_NAME,
+      op: context.op,
+      entryId: context.entryId,
+      userId: context.userId,
+      partnerId: context.partnerId,
+      orgId: context.orgId,
+      durationMinutes: context.durationMinutes,
+      minimumMinutes: context.minimumMinutes,
+      roundingIncrementMinutes: context.roundingIncrementMinutes,
+      ...(context.at === undefined ? {} : { at: context.at }),
+    };
+    console.error('[timeEntryService] BILLABLE_MINUTES_DRIFT', detail, err);
+    captureException(err, undefined, {
+      service: 'timeEntryService',
+      code: 'BILLABLE_MINUTES_DRIFT',
+      ...Object.fromEntries(
+        Object.entries(detail).map(([key, value]) => [key, value === null ? 'null' : String(value)]),
+      ),
+    });
+    throw new TimeEntryServiceError(
+      BILLABLE_MINUTES_DRIFT_MESSAGE[context.op],
+      422,
+      'BILLABLE_MINUTES_DRIFT',
+    );
   }
 }
 
@@ -424,20 +544,6 @@ async function resolveAndLockTicketLink(ticketId: string, actor: TimeEntryActor,
   return link;
 }
 
-/** Supported zero-decimal codes (JPY, KRW, …) — every other supported currency has 2 minor-unit digits (spec §12). */
-const ZERO_DECIMAL_CODES: string[] = CURRENCY_CODES.filter((code) => isZeroDecimal(code));
-
-/**
- * SQL scale for a per-row ROUND at the row's own currency minor unit — the
- * SQL twin of `roundToCurrency` (PG `ROUND(numeric, int)` is half away from
- * zero, which is half-up for the non-negative amounts these rows carry).
- */
-function minorUnitScaleSql(currencyColumn: AnyColumn): SQL<number> {
-  return ZERO_DECIMAL_CODES.length > 0
-    ? sql<number>`CASE WHEN ${currencyColumn} IN (${sql.join(ZERO_DECIMAL_CODES.map((code) => sql`${code}`), sql`, `)}) THEN 0 ELSE 2 END`
-    : sql<number>`2`;
-}
-
 /** Standalone entries: money still needs a currency (CHECK time_entries_currency_required_when_rate_chk). */
 async function getPartnerCurrency(partnerId: string): Promise<string> {
   const rows = await runOutsideDbContext(() =>
@@ -579,7 +685,16 @@ export async function createTimeEntry(
   const stamp = applyBillingInput(billing, input, actor);
   assertRepresentable(stamp.hourlyRate, currencyCode);
 
-  const rows = await db
+  const rows = await refuseBillableMinutesDrift({
+    op: 'createTimeEntry',
+    entryId: null,
+    userId: actor.userId,
+    partnerId,
+    orgId,
+    durationMinutes: computeDurationMinutes(input.startedAt, input.endedAt),
+    minimumMinutes: stamp.minimumMinutes ?? null,
+    roundingIncrementMinutes: stamp.roundingIncrementMinutes ?? null,
+  }, () => db
     .insert(timeEntries)
     .values({
       partnerId,
@@ -604,7 +719,7 @@ export async function createTimeEntry(
       // W06 (#3900): server-stamped provenance; no public schema accepts it.
       source: provenance.source
     })
-    .returning();
+    .returning());
   const entry = rows[0]!;
   recordAuditMutation(actor, 'time_entry.created', entry);
 
@@ -676,7 +791,22 @@ async function stopRunningEntry(
   // rewrites the terms must hand billableMinutesSql the NEW ones — SET reads
   // the old row, the CHECK validates the new one.
   const durationExpr = sql`FLOOR(EXTRACT(EPOCH FROM (${now.toISOString()}::timestamp - ${timeEntries.startedAt})) / 60)::int`;
-  const rows = await db
+  const rows = await refuseBillableMinutesDrift({
+    op: 'stopRunningEntry',
+    // Undefined on the plain-stop path: the CAS is pinned to the actor, not to
+    // a pre-read row. `at` is the statement's own `now`, so the row this
+    // refused is still findable from the log.
+    entryId: entryId ?? null,
+    userId: actor.userId,
+    partnerId: actor.partnerId,
+    orgId: null,
+    // Computed by the statement itself (see durationExpr above), so the service
+    // never holds the value the CHECK disagreed about.
+    durationMinutes: 'computed-in-sql',
+    minimumMinutes: billingOverride?.minimumMinutes ?? null,
+    roundingIncrementMinutes: billingOverride?.roundingIncrementMinutes ?? null,
+    at: now.toISOString(),
+  }, () => db
     .update(timeEntries)
     .set({
       endedAt: now,
@@ -694,7 +824,7 @@ async function stopRunningEntry(
     })
     .where(and(eq(timeEntries.userId, actor.userId), isNull(timeEntries.endedAt),
       entryId ? eq(timeEntries.id, entryId) : undefined))
-    .returning();
+    .returning());
   return rows[0] ?? null;
 }
 
@@ -958,16 +1088,21 @@ export async function updateTimeEntry(id: string, input: UpdateTimeEntryInput, a
   // just stopRunningEntry — is a real stop path. Placed after the re-price and
   // override blocks so a re-price and a duration change in one PATCH both feed
   // the same recompute.
+  // #6465: gate on a VALUE change, not key presence. applyBillingInput returns a
+  // full stamp, so `editable` re-writes minimumMinutes on every billing-ish PATCH
+  // — including a rate-only edit. Keying off presence restamped billable_minutes
+  // on legacy rows whose quantity was deliberately NULL, silently moving the
+  // invoice quantity when the technician only corrected a rate.
+  const nextMinimum = set.minimumMinutes !== undefined
+    ? (set.minimumMinutes as number | null) : entry.minimumMinutes;
+  const nextIncrement = set.roundingIncrementMinutes !== undefined
+    ? (set.roundingIncrementMinutes as number | null) : entry.roundingIncrementMinutes;
   if (
     set.durationMinutes !== undefined ||
-    set.minimumMinutes !== undefined ||
-    set.roundingIncrementMinutes !== undefined
+    nextMinimum !== entry.minimumMinutes ||
+    nextIncrement !== entry.roundingIncrementMinutes
   ) {
     const nextDuration = (set.durationMinutes as number | undefined) ?? entry.durationMinutes;
-    const nextMinimum = set.minimumMinutes !== undefined
-      ? (set.minimumMinutes as number | null) : entry.minimumMinutes;
-    const nextIncrement = set.roundingIncrementMinutes !== undefined
-      ? (set.roundingIncrementMinutes as number | null) : entry.roundingIncrementMinutes;
     set.billableMinutes = computeBillableMinutes({
       durationMinutes: nextDuration ?? null,
       minimumMinutes: nextMinimum ?? null,
@@ -991,22 +1126,41 @@ export async function updateTimeEntry(id: string, input: UpdateTimeEntryInput, a
   set.approvedBy = null;
   set.approvedAt = null;
 
-  const rows = await db.update(timeEntries).set(set).where(eq(timeEntries.id, id)).returning();
+  const rows = await refuseBillableMinutesDrift({
+    op: 'updateTimeEntry',
+    entryId: id,
+    userId: actor.userId,
+    partnerId: entry.partnerId,
+    orgId: entry.orgId,
+    durationMinutes: (set.durationMinutes as number | undefined) ?? entry.durationMinutes ?? null,
+    minimumMinutes: (set.minimumMinutes as number | null | undefined) ?? entry.minimumMinutes ?? null,
+    roundingIncrementMinutes:
+      (set.roundingIncrementMinutes as number | null | undefined) ?? entry.roundingIncrementMinutes ?? null,
+  }, () => db.update(timeEntries).set(set).where(eq(timeEntries.id, id)).returning());
   const mutated = rows[0];
-  const updated = mutated ?? entry;
-
-  if (mutated) {
-    recordAuditMutation(actor, 'time_entry.updated', mutated);
+  if (!mutated) {
+    // The row existed at the top of this call (getEntryOr404) but the UPDATE
+    // matched zero rows — it was re-pointed or deleted in between (org move,
+    // RLS context change, concurrent delete). Returning the stale pre-update
+    // row here would tell the caller (including mobile's stop-timer replay,
+    // see the recompute comment above) that the write succeeded when it did not.
+    throw new TimeEntryServiceError(
+      'Entry could not be updated — reload and retry',
+      409,
+      'ENTRY_UPDATE_LOST'
+    );
   }
+
+  recordAuditMutation(actor, 'time_entry.updated', mutated);
   await emitTimeEntryEvent({
     type: 'time_entry.updated',
     timeEntryId: id,
     partnerId: entry.partnerId,
-    ticketId: (updated as typeof entry).ticketId ?? entry.ticketId,
+    ticketId: mutated.ticketId ?? entry.ticketId,
     actorUserId: actor.userId,
     payload: { changed }
   });
-  return updated;
+  return mutated;
 }
 
 export async function deleteTimeEntry(id: string, actor: TimeEntryActor) {
@@ -1194,7 +1348,21 @@ export async function updateTicketPart(id: string, input: Partial<TicketPartInpu
   if (input.billingStatus !== undefined) set.billingStatus = input.billingStatus;
   if (input.notes !== undefined) set.notes = input.notes;
   const rows = await db.update(ticketParts).set(set).where(eq(ticketParts.id, id)).returning();
-  return rows[0] ?? part;
+  const mutated = rows[0];
+  if (!mutated) {
+    // The part existed at the top of this call (getPartOr404) but the UPDATE
+    // matched zero rows — it was re-pointed or deleted in between (org move,
+    // RLS context change, concurrent delete). Returning the stale pre-update
+    // part here would tell the caller the write succeeded when it did not,
+    // and unlike updateTimeEntry there's no audit/event call to skip either —
+    // the write loss would otherwise be purely silent.
+    throw new TimeEntryServiceError(
+      'Part could not be updated — reload and retry',
+      409,
+      'PART_UPDATE_LOST'
+    );
+  }
+  return mutated;
 }
 
 export async function deleteTicketPart(id: string, _actor: TimeEntryActor) {
@@ -1206,7 +1374,20 @@ export async function deleteTicketPart(id: string, _actor: TimeEntryActor) {
       'PART_BILLED',
     );
   }
-  await db.delete(ticketParts).where(eq(ticketParts.id, id));
+  const deleted = await db.delete(ticketParts).where(eq(ticketParts.id, id)).returning({ id: ticketParts.id });
+  if (deleted.length === 0) {
+    // The part existed at the top of this call (getPartOr404's FOR UPDATE
+    // re-read) but the DELETE matched zero rows — it was re-pointed out of
+    // this caller's visibility in between (org move, RLS context change).
+    // Reporting `{ deleted: true }` here would tell the caller the row is
+    // gone when it is not. Same race class as updateTicketPart (#6568/#6588),
+    // with its own code so callers can tell the two write paths apart.
+    throw new TimeEntryServiceError(
+      'Part could not be deleted — reload and retry',
+      409,
+      'PART_DELETE_LOST',
+    );
+  }
 }
 
 // ── Queries ──────────────────────────────────────────────────────────────
@@ -1497,7 +1678,20 @@ interface BillableRowBase {
   technician: string | null;
   quantity: string;       // hours for time rows, qty for parts
   rate: string | null;    // hourly rate / unit price
-  amount: string;
+  /** Null when `missingRate` is true — an unresolved rate is reported as an
+   *  explicit gap, never a fabricated '0.00' line (#6461). */
+  amount: string | null;
+  /** True for a TIME row with no resolvable hourly rate, for ANY billing
+   *  status except `contract`/`no_charge` (those are an intentional zero,
+   *  never a gap) — see invoiceAssembly.isMissingRateGap, the same predicate
+   *  invoiceAssembly.partitionTimeEntries uses to route the identical
+   *  `not_billed` row to its `missingRate` bucket instead of a line. Unlike
+   *  partitionTimeEntries (which only ever sees `not_billed` rows), this
+   *  export sees every billing_status, so a `billed` row can be a gap too:
+   *  no resolvable rate means no amount to report or sum, regardless of
+   *  whether it was previously marked billed. Ticket parts have no gap
+   *  concept (`ticket_parts.unit_price` is NOT NULL) and are always false. */
+  missingRate: boolean;
   currencyCode: string | null;
   billingStatus: BillingStatus;
 }
@@ -1598,6 +1792,12 @@ export async function listBillables(
     // with no card terms — bill the actual duration.
     const hours = (((r.billableMinutes ?? r.minutes) ?? 0) / 60).toFixed(2);
     const rate = toFinite(r.rate);
+    // A row with no resolvable rate is a genuine assembly gap (#6461),
+    // regardless of billing_status, EXCEPT `contract`/`no_charge` where a
+    // null rate is an intentional zero — includes `billed` rows: a
+    // previously-billed entry that has since lost its rate (or never had a
+    // resolvable one) still has no amount to report or sum.
+    const missingRate = isMissingRateGap(rate, r.billingStatus);
     rows.push({
       kind: 'time',
       date: r.date,
@@ -1610,10 +1810,14 @@ export async function listBillables(
       // Labor rule (one rule everywhere): hours to 2 dp first, then ONE exact
       // half-up round of the product at the snapshot currency's minor unit
       // (review #2 — never through a double). Standalone entries with no
-      // currency fall back to the 2-decimal exponent.
-      amount: rate != null
-        ? multiplyToCurrency(hours, rate, r.currencyCode ?? 'USD')
-        : '0.00',
+      // currency fall back to the 2-decimal exponent. Never a fabricated
+      // '0.00' for a missingRate gap — null instead (#6461).
+      amount: missingRate
+        ? null
+        : rate != null
+          ? multiplyToCurrency(hours, rate, r.currencyCode ?? 'USD')
+          : '0.00',
+      missingRate,
       currencyCode: r.currencyCode,
       billingStatus: r.billingStatus,
       isApproved: r.isApproved
@@ -1631,9 +1835,13 @@ export async function listBillables(
       technician: r.technician,
       quantity: r.quantity,
       rate: r.unitPrice,
+      // ticket_parts.unit_price/quantity are NOT NULL — this branch is only
+      // the corrupt-numeric-string defensive fallback (toFinite already
+      // logged it), never a real gap, so parts have no missingRate concept.
       amount: quantity != null && unitPrice != null
         ? multiplyToCurrency(quantity, unitPrice, r.currencyCode ?? 'USD')
         : '0.00',
+      missingRate: false,
       currencyCode: r.currencyCode,
       billingStatus: r.billingStatus,
       isApproved: null
@@ -1641,9 +1849,11 @@ export async function listBillables(
   }
   rows.sort((a, b) => a.date.getTime() - b.date.getTime());
   // Sum as integer minor units — never float-add 2-dp strings and re-round.
+  // A missingRate gap contributes no money at all, not even a zero entry
+  // under its currency (#6461) — it has no amount to sum.
   const totals = new Map<string, number>();
   for (const r of rows) {
-    if (r.currencyCode == null) continue;
+    if (r.currencyCode == null || r.missingRate || r.amount == null) continue;
     totals.set(r.currencyCode, (totals.get(r.currencyCode) ?? 0) + toMinorUnits(r.amount, r.currencyCode));
   }
   const totalsByCurrency: CurrencyAmount[] = [...totals].map(([currencyCode, minor]) => ({

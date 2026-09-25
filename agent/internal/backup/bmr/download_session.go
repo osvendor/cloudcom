@@ -119,9 +119,21 @@ func (p *recoveryDownloadProvider) authenticateAndSwap() error {
 		return errRefreshMissingDescriptor
 	}
 	descriptor := rewriteDescriptorOrigin(p.serverURL, bootstrap.Download)
+
+	// --- inserted (Task 9): compute the fresh capability and refuse the
+	// swap outright if it drops a capability the provider already relies
+	// on — keep the previous descriptor and generation, never shrink or
+	// drop the admissible set.
+	newMembership := descriptor != nil && HasCapability(descriptor.Capabilities, CapabilitySnapshotFileMembershipV1)
+
 	p.mu.Lock()
+	if p.membership && !newMembership {
+		p.mu.Unlock()
+		return ErrCapabilityDowngrade
+	}
 	p.descriptor = descriptor
 	p.generation++
+	p.membership = newMembership // inserted (Task 9), alongside the existing generation bump
 	p.mu.Unlock()
 	p.lastAuthAt = p.now()
 	p.authNotBefore = time.Time{}
@@ -197,6 +209,57 @@ func (p *recoveryDownloadProvider) refreshAfterUnauthorized(observed uint64) err
 		}
 		if ctxErr := p.ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("bmr: re-authenticate cancelled: %w", ctxErr)
+		}
+
+		// A capability downgrade — whether detected locally by
+		// authenticateAndSwap (the fresh descriptor silently dropped the
+		// capability, ErrCapabilityDowngrade) or reported by the server as
+		// a terminal 409 capability_downgrade — can never be fixed by
+		// retrying: keep the previous (still-capable) descriptor in place
+		// and refuse immediately (review finding #3).
+		if errors.Is(err, ErrCapabilityDowngrade) {
+			return p.markSessionLost(err)
+		}
+
+		// Any other negotiation 409 from /bmr/recover/authenticate
+		// (client_capability_required, storage_identity_drift,
+		// snapshot_storage_identity_unknown, snapshot_index_failed) is
+		// also terminal EXCEPT snapshot_index_pending, which means "come
+		// back shortly" — honour the server's RetryAfterSeconds (bounded
+		// by the same reauthMaxAttempts cap as every other reactive
+		// attempt) rather than treating it as a hard refusal.
+		// *RecoveryNegotiationError is a distinct type from
+		// *authenticateStatusError (both are 409s, decoded differently by
+		// authenticateRecoverySessionContext) — a bare
+		// errors.As(err, &statusErr) below never matches it, which is
+		// exactly why this case must be handled first.
+		var negErr *RecoveryNegotiationError
+		if errors.As(err, &negErr) {
+			if negErr.Code == "capability_downgrade" {
+				// Fold the server-reported code into the same sentinel a
+				// local downgrade detection uses, so callers can match
+				// either signal with one errors.Is check while
+				// errors.As(&negErr) still recovers the code/message.
+				return p.markSessionLost(fmt.Errorf("%w: %w", ErrCapabilityDowngrade, err))
+			}
+			if negErr.Code != "snapshot_index_pending" {
+				return p.markSessionLost(err)
+			}
+			if attempt >= reauthMaxAttempts {
+				return p.markSessionLost(fmt.Errorf("re-authenticate still pending after %d attempts: %w", attempt, err))
+			}
+			wait := time.Duration(negErr.RetryAfterSeconds) * time.Second
+			if wait <= 0 {
+				wait = delay
+			}
+			p.authNotBefore = p.now().Add(wait)
+			slog.Warn("bmr: recovery session index not ready yet, retrying re-authenticate",
+				"attempt", attempt, "wait", wait, "code", negErr.Code)
+			delay *= 2
+			if delay > reauthMaxDelay {
+				delay = reauthMaxDelay
+			}
+			continue
 		}
 
 		var statusErr *authenticateStatusError

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { pgOffsetlessTimestamp } from '../testUtils/pgOffsetlessTimestamp';
 
 const selectMock = vi.fn();
@@ -35,6 +35,7 @@ vi.mock('../db/schema', () => ({
   reports: {
     id: 'reports.id',
     orgId: 'reports.org_id',
+    partnerId: 'reports.partner_id',
     // P2-3 (#4190) — the column A7's exclusion predicate names.
     type: 'reports.type',
     createdBy: 'reports.created_by',
@@ -84,7 +85,18 @@ const reportExecutionPreflightMock = vi.fn();
 const previousBaselineForMock = vi.fn<
   (reportId: string, fingerprint: string) => Promise<PreviousBaseline>
 >(async () => undefined);
+// Same shape as the real class (the worker branches on `instanceof`).
+const { UnsupportedReportScopeErrorMock } = vi.hoisted(() => ({
+  UnsupportedReportScopeErrorMock: class UnsupportedReportScopeError extends Error {
+    readonly code = 'unsupported_report_scope';
+    constructor(readonly reportType: string, readonly scope: 'organization' | 'partner') {
+      super(`${reportType} cannot run at ${scope} scope`);
+      this.name = 'UnsupportedReportScopeError';
+    }
+  },
+}));
 vi.mock('../services/reportGenerationService', () => ({
+  UnsupportedReportScopeError: UnsupportedReportScopeErrorMock,
   generateReport: (...args: unknown[]) => generateReportMock(...(args as [])),
   assertReportExecutionPreflight: (...args: unknown[]) =>
     reportExecutionPreflightMock(...args),
@@ -92,7 +104,11 @@ vi.mock('../services/reportGenerationService', () => ({
     previousBaselineForMock(...(args as [string, string])),
 }));
 
+const realSiteScope = vi.hoisted(() => ({
+  intersectSiteScopes: null as null | ((a: any, b: any) => any),
+}));
 const scopeState = vi.hoisted(() => ({
+  partnerLiveResult: null as any,
   liveResult: null as any,
   decodedScope: null as any,
   intersection: null as any,
@@ -108,7 +124,38 @@ const decodeSiteScopeMock = vi.fn((_row: unknown, _orgId: string) => {
 const intersectSiteScopesMock = vi.fn(
   (_persistedScope: unknown, _currentScope: unknown) => scopeState.intersection,
 );
-vi.mock('../services/siteScope', () => ({
+// #3198 W01 — partner-owned definitions reauthorize through the partner resolver.
+const resolveLivePartnerReportAuthorityMock = vi.fn(
+  async (_userId: string, _partnerId: string, _action: 'read') => scopeState.partnerLiveResult,
+);
+// #3198 W02 (ruling P8) — the business-type permission re-check.
+const resolveLiveReportTypePermissionsMock = vi.fn(
+  async (_userId: string, _owner: unknown, _required: unknown) => true,
+);
+// #3198 W02 — the generator's scope. The partner org list is a DB read in
+// reportScope.ts (covered by reportScope.test.ts); stubbed here.
+const reportScopeFromAuthorityMock = vi.fn(
+  async (owner: { orgId?: string; partnerId?: string }, _authority: unknown) =>
+    owner.partnerId !== undefined
+      ? { kind: 'partner', partnerId: owner.partnerId, orgIds: ['77777777-7777-4777-8777-777777777777'] }
+      : { kind: 'organization', orgId: owner.orgId },
+);
+vi.mock('../services/reportScope', () => ({
+  organizationScope: (orgId: string) => ({ kind: 'organization', orgId }),
+  reportScopeFromAuthority: (...args: unknown[]) =>
+    reportScopeFromAuthorityMock(...(args as [{ orgId?: string; partnerId?: string }, unknown])),
+}));
+vi.mock('../services/siteScope', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/siteScope')>();
+  realSiteScope.intersectSiteScopes = actual.intersectSiteScopes;
+  return {
+  resolveLiveReportTypePermissions: (...args: unknown[]) =>
+    resolveLiveReportTypePermissionsMock(...(args as [string, unknown, unknown])),
+  // The REAL owner-axis decision: the worker's branch is only as good as it.
+  reportOwnerOf: actual.reportOwnerOf,
+  partnerWideScope: actual.partnerWideScope,
+  resolveLivePartnerReportAuthority: (...args: unknown[]) =>
+    resolveLivePartnerReportAuthorityMock(...(args as [string, string, 'read'])),
   resolveLiveReportAuthority: (...args: unknown[]) =>
     resolveLiveReportAuthorityMock(...(args as [string, string, 'read'])),
   decodeSiteScope: (...args: unknown[]) =>
@@ -128,7 +175,8 @@ vi.mock('../services/siteScope', () => ({
     executionScopeCapturedAt: authority.capturedAt,
     executionScopePrincipalKind: 'user',
   })),
-}));
+  };
+});
 
 const sendEmailMock = vi.fn();
 vi.mock('../services/email', () => ({
@@ -140,8 +188,15 @@ const loadReportBrandingForOrgMock = vi.fn(async () => ({
   logoDataUrl: null,
   logoAspect: null,
 }));
+const loadReportBrandingForPartnerMock = vi.fn(async (_partnerId: string) => ({
+  name: 'Partner MSP',
+  logoDataUrl: null,
+  logoAspect: null,
+}));
 vi.mock('../services/reportBranding', () => ({
   loadReportBrandingForOrg: (...args: unknown[]) => loadReportBrandingForOrgMock(...(args as [])),
+  loadReportBrandingForPartner: (...args: unknown[]) =>
+    loadReportBrandingForPartnerMock(...(args as [string])),
 }));
 
 // Passthrough mock of the shared PDF renderer with a failure switch: by default
@@ -191,7 +246,9 @@ import {
   processRunScheduledReport,
   buildOccurrenceClaimCas,
   resolveScheduledReportRecipients,
+  resolveScheduledDeliveryContext,
 } from './reportScheduleWorker';
+import { persistedSiteScopeValues } from '../services/siteScope';
 
 const REPORT_ID = '11111111-1111-1111-1111-111111111111';
 const ORG_ID = '22222222-2222-2222-2222-222222222222';
@@ -244,6 +301,8 @@ beforeEach(() => {
   updateMock.mockReset();
   generateReportMock.mockReset();
   reportExecutionPreflightMock.mockReset();
+  resolveLiveReportTypePermissionsMock.mockReset();
+  resolveLiveReportTypePermissionsMock.mockResolvedValue(true);
   previousBaselineForMock.mockReset();
   sendEmailMock.mockReset();
   loadReportBrandingForOrgMock.mockReset();
@@ -707,6 +766,30 @@ describe('processRunScheduledReport', () => {
     executionScopeCapturedAt: new Date('2026-07-24T12:00:00.000Z'),
   };
 
+  // #3198 W02 ruling F1: an org-owned msp_staff (business) report is re-checked
+  // on the PARTNER axis only — an execution user who reaches the org through
+  // an org membership alone (a customer user) is denied.
+  it('re-checks an org-owned ar_aging report on the partner axis only, and denies scope_permission_missing', async () => {
+    selectMock.mockReturnValueOnce(selectChain([{ ...report, type: 'ar_aging', config: { schedule: { time: '09:00' } } }]));
+    resolveLiveReportTypePermissionsMock.mockResolvedValueOnce(false);
+    const failedInsert = insertChain([{ id: RUN_ID }]);
+    insertMock.mockReturnValueOnce(failedInsert);
+
+    await processRunScheduledReport({ type: 'run-scheduled-report', reportId: REPORT_ID, occurrenceKey: 202607010900 });
+
+    expect(resolveLiveReportTypePermissionsMock).toHaveBeenCalledWith(
+      report.executionScopeUserId,
+      { orgId: ORG_ID },
+      [{ resource: 'invoices', action: 'read' }],
+      { partnerAxisOnly: true },
+    );
+    expect(failedInsert.values).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'failed', errorMessage: 'scope_permission_missing' }),
+    );
+    expect(generateReportMock).not.toHaveBeenCalled();
+    expect(sendEmailMock).not.toHaveBeenCalled();
+  });
+
   it('stores a completed run, stamps lastGeneratedAt, and emails valid recipients with a CSV', async () => {
     selectMock.mockReturnValueOnce(selectChain([report]));
     selectMock.mockReturnValueOnce(selectChain([])); // scheduled contact recipients
@@ -724,9 +807,19 @@ describe('processRunScheduledReport', () => {
       ORG_ID,
       'read',
     );
+    // #3198 W01 — the org owner axis is threaded into decode and preflight.
+    expect(decodeSiteScopeMock).toHaveBeenCalledWith(expect.anything(), { orgId: ORG_ID });
+    expect(reportExecutionPreflightMock).toHaveBeenCalledWith(
+      { orgId: ORG_ID },
+      report.config,
+      expect.anything(),
+      'device_inventory',
+    );
+    // A legacy type declares no extra permissions: no re-check query.
+    expect(resolveLiveReportTypePermissionsMock).not.toHaveBeenCalled();
     expect(generateReportMock).toHaveBeenCalledWith(
       'device_inventory',
-      ORG_ID,
+      { kind: 'organization', orgId: ORG_ID },
       report.config,
       expect.objectContaining({
         principalKind: 'user',
@@ -1093,7 +1186,7 @@ describe('processRunScheduledReport', () => {
     expect(previousBaselineForMock).toHaveBeenCalledWith(REPORT_ID, 'a'.repeat(64));
     expect(generateReportMock).toHaveBeenCalledWith(
       'device_inventory',
-      ORG_ID,
+      { kind: 'organization', orgId: ORG_ID },
       {},
       expect.objectContaining({ scope: restricted, fingerprint: 'a'.repeat(64) }),
     );
@@ -1251,6 +1344,33 @@ describe('processRunScheduledReport', () => {
     const mail = sendEmailMock.mock.calls[0]![0] as { attachments: Array<{ filename: string }> };
     expect(mail.attachments).toHaveLength(1);
     expect(mail.attachments[0]!.filename).toMatch(/device_inventory-report-.*\.csv/);
+  });
+
+  // #3198 W02 fix round (minor): a delivery failure keeps the stored run, but
+  // it must reach error tracking, not only stderr.
+  it('reports an email delivery failure to error tracking without failing the run', async () => {
+    selectMock.mockReturnValueOnce(
+      selectChain([{ ...report, format: 'csv', config: { emailRecipients: ['a@b.co'] } }]),
+    );
+    selectMock.mockReturnValueOnce(selectChain([])); // scheduled contact recipients
+    selectMock.mockReturnValueOnce(
+      selectChain([{ orgSettings: {}, partnerTimezone: 'UTC', partnerSettings: {} }]),
+    );
+    insertMock.mockReturnValueOnce(insertChain([{ id: RUN_ID }]));
+    const updates = [updateChain(), updateChain()];
+    updateMock.mockReturnValueOnce(updates[0]).mockReturnValueOnce(updates[1]);
+    generateReportMock.mockResolvedValueOnce({ rows: [{ hostname: 'PC-1' }], rowCount: 1 });
+    const smtpDown = new Error('smtp down');
+    sendEmailMock.mockRejectedValueOnce(smtpDown);
+    captureExceptionMock.mockClear();
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await processRunScheduledReport({ type: 'run-scheduled-report', reportId: REPORT_ID, occurrenceKey: 202607010900 });
+    } finally {
+      consoleError.mockRestore();
+    }
+    expect(updates[1]!.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'completed' }));
+    expect(captureExceptionMock).toHaveBeenCalledWith(smtpDown);
   });
 
   it('warns when an attachment exceeds 5MB and sends link-only', async () => {
@@ -1493,5 +1613,520 @@ describe('system-managed narrative definitions are outside this worker (P2-3)', 
     });
 
     expect(generateReportMock).toHaveBeenCalled();
+  });
+});
+
+// ─── #3198 W01: partner-owned definitions (spec §3.1a) ──────────────────────
+
+describe('partner-owned scheduled definitions (#3198 W01/W02)', () => {
+  const PARTNER_ID = '55555555-5555-4555-8555-555555555555';
+  const OTHER_PARTNER_ID = '66666666-6666-4666-8666-666666666666';
+  const USER_ID = '44444444-4444-4444-8444-444444444444';
+  const partnerScope = { version: 1 as const, kind: 'partner_wide' as const, partnerId: PARTNER_ID };
+
+  const partnerReport = {
+    id: REPORT_ID,
+    orgId: null,
+    partnerId: PARTNER_ID,
+    name: 'Monthly AR aging',
+    type: 'ar_aging',
+    format: 'pdf',
+    schedule: 'monthly',
+    config: { schedule: { time: '09:00', date: '1' }, emailRecipients: ['books@msp.example'] },
+    lastGeneratedAt: null,
+    executionScopeVersion: 1,
+    executionScopeKind: 'partner_wide',
+    executionScopeSiteIds: null,
+    executionScopeUserId: USER_ID,
+    executionScopeFingerprint: 'f'.repeat(64),
+    executionScopeCapturedAt: new Date('2026-07-24T12:00:00.000Z'),
+    executionScopePrincipalKind: 'user',
+  };
+
+  const liveFor = (partnerId: string) => ({
+    ok: true,
+    authority: {
+      principalKind: 'user',
+      scope: { version: 1, kind: 'partner_wide', partnerId },
+      principalUserId: USER_ID,
+      capturedAt: new Date('2026-07-25T12:00:00.000Z'),
+      fingerprint: 'f'.repeat(64),
+    },
+  });
+
+  beforeEach(() => {
+    scopeState.decodedScope = partnerScope;
+    scopeState.partnerLiveResult = liveFor(PARTNER_ID);
+    // The REAL intersection: partner_wide meets only itself, same partner.
+    intersectSiteScopesMock.mockImplementation((a, b) => realSiteScope.intersectSiteScopes!(a, b));
+    resolveLivePartnerReportAuthorityMock.mockClear();
+  });
+
+  afterEach(() => {
+    intersectSiteScopesMock.mockImplementation(() => scopeState.intersection);
+  });
+
+  const run = () =>
+    processRunScheduledReport({ type: 'run-scheduled-report', reportId: REPORT_ID, occurrenceKey: 202607010900 });
+
+  it('reauthorizes a partner-owned definition through resolveLivePartnerReportAuthority and stamps a partner_wide run', async () => {
+    selectMock.mockReturnValueOnce(selectChain([partnerReport]));
+    const runInsert = insertChain([{ id: RUN_ID }]);
+    insertMock.mockReturnValueOnce(runInsert);
+    updateMock.mockReturnValueOnce(updateChain()).mockReturnValueOnce(updateChain());
+    generateReportMock.mockResolvedValueOnce({ rows: [] });
+
+    await run();
+
+    expect(decodeSiteScopeMock).toHaveBeenCalledWith(partnerReport, { partnerId: PARTNER_ID });
+    expect(resolveLivePartnerReportAuthorityMock).toHaveBeenCalledWith(USER_ID, PARTNER_ID, 'read');
+    expect(resolveLiveReportAuthorityMock).not.toHaveBeenCalled();
+    expect(reportExecutionPreflightMock).toHaveBeenCalledWith(
+      { partnerId: PARTNER_ID },
+      partnerReport.config,
+      expect.objectContaining({ principalKind: 'user', scope: partnerScope, principalUserId: USER_ID }),
+      'ar_aging',
+    );
+    expect(insertMock).toHaveBeenCalledTimes(1);
+    expect(runInsert.values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'running',
+        executionScopeKind: 'partner_wide',
+        executionScopeSiteIds: null,
+        executionScopeUserId: USER_ID,
+        requestedByKind: 'user',
+        requestedByUserId: USER_ID,
+        requestedByPortalUserId: null,
+      }),
+    );
+  });
+
+  it('generates a partner-owned definition under a partner scope and completes the run (#3198 W02)', async () => {
+    selectMock.mockReturnValueOnce(selectChain([{ ...partnerReport, config: { schedule: { time: '09:00', date: '1' } } }]));
+    insertMock.mockReturnValueOnce(insertChain([{ id: RUN_ID }]));
+    const updates = [updateChain(), updateChain()];
+    updateMock.mockReturnValueOnce(updates[0]).mockReturnValueOnce(updates[1]);
+    generateReportMock.mockResolvedValueOnce({ rows: [], summary: { kind: 'ar_aging' } });
+
+    await expect(run()).resolves.toBeUndefined();
+
+    expect(resolveLiveReportTypePermissionsMock).toHaveBeenCalledWith(
+      USER_ID, { partnerId: PARTNER_ID }, [{ resource: 'invoices', action: 'read' }], { partnerAxisOnly: true },
+    );
+    expect(reportScopeFromAuthorityMock).toHaveBeenCalledWith(
+      { partnerId: PARTNER_ID },
+      expect.objectContaining({ scope: partnerScope }),
+    );
+    expect(generateReportMock).toHaveBeenCalledWith(
+      'ar_aging',
+      { kind: 'partner', partnerId: PARTNER_ID, orgIds: ['77777777-7777-4777-8777-777777777777'] },
+      expect.any(Object),
+      expect.objectContaining({ principalKind: 'user', scope: partnerScope, principalUserId: USER_ID }),
+    );
+    expect(updates[1]!.set).toHaveBeenCalledWith(expect.objectContaining({ status: 'completed' }));
+  });
+
+  it('still records the stable unsupported_report_scope code when a partner-owned type cannot run at partner scope', async () => {
+    selectMock.mockReturnValueOnce(selectChain([{ ...partnerReport, type: 'device_inventory' }]));
+    insertMock.mockReturnValueOnce(insertChain([{ id: RUN_ID }]));
+    const updates = [updateChain(), updateChain()];
+    updateMock.mockReturnValueOnce(updates[0]).mockReturnValueOnce(updates[1]);
+    generateReportMock.mockRejectedValueOnce(new UnsupportedReportScopeErrorMock('device_inventory', 'partner'));
+
+    // Deterministic refusal: resolves (no BullMQ retry, no second failed row)
+    // even on the final attempt, and never tells recipients a report "failed"
+    // that cannot be produced at all.
+    await expect(
+      processRunScheduledReport(
+        { type: 'run-scheduled-report', reportId: REPORT_ID, occurrenceKey: 202607010900 },
+        { finalAttempt: true },
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(updates[0]!.set).toHaveBeenCalledWith(expect.objectContaining({ lastGeneratedAt: expect.any(Date) }));
+    expect(updates[1]!.set).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'failed', errorMessage: 'unsupported_report_scope' }),
+    );
+    expect(sendEmailMock).not.toHaveBeenCalled();
+  });
+
+  it('denies scope_permission_missing when the execution user lost invoices:read (ruling P8)', async () => {
+    selectMock.mockReturnValueOnce(selectChain([partnerReport]));
+    resolveLiveReportTypePermissionsMock.mockResolvedValueOnce(false);
+    const failedInsert = insertChain([{ id: RUN_ID }]);
+    insertMock.mockReturnValueOnce(failedInsert);
+
+    await expect(run()).resolves.toBeUndefined();
+
+    expect(insertMock).toHaveBeenCalledTimes(1);
+    expect(failedInsert.values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'failed',
+        errorMessage: 'scope_permission_missing',
+        requestedByKind: 'user',
+        requestedByUserId: USER_ID,
+      }),
+    );
+    expect(generateReportMock).not.toHaveBeenCalled();
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(sendEmailMock).not.toHaveBeenCalled();
+  });
+
+  it('denies scope_permission_missing without Sentry for a real "not granted" answer', async () => {
+    selectMock.mockReturnValueOnce(selectChain([partnerReport]));
+    resolveLiveReportTypePermissionsMock.mockResolvedValueOnce(false);
+    insertMock.mockReturnValueOnce(insertChain([{ id: RUN_ID }]));
+    captureExceptionMock.mockClear();
+
+    await run();
+
+    expect(captureExceptionMock).not.toHaveBeenCalled();
+  });
+
+  it('denies scope_unverifiable (not scope_permission_missing) and reports to Sentry when the permission re-check cannot run', async () => {
+    selectMock.mockReturnValueOnce(selectChain([partnerReport]));
+    const dbDown = new Error('connection reset');
+    resolveLiveReportTypePermissionsMock.mockRejectedValueOnce(dbDown);
+    const failedInsert = insertChain([{ id: RUN_ID }]);
+    insertMock.mockReturnValueOnce(failedInsert);
+    captureExceptionMock.mockClear();
+
+    await expect(run()).resolves.toBeUndefined();
+
+    expect(insertMock).toHaveBeenCalledTimes(1);
+    expect(failedInsert.values).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'failed', errorMessage: 'scope_unverifiable' }),
+    );
+    expect(captureExceptionMock).toHaveBeenCalledTimes(1);
+    expect(captureExceptionMock).toHaveBeenCalledWith(dbDown);
+    expect(generateReportMock).not.toHaveBeenCalled();
+    expect(sendEmailMock).not.toHaveBeenCalled();
+  });
+
+  it('denies scope_unverifiable (does not throw out of the job) for a stored report type the registry does not know', async () => {
+    selectMock.mockReturnValueOnce(selectChain([{ ...partnerReport, type: 'not_a_real_type' }]));
+    const failedInsert = insertChain([{ id: RUN_ID }]);
+    insertMock.mockReturnValueOnce(failedInsert);
+    captureExceptionMock.mockClear();
+
+    await expect(run()).resolves.toBeUndefined();
+
+    expect(failedInsert.values).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'failed', errorMessage: 'scope_unverifiable' }),
+    );
+    expect(captureExceptionMock).toHaveBeenCalledTimes(1);
+    expect(resolveLiveReportTypePermissionsMock).not.toHaveBeenCalled();
+    expect(generateReportMock).not.toHaveBeenCalled();
+  });
+
+  it('denies scope_config_outside_authority (not a failed run) when the preflight refuses the config', async () => {
+    selectMock.mockReturnValueOnce(selectChain([partnerReport]));
+    reportExecutionPreflightMock.mockImplementationOnce(() => {
+      throw new Error('partner-scope report config is not valid for report type ar_aging');
+    });
+    const failedInsert = insertChain([{ id: RUN_ID }]);
+    insertMock.mockReturnValueOnce(failedInsert);
+
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await run();
+      // Fix round (minor): the refusal reason is logged with its key context,
+      // not swallowed by a bare catch.
+      expect(consoleWarn).toHaveBeenCalledWith(
+        expect.stringContaining('preflight refused'),
+        expect.objectContaining({
+          reportId: partnerReport.id,
+          reportType: partnerReport.type,
+          reason: 'partner-scope report config is not valid for report type ar_aging',
+        }),
+      );
+    } finally {
+      consoleWarn.mockRestore();
+    }
+
+    expect(failedInsert.values).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'failed', errorMessage: 'scope_config_outside_authority' }),
+    );
+    expect(generateReportMock).not.toHaveBeenCalled();
+  });
+
+  it('maps an org-owned UnsupportedReportScopeError from generateReport to the same stable reason', async () => {
+    scopeState.decodedScope = { version: 1, kind: 'unrestricted', orgId: ORG_ID };
+    intersectSiteScopesMock.mockImplementation(() => scopeState.intersection);
+    selectMock.mockReturnValueOnce(selectChain([{ ...partnerReport, orgId: ORG_ID, partnerId: null, executionScopeKind: 'unrestricted' }]));
+    insertMock.mockReturnValueOnce(insertChain([{ id: RUN_ID }]));
+    const updates = [updateChain(), updateChain()];
+    updateMock.mockReturnValueOnce(updates[0]).mockReturnValueOnce(updates[1]);
+    generateReportMock.mockRejectedValueOnce(new UnsupportedReportScopeErrorMock('ar_aging', 'organization'));
+
+    await expect(run()).resolves.toBeUndefined();
+
+    expect(generateReportMock).toHaveBeenCalledWith('ar_aging', { kind: 'organization', orgId: ORG_ID }, expect.any(Object), expect.any(Object));
+    // An org owner of an msp_staff type re-checks on the partner axis only (ruling F1).
+    expect(resolveLiveReportTypePermissionsMock).toHaveBeenCalledWith(
+      USER_ID, { orgId: ORG_ID }, [{ resource: 'invoices', action: 'read' }], { partnerAxisOnly: true },
+    );
+    expect(updates[1]!.set).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'failed', errorMessage: 'unsupported_report_scope' }),
+    );
+  });
+
+  it('denies scope_no_intersection when the live partner authority is for a different partner', async () => {
+    selectMock.mockReturnValueOnce(selectChain([partnerReport]));
+    scopeState.partnerLiveResult = liveFor(OTHER_PARTNER_ID);
+    const failedInsert = insertChain([{ id: RUN_ID }]);
+    insertMock.mockReturnValueOnce(failedInsert);
+
+    await run();
+
+    expect(resolveLivePartnerReportAuthorityMock).toHaveBeenCalledWith(USER_ID, PARTNER_ID, 'read');
+    expect(insertMock).toHaveBeenCalledTimes(1);
+    expect(failedInsert.values).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'failed',
+        errorMessage: 'scope_no_intersection',
+        requestedByKind: 'user',
+        requestedByUserId: USER_ID,
+      }),
+    );
+    expect(reportExecutionPreflightMock).not.toHaveBeenCalled();
+    expect(generateReportMock).not.toHaveBeenCalled();
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a partner resolver refusal reason (partner_access_not_all) as the deny reason', async () => {
+    selectMock.mockReturnValueOnce(selectChain([partnerReport]));
+    scopeState.partnerLiveResult = { ok: false, reason: 'partner_access_not_all' };
+    const failedInsert = insertChain([{ id: RUN_ID }]);
+    insertMock.mockReturnValueOnce(failedInsert);
+
+    await run();
+
+    expect(failedInsert.values).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'failed', errorMessage: 'scope_partner_access_not_all' }),
+    );
+    expect(generateReportMock).not.toHaveBeenCalled();
+  });
+
+  // #3198 W02 (addendum B3): a partner-owned deny row carries the owner's
+  // partner_wide envelope, so the run list / by-id read (which only admit
+  // complete partner_wide rows for a partner owner) can show the refusal.
+  describe('partner-owner deny rows carry a partner_wide envelope (B3)', () => {
+    const partnerWideEnvelope = {
+      executionScopeVersion: 1,
+      executionScopeKind: 'partner_wide',
+      executionScopeSiteIds: null,
+      executionScopeUserId: USER_ID,
+      executionScopeFingerprint: 'f'.repeat(64),
+      executionScopeCapturedAt: expect.any(Date),
+      executionScopePrincipalKind: 'user',
+    };
+
+    it.each([
+      ['scope_partner_access_not_all', () => { scopeState.partnerLiveResult = { ok: false, reason: 'partner_access_not_all' }; }],
+      ['scope_permission_missing', () => { resolveLiveReportTypePermissionsMock.mockResolvedValueOnce(false); }],
+      ['scope_no_intersection', () => { scopeState.partnerLiveResult = liveFor(OTHER_PARTNER_ID); }],
+      ['scope_config_outside_authority', () => {
+        reportExecutionPreflightMock.mockImplementationOnce(() => { throw new Error('config outside authority'); });
+      }],
+    ])('stamps the envelope on a %s deny', async (reason, arrange) => {
+      selectMock.mockReturnValueOnce(selectChain([partnerReport]));
+      arrange();
+      const failedInsert = insertChain([{ id: RUN_ID }]);
+      insertMock.mockReturnValueOnce(failedInsert);
+      vi.mocked(persistedSiteScopeValues).mockClear();
+
+      await run();
+
+      expect(failedInsert.values).toHaveBeenCalledWith({
+        reportId: REPORT_ID,
+        status: 'failed',
+        completedAt: expect.any(Date),
+        errorMessage: reason,
+        requestedByKind: 'user',
+        requestedByUserId: USER_ID,
+        requestedByPortalUserId: null,
+        ...partnerWideEnvelope,
+      });
+      // Built from the OWNER's partner and the definition's execution user —
+      // never from the live result (which may name another partner).
+      expect(persistedSiteScopeValues).toHaveBeenCalledWith({
+        principalKind: 'user',
+        scope: partnerScope,
+        principalUserId: USER_ID,
+        capturedAt: expect.any(Date),
+        fingerprint: 'f'.repeat(64),
+      });
+      expect(generateReportMock).not.toHaveBeenCalled();
+    });
+
+    it('stamps nothing when the owner is not known yet (corrupt owner axes)', async () => {
+      selectMock.mockReturnValueOnce(selectChain([{ ...partnerReport, orgId: ORG_ID }]));
+      const failedInsert = insertChain([{ id: RUN_ID }]);
+      insertMock.mockReturnValueOnce(failedInsert);
+
+      await run();
+
+      const values = vi.mocked(failedInsert.values).mock.calls[0]![0] as Record<string, unknown>;
+      expect(values).toMatchObject({ status: 'failed', errorMessage: 'scope_unverifiable' });
+      expect(values).not.toHaveProperty('executionScopeKind');
+    });
+
+    it('stamps nothing when the definition has no execution user (the CHECK arm needs one)', async () => {
+      selectMock.mockReturnValueOnce(selectChain([{ ...partnerReport, executionScopeUserId: null }]));
+      const failedInsert = insertChain([{ id: RUN_ID }]);
+      insertMock.mockReturnValueOnce(failedInsert);
+
+      await run();
+
+      const values = vi.mocked(failedInsert.values).mock.calls[0]![0] as Record<string, unknown>;
+      expect(values).toMatchObject({ status: 'failed', errorMessage: 'scope_unverifiable', requestedByKind: null });
+      expect(values).not.toHaveProperty('executionScopeKind');
+    });
+
+    it('leaves an ORG-owned deny row without an envelope (org lists admit the all-NULL legacy shape)', async () => {
+      scopeState.decodedScope = { version: 1, kind: 'unrestricted', orgId: ORG_ID };
+      selectMock.mockReturnValueOnce(selectChain([{ ...partnerReport, orgId: ORG_ID, partnerId: null, executionScopeKind: 'unrestricted' }]));
+      resolveLiveReportTypePermissionsMock.mockResolvedValueOnce(false);
+      const failedInsert = insertChain([{ id: RUN_ID }]);
+      insertMock.mockReturnValueOnce(failedInsert);
+
+      await run();
+
+      const values = vi.mocked(failedInsert.values).mock.calls[0]![0] as Record<string, unknown>;
+      expect(values).toMatchObject({ status: 'failed', errorMessage: 'scope_permission_missing' });
+      expect(values).not.toHaveProperty('executionScopeKind');
+    });
+  });
+
+  it('refuses a row with no (or two) owner axes as scope_unverifiable before any authority read', async () => {
+    selectMock.mockReturnValueOnce(selectChain([{ ...partnerReport, orgId: ORG_ID }]));
+    const failedInsert = insertChain([{ id: RUN_ID }]);
+    insertMock.mockReturnValueOnce(failedInsert);
+
+    await run();
+
+    expect(failedInsert.values).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'failed', errorMessage: 'scope_unverifiable' }),
+    );
+    expect(decodeSiteScopeMock).not.toHaveBeenCalled();
+    expect(resolveLivePartnerReportAuthorityMock).not.toHaveBeenCalled();
+    expect(resolveLiveReportAuthorityMock).not.toHaveBeenCalled();
+  });
+
+  // #3198 W02 (B4): each fail-closed catch still denies with the same reason,
+  // but reports the underlying error instead of swallowing it.
+  describe('scope_unverifiable catches log + capture (B4)', () => {
+    let errorSpy: ReturnType<typeof vi.spyOn>;
+    beforeEach(() => {
+      captureExceptionMock.mockClear();
+      errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    });
+    afterEach(() => errorSpy.mockRestore());
+
+    function expectReported(stage: string, err?: unknown) {
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[ReportScheduleWorker] Execution scope could not be verified',
+        expect.objectContaining({ reportId: REPORT_ID, stage, err: err ?? expect.anything() }),
+      );
+      expect(captureExceptionMock).toHaveBeenCalledTimes(1);
+      if (err) expect(captureExceptionMock).toHaveBeenCalledWith(err);
+    }
+
+    it('corrupt owner axes', async () => {
+      selectMock.mockReturnValueOnce(selectChain([{ ...partnerReport, orgId: ORG_ID }]));
+      const failedInsert = insertChain([{ id: RUN_ID }]);
+      insertMock.mockReturnValueOnce(failedInsert);
+
+      await run();
+
+      expect(failedInsert.values).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'failed', errorMessage: 'scope_unverifiable' }),
+      );
+      expectReported('owner');
+    });
+
+    it('persisted scope decode failure', async () => {
+      const err = new Error('partial scope');
+      scopeState.decodeError = err;
+      selectMock.mockReturnValueOnce(selectChain([partnerReport]));
+      const failedInsert = insertChain([{ id: RUN_ID }]);
+      insertMock.mockReturnValueOnce(failedInsert);
+
+      await run();
+
+      expect(failedInsert.values).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'failed', errorMessage: 'scope_unverifiable' }),
+      );
+      expectReported('decode', err);
+    });
+
+    it('live authority resolver throw', async () => {
+      const err = new Error('database unavailable');
+      resolveLivePartnerReportAuthorityMock.mockRejectedValueOnce(err);
+      selectMock.mockReturnValueOnce(selectChain([partnerReport]));
+      const failedInsert = insertChain([{ id: RUN_ID }]);
+      insertMock.mockReturnValueOnce(failedInsert);
+
+      await run();
+
+      expect(failedInsert.values).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'failed', errorMessage: 'scope_unverifiable' }),
+      );
+      expectReported('live_authority', err);
+      expect(generateReportMock).not.toHaveBeenCalled();
+    });
+
+    it('a missing execution user is an ordinary denial, not reported', async () => {
+      selectMock.mockReturnValueOnce(selectChain([{ ...partnerReport, executionScopeUserId: null }]));
+      insertMock.mockReturnValueOnce(insertChain([{ id: RUN_ID }]));
+
+      await run();
+
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(captureExceptionMock).not.toHaveBeenCalled();
+    });
+  });
+
+  it('delivers a partner-owned report on the owner partner lane: partner timezone + partner branding, no org reads', async () => {
+    selectMock.mockReturnValueOnce(selectChain([{ partnerTimezone: 'Europe/Berlin', partnerSettings: {} }]));
+
+    const ctx = await resolveScheduledDeliveryContext({ partnerId: PARTNER_ID });
+
+    expect(ctx).toEqual({
+      timeZone: 'Europe/Berlin',
+      branding: { name: 'Partner MSP', logoDataUrl: null, logoAspect: null },
+      partnerId: PARTNER_ID,
+    });
+    expect(loadReportBrandingForPartnerMock).toHaveBeenCalledWith(PARTNER_ID);
+    expect(loadReportBrandingForOrgMock).not.toHaveBeenCalled();
+    expect(selectMock).toHaveBeenCalledTimes(1); // the partner tz row only
+  });
+
+  it('keeps the org lane for an org owner (org timezone chain, org branding, org partner id)', async () => {
+    selectMock
+      .mockReturnValueOnce(selectChain([{ orgSettings: { timezone: 'America/Chicago' }, partnerTimezone: 'UTC', partnerSettings: {} }]))
+      .mockReturnValueOnce(selectChain([{ partnerId: PARTNER_ID }]));
+
+    const ctx = await resolveScheduledDeliveryContext({ orgId: ORG_ID });
+
+    expect(ctx).toEqual({
+      timeZone: 'America/Chicago',
+      branding: { name: 'Olive MSP', logoDataUrl: null, logoAspect: null },
+      partnerId: PARTNER_ID,
+    });
+    expect(loadReportBrandingForOrgMock).toHaveBeenCalledWith(ORG_ID);
+    expect(loadReportBrandingForPartnerMock).not.toHaveBeenCalled();
+  });
+
+  it('resolves only config.emailRecipients for a partner owner (no contact-recipient query)', async () => {
+    const recipients = await resolveScheduledReportRecipients({
+      reportId: REPORT_ID,
+      orgId: null,
+      config: { emailRecipients: ['books@msp.example', 'not-an-email'] },
+    });
+
+    expect(recipients).toEqual(['books@msp.example']);
+    expect(selectMock).not.toHaveBeenCalled();
   });
 });

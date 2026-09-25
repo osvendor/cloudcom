@@ -1178,7 +1178,51 @@
       "shareLinkNewLinkOriginalLive": "Se copió un enlace NUEVO. Esta propuesta es anterior al seguimiento de enlaces, así que no se pudo reutilizar el que ya tenía el cliente; ese sigue funcionando junto con este.",
       "shareLinkNewLinkOriginalDead": "Se copió un enlace NUEVO. El enlace anterior ya no se puede abrir, así que quien lo tenga debe usar este.",
       "currencyMismatch": "Esta cotización está en {{documentCurrency}}, pero tu cuenta de Stripe liquida en {{accountCurrency}}. Stripe mostrará {{documentCurrency}} al cliente y lo convertirá al liquidar: tú asumes el diferencial cambiario y cualquier comisión por conversión.",
-      "currencyUnknown": "La moneda de liquidación de tu cuenta de Stripe aún no está en caché, así que no se pudo comparar con esta cotización en {{documentCurrency}}. Actualiza los datos de tu cuenta de Stripe en Configuración → Integraciones para habilitar la verificación."
+      "currencyUnknown": "La moneda de liquidación de tu cuenta de Stripe aún no está en caché, así que no se pudo comparar con esta cotización en {{documentCurrency}}. Actualiza los datos de tu cuenta de Stripe en Configuración → Integraciones para habilitar la verificación.",
+      "acceptOnBehalf": {
+        "button": "Aceptar en nombre del cliente",
+        "title": "Registrar la aceptación del cliente",
+        "methodLabel": "¿Cómo dio su conformidad?",
+        "method": {
+          "verbal": "Verbalmente / por teléfono",
+          "email": "Por correo electrónico",
+          "signed_document": "Documento firmado",
+          "purchase_order": "Orden de compra",
+          "other": "Otro"
+        },
+        "referenceLabel": "Referencia",
+        "referenceHelp": "Dónde encontraría un revisor la conformidad del cliente: un número de orden de compra, un correo con fecha o un ticket.",
+        "signerNameLabel": "Quién dio la conformidad",
+        "signerEmailLabel": "Su correo electrónico (opcional)",
+        "consequenceInvoice": "Se emitirá y numerará ahora una factura por {{amount}}.",
+        "consequenceContracts": "Las líneas recurrentes se convierten en contratos en borrador que activas después.",
+        "consequenceEmail": "La factura se enviará por correo electrónico al cliente.",
+        "consequenceDraft": "Esta propuesta nunca se envió. Lo primero que el cliente verá de ella será la factura.",
+        "submit": "Aceptar y emitir factura",
+        "success": "Propuesta aceptada. Factura {{number}} emitida.",
+        "error": "No se pudo registrar la aceptación.",
+        "successDraftInvoice": "Propuesta aceptada. Factura creada como borrador.",
+        "errorContractVariablesUnresolved": "Este contrato todavía necesita valores para: {{names}}. Cierra este diálogo, complétalos abajo y vuelve a intentarlo.",
+        "errorContractVariablesUnresolvedGeneric": "Este contrato tiene variables sin resolver. Cierra este diálogo, complétalas abajo y vuelve a intentarlo.",
+        "errorDepositInvalid": "El depósito no se puede cobrar con la configuración actual. Cierra este diálogo, corrige la configuración del depósito abajo y vuelve a intentarlo.",
+        "evidenceLabel": "Archivo de evidencia (opcional)",
+        "evidenceHelp": "PDF, PNG o JPEG, hasta 10 MB — por ejemplo, la orden de compra firmada o el documento.",
+        "evidenceTooLarge": "Este archivo supera los 10 MB. Elige un archivo más pequeño.",
+        "evidenceAttached": "Evidencia adjuntada.",
+        "evidenceError": "La aceptación quedó registrada, pero no se pudo adjuntar el archivo de evidencia. Adjúntalo desde la página de la propuesta."
+      },
+      "declineOnBehalf": {
+        "button": "Rechazar en nombre del cliente",
+        "title": "Registrar el rechazo del cliente",
+        "methodLabel": "¿Cómo lo rechazó?",
+        "referenceLabel": "Referencia",
+        "referenceHelp": "Dónde un revisor encontraría el rechazo del cliente: un correo y su fecha, una nota de llamada o un ticket.",
+        "reasonLabel": "Su motivo (opcional)",
+        "consequence": "La propuesta se marcará como rechazada y ya no podrá aceptarse. Revísela para enviarle al cliente una nueva versión.",
+        "submit": "Marcar como rechazada",
+        "success": "Propuesta marcada como rechazada.",
+        "error": "No se pudo registrar el rechazo."
+      }
     },
     "detail": {
       "addContentInEditor": "Agregar contenido en el Editor",
@@ -1303,6 +1347,18 @@
         "inProgressTitle": "Se está preparando una revisión de esta cotización: al enviarla se reemplazará esta cotización y se desactivará el enlace del cliente:",
         "revisionOfTitle": "Revisión de",
         "untitled": "una versión más reciente"
+      },
+      "acceptedOnBehalf": "Aceptado en nombre de {{signer}} por {{recorder}} el {{date}} · {{method}} · {{reference}}",
+      "deletedUser": "un usuario eliminado",
+      "evidence": {
+        "download": "Descargar evidencia",
+        "downloadTitle": "Descargar {{filename}}",
+        "attach": "Adjuntar evidencia",
+        "replace": "Reemplazar evidencia",
+        "attached": "Evidencia adjuntada.",
+        "attachError": "No se pudo adjuntar el archivo de evidencia.",
+        "downloadError": "No se pudo descargar el archivo de evidencia.",
+        "tooLarge": "Este archivo supera los 10 MB. Elige un archivo más pequeño."
       }
     },
     "currency": {
@@ -1952,6 +2008,8 @@
       "unitPrice": "Precio unitario"
     },
     "terms": "Términos y condiciones",
+    "ticketHeader": "Ticket n.º {{number}}",
+    "ticketWork": "Trabajo de ticket",
     "totals": {
       "amountDue": "Monto adeudado",
       "paid": "Pagado",
@@ -2140,7 +2198,6 @@
     "saveSuccess": "Configuración de facturación de la organización guardada",
     "tax": {
       "partnerDefault": "Valor predeterminado del socio",
-      "partnerDefaultWithValue": "{{pct}}% (valor predeterminado del socio)",
       "taxExempt": "Exento de impuestos",
       "taxId": "Impuesto ID",
       "taxRate": "Tasa impositiva (%)",
@@ -2171,6 +2228,8 @@
       "autoTaxHardwareHelp": "El hardware recién importado está sujeto a impuestos de forma predeterminada.",
       "autoEmailInvoice": "Enviar la factura por correo automáticamente al aceptar una cotización",
       "autoEmailInvoiceHelp": "Cuando un cliente acepta una propuesta, la factura emitida se envía de inmediato por correo con un enlace seguro para ver y pagar — sin iniciar sesión.",
+      "notifyOnBehalfAcceptance": "Enviar un correo al cliente cuando registres una aceptación en su nombre",
+      "notifyOnBehalfAcceptanceHelp": "Cuando alguien de tu equipo acepta una cotización por un cliente, el cliente recibe una nota breve que indica quién la registró y cuándo, con el número de factura si se emitió una. Puede responder si algo no es correcto. Desactivado de forma predeterminada.",
       "currencyCode": "Código de moneda",
       "defaultMarkup": "Margen predeterminado (%)",
       "defaultTaxRate": "Tasa impositiva predeterminada (%)",

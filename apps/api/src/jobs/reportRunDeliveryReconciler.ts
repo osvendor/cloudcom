@@ -13,6 +13,8 @@
  *   `last_error = 'reconciler: claim went stale; send outcome unknown'`.
  *   **Never resent.** The email service has no idempotency key, so a resend is
  *   a real duplicate risk; making the ambiguity visible is the honest move.
+ *   Exception (#3198 W02): a stale claim under a PARTNER-owned run is settled
+ *   `failed` — nothing can have been sent for it (see the partner arm below).
  * - `unknown` rows → never touched. Replay is a human decision.
  *
  * Every DB touch is a short-lived system context of its own; the send itself
@@ -26,7 +28,12 @@ import { reportRuns, reports } from '../db/schema/reports';
 import { getBullMQConnection } from '../services/redis';
 import { captureException } from '../services/sentry';
 import { deliverNarrativeEmails } from '../services/reportNarrativeDelivery';
-import { STALE_CLAIM_MS, listUnsettledDeliveries, settleDelivery } from '../services/reportRunDelivery';
+import {
+  STALE_CLAIM_MS,
+  claimDelivery,
+  listUnsettledDeliveries,
+  settleDelivery,
+} from '../services/reportRunDelivery';
 import { attachWorkerObservability } from './workerObservability';
 
 const QUEUE_NAME = 'report-run-delivery-reconciler';
@@ -35,6 +42,9 @@ export const RECONCILE_INTERVAL_MS = 15 * 60 * 1000;
 /** Rows examined per pass; the unsettled partial index keeps this cheap. */
 const MAX_ROWS_PER_PASS = 500;
 export const STALE_CLAIM_ERROR = 'reconciler: claim went stale; send outcome unknown';
+/** #3198 W02 (addendum B7): the stable last_error of a delivery settled as
+ *  failed because its run is partner-owned (narrative delivery is org-only). */
+export const PARTNER_OWNED_DELIVERY_ERROR = 'reconciler: run is partner-owned; narrative delivery is org-only';
 
 type ReconcilerJobData = { type: typeof JOB_NAME; queuedAt: string };
 
@@ -48,16 +58,31 @@ function getQueue(): Queue<ReconcilerJobData> {
   return reconcilerQueue;
 }
 
-async function loadRunOrgs(reportRunIds: string[]): Promise<Map<string, string>> {
+/**
+ * Each run's owning report axis. #3198 W01 made `reports.org_id` nullable
+ * (org XOR partner), so the owner is carried as a discriminated value rather
+ * than a bare org id: narrative delivery is org-keyed, and a partner-owned
+ * run must be handled explicitly, never coerced into an org slot.
+ */
+type RunOwner = { orgId: string } | { partnerId: string };
+
+async function loadRunOwners(reportRunIds: string[]): Promise<Map<string, RunOwner>> {
   if (reportRunIds.length === 0) return new Map();
   const rows = await runOutsideDbContext(() => withSystemDbAccessContext(() =>
     db
-      .select({ reportRunId: reportRuns.id, orgId: reports.orgId })
+      .select({ reportRunId: reportRuns.id, orgId: reports.orgId, partnerId: reports.partnerId })
       .from(reportRuns)
       .innerJoin(reports, eq(reports.id, reportRuns.reportId))
       .where(inArray(reportRuns.id, reportRunIds)),
   ));
-  return new Map(rows.map((row) => [row.reportRunId, row.orgId]));
+  const owners = new Map<string, RunOwner>();
+  for (const row of rows) {
+    if (row.orgId) owners.set(row.reportRunId, { orgId: row.orgId });
+    else if (row.partnerId) owners.set(row.reportRunId, { partnerId: row.partnerId });
+    // Neither axis violates reports_one_owner_chk; left out, it takes the
+    // logged "vanished" path below rather than being guessed at.
+  }
+  return owners;
 }
 
 export async function reconcileReportRunDeliveries(
@@ -77,22 +102,41 @@ export async function reconcileReportRunDeliveries(
   const unsettled = await listUnsettledDeliveries(pendingCutoff, MAX_ROWS_PER_PASS);
 
   const pendingRuns = new Set<string>();
+  const pendingByRun = new Map<string, string[]>();
+  const staleClaims: { id: string; reportRunId: string }[] = [];
   for (const row of unsettled) {
     if (row.state === 'claimed') {
-      if (row.claimedAt && row.claimedAt < staleClaimCutoff) {
-        await settleDelivery(row.id, { state: 'unknown', error: STALE_CLAIM_ERROR });
-        markedUnknown += 1;
-      }
+      if (row.claimedAt && row.claimedAt < staleClaimCutoff) staleClaims.push(row);
       continue;
     }
-    if (row.state === 'pending') pendingRuns.add(row.reportRunId);
+    if (row.state === 'pending') {
+      pendingRuns.add(row.reportRunId);
+      pendingByRun.set(row.reportRunId, [...(pendingByRun.get(row.reportRunId) ?? []), row.id]);
+    }
+  }
+
+  const runOwners = await loadRunOwners([
+    ...new Set([...pendingRuns, ...staleClaims.map((c) => c.reportRunId)]),
+  ]);
+
+  for (const claim of staleClaims) {
+    // #3198 W02: a claim under a PARTNER-owned run was only ever taken by the
+    // partner-owned settle below (narrative delivery is org-only, nothing is
+    // sent), so a stale one is a settle that threw — settle it failed, not
+    // "outcome unknown". Every other stale claim stays unknown (never resent).
+    const claimOwner = runOwners.get(claim.reportRunId);
+    if (claimOwner && 'partnerId' in claimOwner) {
+      await settleDelivery(claim.id, { state: 'failed', error: PARTNER_OWNED_DELIVERY_ERROR });
+      continue;
+    }
+    await settleDelivery(claim.id, { state: 'unknown', error: STALE_CLAIM_ERROR });
+    markedUnknown += 1;
   }
 
   if (pendingRuns.size > 0) {
-    const runOrgs = await loadRunOrgs([...pendingRuns]);
     for (const reportRunId of pendingRuns) {
-      const orgId = runOrgs.get(reportRunId);
-      if (!orgId) {
+      const owner = runOwners.get(reportRunId);
+      if (!owner) {
         // Normally benign: the run (and, by cascade, its rows) went away
         // between the two reads. Logged anyway — if the join ever diverges
         // for any OTHER reason, these rows are dropped from every future
@@ -102,6 +146,36 @@ export async function reconcileReportRunDeliveries(
         });
         continue;
       }
+      if ('partnerId' in owner) {
+        // Narrative deliveries exist only for the org-owned weekly narrative;
+        // a pending row under a partner-owned run has no org-keyed authority
+        // gate to go through, so it can never be sent. #3198 W02 (addendum
+        // B7): settle it as failed ONCE (pending -> claimed -> failed, the
+        // state machine's permanent-refusal path; nothing is sent) and report
+        // the invariant break once, instead of re-reporting every pass.
+        const unsupported = new Error(
+          '[ReportRunDeliveryReconciler] pending delivery on a partner-owned run; narrative delivery is org-only, settling it as failed',
+        );
+        const deliveryIds = pendingByRun.get(reportRunId) ?? [];
+        console.error(unsupported.message, { reportRunId, partnerId: owner.partnerId, deliveryIds });
+        captureException(unsupported);
+        try {
+          for (const deliveryId of deliveryIds) {
+            if (await claimDelivery(deliveryId)) {
+              await settleDelivery(deliveryId, { state: 'failed', error: PARTNER_OWNED_DELIVERY_ERROR });
+            }
+          }
+        } catch (error) {
+          // Never stops the sweep. A claim that failed leaves the row pending
+          // (next pass retries); a settle that failed AFTER a successful claim
+          // leaves it claimed, and the stale-claim sweep above settles it
+          // failed (not unknown) once STALE_CLAIM_MS passes.
+          console.error('[ReportRunDeliveryReconciler] could not settle partner-owned deliveries', { reportRunId, error });
+          captureException(error instanceof Error ? error : new Error(String(error)));
+        }
+        continue;
+      }
+      const { orgId } = owner;
       try {
         const result = await deliverNarrativeEmails(reportRunId, { orgId });
         resent += result.sentNow;

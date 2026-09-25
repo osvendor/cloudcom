@@ -40,7 +40,7 @@ Branding and version naming remain unchanged. Preserve upstream licenses, packag
 
 ## Candidate image preparation
 
-CloudCom Candidate Images is manual-only on the default branch. Its source_commit input must be an exact commit ancestral to the default branch with a successful push-triggered CloudCom CI run. It builds Linux amd64 API, web and portal runtime images, plus a migration-only builder image, from the selected commit. Version metadata comes from that commit’s upstream baseline.
+CloudCom Candidate Images is manual-only on the default branch. Its source_commit input must be an exact commit ancestral to the default branch with a successful push-triggered CloudCom CI run. It must also be the commit that advances the pinned LanternOps baseline; routine CloudCom feature releases do not build images. See [direct-code deployment](cloudcom-direct-code-deployment.md) for the intended no-image path and its current implementation gate. The workflow builds Linux amd64 API, web and portal runtime images, plus a migration-only builder image, from the selected intake commit. Version metadata comes from that commit’s upstream baseline.
 
 The workflow exports gzip image archives, SHA256SUMS and exact Docker image IDs as seven-day Actions artifacts. It does not publish a release, push registry tags or deploy. Verify archive hashes and loaded image IDs before using them. These preparation artifacts do not replace signed production release inventories.
 

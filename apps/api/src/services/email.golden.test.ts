@@ -51,6 +51,9 @@ const GOLDEN: Array<{ name: string; params: SendEmailParams; expectedFrom: strin
   { name: 'auth.staff_invite', params: { ...MESSAGE, purpose: 'auth.staff_invite' }, expectedFrom: DEFAULT_FROM },
   { name: 'auth.account_locked', params: { ...MESSAGE, purpose: 'auth.account_locked' }, expectedFrom: DEFAULT_FROM },
   { name: 'security.mfa_enrollment', params: { ...MESSAGE, purpose: 'security.mfa_enrollment' }, expectedFrom: DEFAULT_FROM },
+  // Caller verification (#6354): a rejected caller notifies the org's security
+  // reviewers. Platform lane like every other security notice.
+  { name: 'security.caller_rejection', params: { ...MESSAGE, purpose: 'security.caller_rejection' }, expectedFrom: DEFAULT_FROM },
   { name: 'account.deletion_requested', params: { ...MESSAGE, purpose: 'account.deletion_requested' }, expectedFrom: DEFAULT_FROM },
   { name: 'account.deletion_declined', params: { ...MESSAGE, purpose: 'account.deletion_declined' }, expectedFrom: DEFAULT_FROM },
   { name: 'account.purge_warning', params: { ...MESSAGE, purpose: 'account.purge_warning' }, expectedFrom: DEFAULT_FROM },
@@ -71,6 +74,8 @@ const GOLDEN: Array<{ name: string; params: SendEmailParams; expectedFrom: strin
   { name: 'report.delivery', params: { ...MESSAGE, purpose: 'report.delivery', partnerId: null }, expectedFrom: DEFAULT_FROM },
   { name: 'quote.sent (partner named)', params: { ...MESSAGE, purpose: 'quote.sent', partnerId: PARTNER_ID, partnerName: 'Acme MSP' }, expectedFrom: BRANDED_FROM },
   { name: 'quote.sent (no partner name)', params: { ...MESSAGE, purpose: 'quote.sent', partnerId: PARTNER_ID, partnerName: null }, expectedFrom: DEFAULT_FROM },
+  { name: 'quote.acceptance_recorded (partner named)', params: { ...MESSAGE, purpose: 'quote.acceptance_recorded', partnerId: PARTNER_ID, partnerName: 'Acme MSP' }, expectedFrom: BRANDED_FROM },
+  { name: 'quote.acceptance_recorded (no partner name)', params: { ...MESSAGE, purpose: 'quote.acceptance_recorded', partnerId: PARTNER_ID, partnerName: null }, expectedFrom: DEFAULT_FROM },
   { name: 'invoice.sent (partner named)', params: { ...MESSAGE, purpose: 'invoice.sent', partnerId: PARTNER_ID, partnerName: 'Acme MSP' }, expectedFrom: BRANDED_FROM },
   { name: 'invoice.sent (no partner name)', params: { ...MESSAGE, purpose: 'invoice.sent', partnerId: PARTNER_ID, partnerName: null }, expectedFrom: DEFAULT_FROM },
 ];

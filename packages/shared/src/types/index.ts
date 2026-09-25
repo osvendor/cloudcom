@@ -10,6 +10,7 @@ export * from './agentHealth';
 export * from './scriptAdmission';
 export * from './softwareInventoryObservation';
 export * from './scriptProposals';
+export * from './backupHealth';
 
 // ============================================
 // Multi-Tenancy Types
@@ -914,3 +915,11 @@ export * from './topologyCollection';
 export * from './topologyConfiguration';
 
 export * from './topologyDiagnostics';
+
+export * from './securityScan';
+
+// Metric anomaly episodes (spec 2026-09-21)
+export * from './metricAnomalyEpisodes';
+
+// Business reports (#3198 W02)
+export * from './businessReports';
