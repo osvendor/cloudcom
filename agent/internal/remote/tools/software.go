@@ -167,7 +167,29 @@ func uninstallSoftwareWindows(name, version string) error {
 	// Resolve winget once for all attempts: under the SYSTEM service the
 	// per-user "winget" PATH alias doesn't exist (see resolveWingetCommand).
 	wingetCmd := resolveWingetCommand()
-	attempts := []uninstallAttempt{
+	attempts := make([]uninstallAttempt, 0, 4)
+	// winget can find an MSI entry yet invoke a stale product identifier and
+	// fail with 1605. The software inventory already carries the registered
+	// UninstallString. Accept only an exact name/version match and a bare MSI
+	// product GUID, then invoke msiexec ourselves without executing registry
+	// command text or a shell. This also works on Windows 11 without wmic.
+	msiAttempt, err := windowsMSIUninstallAttempt(name, version)
+	if err != nil {
+		return err
+	}
+	if msiAttempt != nil {
+		attempts = append(attempts, *msiAttempt)
+	}
+	if version != "" {
+		attempts = append(attempts, uninstallAttempt{
+			command: wingetCmd,
+			args: []string{
+				"uninstall", "--name", name, "--version", version,
+				"--silent", "--accept-source-agreements", "--disable-interactivity",
+			},
+		})
+	}
+	attempts = append(attempts, []uninstallAttempt{
 		{
 			command: wingetCmd,
 			args: []string{
@@ -189,25 +211,71 @@ func uninstallSoftwareWindows(name, version string) error {
 				"/nointeractive",
 			},
 		},
-	}
-
-	if version != "" {
-		attempts = append([]uninstallAttempt{
-			{
-				command: wingetCmd,
-				args: []string{
-					"uninstall",
-					"--name", name,
-					"--version", version,
-					"--silent",
-					"--accept-source-agreements",
-					"--disable-interactivity",
-				},
-			},
-		}, attempts...)
-	}
+	}...)
 
 	return runUninstallAttempts(name, attempts)
+}
+
+var msiProductCodePattern = regexp.MustCompile(`(?i)^/[xi]\s*(\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\})(?:\s|$)`)
+
+// msiProductCode extracts a GUID only from a standard msiexec uninstall
+// registration. Arguments after the GUID are deliberately ignored.
+func msiProductCode(uninstallString string) string {
+	command := strings.TrimSpace(uninstallString)
+	if command == "" {
+		return ""
+	}
+	var executable, args string
+	if strings.HasPrefix(command, `"`) {
+		end := strings.Index(command[1:], `"`)
+		if end < 0 {
+			return ""
+		}
+		executable = command[1 : end+1]
+		args = strings.TrimSpace(command[end+2:])
+	} else {
+		fields := strings.Fields(command)
+		if len(fields) < 2 {
+			return ""
+		}
+		executable = fields[0]
+		args = strings.TrimSpace(command[len(executable):])
+	}
+	base := filepath.Base(strings.ReplaceAll(executable, `\`, `/`))
+	if !strings.EqualFold(base, "msiexec.exe") && !strings.EqualFold(base, "msiexec") {
+		return ""
+	}
+	match := msiProductCodePattern.FindStringSubmatch(args)
+	if len(match) != 2 {
+		return ""
+	}
+	return strings.ToUpper(match[1])
+}
+
+func windowsMSIUninstallAttempt(name, version string) (*uninstallAttempt, error) {
+	items, err := softwareInventoryFn()
+	if err != nil {
+		// The other providers can still be tried; their post-condition check
+		// will fail closed if inventory remains unavailable.
+		return nil, nil
+	}
+	codes := make(map[string]struct{})
+	for _, item := range items {
+		if !strings.EqualFold(strings.TrimSpace(item.Name), name) ||
+			(version != "" && !strings.EqualFold(strings.TrimSpace(item.Version), version)) {
+			continue
+		}
+		if code := msiProductCode(item.UninstallString); code != "" {
+			codes[code] = struct{}{}
+		}
+	}
+	if len(codes) > 1 {
+		return nil, fmt.Errorf("multiple MSI products match %q version %q; refusing an ambiguous uninstall", name, version)
+	}
+	for code := range codes {
+		return &uninstallAttempt{command: "msiexec.exe", args: []string{"/x", code, "/qn", "/norestart"}}, nil
+	}
+	return nil, nil
 }
 
 func safeMacOSApplicationPath(name string) (string, error) {
