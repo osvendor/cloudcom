@@ -32,6 +32,7 @@ import { monitorDefinitionRoutes } from './routes/monitorDefinitions';
 import { alertRoutes } from './routes/alerts';
 import { alertTemplateRoutes } from './routes/alertTemplates';
 import { ticketsRoutes } from './routes/tickets';
+import { callerVerificationRoutes } from './routes/callerVerification';
 import { mailboxRoutes } from './routes/tickets/mailboxConnect';
 import { catalogRoutes } from './routes/catalog';
 import { emailWebhookRoutes } from './routes/tickets/emailWebhook';
@@ -839,6 +840,10 @@ api.route('/alert-templates', alertTemplateRoutes);
 // token). The callback authenticates via signed state + binding cookie instead.
 api.route('/tickets/mailbox', mailboxRoutes);
 api.route('/tickets', ticketsRoutes);
+// Caller verification (#6354 W01): mounted at the root because its paths
+// span /orgs/:orgId/…, /partner/… and /orgs/:orgId/tickets/:ticketId/…; the
+// router gates itself (404 while CALLER_VERIFICATION_ENABLED !== 'true').
+api.route('/', callerVerificationRoutes);
 api.route('/catalog', catalogRoutes);
 // Public, token-gated invoice view-and-pay (no auth) — MUST precede the
 // auth-gated /invoices router so the unauthenticated /invoices/public/* sub-path
@@ -1685,6 +1690,9 @@ async function bootstrap(): Promise<void> {
   await initializeDatabaseForStartup({
     autoMigrateEnabled: process.env.AUTO_MIGRATE !== 'false',
     production: config.NODE_ENV === 'production',
+    // #6605: report retirements this upgrade crosses before migrating, and
+    // record the running version after. Report-only; never blocks boot.
+    upgradeChecks: true,
   });
   // Migrations may have changed role_permissions (W02 seeded agreements:* and
   // back-filled it onto every role holding the equivalent contracts grant), and

@@ -400,6 +400,7 @@ The authoritative list of assignable permissions is also available at runtime vi
 | `access` | Start a remote access session |
 | `export` | Export data (audit logs, reports, invoices) |
 | `send` | Send an invoice or quote to a customer |
+| `accept` | Record a customer's acceptance on their behalf (phone, email, signed PO) and convert the quote to an invoice. Granted automatically to every role that already held `send` when upgrading; revoke it if you want acceptance narrower than sending. |
 | `fulfill` | Mark a quote fulfilled |
 | `admin` | Full administration of a resource (SSO, ticket mailbox) |
 | `accept_risk` | Accept a vulnerability finding's risk |
@@ -410,7 +411,7 @@ The authoritative list of assignable permissions is also available at runtime vi
 There is no `view` or `update` action -- read access is `read`, and a write/create/update is `write` (or `create` for the one resource, `agent_rollback`, that uses it). Additionally, the wildcard permission `*:*` grants full administrative access.
 
 <Aside type="note">
-  Opening and using the AI assistant (chat sessions, your own session history, the org's AI usage figures) requires `ai_sessions:use`. It is granted by default to **Org Admin**, **Org Technician** and **Partner Technician**; Partner Admin holds it through `*:*`. Viewer and billing roles do not get it, and the assistant button is hidden for them. The permission only opens the conversation: every tool the assistant calls is checked against the same permission its HTTP route requires, so it cannot do anything the user could not do by hand. Setting the org's AI budget and flagging another user's session still need `organizations:write`. **Upgrading:** built-in roles receive the new key automatically; a custom role that was given `organizations:write` specifically so its users could open the assistant must be granted `ai_sessions:use` under **Settings → Users & Roles**, or its users lose chat.
+  Opening and using the AI assistant (chat sessions, your own session history, the org's AI usage figures) requires `ai_sessions:use`. It is granted by default to **Org Admin**, **Org Technician** and **Partner Technician**; Partner Admin holds it through `*:*`. Viewer and billing roles do not get it, and the assistant button, the **AI Assistant** navigation entry and the `/workspace` page are all hidden for them. The permission only opens the conversation: every tool the assistant calls is checked against the same permission its HTTP route requires, so it cannot do anything the user could not do by hand. Setting the org's AI budget and flagging another user's session still need `organizations:write`. **Upgrading:** built-in roles receive the new key automatically; a custom role that was given `organizations:write` specifically so its users could open the assistant must be granted `ai_sessions:use` under **Settings → Users & Roles**, or its users lose chat.
 </Aside>
 
 <Aside type="note">
@@ -466,6 +467,7 @@ The following named permission constants (`packages/shared/src/constants/permiss
 | `QUOTES_READ` | `quotes` | `read` |
 | `QUOTES_WRITE` | `quotes` | `write` |
 | `QUOTES_SEND` | `quotes` | `send` |
+| `QUOTES_ACCEPT` | `quotes` | `accept` |
 | `QUOTES_FULFILL` | `quotes` | `fulfill` |
 | `TIME_ENTRIES_READ` | `time_entries` | `read` |
 | `TIME_ENTRIES_WRITE` | `time_entries` | `write` |

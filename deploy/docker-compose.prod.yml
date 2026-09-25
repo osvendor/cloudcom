@@ -42,6 +42,7 @@ x-api-env: &api-env
   DB_WEDGED_BACKEND_SCAN_DISABLED: ${DB_WEDGED_BACKEND_SCAN_DISABLED:-}
   DB_WEDGED_BACKEND_SCAN_INTERVAL_MS: ${DB_WEDGED_BACKEND_SCAN_INTERVAL_MS:-}
   DB_WEDGED_BACKEND_MIN_AGE_MS: ${DB_WEDGED_BACKEND_MIN_AGE_MS:-}
+  DB_WEDGED_BACKEND_SCANNER_RECLAIM_DISABLED: ${DB_WEDGED_BACKEND_SCANNER_RECLAIM_DISABLED:-}
   DB_WEDGED_BACKEND_RECLAIM_DISABLED: ${DB_WEDGED_BACKEND_RECLAIM_DISABLED:-}
   DB_WEDGED_BACKEND_RECLAIM_MIN_INTERVAL_MS: ${DB_WEDGED_BACKEND_RECLAIM_MIN_INTERVAL_MS:-}
   DB_WEDGED_BACKEND_RECLAIM_MAX_PER_PASS: ${DB_WEDGED_BACKEND_RECLAIM_MAX_PER_PASS:-}
@@ -404,6 +405,8 @@ x-api-env: &api-env
   # Empty === unset for both readers, so unset keeps the code defaults.
   EXCHANGE_RATE_SYNC_ENABLED: ${EXCHANGE_RATE_SYNC_ENABLED:-}
   FRANKFURTER_BASE_URL: ${FRANKFURTER_BASE_URL:-}
+  # Caller verification (#6354): exact-'true' readiness flag, default off.
+  CALLER_VERIFICATION_ENABLED: ${CALLER_VERIFICATION_ENABLED:-false}
   # Readiness cache + dependency-probe bounds. Empty === unset, so the
   # `${VAR:-}` form keeps the clamped code defaults (5000 / 3000 ms). Both
   # MUST be listed here: compose only interpolates vars named in this block,

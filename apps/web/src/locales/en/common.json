@@ -97,7 +97,8 @@
     "sectionServiceDesk": "Service Desk",
     "serviceManagement": "Service Management",
     "ticketing": "Ticketing",
-    "deliverableTemplates": "Deliverable Templates"
+    "deliverableTemplates": "Deliverable Templates",
+    "securityScans": "IOC Scans"
   },
   "documentTitles": {
     "dashboard": "Dashboard",
@@ -2539,5 +2540,11 @@
     "message": "Multi-factor authentication is not required for your team. Password-only sessions can run scripts, move devices and change policies.",
     "cta": "Require MFA",
     "dismiss": "Dismiss the MFA policy reminder for today"
+  },
+  "inheritedField": {
+    "inheritsFrom": "Inherits from {{source}}",
+    "noneConfigured": "No {{source}} configured",
+    "overriding": "Overrides {{source}}",
+    "overridingWithValue": "Overrides {{source}} ({{value}})"
   }
 }

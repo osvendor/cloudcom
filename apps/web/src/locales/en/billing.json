@@ -1178,7 +1178,51 @@
       "shareLinkNewLinkOriginalLive": "Copied a NEW link. This proposal predates link tracking, so the link the customer already had could not be reused; it still works alongside this one.",
       "shareLinkNewLinkOriginalDead": "Copied a NEW link. The previous link can no longer be opened, so anyone holding it must use this one.",
       "currencyMismatch": "This quote is in {{documentCurrency}} but your Stripe account settles in {{accountCurrency}}. Stripe will present {{documentCurrency}} to the customer and convert it on settlement — you bear the FX spread and any conversion fee.",
-      "currencyUnknown": "Your Stripe account's settlement currency hasn't been cached, so it couldn't be checked against this {{documentCurrency}} quote. Refresh your Stripe account details under Settings → Integrations to enable the mismatch check."
+      "currencyUnknown": "Your Stripe account's settlement currency hasn't been cached, so it couldn't be checked against this {{documentCurrency}} quote. Refresh your Stripe account details under Settings → Integrations to enable the mismatch check.",
+      "acceptOnBehalf": {
+        "button": "Accept on behalf",
+        "title": "Record the customer's acceptance",
+        "methodLabel": "How did they agree?",
+        "method": {
+          "verbal": "Verbally / by phone",
+          "email": "By email",
+          "signed_document": "Signed document",
+          "purchase_order": "Purchase order",
+          "other": "Other"
+        },
+        "referenceLabel": "Reference",
+        "referenceHelp": "Where a reviewer would find the customer's agreement — a PO number, an email and date, or a ticket.",
+        "signerNameLabel": "Who agreed",
+        "signerEmailLabel": "Their email (optional)",
+        "consequenceInvoice": "An invoice for {{amount}} will be issued and numbered now.",
+        "consequenceContracts": "Recurring lines become draft contracts you activate later.",
+        "consequenceEmail": "The invoice will be emailed to the customer.",
+        "consequenceDraft": "This quote was never sent. The customer's first sight of it will be the invoice.",
+        "submit": "Accept and issue invoice",
+        "success": "Quote accepted. Invoice {{number}} issued.",
+        "error": "Could not record the acceptance.",
+        "successDraftInvoice": "Quote accepted. Invoice created as a draft.",
+        "errorContractVariablesUnresolved": "This quote's contract still needs values for: {{names}}. Close this dialog, fill them in below, then try again.",
+        "errorContractVariablesUnresolvedGeneric": "This quote's contract has unresolved variables. Close this dialog, fill them in below, then try again.",
+        "errorDepositInvalid": "This quote's deposit can't be collected as configured. Close this dialog, fix the deposit settings below, then try again.",
+        "evidenceLabel": "Evidence file (optional)",
+        "evidenceHelp": "PDF, PNG or JPEG, up to 10 MB — e.g. the signed PO or document.",
+        "evidenceTooLarge": "This file is larger than 10 MB. Choose a smaller file.",
+        "evidenceAttached": "Evidence attached.",
+        "evidenceError": "The acceptance was recorded, but the evidence file could not be attached. Attach it from the quote page."
+      },
+      "declineOnBehalf": {
+        "button": "Decline on behalf",
+        "title": "Record the customer's decline",
+        "methodLabel": "How did they decline?",
+        "referenceLabel": "Reference",
+        "referenceHelp": "Where a reviewer would find the customer's decline — an email and date, a call note, or a ticket.",
+        "reasonLabel": "Their reason (optional)",
+        "consequence": "The quote will be marked declined and can no longer be accepted. Revise it to send the customer a new version.",
+        "submit": "Mark declined",
+        "success": "Quote marked declined.",
+        "error": "Could not record the decline."
+      }
     },
     "detail": {
       "addContentInEditor": "Add content in the Editor",
@@ -1303,6 +1347,18 @@
         "inProgressTitle": "A revision of this quote is being drafted — sending it will replace this quote and disable the customer’s link:",
         "revisionOfTitle": "Revision of",
         "untitled": "a newer version"
+      },
+      "acceptedOnBehalf": "Accepted on behalf of {{signer}} by {{recorder}} on {{date}} · {{method}} · {{reference}}",
+      "deletedUser": "a deleted user",
+      "evidence": {
+        "download": "Download evidence",
+        "downloadTitle": "Download {{filename}}",
+        "attach": "Attach evidence",
+        "replace": "Replace evidence",
+        "attached": "Evidence attached.",
+        "attachError": "Could not attach the evidence file.",
+        "downloadError": "Could not download the evidence file.",
+        "tooLarge": "This file is larger than 10 MB. Choose a smaller file."
       }
     },
     "currency": {
@@ -1952,6 +2008,8 @@
       "unitPrice": "Unit price"
     },
     "terms": "Terms & Conditions",
+    "ticketHeader": "Ticket #{{number}}",
+    "ticketWork": "Ticket work",
     "totals": {
       "amountDue": "Amount due",
       "paid": "Paid",
@@ -2140,7 +2198,6 @@
     "saveSuccess": "Organization billing settings saved",
     "tax": {
       "partnerDefault": "Partner default",
-      "partnerDefaultWithValue": "{{pct}}% (partner default)",
       "taxExempt": "Tax exempt",
       "taxId": "Tax ID",
       "taxRate": "Tax rate (%)",
@@ -2171,6 +2228,8 @@
       "autoTaxHardwareHelp": "Newly imported hardware defaults to taxable.",
       "autoEmailInvoice": "Email the invoice automatically when a quote is accepted",
       "autoEmailInvoiceHelp": "When a customer accepts a proposal, the issued invoice is emailed right away with a secure view & pay link — no sign-in needed.",
+      "notifyOnBehalfAcceptance": "Email the customer when you record an acceptance on their behalf",
+      "notifyOnBehalfAcceptanceHelp": "When someone on your team accepts a quote for a customer, the customer gets a short note saying who recorded it and when, with the invoice number if one was issued. They can reply if it's wrong. Off by default.",
       "currencyCode": "Currency code",
       "defaultMarkup": "Default markup (%)",
       "defaultTaxRate": "Default tax rate (%)",

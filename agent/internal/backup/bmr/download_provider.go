@@ -34,6 +34,23 @@ const (
 	downloadRetryMaxDelay     = 30 * time.Second
 	downloadRetryMaxTotalWait = 5 * time.Minute
 
+	// downloadTransportMaxAttempts bounds retries of a TRANSPORT-class
+	// failure (connection reset/refused, unexpected EOF mid-body, the
+	// per-request client timeout) — D-W09-3 (#6491 KIT lab): a 4 h 01 m,
+	// 107,636-file rebuild died on ONE file whose presigned GET failed with
+	// `context deadline exceeded`, which carries no HTTP status and so was
+	// classified permanent after a single attempt. Transport errors follow
+	// the same exponential schedule as 429/503 but are attempt-bounded, not
+	// time-bounded: the backoff itself costs 1+2+4 s per file, and each
+	// attempt is additionally bounded by whatever the transport takes to
+	// fail — instant for a refused connection, the dial timeout for a
+	// black-holed host, and up to noAuthRedirectClient.Timeout (30 min) for
+	// a server that accepts the connection and never finishes. The
+	// consecutive-failure breaker in bmr.go still stops the run. A failure
+	// that is the PARENT context being cancelled is never retried — see
+	// downloadWithRetry.
+	downloadTransportMaxAttempts = 4
+
 	// downloadMaxRedirectHops bounds how many redirect hops downloadOnce
 	// will follow for a single object: the first redirect (typically a 302
 	// handing back a presigned storage URL) is always followed, plus up to
@@ -95,6 +112,24 @@ func (e *downloadStatusError) Error() string {
 func (e *downloadStatusError) Is(target error) bool {
 	return e.statusCode == http.StatusNotFound && target == providers.ErrObjectNotFound
 }
+
+// downloadTransportError is a download attempt that failed before or while
+// reading the body without an HTTP status to branch on: the initial
+// request, a redirect hop, or the body copy itself (connection reset,
+// unexpected EOF, per-request client timeout). It is what makes a
+// transport failure distinguishable from the typed status failures above
+// and from local errors (destination file creation, descriptor shape),
+// which are NOT transport-class and are never retried.
+type downloadTransportError struct {
+	stage string // "request", "redirect", "body"
+	cause error
+}
+
+func (e *downloadTransportError) Error() string {
+	return fmt.Sprintf("bmr: download %s failed: %v", e.stage, e.cause)
+}
+
+func (e *downloadTransportError) Unwrap() error { return e.cause }
 
 // isRetryableDownloadStatus reports whether a status is a transient
 // condition worth retrying with backoff. Any other 4xx (401/403/404/etc.) is
@@ -191,7 +226,7 @@ func (p *recoveryDownloadProvider) followDownloadRedirects(resp *http.Response, 
 
 		redirectResp, err := noAuthRedirectClient.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("bmr: download redirect request failed: %w", err)
+			return nil, &downloadTransportError{stage: "redirect request", cause: err}
 		}
 
 		resp = redirectResp
@@ -233,19 +268,80 @@ type recoveryDownloadProvider struct {
 
 	// now is the clock seam for tests.
 	now func() time.Time
+
+	// admissible holds exact external object keys widened into scope by
+	// bmr.ApplyManifestScope (scope.go, Task 10) after the manifest is
+	// downloaded. Guarded by mu, same as descriptor/generation. Keys are
+	// never removed — only ever added — for the life of the provider.
+	admissible map[string]struct{}
+	// membership mirrors HasCapability(descriptor.Capabilities,
+	// CapabilitySnapshotFileMembershipV1) at construction/last swap time.
+	membership bool
 }
 
 func newRecoveryDownloadProvider(ctx context.Context, serverURL, token string, descriptor *AuthenticatedDownloadDescriptor) *recoveryDownloadProvider {
+	d := rewriteDescriptorOrigin(serverURL, descriptor)
 	return &recoveryDownloadProvider{
 		ctx:        ctx,
 		serverURL:  serverURL,
 		token:      token,
-		descriptor: rewriteDescriptorOrigin(serverURL, descriptor),
+		descriptor: d,
 		// The bootstrap carrying descriptor was authenticated just before
 		// the provider is built (authenticate or exchange).
 		lastAuthAt: time.Now(),
 		now:        time.Now,
+		admissible: make(map[string]struct{}),
+		membership: d != nil && HasCapability(d.Capabilities, CapabilitySnapshotFileMembershipV1),
 	}
+}
+
+// ErrCapabilityDowngrade is returned by authenticateAndSwap when a session
+// refresh's fresh descriptor no longer grants
+// CapabilitySnapshotFileMembershipV1 but the provider had already negotiated
+// it — the admissible set built from the old descriptor could then admit
+// keys the server no longer authorizes. The previous descriptor is kept in
+// place; the caller (bmr.go / rebuild_cmd.go) treats this as a hard refusal.
+var ErrCapabilityDowngrade = errors.New("bmr: server dropped snapshot-file-membership-v1 on session refresh")
+
+// MembershipNegotiated reports whether the current descriptor grants
+// CapabilitySnapshotFileMembershipV1.
+func (p *recoveryDownloadProvider) MembershipNegotiated() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.membership
+}
+
+// ExtendAdmissible widens the admissible set with exact external object
+// keys. It does not itself check MembershipNegotiated — downloadOnce and
+// Admits are the enforcement points, so a caller that widens the set on a
+// non-membership provider still cannot download anything through it.
+func (p *recoveryDownloadProvider) ExtendAdmissible(keys []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, k := range keys {
+		p.admissible[k] = struct{}{}
+	}
+}
+
+// Admits reports whether key is a member of the admissible set under an
+// active membership grant. It is the exact predicate downloadOnce uses for
+// external keys and must be called while NOT already holding p.mu (it
+// acquires its own read lock).
+func (p *recoveryDownloadProvider) Admits(key string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.descriptor != nil {
+		normalizedKey := strings.TrimLeft(pathClean(key), "/")
+		normalizedPrefix := strings.Trim(p.descriptor.PathPrefix, "/")
+		if normalizedPrefix != "" && (normalizedKey == normalizedPrefix || strings.HasPrefix(normalizedKey, normalizedPrefix+"/")) {
+			return true
+		}
+	}
+	if !p.membership {
+		return false
+	}
+	_, ok := p.admissible[key]
+	return ok
 }
 
 // rewriteDescriptorOrigin makes the download descriptor's URL target the
@@ -378,42 +474,71 @@ func isSessionExpired(err error) bool {
 
 // downloadWithRetry retries downloadOnce with exponential backoff on a
 // transient status (429/502/503/504), honoring the server's Retry-After
-// header when present instead of the internal schedule. It keeps retrying
-// until it has waited at least downloadRetryMaxTotalWait cumulative time,
-// then gives up. Non-retryable errors (including 401, left for Download's
-// session refresh, and any non-HTTP error) return
-// immediately on the first attempt.
+// header when present instead of the internal schedule, and on a
+// transport-class failure (downloadTransportError — D-W09-3). A status
+// failure keeps retrying until it has waited at least
+// downloadRetryMaxTotalWait cumulative time; a transport failure is
+// bounded to downloadTransportMaxAttempts attempts. Anything else — a
+// permanent 4xx (401 is left for Download's session refresh), a local
+// file error, a descriptor problem — returns immediately on the first
+// attempt. A transport failure observed while p.ctx is already done is
+// the parent recovery being cancelled, not the network: it returns
+// immediately with ctx.Err() wrapped, never a backoff, never a second
+// request.
 func (p *recoveryDownloadProvider) downloadWithRetry(remotePath, localPath string) error {
 	delay := downloadRetryInitialDelay
 	var totalWaited time.Duration
 	var retried bool
+	attempts := 0
 
 	for {
+		attempts++
 		err := p.downloadOnce(remotePath, localPath)
 		if err == nil {
 			if retried {
-				slog.Info("bmr: download succeeded after retry", "path", remotePath)
+				slog.Info("bmr: download succeeded after retry", "path", remotePath, "attempts", attempts)
 			}
 			return nil
 		}
 
 		var statusErr *downloadStatusError
-		if !errors.As(err, &statusErr) || !isRetryableDownloadStatus(statusErr.statusCode) {
+		var transportErr *downloadTransportError
+		var wait time.Duration
+		var why string
+		switch {
+		case errors.As(err, &statusErr):
+			if !isRetryableDownloadStatus(statusErr.statusCode) {
+				return err
+			}
+			if totalWaited >= downloadRetryMaxTotalWait {
+				return fmt.Errorf("bmr: download retries exhausted after %s: %w", totalWaited.Round(time.Second), err)
+			}
+			wait = delay
+			if statusErr.retryAfter > 0 {
+				wait = statusErr.retryAfter
+			}
+			why = fmt.Sprintf("status %d", statusErr.statusCode)
+		case errors.As(err, &transportErr):
+			if ctxErr := p.ctx.Err(); ctxErr != nil {
+				// The parent recovery context is done — this "transport
+				// error" is our own cancellation surfacing through net/http.
+				return fmt.Errorf("bmr: download cancelled: %w (%w)", ctxErr, err)
+			}
+			if attempts >= downloadTransportMaxAttempts {
+				return fmt.Errorf("bmr: download transport retries exhausted after %d attempts: %w", attempts, err)
+			}
+			wait = delay
+			why = "transport: " + transportErr.cause.Error()
+		default:
 			return err
 		}
 
-		if totalWaited >= downloadRetryMaxTotalWait {
-			return fmt.Errorf("bmr: download retries exhausted after %s: %w", totalWaited.Round(time.Second), err)
-		}
-
-		wait := delay
-		if statusErr.retryAfter > 0 {
-			wait = statusErr.retryAfter
-		}
-
-		if !retried {
+		// Status retries log once per file (a 429 storm would otherwise
+		// flood the log); transport retries are few and each one is a
+		// distinct symptom of a flaky path, so log every attempt.
+		if !retried || transportErr != nil {
 			slog.Warn("bmr: download failed, retrying with backoff",
-				"path", remotePath, "status", statusErr.statusCode, "wait", wait)
+				"path", remotePath, "attempt", attempts, "reason", why, "wait", wait)
 			retried = true
 		}
 
@@ -453,8 +578,11 @@ func (p *recoveryDownloadProvider) downloadOnce(remotePath, localPath string) er
 
 	normalizedRemotePath := strings.TrimLeft(pathClean(remotePath), "/")
 	normalizedPrefix := strings.Trim(descriptor.PathPrefix, "/")
-	if normalizedRemotePath != normalizedPrefix && !strings.HasPrefix(normalizedRemotePath, normalizedPrefix+"/") {
-		return fmt.Errorf("bmr: requested path %q is outside allowed prefix %q", remotePath, descriptor.PathPrefix)
+	ownPrefix := normalizedPrefix + "/"
+	if normalizedRemotePath != normalizedPrefix && !strings.HasPrefix(normalizedRemotePath, ownPrefix) {
+		if !p.Admits(remotePath) {
+			return fmt.Errorf("bmr: requested path %q is not an authorized object of snapshot %q", remotePath, normalizedPrefix)
+		}
 	}
 
 	requestURL, err := url.Parse(descriptor.URL)
@@ -487,7 +615,7 @@ func (p *recoveryDownloadProvider) downloadOnce(remotePath, localPath string) er
 
 	resp, err := noAuthRedirectClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("bmr: download request failed: %w", err)
+		return &downloadTransportError{stage: "request", cause: err}
 	}
 
 	resp, err = p.followDownloadRedirects(resp, req.URL)
@@ -517,6 +645,20 @@ func (p *recoveryDownloadProvider) downloadOnce(remotePath, localPath string) er
 	_, copyErr := io.Copy(file, resp.Body)
 	closeErr := file.Close()
 	if copyErr != nil {
+		// io.Copy's error is either a read failure on resp.Body (the
+		// connection dropped or timed out mid-body — transport-class and
+		// worth a retry, D-W09-3) or a write failure on the local file (disk
+		// full, I/O error — retrying cannot help). io.Copy does not wrap the
+		// two distinguishably, so ask the body: the same failure that broke
+		// the copy is still there on a follow-up read, while a healthy body
+		// means the write side failed.
+		// Either way the destination holds a truncated object: remove it so a
+		// final failure never leaves a half-written file at the restore
+		// target for restore.go/bmr.go to count as present.
+		_ = os.Remove(localPath)
+		if _, probe := resp.Body.Read(make([]byte, 1)); probe != nil && probe != io.EOF {
+			return &downloadTransportError{stage: "body read", cause: copyErr}
+		}
 		return fmt.Errorf("bmr: write downloaded file: %w", copyErr)
 	}
 	if closeErr != nil {

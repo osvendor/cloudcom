@@ -23,6 +23,9 @@ describe('isSelfManagedDbContextRoute', () => {
     ['POST', '/api/v1/portal/quotes/def-456/pay'],
     ['POST', '/api/v1/portal/quotes/def-456/pay/'],
     ['post', '/api/v1/portal/quotes/def-456/pay'], // method is case-insensitive
+    ['GET', '/api/v1/portal/network/overview'],
+    ['GET', '/api/v1/portal/network/overview/'],
+    ['get', '/api/v1/portal/network/overview'], // method is case-insensitive
     ['POST', '/api/v1/partner/stripe-connect/key'],
     ['POST', '/api/v1/partner/stripe-connect/key/'],
     ['GET', '/api/v1/partner/stripe-connect'],
@@ -145,6 +148,11 @@ describe('isSelfManagedDbContextRoute', () => {
     ['POST', '/api/v1/quotes/abc-123/resend'],
     ['POST', '/api/v1/quotes/abc-123/resend/'],
     ['post', '/api/v1/quotes/abc-123/resend'], // method is case-insensitive
+    // Accept on behalf (spec 2026-09-21) — the accept runs in its own system
+    // context; the ambient request tx would pin a second pooled connection.
+    ['POST', '/api/v1/quotes/abc-123/accept-on-behalf'],
+    ['POST', '/api/v1/quotes/abc-123/accept-on-behalf/'],
+    ['post', '/api/v1/quotes/abc-123/accept-on-behalf'], // method is case-insensitive
     // Task A9 — the tool test-call route dispatches a real outbound MCP call.
     ['POST', '/api/v1/tool-sources'],
     ['PATCH', '/api/v1/tool-sources/src-1'],
@@ -159,6 +167,14 @@ describe('isSelfManagedDbContextRoute', () => {
     ['POST', '/api/v1/agent-versions/sync-github'],
     ['POST', '/api/v1/agent-versions/sync-github/'],
     ['post', '/api/v1/agent-versions/sync-github'], // method is case-insensitive
+    // #6008 W01 — the three backup-provider routes that call Cove inside the handler.
+    ['POST', '/api/v1/backup/providers/connections'],
+    ['POST', '/api/v1/backup/providers/connections/'],
+    ['PATCH', '/api/v1/backup/providers/connections/conn-1'],
+    ['PATCH', '/api/v1/backup/providers/connections/conn-1/'],
+    ['POST', '/api/v1/backup/providers/connections/conn-1/test'],
+    ['POST', '/api/v1/backup/providers/connections/conn-1/test/'],
+    ['post', '/api/v1/backup/providers/connections/conn-1/test'], // method is case-insensitive
   ];
 
   const NO_MATCH: ReadonlyArray<[string, string, string]> = [
@@ -175,6 +191,7 @@ describe('isSelfManagedDbContextRoute', () => {
     ['POST', '/api/v1/quotes//send', 'empty id segment must not match'],
     ['POST', '/api/v1/quotes/abc-123/send/extra', 'extra path segment must not match'],
     ['GET', '/api/v1/quotes/abc-123/share-link', 'share-link mails nothing and keeps the ambient tx'],
+    ['GET', '/api/v1/quotes/abc-123/accept-on-behalf', 'accept-on-behalf is POST-only'],
     ['GET', '/api/v1/invoices/abc-123/pay-link', 'wrong method (only POST opts out)'],
     ['GET', '/api/v1/portal/invoices/def-456/pay', 'wrong method'],
     ['POST', '/api/v1/invoices/abc-123', 'invoice route without /pay-link'],
@@ -187,6 +204,9 @@ describe('isSelfManagedDbContextRoute', () => {
     ['POST', '/api/v1/portal/quotes/def-456/accept', 'accept/decline are DB-only and keep the ambient org tx'],
     ['POST', '/api/v1/portal/quotes/def-456/decline', 'accept/decline are DB-only and keep the ambient org tx'],
     ['POST', '/api/v1/portal/quotes//pay', 'empty id segment must not match'],
+    ['POST', '/api/v1/portal/network/overview', 'network overview is GET-only'],
+    ['GET', '/api/v1/portal/network', 'only the overview endpoint is self-managed'],
+    ['GET', '/api/v1/portal/network/overview/extra', 'extra path segment must not match'],
     ['POST', '/api/v1/portal/quotes/def-456/pay/confirm', 'deeper portal quote path must not match'],
     ['POST', '/api/v1/invoices', 'collection route'],
     ['DELETE', '/api/v1/partner/stripe-connect', 'disconnect is DB-only and keeps the ambient transaction'],
@@ -322,6 +342,17 @@ describe('isSelfManagedDbContextRoute', () => {
     ['DELETE', '/api/v1/monitoring/assets/11111111-1111-4111-8111-111111111111/snmp', 'snmp delete is DB-only'],
     ['PUT', '/api/v1/monitoring/assets/11111111-1111-4111-8111-111111111111', 'asset update is DB-only'],
     ['PUT', '/api/v1/monitoring/assets/11111111-1111-4111-8111-111111111111/snmp/extra', 'extra segment must not match'],
+    // The provider routes that do only DB work MUST keep the ambient tx —
+    // losing it would put their writes on the bare pool with no RLS GUC, where
+    // forced RLS silently affects 0 rows (#1375).
+    ['GET', '/api/v1/backup/providers/connections', 'listing is DB-only'],
+    ['POST', '/api/v1/backup/providers/connections/conn-1/sync', 'sync only enqueues'],
+    ['DELETE', '/api/v1/backup/providers/connections/conn-1', 'delete makes no outbound call'],
+    ['PUT', '/api/v1/backup/providers/customers/cust-1/mapping', 'remap is DB-only'],
+    ['PUT', '/api/v1/backup/providers/devices/dev-1/link', 'manual link is DB-only'],
+    ['POST', '/api/v1/backup/providers/connections//test', 'empty connection id must not match'],
+    ['POST', '/api/v1/backup/providers/connections/conn-1/test/extra', 'extra segment must not match'],
+    ['GET', '/api/v1/backup/providers/connections/conn-1/test', 'test is POST-only'],
   ];
 
   const SNMP_MATCH: ReadonlyArray<[string, string]> = [
@@ -365,3 +396,18 @@ describe('isSelfManagedDbContextRoute', () => {
     expect(isSelfManagedDbContextRoute('GET', '/api/v1/portal/remote/devices')).toBe(false);
     expect(isSelfManagedDbContextRoute('POST', `/api/v1/portal/remote/sessions/${id}/other`)).toBe(false);
   });
+
+// Caller verification (#6354 W01): only the three Graph-backed operations own
+// their DB context; every other verification route keeps the ambient tx.
+it.each([['GET', 'caller-verification-directory-users'], ['POST', 'caller-verification-directory-sync']])('self-manages %s %s', (method, path) => {
+  expect(isSelfManagedDbContextRoute(method, `/api/v1/orgs/o/${path}`)).toBe(true);
+  expect(isSelfManagedDbContextRoute(method === 'GET' ? 'POST' : 'GET', `/api/v1/orgs/o/${path}`)).toBe(false);
+});
+
+it('self-manages the Graph binding POST but not ordinary verification writes', () => {
+  const path = '/api/v1/orgs/o/contacts/c/caller-verification-bindings';
+  expect(isSelfManagedDbContextRoute('POST', path)).toBe(true);
+  expect(isSelfManagedDbContextRoute('DELETE', `${path}/b`)).toBe(false);
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/orgs/o/caller-verifications')).toBe(false);
+  expect(isSelfManagedDbContextRoute('PUT', '/api/v1/orgs/o/caller-verification-policy')).toBe(false);
+});

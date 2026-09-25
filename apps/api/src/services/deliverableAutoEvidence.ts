@@ -52,8 +52,10 @@ import {
   type EvidenceRunContext,
   type ReportResult,
 } from './reportGenerationService';
+import { organizationScope } from './reportScope';
 import { previousOccurrenceBaselineFor } from './evidenceBaseline';
 import { isManagedEvidenceType, type ManagedEvidenceType } from './managedEvidenceRegistry';
+import { isMspStaffReportType } from './reportRegistry';
 import { captureException } from './sentry';
 import {
   decodeSiteScope, intersectSiteScopes, persistedSiteScopeValues, persistedSystemSiteScopeValues,
@@ -67,7 +69,8 @@ export const AUTO_EVIDENCE_TICKET_NOTE = 'Report attached, review and resolve';
 export type AutoEvidenceRefusal =
   | 'already_attached' | 'not_due' | 'definition_not_found'
   | 'system_principal_definition' | 'portal_user_principal_definition'
-  | 'scope_unverifiable' | 'scope_no_intersection' | 'scope_empty' | 'generation_failed';
+  | 'scope_unverifiable' | 'scope_no_intersection' | 'scope_empty' | 'generation_failed'
+  | 'internal_report_type';
 
 /**
  * What the technician reads on the ticket when the nightly sweep could not build
@@ -85,6 +88,7 @@ export const AUTO_EVIDENCE_REFUSAL_NOTES: Record<AutoEvidenceRefusal, string | n
   scope_no_intersection: 'Automatic evidence could not be generated: the report definition is limited to sites the current owner cannot see. Widen the definition’s sites or re-save it under an owner with access.',
   scope_empty: 'Automatic evidence could not be generated: the report definition resolves to zero sites. Widen its site selection.',
   generation_failed: 'Automatic evidence could not be generated: the report run failed. Open the report definition and run it by hand to see the error.',
+  internal_report_type: 'Automatic evidence could not be generated: the linked report is an internal business report (SLA attainment, technician time, or AR aging), which is never attached as customer-visible evidence. Link a different report type.',
 };
 
 export type AutoEvidenceOutcome =
@@ -195,6 +199,16 @@ export async function generateAutoEvidenceForOccurrence(args: AutoEvidenceOccurr
   const [definition] = await db.select().from(reports)
     .where(and(eq(reports.id, args.reportId), eq(reports.orgId, args.orgId))).limit(1);
   if (!definition) return recordRefusal('definition_not_found');
+  // #3198 W02 ruling F1: business types (registry audience 'msp_staff') are
+  // internal to the MSP, and evidence can be customer-visible (portal). Refused
+  // before any run row or authority lookup; the deliverable loop logs it.
+  if (isMspStaffReportType(definition.type)) return recordRefusal('internal_report_type');
+  // #3198 W01: the WHERE above already pins this row to `reports.orgId =
+  // args.orgId` (a non-null `string`), so use `args.orgId` below instead of
+  // `definition.orgId`, which Drizzle still types `string | null` on the
+  // nullable column. This module only ever handles org-owned deliverable
+  // evidence definitions — a partner-owned row (`orgId: null`) can never
+  // satisfy that WHERE clause and so never reaches here.
 
   const config = (definition.config ?? {}) as Record<string, unknown>;
 
@@ -286,10 +300,10 @@ export async function generateAutoEvidenceForOccurrence(args: AutoEvidenceOccurr
       generatedAt: new Date().toISOString(),
       deliverableId: args.deliverableId,
     };
-    const authority = systemReportAuthorityFor(definition.orgId);
+    const authority = systemReportAuthorityFor(args.orgId);
     return runGenerator(
       persistedSystemSiteScopeValues(authority),
-      () => generateManagedEvidenceReport(definition.type as ManagedEvidenceType, definition.orgId, config, evidence),
+      () => generateManagedEvidenceReport(definition.type as ManagedEvidenceType, args.orgId, config, evidence),
     );
   }
 
@@ -300,11 +314,11 @@ export async function generateAutoEvidenceForOccurrence(args: AutoEvidenceOccurr
   if (!definition.executionScopeUserId) return recordRefusal('scope_unverifiable');
 
   let persistedScope;
-  try { persistedScope = decodeSiteScope(definition as unknown as PersistedSiteScopeColumns, definition.orgId); }
+  try { persistedScope = decodeSiteScope(definition as unknown as PersistedSiteScopeColumns, args.orgId); }
   catch { return recordRefusal('scope_unverifiable'); }
   if (persistedScope.kind === 'legacy_unscoped') return recordRefusal('scope_unverifiable');
 
-  const live = await resolveLiveReportAuthority(definition.executionScopeUserId, definition.orgId, 'read')
+  const live = await resolveLiveReportAuthority(definition.executionScopeUserId, args.orgId, 'read')
     .catch(() => ({ ok: false as const, reason: 'unverifiable_scope' as const }));
   if (!live.ok || live.authority.scope.kind === 'legacy_unscoped') return recordRefusal('scope_unverifiable');
 
@@ -318,11 +332,11 @@ export async function generateAutoEvidenceForOccurrence(args: AutoEvidenceOccurr
     principalUserId: live.authority.principalUserId, capturedAt: live.authority.capturedAt,
     fingerprint: siteScopeFingerprint(effectiveScope),
   };
-  try { assertReportExecutionPreflight(definition.orgId, config, authority, definition.type); }
+  try { assertReportExecutionPreflight(args.orgId, config, authority, definition.type); }
   catch { return recordRefusal('scope_unverifiable'); }
 
   return runGenerator(
     persistedSiteScopeValues(authority),
-    () => generateReport(definition.type, definition.orgId, config, authority),
+    () => generateReport(definition.type, organizationScope(args.orgId), config, authority),
   );
 }

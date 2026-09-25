@@ -125,6 +125,18 @@ export function remoteDesktopFenceRequired(): boolean {
   return envFlag('REMOTE_DESKTOP_FENCE_REQUIRED', false);
 }
 
+// Caller verification (anti-vishing, #6354). W01 ships the backend dark:
+// every caller-verification route returns 404 `feature_disabled` to an
+// AUTHENTICATED caller (auth runs first, so an anonymous request still gets
+// 401 — routerAuthGate.contract.test.ts requires that of every mounted route)
+// and the release gate refuses with `feature_disabled` while this is off. The
+// cross-wave contract is deliberately stricter than envFlag(): ONLY the exact
+// string 'true' enables it — '1' / 'yes' / 'on' / 'TRUE' stay off. Read at
+// CALL time so a test can flip it per-case without vi.resetModules().
+export function callerVerificationEnabled(): boolean {
+  return process.env.CALLER_VERIFICATION_ENABLED === 'true';
+}
+
 // #4442 W04 (AI sweeps act mode). A SUB-flag of
 // BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED, not a replacement for it: the sweep
 // lane widens autonomy to targets the run never established for itself (a
@@ -308,6 +320,18 @@ export function m365SyncMaxBacklog(): number {
 /** Rows claimed per tick (spec §5.2 step 3, §5.9 — this is the capacity dial). */
 export function m365SyncTickBatch(): number {
   return positiveIntEnv('M365_SYNC_TICK_BATCH', 200, 1, 5_000);
+}
+
+// Inbound email-to-ticket flood protection. The global BullMQ inbound-queue
+// processing ceiling (jobs per second) is backpressure: it bounds the RATE of
+// ticket creation across all senders, NOT the total. Over-rate jobs are delayed
+// (never dropped) and still processed, so a sustained flood is slowed, not
+// capped. (Per-sender/domain/partner sliding-window caps were considered but
+// deferred: no implementation can be both exact and avoid a held-transaction
+// Redis call under #1105; the rate ceiling here is the protection that ships.)
+/** Global BullMQ inbound-queue processing ceiling (jobs per second). */
+export function inboundQueueMaxPerSec(): number {
+  return positiveIntEnv('INBOUND_QUEUE_MAX_PER_SEC', 20, 1, 5_000);
 }
 
 // Breeze AI for Office (Excel add-in / client AI). The Entra application

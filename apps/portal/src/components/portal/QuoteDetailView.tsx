@@ -380,6 +380,20 @@ export function QuoteDetailView({ detail, error, statusCode }: QuoteDetailViewPr
           className="space-y-3 rounded-md bg-success/10 p-4 text-sm text-success-on-tint"
         >
           <p>{!msgError && msg ? msg : 'This proposal has been accepted.'}</p>
+          {quote.acceptanceOrigin === 'on_behalf' && (
+            // The customer never clicked anything — their provider recorded an
+            // agreement reached elsewhere. Saying so plainly is what makes the
+            // record honest from their side; the method and the reference are
+            // the provider's internal detail and are deliberately absent.
+            // Both values are nullable (unbranded portal / an acceptance whose
+            // accepted_at never landed), and a blank name or a dangling "on ."
+            // reads as a bug to the customer — fall back, and drop the date
+            // clause entirely rather than printing an empty one.
+            <p data-testid="quote-accepted-on-behalf">
+              Accepted on your behalf by {branding?.partnerName || 'your provider'}
+              {quote.acceptedAt ? ` on ${shortDate(quote.acceptedAt)}` : ''}.
+            </p>
+          )}
           <div className="flex flex-wrap items-center gap-3">
             {canPay && (
               <button

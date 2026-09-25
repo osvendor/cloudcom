@@ -521,13 +521,31 @@ describe('invoiceService guards', () => {
       lineTotal: '100',
     })).toEqual({
       ticketNumber: 'T-100',
+      ticketCategory: null,
       name: 'Support',
       description: 'Printer repair',
       quantity: '1',
       unitPrice: '100',
       taxable: false,
       lineTotal: '100',
+      workedMinutes: null,
     });
+  });
+
+  // #6467: worked/billed disclosure travels as structured data, not prose —
+  // the portal DTO must carry it so the note can render (and survive a
+  // description edit) exactly like the web/PDF renderers.
+  it('serializes workedMinutes through to the customer-safe line', () => {
+    expect(svc.toCustomerInvoiceLine({
+      ticketNumber: null,
+      name: null,
+      description: 'On-site',
+      quantity: '1.00',
+      unitPrice: '225.00',
+      taxable: false,
+      lineTotal: '225.00',
+      workedMinutes: 30,
+    })).toMatchObject({ workedMinutes: 30 });
   });
 
   it('joins tickets and scopes both sides to the invoice org', async () => {
@@ -536,12 +554,17 @@ describe('invoiceService guards', () => {
     }]);
     queueResult([]);
     await svc.getCustomerInvoice('invoice-1', 'org1');
-    const join = (db as unknown as { leftJoin: Mock }).leftJoin.mock.calls.at(-1)![1];
-    const compiledJoin = new PgDialect().sqlToQuery(join as SQL);
+    const ticketJoinCall = (db as unknown as { leftJoin: Mock }).leftJoin.mock.calls.find((call) => {
+      const q = new PgDialect().sqlToQuery(call[1] as SQL);
+      return q.sql.includes('"tickets"."id" = "invoice_lines"."ticket_id"');
+    })!;
+    expect(ticketJoinCall).toBeDefined();
+    const compiledJoin = new PgDialect().sqlToQuery(ticketJoinCall[1] as SQL);
     expect(compiledJoin.sql).toContain(
       '"tickets"."id" = "invoice_lines"."ticket_id"',
     );
     expect(compiledJoin.sql).toContain('"tickets"."org_id" =');
+    expect(compiledJoin.sql).toContain('"tickets"."deleted_at" is null');
     expect(compiledJoin.params).toContain('org1');
 
     const where = (db as unknown as { where: Mock }).where.mock.calls.at(-1)![0];
@@ -570,15 +593,17 @@ describe('invoiceService guards', () => {
       isUnapprovedTime: true,
       customerVisible: true,
       sortOrder: 0,
+      workedMinutes: null,
     }]);
 
     const result = await svc.getCustomerInvoice('i1', 'org1');
 
     expect(Object.keys(result.lines[0]!).sort()).toEqual([
-      'description', 'lineTotal', 'name', 'quantity', 'taxable', 'ticketNumber', 'unitPrice',
+      'description', 'lineTotal', 'name', 'quantity', 'taxable', 'ticketCategory', 'ticketNumber', 'unitPrice', 'workedMinutes',
     ]);
     expect(result.lines[0]).toEqual({
       ticketNumber: null,
+      ticketCategory: null,
       // Legacy line (source row carries no `name`): description stays the title.
       name: null,
       description: 'Customer-facing work',
@@ -586,6 +611,7 @@ describe('invoiceService guards', () => {
       unitPrice: '75.00',
       taxable: true,
       lineTotal: '150.00',
+      workedMinutes: null,
     });
   });
 
@@ -607,6 +633,7 @@ describe('invoiceService guards', () => {
       lineTotal: '1500.00',
       customerVisible: true,
       sortOrder: 0,
+      workedMinutes: null,
     }]);
 
     const result = await svc.getCustomerInvoice('i1', 'org1');
@@ -617,7 +644,7 @@ describe('invoiceService guards', () => {
     });
     // Still no internal columns leaked alongside the new field.
     expect(Object.keys(result.lines[0]!).sort()).toEqual([
-      'description', 'lineTotal', 'name', 'quantity', 'taxable', 'ticketNumber', 'unitPrice',
+      'description', 'lineTotal', 'name', 'quantity', 'taxable', 'ticketCategory', 'ticketNumber', 'unitPrice', 'workedMinutes',
     ]);
   });
 
@@ -657,6 +684,21 @@ describe('invoiceService guards', () => {
       actor
     );
     expect(row.autoTaxHardware).toBe(false);
+  });
+
+  it('#6635: updatePartnerBillingSettings writes and returns notifyCustomerOnBehalfAcceptance', async () => {
+    queueResult([{ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30, notifyCustomerOnBehalfAcceptance: true }]);
+    const actor = { userId: 'u1', partnerId: 'p1', accessibleOrgIds: null };
+    const row = await svc.updatePartnerBillingSettings(
+      { currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30, notifyCustomerOnBehalfAcceptance: true },
+      actor,
+    );
+    const setMock = (db as unknown as { set: { mock: { calls: unknown[][] } } }).set;
+    const setArg = setMock.mock.calls.at(-1)![0] as Record<string, unknown>;
+    expect(setArg.notifyCustomerOnBehalfAcceptance).toBe(true);
+    const returning = (db as unknown as { returning: { mock: { calls: unknown[][] } } }).returning;
+    expect(Object.keys(returning.mock.calls.at(-1)![0] as object)).toContain('notifyCustomerOnBehalfAcceptance');
+    expect(row.notifyCustomerOnBehalfAcceptance).toBe(true);
   });
 
   it('updatePartnerBillingSettings persists a scale-5 tax rate and a 2-decimal markup', async () => {
@@ -1435,7 +1477,7 @@ describe('assembly consumers — currency override + blocked-by-currency groups 
   const spec = (lineTotal: string, sourceId = 'te1'): DraftLineSpec => ({
     sourceType: 'time_entry', sourceId, catalogItemId: null, ticketId: null, description: 'Work',
     quantity: '1.00', unitPrice: lineTotal, costBasis: null, taxable: false, customerVisible: true,
-    lineTotal, isUnapprovedTime: false
+    lineTotal, isUnapprovedTime: false, workedMinutes: null
   });
   const empty = () => ({ included: [], blockedByCurrency: {}, missingRate: [] });
   const gap = (sourceId: string, quantity = '1.50') => ({
@@ -1658,6 +1700,26 @@ describe('getInvoice — Stripe account currency exposure (#3777)', () => {
     expect(out.currencyWarning).toMatchObject({
       code: 'CURRENCY_DIFFERS_FROM_STRIPE_ACCOUNT', documentCurrency: 'EUR', accountCurrency: 'USD',
     });
+  });
+
+  // #5856: the staff detail view joins tickets for the grouping header — the
+  // join must stay org-scoped and skip soft-deleted tickets, same as the
+  // customer projection.
+  it('scopes the ticket join to the invoice org and passes ticket fields through', async () => {
+    queueResult([{ id: 'i1', status: 'sent', orgId: 'org1', partnerId: 'p1', currencyCode: 'USD' }]);
+    queueResult([{ id: 'l1', ticketId: 't1', ticketNumber: 'T-7', ticketSubject: 'Printer down', ticketCategory: 'Hardware' }]);
+    queueResult([]);
+    queueResult([]);
+    queueResult([]);
+    const out = await svc.getInvoice('i1', actor);
+    expect(out.lines[0]).toMatchObject({ ticketNumber: 'T-7', ticketSubject: 'Printer down', ticketCategory: 'Hardware', deviceCount: 0 });
+    const ticketJoinCall = (db as unknown as { leftJoin: Mock }).leftJoin.mock.calls.find((call) =>
+      new PgDialect().sqlToQuery(call[1] as SQL).sql.includes('"invoice_lines"."ticket_id" = "tickets"."id"'))!;
+    expect(ticketJoinCall).toBeDefined();
+    const compiled = new PgDialect().sqlToQuery(ticketJoinCall[1] as SQL);
+    expect(compiled.sql).toContain('"tickets"."org_id" =');
+    expect(compiled.sql).toContain('"tickets"."deleted_at" is null');
+    expect(compiled.params).toContain('org1');
   });
 
   it('no warning when the account settles in the document currency', async () => {

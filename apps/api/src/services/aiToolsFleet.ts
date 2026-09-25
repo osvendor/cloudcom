@@ -75,7 +75,16 @@ async function scheduleAiGroupPeripheralReconciliation(deviceIds: readonly strin
 import type { AiTool } from './aiTools';
 import type { ToolExecutionContext } from './toolExecutionContext';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from './siteCeilingAccess';
-import type { UserPermissions } from './permissions';
+import { getUserPermissions, type UserPermissions } from './permissions';
+import {
+  missingReportTypePermission,
+  reportAudienceCondition,
+  reportTypeHiddenByPermission,
+  reportTypeHiddenFromCaller,
+  reportTypePermissionCondition,
+  reportTypeRequiresPermissions,
+} from './reportTypePermissions';
+import { reportTypeDef } from './reportRegistry';
 import { canManagePartnerWidePolicies, PARTNER_WIDE_WRITE_DENIED_MESSAGE } from './partnerWideAccess';
 import { filterWindowsToSiteScope, scopeWindowForRead } from './maintenanceSiteScope';
 import {
@@ -100,6 +109,7 @@ import {
   persistedSiteScopeValues,
   reportDefinitionMultiOrgScopeSqlPredicate,
   reportDefinitionScopeSqlPredicate,
+  reportOwnerOf,
   reportRunScopeSqlPredicate,
   resolveRequestReportAuthority,
   resolveRequestReportAuthorityMap,
@@ -109,7 +119,7 @@ import {
   type PersistedSiteScopeColumns,
   type ReportAction,
   type ReportExecutionAuthority,
-  type UserReportExecutionAuthority,
+  type OrgAxisUserReportExecutionAuthority,
 } from './siteScope';
 import { upsertPatchApproval, resolvePartnerIdForOrg, declineAllRingApprovals } from '../routes/patches/helpers';
 import { sanitizeThrownToolError } from './aiToolErrors';
@@ -202,6 +212,10 @@ function orgWhere(auth: AuthContext, orgIdCol: ReturnType<typeof sql.raw> | any)
 const aiReportDefinitionMetadataProjection = {
   id: reports.id,
   orgId: reports.orgId,
+  // #3198 W01: the other owner axis (siteScope.projections.test.ts).
+  partnerId: reports.partnerId,
+  // #3198 W02 ruling P8b: the permission belt reads the definition's type.
+  type: reports.type,
   executionScopeVersion: reports.executionScopeVersion,
   executionScopeKind: reports.executionScopeKind,
   executionScopeSiteIds: reports.executionScopeSiteIds,
@@ -215,6 +229,10 @@ const aiReportRunMetadataProjection = {
   id: reportRuns.id,
   reportId: reportRuns.reportId,
   orgId: reports.orgId,
+  // #3198 W01: the other owner axis (siteScope.projections.test.ts).
+  partnerId: reports.partnerId,
+  // #3198 W02 ruling F1: the audience belt reads the definition's type.
+  type: reports.type,
   executionScopeVersion: reportRuns.executionScopeVersion,
   executionScopeKind: reportRuns.executionScopeKind,
   executionScopeSiteIds: reportRuns.executionScopeSiteIds,
@@ -228,14 +246,57 @@ export async function aiLiveReportAuthority(
   auth: AuthContext,
   orgId: string,
   action: ReportAction,
-): Promise<
-  (Omit<UserReportExecutionAuthority, 'scope'> & { scope: LiveSiteScopeV1 }) | null
-> {
+): Promise<OrgAxisUserReportExecutionAuthority | null> {
   const result = await resolveRequestReportAuthority(auth, orgId, action);
-  if (!result.ok || result.authority.scope.kind === 'legacy_unscoped') return null;
-  return result.authority as Omit<UserReportExecutionAuthority, 'scope'> & {
-    scope: LiveSiteScopeV1;
-  };
+  if (!result.ok) return null;
+  // #3198 W02 (addendum B5): only an ORG-axis scope is usable here — every
+  // caller runs an org generator. legacy_unscoped was always refused; a
+  // partner_wide scope (never produced by the org resolver) is refused too
+  // rather than cast through.
+  const { authority } = result;
+  if (authority.scope.kind !== 'unrestricted' && authority.scope.kind !== 'restricted') return null;
+  return authority as OrgAxisUserReportExecutionAuthority;
+}
+
+/**
+ * #3198 W01. Fleet/AI report tools operate only on org-owned reports — every
+ * caller here is org-scoped (an `orgId` tool input), and none of them know
+ * how to render a partner-wide report. A partner-owned row (`orgId: null`)
+ * must never reach the callers below, so refuse it explicitly rather than
+ * let a bare cast smuggle `null` through as a string. Callers already treat
+ * a `null` return as "not found or access denied" for the same id, so this
+ * folds into that existing fail-closed path instead of throwing.
+ */
+export function requireOrgOwnedReportRow<T extends { orgId: string | null; partnerId: string | null }>(
+  row: T,
+  where: string,
+): (T & { orgId: string }) | null {
+  const owner = reportOwnerOf(row);
+  if (owner.orgId === undefined) {
+    console.warn(`[aiToolsFleet] refusing partner-owned report row in ${where}`);
+    return null;
+  }
+  return row as T & { orgId: string };
+}
+
+/** The AI caller's LIVE permission set — what `requirePermission` would
+ *  resolve for the same token on an HTTP route. */
+function aiCallerPermissions(auth: AuthContext): Promise<UserPermissions | null> {
+  return getUserPermissions(auth.user.id, {
+    partnerId: auth.partnerId || undefined,
+    orgId: auth.orgId || undefined,
+    scope: auth.scope,
+  });
+}
+
+/**
+ * #3198 W02, ruling P8b: a stored type whose underlying read permissions the
+ * caller lacks is hidden from every AI report read, exactly as from the HTTP
+ * routes. Only a type that lists extra permissions pays the permission lookup.
+ */
+async function aiReportTypeHiddenByPermission(auth: AuthContext, type: string): Promise<boolean> {
+  if (!reportTypeRequiresPermissions(type)) return false;
+  return reportTypeHiddenByPermission(type, await aiCallerPermissions(auth));
 }
 
 async function aiReportDefinitionAccess(
@@ -246,12 +307,19 @@ async function aiReportDefinitionAccess(
   const metadataConditions: SQL[] = [eq(reports.id, reportId)];
   const tenantCondition = orgWhere(auth, reports.orgId);
   if (tenantCondition) metadataConditions.push(tenantCondition);
-  const [metadata] = await db
+  // #3198 W02 ruling F1: an org-scope caller never reaches an msp_staff type.
+  const audience = reportAudienceCondition(auth, reports.type);
+  if (audience) metadataConditions.push(audience);
+  const [metadataRow] = await db
     .select(aiReportDefinitionMetadataProjection)
     .from(reports)
     .where(and(...metadataConditions))
     .limit(1);
+  if (!metadataRow) return null;
+  const metadata = requireOrgOwnedReportRow(metadataRow, 'aiReportDefinitionAccess metadata');
   if (!metadata) return null;
+  // Ruling P8b: hidden (not found) when the caller lacks the type's read permissions.
+  if (await aiReportTypeHiddenByPermission(auth, metadata.type)) return null;
 
   const authority = await aiLiveReportAuthority(auth, metadata.orgId, action);
   if (!authority) return null;
@@ -266,7 +334,7 @@ async function aiReportDefinitionAccess(
   }
 
   const predicate = reportDefinitionScopeSqlPredicate(reports, authority.scope);
-  const [report] = await db
+  const [reportRow] = await db
     .select()
     .from(reports)
     .where(and(
@@ -275,7 +343,11 @@ async function aiReportDefinitionAccess(
       predicate,
     ))
     .limit(1);
+  if (!reportRow) return null;
+  const report = requireOrgOwnedReportRow(reportRow, 'aiReportDefinitionAccess report');
   if (!report) return null;
+  // Ruling F1, defense in depth (the metadata read already excludes it).
+  if (reportTypeHiddenFromCaller(report.type, auth)) return null;
 
   try {
     const storedScope = decodeSiteScope(
@@ -297,13 +369,22 @@ async function aiReportRunAccess(
   const metadataConditions: SQL[] = [eq(reportRuns.id, runId)];
   const tenantCondition = orgWhere(auth, reports.orgId);
   if (tenantCondition) metadataConditions.push(tenantCondition);
-  const [metadata] = await db
+  // #3198 W02 ruling F1: an org-scope caller never reaches an msp_staff run.
+  const audience = reportAudienceCondition(auth, reports.type);
+  if (audience) metadataConditions.push(audience);
+  const [metadataRow] = await db
     .select(aiReportRunMetadataProjection)
     .from(reportRuns)
     .innerJoin(reports, eq(reportRuns.reportId, reports.id))
     .where(and(...metadataConditions))
     .limit(1);
+  if (!metadataRow) return null;
+  const metadata = requireOrgOwnedReportRow(metadataRow, 'aiReportRunAccess metadata');
   if (!metadata) return null;
+  // Ruling F1, defense in depth (the metadata read already excludes it).
+  if (reportTypeHiddenFromCaller(metadata.type, auth)) return null;
+  // Ruling P8b: hidden (not found) when the caller lacks the type's read permissions.
+  if (await aiReportTypeHiddenByPermission(auth, metadata.type)) return null;
 
   const authority = await aiLiveReportAuthority(auth, metadata.orgId, action);
   if (!authority) return null;
@@ -720,7 +801,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
     searchHint: 'software deployments: list, get, device status, create, start, pause, resume, cancel',
     definition: {
       name: 'manage_deployments',
-      description: 'Manage staged software deployments: list, get details, view per-device status, create, start, pause, resume, or cancel deployments.',
+      description: 'Manage staged software deployments: list, get details, view per-device status, create, start, pause, resume, or cancel deployments. Actions: list, get, device_status, create, start, pause, resume, cancel.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -1069,18 +1150,18 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceIds', 'deviceId'],
     definition: {
       name: 'manage_patches',
-      description: 'Manage patches: list patches present on the org\'s devices (optionally scoped to a single device via deviceId, which also returns per-device install status), check compliance, trigger scans, approve/decline/defer patches, bulk approve, install on targets, or rollback. Required fields per action: install requires BOTH patchIds and deviceIds; scan requires deviceIds; bulk_approve requires patchIds; approve/decline/defer require patchId OR patchName; rollback requires BOTH patchId and deviceIds; list/compliance require none. approve/decline/defer accept an optional ringId to scope the action to one update ring (omit for the partner-wide blanket); decline also accepts allRings to revoke the approval in every update ring at once, not just the current scope — use this to fully unapprove a patch a device might otherwise still install under a different ring. To configure patch schedules and auto-approval policies, use manage_policy_feature_link with featureType "patch".',
+      description: 'CVEs: get_vulnerability_report. Install requires BOTH patchIds and deviceIds. Approvals default partner-wide. Schedules/auto-approval: manage_policy_feature_link featureType "patch". Actions: list, compliance, scan, approve, decline, defer, bulk_approve, install, rollback.',
       input_schema: {
         type: 'object' as const,
         properties: {
-          action: { type: 'string', enum: ['list', 'compliance', 'scan', 'approve', 'decline', 'defer', 'bulk_approve', 'install', 'rollback'], description: 'The action to perform. Required inputs: install needs patchIds AND deviceIds; scan needs deviceIds; bulk_approve needs patchIds; approve/decline/defer need patchId or patchName; rollback needs patchId AND deviceIds. To configure patch policies/auto-approval, use manage_policy_feature_link with featureType "patch".' },
+          action: { type: 'string', enum: ['list', 'compliance', 'scan', 'approve', 'decline', 'defer', 'bulk_approve', 'install', 'rollback'], description: "Install needs patchIds AND deviceIds; scan: deviceIds; bulk_approve: patchIds; approve/decline/defer: patchId or patchName; rollback: patchId+deviceIds." },
           patchId: { type: 'string', description: 'Patch UUID. Required for approve/decline/defer/rollback unless patchName is given (rollback always needs the UUID).' },
-          patchName: { type: 'string', description: 'Patch title or KB/external ID to look up when the UUID is unknown (for approve/decline/defer only). Matched against patches present on this org\'s fleet; an ambiguous match returns the candidates instead of guessing.' },
+          patchName: { type: 'string', description: "Patch title or KB/external ID on this org's fleet (approve/decline/defer). Ambiguous matches return candidates." },
           patchIds: { type: 'array', items: { type: 'string' }, description: 'Patch UUIDs. Required for bulk_approve and install.' },
           deviceIds: { type: 'array', items: { type: 'string' }, description: 'Device UUIDs. Required for scan, install, and rollback.' },
           deviceId: { type: 'string', description: 'Single device UUID to scope the patch list to one device (for list); returns per-device install status' },
-          ringId: { type: 'string', description: 'Update ring UUID to scope approve/decline/defer to one ring (for approve/decline/defer only; omit for the partner-wide blanket). Cannot be combined with allRings.' },
-          allRings: { type: 'boolean', description: 'Decline only: revoke this patch\'s approval in every update ring for the partner, not just the current/blanket scope — use to fully unapprove a patch that was approved in more than one ring. Cannot be combined with ringId.' },
+          ringId: { type: 'string', description: 'Update ring UUID for approve/decline/defer. Omit for partner-wide approval; mutually exclusive with allRings.' },
+          allRings: { type: 'boolean', description: "Decline only: revoke approval in every update ring for the partner. Mutually exclusive with ringId." },
           source: { type: 'string', enum: ['microsoft', 'apple', 'linux', 'third_party', 'custom'], description: 'Filter by source' },
           severity: { type: 'string', enum: ['critical', 'important', 'moderate', 'low', 'unknown'], description: 'Filter by severity' },
           status: { type: 'string', enum: ['pending', 'approved', 'rejected', 'deferred'], description: 'Filter by approval status' },
@@ -1585,7 +1666,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceIds'],
     definition: {
       name: 'manage_groups',
-      description: 'Manage device groups: list groups, get details with members, preview dynamic filter results, view membership audit log, create/update/delete groups, add/remove devices.',
+      description: 'Manage device groups: list groups, get details with members, preview dynamic filter results, view membership audit log, create/update/delete groups, add/remove devices. Actions: list, get, preview, membership_log, create, update, delete, add_devices, remove_devices.',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -1918,7 +1999,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceIds'],
     definition: {
       name: 'manage_maintenance_windows',
-      description: 'Query maintenance windows (read-only): list windows, get details with occurrences, check what is in maintenance right now. To create or modify maintenance windows, use manage_policy_feature_link with featureType "maintenance".',
+      description: 'Read maintenance windows and occurrences. Actions: list, get, active_now, create (disabled), update (disabled), delete (disabled). For writes, use manage_policy_feature_link with featureType "maintenance".',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -2531,7 +2612,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
     searchHint: 'alert rules: list templates, list rules, get rule, test rule, list channels, alert summary',
     definition: {
       name: 'manage_alert_rules',
-      description: 'Query alert rules, templates, and notification channels (read-only). Alert rules are managed through configuration policies — use manage_policy_feature_link with featureType "alert_rule" to create or modify alert rules. This tool is for querying only: list_templates to discover available templates, list_rules/get_rule to inspect existing rules, test_rule to check rule state, list_channels for notification channels, alert_summary for overview. Actions: list_templates, list_rules, get_rule, test_rule, list_channels, alert_summary.',
+      description: 'Read alert rules, templates and channels. Actions: list_templates, list_rules, get_rule, test_rule, list_channels, alert_summary, create_rule (disabled), update_rule (disabled), delete_rule (disabled). For writes, use manage_policy_feature_link with featureType "alert_rule".',
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -2806,6 +2887,13 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       if (action === 'list') {
         const conditions: SQL[] = [];
         let definitionPredicate: SQL;
+        // #3198 W02 ruling P8b: never list a type whose underlying read
+        // permissions the caller lacks, on any scope.
+        const typePermission = reportTypePermissionCondition(
+          await aiCallerPermissions(auth),
+          reports.type,
+        );
+        if (typePermission) conditions.push(typePermission);
         if (auth.scope === 'organization') {
           if (!auth.orgId) return JSON.stringify({ error: 'Organization context required' });
           const authority = await aiLiveReportAuthority(auth, auth.orgId, 'read');
@@ -2813,6 +2901,9 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
             return JSON.stringify({ reports: [], showing: 0 });
           }
           conditions.push(eq(reports.orgId, auth.orgId));
+          // #3198 W02 ruling F1: never list an msp_staff type to an org caller.
+          const audience = reportAudienceCondition(auth, reports.type);
+          if (audience) conditions.push(audience);
           definitionPredicate = reportDefinitionScopeSqlPredicate(
             reports,
             authority.scope,
@@ -2878,6 +2969,22 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           );
           if (!access) return JSON.stringify({ error: 'Report not found or access denied' });
           reportDef = access.report;
+          // #3198 W02 (ruling P8 + F1): the stored type's underlying read
+          // permissions, from the caller's LIVE permission set, before any run
+          // row — the HTTP generate route's gate. Only a type that lists extra
+          // permissions pays the lookup. (Org-scope callers never get here with
+          // an msp_staff type, and since ruling P8b nobody gets here without
+          // the type's permissions: aiReportDefinitionAccess hid it. Kept as
+          // defense in depth.)
+          if (reportTypeDef(reportDef.type).requiredPermissions.length > 0) {
+            const permissions = await aiCallerPermissions(auth);
+            if (
+              reportTypeHiddenFromCaller(reportDef.type, auth)
+              || missingReportTypePermission(reportDef.type, permissions)
+            ) {
+              return JSON.stringify({ error: 'Insufficient permissions' });
+            }
+          }
           try {
             const persistedScope = decodeSiteScope(
               reportDef as unknown as PersistedSiteScopeColumns,
@@ -3218,9 +3325,14 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
         if (!run) return JSON.stringify({ error: 'Report run not found' });
         try {
+          // `run.reportOrgId` is `reports.orgId` selected fresh, so Drizzle
+          // still types it nullable — but the WHERE above already pins this
+          // query to `eq(reports.orgId, access.metadata.orgId)`, a value
+          // `requireOrgOwnedReportRow` already proved non-null, so use that
+          // instead of re-widening back to `string | null`.
           const storedScope = decodeSiteScope(
             run as unknown as PersistedSiteScopeColumns,
-            run.reportOrgId,
+            access.metadata.orgId,
           );
           if (!isSiteScopeSubset(storedScope, access.authority.scope)) {
             return JSON.stringify({ error: 'Report run not found' });
@@ -3263,7 +3375,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
     searchHint: 'service and process monitoring watches: list',
     definition: {
       name: 'manage_service_monitors',
-      description: 'Query service and process monitoring watches (read-only). To add or remove monitoring watches, use manage_policy_feature_link with featureType "monitoring" and action "update" to configure watches on a configuration policy.',
+      description: 'Query service and process monitoring watches. Actions: list, add (disabled), remove (disabled). For writes, use manage_policy_feature_link with featureType "monitoring" and action "update".',
       input_schema: {
         type: 'object' as const,
         properties: {

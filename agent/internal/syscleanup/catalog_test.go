@@ -76,9 +76,16 @@ func withActions(t *testing.T, actions []Action) {
 func withVolumes(t *testing.T, before, after []VolumeFree) {
 	t.Helper()
 	originalMounts, originalUsage, originalAdvance := fixedVolumesFn, usageFreeFn, advanceVolumeSample
+	originalSync, originalSleep := syncMountFn, sleepFn
 	t.Cleanup(func() {
 		fixedVolumesFn, usageFreeFn, advanceVolumeSample = originalMounts, originalUsage, originalAdvance
+		syncMountFn, sleepFn = originalSync, originalSleep
 	})
+	// settleVolumes' sync + retry is exercised directly in volumes_test.go;
+	// here it would just add real syscalls and sleeps to every Run test for
+	// no assertion value, since the "after" fixture is already stable.
+	syncMountFn = func(string) {}
+	sleepFn = func(time.Duration) {}
 
 	mounts := make([]string, 0, len(before))
 	for _, volume := range before {
@@ -351,5 +358,53 @@ func TestSelectionBareCleanmgrWinsInEitherOrder(t *testing.T) {
 		if len(got) != 1 || len(got[0].(winCleanmgrAction).selectedSlugs) != 0 {
 			t.Fatalf("selectionFor(%v) = %+v, want all handlers", ids, got)
 		}
+	}
+}
+
+// #6603: a retired-only selection must still reach winCleanmgrAction.Run so
+// its retirement branch (Run, windows.go) can answer with `unavailable` and
+// the replacement id — winCleanmgrHandlerBySubID only searched the LIVE
+// handler list, so the id fell through selectionFor's requested[] map (which
+// matches no Action.ID()) and was silently dropped before win_cleanmgr was
+// even constructed.
+func TestSelectionForRetiredHandlerAloneReachesWinCleanmgr(t *testing.T) {
+	withActions(t, []Action{winCleanmgrAction{}})
+
+	got := selectionFor([]string{"win_cleanmgr:update_cleanup"})
+
+	if len(got) != 1 {
+		t.Fatalf("selectionFor = %+v, want the retired id to select win_cleanmgr", got)
+	}
+	action, ok := got[0].(winCleanmgrAction)
+	if !ok {
+		t.Fatalf("selectionFor[0] = %T, want winCleanmgrAction", got[0])
+	}
+	if len(action.selectedSlugs) != 1 || action.selectedSlugs[0] != "update_cleanup" {
+		t.Fatalf("selectedSlugs = %v, want [update_cleanup]", action.selectedSlugs)
+	}
+}
+
+// A mixed retired+live selection must carry BOTH slugs through selectionFor,
+// so the retired one is refused with its reason while the live one still
+// runs (confirmed in the lab: the retired id was absent from subActions
+// entirely, not `unavailable`).
+func TestSelectionForMixedRetiredAndLiveKeepsBothSlugs(t *testing.T) {
+	withActions(t, []Action{winCleanmgrAction{}})
+
+	got := selectionFor([]string{"win_cleanmgr:update_cleanup", "win_cleanmgr:setup_log_files"})
+
+	if len(got) != 1 {
+		t.Fatalf("selectionFor = %+v, want one win_cleanmgr action", got)
+	}
+	action, ok := got[0].(winCleanmgrAction)
+	if !ok {
+		t.Fatalf("selectionFor[0] = %T, want winCleanmgrAction", got[0])
+	}
+	slugs := map[string]bool{}
+	for _, slug := range action.selectedSlugs {
+		slugs[slug] = true
+	}
+	if !slugs["update_cleanup"] || !slugs["setup_log_files"] {
+		t.Fatalf("selectedSlugs = %v, want both update_cleanup and setup_log_files", action.selectedSlugs)
 	}
 }

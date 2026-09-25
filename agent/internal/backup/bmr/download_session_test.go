@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -693,5 +694,158 @@ func TestRestoreFilesAbortsImmediatelyOnRecoverySessionLost(t *testing.T) {
 	}
 	if filesRestored != 2 || failedFiles != 1 {
 		t.Fatalf("filesRestored=%d failedFiles=%d, want 2 and 1", filesRestored, failedFiles)
+	}
+}
+
+// writeTestBootstrapEnvelopeWithCapabilities writes an authenticate-response
+// envelope shaped like writeTestBootstrapEnvelope (session_test.go) but with
+// an explicit download.capabilities list, since that shared helper never
+// sets capabilities at all (see its own doc comment — the exact envelope
+// shape was not independently re-verified byte-for-byte in the W09 research
+// pass). Task 9 needs to control this field precisely to exercise both the
+// "capability preserved" and "capability dropped" refresh paths.
+func writeTestBootstrapEnvelopeWithCapabilities(t *testing.T, w http.ResponseWriter, snapshotID string, capabilities []string) {
+	t.Helper()
+	download := map[string]any{
+		"type": "breeze_proxy", "url": "https://example.invalid/download",
+		"pathQueryParam": "path", "pathPrefix": "snapshots/" + snapshotID,
+	}
+	if capabilities != nil {
+		download["capabilities"] = capabilities
+	}
+	bootstrap := map[string]any{
+		"version": 1,
+		"snapshot": map[string]any{
+			"id": "s1", "snapshotId": snapshotID, "backupType": "file",
+		},
+		"download": download,
+	}
+	body := map[string]any{"bootstrap": bootstrap}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(body); err != nil {
+		t.Fatalf("encode bootstrap envelope: %v", err)
+	}
+}
+
+// TestDownloadSession_RefreshPreservesAdmissibleSet proves a session refresh
+// that re-grants snapshot-file-membership-v1 keeps the admissible set built
+// before the refresh (Task 9): the set is never rebuilt or cleared by
+// authenticateAndSwap, only ever widened elsewhere (Task 10's
+// ApplyManifestScope).
+func TestDownloadSession_RefreshPreservesAdmissibleSet(t *testing.T) {
+	authCalls := int32(0)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/recover/authenticate") {
+			atomic.AddInt32(&authCalls, 1)
+			writeTestBootstrapEnvelopeWithCapabilities(t, w, "gen-2", []string{CapabilitySnapshotFileMembershipV1})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	p := newRecoveryDownloadProvider(context.Background(), server.URL, "tok", &AuthenticatedDownloadDescriptor{
+		Type: "breeze_proxy", Method: http.MethodGet, URL: server.URL + "/download",
+		PathQueryParam: "path", PathPrefix: "snapshots/gen-2",
+		Capabilities: []string{CapabilitySnapshotFileMembershipV1},
+	})
+	p.ExtendAdmissible([]string{"snapshots/gen-1/files/a.gz"})
+
+	if err := p.authenticateAndSwap(); err != nil {
+		t.Fatalf("authenticateAndSwap: %v", err)
+	}
+	if got := atomic.LoadInt32(&authCalls); got != 1 {
+		t.Fatalf("authCalls = %d, want 1", got)
+	}
+	if !p.Admits("snapshots/gen-1/files/a.gz") {
+		t.Fatal("admissible set must survive a session refresh")
+	}
+}
+
+// TestDownloadSession_RefreshWithoutCapabilityReturnsDowngradeError proves
+// that a refresh whose fresh descriptor drops
+// snapshot-file-membership-v1 — a downgraded or misconfigured server — is
+// refused rather than silently shrinking the admissible set (Task 9).
+// TestRecoverySessionReauthTerminalNegotiationRefusalIsImmediate is the
+// regression test for review finding #3 (w09-part0.md R5): a terminal 409
+// from /bmr/recover/authenticate — capability_downgrade,
+// storage_identity_drift, snapshot_storage_identity_unknown, or
+// client_capability_required — is a *RecoveryNegotiationError, a distinct
+// type from *authenticateStatusError. Before the fix,
+// refreshAfterUnauthorized's terminal switch only matched
+// *authenticateStatusError, so errors.As(err, &statusErr) was false for a
+// negotiation error and isStatus's cases never matched — the reactive
+// refresh retried it reauthMaxAttempts times with exponential backoff
+// before finally giving up, instead of recognizing on the FIRST response
+// that retrying cannot help. This proves: exactly one authenticate call,
+// the session is marked lost, and the negotiation error/code survives the
+// error chain via errors.As (and, for the capability_downgrade code
+// specifically, errors.Is(err, ErrCapabilityDowngrade) is also true — the
+// server-side and local capability-loss signals are the same condition).
+func TestRecoverySessionReauthTerminalNegotiationRefusalIsImmediate(t *testing.T) {
+	clock := newFakeClock()
+	stopSleeps := withClockSleep(t, clock)
+	defer stopSleeps()
+
+	srv := newSessionFakeServer(t, clock)
+	desc := srv.openSession(clock.Now().Add(-time.Minute)) // already expired: forces the reactive path
+	p := srv.provider(clock, desc)
+	p.membership = true // this token had already negotiated the capability
+
+	srv.setAuthResponses(fakeAuthResponse{status: http.StatusConflict, message: "capability_downgrade"})
+
+	errs := downloadN(t, p, 1)
+	if errs[0] == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(errs[0], ErrRecoverySessionLost) {
+		t.Fatalf("expected ErrRecoverySessionLost, got %v", errs[0])
+	}
+	if !errors.Is(errs[0], ErrCapabilityDowngrade) {
+		t.Fatalf("expected errors.Is(err, ErrCapabilityDowngrade) = true, got %v", errs[0])
+	}
+	var negErr *RecoveryNegotiationError
+	if !errors.As(errs[0], &negErr) {
+		t.Fatalf("expected errors.As to find a *RecoveryNegotiationError in the chain, got %v", errs[0])
+	}
+	if negErr.Code != "capability_downgrade" {
+		t.Fatalf("negErr.Code = %q, want capability_downgrade", negErr.Code)
+	}
+
+	authCalls, _, _ := srv.counts()
+	if authCalls != 1 {
+		t.Fatalf("authCalls = %d, want exactly 1 (a terminal 409 must not be retried)", authCalls)
+	}
+}
+
+func TestDownloadSession_RefreshWithoutCapabilityReturnsDowngradeError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/recover/authenticate") {
+			// Simulate a server that stops granting the capability on
+			// re-authenticate (e.g. downgraded/misconfigured server).
+			writeTestBootstrapEnvelopeWithCapabilities(t, w, "gen-2", nil)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	p := newRecoveryDownloadProvider(context.Background(), server.URL, "tok", &AuthenticatedDownloadDescriptor{
+		Type: "breeze_proxy", Method: http.MethodGet, URL: server.URL + "/download",
+		PathQueryParam: "path", PathPrefix: "snapshots/gen-2",
+		Capabilities: []string{CapabilitySnapshotFileMembershipV1},
+	})
+	beforeGen := p.sessionGeneration()
+
+	err := p.authenticateAndSwap()
+	if !errors.Is(err, ErrCapabilityDowngrade) {
+		t.Fatalf("authenticateAndSwap error = %v, want ErrCapabilityDowngrade", err)
+	}
+	if got := p.sessionGeneration(); got != beforeGen {
+		t.Fatalf("generation = %d, want unchanged %d (a rejected swap must not bump the generation)", got, beforeGen)
+	}
+	if !p.MembershipNegotiated() {
+		t.Fatal("the previous descriptor's capability must be restored, not dropped")
 	}
 }

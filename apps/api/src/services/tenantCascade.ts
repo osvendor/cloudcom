@@ -305,7 +305,22 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   //     here exactly as it is for the two entries above. Stated only so a
   //     reader knows the RESTRICT edge exists and is load-bearing somewhere.
   'ai_operator_operations',
+  // Recipe Library wave E2 (#6167). All four are Shape 1 with a NOT NULL
+  // org_id, so all four are required here. localeCompare puts '_' ahead of
+  // letters, which is why …_task_target_accounts precedes …_task_targets and
+  // both precede …_tasks. topologicalCascadeOrder()'s runtime pg_constraint
+  // read is what actually orders the DELETEs (children first); the
+  // alphabetical position here is what tenantCascade.test.ts asserts.
+  //
+  // ai_operator_task_events is APPEND-ONLY (REVOKE DELETE from breeze_app plus
+  // an immutability trigger), so it is ALSO in AUDIT_ADMIN_REQUIRED_TABLES
+  // below. Membership here without membership there is a runtime
+  // `permission denied` in the middle of a GDPR erasure.
+  'ai_operator_task_events',
   'ai_operator_task_outbox',
+  'ai_operator_task_steps',
+  'ai_operator_task_target_accounts',
+  'ai_operator_task_targets',
   'ai_operator_tasks',
   // Execution plane W01 (spec §6.1): artifact rows. Child of ai_agent_runs via
   // the composite (run_id, org_id) FK, ON DELETE CASCADE — topologicalCascadeOrder()
@@ -362,6 +377,17 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'backup_jobs',
   'backup_policies',
   'backup_profiles',
+  // Backup Provider Integration W01 (#6008). Three org_id tables; the fourth
+  // (backup_provider_connections) is partner-axis with no org_id and is erased
+  // by cascadeDeletePartner's information_schema partner_id sweep instead.
+  // Alphabetical by localeCompare puts device_history before devices ('_' <
+  // 's'), which also happens to be children-before-parents — but the real
+  // DELETE order comes from topologicalCascadeOrder()'s live pg_constraint
+  // read, and every FK among these three carries an explicit ON DELETE
+  // CASCADE, so position here is determinism, not correctness.
+  'backup_provider_customers',
+  'backup_provider_device_history',
+  'backup_provider_devices',
   'backup_sla_configs',
   'backup_sla_events',
   'backup_snapshot_retirements',
@@ -377,6 +403,10 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'c2c_backup_jobs',
   'c2c_connections',
   'c2c_consent_sessions',
+  'caller_verification_destinations',
+  'caller_verification_policies',
+  'caller_verification_subject_bindings',
+  'caller_verifications',
   'capacity_predictions',
   'capacity_thresholds',
   'catalog_item_org_pricing',
@@ -551,6 +581,10 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'manual_assets',
   'metric_anomalies',
   'metric_anomaly_candidates',
+  // Episodes W01. FK children first is computed by topologicalCascadeOrder():
+  // metric_anomalies.episode_id -> this table is ON DELETE SET NULL, and this
+  // table -> alerts/users is ON DELETE SET NULL. No cycle.
+  'metric_anomaly_episodes',
   'metric_anomaly_incidents',
   'metric_rollups',
   'metric_rollups_default',
@@ -1014,13 +1048,14 @@ const ASSOCIATED_SYSTEM_SCOPED_TABLES: ReadonlyArray<{
   },
   // report_runs has NO org_id column of its own — its tenancy is its parent
   // definition's — so neither the org cascade list nor the partner-axis sweep
-  // reaches it, yet `report_runs_report_id_reports_id_fk` is declared without
-  // an explicit ON DELETE (verified in pg_constraint: confdeltype 'a' =
-  // NO ACTION). The main loop's `DELETE FROM reports WHERE org_id = ...`
-  // therefore aborts with 23503 for ANY org that has ever generated a report
-  // — a PRE-EXISTING latent GDPR erasure bug (found by P2-3's own
-  // narrative-artifact fixture, #4190, but not caused by it: an ordinary
-  // scheduled report has produced these rows since the feature shipped).
+  // reaches it directly. `report_runs_report_id_reports_id_fk` was originally
+  // declared without an explicit ON DELETE (NO ACTION), so the main loop's
+  // `DELETE FROM reports WHERE org_id = ...` aborted with 23503 for ANY org
+  // that had ever generated a report — a latent GDPR erasure bug found by
+  // P2-3's narrative-artifact fixture (#4190), which this pre-clear fixed.
+  // Since 2026-10-27-130100 (#3198 W01) the FK is ON DELETE CASCADE, so the
+  // reports delete would now take its runs with it; this pre-clear is kept as
+  // an explicit, order-deterministic clear and is harmless either way.
   //
   // Safe to clear first: two FKs point INTO report_runs and neither can raise
   // 23503 here —
@@ -1034,10 +1069,11 @@ const ASSOCIATED_SYSTEM_SCOPED_TABLES: ReadonlyArray<{
   //     run cleared here or an evidence row deleted there are both fine in
   //     either order.
   //
-  // No partner-axis twin is needed (unlike the SSO/PSA/software entries):
-  // `reports.org_id` is NOT NULL, so every definition — and therefore every
-  // report_runs row — is reached through the per-child-org cascadeDeleteOrg
-  // calls the partner purge already makes.
+  // #3198 W01: reports is org XOR partner. Org-owned definitions (and their
+  // runs, via this pre-clear) are reached by the per-org cascade; PARTNER-
+  // owned definitions are reached only by the partner sweep's automatic
+  // `partner_id` discovery in cascadeDeletePartner, and their runs by the
+  // report_runs.report_id ON DELETE CASCADE that 2026-10-27-130100 added.
   {
     table: 'report_runs',
     clearSql: (orgId) => sql`
@@ -1127,6 +1163,11 @@ const AUDIT_ADMIN_REQUIRED_TABLES: ReadonlySet<string> = new Set<string>([
   // immutability trigger (2026-10-16-100100), so erasure has to run as
   // breeze_audit_admin with breeze.allow_audit_retention=1.
   'script_proposal_reviews',
+  // Append-only AI Operator task timeline: REVOKE UPDATE/DELETE from
+  // breeze_app plus ai_operator_task_events_append_only()
+  // (2026-10-26-160000), so erasure has to run as breeze_audit_admin with
+  // breeze.allow_audit_retention=1.
+  'ai_operator_task_events',
 ]);
 
 interface FkEdge {
@@ -1139,7 +1180,18 @@ interface FkEdge {
  * Tables whose rows are the only index to an S3 object key. The erasure
  * pre-clear reads them ONE AT A TIME (see the 1a. block in cascadeDeleteOrg).
  */
-const OBJECT_PRECLEAR_TABLES = ['ticket_attachments', 'org_documents'] as const;
+/**
+ * Every tenant table whose rows are the ONLY index to blob-store objects
+ * (services/blobStorage.ts). Each entry names the row's key and backend
+ * columns: most byte tables use plain `storage_key`/`storage_backend`, while
+ * `quote_acceptances` carries its optional on-behalf evidence file (#6633) in
+ * `evidence_*` columns beside the acceptance record itself.
+ */
+const OBJECT_PRECLEAR_TABLES: ReadonlyArray<{ table: string; keyColumn: string; backendColumn: string }> = [
+  { table: 'ticket_attachments', keyColumn: 'storage_key', backendColumn: 'storage_backend' },
+  { table: 'org_documents', keyColumn: 'storage_key', backendColumn: 'storage_backend' },
+  { table: 'quote_acceptances', keyColumn: 'evidence_storage_key', backendColumn: 'evidence_storage_backend' },
+];
 
 /**
  * Read foreign-key edges from pg_catalog and return a topological order
@@ -1308,15 +1360,15 @@ export async function cascadeDeleteOrg(
   //     soft-deleted org_documents row has already had its object removed and
   //     its storage_key cleared, so the NOT NULL excludes it.
   const objectKeys: string[] = [];
-  for (const table of OBJECT_PRECLEAR_TABLES) {
+  for (const { table, keyColumn, backendColumn } of OBJECT_PRECLEAR_TABLES) {
     try {
       const keys = await dbModule.withSystemDbAccessContext(async () => {
         const result = await dbModule.db.execute(sql`
-          SELECT storage_key
+          SELECT ${sql.raw(keyColumn)} AS storage_key
           FROM ${sql.raw(`"${table}"`)}
           WHERE org_id = ${orgId}::uuid
-            AND storage_backend = 's3'
-            AND storage_key IS NOT NULL
+            AND ${sql.raw(backendColumn)} = 's3'
+            AND ${sql.raw(keyColumn)} IS NOT NULL
         `);
         const rows = (result as unknown as { rows?: Array<{ storage_key: string }> }).rows
           ?? (result as unknown as Array<{ storage_key: string }>);

@@ -25,6 +25,7 @@ export const PORTAL_PROTECTED_PREFIXES = [
   '/service',
   '/documents',
   '/remote',
+  '/network',
   PORTAL_ACCOUNT_DISABLED_PAGE
 ] as const;
 

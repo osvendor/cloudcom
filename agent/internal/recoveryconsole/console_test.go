@@ -68,6 +68,7 @@ type fakeDeps struct {
 	collectFn  func(ctx context.Context) (*layout.Manifest, error)
 	mediaFn    func() ([]string, error)
 	rebuildFn  func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error)
+	widenFn    func(ctx context.Context, provider providers.BackupProvider, bs *bmr.BootstrapResponse) error
 
 	rebuildCalls  []rebuild.Options
 	progressCalls []bmr.ProgressUpdate
@@ -92,6 +93,7 @@ func (f *fakeDeps) build(version string) Deps {
 		Provider: func(ctx context.Context, server, token string, bs *bmr.BootstrapResponse) (providers.BackupProvider, error) {
 			return nil, nil
 		},
+		WidenScope: f.widenFn,
 		Progress: func(ctx context.Context, server, token string, u bmr.ProgressUpdate) error {
 			f.progressCalls = append(f.progressCalls, u)
 			return f.progressErr
@@ -738,5 +740,204 @@ func TestConsole_ExpectSystemStateFollowsBootstrap(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestConsole_SnapshotIndexPendingAutoRetries(t *testing.T) {
+	calls := 0
+	deps := &fakeDeps{
+		exchangeFn: func(ctx context.Context, server, code string) (string, *bmr.BootstrapResponse, error) {
+			calls++
+			if calls < 3 {
+				return "", nil, &bmr.RecoveryNegotiationError{
+					Code:              "snapshot_index_pending",
+					Message:           "Breeze is preparing the file index for this snapshot (3 files reference earlier snapshots). Retry in 30 seconds.",
+					RetryAfterSeconds: 0, // zeroed for the test's fast clock
+				}
+			}
+			return "recv-token", &bmr.BootstrapResponse{SnapshotID: "gen-3"}, nil
+		},
+	}
+	io := &fakeIO{}
+	c := &Console{
+		IO:   io,
+		Deps: deps.build("0.111.1"),
+		sleep: func(time.Duration) <-chan time.Time {
+			ch := make(chan time.Time, 1)
+			ch <- time.Now()
+			return ch
+		},
+	}
+	token, bs, err := c.promptCodeAndExchange(context.Background(), true, Answers{Code: "ABCDEFGHJ"}, "https://example.invalid")
+	if err != nil {
+		t.Fatalf("promptCodeAndExchange() error = %v", err)
+	}
+	if token != "recv-token" {
+		t.Fatalf("token = %q, want recv-token", token)
+	}
+	if bs == nil {
+		t.Fatalf("bootstrap = nil, want non-nil")
+	}
+	if calls != 3 {
+		t.Fatalf("Exchange calls = %d, want 3", calls)
+	}
+}
+
+// TestConsole_PendingWaitBudgetResetsPerPromptCodeAndExchangeCall is the
+// regression test for review finding #5: the doc comment on
+// Console.pendingWaitElapsed (console.go ~:82-85) says the 20-minute
+// snapshot_index_pending wait budget is "across one promptCodeAndExchange
+// call", but pendingWaitElapsed is a Console field that promptCodeAndExchange
+// never reset — so a Console instance reused for a second exchange attempt
+// (e.g. after a code the operator mistyped once, sharing the same *Console)
+// silently inherited whatever budget the FIRST attempt had already burned,
+// making the second attempt's 20-minute budget shorter than documented (or,
+// as here, already exhausted). This drives waitAndRetryPending's actual
+// caller (promptCodeAndExchange -> exchangeWithNegotiation) rather than
+// calling waitAndRetryPending directly, so it proves the reset happens at
+// the documented boundary.
+func TestConsole_PendingWaitBudgetResetsPerPromptCodeAndExchangeCall(t *testing.T) {
+	calls := 0
+	deps := &fakeDeps{
+		exchangeFn: func(ctx context.Context, server, code string) (string, *bmr.BootstrapResponse, error) {
+			calls++
+			if calls < 2 {
+				return "", nil, &bmr.RecoveryNegotiationError{
+					Code:              "snapshot_index_pending",
+					Message:           "Breeze is preparing the file index for this snapshot. Retry in 30 seconds.",
+					RetryAfterSeconds: 0, // zeroed for the test's fast clock -> defaults to 30s
+				}
+			}
+			return "recv-token", &bmr.BootstrapResponse{SnapshotID: "gen-3"}, nil
+		},
+	}
+	io := &fakeIO{}
+	c := &Console{
+		IO:   io,
+		Deps: deps.build("0.111.1"),
+		sleep: func(time.Duration) <-chan time.Time {
+			ch := make(chan time.Time, 1)
+			ch <- time.Now()
+			return ch
+		},
+		// Simulates a Console instance that already burned its entire
+		// 20-minute budget on a PRIOR promptCodeAndExchange call (e.g. the
+		// operator typed a wrong code, retried, and the console reused the
+		// same struct) — the field the doc comment says is scoped to "one
+		// promptCodeAndExchange call".
+		pendingWaitElapsed: 20 * time.Minute,
+	}
+
+	token, bs, err := c.promptCodeAndExchange(context.Background(), true, Answers{Code: "ABCDEFGHJ"}, "https://example.invalid")
+	if err != nil {
+		t.Fatalf("promptCodeAndExchange() error = %v, want nil (the wait budget should have reset for this call)", err)
+	}
+	if token != "recv-token" {
+		t.Fatalf("token = %q, want recv-token", token)
+	}
+	if bs == nil {
+		t.Fatal("bootstrap = nil, want non-nil")
+	}
+	if calls != 2 {
+		t.Fatalf("Exchange calls = %d, want 2 (one pending, one success)", calls)
+	}
+}
+
+func TestConsole_ClientCapabilityRequiredReturnsToCodePromptWithMessage(t *testing.T) {
+	deps := &fakeDeps{
+		exchangeFn: func(ctx context.Context, server, code string) (string, *bmr.BootstrapResponse, error) {
+			return "", nil, &bmr.RecoveryNegotiationError{
+				Code:    "client_capability_required",
+				Message: "This backup references files stored with earlier snapshots. The recovery media you booted is too old to read them — download the current recovery media from Breeze and boot again.",
+			}
+		},
+	}
+	io := &fakeIO{}
+	c := &Console{IO: io, Deps: deps.build("0.111.1")}
+	_, _, err := c.promptCodeAndExchange(context.Background(), true, Answers{Code: "ABCDEFGHJ"}, "https://example.invalid")
+	if err == nil {
+		t.Fatalf("promptCodeAndExchange() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "too old to read them") {
+		t.Fatalf("error = %q, want it to contain %q", err.Error(), "too old to read them")
+	}
+}
+
+func TestConsole_StorageIdentityDriftShowsMessageVerbatim(t *testing.T) {
+	deps := &fakeDeps{
+		exchangeFn: func(ctx context.Context, server, code string) (string, *bmr.BootstrapResponse, error) {
+			return "", nil, &bmr.RecoveryNegotiationError{
+				Code:    "storage_identity_drift",
+				Message: "The backup destination for this device has changed since this snapshot was written. Restore the previous destination settings or choose a snapshot written to the current destination.",
+			}
+		},
+	}
+	io := &fakeIO{}
+	c := &Console{IO: io, Deps: deps.build("0.111.1")}
+	_, _, err := c.promptCodeAndExchange(context.Background(), true, Answers{Code: "ABCDEFGHJ"}, "https://example.invalid")
+	if err == nil {
+		t.Fatalf("promptCodeAndExchange() error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "destination for this device has changed") {
+		t.Fatalf("error = %q, want it to contain %q", err.Error(), "destination for this device has changed")
+	}
+}
+
+// W09 (#6464): the console gates on the download scope BEFORE the DryRun —
+// a ScopeRefusalError from WidenScope posts `refused`, never calls
+// Rebuild (no target write), and offers the failure menu.
+func TestConsole_ScopeRefusalPostsRefusedBeforeRebuild(t *testing.T) {
+	io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj", "p"}}
+	deps := &fakeDeps{
+		exchangeFn: happyExchange(t),
+		collectFn:  func(ctx context.Context) (*layout.Manifest, error) { return singleDiskLayout(), nil },
+		rebuildFn: func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error) {
+			t.Fatal("Rebuild must not run after a scope refusal")
+			return nil, nil
+		},
+		widenFn: func(ctx context.Context, provider providers.BackupProvider, bs *bmr.BootstrapResponse) error {
+			return &bmr.ScopeRefusalError{Reason: "this backup references 3 file(s) stored with earlier snapshots and the server did not grant cross-snapshot downloads", External: 3}
+		},
+	}
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: "breeze.media=1"}
+
+	if err := c.Run(context.Background()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(deps.rebuildCalls) != 0 {
+		t.Fatalf("rebuild calls = %d, want 0", len(deps.rebuildCalls))
+	}
+	if len(deps.progressCalls) != 1 || deps.progressCalls[0].Status != "refused" || !strings.Contains(deps.progressCalls[0].Reason, "earlier snapshots") {
+		t.Errorf("progress calls = %+v, want one 'refused' naming earlier snapshots", deps.progressCalls)
+	}
+	if strings.Join(deps.powerCalls, ",") != "poweroff" {
+		t.Errorf("power calls = %v, want [poweroff]", deps.powerCalls)
+	}
+}
+
+// A WidenScope success must leave the normal flow untouched (called once,
+// before the DryRun).
+func TestConsole_WidenScopeRunsBeforeDryRun(t *testing.T) {
+	io := &fakeIO{Answers: []string{"https://breeze.example", "abc-def-ghj", "ERASE"}}
+	order := []string{}
+	deps := &fakeDeps{
+		exchangeFn: happyExchange(t),
+		collectFn:  func(ctx context.Context) (*layout.Manifest, error) { return singleDiskLayout(), nil },
+		rebuildFn: func(ctx context.Context, opts rebuild.Options) (*rebuild.Result, error) {
+			order = append(order, "rebuild")
+			return &rebuild.Result{Status: "validated"}, nil
+		},
+		widenFn: func(ctx context.Context, provider providers.BackupProvider, bs *bmr.BootstrapResponse) error {
+			order = append(order, "widen")
+			return nil
+		},
+	}
+	c := &Console{IO: io, Deps: deps.build("0.111.1"), Cmdline: "breeze.media=1"}
+	_ = c.Run(context.Background())
+	if len(order) < 2 || order[0] != "widen" || order[1] != "rebuild" {
+		t.Fatalf("call order = %v, want widen before the first rebuild", order)
+	}
+	if strings.Count(strings.Join(order, ","), "widen") != 1 {
+		t.Fatalf("widen called %d times, want 1", strings.Count(strings.Join(order, ","), "widen"))
 	}
 }

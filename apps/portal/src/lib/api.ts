@@ -7,7 +7,7 @@ import { navigateTo } from './navigation';
 // Invoice-domain enum SSOT lives in @breeze/shared (billing-enums.ts). Imported
 // into local scope for the InvoiceSummary/InvoiceDetail types below and re-exported
 // (type-only, erased at build) so '@/lib/api' consumers are unaffected.
-import type { BackupDevicesDto, BackupOverviewDto, DashboardDto, DocumentPageSize, DocumentThemeId, EnrichedPortalDevice, InvoiceStatus, PublicQuoteCoverPage, PublicQuoteHeader, QuotePresentation, SecurityDevicesDto, SecurityOverviewDto, SlaDto, SupportUsageDto, TicketFormField } from '@breeze/shared';
+import type { BackupDevicesDto, BackupOverviewDto, DashboardDto, DocumentPageSize, DocumentThemeId, EnrichedPortalDevice, InvoiceStatus, NetworkOverviewDto, PublicQuoteCoverPage, PublicQuoteHeader, QuotePresentation, SecurityDevicesDto, SecurityOverviewDto, SlaDto, SupportUsageDto, TicketFormField } from '@breeze/shared';
 import type { HardwareLifecycleSummary, PortalRunDto, PortalRunsDto } from '@breeze/shared';
 import type { PortalDocumentsDto, PortalOccurrencesDto, PortalServiceOverviewDto } from '@breeze/shared';
 
@@ -472,6 +472,7 @@ export interface SellerSnapshot {
 
 export interface InvoiceLine {
   ticketNumber: string | null;
+  ticketCategory?: string | null;
   /** Line title; NULL on legacy lines where `description` holds the title (#3319). */
   name: string | null;
   description: string;
@@ -479,6 +480,26 @@ export interface InvoiceLine {
   unitPrice: string;
   lineTotal: string;
   taxable: boolean;
+  /** #6467: worked minutes for a time_entry line — drives the worked-vs-billed
+   *  disclosure note, never rendered from `description`. Null for
+   *  non-time-entry lines and legacy rows predating the column; optional
+   *  because older test fixtures and API responses predate the field. */
+  workedMinutes?: number | null;
+}
+
+/** #6467 — one line naming the worked time whenever it differs from the
+ *  billed quantity (§3.5). Sourced from `workedMinutes` (structured data),
+ *  never from `description` — an edit to the description can't erase it.
+ *  Returns null when the line isn't a time_entry line, or the two agree.
+ *  Portal has no i18n runtime (unlike web/PDF), so — like every other string
+ *  on this page — the note is plain English; that gap is pre-existing and
+ *  portal-wide, not specific to this note. */
+export function lineWorkedVsBilledNote(l: { quantity: string; workedMinutes?: number | null }): string | null {
+  if (l.workedMinutes == null) return null;
+  const worked = (l.workedMinutes / 60).toFixed(2);
+  const billed = Number(l.quantity).toFixed(2);
+  if (worked === billed) return null;
+  return `${worked} h worked · ${billed} h billed`;
 }
 
 export interface InvoiceDetail {
@@ -647,6 +668,12 @@ export interface QuoteDetail {
      *  draft successors on purpose — a customer must not learn a revision is
      *  being prepared for them. */
     supersededByQuoteId?: string | null;
+    /** When the quote was accepted (either by the customer or on their behalf). */
+    acceptedAt?: string | null;
+    /** Who recorded the acceptance. The method and reference behind an
+     *  'on_behalf' acceptance are the MSP's internal evidence trail and are
+     *  never sent to the portal — only the origin is. */
+    acceptanceOrigin?: 'customer' | 'on_behalf' | null;
   };
   blocks: QuoteBlock[];
   lines: QuoteLine[];
@@ -763,6 +790,7 @@ export interface BrandingConfig {
   enableService?: boolean;
   enableDocuments?: boolean;
   enableLifecycle?: boolean;
+  enableNetworkVisibility?: boolean;
   /** Curated chrome accent key (packages/shared/src/types/portalChromeAccent.ts).
    *  null/unset/unrecognized means the default ('spruce') — nothing to apply. */
   chromeAccent?: string | null;
@@ -1237,6 +1265,12 @@ export const portalApi = {
       })}`,
       config
     ),
+
+  // #6640 — network visibility overview
+  getNetworkOverview: (
+    config: ApiRequestConfig = {}
+  ): Promise<ApiResponse<NetworkOverviewDto>> =>
+    apiGet<NetworkOverviewDto>('/portal/network/overview', config),
 
   // ---------------------------------------------------------------------------
   // W08 — support usage

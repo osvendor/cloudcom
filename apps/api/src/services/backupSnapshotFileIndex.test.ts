@@ -1,5 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
+// A REAL agent manifest shape (KIT lab, PR #6491): content-less dir/symlink
+// entries with backupPath "", systemd unit names with a literal backslash,
+// dpkg info files with a colon. Shared with the Go side (objectkey_test.go,
+// fakeserver_test.go) so the API and the agent are pinned to the same bytes.
+const REAL_MANIFEST_FIXTURE = path.resolve(__dirname, '../../../../agent/internal/backup/bmr/testdata/real-manifest-shape.json');
+const REAL_MANIFEST_ID = 'snapshot-20260921T192625Z-2e609375';
+const REAL_MANIFEST_BASE_ID = 'snapshot-20260921T184722Z-3f770c73';
 
 // Renders the text of the drizzle SQL condition chunks passed to `.where()` so
 // we can assert on the *shape* of the CAS predicate without a real DB —
@@ -155,6 +165,68 @@ describe('hydrateSnapshotFileIndex', () => {
     const outcome = await hydrateSnapshotFileIndex(SNAPSHOT_DB_ID, { deps });
     expect(outcome).toMatchObject({ status: 'failed', failure: 'manifest_key_invalid', retryable: false });
     expect((outcome as { reason: string }).reason).toContain('snapshots/snap-current/../x');
+  });
+
+  it('hydrates a REAL agent manifest (D-W09-1 + D-W09-2): empty backupPath on dir/symlink entries is skipped, a backslash in a systemd unit key is admitted', async () => {
+    const bytes = readFileSync(REAL_MANIFEST_FIXTURE);
+    const manifest = JSON.parse(bytes.toString('utf8')) as { files: Array<{ backupPath: string; kind?: string }> };
+    const contentless = manifest.files.filter((f) => f.backupPath === '');
+    const external = manifest.files.filter((f) => f.backupPath.startsWith(`snapshots/${REAL_MANIFEST_BASE_ID}/`));
+    const own = manifest.files.filter((f) => f.backupPath.startsWith(`snapshots/${REAL_MANIFEST_ID}/`));
+    // The fixture must actually carry the traits that broke hydration on the KIT rig.
+    expect(contentless.length).toBeGreaterThan(0);
+    expect(contentless.every((f) => f.kind === 'dir' || f.kind === 'symlink')).toBe(true);
+    expect(external.some((f) => f.backupPath.includes('\\x2d'))).toBe(true);
+    expect(external.some((f) => f.backupPath.includes(':'))).toBe(true);
+
+    selectMock
+      .mockReturnValueOnce(chainMock([snapshotRow({ snapshotId: REAL_MANIFEST_ID })]))
+      .mockReturnValueOnce(chainMock([{ referencedFiles: external.length }]))
+      .mockReturnValueOnce(chainMock([{ id: 'origin-db-id', orgId: ORG_ID, deviceId: DEVICE_ID, storageIdentity: STORAGE_IDENTITY, metadata: {} }]));
+    const deps = { fetchManifestBytes: vi.fn().mockResolvedValue(new Uint8Array(bytes)) };
+
+    const outcome = await hydrateSnapshotFileIndex(SNAPSHOT_DB_ID, { deps });
+
+    expect(outcome).toMatchObject({
+      status: 'complete',
+      entryCount: external.length + own.length,
+      externalCount: external.length,
+      originSnapshotIds: [REAL_MANIFEST_BASE_ID],
+    });
+    // Every content entry — backslash and colon keys included — is written verbatim as a file row.
+    const insertedRows = insertMock.mock.results
+      .map((r) => r.value)
+      .flatMap((chain) => (chain?.values?.mock?.calls ?? []).flatMap((c: unknown[]) => c[0] as Array<{ backupPath: string }>));
+    const insertedKeys = new Set(insertedRows.map((r) => r.backupPath));
+    for (const f of [...external, ...own]) expect(insertedKeys.has(f.backupPath)).toBe(true);
+    for (const f of contentless) expect(insertedKeys.has('')).toBe(false);
+  });
+
+  it('still fails manifest_invalid when a CONTENT entry (no kind) has an empty backupPath — the relaxation is by kind, not blanket — and the reason names the entry, not a zod dump', async () => {
+    selectMock.mockReturnValueOnce(chainMock([snapshotRow()]));
+    selectMock.mockReturnValueOnce(chainMock([{ referencedFiles: 5 }]));
+    const entries = Array.from({ length: 3000 }, (_, i) => ({ sourcePath: `/bad${i}`, backupPath: '' }));
+    const deps = { fetchManifestBytes: vi.fn().mockResolvedValue(manifestBytes(entries)) };
+    const outcome = await hydrateSnapshotFileIndex(SNAPSHOT_DB_ID, { deps });
+    expect(outcome).toMatchObject({ status: 'failed', failure: 'manifest_invalid', retryable: false });
+    const reason = (outcome as { reason: string }).reason;
+    // First offending entry named by sourcePath, total count reported, and
+    // NOT the multi-megabyte ZodError JSON for 3,000 issues.
+    expect(reason).toContain('"/bad0"');
+    expect(reason).toContain('2999 more issue(s)');
+    expect(reason.length).toBeLessThan(400);
+  });
+
+  it('admits an UNKNOWN kind from a newer agent as long as a content entry names its object (forward compatible, fails closed only on missing object)', async () => {
+    selectMock.mockReturnValueOnce(chainMock([snapshotRow()]));
+    selectMock.mockReturnValueOnce(chainMock([{ referencedFiles: 5 }]));
+    const deps = {
+      fetchManifestBytes: vi.fn().mockResolvedValue(
+        manifestBytes([{ sourcePath: '/a', backupPath: 'snapshots/snap-current/files/a.gz', kind: 'hardlink' } as never]),
+      ),
+    };
+    const outcome = await hydrateSnapshotFileIndex(SNAPSHOT_DB_ID, { deps });
+    expect(outcome).toMatchObject({ status: 'complete', entryCount: 1 });
   });
 
   it('verifies an origin against a LIVE row on the same device/identity (provenance: live)', async () => {

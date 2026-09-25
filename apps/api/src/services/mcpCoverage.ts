@@ -27,7 +27,45 @@ export type McpExemptReason =
    * governance-gated, and a preview must be read by a human before the
    * matching convert call is made.
    */
-  | 'human_only_migration';
+  | 'human_only_migration'
+  /**
+   * Partner-level administration of an EXTERNAL VENDOR CONSOLE connection and
+   * the tenant bookkeeping it requires: storing/rotating the vendor login,
+   * mapping a discovered vendor customer onto a Breeze organization, and
+   * linking a vendor device row to a Breeze device. Deliberately not
+   * agent-reachable — these writes decide which tenant a third party's data
+   * lands under, and the credential routes are MFA- plus
+   * partner-wide-manage-gated. The agent-facing READ surface for backup health
+   * is `GET /backup/health` (#6008 W03), which carries its own tools.
+   */
+  | 'vendor_console_admin'
+  /**
+   * Caller verification (#6354) — the anti-vishing control itself. Starting,
+   * attesting, cancelling or overriding a verification, binding a canonical
+   * identity to a contact, and editing the policy floors are all decisions
+   * about WHETHER A CALLER IS WHO THEY CLAIM TO BE. An agent-reachable tool
+   * here would be the vishing vector the feature exists to close: a
+   * prompt-injected or socially-engineered agent could attest a caller's
+   * identity, bind an attacker's phone number as canonical, or lower the
+   * policy floor, and every downstream control would then read as satisfied.
+   * Every write on this router is `organizations:write` + `requireMfa()`
+   * precisely so a HUMAN with a second factor is the only actor that can
+   * decide one. The read side is deliberately excluded too: the verification
+   * record carries challenge and destination provenance material that is
+   * classified `excludedSensitive` in the tenant export policy.
+   */
+  | 'human_only_verification'
+  /**
+   * Evidence of a customer's agreement attached to an MSP-recorded ("accept on
+   * behalf") quote acceptance (#6633) — a signed PDF, PO scan, or email export
+   * a dispute reviewer relies on. Accepting on behalf is itself human-only (the
+   * spec gives it no AI tool: it commits the customer to an invoice and
+   * contracts), and an agent that could attach or replace the supporting file
+   * could fabricate the proof behind a money-committing record. Download is
+   * excluded with it: the file is internal, never shown to the customer, and
+   * is read by a human reviewer from the quote page.
+   */
+  | 'human_only_legal_evidence';
 
 export const MCP_COVERAGE: Readonly<Record<string, McpCoverageEntry>> = {
   'accessReviews.ts': { gap: '#6141' },
@@ -124,6 +162,11 @@ export const MCP_COVERAGE: Readonly<Record<string, McpCoverageEntry>> = {
   'backup/jobs.ts': { tools: ['query_backups', 'trigger_backup'] },
   'backup/mssql.ts': { tools: ['query_mssql_instances', 'get_mssql_backup_status', 'trigger_mssql_backup', 'restore_mssql_database', 'verify_mssql_backup'] },
   'backup/profiles.ts': { tools: ['manage_backup_profiles'] },
+  // #6008 W01 — the external backup-provider (Cove) admin surface; see
+  // `vendor_console_admin` above for why none of it is agent-reachable.
+  'backup/providerCustomers.ts': { exempt: 'vendor_console_admin', note: 'maps a discovered Cove customer onto a Breeze org' },
+  'backup/providerDevices.ts': { exempt: 'vendor_console_admin', note: 'lists provider device rows and links one to a Breeze device' },
+  'backup/providers.ts': { exempt: 'vendor_console_admin', note: 'stores and rotates the Cove console credential' },
   'backup/reconcile.ts': { gap: '#6141' },
   'backup/resilienceAuthorization.ts': { exempt: 'internal_plumbing', note: 'Authorization/helper or router composition module; the textual scanner matches context access, not a standalone endpoint.' },
   'backup/restore.ts': { tools: ['restore_snapshot'] },
@@ -140,6 +183,7 @@ export const MCP_COVERAGE: Readonly<Record<string, McpCoverageEntry>> = {
   'c2c/items.ts': { tools: ['search_c2c_items', 'restore_c2c_items'] },
   'c2c/jobs.ts': { tools: ['query_c2c_jobs', 'trigger_c2c_sync'] },
   'c2c/m365Auth.ts': { gap: '#6141' },
+  'callerVerification.ts': { exempt: 'human_only_verification' },
   'catalog/bundles.ts': { tools: ['manage_catalog'] },
   'catalog/catalog.ts': { tools: ['search_catalog', 'get_catalog_item', 'manage_catalog'] },
   'catalog/distributors.ts': { tools: ['lookup_distributor_product'] },
@@ -337,6 +381,7 @@ export const MCP_COVERAGE: Readonly<Record<string, McpCoverageEntry>> = {
   'portal/featureFlags.ts': { exempt: 'portal' },
   'portal/helpers.ts': { exempt: 'portal' },
   'portal/invoices.ts': { exempt: 'portal' },
+  'portal/network.ts': { exempt: 'portal' },
   'portal/profile.ts': { exempt: 'portal' },
   'portal/quotes.ts': { exempt: 'portal' },
   'portal/reports.ts': { exempt: 'portal' },
@@ -344,6 +389,7 @@ export const MCP_COVERAGE: Readonly<Record<string, McpCoverageEntry>> = {
   'portal/service.ts': { exempt: 'portal' },
   'portal/tickets.ts': { exempt: 'portal' },
   'psa.ts': { tools: ['query_psa_status'] },
+  'quotes/acceptanceEvidence.ts': { exempt: 'human_only_legal_evidence', note: 'Upload/download of the evidence file behind an on-behalf quote acceptance (#6633); the acceptance itself has no AI tool by design.' },
   'quotes/bulk.ts': { gap: '#6141' },
   'quotes/lifecycle.ts': { tools: ['manage_quotes'] },
   'quotes/quotes.ts': { tools: ['list_quotes', 'get_quote', 'manage_quotes'] },
