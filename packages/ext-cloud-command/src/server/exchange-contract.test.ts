@@ -1,5 +1,135 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createExchangeAddressesClient, createExchangeAutoReplyClient, createExchangeDelegationClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, createExchangeTraceClient, ExchangeWorkerError } from './exchange-contract';
+import { createExchangeAddressesClient, createExchangeAutoReplyClient, createExchangeConvertSharedClient, createExchangeDelegationClient, createExchangeDistributionClient, createExchangeDistributionMemberClient, createExchangeDistributionMembersClient, createExchangeDistributionNameClient, createExchangeGroupPrimaryClient, createExchangeGroupSettingsClient, createExchangeGroupExternalClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, createExchangeMailboxStatisticsClient, createExchangePreservationInspectClient, createExchangeSharedClient, createExchangeTraceClient, ExchangeWorkerError } from './exchange-contract';
+
+describe('Exchange group primary SMTP contract', () => {
+  const input = { groupId: '44444444-4444-4444-8444-444444444444', address: 'new@example.test' };
+  it('dispatches only the typed address write and requires exact readback', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: {
+      groupId: input.groupId, primarySmtpAddress: input.address, accepted: true, verified: true, changed: true } }));
+    await expect(createExchangeGroupPrimaryClient({ dispatch })(binding, input)).resolves.toMatchObject({ verified: true });
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'group.primary.set', parameters: input }));
+    await expect(createExchangeGroupPrimaryClient({ dispatch })(binding, { ...input, command: 'Remove-DistributionGroup' } as never)).rejects.toThrow();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true, data: {
+      groupId: input.groupId, primarySmtpAddress: 'wrong@example.test', accepted: true, verified: true, changed: true } }));
+    await expect(createExchangeGroupPrimaryClient({ dispatch })(binding, input)).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+  });
+});
+
+describe('Exchange distribution name contract', () => {
+  const input = { groupId: '44444444-4444-4444-8444-444444444444', displayName: 'QA Renamed' };
+  it('dispatches only the typed name write and verifies exact readback', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: {
+      ...input, accepted: true, verified: true, changed: true } }));
+    await expect(createExchangeDistributionNameClient({ dispatch })(binding, input)).resolves.toMatchObject({ verified: true });
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'distribution.name.set', parameters: input }));
+    await expect(createExchangeDistributionNameClient({ dispatch })(binding, { ...input, command: 'Remove-DistributionGroup' } as never)).rejects.toThrow();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true, data: {
+      ...input, displayName: 'Wrong', accepted: true, verified: true, changed: true } }));
+    await expect(createExchangeDistributionNameClient({ dispatch })(binding, input)).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+  });
+});
+
+describe('Exchange external-sender setting contract', () => {
+  const input = { groupId: '44444444-4444-4444-8444-444444444444', allowExternalSenders: true };
+  it('dispatches one typed write and requires matching verified readback', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: {
+      ...input, accepted: true, verified: true, changed: true } }));
+    await expect(createExchangeGroupExternalClient({ dispatch })(binding, input)).resolves.toMatchObject({ verified: true });
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'group.external.set', parameters: input }));
+    await expect(createExchangeGroupExternalClient({ dispatch })(binding, { ...input, command: 'Remove-UnifiedGroup' } as never)).rejects.toThrow();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true, data: {
+      ...input, allowExternalSenders: false, accepted: true, verified: true, changed: true } }));
+    await expect(createExchangeGroupExternalClient({ dispatch })(binding, input)).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+  });
+});
+
+describe('Exchange group settings read contract', () => {
+  const groupId = '44444444-4444-4444-8444-444444444444';
+  it('requires exact group identity and a typed settings response', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: {
+      groupId, kind: 'distribution', displayName: 'QA', primarySmtpAddress: 'qa@example.com', requireSenderAuthenticationEnabled: true,
+      emailAddressPolicyEnabled: false, aliases: ['old@example.com'] } }));
+    await expect(createExchangeGroupSettingsClient({ dispatch })(binding, groupId)).resolves.toMatchObject({ kind: 'distribution' });
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'group.settings.get', parameters: { groupId } }));
+    dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true, data: {
+      groupId: '66666666-6666-4666-8666-666666666666', kind: 'distribution', displayName: 'QA',
+      primarySmtpAddress: 'qa@example.com', requireSenderAuthenticationEnabled: true,
+      emailAddressPolicyEnabled: false, aliases: [] } }));
+    await expect(createExchangeGroupSettingsClient({ dispatch })(binding, groupId)).rejects.toMatchObject({ code: 'provider_unreachable' });
+  });
+});
+
+describe('Exchange distribution members read contract', () => {
+  const groupId = '44444444-4444-4444-8444-444444444444';
+  it('uses a fixed group ID and rejects mismatched or injected responses', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: {
+      groupId, members: [{ id: '55555555-5555-4555-8555-555555555555', displayName: 'QA', primarySmtpAddress: 'qa@example.com' }], complete: true } }));
+    await expect(createExchangeDistributionMembersClient({ dispatch })(binding, groupId)).resolves.toMatchObject({ complete: true });
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'distribution.members.get', parameters: { groupId } }));
+    await expect(createExchangeDistributionMembersClient({ dispatch })(binding, { groupId, command: 'Remove-DistributionGroup' } as never)).rejects.toThrow();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true, data: { groupId: '66666666-6666-4666-8666-666666666666', members: [], complete: true } }));
+    await expect(createExchangeDistributionMembersClient({ dispatch })(binding, groupId)).rejects.toMatchObject({ code: 'provider_unreachable' });
+  });
+});
+
+describe('Exchange distribution membership contract', () => {
+  const input = { groupId: '44444444-4444-4444-8444-444444444444', memberId: '55555555-5555-4555-8555-555555555555', enabled: true };
+  it('dispatches a fixed bound change and verifies both identities', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: {
+      ...input, accepted: true, verified: true, changed: true } }));
+    await expect(createExchangeDistributionMemberClient({ dispatch })(binding, input)).resolves.toMatchObject({ changed: true });
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'distribution.member.set', parameters: input }));
+  });
+  it('blocks injected input and a mismatched readback', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: {
+      ...input, memberId: '66666666-6666-4666-8666-666666666666', accepted: true, verified: true, changed: true } }));
+    const client = createExchangeDistributionMemberClient({ dispatch });
+    await expect(client(binding, { ...input, command: 'Remove-DistributionGroup' } as never)).rejects.toThrow();
+    expect(dispatch).not.toHaveBeenCalled();
+    await expect(client(binding, input)).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+  });
+});
+
+describe('Exchange distribution creation contract', () => {
+  const input = { name: 'QA Distribution', primarySmtpAddress: 'qa@example.com' };
+  it('accepts one fixed request and matching verified readback', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: {
+      accepted: true, verified: true, id: null, primarySmtpAddress: input.primarySmtpAddress } }));
+    await expect(createExchangeDistributionClient({ dispatch })(binding, input)).resolves.toMatchObject({ verified: true });
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'distribution.create', parameters: input }));
+  });
+  it('blocks injected parameters and treats a mismatched address as an unknown write outcome', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: {
+      accepted: true, verified: true, id: null, primarySmtpAddress: 'other@example.com' } }));
+    const client = createExchangeDistributionClient({ dispatch });
+    await expect(client(binding, { ...input, command: 'Remove-DistributionGroup' } as never)).rejects.toThrow();
+    expect(dispatch).not.toHaveBeenCalled();
+    await expect(client(binding, input)).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+  });
+});
+
+describe('Exchange shared mailbox creation contract', () => {
+  const input = { name: 'QA Shared', primarySmtpAddress: 'shared@example.com' };
+  it('dispatches a fixed shared operation with matching recipient readback', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: {
+      accepted: true, verified: true, id: '44444444-4444-4444-8444-444444444444', primarySmtpAddress: input.primarySmtpAddress } }));
+    await expect(createExchangeSharedClient({ dispatch })(binding, input)).resolves.toMatchObject({ verified: true });
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'shared.create', parameters: input }));
+    expect(JSON.stringify(dispatch.mock.calls)).not.toContain('certificate');
+  });
+  it('rejects extra inputs and treats mismatched readback as uncertain', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: {
+      accepted: true, verified: true, id: null, primarySmtpAddress: 'other@example.com' } }));
+    const client = createExchangeSharedClient({ dispatch });
+    await expect(client(binding, { ...input, command: 'Remove-Mailbox' } as never)).rejects.toThrow();
+    expect(dispatch).not.toHaveBeenCalled();
+    await expect(client(binding, input)).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+  });
+});
 
 const binding = {
   organizationId: '11111111-1111-4111-8111-111111111111', tenantId: '22222222-2222-4222-8222-222222222222',
@@ -9,13 +139,109 @@ const mailbox = {
   id: '44444444-4444-4444-8444-444444444444', primarySmtpAddress: 'test@example.com', recipientType: 'UserMailbox',
   archiveEnabled: false, mailboxBytes: 12, archiveBytes: null, collectedAt: '2026-09-22T00:00:00.000Z', statisticsUnavailable: false,
 };
+describe('Exchange preservation inspection contract', () => {
+  const data = { mailboxId: mailbox.id, primarySmtpAddress: mailbox.primarySmtpAddress,
+    recipientType: 'SharedMailbox', mailboxBytes: 12, archiveEnabled: false, directorySynced: false,
+    litigationHoldEnabled: false, inPlaceHolds: [], licenseRemovalEligible: true,
+    checkedAt: '2026-09-25T00:00:00Z' };
+  it('returns a fixed read-only preflight for an exact mailbox ID', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data }));
+    await expect(createExchangePreservationInspectClient({ dispatch })(binding, mailbox.id)).resolves.toEqual(data);
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'mailbox.preservation.get', parameters: { mailboxId: mailbox.id } }));
+  });
+  it('rejects an eligibility claim when a hold or archive is present', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: { ...data, inPlaceHolds: ['hold-1'] } }));
+    await expect(createExchangePreservationInspectClient({ dispatch })(binding, mailbox.id)).rejects.toMatchObject({ code: 'provider_unreachable' });
+    dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true, data: { ...data, directorySynced: true } }));
+    await expect(createExchangePreservationInspectClient({ dispatch })(binding, mailbox.id)).rejects.toMatchObject({ code: 'provider_unreachable' });
+  });
+});
+describe('Exchange shared-mailbox conversion contract', () => {
+  it('accepts only an exact verified same-mailbox conversion outcome', async () => {
+    const data = { mailboxId: mailbox.id, primarySmtpAddress: mailbox.primarySmtpAddress,
+      recipientType: 'SharedMailbox', accepted: true, verified: true, changed: true };
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data }));
+    await expect(createExchangeConvertSharedClient({ dispatch })(binding, mailbox.id)).resolves.toEqual(data);
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'mailbox.convert.shared', parameters: { mailboxId: mailbox.id } }));
+    await expect(createExchangeConvertSharedClient({ dispatch })(binding, 'bad-id')).rejects.toThrow();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,
+      data: { ...data, mailboxId: binding.organizationId } }));
+    await expect(createExchangeConvertSharedClient({ dispatch })(binding, mailbox.id)).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+  });
+});
 describe('Exchange worker contract', () => {
+  it('retrieves statistics for one authorized mailbox ID and rejects a substituted record', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: mailbox }));
+    await expect(createExchangeMailboxStatisticsClient({ dispatch })(binding, mailbox.id)).resolves.toEqual(mailbox);
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'mailbox.statistics.get', parameters: { mailboxId: mailbox.id } }));
+    await expect(createExchangeMailboxStatisticsClient({ dispatch })(binding, 'bad id')).rejects.toThrow();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true, data: { ...mailbox, id: binding.organizationId } }));
+    await expect(createExchangeMailboxStatisticsClient({ dispatch })(binding, mailbox.id)).rejects.toMatchObject({ code: 'provider_unreachable' });
+  });
   it('dispatches only the fixed bounded mailbox inventory operation', async () => {
     const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: { records: [mailbox], partial: false, collectedAt: mailbox.collectedAt } }));
     const result = await createExchangeMailboxInventoryClient({ dispatch })(binding, { pageSize: 25 });
-    expect(result.records).toEqual([mailbox]);
+    expect(result.records).toEqual([{ ...mailbox, statistics: { mailbox: 'available', archive: 'not_enabled' } }]);
     expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ ...binding, operation: 'mailbox.inventory', parameters: { pageSize: 25 }, requestId: expect.any(String) }));
     expect(JSON.stringify(dispatch.mock.calls)).not.toContain('certificate');
+  });
+  it('assembles a stable Exchange snapshot across bounded continuation pages', async () => {
+    const second = { ...mailbox, id: '55555555-5555-4555-8555-555555555555', primarySmtpAddress: 'second@example.com' };
+    const cursor = '66666666-6666-4666-8666-666666666666:1';
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: request.parameters.cursor
+      ? { records: [second], partial: false, collectedAt: mailbox.collectedAt, next: null }
+      : { records: [mailbox], partial: true, collectedAt: mailbox.collectedAt, next: cursor } }));
+    const result = await createExchangeMailboxInventoryClient({ dispatch })(binding, { pageSize: 1 });
+    expect(result.records.map(row => row.id)).toEqual([mailbox.id, second.id]);
+    expect(result.partial).toBe(false);
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(dispatch.mock.calls[1]![0].parameters).toEqual({ pageSize: 1, cursor });
+  });
+  it('classifies mailboxes beyond the original first 200 without marking the inventory partial', async () => {
+    const mailboxes = Array.from({ length: 201 }, (_, index) => ({ ...mailbox,
+      id: `00000000-0000-4000-8000-${(index + 1).toString(16).padStart(12, '0')}`,
+      primarySmtpAddress: `account${index + 1}@example.com`,
+      recipientType: index === 200 ? 'SharedMailbox' as const : 'UserMailbox' as const,
+    }));
+    const cursor = '66666666-6666-4666-8666-666666666666:200';
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: request.parameters.cursor
+      ? { records: mailboxes.slice(200), partial: false, collectedAt: mailbox.collectedAt, next: null }
+      : { records: mailboxes.slice(0, 200), partial: true, collectedAt: mailbox.collectedAt, next: cursor } }));
+    const result = await createExchangeMailboxInventoryClient({ dispatch })(binding, { pageSize: 200 });
+    expect(result.records).toHaveLength(201);
+    expect(result.summary.sharedMailboxCount).toBe(1);
+    expect(result.partial).toBe(false);
+  });
+  it('rejects changed snapshots, repeated identities and cursor loops', async () => {
+    const cursor = '66666666-6666-4666-8666-666666666666:1';
+    for (const later of [
+      { records: [mailbox], partial: false, collectedAt: '2026-09-23T00:00:00.000Z', next: null },
+      { records: [mailbox], partial: false, collectedAt: mailbox.collectedAt, next: null },
+      { records: [mailbox], partial: true, collectedAt: mailbox.collectedAt, next: cursor },
+    ]) {
+      const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: request.parameters.cursor
+        ? later : { records: [mailbox], partial: true, collectedAt: mailbox.collectedAt, next: cursor } }));
+      await expect(createExchangeMailboxInventoryClient({ dispatch })(binding)).rejects.toMatchObject({ code: 'provider_unreachable' });
+    }
+  });
+  it('separates shared mailboxes and per-statistic availability without guessing', async () => {
+    const shared = { ...mailbox, id: '55555555-5555-4555-8555-555555555555', primarySmtpAddress: 'shared@example.com',
+      recipientType: 'SharedMailbox' as const, archiveEnabled: true, mailboxBytes: 48, archiveBytes: null, statisticsUnavailable: true };
+    const unavailable = { ...mailbox, id: '66666666-6666-4666-8666-666666666666', primarySmtpAddress: 'missing@example.com',
+      archiveEnabled: false, mailboxBytes: null, archiveBytes: null, statisticsUnavailable: true };
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true,
+      data: { records: [mailbox, shared, unavailable], partial: true, collectedAt: mailbox.collectedAt } }));
+    const result = await createExchangeMailboxInventoryClient({ dispatch })(binding);
+    expect(result.partial).toBe(true);
+    expect(result.summary).toEqual({ userMailboxCount: 2, sharedMailboxCount: 1,
+      mailboxStatisticsUnavailableCount: 1, archiveStatisticsUnavailableCount: 1 });
+    expect(result.records.map(row => [row.recipientType, row.statistics])).toEqual([
+      ['UserMailbox', { mailbox: 'available', archive: 'not_enabled' }],
+      ['SharedMailbox', { mailbox: 'available', archive: 'unavailable' }],
+      ['UserMailbox', { mailbox: 'unavailable', archive: 'not_enabled' }],
+    ]);
   });
   it.each([
     [{ ...binding, tenantId: 'not-a-tenant' }, {}],
@@ -105,6 +331,17 @@ describe('Exchange mailbox address contract', () => {
 
 describe('Exchange delegation contract', () => {
   const mailboxId = mailbox.id, delegateId = '66666666-6666-4666-8666-666666666666';
+  it('lists only bounded, mailbox-bound direct delegation rows', async () => {
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true,
+      data: { mailboxId, entries: [{ delegateAddress: 'delegate@example.com', fullAccess: true, sendAs: false, sendOnBehalf: true }],
+        partial: false, checkedAt: '2026-09-25T00:00:00Z' } }));
+    const client = createExchangeDelegationClient({ dispatch });
+    await expect(client.list(binding, mailboxId)).resolves.toMatchObject({ mailboxId, entries: [expect.objectContaining({ fullAccess: true })] });
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'mailbox.delegation.list', parameters: { mailboxId } }));
+    dispatch.mockImplementationOnce(async request => ({ requestId: request.requestId, ok: true,
+      data: { mailboxId: delegateId, entries: [], partial: false, checkedAt: '2026-09-25T00:00:00Z' } }));
+    await expect(client.list(binding, mailboxId)).rejects.toMatchObject({ code: 'provider_unreachable' });
+  });
   it('dispatches one typed right per write and verifies both mailbox identities', async () => {
     const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true,
       data: { mailboxId, delegateId, delegateAddress: 'delegate@example.com', fullAccess: true,

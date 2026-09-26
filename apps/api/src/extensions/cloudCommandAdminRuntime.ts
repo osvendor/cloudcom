@@ -15,7 +15,7 @@ const EXCHANGE_SOCKET_ENV = 'CLOUDCOM_EXCHANGE_SOCKET_PATH';
 const CALLBACK_PATH = '/extensions/cloudcommand/connect';
 const LOGIN_ORIGIN = 'https://login.microsoftonline.com';
 const JWKS = createRemoteJWKSet(new URL(`${LOGIN_ORIGIN}/common/discovery/v2.0/keys`), { cacheMaxAge: 600_000, cooldownDuration: 30_000 });
-const ADMIN_ROLES = new Set(['62e90394-69f5-4237-9190-012177145e10', 'e8611ab8-c189-46e8-94e1-60213ab1f814']);
+const GLOBAL_ADMIN_ROLE = '62e90394-69f5-4237-9190-012177145e10';
 
 export type CloudCommandAdminConfiguration = { clientId: string; credentialVersion: string; redirectUri: string };
 export type CloudCommandAdminConnection = { tenantId: string; clientId: string; credentialVersion: string };
@@ -109,7 +109,7 @@ async function verifyIdentity(idToken: string, expected: { tenantId: string; cli
   const roles = Array.isArray(payload.wids) && payload.wids.every(role => typeof role === 'string') ? payload.wids as string[] : undefined;
   if (!tenantId || tenantId !== expected.tenantId || !administratorObjectId || payload.iss !== `${LOGIN_ORIGIN}/${tenantId}/v2.0`
     || payload.aud !== expected.clientId || typeof payload.sub !== 'string' || !payload.sub || payload.nonce !== expected.nonce
-    || !roles || !roles.some(role => ADMIN_ROLES.has(role.toLowerCase()))) throw authorizationInvalid();
+    || !roles || !roles.some(role => role.toLowerCase() === GLOBAL_ADMIN_ROLE)) throw authorizationInvalid();
   return { tenantId, administratorObjectId };
 }
 

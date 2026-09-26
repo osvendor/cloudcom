@@ -337,7 +337,7 @@ func handleCollectSoftware(_ *Heartbeat, cmd Command) tools.CommandResult {
 // uninstallSoftware is indirected so the re-report gating in
 // handleSoftwareUninstall can be tested on both a successful and a failed
 // uninstall without running a real package manager.
-var uninstallSoftware = tools.UninstallSoftware
+var uninstallSoftware = tools.UninstallSoftwareWithUserExec
 
 // handleSoftwareUninstall removes software and, on success, immediately
 // re-reports software inventory.
@@ -353,7 +353,11 @@ var uninstallSoftware = tools.UninstallSoftware
 // re-report is idempotent anyway — the API replaces the device's whole software
 // list per report — so the worst case is a redundant PUT.
 func handleSoftwareUninstall(h *Heartbeat, cmd Command) tools.CommandResult {
-	result := uninstallSoftware(cmd.Payload)
+	var userExec tools.UserUninstallExec
+	if h != nil {
+		userExec = tools.UserUninstallExec(h.makeUserExecFunc())
+	}
+	result := uninstallSoftware(cmd.Payload, userExec)
 	if result.Status == "completed" && h != nil {
 		if h.sendSoftwareInventoryFn != nil {
 			h.sendSoftwareInventoryFn()

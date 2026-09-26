@@ -28,7 +28,7 @@ function attempt() { return { org_id: org, actor_id: actor, tenant_id: tenant, c
   expected_generation: null, nonce: 'nonce', verifier_ciphertext: 'enc:v3:opaque', state_hash: 'hashed', stage: 'processing' }; }
 describe('unified administration onboarding', () => {
   it.each(['user.create', 'user.license.assign', 'user.update', 'user.password.reset', 'user.sessions.revoke', 'user.globalAdmin.get', 'user.globalAdmin.set',
-    'user.mfa.methods.list', 'user.mfa.method.remove', 'group.member.add'])(
+    'user.mfa.methods.list', 'user.mfa.method.remove', 'user.mfa.recoveryEmail.set', 'user.mfa.mobilePhone.set', 'group.member.add', 'group.owner.add'])(
     'requires manager authorization for %s before credential access', async type => {
       const h = setup();
       h.runtime.authorize.mockImplementation(async (_request, _orgId, mutation) => mutation ? null : { actorId: actor });
@@ -38,27 +38,35 @@ describe('unified administration onboarding', () => {
         : type === 'user.globalAdmin.set' ? { type, id: actor, enabled: true, confirmation: 'GLOBAL_ADMIN' }
         : type === 'user.mfa.methods.list' || type === 'user.globalAdmin.get' ? { type, id: actor }
         : type === 'user.mfa.method.remove' ? { type, id: actor, kind: 'phone', methodId: actor, confirmation: 'REMOVE_AUTH_METHOD' }
-        : type === 'group.member.add' ? { type, groupId: actor, userId: actor } : { type, id: actor };
+        : type === 'user.mfa.recoveryEmail.set' ? { type, id: actor, emailAddress: 'qa@example.net', confirmation: 'SET_RECOVERY_EMAIL' }
+        : type === 'user.mfa.mobilePhone.set' ? { type, id: actor, phoneNumber: '+1 5555551234', confirmation: 'SET_MOBILE_PHONE' }
+        : type === 'group.member.add' || type === 'group.owner.add' ? { type, groupId: actor, userId: actor } : { type, id: actor };
       await expect(h.admin.execute(request, input)).rejects.toMatchObject({ code: 'access_denied' });
       expect(h.runtime.authorize).toHaveBeenCalledWith(request, org, true);
       expect(h.runtime.acquireToken).not.toHaveBeenCalled();
       expect(h.fetch).not.toHaveBeenCalled();
     });
-  it('starts one tenant-bound consent using encrypted PKCE state and server configuration', async () => {
+  it('starts tenant discovery with one consent using encrypted PKCE state and server configuration', async () => {
     const h = setup();
-    const result = await h.admin.start(request, { tenantId: tenant, version: null }) as { authorizationUrl: string };
+    const result = await h.admin.start(request, { version: null }) as { authorizationUrl: string };
     const url = new URL(result.authorizationUrl);
-    expect(url.pathname).toBe(`/${tenant}/adminconsent`);
+    expect(url.pathname).toBe('/organizations/adminconsent');
     expect(url.searchParams.get('client_id')).toBe(client);
-    expect(store.start).toHaveBeenCalledWith(expect.objectContaining({ org_id: org, actor_id: actor, tenant_id: tenant, expected_generation: null, verifier_ciphertext: 'enc:v3:opaque' }));
+    expect(store.start).toHaveBeenCalledWith(expect.objectContaining({ org_id: org, actor_id: actor, tenant_id: null, expected_generation: null, verifier_ciphertext: 'enc:v3:opaque' }));
     expect(store.start.mock.calls[0][0].state_hash).not.toBe(url.searchParams.get('state'));
+  });
+  it('pins reconnection to the existing tenant', async () => {
+    const h = setup(); store.load.mockResolvedValue({ generation: 2, tenantId: tenant });
+    const result = await h.admin.start(request, { version: 2 }) as { authorizationUrl: string };
+    expect(new URL(result.authorizationUrl).pathname).toBe(`/${tenant}/adminconsent`);
+    expect(store.start).toHaveBeenCalledWith(expect.objectContaining({ tenant_id: tenant, expected_generation: 2 }));
   });
   it('rejects stale onboarding and nonmanagers before replacing consent state', async () => {
     const h = setup(); store.load.mockResolvedValue({ generation: 2 });
-    await expect(h.admin.start(request, { tenantId: tenant, version: 1 })).rejects.toMatchObject({ code: 'connection_changed' });
+    await expect(h.admin.start(request, { version: 1 })).rejects.toMatchObject({ code: 'connection_changed' });
     expect(store.start).not.toHaveBeenCalled();
     h.runtime.authorize.mockResolvedValue(null);
-    await expect(h.admin.start(request, { tenantId: tenant, version: 2 })).rejects.toMatchObject({ code: 'access_denied' });
+    await expect(h.admin.start(request, { version: 2 })).rejects.toMatchObject({ code: 'access_denied' });
   });
   it('rejects consumed, expired, wrong-user and wrong-org callbacks through scoped atomic claim', async () => {
     const h = setup(); store.claim.mockResolvedValue(null);
@@ -67,12 +75,13 @@ describe('unified administration onboarding', () => {
     expect(h.runtime.verifyAuthorization).not.toHaveBeenCalled(); expect(store.save).not.toHaveBeenCalled();
   });
   it('never treats an admin_consent query as proof of administrator identity', async () => {
-    const h = setup(); store.claim.mockResolvedValue(attempt());
+    const h = setup(); store.claim.mockResolvedValue({ ...attempt(), tenant_id: null });
     const result = await h.admin.complete(request, { state: 'a'.repeat(43), adminConsent: true, tenant }) as { authorizationUrl: string };
     const url = new URL(result.authorizationUrl);
     expect(url.pathname).toBe(`/${tenant}/oauth2/v2.0/authorize`);
     expect(url.searchParams.get('code_challenge_method')).toBe('S256');
     expect(url.searchParams.get('nonce')).toBe('nonce');
+    expect(store.advance).toHaveBeenCalledWith(org, expect.stringMatching(/^[a-f0-9]{64}$/), expect.stringMatching(/^[a-f0-9]{64}$/), tenant);
     expect(store.save).not.toHaveBeenCalled();
   });
   it('rejects a forged tenant or credential rotation during consent', async () => {
@@ -121,5 +130,142 @@ describe('unified administration onboarding', () => {
     store.disable.mockResolvedValue(true);
     await expect(h.admin.disconnect(request, { version: 3 })).resolves.toEqual({ success: true });
     expect(registry.revoke).toHaveBeenCalledWith(org);
+  });
+  it('routes only a strict distribution-create payload to the bound Exchange worker', async () => {
+    const h = setup();
+    store.load.mockResolvedValue({ id: client, orgId: org, tenantId: tenant, clientId: client,
+      credentialVersion: 'cert-1', permissionManifestVersion: 'business-standard-v1', enabled: true, generation: 3,
+      tenantName: 'Fixture', verifiedAt: null });
+    const registry = { provision: vi.fn(async () => {}), revoke: vi.fn(async () => {}) };
+    const worker = { dispatch: vi.fn(async value => ({ requestId: value.requestId, ok: true,
+      data: { accepted: true, verified: true, id: null, primarySmtpAddress: 'qa@example.com' } })) };
+    h.runtime.exchange = vi.fn(async () => ({ registry, worker }));
+    await expect(h.admin.execute(request, { type: 'distribution.create', name: 'QA', primarySmtpAddress: 'qa@example.com',
+      command: 'Remove-DistributionGroup' })).rejects.toMatchObject({ code: 'invalid_operation' });
+    expect(worker.dispatch).not.toHaveBeenCalled();
+    await expect(h.admin.execute(request, { type: 'distribution.create', name: 'QA', primarySmtpAddress: 'qa@example.com' }))
+      .resolves.toMatchObject({ verified: true });
+    expect(worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'distribution.create',
+      parameters: { name: 'QA', primarySmtpAddress: 'qa@example.com' } }));
+    expect(h.fetch).not.toHaveBeenCalled();
+  });
+  it('routes only a strict shared-mailbox creation payload to Exchange', async () => {
+    const h = setup();
+    store.load.mockResolvedValue({ id: client, orgId: org, tenantId: tenant, clientId: client,
+      credentialVersion: 'cert-1', permissionManifestVersion: 'business-standard-v1', enabled: true, generation: 3,
+      tenantName: 'Fixture', verifiedAt: null });
+    const registry = { provision: vi.fn(async () => {}), revoke: vi.fn(async () => {}) };
+    const worker = { dispatch: vi.fn(async value => ({ requestId: value.requestId, ok: true,
+      data: { accepted: true, verified: true, id: '66666666-6666-4666-8666-666666666666', primarySmtpAddress: 'shared@example.com' } })) };
+    h.runtime.exchange = vi.fn(async () => ({ registry, worker }));
+    await expect(h.admin.execute(request, { type: 'shared.create', name: 'QA Shared', primarySmtpAddress: 'shared@example.com',
+      certificatePath: '/private/key' })).rejects.toMatchObject({ code: 'invalid_operation' });
+    expect(worker.dispatch).not.toHaveBeenCalled();
+    await expect(h.admin.execute(request, { type: 'shared.create', name: 'QA Shared', primarySmtpAddress: 'shared@example.com' }))
+      .resolves.toMatchObject({ verified: true });
+    expect(worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'shared.create',
+      parameters: { name: 'QA Shared', primarySmtpAddress: 'shared@example.com' } }));
+    expect(h.fetch).not.toHaveBeenCalled();
+  });
+  it('rejects an injected distribution-membership payload and routes a bound typed change', async () => {
+    const h = setup();
+    store.load.mockResolvedValue({ id: client, orgId: org, tenantId: tenant, clientId: client,
+      credentialVersion: 'cert-1', permissionManifestVersion: 'business-standard-v1', enabled: true, generation: 3,
+      tenantName: 'Fixture', verifiedAt: null });
+    const registry = { provision: vi.fn(async () => {}), revoke: vi.fn(async () => {}) };
+    const groupId = '66666666-6666-4666-8666-666666666666', memberId = '77777777-7777-4777-8777-777777777777';
+    const worker = { dispatch: vi.fn(async value => ({ requestId: value.requestId, ok: true,
+      data: { groupId, memberId, enabled: true, accepted: true, verified: true, changed: true } })) };
+    h.runtime.exchange = vi.fn(async () => ({ registry, worker }));
+    await expect(h.admin.execute(request, { type: 'distribution.member.set', groupId, memberId, enabled: true,
+      command: 'Remove-DistributionGroup' })).rejects.toMatchObject({ code: 'invalid_operation' });
+    expect(worker.dispatch).not.toHaveBeenCalled();
+    await expect(h.admin.execute(request, { type: 'distribution.member.set', groupId, memberId, enabled: true }))
+      .resolves.toMatchObject({ changed: true });
+    expect(worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'distribution.member.set',
+      parameters: { groupId, memberId, enabled: true } }));
+  });
+  it('routes a bounded distribution-membership read without a mutation permission or injected fields', async () => {
+    const h = setup();
+    store.load.mockResolvedValue({ id: client, orgId: org, tenantId: tenant, clientId: client,
+      credentialVersion: 'cert-1', permissionManifestVersion: 'business-standard-v1', enabled: true, generation: 3,
+      tenantName: 'Fixture', verifiedAt: null });
+    const registry = { provision: vi.fn(async () => {}), revoke: vi.fn(async () => {}) };
+    const groupId = '66666666-6666-4666-8666-666666666666';
+    const worker = { dispatch: vi.fn(async value => ({ requestId: value.requestId, ok: true,
+      data: { groupId, members: [], complete: true } })) };
+    h.runtime.exchange = vi.fn(async () => ({ registry, worker }));
+    await expect(h.admin.execute(request, { type: 'distribution.members.get', groupId, command: 'Remove-DistributionGroup' }))
+      .rejects.toMatchObject({ code: 'invalid_operation' });
+    expect(worker.dispatch).not.toHaveBeenCalled();
+    await expect(h.admin.execute(request, { type: 'distribution.members.get', groupId }))
+      .resolves.toMatchObject({ groupId, complete: true });
+    expect(worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'distribution.members.get',
+      parameters: { groupId } }));
+  });
+  it('routes group settings to the fixed Exchange read operation', async () => {
+    const h = setup();
+    store.load.mockResolvedValue({ id: client, orgId: org, tenantId: tenant, clientId: client,
+      credentialVersion: 'cert-1', permissionManifestVersion: 'business-standard-v1', enabled: true, generation: 3,
+      tenantName: 'Fixture', verifiedAt: null });
+    const registry = { provision: vi.fn(async () => {}), revoke: vi.fn(async () => {}) };
+    const groupId = '66666666-6666-4666-8666-666666666666';
+    const worker = { dispatch: vi.fn(async value => ({ requestId: value.requestId, ok: true,
+      data: { groupId, kind: 'distribution', displayName: 'QA', primarySmtpAddress: 'qa@example.test', requireSenderAuthenticationEnabled: true,
+        emailAddressPolicyEnabled: false, aliases: [] } })) };
+    h.runtime.exchange = vi.fn(async () => ({ registry, worker }));
+    await expect(h.admin.execute(request, { type: 'group.settings.get', groupId, command: 'Remove-DistributionGroup' }))
+      .rejects.toMatchObject({ code: 'invalid_operation' });
+    expect(worker.dispatch).not.toHaveBeenCalled();
+    await expect(h.admin.execute(request, { type: 'group.settings.get', groupId })).resolves.toMatchObject({ groupId });
+    expect(worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'group.settings.get', parameters: { groupId } }));
+  });
+  it('routes group primary addresses through a strict Exchange action', async () => {
+    const h = setup();
+    store.load.mockResolvedValue({ id: client, orgId: org, tenantId: tenant, clientId: client,
+      credentialVersion: 'cert-1', permissionManifestVersion: 'business-standard-v1', enabled: true, generation: 3,
+      tenantName: 'Fixture', verifiedAt: null });
+    const registry = { provision: vi.fn(async () => {}), revoke: vi.fn(async () => {}) };
+    const input = { groupId: '66666666-6666-4666-8666-666666666666', address: 'new@example.test' };
+    const worker = { dispatch: vi.fn(async value => ({ requestId: value.requestId, ok: true,
+      data: { groupId: input.groupId, primarySmtpAddress: input.address, accepted: true, verified: true, changed: true } })) };
+    h.runtime.exchange = vi.fn(async () => ({ registry, worker }));
+    await expect(h.admin.execute(request, { type: 'group.primary.set', ...input, command: 'Remove-DistributionGroup' }))
+      .rejects.toMatchObject({ code: 'invalid_operation' });
+    expect(worker.dispatch).not.toHaveBeenCalled();
+    await expect(h.admin.execute(request, { type: 'group.primary.set', ...input })).resolves.toMatchObject({ verified: true });
+    expect(worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'group.primary.set', parameters: input }));
+  });
+  it('routes distribution-list names through a strict Exchange action', async () => {
+    const h = setup();
+    store.load.mockResolvedValue({ id: client, orgId: org, tenantId: tenant, clientId: client,
+      credentialVersion: 'cert-1', permissionManifestVersion: 'business-standard-v1', enabled: true, generation: 3,
+      tenantName: 'Fixture', verifiedAt: null });
+    const registry = { provision: vi.fn(async () => {}), revoke: vi.fn(async () => {}) };
+    const input = { groupId: '66666666-6666-4666-8666-666666666666', displayName: 'QA Renamed' };
+    const worker = { dispatch: vi.fn(async value => ({ requestId: value.requestId, ok: true,
+      data: { ...input, accepted: true, verified: true, changed: true } })) };
+    h.runtime.exchange = vi.fn(async () => ({ registry, worker }));
+    await expect(h.admin.execute(request, { type: 'distribution.name.set', ...input, command: 'Remove-DistributionGroup' }))
+      .rejects.toMatchObject({ code: 'invalid_operation' });
+    expect(worker.dispatch).not.toHaveBeenCalled();
+    await expect(h.admin.execute(request, { type: 'distribution.name.set', ...input })).resolves.toMatchObject({ verified: true });
+    expect(worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'distribution.name.set', parameters: input }));
+  });
+  it('routes external-sender changes through a strict Exchange action', async () => {
+    const h = setup();
+    store.load.mockResolvedValue({ id: client, orgId: org, tenantId: tenant, clientId: client,
+      credentialVersion: 'cert-1', permissionManifestVersion: 'business-standard-v1', enabled: true, generation: 3,
+      tenantName: 'Fixture', verifiedAt: null });
+    const registry = { provision: vi.fn(async () => {}), revoke: vi.fn(async () => {}) };
+    const input = { groupId: '66666666-6666-4666-8666-666666666666', allowExternalSenders: true };
+    const worker = { dispatch: vi.fn(async value => ({ requestId: value.requestId, ok: true,
+      data: { ...input, accepted: true, verified: true, changed: true } })) };
+    h.runtime.exchange = vi.fn(async () => ({ registry, worker }));
+    await expect(h.admin.execute(request, { type: 'group.external.set', ...input, command: 'Set-UnifiedGroup' }))
+      .rejects.toMatchObject({ code: 'invalid_operation' });
+    expect(worker.dispatch).not.toHaveBeenCalled();
+    await expect(h.admin.execute(request, { type: 'group.external.set', ...input })).resolves.toMatchObject({ verified: true });
+    expect(worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'group.external.set', parameters: input }));
   });
 });

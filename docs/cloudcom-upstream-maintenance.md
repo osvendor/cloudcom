@@ -13,6 +13,16 @@ This guide records how the CloudCom fork differs from LanternOps/Breeze and how 
 
 ## Change register
 
+Managed viewer routing correction (2026-09-24): `scripts/cloudcom/rustdesk/launch-managed.ps1`
+and its dependency-free regression test pin private routing per viewer process and
+validate bundle fingerprints. See [launch and release acceptance](cloudcom-managed-viewer-launch.md).
+No API, agent, database, or provider authorization path changes. Preserve the launcher,
+test and guide during upstream updates. Local profile hashes are not release signing.
+Nine focused launcher checks passed; the existing managed test bundle connected to
+the private relay, consumed its Breeze admission ticket, and displayed the desktop
+with user confirmation. Full installer distribution and the complete upgrade/revocation
+acceptance matrix remain separate from this routing fix.
+
 | Area | Current state and files | Upstream merge considerations | Validation |
 | --- | --- | --- | --- |
 | Agent WebSocket recovery | Candidate in `agent/internal/websocket/client.go` and adjacent regression tests: back off after short-lived upgraded connections, reject sockets established after Stop, and retain safe handshake HTTP status. The native job in `cloudcom-ci.yml` installs libpcap development headers required by discovery. [Diagnostics and canary procedure](cloudcom-agent-connectivity.md). Not deployed or signed as a fleet release. | Preserve bearer/TLS authentication, indefinite retries, cancellation and stable-session reset. Reassess against upstream reconnect changes; do not silently alter device offline semantics. | Targeted Linux race tests and final-head CloudCom native CI required; actual results recorded in PR. Historical outage attribution and canary acceptance remain separate. No DB migration; rollback restores previous verified agent binary. |
@@ -120,6 +130,8 @@ A separate `admin-auth-methods.ts` candidate adds tenant-fenced, typed Graph aut
 The directory Exclude preference candidate adds `cloudcommand_microsoft_directory_preferences` through a forward-only extension migration. Its rows are scoped to organization, technician and Microsoft user, with forced RLS, host-derived actor identity, manager/MFA-gated writes and audit. The manifest registers organization cascade/export metadata; the UI hides excluded users by default and offers an Exclude view to restore them. The integration test checks both organization and same-organization technician isolation on disposable PostgreSQL. This migration cannot be removed by a later upstream merge.
 
 The OneDrive usage candidate extends the fixed Microsoft Graph read-action allowlist and executor with the tenant's usage report. It accepts only the documented report redirect host, parses a bounded CSV into scalar per-user used storage, joins by UPN in the existing organization connection, and leaves the directory value unavailable when report permission or data is absent. It does not block the user list. The executor files and focused tests are included in CloudCom's CI classifier and upstream customization contract. `Reports.Read.All` app consent and live tenant response remain unverified; no report access is claimed yet.
+
+Direct-code Microsoft directory follow-up (2026-09-25): the live Cloud Command extension mounts `createAdministrationServices` in preference to the separate Graph-read bridge. The administration enterprise app is therefore the directory's authority. Its user list now selects `userType` and `assignedLicenses`, resolves assigned SKU IDs against the same tenant's subscribed SKUs, and returns only a scalar license summary. A bounded OneDrive usage report uses the same app only when its token has `Reports.Read.All`; missing consent or report failures leave usage unknown without blocking users. The fixed Exchange worker mailbox inventory supplies `UserMailbox`/`SharedMailbox` and mailbox/archive usage; the web view separates shared mailboxes and labels incomplete statistics. Preserve these paths together during LanternOps intake. The source and focused tests are complete locally; the ordinary no-image production artifact path is not implemented, and live report permission, inventory response, and visual acceptance remain release checks.
 
 The Microsoft Create user candidate performs only the base Graph identity creation step after selecting a verified tenant domain. It generates a one-time password on the server, requires change at first sign-in, fences the tenant connection and actor, audits the operation, and marks responses `no-store`. Optional Cloud Command steps (license, MFA, aliases, and groups) remain visibly pending. It has not been run against a live tenant, so no full create workflow is claimed.
 

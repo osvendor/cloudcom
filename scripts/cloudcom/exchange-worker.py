@@ -14,9 +14,9 @@ MAX_REQUEST = 64 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
 MAX_PAGE_SIZE = 200
 COMMAND_TIMEOUT_SECONDS = 45
-ALLOWED_OPERATIONS = frozenset(('mailbox.inventory', 'mailbox.forwarding.get', 'mailbox.forwarding.set',
+ALLOWED_OPERATIONS = frozenset(('mailbox.inventory', 'mailbox.statistics.get', 'mailbox.preservation.get', 'mailbox.convert.shared', 'mailbox.forwarding.get', 'mailbox.forwarding.set',
     'mailbox.autoreply.get', 'mailbox.autoreply.set', 'mailbox.addresses.get', 'mailbox.primary.set',
-    'mailbox.alias.add', 'mailbox.alias.remove', 'mailbox.delegation.get', 'mailbox.delegation.set', 'trace.search', 'trace.detail'))
+    'mailbox.alias.add', 'mailbox.alias.remove', 'mailbox.delegation.get', 'mailbox.delegation.list', 'mailbox.delegation.set', 'distribution.create', 'shared.create', 'distribution.member.set', 'distribution.members.get', 'group.settings.get', 'group.external.set', 'distribution.name.set', 'group.primary.set', 'trace.search', 'trace.detail'))
 TRACE_STATUSES = frozenset(('Delivered', 'Expanded', 'Failed', 'FilteredAsSpam', 'GettingStatus', 'Pending', 'Quarantined'))
 ADDRESS = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 def trace_address(value): return isinstance(value, str) and len(value) <= 320 and ADDRESS.fullmatch(value) is not None
@@ -25,13 +25,17 @@ def trace_time(value):
     result = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
     if result.tzinfo is None: raise ValueError()
     return result.astimezone(datetime.timezone.utc)
-def is_write(operation): return operation.endswith(('.set', '.add', '.remove'))
+def is_write(operation): return operation == 'mailbox.convert.shared' or operation.endswith(('.set', '.add', '.remove', '.create'))
 SAFE_FAILURES = frozenset(('access_denied', 'connection_mismatch', 'credential_unavailable', 'invalid_request',
                             'provider_access_denied', 'provider_rejected', 'provider_unreachable', 'response_too_large', 'worker_busy', 'unknown_write_outcome'))
 PEERCRED = getattr(socket, 'SO_PEERCRED', 17) # Linux value; main rejects non-Linux runtimes.
 
 def fail(request_id, code): return {'requestId': request_id, 'ok': False, 'code': code if code in SAFE_FAILURES else 'provider_unreachable'}
 def normalized_uuid(value): return str(uuid.UUID(str(value))).lower()
+def inventory_cursor(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9a-fA-F-]{36}:[1-9][0-9]{0,4}', value): return False
+    try: return normalized_uuid(value.split(':', 1)[0]) == value.split(':', 1)[0].lower() and int(value.split(':', 1)[1]) <= 10000
+    except (TypeError, ValueError): return False
 def peer_allowed(connection, allowed_uid):
     _pid, uid, _gid = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, PEERCRED, 12))
     return uid == allowed_uid
@@ -44,8 +48,83 @@ def valid_success_response(result, request_id, operation):
     if not isinstance(result, dict) or result.get('requestId') != request_id or result.get('ok') is not True: return 'provider_unreachable'
     data = result.get('data')
     if operation == 'mailbox.inventory':
-        if not isinstance(data, dict) or set(data) != {'records', 'partial', 'collectedAt'} or not isinstance(data['records'], list) or not isinstance(data['partial'], bool) or not isinstance(data['collectedAt'], str): return 'provider_unreachable'
+        if not isinstance(data, dict) or not {'records', 'partial', 'collectedAt'} <= set(data) or set(data) - {'records', 'partial', 'collectedAt', 'next'} or not isinstance(data['records'], list) or not isinstance(data['partial'], bool) or not isinstance(data['collectedAt'], str): return 'provider_unreachable'
         if len(data['records']) > MAX_PAGE_SIZE: return 'response_too_large'
+        if 'next' in data and data['next'] is not None:
+            if not data['partial'] or not data['records'] or not inventory_cursor(data['next']): return 'provider_unreachable'
+    elif operation == 'mailbox.statistics.get':
+        expected = {'id', 'primarySmtpAddress', 'recipientType', 'archiveEnabled', 'mailboxBytes', 'archiveBytes', 'collectedAt', 'statisticsUnavailable'}
+        if not isinstance(data, dict) or set(data) != expected: return 'provider_unreachable'
+        try: normalized_uuid(data['id']); trace_time(data['collectedAt'])
+        except (TypeError, ValueError): return 'provider_unreachable'
+        if not trace_address(data['primarySmtpAddress']) or data['recipientType'] not in ('UserMailbox', 'SharedMailbox'): return 'provider_unreachable'
+        if type(data['archiveEnabled']) is not bool or type(data['statisticsUnavailable']) is not bool: return 'provider_unreachable'
+        if any(value is not None and (type(value) is not int or value < 0) for value in (data['mailboxBytes'], data['archiveBytes'])): return 'provider_unreachable'
+    elif operation == 'mailbox.preservation.get':
+        expected = {'mailboxId', 'primarySmtpAddress', 'recipientType', 'mailboxBytes', 'archiveEnabled', 'directorySynced',
+                    'litigationHoldEnabled', 'inPlaceHolds', 'licenseRemovalEligible', 'checkedAt'}
+        if not isinstance(data, dict) or set(data) != expected: return 'provider_unreachable'
+        try: normalized_uuid(data['mailboxId']); trace_time(data['checkedAt'])
+        except (TypeError, ValueError): return 'provider_unreachable'
+        if not trace_address(data['primarySmtpAddress']) or data['recipientType'] not in ('UserMailbox', 'SharedMailbox'): return 'provider_unreachable'
+        if type(data['archiveEnabled']) is not bool or type(data['licenseRemovalEligible']) is not bool: return 'provider_unreachable'
+        if data['mailboxBytes'] is not None and (type(data['mailboxBytes']) is not int or data['mailboxBytes'] < 0): return 'provider_unreachable'
+        if data['directorySynced'] is not None and type(data['directorySynced']) is not bool: return 'provider_unreachable'
+        if data['litigationHoldEnabled'] is not None and type(data['litigationHoldEnabled']) is not bool: return 'provider_unreachable'
+        if data['inPlaceHolds'] is not None and (not isinstance(data['inPlaceHolds'], list) or len(data['inPlaceHolds']) > 100
+            or any(not isinstance(hold, str) or not 1 <= len(hold) <= 256 for hold in data['inPlaceHolds'])): return 'provider_unreachable'
+        if data['licenseRemovalEligible'] and (data['recipientType'] != 'SharedMailbox' or data['directorySynced'] is not False or data['mailboxBytes'] is None
+            or data['mailboxBytes'] >= 50 * 1024 ** 3 or data['archiveEnabled'] or data['litigationHoldEnabled'] is not False
+            or data['inPlaceHolds'] is None or data['inPlaceHolds']): return 'provider_unreachable'
+    elif operation == 'mailbox.convert.shared':
+        if not isinstance(data, dict) or set(data) != {'mailboxId', 'primarySmtpAddress', 'recipientType', 'accepted', 'verified', 'changed'}: return 'provider_unreachable'
+        try: normalized_uuid(data['mailboxId'])
+        except (TypeError, ValueError): return 'provider_unreachable'
+        if not trace_address(data['primarySmtpAddress']) or data['recipientType'] != 'SharedMailbox' or data['accepted'] is not True or data['verified'] is not True or type(data['changed']) is not bool: return 'provider_unreachable'
+    elif operation in ('distribution.create', 'shared.create'):
+        if not isinstance(data, dict) or set(data) != {'accepted', 'verified', 'id', 'primarySmtpAddress'}: return 'provider_unreachable'
+        if data['accepted'] is not True or type(data['verified']) is not bool or not trace_address(data['primarySmtpAddress']): return 'provider_unreachable'
+        if data['id'] is not None:
+            try: normalized_uuid(data['id'])
+            except (TypeError, ValueError): return 'provider_unreachable'
+    elif operation == 'distribution.member.set':
+        if not isinstance(data, dict) or set(data) != {'groupId', 'memberId', 'enabled', 'accepted', 'verified', 'changed'}: return 'provider_unreachable'
+        try: normalized_uuid(data['groupId']); normalized_uuid(data['memberId'])
+        except (TypeError, ValueError): return 'provider_unreachable'
+        if data['accepted'] is not True or any(type(data[key]) is not bool for key in ('enabled', 'verified', 'changed')): return 'provider_unreachable'
+    elif operation == 'distribution.members.get':
+        if not isinstance(data, dict) or set(data) != {'groupId', 'members', 'complete'} or type(data['complete']) is not bool: return 'provider_unreachable'
+        try: normalized_uuid(data['groupId'])
+        except (TypeError, ValueError): return 'provider_unreachable'
+        if not isinstance(data['members'], list) or len(data['members']) > 500: return 'response_too_large'
+        for member in data['members']:
+            if not isinstance(member, dict) or set(member) != {'id', 'displayName', 'primarySmtpAddress'}: return 'provider_unreachable'
+            try: normalized_uuid(member['id'])
+            except (TypeError, ValueError): return 'provider_unreachable'
+            if not isinstance(member['displayName'], str) or len(member['displayName']) > 256 or not trace_address(member['primarySmtpAddress']): return 'provider_unreachable'
+    elif operation == 'group.settings.get':
+        if not isinstance(data, dict) or set(data) != {'groupId', 'kind', 'displayName', 'primarySmtpAddress', 'requireSenderAuthenticationEnabled', 'emailAddressPolicyEnabled', 'aliases'}: return 'provider_unreachable'
+        try: normalized_uuid(data['groupId'])
+        except (TypeError, ValueError): return 'provider_unreachable'
+        if data['kind'] not in ('distribution', 'microsoft365') or not isinstance(data['displayName'], str) or len(data['displayName']) > 256 or not trace_address(data['primarySmtpAddress']) or type(data['requireSenderAuthenticationEnabled']) is not bool: return 'provider_unreachable'
+        if data['kind'] == 'microsoft365' and data['emailAddressPolicyEnabled'] is not None: return 'provider_unreachable'
+        if data['kind'] == 'distribution' and type(data['emailAddressPolicyEnabled']) is not bool: return 'provider_unreachable'
+        if not isinstance(data['aliases'], list) or len(data['aliases']) > 500 or any(not trace_address(address) for address in data['aliases']): return 'provider_unreachable'
+    elif operation == 'group.external.set':
+        if not isinstance(data, dict) or set(data) != {'groupId', 'allowExternalSenders', 'accepted', 'verified', 'changed'}: return 'provider_unreachable'
+        try: normalized_uuid(data['groupId'])
+        except (TypeError, ValueError): return 'provider_unreachable'
+        if data['accepted'] is not True or any(type(data[key]) is not bool for key in ('allowExternalSenders', 'verified', 'changed')): return 'provider_unreachable'
+    elif operation == 'distribution.name.set':
+        if not isinstance(data, dict) or set(data) != {'groupId', 'displayName', 'accepted', 'verified', 'changed'}: return 'provider_unreachable'
+        try: normalized_uuid(data['groupId'])
+        except (TypeError, ValueError): return 'provider_unreachable'
+        if data['accepted'] is not True or any(type(data[key]) is not bool for key in ('verified', 'changed')) or not isinstance(data['displayName'], str) or not 1 <= len(data['displayName'].strip()) <= 256: return 'provider_unreachable'
+    elif operation == 'group.primary.set':
+        if not isinstance(data, dict) or set(data) != {'groupId', 'primarySmtpAddress', 'accepted', 'verified', 'changed'}: return 'provider_unreachable'
+        try: normalized_uuid(data['groupId'])
+        except (TypeError, ValueError): return 'provider_unreachable'
+        if data['accepted'] is not True or any(type(data[key]) is not bool for key in ('verified', 'changed')) or not trace_address(data['primarySmtpAddress']): return 'provider_unreachable'
     elif operation == 'trace.search':
         if not isinstance(data, dict) or set(data) != {'rows', 'next', 'partial', 'checkedAt'} or type(data['partial']) is not bool: return 'provider_unreachable'
         if not isinstance(data['rows'], list) or len(data['rows']) > 1000: return 'response_too_large'
@@ -93,6 +172,15 @@ def valid_success_response(result, request_id, operation):
         if not all(isinstance(data[key], str) and len(data[key]) <= 16384 for key in ('internalMessage', 'externalMessage')): return 'provider_unreachable'
         if not all(data[key] is None or isinstance(data[key], str) and len(data[key]) <= 64 for key in ('start', 'end')): return 'provider_unreachable'
         if operation == 'mailbox.autoreply.set' and (data['accepted'] is not True or type(data['verified']) is not bool): return 'provider_unreachable'
+    elif operation == 'mailbox.delegation.list':
+        if not isinstance(data, dict) or set(data) != {'mailboxId', 'entries', 'partial', 'checkedAt'}: return 'provider_unreachable'
+        try: normalized_uuid(data['mailboxId']); trace_time(data['checkedAt'])
+        except (TypeError, ValueError): return 'provider_unreachable'
+        if type(data['partial']) is not bool or not isinstance(data['entries'], list) or len(data['entries']) > 200: return 'provider_unreachable'
+        for entry in data['entries']:
+            if not isinstance(entry, dict) or set(entry) != {'delegateAddress', 'fullAccess', 'sendAs', 'sendOnBehalf'}: return 'provider_unreachable'
+            if not trace_address(entry['delegateAddress']): return 'provider_unreachable'
+            if any(type(entry[key]) is not bool for key in ('fullAccess', 'sendAs', 'sendOnBehalf')): return 'provider_unreachable'
     elif operation.startswith('mailbox.delegation.'):
         expected = {'mailboxId', 'delegateId', 'delegateAddress', 'fullAccess', 'sendAs', 'sendOnBehalf'}
         if is_write(operation): expected.update(('accepted', 'verified'))
@@ -133,7 +221,29 @@ def validate_request(value, tenants):
     if operation not in ALLOWED_OPERATIONS or not isinstance(version, str) or not version or len(version) > 128 or type(generation) is not int or generation < 1: raise ValueError()
     if not isinstance(params, dict): raise ValueError()
     if operation == 'mailbox.inventory':
-        if set(params) != {'pageSize'} or type(params['pageSize']) is not int or not 1 <= params['pageSize'] <= MAX_PAGE_SIZE: raise ValueError()
+        if set(params) not in ({'pageSize'}, {'pageSize', 'cursor'}) or type(params['pageSize']) is not int or not 1 <= params['pageSize'] <= MAX_PAGE_SIZE: raise ValueError()
+        if 'cursor' in params:
+            if not inventory_cursor(params['cursor']): raise ValueError()
+    elif operation in ('mailbox.statistics.get', 'mailbox.preservation.get', 'mailbox.convert.shared'):
+        if set(params) != {'mailboxId'}: raise ValueError()
+        normalized_uuid(params['mailboxId'])
+    elif operation in ('distribution.create', 'shared.create'):
+        if set(params) != {'name', 'primarySmtpAddress'} or not isinstance(params['name'], str) or not 1 <= len(params['name'].strip()) <= 256 or not trace_address(params['primarySmtpAddress']): raise ValueError()
+    elif operation == 'distribution.member.set':
+        if set(params) != {'groupId', 'memberId', 'enabled'} or type(params['enabled']) is not bool: raise ValueError()
+        if normalized_uuid(params['groupId']) == normalized_uuid(params['memberId']): raise ValueError()
+    elif operation in ('distribution.members.get', 'group.settings.get'):
+        if set(params) != {'groupId'}: raise ValueError()
+        normalized_uuid(params['groupId'])
+    elif operation == 'group.external.set':
+        if set(params) != {'groupId', 'allowExternalSenders'} or type(params['allowExternalSenders']) is not bool: raise ValueError()
+        normalized_uuid(params['groupId'])
+    elif operation == 'distribution.name.set':
+        if set(params) != {'groupId', 'displayName'} or not isinstance(params['displayName'], str) or not 1 <= len(params['displayName'].strip()) <= 256: raise ValueError()
+        normalized_uuid(params['groupId'])
+    elif operation == 'group.primary.set':
+        if set(params) != {'groupId', 'address'} or not trace_address(params['address']): raise ValueError()
+        normalized_uuid(params['groupId'])
     elif operation == 'trace.search':
         if set(params) != {'start', 'end', 'sender', 'recipient', 'status', 'cursor'}: raise ValueError()
         start, end, now = trace_time(params['start']), trace_time(params['end']), datetime.datetime.now(datetime.timezone.utc)
@@ -167,9 +277,12 @@ def validate_request(value, tenants):
                 except (AttributeError, TypeError, ValueError): raise ValueError()
             elif params['start'] is not None or params['end'] is not None: raise ValueError()
     elif operation.startswith('mailbox.delegation.'):
-        if set(params) != ({'mailboxId', 'delegateId'} if operation == 'mailbox.delegation.get' else {'mailboxId', 'delegateId', 'right', 'enabled'}): raise ValueError()
-        mailbox_id, delegate_id = normalized_uuid(params['mailboxId']), normalized_uuid(params['delegateId'])
-        if mailbox_id == delegate_id: raise ValueError()
+        expected = {'mailboxId'} if operation == 'mailbox.delegation.list' else {'mailboxId', 'delegateId'} if operation == 'mailbox.delegation.get' else {'mailboxId', 'delegateId', 'right', 'enabled'}
+        if set(params) != expected: raise ValueError()
+        mailbox_id = normalized_uuid(params['mailboxId'])
+        if operation != 'mailbox.delegation.list':
+            delegate_id = normalized_uuid(params['delegateId'])
+            if mailbox_id == delegate_id: raise ValueError()
         if operation == 'mailbox.delegation.set' and (params['right'] not in ('FullAccess', 'SendAs', 'SendOnBehalf') or type(params['enabled']) is not bool): raise ValueError()
     else:
         if set(params) != ({'mailboxId'} if operation == 'mailbox.addresses.get' else {'mailboxId', 'address'}): raise ValueError()

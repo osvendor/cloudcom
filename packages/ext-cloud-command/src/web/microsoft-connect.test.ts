@@ -10,7 +10,7 @@ function mount(request: CloudCommandHostApi['request']) {
   const page = new CloudCommandMicrosoftConnect();
   page.context = context(); page.hostApi = { request }; document.body.append(page); return page;
 }
-afterEach(() => { document.body.replaceChildren(); window.sessionStorage.clear(); window.history.replaceState({}, '', '/extensions/cloudcommand/connect#microsoft'); });
+afterEach(() => { document.body.replaceChildren(); window.sessionStorage.clear(); window.history.replaceState({}, '', '/extensions/cloudcommand/connect#microsoft'); vi.restoreAllMocks(); });
 
 describe('Microsoft Connect onboarding', () => {
   it('shows individual readiness without claiming administration is ready or linking to a second setup', async () => {
@@ -59,13 +59,26 @@ describe('Microsoft Connect onboarding', () => {
     expect(page.shadowRoot!.querySelector('a')).toBeNull();
     expect(page.shadowRoot!.querySelector('[role="alert"]')).toBeTruthy();
   });
-  it('sends the selected tenant and version, remembers the authorization origin, and continues in the same tab', async () => {
+  it('starts from one click without a tenant ID, remembers the origin, and opens Microsoft in the same tab', async () => {
+    const redirect = vi.spyOn(CloudCommandMicrosoftConnect.prototype as unknown as { redirectToMicrosoft(url: string): void }, 'redirectToMicrosoft').mockImplementation(() => {});
     const request = vi.fn().mockResolvedValueOnce(Response.json(status({ canStart: true, tenantId, version: 7 }))).mockResolvedValueOnce(Response.json({ authorizationUrl: 'https://login.microsoftonline.com/common/adminconsent?state=first-state' }));
     const page = mount(request); await flush(); page.shadowRoot!.querySelector<HTMLButtonElement>('#start')!.click(); await flush();
     const start = request.mock.calls[1] as [string, RequestInit?];
-    expect(JSON.parse(String(start[1]?.body))).toEqual({ tenantId, version: 7 });
+    expect(page.shadowRoot!.querySelector('#tenant-id')).toBeNull();
+    expect(JSON.parse(String(start[1]?.body))).toEqual({ version: 7 });
     expect(window.sessionStorage.getItem('cloudcommand.microsoft.onboarding.first-state')).toBe('org-a');
-    expect(page.shadowRoot!.querySelector('a')!.getAttribute('target')).toBeNull();
+    expect(redirect).toHaveBeenCalledWith('https://login.microsoftonline.com/common/adminconsent?state=first-state');
+  });
+  it('continues from consent to administrator identity without another button click', async () => {
+    const redirect = vi.spyOn(CloudCommandMicrosoftConnect.prototype as unknown as { redirectToMicrosoft(url: string): void }, 'redirectToMicrosoft').mockImplementation(() => {});
+    window.history.replaceState({}, '', `/extensions/cloudcommand/connect?state=consent-state&tenant=${tenantId}&admin_consent=True#microsoft`);
+    window.sessionStorage.setItem('cloudcommand.microsoft.onboarding.consent-state', 'org-a');
+    const request = vi.fn().mockResolvedValueOnce(Response.json(status()))
+      .mockResolvedValueOnce(Response.json({ authorizationUrl: `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize?state=identity-state` }));
+    mount(request); await flush(); await flush();
+    expect(request.mock.calls.some(([path]) => path === '/microsoft/onboarding/complete')).toBe(true);
+    expect(redirect).toHaveBeenCalledWith(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize?state=identity-state`);
+    expect(window.sessionStorage.getItem('cloudcommand.microsoft.onboarding.identity-state')).toBe('org-a');
   });
   it('clears a callback URL and completes it only for its initiating organization', async () => {
     window.history.replaceState({}, '', '/extensions/cloudcommand/connect?state=return-state&code=secret-code#microsoft');

@@ -3,7 +3,7 @@ import type { ExtensionRuntimeContext } from '@breeze/extension-sdk';
 import type { AdministrationConnection } from './admin-execution';
 
 export type StoredAdministrationConnection = AdministrationConnection & { tenantName: string; verifiedAt: string | Date | null };
-export type ConsentAttempt = { org_id: string; actor_id: string; tenant_id: string; client_id: string;
+export type ConsentAttempt = { org_id: string; actor_id: string; tenant_id: string | null; client_id: string;
   credential_version: string; expected_generation: number | null; state_hash: string;
   stage: 'consent' | 'identity' | 'processing' | 'complete'; verifier_ciphertext: string; nonce: string };
 function rows<T>(value: unknown): T[] { if (!Array.isArray(value)) throw new Error('Invalid database result'); return value as T[]; }
@@ -31,15 +31,18 @@ export function createAdministrationStore(context: ExtensionRuntimeContext) {
         WHERE org_id = ${orgId}::uuid AND actor_id = ${actorId}::uuid AND state_hash = ${stateHash}
           AND stage = ${stage} AND expires_at > now() RETURNING *`))[0] ?? null;
     },
-    async advance(orgId: string, oldHash: string, nextHash: string) {
-      return rows(await context.db.execute(sql`UPDATE cloudcommand_microsoft_admin_consent SET stage = 'identity', state_hash = ${nextHash}
-        WHERE org_id = ${orgId}::uuid AND state_hash = ${oldHash} AND stage = 'processing' RETURNING org_id`)).length === 1;
+    async advance(orgId: string, oldHash: string, nextHash: string, tenantId: string) {
+      return rows(await context.db.execute(sql`UPDATE cloudcommand_microsoft_admin_consent SET stage = 'identity', state_hash = ${nextHash},
+          tenant_id = ${tenantId}::uuid
+        WHERE org_id = ${orgId}::uuid AND state_hash = ${oldHash} AND stage = 'processing'
+          AND (tenant_id IS NULL OR tenant_id = ${tenantId}::uuid) RETURNING org_id`)).length === 1;
     },
     async finish(orgId: string, stateHash: string) {
       await context.db.execute(sql`UPDATE cloudcommand_microsoft_admin_consent SET stage = 'complete', verifier_ciphertext = '', nonce = ''
         WHERE org_id = ${orgId}::uuid AND state_hash = ${stateHash} AND stage = 'processing'`);
     },
     async save(attempt: ConsentAttempt, tenantName: string) {
+      if (!attempt.tenant_id) return false;
       const result = attempt.expected_generation === null
         ? await context.db.execute(sql`INSERT INTO cloudcommand_microsoft_admin_connections
             (org_id, tenant_id, tenant_name, client_id, credential_version, permission_manifest_version, enabled, verified_at)

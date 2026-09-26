@@ -10,14 +10,19 @@ const operation = z.discriminatedUnion('type', [
   z.object({ type: z.literal('user.domains.list') }).strict(),
   z.object({ type: z.literal('user.create'), user: adminUserCreateSchema }).strict(),
   z.object({ type: z.literal('user.license.assign'), id: uuid, license: adminLicenseAssignSchema }).strict(),
+  z.object({ type: z.literal('user.licenses.get'), id: uuid }).strict(),
+  z.object({ type: z.literal('user.license.remove'), id: uuid, skuId: uuid, confirmation: z.literal('REMOVE_LICENSE') }).strict(),
   z.object({ type: z.literal('groups.list') }).strict(),
   z.object({ type: z.literal('group.create'), group: adminGroupCreateSchema }).strict(),
   z.object({ type: z.literal('group.update'), id: uuid, update: adminGroupUpdateSchema }).strict(),
   z.object({ type: z.literal('licenses.list') }).strict(),
   z.object({ type: z.literal('service.health.get') }).strict(),
   z.object({ type: z.literal('user.get'), id: uuid }).strict(),
+  z.object({ type: z.literal('user.drive.usage.get'), id: uuid }).strict(),
+  z.object({ type: z.literal('user.drive.link.get'), id: uuid }).strict(),
   z.object({ type: z.literal('user.globalAdmin.get'), id: uuid }).strict(),
   z.object({ type: z.literal('group.get'), id: uuid }).strict(),
+  z.object({ type: z.literal('group.people.list'), id: uuid }).strict(),
   z.object({ type: z.literal('user.update'), id: uuid, update: adminUserUpdateSchema }).strict(),
   z.object({ type: z.literal('user.password.reset'), id: uuid }).strict(),
   z.object({ type: z.literal('user.sessions.revoke'), id: uuid }).strict(),
@@ -25,12 +30,18 @@ const operation = z.discriminatedUnion('type', [
   z.object({ type: z.literal('user.mfa.method.remove'), id: uuid,
     kind: z.enum(['phone', 'microsoftAuthenticator']), methodId: uuid,
     confirmation: z.literal('REMOVE_AUTH_METHOD') }).strict(),
+  z.object({ type: z.literal('user.mfa.recoveryEmail.set'), id: uuid,
+    emailAddress: z.string().trim().email().max(320), confirmation: z.literal('SET_RECOVERY_EMAIL') }).strict(),
+  z.object({ type: z.literal('user.mfa.mobilePhone.set'), id: uuid,
+    phoneNumber: z.string().trim().min(8).max(40), confirmation: z.literal('SET_MOBILE_PHONE') }).strict(),
   // This is intentionally not a generic directory-role mutation. The provider accepts
   // only the Global Administrator template and this phrase makes the elevation/removal
   // a deliberate, independently auditable action.
   z.object({ type: z.literal('user.globalAdmin.set'), id: uuid, enabled: z.boolean(), confirmation: z.literal('GLOBAL_ADMIN') }).strict(),
   z.object({ type: z.literal('group.member.add'), groupId: uuid, userId: uuid }).strict(),
   z.object({ type: z.literal('group.member.remove'), groupId: uuid, userId: uuid }).strict(),
+  z.object({ type: z.literal('group.owner.add'), groupId: uuid, userId: uuid }).strict(),
+  z.object({ type: z.literal('group.owner.remove'), groupId: uuid, userId: uuid }).strict(),
 ]);
 export type AdministrationOperation = z.infer<typeof operation>;
 const connectionSchema = z.object({
@@ -74,10 +85,10 @@ export function createAdministrationExecutor<Request>(ports: {
     if (!initial.success || initial.data.orgId !== orgId) throw new AdministrationExecutionError('connection_not_ready');
     const snapshot = Object.freeze(initial.data);
     const fields = Object.keys(connectionSchema.shape) as (keyof AdministrationConnection)[];
-    const mutation = op.type === 'user.create' || op.type === 'user.license.assign' || op.type === 'user.update' || op.type === 'user.password.reset'
+    const mutation = op.type === 'user.create' || op.type === 'user.license.assign' || op.type === 'user.license.remove' || op.type === 'user.update' || op.type === 'user.password.reset'
       || op.type === 'group.create' || op.type === 'group.update'
-      || op.type === 'user.sessions.revoke' || op.type === 'user.mfa.method.remove'
-      || op.type === 'user.globalAdmin.set' || op.type.startsWith('group.member.');
+      || op.type === 'user.sessions.revoke' || op.type === 'user.mfa.method.remove' || op.type === 'user.mfa.recoveryEmail.set' || op.type === 'user.mfa.mobilePhone.set'
+      || op.type === 'user.globalAdmin.set' || op.type.startsWith('group.member.') || op.type.startsWith('group.owner.');
     let dispatched = false;
     let fenceFailure: AdministrationExecutionError | undefined;
     async function checkFence() {
@@ -97,19 +108,23 @@ export function createAdministrationExecutor<Request>(ports: {
     const targets = op.type === 'group.create' ? { userId: op.group.ownerId }
       : op.type === 'user.license.assign'
       ? { userId: op.id, licenseSkuId: op.license.skuId }
+      : op.type === 'user.license.remove'
+      ? { userId: op.id, licenseSkuId: op.skuId }
       : op.type === 'user.mfa.method.remove'
       ? { userId: op.id, methodKind: op.kind, methodId: op.methodId }
       : 'groupId' in op ? { groupId: op.groupId, userId: op.userId }
-      : 'id' in op ? (op.type === 'group.get' ? { groupId: op.id } : { userId: op.id }) : {};
+      : 'id' in op ? (op.type === 'group.get' || op.type === 'group.people.list' ? { groupId: op.id } : { userId: op.id }) : {};
     const event = { executionId: randomUUID(), orgId, actorId: principal.actorId, connectionId: snapshot.id,
       operation: op.type, targets, changedFields: op.type === 'user.create' ? ['displayName', 'userPrincipalName', 'passwordProfile', ...(op.user.usageLocation ? ['usageLocation'] : [])]
         : op.type === 'group.create' ? ['displayName', 'mailNickname', 'owners']
         : op.type === 'group.update' ? ['displayName']
-        : op.type === 'user.license.assign' ? ['assignedLicenses']
+        : op.type === 'user.license.assign' || op.type === 'user.license.remove' ? ['assignedLicenses']
         : op.type === 'user.update' ? Object.keys(op.update)
+        : op.type.startsWith('group.owner.') ? ['owners']
+        : op.type.startsWith('group.member.') ? ['members']
         : op.type === 'user.password.reset' ? ['passwordProfile']
           : op.type === 'user.sessions.revoke' ? ['signInSessions']
-            : op.type === 'user.mfa.method.remove' ? ['authenticationMethod']
+            : op.type === 'user.mfa.method.remove' || op.type === 'user.mfa.recoveryEmail.set' || op.type === 'user.mfa.mobilePhone.set' ? ['authenticationMethod']
             : op.type === 'user.globalAdmin.set' ? ['globalAdministrator'] : [] };
     async function audit(phase: Audit['phase'], outcome?: Audit['outcome']) {
       try { await ports.audit({ ...event, phase, ...(outcome ? { outcome } : {}) }); }
@@ -158,22 +173,31 @@ export function createAdministrationExecutor<Request>(ports: {
         case 'user.domains.list': result = await provider.listVerifiedUserDomains(); break;
         case 'user.create': result = await provider.createUser(op.user, fence); break;
         case 'user.license.assign': result = await provider.assignUserLicense(op.id, op.license, fence); break;
+        case 'user.licenses.get': result = await provider.getUserLicenses(op.id); break;
+        case 'user.license.remove': result = await provider.removeUserLicense(op.id, op.skuId, fence); break;
         case 'groups.list': result = await provider.listGroups(); break;
         case 'group.create': result = await provider.createGroup(op.group, fence); break;
         case 'group.update': result = await provider.updateGroup(op.id, op.update, fence); break;
         case 'licenses.list': result = await provider.listLicenses(); break;
         case 'service.health.get': result = await provider.serviceHealth(); break;
         case 'user.get': result = await provider.getUser(op.id); break;
+        case 'user.drive.usage.get': result = await provider.getUserDriveUsage(op.id); break;
+        case 'user.drive.link.get': result = await provider.getUserDriveLink(op.id); break;
         case 'user.globalAdmin.get': result = await provider.getGlobalAdministrator(op.id); break;
         case 'group.get': result = await provider.getGroup(op.id); break;
+        case 'group.people.list': result = await provider.listGroupPeople(op.id); break;
         case 'user.update': result = await provider.updateUser(op.id, op.update); break;
         case 'user.password.reset': result = await provider.resetUserPassword(op.id, fence); break;
         case 'user.sessions.revoke': result = await provider.revokeUserSessions(op.id, fence); break;
         case 'user.mfa.methods.list': result = await authenticationMethods.list(op.id); break;
         case 'user.mfa.method.remove': result = await authenticationMethods.remove(op.id, { kind: op.kind, methodId: op.methodId }, fence); break;
+        case 'user.mfa.recoveryEmail.set': result = await authenticationMethods.setRecoveryEmail(op.id, op.emailAddress, fence); break;
+        case 'user.mfa.mobilePhone.set': result = await authenticationMethods.setMobilePhone(op.id, op.phoneNumber, fence); break;
         case 'user.globalAdmin.set': result = await provider.setGlobalAdministrator(op.id, op.enabled, fence); break;
         case 'group.member.add': result = await provider.addGroupMember(op.groupId, op.userId); break;
         case 'group.member.remove': result = await provider.removeGroupMember(op.groupId, op.userId); break;
+        case 'group.owner.add': result = await provider.addGroupOwner(op.groupId, op.userId); break;
+        case 'group.owner.remove': result = await provider.removeGroupOwner(op.groupId, op.userId); break;
       }
       await fence();
     } catch (error) {
@@ -185,7 +209,7 @@ export function createAdministrationExecutor<Request>(ports: {
       if (error instanceof AdministrationExecutionError || error instanceof AdminGraphError || error instanceof AuthenticationMethodError) throw error;
       throw new AdministrationExecutionError('provider_failed');
     }
-    await audit('outcome', (op.type === 'user.license.assign' || op.type === 'group.create' || op.type === 'group.update' || op.type.startsWith('group.member.')) && typeof result === 'object' && result !== null
+    await audit('outcome', (op.type === 'user.license.assign' || op.type === 'user.license.remove' || op.type === 'user.mfa.recoveryEmail.set' || op.type === 'user.mfa.mobilePhone.set' || op.type === 'group.create' || op.type === 'group.update' || op.type.startsWith('group.member.') || op.type.startsWith('group.owner.')) && typeof result === 'object' && result !== null
       && 'verified' in result && result.verified === false ? 'unknown' : 'success');
     return result;
   };

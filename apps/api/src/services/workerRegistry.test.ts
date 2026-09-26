@@ -62,7 +62,7 @@ const EXPECTED_WORKER_NAMES = [
   'dnsSyncWorker', 's1SyncWorker', 'huntressSyncWorker',
   // Backup provider integration W02 (#6008 / #6010).
   'backupProviderSyncWorker',
-  'm365SyncWorker', 'pax8SyncWorker',
+  'cloudCommandM365SnapshotWorker', 'm365SyncWorker', 'pax8SyncWorker',
   'tdSynnexSftpSyncWorker', 'logForwardingWorker', 'patchJobWorker', 'patchSchedulerWorker',
   'maintenanceRebootWorker', 'backupWorker', 'backupSnapshotFileIndexWorker', 'sensitiveDataWorker',
   // YARA/IOC scanning W01 (#6263) — dispatches security.scan agent commands.

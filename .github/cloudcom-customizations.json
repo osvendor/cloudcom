@@ -2,6 +2,22 @@
   "version": 1,
   "customizations": [
     {
+      "id": "managed-rustdesk-viewer-routing",
+      "requiredFiles": [
+        "scripts/cloudcom/rustdesk/build-viewer-msi.ps1",
+          "scripts/cloudcom/rustdesk/build-managed-client-local.ps1",
+        "scripts/cloudcom/rustdesk/ManagedViewerLauncher.cs",
+        "docs/cloudcom-managed-viewer-msi.md",
+        "scripts/cloudcom/rustdesk/launch-managed.ps1",
+        "scripts/cloudcom/rustdesk/launch-managed.test.ps1",
+        "docs/cloudcom-managed-viewer-launch.md"
+      ],
+      "hooks": [
+        { "file": ".github/workflows/cloudcom-ci.yml", "contains": "./scripts/cloudcom/rustdesk/launch-managed.test.ps1" },
+        { "file": "scripts/cloudcom/rustdesk/launch-managed.ps1", "contains": "$start.EnvironmentVariables['RUSTDESK_APPNAME'] = $route" }
+      ]
+    },
+    {
       "id": "rustdesk-desired-state",
       "requiredFiles": [
         "scripts/cloudcom/rustdesk/common.ps1",

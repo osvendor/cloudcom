@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { AdministrationConnection } from './admin-execution';
-import { createExchangeAddressesClient, createExchangeAutoReplyClient, createExchangeDelegationClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, createExchangeTraceClient, type ExchangeTraceSearch, type ExchangeTraceDetail, type ExchangeAddressAction, type ExchangeAddressWrite, type ExchangeAutoReplySet, type ExchangeConnectionBinding, type ExchangeDelegationSet, type ExchangeForwardingSet, type ExchangeWorkerPort, ExchangeWorkerError } from './exchange-contract';
+import { createExchangeAddressesClient, createExchangeAutoReplyClient, createExchangeDelegationClient, createExchangeDistributionClient, createExchangeDistributionMemberClient, createExchangeDistributionMembersClient, createExchangeDistributionNameClient, createExchangeGroupPrimaryClient, createExchangeGroupSettingsClient, createExchangeGroupExternalClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, createExchangeMailboxStatisticsClient, createExchangeSharedClient, createExchangeTraceClient, type ExchangeTraceSearch, type ExchangeTraceDetail, type ExchangeAddressAction, type ExchangeAddressWrite, type ExchangeAutoReplySet, type ExchangeConnectionBinding, type ExchangeDelegationSet, type ExchangeDistributionCreate, type ExchangeDistributionMemberSet, type ExchangeDistributionNameSet, type ExchangeGroupPrimarySet, type ExchangeGroupExternalSet, type ExchangeSharedCreate, type ExchangeForwardingSet, type ExchangeWorkerPort, ExchangeWorkerError } from './exchange-contract';
 
 const uuid = z.string().uuid().transform(value => value.toLowerCase());
 const inventoryInput = z.object({ pageSize: z.number().int().min(1).max(200).optional() }).strict();
@@ -47,10 +47,19 @@ export function createExchangeMailboxInventoryService<Request>(ports: {
   audit(event: { organizationId: string; actorId: string; action: string; result: 'success' | 'failure'; details: Record<string, unknown> }): Promise<void>;
 }) {
   const inventory = createExchangeMailboxInventoryClient(ports.worker);
+  const statistics = createExchangeMailboxStatisticsClient(ports.worker);
   const forwarding = createExchangeForwardingClient(ports.worker);
   const autoReply = createExchangeAutoReplyClient(ports.worker);
   const addresses = createExchangeAddressesClient(ports.worker);
   const delegation = createExchangeDelegationClient(ports.worker);
+  const distribution = createExchangeDistributionClient(ports.worker);
+  const distributionMember = createExchangeDistributionMemberClient(ports.worker);
+  const distributionMembers = createExchangeDistributionMembersClient(ports.worker);
+  const groupSettings = createExchangeGroupSettingsClient(ports.worker);
+  const groupExternal = createExchangeGroupExternalClient(ports.worker);
+  const distributionName = createExchangeDistributionNameClient(ports.worker);
+  const groupPrimary = createExchangeGroupPrimaryClient(ports.worker);
+  const shared = createExchangeSharedClient(ports.worker);
   const trace = createExchangeTraceClient(ports.worker);
   async function fence(request: Request, organizationId: string, actorId: string, snapshot: AdministrationConnection, mutation = false) {
     const principal = await ports.authorize(request, organizationId, mutation);
@@ -62,6 +71,279 @@ export function createExchangeMailboxInventoryService<Request>(ports: {
     catch { throw new ExchangeServiceError('audit_unavailable'); }
   }
   return {
+    async groupPrimarySet(request: Request, organizationId: string, input: ExchangeGroupPrimarySet) {
+      if (!uuid.safeParse(organizationId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId);
+      const parsed = z.object({ groupId: uuid, address: z.string().trim().email().max(320) }).strict().safeParse(input);
+      if (!parsed.success) throw new ExchangeServiceError('invalid_operation');
+      const principal = await ports.authorize(request, organizationId, true);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: 'group.primary.set',
+        groupId: parsed.data.groupId, changedFields: ['PrimarySmtpAddress'] };
+      await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.group.primary.set.intent', result: 'success', details });
+      let dispatched = false;
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        dispatched = true;
+        const result = await groupPrimary(bindingOf(snapshot), parsed.data);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.group.primary.set.outcome',
+          result: 'success', details: { ...details, outcome: 'verified', changed: result.changed } });
+        return result;
+      } catch (error) {
+        const rawCode = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        const code = dispatched && (rawCode === 'connection_changed' || rawCode === 'access_denied' || rawCode === 'audit_unavailable' || rawCode === 'provider_unreachable')
+          ? 'unknown_write_outcome' : rawCode;
+        try { await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.group.primary.set.outcome',
+          result: 'failure', details: { ...details, code } }); }
+        catch { throw new ExchangeServiceError(dispatched ? 'unknown_write_outcome' : 'audit_unavailable'); }
+        throw new ExchangeServiceError(code === 'invalid_request' || code === 'connection_mismatch' || code === 'credential_unavailable' || code === 'response_too_large'
+          ? 'provider_unreachable' : code);
+      }
+    },
+    async distributionNameSet(request: Request, organizationId: string, input: ExchangeDistributionNameSet) {
+      if (!uuid.safeParse(organizationId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId);
+      const parsed = z.object({ groupId: uuid, displayName: z.string().trim().min(1).max(256) }).strict().safeParse(input);
+      if (!parsed.success) throw new ExchangeServiceError('invalid_operation');
+      const principal = await ports.authorize(request, organizationId, true);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: 'distribution.name.set',
+        groupId: parsed.data.groupId, changedFields: ['DisplayName'] };
+      await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.distribution.name.set.intent', result: 'success', details });
+      let dispatched = false;
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        dispatched = true;
+        const result = await distributionName(bindingOf(snapshot), parsed.data);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.distribution.name.set.outcome',
+          result: 'success', details: { ...details, outcome: 'verified', changed: result.changed } });
+        return result;
+      } catch (error) {
+        const rawCode = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        const code = dispatched && (rawCode === 'connection_changed' || rawCode === 'access_denied' || rawCode === 'audit_unavailable' || rawCode === 'provider_unreachable')
+          ? 'unknown_write_outcome' : rawCode;
+        try { await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.distribution.name.set.outcome',
+          result: 'failure', details: { ...details, code } }); }
+        catch { throw new ExchangeServiceError(dispatched ? 'unknown_write_outcome' : 'audit_unavailable'); }
+        throw new ExchangeServiceError(code === 'invalid_request' || code === 'connection_mismatch' || code === 'credential_unavailable' || code === 'response_too_large'
+          ? 'provider_unreachable' : code);
+      }
+    },
+    async groupExternalSet(request: Request, organizationId: string, input: ExchangeGroupExternalSet) {
+      if (!uuid.safeParse(organizationId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId);
+      const parsed = z.object({ groupId: uuid, allowExternalSenders: z.boolean() }).strict().safeParse(input);
+      if (!parsed.success) throw new ExchangeServiceError('invalid_operation');
+      const principal = await ports.authorize(request, organizationId, true);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: 'group.external.set',
+        groupId: parsed.data.groupId, changedFields: ['RequireSenderAuthenticationEnabled'] };
+      await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.group.external.set.intent', result: 'success', details });
+      let dispatched = false;
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        dispatched = true;
+        const result = await groupExternal(bindingOf(snapshot), parsed.data);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.group.external.set.outcome',
+          result: 'success', details: { ...details, outcome: 'verified', changed: result.changed } });
+        return result;
+      } catch (error) {
+        const rawCode = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        const code = dispatched && (rawCode === 'connection_changed' || rawCode === 'access_denied' || rawCode === 'audit_unavailable' || rawCode === 'provider_unreachable')
+          ? 'unknown_write_outcome' : rawCode;
+        try { await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.group.external.set.outcome',
+          result: 'failure', details: { ...details, code } }); }
+        catch { throw new ExchangeServiceError(dispatched ? 'unknown_write_outcome' : 'audit_unavailable'); }
+        throw new ExchangeServiceError(code === 'invalid_request' || code === 'connection_mismatch' || code === 'credential_unavailable' || code === 'response_too_large'
+          ? 'provider_unreachable' : code);
+      }
+    },
+    async groupSettingsGet(request: Request, organizationId: string, groupId: string) {
+      if (!uuid.safeParse(organizationId).success || !uuid.safeParse(groupId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId); groupId = uuid.parse(groupId);
+      const principal = await ports.authorize(request, organizationId, false);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: 'group.settings.get', groupId };
+      await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.group.settings.get.intent', result: 'success', details });
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot);
+        const result = await groupSettings(bindingOf(snapshot), groupId);
+        await fence(request, organizationId, principal.actorId, snapshot);
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.group.settings.get.outcome', result: 'success', details });
+        return result;
+      } catch (error) {
+        const code = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.group.settings.get.outcome', result: 'failure', details: { ...details, code } });
+        throw new ExchangeServiceError(code === 'invalid_request' || code === 'connection_mismatch' || code === 'credential_unavailable' || code === 'response_too_large' || code === 'unknown_write_outcome' ? 'provider_unreachable' : code);
+      }
+    },
+    async distributionMembersGet(request: Request, organizationId: string, groupId: string) {
+      if (!uuid.safeParse(organizationId).success || !uuid.safeParse(groupId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId); groupId = uuid.parse(groupId);
+      const principal = await ports.authorize(request, organizationId, false);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: 'distribution.members.get', groupId };
+      await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.distribution.members.get.intent', result: 'success', details });
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot);
+        const result = await distributionMembers(bindingOf(snapshot), groupId);
+        await fence(request, organizationId, principal.actorId, snapshot);
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.distribution.members.get.outcome', result: 'success', details });
+        return result;
+      } catch (error) {
+        const code = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.distribution.members.get.outcome', result: 'failure', details: { ...details, code } });
+        throw new ExchangeServiceError(code === 'invalid_request' || code === 'connection_mismatch' || code === 'credential_unavailable' || code === 'response_too_large' || code === 'unknown_write_outcome' ? 'provider_unreachable' : code);
+      }
+    },
+    async distributionMemberSet(request: Request, organizationId: string, input: ExchangeDistributionMemberSet) {
+      if (!uuid.safeParse(organizationId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId);
+      const parsed = z.object({ groupId: uuid, memberId: uuid, enabled: z.boolean() }).strict().safeParse(input);
+      if (!parsed.success || parsed.data.groupId === parsed.data.memberId) throw new ExchangeServiceError('invalid_operation');
+      const principal = await ports.authorize(request, organizationId, true);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: 'distribution.member.set',
+        groupId: parsed.data.groupId, memberId: parsed.data.memberId, changedFields: ['Members'] };
+      await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.distribution.member.set.intent', result: 'success', details });
+      let dispatched = false;
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        dispatched = true;
+        const result = await distributionMember(bindingOf(snapshot), parsed.data);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.distribution.member.set.outcome',
+          result: 'success', details: { ...details, outcome: 'verified', changed: result.changed } });
+        return result;
+      } catch (error) {
+        const rawCode = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        const code = dispatched && (rawCode === 'connection_changed' || rawCode === 'access_denied' || rawCode === 'audit_unavailable' || rawCode === 'provider_unreachable')
+          ? 'unknown_write_outcome' : rawCode;
+        try { await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.distribution.member.set.outcome',
+          result: 'failure', details: { ...details, code } }); }
+        catch { throw new ExchangeServiceError(dispatched ? 'unknown_write_outcome' : 'audit_unavailable'); }
+        throw new ExchangeServiceError(code === 'invalid_request' || code === 'connection_mismatch' || code === 'credential_unavailable' || code === 'response_too_large'
+          ? 'provider_unreachable' : code);
+      }
+    },
+    async sharedCreate(request: Request, organizationId: string, input: ExchangeSharedCreate) {
+      if (!uuid.safeParse(organizationId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId);
+      const parsed = z.object({ name: z.string().trim().min(1).max(256), primarySmtpAddress: z.string().email().max(320) }).strict().safeParse(input);
+      if (!parsed.success) throw new ExchangeServiceError('invalid_operation');
+      const principal = await ports.authorize(request, organizationId, true);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: 'shared.create',
+        primarySmtpAddress: parsed.data.primarySmtpAddress, changedFields: ['Name', 'DisplayName', 'PrimarySmtpAddress'] };
+      await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.shared.create.intent', result: 'success', details });
+      let dispatched = false;
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        dispatched = true;
+        const result = await shared(bindingOf(snapshot), parsed.data);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.shared.create.outcome',
+          result: result.verified ? 'success' : 'failure', details: { ...details, outcome: result.verified ? 'verified' : 'readback_pending', mailboxId: result.id } });
+        return result;
+      } catch (error) {
+        const rawCode = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        const code = dispatched && (rawCode === 'connection_changed' || rawCode === 'access_denied' || rawCode === 'audit_unavailable' || rawCode === 'provider_unreachable')
+          ? 'unknown_write_outcome' : rawCode;
+        try { await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.shared.create.outcome',
+          result: 'failure', details: { ...details, code } }); }
+        catch { throw new ExchangeServiceError(dispatched ? 'unknown_write_outcome' : 'audit_unavailable'); }
+        throw new ExchangeServiceError(code === 'invalid_request' || code === 'connection_mismatch' || code === 'credential_unavailable' || code === 'response_too_large'
+          ? 'provider_unreachable' : code);
+      }
+    },
+    async distributionCreate(request: Request, organizationId: string, input: ExchangeDistributionCreate) {
+      if (!uuid.safeParse(organizationId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId);
+      const parsed = z.object({ name: z.string().trim().min(1).max(256), primarySmtpAddress: z.string().email().max(320) }).strict().safeParse(input);
+      if (!parsed.success) throw new ExchangeServiceError('invalid_operation');
+      const principal = await ports.authorize(request, organizationId, true);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: 'distribution.create',
+        primarySmtpAddress: parsed.data.primarySmtpAddress, changedFields: ['Name', 'PrimarySmtpAddress'] };
+      await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.distribution.create.intent', result: 'success', details });
+      let dispatched = false;
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        dispatched = true;
+        const result = await distribution(bindingOf(snapshot), parsed.data);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.distribution.create.outcome',
+          result: result.verified ? 'success' : 'failure', details: { ...details, outcome: result.verified ? 'verified' : 'readback_pending', groupId: result.id } });
+        return result;
+      } catch (error) {
+        const rawCode = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        const code = dispatched && (rawCode === 'connection_changed' || rawCode === 'access_denied' || rawCode === 'audit_unavailable' || rawCode === 'provider_unreachable')
+          ? 'unknown_write_outcome' : rawCode;
+        try { await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.distribution.create.outcome',
+          result: 'failure', details: { ...details, code } }); }
+        catch { throw new ExchangeServiceError(dispatched ? 'unknown_write_outcome' : 'audit_unavailable'); }
+        throw new ExchangeServiceError(code === 'invalid_request' || code === 'connection_mismatch' || code === 'credential_unavailable' || code === 'response_too_large'
+          ? 'provider_unreachable' : code);
+      }
+    },
+    async statisticsGet(request: Request, organizationId: string, mailboxId: string) {
+      if (!uuid.safeParse(organizationId).success || !uuid.safeParse(mailboxId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId); mailboxId = uuid.parse(mailboxId);
+      const principal = await ports.authorize(request, organizationId, false);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: 'mailbox.statistics.get', mailboxId };
+      await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.statistics.intent', result: 'success', details });
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot);
+        const result = await statistics(bindingOf(snapshot), mailboxId);
+        await fence(request, organizationId, principal.actorId, snapshot);
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.statistics.outcome', result: 'success', details });
+        return result;
+      } catch (error) {
+        const code = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.statistics.outcome', result: 'failure', details: { ...details, code } });
+        throw new ExchangeServiceError(code === 'provider_access_denied' || code === 'provider_rejected' || code === 'worker_busy' || code === 'connection_changed' || code === 'access_denied' ? code : 'provider_unreachable');
+      }
+    },
     async traceSearch(request: Request, organizationId: string, input: ExchangeTraceSearch) {
       if (!uuid.safeParse(organizationId).success) throw new ExchangeServiceError('invalid_operation');
       organizationId = uuid.parse(organizationId);
@@ -324,6 +606,29 @@ export function createExchangeMailboxInventoryService<Request>(ports: {
         try { await audit({ organizationId, actorId: principal.actorId, action: `cloudcommand.microsoft.exchange.${action}.outcome`, result: 'failure', details: { ...details, code } }); }
         catch { throw new ExchangeServiceError(dispatched ? 'unknown_write_outcome' : 'audit_unavailable'); }
         throw new ExchangeServiceError(code === 'invalid_request' || code === 'connection_mismatch' || code === 'credential_unavailable' || code === 'response_too_large' ? 'provider_unreachable' : code);
+      }
+    },
+    async delegationList(request: Request, organizationId: string, mailboxId: string) {
+      if (!uuid.safeParse(organizationId).success || !uuid.safeParse(mailboxId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId); mailboxId = uuid.parse(mailboxId);
+      const principal = await ports.authorize(request, organizationId, false);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: 'mailbox.delegation.list', mailboxId };
+      await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.delegation.list.intent', result: 'success', details });
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot);
+        const result = await delegation.list(bindingOf(snapshot), mailboxId);
+        await fence(request, organizationId, principal.actorId, snapshot);
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.delegation.list.outcome', result: 'success', details: { ...details, partial: result.partial, count: result.entries.length } });
+        return result;
+      } catch (error) {
+        const code = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.delegation.list.outcome', result: 'failure', details: { ...details, code } });
+        throw new ExchangeServiceError(code === 'invalid_request' || code === 'connection_mismatch' || code === 'credential_unavailable' || code === 'response_too_large' || code === 'unknown_write_outcome' ? 'provider_unreachable' : code);
       }
     },
     async delegationGet(request: Request, organizationId: string, mailboxId: string, delegateId: string) {

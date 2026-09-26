@@ -87,6 +87,8 @@
       "cloudcommand_microsoft_admin_connections",
       "cloudcommand_microsoft_admin_consent",
       "cloudcommand_microsoft_directory_preferences",
+      "cloudcommand_microsoft_directory_layouts",
+      "cloudcommand_microsoft_directory_snapshots",
       "cloudcommand_google_oauth_connections",
       "cloudcommand_google_oauth_attempts"
     ],
@@ -163,6 +165,14 @@
           "updated_at"
         ],
         "exclude": []
+      },
+      "cloudcommand_microsoft_directory_layouts": {
+        "include": ["org_id", "actor_id", "resource", "layout", "updated_at"],
+        "exclude": []
+      },
+      "cloudcommand_microsoft_directory_snapshots": {
+        "include": ["org_id", "tenant_id", "connection_generation", "directory_collected_at", "usage_collected_at", "last_attempt_at", "directory_status", "usage_status"],
+        "exclude": ["directory_data", "usage_data"]
       },
       "cloudcommand_microsoft_admin_consent": {
         "exclude": [

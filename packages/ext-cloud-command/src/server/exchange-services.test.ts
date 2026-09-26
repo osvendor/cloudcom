@@ -49,6 +49,159 @@ describe('Exchange mailbox inventory attachment', () => {
   });
 });
 
+describe('Exchange distribution creation', () => {
+  const input = { name: 'QA Distribution', primarySmtpAddress: 'qa@example.com' };
+  it('requires mutation authorization, a fixed tenant generation, and audited readback', async () => {
+    const s = setup();
+    s.worker.dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,
+      data: { accepted: true, verified: true, id: null, primarySmtpAddress: input.primarySmtpAddress } }));
+    await expect(s.service.distributionCreate({}, org, input)).resolves.toMatchObject({ verified: true });
+    expect(s.authorize).toHaveBeenCalledWith({}, org, true);
+    expect(s.worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'distribution.create', parameters: input }));
+    expect(s.audit.mock.calls.map(([event]) => event.action)).toEqual([
+      'cloudcommand.microsoft.exchange.distribution.create.intent', 'cloudcommand.microsoft.exchange.distribution.create.outcome']);
+  });
+  it('does not dispatch without permission and does not retry an uncertain write', async () => {
+    const s = setup(); s.authorize.mockResolvedValue(null);
+    await expect(s.service.distributionCreate({}, org, input)).rejects.toMatchObject({ code: 'access_denied' });
+    expect(s.worker.dispatch).not.toHaveBeenCalled();
+    s.authorize.mockResolvedValue({ actorId: actor });
+    s.worker.dispatch.mockRejectedValue(new Error('socket closed'));
+    await expect(s.service.distributionCreate({}, org, input)).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+    expect(s.worker.dispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Exchange distribution membership', () => {
+  const input = { groupId: '77777777-7777-4777-8777-777777777777', memberId: '88888888-8888-4888-8888-888888888888', enabled: true };
+  it('requires mutation authorization and audits a verified change', async () => {
+    const s = setup(); s.worker.dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,
+      data: { ...input, accepted: true, verified: true, changed: true } }));
+    await expect(s.service.distributionMemberSet({}, org, input)).resolves.toMatchObject({ changed: true });
+    expect(s.authorize).toHaveBeenCalledWith({}, org, true);
+    expect(s.worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'distribution.member.set', parameters: input }));
+    expect(s.audit.mock.calls.map(([event]) => event.action)).toEqual([
+      'cloudcommand.microsoft.exchange.distribution.member.set.intent', 'cloudcommand.microsoft.exchange.distribution.member.set.outcome']);
+  });
+  it('blocks unauthorized callers and reports a lost write without retrying', async () => {
+    const s = setup(); s.authorize.mockResolvedValue(null);
+    await expect(s.service.distributionMemberSet({}, org, input)).rejects.toMatchObject({ code: 'access_denied' });
+    expect(s.worker.dispatch).not.toHaveBeenCalled();
+    s.authorize.mockResolvedValue({ actorId: actor }); s.worker.dispatch.mockRejectedValue(new Error('socket closed'));
+    await expect(s.service.distributionMemberSet({}, org, input)).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+    expect(s.worker.dispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Exchange distribution members read', () => {
+  const groupId = '77777777-7777-4777-8777-777777777777';
+  it('authorizes as a read, fences the connection, and audits the exact group', async () => {
+    const s = setup();
+    s.worker.dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,
+      data: { groupId, members: [], complete: true } }));
+    await expect(s.service.distributionMembersGet({}, org, groupId)).resolves.toMatchObject({ groupId, complete: true });
+    expect(s.authorize).toHaveBeenCalledWith({}, org, false);
+    expect(s.worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'distribution.members.get', parameters: { groupId } }));
+    expect(s.audit.mock.calls.map(([event]) => event.action)).toEqual([
+      'cloudcommand.microsoft.exchange.distribution.members.get.intent', 'cloudcommand.microsoft.exchange.distribution.members.get.outcome']);
+  });
+  it('does not dispatch when the connection changed', async () => {
+    const s = setup(); s.registry.provision.mockImplementation(async () => { s.change({ generation: 5 }); });
+    await expect(s.service.distributionMembersGet({}, org, groupId)).rejects.toMatchObject({ code: 'connection_changed' });
+    expect(s.worker.dispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('Exchange group primary SMTP write', () => {
+  const input = { groupId: '77777777-7777-4777-8777-777777777777', address: 'new@example.test' };
+  it('requires mutation authorization, fences the connection and audits a verified write', async () => {
+    const s = setup();
+    s.worker.dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,
+      data: { groupId: input.groupId, primarySmtpAddress: input.address, accepted: true, verified: true, changed: true } }));
+    await expect(s.service.groupPrimarySet({}, org, input)).resolves.toMatchObject({ verified: true });
+    expect(s.authorize).toHaveBeenCalledWith({}, org, true);
+    expect(s.worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'group.primary.set', parameters: input }));
+    expect(s.audit.mock.calls.map(([event]) => event.action)).toEqual([
+      'cloudcommand.microsoft.exchange.group.primary.set.intent', 'cloudcommand.microsoft.exchange.group.primary.set.outcome']);
+  });
+  it('does not dispatch after a connection change', async () => {
+    const s = setup(); s.registry.provision.mockImplementation(async () => { s.change({ generation: 5 }); });
+    await expect(s.service.groupPrimarySet({}, org, input)).rejects.toMatchObject({ code: 'connection_changed' });
+    expect(s.worker.dispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('Exchange distribution name write', () => {
+  const input = { groupId: '77777777-7777-4777-8777-777777777777', displayName: 'QA Renamed' };
+  it('requires mutation authorization, fences the connection and audits a verified write', async () => {
+    const s = setup();
+    s.worker.dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,
+      data: { ...input, accepted: true, verified: true, changed: true } }));
+    await expect(s.service.distributionNameSet({}, org, input)).resolves.toMatchObject({ verified: true });
+    expect(s.authorize).toHaveBeenCalledWith({}, org, true);
+    expect(s.worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'distribution.name.set', parameters: input }));
+    expect(s.audit.mock.calls.map(([event]) => event.action)).toEqual([
+      'cloudcommand.microsoft.exchange.distribution.name.set.intent', 'cloudcommand.microsoft.exchange.distribution.name.set.outcome']);
+  });
+  it('does not dispatch after a connection change', async () => {
+    const s = setup(); s.registry.provision.mockImplementation(async () => { s.change({ generation: 5 }); });
+    await expect(s.service.distributionNameSet({}, org, input)).rejects.toMatchObject({ code: 'connection_changed' });
+    expect(s.worker.dispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('Exchange group settings read', () => {
+  const groupId = '77777777-7777-4777-8777-777777777777';
+  it('uses read authorization and fences the selected organization connection', async () => {
+    const s = setup();
+    s.worker.dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,
+      data: { groupId, kind: 'distribution', displayName: 'QA', primarySmtpAddress: 'qa@example.test', requireSenderAuthenticationEnabled: true,
+        emailAddressPolicyEnabled: false, aliases: [] } }));
+    await expect(s.service.groupSettingsGet({}, org, groupId)).resolves.toMatchObject({ groupId, kind: 'distribution' });
+    expect(s.authorize).toHaveBeenCalledWith({}, org, false);
+    expect(s.worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'group.settings.get', parameters: { groupId } }));
+    expect(s.audit.mock.calls.map(([event]) => event.action)).toEqual([
+      'cloudcommand.microsoft.exchange.group.settings.get.intent', 'cloudcommand.microsoft.exchange.group.settings.get.outcome']);
+  });
+});
+
+describe('Exchange external-sender setting write', () => {
+  const input = { groupId: '77777777-7777-4777-8777-777777777777', allowExternalSenders: true };
+  it('requires mutation authorization and audits one verified write', async () => {
+    const s = setup();
+    s.worker.dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,
+      data: { ...input, accepted: true, verified: true, changed: true } }));
+    await expect(s.service.groupExternalSet({}, org, input)).resolves.toMatchObject({ verified: true });
+    expect(s.authorize).toHaveBeenCalledWith({}, org, true);
+    expect(s.worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'group.external.set', parameters: input }));
+    expect(s.audit.mock.calls.map(([event]) => event.action)).toEqual([
+      'cloudcommand.microsoft.exchange.group.external.set.intent', 'cloudcommand.microsoft.exchange.group.external.set.outcome']);
+  });
+  it('does not retry after a lost write outcome', async () => {
+    const s = setup(); s.worker.dispatch.mockRejectedValue(new Error('socket closed'));
+    await expect(s.service.groupExternalSet({}, org, input)).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+    expect(s.worker.dispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Exchange shared mailbox creation', () => {
+  const input = { name: 'QA Shared', primarySmtpAddress: 'shared@example.com' };
+  it('requires mutation authorization and audits a bound verified create', async () => {
+    const s = setup(); s.worker.dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,
+      data: { accepted: true, verified: true, id: '66666666-6666-4666-8666-666666666666', primarySmtpAddress: input.primarySmtpAddress } }));
+    await expect(s.service.sharedCreate({}, org, input)).resolves.toMatchObject({ verified: true });
+    expect(s.authorize).toHaveBeenCalledWith({}, org, true);
+    expect(s.worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'shared.create', parameters: input }));
+    expect(s.audit.mock.calls.map(([event]) => event.action)).toEqual([
+      'cloudcommand.microsoft.exchange.shared.create.intent', 'cloudcommand.microsoft.exchange.shared.create.outcome']);
+  });
+  it('never retries after a lost response', async () => {
+    const s = setup(); s.worker.dispatch.mockRejectedValue(new Error('socket closed'));
+    await expect(s.service.sharedCreate({}, org, input)).rejects.toMatchObject({ code: 'unknown_write_outcome' });
+    expect(s.worker.dispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('Exchange message trace read attachment', () => {
   const end = new Date(Date.now() - 60000).toISOString(), start = new Date(Date.now() - 86400000).toISOString();
   const search = { start, end, sender: null, recipient: 'recipient@example.com', status: null, cursor: null };

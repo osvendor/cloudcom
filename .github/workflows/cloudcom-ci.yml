@@ -203,6 +203,7 @@ jobs:
         shell: pwsh
         run: |
           ./scripts/cloudcom/rustdesk/test-contract.ps1
+          ./scripts/cloudcom/rustdesk/launch-managed.test.ps1
           Install-Module Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -Repository PSGallery
           Import-Module Pester -RequiredVersion 5.7.1
           Invoke-Pester ./scripts/cloudcom/rustdesk/repair.Tests.ps1 -Output Detailed -CI

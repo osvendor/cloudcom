@@ -71,3 +71,32 @@ describe('per-technician Microsoft directory exclusion preferences', () => {
     expect(h.execute).not.toHaveBeenCalled(); expect(h.audit).not.toHaveBeenCalled();
   });
 });
+
+describe('per-technician Microsoft directory layout', () => {
+  const layout = { columns: ['displayName', 'mailbox'], widths: { mailbox: 190 }, sortKey: 'mailbox', sortDirection: 'desc' };
+  it('reads and writes a layout for the host-derived actor and organization', async () => {
+    const h = harness({ manage: false, rows: [[{ layout }], [{ layout }]] });
+    const get = await h.app.request('/microsoft/directory/layout/users');
+    expect(await get.json()).toEqual({ layout });
+    const put = await h.app.request('/microsoft/directory/layout/users', { method: 'PUT',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify(layout) });
+    expect(await put.json()).toEqual({ layout });
+    for (const [query] of h.execute.mock.calls as unknown as Array<[unknown]>) {
+      expect(JSON.stringify(query)).toContain(ORG_A);
+      expect(JSON.stringify(query)).toContain(ACTOR_A);
+    }
+  });
+  it('rejects unbounded, duplicate and unknown-resource layouts before database access', async () => {
+    const h = harness();
+    for (const [resource, body] of [
+      ['other', layout],
+      ['users', { ...layout, columns: ['displayName', 'displayName'] }],
+      ['users', { ...layout, widths: { mailbox: 9000 } }],
+    ] as const) {
+      const response = await h.app.request(`/microsoft/directory/layout/${resource}`, { method: 'PUT',
+        headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+      expect(response.status).toBe(400);
+    }
+    expect(h.execute).not.toHaveBeenCalled();
+  });
+});

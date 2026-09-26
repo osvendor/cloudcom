@@ -2,13 +2,14 @@ $ErrorActionPreference = 'Stop'
 $WarningPreference = 'SilentlyContinue'
 $config = $env:CLOUDCOM_EXCHANGE_CONFIG | ConvertFrom-Json -AsHashtable
 $boundTenant = $null
+$inventorySnapshots = @{}
 
 function Send-Failure([string]$RequestId, [string]$Code) {
   @{ requestId = $RequestId; ok = $false; code = $Code } | ConvertTo-Json -Compress
   [Console]::Out.Flush()
 }
-function Send-Result([string]$RequestId, $Records) {
-  @{ requestId = $RequestId; ok = $true; data = @{ records = @($Records); partial = $true; collectedAt = [DateTime]::UtcNow.ToString('o') } } | ConvertTo-Json -Depth 6 -Compress
+function Send-Result([string]$RequestId, $Records, [bool]$Partial, [string]$CollectedAt, $Next) {
+  @{ requestId = $RequestId; ok = $true; data = @{ records = @($Records); partial = $Partial; collectedAt = $CollectedAt; next = $Next } } | ConvertTo-Json -Depth 6 -Compress
   [Console]::Out.Flush()
 }
 function Send-Forwarding([string]$RequestId, $Data) {
@@ -25,6 +26,35 @@ function Get-BoundMailbox([string]$MailboxId) {
   $mailbox = Get-Mailbox -Identity ([string]$candidate.PrimarySmtpAddress) -ErrorAction Stop
   if (-not $mailbox -or [string]$mailbox.ExternalDirectoryObjectId -ine $MailboxId) { throw 'mailbox identity mismatch' }
   return $mailbox
+}
+function Statistic-Bytes($Size) {
+  if ($null -eq $Size) { throw 'missing mailbox size' }
+  # EXO V3 may return a live ByteQuantifiedSize, a deserialized Value, or
+  # a formatted string such as "1.2 GB (1,288,490,189 bytes)".
+  foreach ($candidate in @($Size.Value, $Size)) {
+    if ($null -eq $candidate) { continue }
+    try { return [int64]$candidate.ToBytes() } catch { }
+    $text = [string]$candidate
+    if ($text -match '\(([\d,\s]+) bytes?\)') {
+      return [int64]($Matches[1] -replace '[^\d]', '')
+    }
+    if ($text -match '^\d+$') { return [int64]$text }
+  }
+  throw 'unrecognized mailbox size'
+}
+function Mailbox-Record($Mailbox, [bool]$IncludeStatistics) {
+  $size = $null; $archiveSize = $null; $statisticsUnavailable = -not $IncludeStatistics
+  $archiveEnabled = [string]$Mailbox.ArchiveStatus -eq 'Active'
+  if ($IncludeStatistics) {
+    try { $size = Statistic-Bytes (Get-EXOMailboxStatistics -Identity $Mailbox.ExternalDirectoryObjectId -ErrorAction Stop).TotalItemSize } catch { $statisticsUnavailable = $true }
+    if ($archiveEnabled) {
+      try { $archiveSize = Statistic-Bytes (Get-EXOMailboxStatistics -Identity $Mailbox.ExternalDirectoryObjectId -Archive -ErrorAction Stop).TotalItemSize } catch { $statisticsUnavailable = $true }
+    }
+  }
+  @{ id = [string]$Mailbox.ExternalDirectoryObjectId; primarySmtpAddress = [string]$Mailbox.PrimarySmtpAddress;
+     recipientType = [string]$Mailbox.RecipientTypeDetails; archiveEnabled = $archiveEnabled;
+     mailboxBytes = $size; archiveBytes = $archiveSize; collectedAt = [DateTime]::UtcNow.ToString('o');
+     statisticsUnavailable = $statisticsUnavailable }
 }
 function Forwarding-State([string]$MailboxId, $Mailbox) {
   $smtp = [string]$Mailbox.ForwardingSmtpAddress
@@ -75,6 +105,40 @@ function Delegation-State([string]$MailboxId, [string]$DelegateId, $Mailbox, $De
   @{ mailboxId = $MailboxId; delegateId = $DelegateId; delegateAddress = $delegateAddress;
      fullAccess = [bool]$full; sendAs = [bool]$sendAs; sendOnBehalf = [bool]$behalf }
 }
+function Delegation-List([string]$MailboxId, $Mailbox) {
+  $address = [string]$Mailbox.PrimarySmtpAddress
+  $rights = @{}
+  $partial = $false
+  function Add-DelegationRight($Identity, [string]$Right) {
+    if (-not $Identity) { $script:delegationListPartial = $true; return }
+    try {
+      $recipient = Get-Recipient -Identity ([string]$Identity) -ErrorAction Stop
+      $smtp = [string]$recipient.PrimarySmtpAddress
+      if ($smtp -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$' -or $smtp.Length -gt 320) { throw 'unresolved recipient' }
+      $key = $smtp.ToLowerInvariant()
+      if (-not $rights.ContainsKey($key)) { $rights[$key] = @{ delegateAddress = $smtp; fullAccess = $false; sendAs = $false; sendOnBehalf = $false } }
+      $rights[$key][$Right] = $true
+    } catch { $script:delegationListPartial = $true }
+  }
+  $script:delegationListPartial = $false
+  foreach ($entry in @(Get-MailboxPermission -Identity $address -ErrorAction Stop)) {
+    if ($entry.Deny -or $entry.IsInherited -or @($entry.AccessRights) -notcontains 'FullAccess' -or [string]$entry.User -match '^(NT AUTHORITY|S-1-|SELF)') { continue }
+    Add-DelegationRight $entry.User 'fullAccess'
+  }
+  foreach ($entry in @(Get-RecipientPermission -Identity $address -ErrorAction Stop)) {
+    if ($entry.Deny -or $entry.IsInherited -or @($entry.AccessRights) -notcontains 'SendAs' -or [string]$entry.Trustee -match '^(NT AUTHORITY|S-1-|SELF)') { continue }
+    Add-DelegationRight $entry.Trustee 'sendAs'
+  }
+  foreach ($entry in @($Mailbox.GrantSendOnBehalfTo)) {
+    if (-not $entry) { continue }
+    Add-DelegationRight $(if ($entry.DistinguishedName) { $entry.DistinguishedName } else { $entry }) 'sendOnBehalf'
+  }
+  $rows = @($rights.Values | Sort-Object delegateAddress)
+  if ($rows.Count -gt 200) { $rows = @($rows | Select-Object -First 200); $script:delegationListPartial = $true }
+  $partial = $script:delegationListPartial
+  Remove-Variable delegationListPartial -Scope Script -ErrorAction SilentlyContinue
+  @{ mailboxId = $MailboxId.ToLowerInvariant(); entries = $rows; partial = [bool]$partial; checkedAt = [DateTime]::UtcNow.ToString('o') }
+}
 
 while ($null -ne ($line = [Console]::In.ReadLine())) {
   $requestId = '00000000-0000-4000-8000-000000000000'
@@ -82,20 +146,55 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   try {
     $request = $line | ConvertFrom-Json -AsHashtable
     $requestId = [string]$request.requestId
-    if ($request.operation -notin @('mailbox.inventory','mailbox.forwarding.get','mailbox.forwarding.set','mailbox.autoreply.get','mailbox.autoreply.set',
+    if ($request.operation -notin @('mailbox.inventory','mailbox.statistics.get','mailbox.preservation.get','mailbox.convert.shared','mailbox.forwarding.get','mailbox.forwarding.set','mailbox.autoreply.get','mailbox.autoreply.set',
       'mailbox.addresses.get','mailbox.primary.set','mailbox.alias.add','mailbox.alias.remove',
-      'mailbox.delegation.get','mailbox.delegation.set','trace.search','trace.detail')) { throw 'invalid request' }
+      'mailbox.delegation.get','mailbox.delegation.list','mailbox.delegation.set','distribution.create','shared.create','distribution.member.set','distribution.members.get','group.settings.get','group.external.set','distribution.name.set','group.primary.set','trace.search','trace.detail')) { throw 'invalid request' }
     if ($request.operation -eq 'mailbox.inventory') {
-      if ($request.parameters.Keys.Count -ne 1 -or -not $request.parameters.ContainsKey('pageSize')) { throw 'invalid request' }
+      if ($request.parameters.Keys.Count -notin @(1,2) -or -not $request.parameters.ContainsKey('pageSize') -or
+        ($request.parameters.Keys.Count -eq 2 -and -not $request.parameters.ContainsKey('cursor'))) { throw 'invalid request' }
       $pageSize = [int]$request.parameters.pageSize
       if ($pageSize -lt 1 -or $pageSize -gt 200) { throw 'invalid request' }
+      if ($request.parameters.ContainsKey('cursor') -and [string]$request.parameters.cursor -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}:[1-9][0-9]{0,4}$') { throw 'invalid request' }
+    } elseif ($request.operation -in @('distribution.create','shared.create')) {
+      $p = $request.parameters
+      if ($p.Keys.Count -ne 2 -or -not $p.ContainsKey('name') -or -not $p.ContainsKey('primarySmtpAddress') -or
+        ([string]$p.name).Trim().Length -lt 1 -or ([string]$p.name).Trim().Length -gt 256 -or
+        [string]$p.primarySmtpAddress -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$' -or ([string]$p.primarySmtpAddress).Length -gt 320) { throw 'invalid request' }
+    } elseif ($request.operation -in @('distribution.members.get','group.settings.get')) {
+      $p = $request.parameters
+      if ($p.Keys.Count -ne 1 -or -not $p.ContainsKey('groupId') -or
+        [string]$p.groupId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { throw 'invalid request' }
+    } elseif ($request.operation -eq 'group.external.set') {
+      $p = $request.parameters
+      if ($p.Keys.Count -ne 2 -or -not $p.ContainsKey('groupId') -or -not $p.ContainsKey('allowExternalSenders') -or
+        $p.allowExternalSenders -isnot [bool] -or
+        [string]$p.groupId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { throw 'invalid request' }
+    } elseif ($request.operation -eq 'distribution.name.set') {
+      $p = $request.parameters
+      if ($p.Keys.Count -ne 2 -or -not $p.ContainsKey('groupId') -or -not $p.ContainsKey('displayName') -or
+        [string]$p.groupId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or
+        ([string]$p.displayName).Trim().Length -lt 1 -or ([string]$p.displayName).Trim().Length -gt 256) { throw 'invalid request' }
+    } elseif ($request.operation -eq 'group.primary.set') {
+      $p = $request.parameters
+      if ($p.Keys.Count -ne 2 -or -not $p.ContainsKey('groupId') -or -not $p.ContainsKey('address') -or
+        [string]$p.groupId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or
+        [string]$p.address -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$' -or ([string]$p.address).Length -gt 320) { throw 'invalid request' }
+    } elseif ($request.operation -eq 'distribution.member.set') {
+      $p = $request.parameters
+      if ($p.Keys.Count -ne 3 -or -not $p.ContainsKey('groupId') -or -not $p.ContainsKey('memberId') -or
+        -not $p.ContainsKey('enabled') -or $p.enabled -isnot [bool] -or
+        [string]$p.groupId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or
+        [string]$p.memberId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or
+        [string]$p.groupId -ieq [string]$p.memberId) { throw 'invalid request' }
     } elseif ($request.operation -notin @('trace.search','trace.detail')) {
       $mailboxId = [string]$request.parameters.mailboxId
       if ($mailboxId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { throw 'invalid request' }
+      if ($request.operation -eq 'mailbox.convert.shared' -and ($request.parameters.Keys.Count -ne 1 -or -not $request.parameters.ContainsKey('mailboxId'))) { throw 'invalid request' }
       if ($request.operation -eq 'mailbox.forwarding.set' -and ($request.parameters.Keys.Count -ne 3 -or -not $request.parameters.ContainsKey('smtpAddress') -or -not $request.parameters.ContainsKey('keepCopy'))) { throw 'invalid request' }
       if ($request.operation -eq 'mailbox.autoreply.set' -and ($request.parameters.Keys.Count -ne 5 -or -not $request.parameters.ContainsKey('state') -or -not $request.parameters.ContainsKey('message') -or -not $request.parameters.ContainsKey('start') -or -not $request.parameters.ContainsKey('end'))) { throw 'invalid request' }
       if ($request.operation -in @('mailbox.primary.set','mailbox.alias.add','mailbox.alias.remove') -and ($request.parameters.Keys.Count -ne 2 -or -not $request.parameters.ContainsKey('address'))) { throw 'invalid request' }
       if ($request.operation -eq 'mailbox.delegation.get' -and ($request.parameters.Keys.Count -ne 2 -or -not $request.parameters.ContainsKey('delegateId'))) { throw 'invalid request' }
+      if ($request.operation -eq 'mailbox.delegation.list' -and ($request.parameters.Keys.Count -ne 1 -or -not $request.parameters.ContainsKey('mailboxId'))) { throw 'invalid request' }
       if ($request.operation -eq 'mailbox.delegation.set' -and ($request.parameters.Keys.Count -ne 4 -or -not $request.parameters.ContainsKey('delegateId') -or -not $request.parameters.ContainsKey('right') -or -not $request.parameters.ContainsKey('enabled'))) { throw 'invalid request' }
     }
     if ($boundTenant -and $boundTenant -ne $request.tenantId) { Send-Failure $requestId 'connection_mismatch'; continue }
@@ -104,6 +203,221 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
       $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPemFile($config.certificatePath, $config.privateKeyPath)
       Connect-ExchangeOnline -AppId $config.clientId -Certificate $certificate -Organization $config.exchangeOrganization -ShowBanner:$false
       $boundTenant = [string]$request.tenantId
+    }
+    if ($request.operation -in @('distribution.create','shared.create')) {
+      $address = ([string]$request.parameters.primarySmtpAddress).Trim()
+      $domain = $address.Split('@')[-1]
+      # Get-AcceptedDomain -Identity can return every domain for an unknown
+      # identity; require an exact returned DomainName before any write.
+      $accepted = @(Get-AcceptedDomain -Identity $domain -ErrorAction Stop |
+        Where-Object { [string]$_.DomainName -ieq $domain })
+      if ($accepted.Count -ne 1) { throw 'domain not accepted' }
+      if (Get-Recipient -Identity $address -ErrorAction SilentlyContinue) { throw 'address already exists' }
+      $writeDispatched = $true
+      if ($request.operation -eq 'shared.create') {
+        New-Mailbox -Shared -Name ([string]$request.parameters.name).Trim() -DisplayName ([string]$request.parameters.name).Trim() -PrimarySmtpAddress $address -ErrorAction Stop | Out-Null
+        $created = Get-Mailbox -Identity $address -ErrorAction Stop
+        $expectedKind = 'SharedMailbox'
+      } else {
+        New-DistributionGroup -Name ([string]$request.parameters.name).Trim() -PrimarySmtpAddress $address -ErrorAction Stop | Out-Null
+        $created = Get-DistributionGroup -Identity $address -ErrorAction Stop
+        $expectedKind = 'MailUniversalDistributionGroup'
+      }
+      if (-not $created -or [string]$created.RecipientTypeDetails -ne $expectedKind -or
+        [string]$created.PrimarySmtpAddress -ine $address) { throw 'recipient readback mismatch' }
+      $objectId = $null
+      if ([string]$created.ExternalDirectoryObjectId -match '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+        $objectId = ([string]([guid]$created.ExternalDirectoryObjectId)).ToLowerInvariant()
+      }
+      Send-Forwarding $requestId @{ accepted = $true; verified = $true; id = $objectId;
+        primarySmtpAddress = [string]$created.PrimarySmtpAddress }
+      continue
+    }
+    if ($request.operation -eq 'group.primary.set') {
+      $groupId = [string]$request.parameters.groupId
+      $newAddress = ([string]$request.parameters.address).Trim()
+      $domain = $newAddress.Split('@')[-1]
+      $acceptedDomain = Get-AcceptedDomain -Identity $domain -ErrorAction Stop
+      if (-not $acceptedDomain -or [string]$acceptedDomain.DomainName -ine $domain) { throw 'group address domain is not accepted' }
+      $recipient = Get-EXORecipient -ExternalDirectoryObjectId $groupId -ErrorAction Stop
+      if (-not $recipient -or [string]$recipient.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$recipient.RecipientTypeDetails -notin @('MailUniversalDistributionGroup','GroupMailbox')) { throw 'group identity mismatch' }
+      $oldAddress = [string]$recipient.PrimarySmtpAddress
+      $unified = [string]$recipient.RecipientTypeDetails -eq 'GroupMailbox'
+      $group = $(if ($unified) { Get-UnifiedGroup -Identity $oldAddress -ErrorAction Stop }
+        else { Get-DistributionGroup -Identity $oldAddress -ErrorAction Stop })
+      if (-not $group -or [string]$group.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$group.RecipientTypeDetails -ne [string]$recipient.RecipientTypeDetails -or
+        [string]$group.PrimarySmtpAddress -ine $oldAddress) { throw 'group identity mismatch' }
+      if (-not $unified -and $group.EmailAddressPolicyEnabled -isnot [bool]) { throw 'group address policy unavailable' }
+      if (-not $unified -and [bool]$group.EmailAddressPolicyEnabled) { throw 'group address is controlled by policy' }
+      $beforeAddresses = @($group.EmailAddresses | ForEach-Object { [string]$_ })
+      if ($beforeAddresses.Count -gt 501 -or "SMTP:$oldAddress" -notin $beforeAddresses) { throw 'group aliases unavailable' }
+      $collision = Get-Recipient -Identity $newAddress -ErrorAction SilentlyContinue
+      if ($collision -and [string]$collision.ExternalDirectoryObjectId -ine $groupId) { throw 'group address already assigned' }
+      $changed = $newAddress -ine $oldAddress
+      if ($changed) {
+        $writeDispatched = $true
+        if ($unified) { Set-UnifiedGroup -Identity $oldAddress -PrimarySmtpAddress $newAddress -ErrorAction Stop | Out-Null }
+        else { Set-DistributionGroup -Identity $oldAddress -PrimarySmtpAddress $newAddress -ErrorAction Stop | Out-Null }
+        $group = $(if ($unified) { Get-UnifiedGroup -Identity $newAddress -ErrorAction Stop }
+          else { Get-DistributionGroup -Identity $newAddress -ErrorAction Stop })
+      }
+      $afterAddresses = @($group.EmailAddresses | ForEach-Object { [string]$_ })
+      if (-not $group -or [string]$group.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$group.RecipientTypeDetails -ne [string]$recipient.RecipientTypeDetails -or
+        [string]$group.PrimarySmtpAddress -ine $newAddress -or "SMTP:$oldAddress" -notin $afterAddresses -or
+        @($beforeAddresses | Where-Object { $_ -notin $afterAddresses }).Count -gt 0) { throw 'group address readback mismatch' }
+      Send-Forwarding $requestId @{ groupId = $groupId.ToLowerInvariant(); primarySmtpAddress = [string]$group.PrimarySmtpAddress;
+        accepted = $true; verified = $true; changed = [bool]$changed }
+      continue
+    }
+    if ($request.operation -eq 'distribution.name.set') {
+      $groupId = [string]$request.parameters.groupId
+      $displayName = ([string]$request.parameters.displayName).Trim()
+      $recipient = Get-EXORecipient -ExternalDirectoryObjectId $groupId -ErrorAction Stop
+      if (-not $recipient -or [string]$recipient.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$recipient.RecipientTypeDetails -ne 'MailUniversalDistributionGroup') { throw 'distribution identity mismatch' }
+      $address = [string]$recipient.PrimarySmtpAddress
+      $group = Get-DistributionGroup -Identity $address -ErrorAction Stop
+      if (-not $group -or [string]$group.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$group.RecipientTypeDetails -ne 'MailUniversalDistributionGroup' -or
+        [string]$group.PrimarySmtpAddress -ine $address) { throw 'distribution identity mismatch' }
+      $changed = [string]$group.DisplayName -cne $displayName
+      if ($changed) {
+        $writeDispatched = $true
+        Set-DistributionGroup -Identity $address -DisplayName $displayName -ErrorAction Stop | Out-Null
+        $group = Get-DistributionGroup -Identity $address -ErrorAction Stop
+      }
+      if (-not $group -or [string]$group.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$group.RecipientTypeDetails -ne 'MailUniversalDistributionGroup' -or
+        [string]$group.PrimarySmtpAddress -ine $address -or
+        [string]$group.DisplayName -cne $displayName) { throw 'distribution readback mismatch' }
+      Send-Forwarding $requestId @{ groupId = $groupId.ToLowerInvariant(); displayName = $displayName;
+        accepted = $true; verified = $true; changed = [bool]$changed }
+      continue
+    }
+    if ($request.operation -eq 'group.external.set') {
+      $groupId = [string]$request.parameters.groupId
+      $recipient = Get-EXORecipient -ExternalDirectoryObjectId $groupId -ErrorAction Stop
+      if (-not $recipient -or [string]$recipient.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$recipient.RecipientTypeDetails -notin @('MailUniversalDistributionGroup','GroupMailbox')) { throw 'group identity mismatch' }
+      $address = [string]$recipient.PrimarySmtpAddress
+      $unified = [string]$recipient.RecipientTypeDetails -eq 'GroupMailbox'
+      $group = $(if ($unified) { Get-UnifiedGroup -Identity $address -ErrorAction Stop }
+        else { Get-DistributionGroup -Identity $address -ErrorAction Stop })
+      if (-not $group -or [string]$group.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$group.RecipientTypeDetails -ne [string]$recipient.RecipientTypeDetails -or
+        [string]$group.PrimarySmtpAddress -ine $address -or
+        $group.RequireSenderAuthenticationEnabled -isnot [bool]) { throw 'group identity mismatch' }
+      $requireAuth = -not [bool]$request.parameters.allowExternalSenders
+      $changed = [bool]$group.RequireSenderAuthenticationEnabled -ne $requireAuth
+      if ($changed) {
+        $writeDispatched = $true
+        if ($unified) { Set-UnifiedGroup -Identity $address -RequireSenderAuthenticationEnabled $requireAuth -ErrorAction Stop | Out-Null }
+        else { Set-DistributionGroup -Identity $address -RequireSenderAuthenticationEnabled $requireAuth -ErrorAction Stop | Out-Null }
+        $group = $(if ($unified) { Get-UnifiedGroup -Identity $address -ErrorAction Stop }
+          else { Get-DistributionGroup -Identity $address -ErrorAction Stop })
+      }
+      if (-not $group -or [string]$group.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$group.RecipientTypeDetails -ne [string]$recipient.RecipientTypeDetails -or
+        [string]$group.PrimarySmtpAddress -ine $address -or
+        $group.RequireSenderAuthenticationEnabled -isnot [bool] -or
+        [bool]$group.RequireSenderAuthenticationEnabled -ne $requireAuth) { throw 'group readback mismatch' }
+      Send-Forwarding $requestId @{ groupId = $groupId.ToLowerInvariant();
+        allowExternalSenders = [bool]$request.parameters.allowExternalSenders;
+        accepted = $true; verified = $true; changed = [bool]$changed }
+      continue
+    }
+    if ($request.operation -eq 'group.settings.get') {
+      $groupId = [string]$request.parameters.groupId
+      $recipient = Get-EXORecipient -ExternalDirectoryObjectId $groupId -ErrorAction Stop
+      if (-not $recipient -or [string]$recipient.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$recipient.RecipientTypeDetails -notin @('MailUniversalDistributionGroup','GroupMailbox')) { throw 'group identity mismatch' }
+      $kind = $(if ([string]$recipient.RecipientTypeDetails -eq 'GroupMailbox') { 'microsoft365' } else { 'distribution' })
+      $address = [string]$recipient.PrimarySmtpAddress
+      $group = $(if ($kind -eq 'microsoft365') { Get-UnifiedGroup -Identity $address -ErrorAction Stop }
+        else { Get-DistributionGroup -Identity $address -ErrorAction Stop })
+      if (-not $group -or [string]$group.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$group.RecipientTypeDetails -ne [string]$recipient.RecipientTypeDetails -or
+        [string]$group.PrimarySmtpAddress -ine $address -or
+        $group.RequireSenderAuthenticationEnabled -isnot [bool]) { throw 'group readback mismatch' }
+      $name = [string]$group.DisplayName
+      if ($name.Length -gt 256 -or $address -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$' -or $address.Length -gt 320) { throw 'group response too large' }
+      $policyEnabled = $null
+      if ($kind -eq 'distribution') {
+        if ($group.EmailAddressPolicyEnabled -isnot [bool]) { throw 'group address policy unavailable' }
+        $policyEnabled = [bool]$group.EmailAddressPolicyEnabled
+      }
+      $aliases = @()
+      foreach ($proxy in @($group.EmailAddresses)) {
+        $entry = [string]$proxy
+        if ($entry -notmatch '^(?i:smtp):(.+)$') { continue }
+        $alias = [string]$Matches[1]
+        if ($alias -eq '' -or $alias.Length -gt 320 -or $alias -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw 'group alias unavailable' }
+        if ($alias -ine $address -and $alias -notin $aliases) { $aliases += $alias }
+        if ($aliases.Count -gt 500) { throw 'group response too large' }
+      }
+      Send-Forwarding $requestId @{ groupId = $groupId.ToLowerInvariant(); kind = $kind; displayName = $name;
+        primarySmtpAddress = $address; requireSenderAuthenticationEnabled = [bool]$group.RequireSenderAuthenticationEnabled;
+        emailAddressPolicyEnabled = $policyEnabled; aliases = @($aliases) }
+      continue
+    }
+    if ($request.operation -eq 'distribution.members.get') {
+      $groupId = [string]$request.parameters.groupId
+      $groupRecipient = Get-EXORecipient -ExternalDirectoryObjectId $groupId -ErrorAction Stop
+      if (-not $groupRecipient -or [string]$groupRecipient.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$groupRecipient.RecipientTypeDetails -ne 'MailUniversalDistributionGroup') { throw 'distribution identity mismatch' }
+      $groupAddress = [string]$groupRecipient.PrimarySmtpAddress
+      $group = Get-DistributionGroup -Identity $groupAddress -ErrorAction Stop
+      if (-not $group -or [string]$group.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$group.RecipientTypeDetails -ne 'MailUniversalDistributionGroup') { throw 'distribution identity mismatch' }
+      $rawMembers = @(Get-DistributionGroupMember -Identity $groupAddress -ResultSize 501 -ErrorAction Stop)
+      $complete = $rawMembers.Count -le 500
+      $members = @()
+      foreach ($entry in ($rawMembers | Select-Object -First 500)) {
+        $entryId = [string]$entry.ExternalDirectoryObjectId
+        $address = [string]$entry.PrimarySmtpAddress
+        if ($entryId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or
+          $address -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$' -or $address.Length -gt 320) { $complete = $false; continue }
+        $name = [string]$entry.DisplayName
+        if ($name.Length -gt 256) { $name = $name.Substring(0, 256) }
+        $members += @{ id = $entryId.ToLowerInvariant(); displayName = $name; primarySmtpAddress = $address }
+      }
+      Send-Forwarding $requestId @{ groupId = $groupId.ToLowerInvariant(); members = @($members); complete = [bool]$complete }
+      continue
+    }
+    if ($request.operation -eq 'distribution.member.set') {
+      $groupId = [string]$request.parameters.groupId
+      $memberId = [string]$request.parameters.memberId
+      $groupRecipient = Get-EXORecipient -ExternalDirectoryObjectId $groupId -ErrorAction Stop
+      if (-not $groupRecipient -or [string]$groupRecipient.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$groupRecipient.RecipientTypeDetails -ne 'MailUniversalDistributionGroup') { throw 'distribution identity mismatch' }
+      $groupAddress = [string]$groupRecipient.PrimarySmtpAddress
+      $group = Get-DistributionGroup -Identity $groupAddress -ErrorAction Stop
+      if (-not $group -or [string]$group.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$group.RecipientTypeDetails -ne 'MailUniversalDistributionGroup') { throw 'distribution identity mismatch' }
+      $memberRecipient = Get-EXORecipient -ExternalDirectoryObjectId $memberId -ErrorAction Stop
+      if (-not $memberRecipient -or [string]$memberRecipient.ExternalDirectoryObjectId -ine $memberId -or
+        [string]$memberRecipient.RecipientTypeDetails -notin @('UserMailbox','SharedMailbox')) { throw 'member identity mismatch' }
+      $memberAddress = [string]$memberRecipient.PrimarySmtpAddress
+      $member = Get-Recipient -Identity $memberAddress -ErrorAction Stop
+      if (-not $member -or [string]$member.ExternalDirectoryObjectId -ine $memberId) { throw 'member identity mismatch' }
+      $present = @((Get-DistributionGroupMember -Identity $groupAddress -ResultSize Unlimited -ErrorAction Stop) |
+        Where-Object { [string]$_.ExternalDirectoryObjectId -ieq $memberId }).Count -gt 0
+      $enabled = [bool]$request.parameters.enabled
+      $changed = $present -ne $enabled
+      if ($changed) {
+        $writeDispatched = $true
+        if ($enabled) { Add-DistributionGroupMember -Identity $groupAddress -Member $memberAddress -ErrorAction Stop }
+        else { Remove-DistributionGroupMember -Identity $groupAddress -Member $memberAddress -Confirm:$false -ErrorAction Stop }
+        $present = @((Get-DistributionGroupMember -Identity $groupAddress -ResultSize Unlimited -ErrorAction Stop) |
+          Where-Object { [string]$_.ExternalDirectoryObjectId -ieq $memberId }).Count -gt 0
+      }
+      if ($present -ne $enabled) { throw 'member readback mismatch' }
+      Send-Forwarding $requestId @{ groupId = $groupId.ToLowerInvariant(); memberId = $memberId.ToLowerInvariant();
+        enabled = $enabled; accepted = $true; verified = $true; changed = [bool]$changed }
+      continue
     }
     if ($request.operation -eq 'trace.search') {
       $p = $request.parameters
@@ -159,6 +473,77 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
       })
       Send-Forwarding $requestId @{ messageTraceId = ([string]([guid]$p.messageTraceId)).ToLowerInvariant(); recipient = [string]$p.recipient;
         events = $events; partial = [bool]($raw.Count -gt 1000) }
+      continue
+    }
+    if ($request.operation -eq 'mailbox.delegation.list') {
+      $mailbox = Get-BoundMailbox $mailboxId
+      Send-Forwarding $requestId (Delegation-List $mailboxId $mailbox)
+      continue
+    }
+    if ($request.operation -eq 'mailbox.preservation.get') {
+      if ($request.parameters.Keys.Count -ne 1 -or -not $request.parameters.ContainsKey('mailboxId')) { throw 'invalid request' }
+      $mailbox = Get-BoundMailbox $mailboxId
+      $kind = [string]$mailbox.RecipientTypeDetails
+      if ($kind -notin @('UserMailbox','SharedMailbox')) { throw 'mailbox identity mismatch' }
+      $size = $null
+      try { $size = Statistic-Bytes (Get-EXOMailboxStatistics -Identity $mailboxId -ErrorAction Stop).TotalItemSize } catch { }
+      $archiveEnabled = $true
+      if ($mailbox.PSObject.Properties['ArchiveStatus']) { $archiveEnabled = [string]$mailbox.ArchiveStatus -ne 'None' }
+      $directorySynced = $null
+      if ($mailbox.PSObject.Properties['IsDirSynced'] -and $mailbox.IsDirSynced -is [bool]) {
+        $directorySynced = [bool]$mailbox.IsDirSynced
+      }
+      $litigationHoldEnabled = $null
+      if ($mailbox.PSObject.Properties['LitigationHoldEnabled'] -and $null -ne $mailbox.LitigationHoldEnabled) {
+        $litigationHoldEnabled = [bool]$mailbox.LitigationHoldEnabled
+      }
+      $holds = $null
+      if ($mailbox.PSObject.Properties['InPlaceHolds']) {
+        $values = @($mailbox.InPlaceHolds | Where-Object { $null -ne $_ -and [string]$_ -ne '' } | ForEach-Object { [string]$_ })
+        if ($values.Count -le 100 -and @($values | Where-Object { $_.Length -gt 256 }).Count -eq 0) { $holds = @($values) }
+      }
+      $eligible = $kind -eq 'SharedMailbox' -and $directorySynced -eq $false -and $null -ne $size -and $size -lt (50L * 1024 * 1024 * 1024) -and
+        -not $archiveEnabled -and $litigationHoldEnabled -eq $false -and $null -ne $holds -and $holds.Count -eq 0
+      Send-Forwarding $requestId @{ mailboxId = $mailboxId.ToLowerInvariant(); primarySmtpAddress = [string]$mailbox.PrimarySmtpAddress;
+        recipientType = $kind; mailboxBytes = $size; archiveEnabled = [bool]$archiveEnabled; directorySynced = $directorySynced;
+        litigationHoldEnabled = $litigationHoldEnabled; inPlaceHolds = $holds;
+        licenseRemovalEligible = [bool]$eligible; checkedAt = [DateTime]::UtcNow.ToString('o') }
+      continue
+    }
+    if ($request.operation -eq 'mailbox.convert.shared') {
+      $before = Get-BoundMailbox $mailboxId
+      $originalAddress = [string]$before.PrimarySmtpAddress
+      $kind = [string]$before.RecipientTypeDetails
+      if ($kind -notin @('UserMailbox','SharedMailbox')) { throw 'mailbox identity mismatch' }
+      if ($originalAddress -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$' -or $originalAddress.Length -gt 320) { throw 'mailbox address mismatch' }
+      # Hybrid recipients also require an on-premises RemoteMailbox change.
+      # This cloud-only worker cannot safely complete that side of the write.
+      if (-not $before.PSObject.Properties['IsDirSynced'] -or $before.IsDirSynced -isnot [bool] -or $before.IsDirSynced) {
+        throw 'directory-synchronized mailbox requires on-premises conversion'
+      }
+      $changed = $kind -eq 'UserMailbox'
+      if ($changed) {
+        $writeDispatched = $true
+        Set-Mailbox -Identity $originalAddress -Type Shared -ErrorAction Stop
+      }
+      $verified = $false
+      for ($attempt = 0; $attempt -lt 6; $attempt++) {
+        $after = Get-BoundMailbox $mailboxId
+        if ([string]$after.PrimarySmtpAddress -ine $originalAddress) { throw 'mailbox address changed during conversion' }
+        if ([string]$after.RecipientTypeDetails -eq 'SharedMailbox') { $verified = $true; break }
+        if ($attempt -lt 5) { Start-Sleep -Seconds 2 }
+      }
+      if (-not $verified) { throw 'mailbox conversion readback pending' }
+      Send-Forwarding $requestId @{ mailboxId = $mailboxId.ToLowerInvariant(); primarySmtpAddress = $originalAddress;
+        recipientType = 'SharedMailbox'; accepted = $true; verified = $true; changed = [bool]$changed }
+      continue
+    }
+    if ($request.operation -eq 'mailbox.statistics.get') {
+      if ($request.parameters.Keys.Count -ne 1 -or -not $request.parameters.ContainsKey('mailboxId')) { throw 'invalid request' }
+      $candidate = Get-EXOMailbox -ExternalDirectoryObjectId $mailboxId -Properties ArchiveStatus,ExternalDirectoryObjectId,PrimarySmtpAddress,RecipientTypeDetails -ErrorAction Stop
+      if (-not $candidate -or [string]$candidate.ExternalDirectoryObjectId -ine $mailboxId -or
+        [string]$candidate.RecipientTypeDetails -notin @('UserMailbox','SharedMailbox')) { throw 'mailbox identity mismatch' }
+      Send-Forwarding $requestId (Mailbox-Record $candidate $true)
       continue
     }
     if ($request.operation -ne 'mailbox.inventory') {
@@ -267,15 +652,36 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
       Send-Forwarding $requestId $after
       continue
     }
-    $records = @(Get-EXOMailbox -ResultSize $pageSize -Properties ArchiveStatus,ExternalDirectoryObjectId,PrimarySmtpAddress,RecipientTypeDetails |
-      Where-Object { $_.RecipientTypeDetails -in @('UserMailbox','SharedMailbox') } |
-      ForEach-Object {
-        $mailbox = $_; $size = $null; $archiveSize = $null; $statisticsUnavailable = $false
-        try { $size = [int64](Get-EXOMailboxStatistics -Identity $mailbox.ExternalDirectoryObjectId -ErrorAction Stop).TotalItemSize.Value.ToBytes() } catch { $statisticsUnavailable = $true }
-        if ([string]$mailbox.ArchiveStatus -eq 'Active') { try { $archiveSize = [int64](Get-EXOMailboxStatistics -Identity $mailbox.ExternalDirectoryObjectId -Archive -ErrorAction Stop).TotalItemSize.Value.ToBytes() } catch { $statisticsUnavailable = $true } }
-        @{ id = [string]$mailbox.ExternalDirectoryObjectId; primarySmtpAddress = [string]$mailbox.PrimarySmtpAddress; recipientType = [string]$mailbox.RecipientTypeDetails; archiveEnabled = ([string]$mailbox.ArchiveStatus -eq 'Active'); mailboxBytes = $size; archiveBytes = $archiveSize; collectedAt = [DateTime]::UtcNow.ToString('o'); statisticsUnavailable = $statisticsUnavailable }
-      })
-    Send-Result $requestId $records
+    $now = [DateTime]::UtcNow
+    foreach ($key in @($inventorySnapshots.Keys)) {
+      if (($now - $inventorySnapshots[$key].createdAt).TotalMinutes -gt 10) { $inventorySnapshots.Remove($key) }
+    }
+    $offset = 0
+    if ($request.parameters.ContainsKey('cursor')) {
+      $parts = ([string]$request.parameters.cursor).Split(':')
+      $snapshot = $inventorySnapshots[$parts[0].ToLowerInvariant()]
+      $offset = [int]$parts[1]
+      if (-not $snapshot -or $snapshot.tenantId -ine [string]$request.tenantId -or
+        $snapshot.generation -ne [int]$request.connectionGeneration -or $offset -gt $snapshot.records.Count) { throw 'invalid snapshot' }
+    } else {
+      $mailboxes = @(Get-EXOMailbox -ResultSize 10001 -RecipientTypeDetails UserMailbox,SharedMailbox -Properties ArchiveStatus,ExternalDirectoryObjectId,PrimarySmtpAddress,RecipientTypeDetails)
+      $records = @($mailboxes |
+        Where-Object { $_.RecipientTypeDetails -in @('UserMailbox','SharedMailbox') } |
+        Select-Object -First 10000 |
+        ForEach-Object { Mailbox-Record $_ $false })
+      $snapshotId = [guid]::NewGuid().ToString().ToLowerInvariant()
+      $snapshot = @{ tenantId = [string]$request.tenantId; generation = [int]$request.connectionGeneration;
+        records = $records; truncated = $mailboxes.Count -gt 10000; createdAt = $now; collectedAt = $now.ToString('o'); id = $snapshotId }
+      $inventorySnapshots[$snapshotId] = $snapshot
+      if ($inventorySnapshots.Count -gt 4) {
+        $oldest = $inventorySnapshots.GetEnumerator() | Sort-Object { $_.Value.createdAt } | Select-Object -First 1
+        if ($oldest) { $inventorySnapshots.Remove($oldest.Key) }
+      }
+    }
+    $page = @($snapshot.records | Select-Object -Skip $offset -First $pageSize)
+    $nextOffset = $offset + $page.Count
+    $next = if ($nextOffset -lt $snapshot.records.Count) { "$($snapshot.id):$nextOffset" } else { $null }
+    Send-Result $requestId $page ([bool]($next -or $snapshot.truncated)) $snapshot.collectedAt $next
   } catch {
     # Do not return Exchange, filesystem, certificate, or PowerShell errors to an API caller.
     Send-Failure $requestId $(if ($writeDispatched) { 'unknown_write_outcome' } else { 'provider_rejected' })

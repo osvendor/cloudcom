@@ -145,6 +145,7 @@ describe('Cloud Command Microsoft administration runtime', () => {
     ['wrong nonce', { nonce: 'other' }],
     ['wrong tenant', { tid: '44444444-4444-4444-8444-444444444444' }],
     ['non-administrator', { wids: [] }],
+    ['privileged-role-administrator without Global Administrator', { wids: ['e8611ab8-c189-46e8-94e1-60213ab1f814'] }],
   ])('rejects a %s identity token', async (_label, overrides) => {
     const fetch = vi.fn(async () => Response.json({ id_token: await identity(overrides) }));
     const { runtime: subject } = runtime({ fetch });

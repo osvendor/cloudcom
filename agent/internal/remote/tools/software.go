@@ -13,9 +13,16 @@ import (
 )
 
 type uninstallAttempt struct {
-	command string
-	args    []string
+	command         string
+	args            []string
+	run             func() ([]byte, error)
+	installLocation string
 }
+
+// UserUninstallExec runs the exact MSI product-code command in the interactive
+// user's session. Windows Installer can register a product for that user even
+// when its Add/Remove Programs entry is in HKLM. SYSTEM then gets MSI 1605.
+type UserUninstallExec func(string, []string, time.Duration) (string, string, int, error)
 
 const (
 	maxSoftwareNameLength    = 200
@@ -124,6 +131,12 @@ func validateSoftwareVersion(version string) error {
 
 // UninstallSoftware removes software by name using platform-native uninstall methods.
 func UninstallSoftware(payload map[string]any) CommandResult {
+	return UninstallSoftwareWithUserExec(payload, nil)
+}
+
+// UninstallSoftwareWithUserExec additionally supports per-user Windows MSI
+// products when the caller has an authenticated user-helper session.
+func UninstallSoftwareWithUserExec(payload map[string]any, userExec UserUninstallExec) CommandResult {
 	startTime := time.Now()
 
 	name := strings.TrimSpace(GetPayloadString(payload, "name", ""))
@@ -136,7 +149,7 @@ func UninstallSoftware(payload map[string]any) CommandResult {
 		return NewErrorResult(err, time.Since(startTime).Milliseconds())
 	}
 
-	if err := uninstallSoftwareOS(name, version); err != nil {
+	if err := uninstallSoftwareOS(name, version, userExec); err != nil {
 		return NewErrorResult(err, time.Since(startTime).Milliseconds())
 	}
 
@@ -150,10 +163,10 @@ func UninstallSoftware(payload map[string]any) CommandResult {
 	return NewSuccessResult(result, time.Since(startTime).Milliseconds())
 }
 
-func uninstallSoftwareOS(name, version string) error {
+func uninstallSoftwareOS(name, version string, userExec UserUninstallExec) error {
 	switch runtime.GOOS {
 	case "windows":
-		return uninstallSoftwareWindows(name, version)
+		return uninstallSoftwareWindows(name, version, userExec)
 	case "darwin":
 		return uninstallSoftwareMacOS(name)
 	case "linux":
@@ -163,7 +176,7 @@ func uninstallSoftwareOS(name, version string) error {
 	}
 }
 
-func uninstallSoftwareWindows(name, version string) error {
+func uninstallSoftwareWindows(name, version string, userExec UserUninstallExec) error {
 	// Resolve winget once for all attempts: under the SYSTEM service the
 	// per-user "winget" PATH alias doesn't exist (see resolveWingetCommand).
 	wingetCmd := resolveWingetCommand()
@@ -179,6 +192,24 @@ func uninstallSoftwareWindows(name, version string) error {
 	}
 	if msiAttempt != nil {
 		attempts = append(attempts, *msiAttempt)
+		if userExec != nil {
+			args := append([]string(nil), msiAttempt.args...)
+			attempts = append(attempts, uninstallAttempt{
+				command: "msiexec.exe (logged-in user)",
+				args:    args,
+				run: func() ([]byte, error) {
+					stdout, stderr, code, err := userExec("msiexec.exe", args, 10*time.Minute)
+					output := []byte(strings.TrimSpace(stdout + "\n" + stderr))
+					if err != nil {
+						return output, err
+					}
+					if code != 0 {
+						return output, fmt.Errorf("exit status %d", code)
+					}
+					return output, nil
+				},
+			})
+		}
 	}
 	if version != "" {
 		attempts = append(attempts, uninstallAttempt{
@@ -213,7 +244,31 @@ func uninstallSoftwareWindows(name, version string) error {
 		},
 	}...)
 
-	return runUninstallAttempts(name, attempts)
+	if err := runUninstallAttempts(name, attempts); err != nil {
+		return err
+	}
+	if msiAttempt != nil {
+		return verifyWindowsMSIExecutableRemoved(name, msiAttempt.installLocation)
+	}
+	return nil
+}
+
+// An MSI may return 0 and remove its registration while leaving the actual
+// executable behind (observed with a per-user Blender MSI under Program Files).
+// Only check the obvious name.exe at the registered install location; other
+// remaining files may intentionally be user data and are not a failure.
+func verifyWindowsMSIExecutableRemoved(name, installLocation string) error {
+	if installLocation == "" || !filepath.IsAbs(installLocation) {
+		return nil
+	}
+	base := strings.ToLower(strings.ReplaceAll(name, " ", "")) + ".exe"
+	path := filepath.Join(installLocation, base)
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("installer removed %q registration but its executable remains at %s", name, path)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("could not verify %q executable removal at %s: %w", name, path, err)
+	}
+	return nil
 }
 
 var msiProductCodePattern = regexp.MustCompile(`(?i)^/[xi]\s*(\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\})(?:\s|$)`)
@@ -273,7 +328,16 @@ func windowsMSIUninstallAttempt(name, version string) (*uninstallAttempt, error)
 		return nil, fmt.Errorf("multiple MSI products match %q version %q; refusing an ambiguous uninstall", name, version)
 	}
 	for code := range codes {
-		return &uninstallAttempt{command: "msiexec.exe", args: []string{"/x", code, "/qn", "/norestart"}}, nil
+		location := ""
+		for _, item := range items {
+			if strings.EqualFold(strings.TrimSpace(item.Name), name) &&
+				(version == "" || strings.EqualFold(strings.TrimSpace(item.Version), version)) &&
+				msiProductCode(item.UninstallString) == code {
+				location = strings.TrimSpace(item.InstallLocation)
+				break
+			}
+		}
+		return &uninstallAttempt{command: "msiexec.exe", args: []string{"/x", code, "/qn", "/norestart"}, installLocation: location}, nil
 	}
 	return nil, nil
 }
@@ -432,12 +496,20 @@ func runUninstallAttempts(softwareName string, attempts []uninstallAttempt) erro
 	providerNotFoundCount := 0
 
 	for _, attempt := range attempts {
-		if _, err := uninstallLookPath(attempt.command); err != nil {
-			continue
+		if attempt.run == nil {
+			if _, err := uninstallLookPath(attempt.command); err != nil {
+				continue
+			}
 		}
 
 		attempted++
-		output, err := runUninstallCommand(attempt)
+		var output []byte
+		var err error
+		if attempt.run != nil {
+			output, err = attempt.run()
+		} else {
+			output, err = runUninstallCommand(attempt)
+		}
 		sanitizedOutput, outputTruncated := sanitizeUninstallOutput(string(output))
 		lowerOutput := strings.ToLower(sanitizedOutput)
 

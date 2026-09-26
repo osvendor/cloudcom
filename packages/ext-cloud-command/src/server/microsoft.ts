@@ -22,18 +22,21 @@ export function mountMicrosoftRoutes(app: Hono<{ Variables: Variables }>, servic
     }
     catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : 'invalid_or_failed_request';
-      const allowed = new Set(['access_denied', 'invalid_operation', 'connection_not_ready', 'connection_changed', 'audit_unavailable', 'unknown_write_outcome', 'provider_failed', 'provider_rejected', 'provider_unreachable', 'worker_busy', 'exchange_unavailable', 'consent_expired_or_used', 'consent_rejected', 'tenant_verification_failed', 'administration_permissions_missing', 'provider_access_denied', 'provider_rate_limited', 'unsupported_group', 'role_assignment_state_unknown', 'last_global_administrator', 'method_not_removable', 'usage_location_required', 'license_not_available']);
+      const allowed = new Set(['access_denied', 'invalid_operation', 'connection_not_ready', 'connection_changed', 'audit_unavailable', 'unknown_write_outcome', 'provider_failed', 'provider_rejected', 'provider_unreachable', 'worker_busy', 'exchange_unavailable', 'consent_expired_or_used', 'consent_rejected', 'tenant_verification_failed', 'administration_permissions_missing', 'provider_access_denied', 'provider_rate_limited', 'unsupported_group', 'role_assignment_state_unknown', 'last_global_administrator', 'last_group_owner', 'method_not_removable', 'usage_location_required', 'license_not_available', 'license_assignment_state_unknown', 'license_inherited']);
       const operation = method === 'execute' ? await c.req.json().catch(() => null) as { type?: unknown } | null : null;
       const optionalRole = operation?.type === 'user.password.reset' ? 'User-PasswordProfile.ReadWrite.All'
-        : operation?.type === 'user.license.assign' ? 'LicenseAssignment.ReadWrite.All or User.ReadWrite.All'
+        : operation?.type === 'user.license.assign' || operation?.type === 'user.license.remove' ? 'LicenseAssignment.ReadWrite.All or User.ReadWrite.All'
         : operation?.type === 'user.sessions.revoke' ? 'User.RevokeSessions.All'
-          : operation?.type === 'user.globalAdmin.set' ? 'RoleManagement.ReadWrite.Directory'
+          : operation?.type === 'user.globalAdmin.get' ? 'RoleManagement.Read.Directory'
+            : operation?.type === 'user.globalAdmin.set' ? 'RoleManagement.ReadWrite.Directory'
             : operation?.type === 'user.mfa.methods.list' ? 'UserAuthenticationMethod.Read.All'
-              : operation?.type === 'user.mfa.method.remove' ? 'UserAuthenticationMethod.ReadWrite.All' : null;
+              : operation?.type === 'user.mfa.method.remove' || operation?.type === 'user.mfa.recoveryEmail.set' || operation?.type === 'user.mfa.mobilePhone.set' ? 'UserAuthenticationMethod.ReadWrite.All' : null;
       const message = code === 'unknown_write_outcome'
         ? 'The change may have been applied. Refresh before attempting another change.'
         : code === 'provider_rejected' && operation?.type === 'user.update'
           ? 'Microsoft rejected the profile update. Refresh the user and review the current values before trying again.'
+        : code === 'last_group_owner'
+          ? 'A Microsoft 365 group must retain at least one owner. Add another owner before removing this one.'
         : code === 'last_global_administrator'
           ? 'The last Global Administrator cannot be removed.'
         : code === 'role_assignment_state_unknown'
@@ -42,6 +45,10 @@ export function mountMicrosoftRoutes(app: Hono<{ Variables: Variables }>, servic
           ? 'Set a two-letter usage location on this user before assigning a license.'
         : code === 'license_not_available'
           ? 'This license is no longer available. Refresh the tenant license inventory before trying again.'
+        : code === 'license_inherited'
+          ? 'This license is inherited from a group. Change the group assignment instead.'
+        : code === 'license_assignment_state_unknown'
+          ? 'Microsoft did not return a complete license assignment state. No license was removed.'
         : code === 'method_not_removable'
           ? 'This authentication method is not available for removal. Refresh the user before trying again.'
         : code === 'provider_access_denied' && optionalRole

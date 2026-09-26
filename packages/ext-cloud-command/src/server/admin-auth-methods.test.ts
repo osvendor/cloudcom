@@ -80,4 +80,58 @@ describe('tenant-bound authentication methods provider', () => {
     await expect(h.provider.remove(USER, { kind: 'phone', methodId: PHONE })).rejects.toMatchObject({ code: 'unknown_write_outcome' });
     expect(h.fetch).toHaveBeenCalledTimes(3);
   });
+
+  it('creates a recovery email through the fixed Graph path and verifies the resulting address', async () => {
+    const h = harness();
+    h.fetch.mockResolvedValueOnce(response(methods))
+      .mockResolvedValueOnce(response({ id: '3ddfcfc8-9383-446f-83cc-3ab9be4be18f' }, 201))
+      .mockResolvedValueOnce(response({ value: [...methods.value, { '@odata.type': '#microsoft.graph.emailAuthenticationMethod', emailAddress: 'qa@example.net' }] }));
+    await expect(h.provider.setRecoveryEmail(USER, 'qa@example.net')).resolves.toEqual({ accepted: true, verified: true });
+    expect(h.fetch.mock.calls[2]).toEqual([`${ORIGIN}/users/${USER}/authentication/emailMethods`,
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ emailAddress: 'qa@example.net' }) })]);
+  });
+
+  it('updates the existing recovery email by its fixed ID and leaves uncertain readback unverified', async () => {
+    const h = harness();
+    h.fetch.mockResolvedValueOnce(response({ value: [{ '@odata.type': '#microsoft.graph.emailAuthenticationMethod', emailAddress: 'old@example.net' }] }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(response({ value: [{ '@odata.type': '#microsoft.graph.emailAuthenticationMethod', emailAddress: 'old@example.net' }] }));
+    await expect(h.provider.setRecoveryEmail(USER, 'new@example.net')).resolves.toEqual({ accepted: true, verified: false });
+    expect(h.fetch.mock.calls[2]).toEqual([`${ORIGIN}/users/${USER}/authentication/emailMethods/3ddfcfc8-9383-446f-83cc-3ab9be4be18f`,
+      expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ emailAddress: 'new@example.net' }) })]);
+  });
+
+  it('rejects invalid recovery email before acquiring a token', async () => {
+    const h = harness();
+    await expect(h.provider.setRecoveryEmail(USER, 'not-an-email')).rejects.toMatchObject({ code: 'invalid_input' });
+    expect(h.fetch).not.toHaveBeenCalled();
+  });
+
+  it('creates a mobile phone through the fixed Graph collection and verifies its exact readback', async () => {
+    const h = harness();
+    h.fetch.mockResolvedValueOnce(response({ value: [] }))
+      .mockResolvedValueOnce(response({ id: PHONE }, 201))
+      .mockResolvedValueOnce(response({ id: PHONE, phoneType: 'mobile', phoneNumber: '+1 5555551234' }));
+    await expect(h.provider.setMobilePhone(USER, '+1 5555551234')).resolves.toEqual({ accepted: true, verified: true });
+    expect(h.fetch.mock.calls[2]).toEqual([`${ORIGIN}/users/${USER}/authentication/phoneMethods`,
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ phoneNumber: '+1 5555551234', phoneType: 'mobile' }) })]);
+    expect(h.fetch.mock.calls[3]).toEqual([`${ORIGIN}/users/${USER}/authentication/phoneMethods/${PHONE}`,
+      expect.objectContaining({ method: 'GET' })]);
+  });
+
+  it('updates an existing mobile phone without exposing the number in its result', async () => {
+    const h = harness();
+    h.fetch.mockResolvedValueOnce(response(methods))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(response({ id: PHONE, phoneType: 'mobile', phoneNumber: '+1 5555550000' }));
+    await expect(h.provider.setMobilePhone(USER, '+1 5555551234')).resolves.toEqual({ accepted: true, verified: false });
+    expect(h.fetch.mock.calls[2]).toEqual([`${ORIGIN}/users/${USER}/authentication/phoneMethods/${PHONE}`,
+      expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ phoneNumber: '+1 5555551234', phoneType: 'mobile' }) })]);
+  });
+
+  it('rejects an invalid mobile phone before token acquisition', async () => {
+    const h = harness();
+    await expect(h.provider.setMobilePhone(USER, '555-1234')).rejects.toMatchObject({ code: 'invalid_input' });
+    expect(h.fetch).not.toHaveBeenCalled();
+  });
 });

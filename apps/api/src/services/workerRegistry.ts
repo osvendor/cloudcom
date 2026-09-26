@@ -861,6 +861,17 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    // The Cloud Command Microsoft snapshot needs API-private certificate and
+    // Exchange socket mounts. Its DB lease prevents duplicate work across API
+    // replicas; the worker role must never run it without those mounts.
+    name: 'cloudCommandM365SnapshotWorker',
+    placement: 'socket-owner',
+    load: async () => {
+      const m = await import('../jobs/cloudCommandM365SnapshotWorker');
+      return { init: m.initializeCloudCommandM365SnapshotWorker, shutdown: m.shutdownCloudCommandM365SnapshotWorker };
+    },
+  },
+  {
     // socket-owner, not global: its runtime import closure reaches
     // routes/agentWs.ts — jobs/m365SyncWorker.ts -> services/m365Sync/run.ts
     // -> services/m365ControlPlane/readActionService.ts ->
