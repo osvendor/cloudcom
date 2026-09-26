@@ -88,7 +88,8 @@
         "viewAll": "Voir toutes les alertes"
       },
       "lastActivity": "Dernière activité {{date}}",
-      "noSummary": "Les totaux récapitulatifs ne sont pas disponibles pour le moment."
+      "noSummary": "Les totaux récapitulatifs ne sont pas disponibles pour le moment.",
+      "archivedNotice": "Les données de synthèse ne sont pas affichées pour les organisations archivées."
     },
     "archived": {
       "banner": "Cette organisation est archivée et en lecture seule. Restaurez-la pour apporter des modifications.",
@@ -96,7 +97,26 @@
     },
     "lifecycle": {
       "inaccessible": "Cette organisation est {{status}}, ses données en direct ne sont donc pas disponibles. Vous pouvez tout de même la voir dans la liste des organisations.",
+      "unknownTitle": "Organisation inactive",
+      "inaccessibleHistoryOnly": "Cette organisation est inactive, ses données en direct ne sont donc pas disponibles. Son historique de rapports reste consultable ci-dessous.",
+      "genericStatusLabel": "non active",
       "backToList": "Retour aux organisations"
+    },
+    "reportHistory": {
+      "title": "Historique des rapports",
+      "loading": "Chargement de l'historique des rapports…",
+      "readOnlyNote": "Lecture seule : cette organisation est {{status}}, les rapports ne peuvent donc pas être générés, planifiés ou téléchargés.",
+      "forbidden": "Vous n'avez pas accès à l'historique des rapports de cette organisation.",
+      "error": "Impossible de charger l'historique des rapports.",
+      "empty": "Aucun rapport ni exécution de rapport trouvé.",
+      "definitionsTitle": "Définitions de rapports",
+      "definitionsEmpty": "Aucune définition de rapport.",
+      "runsTitle": "Exécutions récentes",
+      "runsEmpty": "Aucune exécution de rapport.",
+      "lastGenerated": "Généré pour la dernière fois le {{date}}",
+      "neverGenerated": "Jamais généré",
+      "rowCount_one": "{{count}} ligne",
+      "rowCount_other": "{{count}} lignes"
     },
     "unavailable": {
       "title": "Non disponible dans cet espace de travail",

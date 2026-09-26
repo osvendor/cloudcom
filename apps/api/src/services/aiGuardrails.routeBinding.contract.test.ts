@@ -219,6 +219,10 @@ interface Binding {
  * comments in `aiGuardrails.ts` beside each mapping.
  */
 const BINDINGS: readonly Binding[] = [
+  {
+    tool: 'read_artifact', routeFile: 'aiArtifacts.ts', method: 'get', path: '/:id',
+    toolOnly: { extra: [], reason: 'Only artifacts anchored to the caller\'s own session or agent run, and only where capture is enabled; the REST download is org-wide.' },
+  },
   { tool: 'list_ai_agents', routeFile: 'aiAgents.ts', method: 'get', path: '/' },
   {
     tool: 'list_ai_agent_runs', routeFile: 'aiAgents.ts', method: 'get', path: '/runs',
@@ -287,6 +291,16 @@ const BINDINGS: readonly Binding[] = [
       reason: 'POST /remote/sessions carries no device grant of its own; the tool keeps devices:execute because starting a session dispatches to the agent, and dropping it would let remote:access alone drive a device',
     },
   },
+
+  // #6930 — ticket checklist steps and templates.
+  { tool: 'manage_ticket_checklist', action: 'list', routeFile: 'tickets/checklist.ts', method: 'get', path: '/:id/checklist' },
+  { tool: 'manage_ticket_checklist', action: 'add_item', routeFile: 'tickets/checklist.ts', method: 'post', path: '/:id/checklist' },
+  { tool: 'manage_ticket_checklist', action: 'update_item', routeFile: 'tickets/checklist.ts', method: 'patch', path: '/checklist/:itemId' },
+  { tool: 'manage_ticket_checklist', action: 'delete_item', routeFile: 'tickets/checklist.ts', method: 'delete', path: '/checklist/:itemId' },
+  { tool: 'manage_ticket_checklist', action: 'reorder', routeFile: 'tickets/checklist.ts', method: 'post', path: '/:id/checklist/reorder' },
+  { tool: 'manage_ticket_checklist', action: 'apply_template', routeFile: 'tickets/checklist.ts', method: 'post', path: '/:id/checklist/apply-template' },
+  { tool: 'manage_ticket_checklist', action: 'list_templates', routeFile: 'ticketChecklistTemplates.ts', method: 'get', path: '/' },
+  { tool: 'manage_ticket_checklist', action: 'get_template', routeFile: 'ticketChecklistTemplates.ts', method: 'get', path: '/:id' },
 
   // §2.5 — the per-action extra-permission map.
   { tool: 'manage_tickets', action: 'move_org', routeFile: 'tickets/moveOrg.ts', method: 'post', path: '/:id/move-org' },

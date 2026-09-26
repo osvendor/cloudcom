@@ -67,6 +67,7 @@
     "fleetDesign": "Diseño de flota",
     "customFields": "Campos personalizados",
     "savedFilters": "Filtros guardados",
+    "moreSettings": "Más configuraciones",
     "users": "Usuarios",
     "roles": "Roles",
     "sso": "SSO",
@@ -98,7 +99,9 @@
     "serviceManagement": "Gestión de servicios",
     "ticketing": "Tickets",
     "deliverableTemplates": "Plantillas de entregables",
-    "securityScans": "Escaneos de IOC"
+    "securityScans": "Escaneos de IOC",
+    "system": "Sistema",
+    "monitorConversion": "Conversión de monitores"
   },
   "documentTitles": {
     "dashboard": "Panel",
@@ -218,7 +221,7 @@
     "mcp": {
       "connecting": "¿Conectando un agente AI?",
       "title": "Dirija a su agente AI aquí",
-      "description": "Pegue este URL en su cliente MCP (Claude.ai, ChatGPT, Cursor,…). Se le enviará de regreso aquí para autorizar la conexión a través de OAuth."
+      "description": "Pegue este URL en su cliente MCP (Claude.ai, ChatGPT, Cursor,…). Se le enviará de regreso aquí para autorizar la conexión a través de OAuth. ¿Prefiere usar una clave de API? Envíe un encabezado X-API-Key con el alcance ai:read/ai:write."
     },
     "progress": {
       "count": "{{current}} de {{total}}",
@@ -1470,6 +1473,12 @@
           "editTitle": "Editar webhook"
         },
         "subtitle": "Entregar eventos a sistemas externos.",
+        "success": {
+          "created": "Webhook creado",
+          "disabled": "Webhook deshabilitado",
+          "enabled": "Webhook habilitado",
+          "updated": "Webhook actualizado"
+        },
         "title": "Webhooks"
       }
     },
@@ -2445,7 +2454,7 @@
         },
         "title": "Correcciones sugeridas",
         "refresh": "Actualizar correcciones sugeridas",
-        "disabledTitle": "Las correcciones sugeridas están deshabilitadas para esta organización.",
+        "disabledTitle": "Las correcciones sugeridas están desactivadas para esta organización. Actívalas en Configuración → Partner → Funciones de IA, o para una sola organización en su pestaña de IA.",
         "suggestionsDisabled": "Sugerencias deshabilitadas",
         "generate": "Generar",
         "empty": "Aún no hay soluciones sugeridas.",

@@ -24,6 +24,7 @@ import { psaConnections } from '../db/schema/integrations';
 import { authMiddleware, requireMfa, requirePermission, requireScope, requirePartner, type AuthContext } from '../middleware/auth';
 import { writeAuditEvent, writeRouteAudit } from '../services/auditEvents';
 import { getEffectiveOrgSettings, assertNotLocked } from '../services/effectiveSettings';
+import { getAiApprovalTimeout } from '../services/aiApprovalTimeout';
 import { normalizeAlertThresholds } from '../services/aiBudgetAlerts';
 import { enqueueAiBudgetEvaluationForPartner } from '../jobs/aiBudgetAlertDelivery';
 import { clearPartnerScopePolicyCache } from '../oauth/partnerScopePolicy';
@@ -57,7 +58,7 @@ import { syncBillingContactRow, syncSiteContactRow } from '../services/contacts/
 import { escapeLike } from '../utils/sql';
 import { PG_UUID_REGEX } from '../utils/uuid';
 import { isPgUniqueViolation } from '../utils/pgErrors';
-import { isAllowedLauncherScheme, isValidIanaTimezone, canonicalizeTimezone, isValidMaintenanceWindow, MAINTENANCE_WINDOW_ERROR_MESSAGE, normalizeVersionPin, PINNABLE_COMPONENTS, agentVersionPinsSchema, enrollmentDefaultsSchema, httpUrlValue, httpUrlField, SUPPORTED_LOCALES, ticketingInboundSettingsSchema, timeTrackingSessionSuggestionsSchema, EMAIL_TEMPLATE_IDS, isBlankEmailTemplateHtml } from '@breeze/shared';
+import { isAllowedLauncherScheme, isValidIanaTimezone, canonicalizeTimezone, isValidMaintenanceWindow, MAINTENANCE_WINDOW_ERROR_MESSAGE, normalizeVersionPin, PINNABLE_COMPONENTS, agentVersionPinsSchema, enrollmentDefaultsSchema, aiApprovalSettingsSchema, httpUrlValue, httpUrlField, SUPPORTED_LOCALES, ticketingInboundSettingsSchema, timeTrackingSessionSuggestionsSchema, EMAIL_TEMPLATE_IDS, isBlankEmailTemplateHtml } from '@breeze/shared';
 import type { IpAllowlistStatus, ResolvedEnrollmentDefaults, SupportedLocale } from '@breeze/shared';
 import { getEnrollmentDefaultsForOrg } from '../services/enrollmentDefaults';
 import { isValidIpOrCidr } from '../services/ipMatch';
@@ -86,6 +87,7 @@ import { registerOrgTicketSettingsRoutes } from './orgTicketSettings';
 import { registerOrgBillingProfileRoutes } from './orgBillingProfile';
 import { registerOrgAuditRetentionSettingsRoutes } from './orgAuditRetentionSettings';
 import { TOPOLOGY_FLAG_KEYS } from '../services/topology/flags';
+import { toolRateLimitMultiplierSchema } from '../services/aiToolRateLimits';
 
 /**
  * Fold the legacy `security.allowedMfaMethods` input alias into the canonical
@@ -615,13 +617,13 @@ const supportedLocales = SUPPORTED_LOCALES;
  * shared `httpUrlValue`/`httpUrlField` helpers (`@breeze/shared`). They split
  * into two risk classes and both land on the same guard:
  *
- *  - `contact.website` — a partner-authored value shaped like a link. Its only
- *    consumers today are this settings form itself (PartnerSettingsPage /
- *    PartnerCompanyTab), so there is no live XSS sink; the guard is here so the
- *    first person to put it in an `href` inherits a safe value. NOTE: the
- *    website printed on branded PDFs/invoices/quotes is a DIFFERENT column,
- *    `partners.billing_website` (see `buildSellerSnapshot`), validated by
- *    `partnerBillingSettingsSchema` in `@breeze/shared`.
+ *  - `contact.website` — a partner-authored value shaped like a link. As of
+ *    #6228, this is no longer form-only: `buildSellerSnapshot` (sellerSnapshot.ts)
+ *    falls back to `contact.website`/`contact.phone` on branded PDFs/invoices/
+ *    quotes whenever the billing letterhead override (`partners.billing_website`,
+ *    validated by `partnerBillingSettingsSchema` in `@breeze/shared`) is blank —
+ *    so this guard is now a genuine second line of defense for a real render
+ *    sink, not just a courtesy for a future `href`.
  *  - values the SERVER dials outbound (Slack webhook, extra webhooks, the
  *    Elasticsearch endpoint), where a non-http scheme like `file://` is a
  *    scheme-confusion problem rather than an XSS one. This guard covers the
@@ -636,6 +638,16 @@ const supportedLocales = SUPPORTED_LOCALES;
  * The helpers used to live here; they moved to the shared package (#3430) so
  * the web form and the billing-settings schema enforce the identical rule.
  */
+
+export const mlSettingsSchema = z.object({
+  anomalies: z.object({
+    enabled: z.boolean().optional(),
+    create_alerts: z.boolean().optional(),
+  }).optional(),
+  remediation_suggestions: z.object({
+    enabled: z.boolean().optional(),
+  }).optional(),
+});
 
 const partnerSettingsSchema = z.object({
   // Partner tz is the canonical default for every downstream tz field (#1318),
@@ -773,6 +785,8 @@ const partnerSettingsSchema = z.object({
     messagesPerHourPerOrg: z.number().int().min(1).max(10000).optional(),
     approvalMode: z.enum(['per_step', 'action_plan', 'auto_approve', 'hybrid_plan']).optional(),
     alertThresholdPercents: z.array(z.number().int().min(1).max(99)).max(5).optional(),
+    // #6476 — partner value wins and locks, like every other aiBudgets key.
+    toolRateLimitMultiplier: toolRateLimitMultiplierSchema.optional(),
   }).optional(),
   organizationOrder: z.array(z.string().guid()).max(10_000).optional(),
   remoteAccessProviders: z.object({
@@ -865,8 +879,20 @@ const partnerSettingsSchema = z.object({
     // sites validate against the same contract this write boundary enforces.
     inbound: ticketingInboundSettingsSchema.optional(),
   }).optional(),
+  // #6475 — partner DEFAULT for the interactive AI approval timeout (5-60 min).
+  // Replaced wholesale (one field); `{}` clears it back to the product default.
+  // Inherit-with-override: an org value at the same key WINS (resolver:
+  // resolveAiApprovalTimeout in @breeze/shared) — NOT partner-locked.
+  aiApprovals: aiApprovalSettingsSchema.optional(),
   // One-level merge by template id (see PATCH /partners/me). Unknown ids 400.
   emailTemplates: z.partialRecord(z.enum(EMAIL_TEMPLATE_IDS), emailTemplateOverrideSchema).optional(),
+  // ML feature switches, read by services/mlFeatureFlags.ts (nested shape:
+  // `settings.ml.<feature>.<flag>`). Partner value is the default every child
+  // org inherits; an org sets the same key on its own settings to override.
+  // PATCH /partners/me deep-merges `ml` one level, so each card section sends
+  // only the feature block it owns (`ml.anomalies`, `ml.remediation_suggestions`)
+  // and must send that block COMPLETE.
+  ml: mlSettingsSchema.optional(),
 });
 
 const updatePartnerSettingsSchema = z.object({
@@ -1021,6 +1047,16 @@ orgRoutes.patch(
     newSettings.topologyFeatureFlags = {
       ...((currentSettings.topologyFeatureFlags as Record<string, unknown> | undefined) ?? {}),
       ...body.settings.topologyFeatureFlags,
+    };
+  }
+
+  // Deep-merge `ml` one level: the AI-features card sends only the feature
+  // block it owns (e.g. `ml.anomalies` or `ml.remediation_suggestions`), and
+  // the sibling blocks must not be wiped by it.
+  if (body.settings?.ml) {
+    newSettings.ml = {
+      ...((currentSettings.ml as Record<string, unknown> | undefined) ?? {}),
+      ...body.settings.ml,
     };
   }
 
@@ -2045,18 +2081,21 @@ orgRoutes.get('/organizations/:id', requireScope('partner', 'system'), requireOr
   // request context — no escalation: this route already requires `partner` or
   // `system` scope, and `partners` RLS grants a partner-scoped actor its own
   // partner row, so `readWithPartnerAxisVisibility` would buy nothing here.
+  // #6229 adds the partner's payment terms the same way, for the org's
+  // payment-terms InheritedField (org `invoiceTermsDays` NULL = inherit this).
   const [partnerRow] = await db
-    .select({ defaultTaxRate: partners.defaultTaxRate })
+    .select({ defaultTaxRate: partners.defaultTaxRate, invoiceTermsDays: partners.invoiceTermsDays })
     .from(partners)
     .where(eq(partners.id, organization.partnerId))
     .limit(1);
   const partnerDefaultTaxRate = partnerRow?.defaultTaxRate ?? null;
+  const partnerDefaultInvoiceTermsDays = partnerRow?.invoiceTermsDays ?? null;
 
   if (isArchiveLifecycleRow(organization)) {
-    return c.json({ ...organization, archived: true as const, partnerDefaultTaxRate });
+    return c.json({ ...organization, archived: true as const, partnerDefaultTaxRate, partnerDefaultInvoiceTermsDays });
   }
 
-  return c.json({ ...organization, partnerDefaultTaxRate });
+  return c.json({ ...organization, partnerDefaultTaxRate, partnerDefaultInvoiceTermsDays });
 });
 
 orgRoutes.get('/organizations/:id/effective-settings',
@@ -2074,7 +2113,13 @@ orgRoutes.get('/organizations/:id/effective-settings',
     }
 
     const result = await getEffectiveOrgSettings(id);
-    return c.json(result);
+    // #6475 — the interactive AI approval timeout is inherit-with-override
+    // (org wins), so it is resolved by its own resolver rather than through
+    // getEffectiveOrgSettings' partner-locks merge, and reported separately:
+    // { minutes, source, inheritedMinutes, inheritedSource } for the org UI's
+    // "Inherit (…)" label.
+    const aiApprovalTimeout = await getAiApprovalTimeout(id);
+    return c.json({ ...result, aiApprovalTimeout });
   }
 );
 
@@ -2302,6 +2347,18 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
       );
       if (!enrollmentParsed.success) {
         return c.json({ error: 'Invalid enrollment defaults', details: enrollmentParsed.error.issues }, 400);
+      }
+    }
+
+    // #6475 — the org override for the interactive AI approval timeout. The
+    // org `settings` blob is z.any(), so validate the block explicitly (same
+    // reason as the defaults checks above). Deliberately NOT in the partner-
+    // lock loop below: this is inherit-with-override and the org wins.
+    // Omitting the key (or `{}`) inherits the partner default.
+    if (settingsObj.aiApprovals !== undefined) {
+      const parsed = aiApprovalSettingsSchema.safeParse(settingsObj.aiApprovals);
+      if (!parsed.success) {
+        return c.json({ error: 'Invalid AI approval settings', details: parsed.error.issues }, 400);
       }
     }
 

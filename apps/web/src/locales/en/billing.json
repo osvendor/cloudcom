@@ -856,6 +856,7 @@
         "saveCoverPage": "Couldn't save the cover page",
         "saveCustomer": "Could not change the customer.",
         "saveTerms": "Could not save terms.",
+        "saveFooter": "Could not save the footer line.",
         "saveTitle": "Could not save the title.",
         "unitPriceZeroOrMore": "Enter a unit price of 0 or more.",
         "updateBlock": "Could not update the block.",
@@ -995,6 +996,15 @@
         "headerStyleAccent": "Accent",
         "reshapedWarning": "This table didn't fit the {{columns}}-column x {{rows}}-row limit, so it was reshaped to fit. Saving replaces the stored table with what you see here."
       },
+      "footer": {
+        "title": "Footer line (every page)",
+        "helper": "One short line printed at the bottom of every page — e.g. validity dates. Leave blank to use the default footer. Put fine print in Terms & Conditions, not here.",
+        "placeholder": "Blank = use the default footer",
+        "inheritedPartner": "Using the partner invoice footer from Settings: “{{text}}”",
+        "inheritedBrand": "Using the brand kit footer text: “{{text}}”",
+        "inheritedNone": "No default footer is set in Settings — the page footer will be empty.",
+        "counter": "{{count}} / {{max}}"
+      },
       "terms": {
         "placeholder": "Payment terms, delivery notes, etc.",
         "title": "Terms & Conditions (plain text)",
@@ -1125,8 +1135,11 @@
         "recipientRequired": "Enter at least one recipient to send.",
         "signaturePreviewLabel": "Signature (set in Settings → Branding):",
         "subjectLabel": "Subject",
-        "subjectPlaceholder": "Proposal {{number}} from your company",
-        "subjectPlaceholderNoNumber": "Proposal from your company",
+        "subjectPartnerFallback": "your company",
+        "subjectPlaceholder": "Proposal {{number}} from {{partner}}",
+        "subjectPlaceholderNoNumber": "Proposal from {{partner}}",
+        "subjectPlaceholderTemplate": "Uses the subject from your proposal email template",
+        "subjectPlaceholderTitled": "{{title}} — proposal from {{partner}}",
         "title": "Send this proposal?",
         "toLabel": "To",
         "toPlaceholder": "Add recipient…",
@@ -2202,22 +2215,33 @@
       "taxId": "Tax ID",
       "taxRate": "Tax rate (%)",
       "title": "Tax"
+    },
+    "terms": {
+      "description": "Days from issue until this organization's invoices are due. Leave blank to use the partner default. Changes apply to invoices issued from now on; issued invoices keep their due date.",
+      "invalid": "Enter a whole number of days from 0 to 365.",
+      "partnerDefault": "Partner default",
+      "paymentTermsDays": "Payment terms (days)",
+      "title": "Payment terms"
     }
   },
   "partnerBillingSettings": {
     "company": {
+      "addressInherited": "Same as company details",
       "addressLine1": "Address line 1",
       "addressLine2": "Address line 2",
+      "addressTitle": "Address",
       "city": "City",
       "country": "Country",
       "defaultTerms": "Default terms & conditions",
       "defaultTermsPlaceholder": "Payment terms, disclaimers, warranty language, etc.",
       "description": "Shown as the seller on quotes and invoices.",
+      "inheritedFromCompanyDetails": "Company details",
       "name": "Company name",
       "phone": "Phone",
       "postal": "Postal code",
       "region": "State / region",
       "title": "Company contact",
+      "useCompanyAddress": "Use company address",
       "website": "Website"
     },
     "defaults": {

@@ -34,9 +34,12 @@ import type { PinnableVersions, AgentVersionPinsValue } from './AgentVersionPinS
 import OrgNotificationSettings from './OrgNotificationSettings';
 import OrgSecuritySettings from './OrgSecuritySettings';
 import OrgAiProcessingToggle from './OrgAiProcessingToggle';
+import OrgMlFeaturesCard from './OrgMlFeaturesCard';
 import { OrgApprovalSecurityTab } from './OrgApprovalSecurityTab';
 import OrgEventLogSettings from './OrgEventLogSettings';
 import OrgAiBudgetSettings from './OrgAiBudgetSettings';
+import OrgAiApprovalTimeoutCard from './OrgAiApprovalTimeoutCard';
+import type { AiApprovalSettings, ResolvedAiApprovalTimeout } from '@breeze/shared';
 import OrgAuditRetentionSettings from './OrgAuditRetentionSettings';
 import OrgRemoteAccessSettings from './OrgRemoteAccessSettings';
 import { useOrgStore } from '../../stores/orgStore';
@@ -47,6 +50,7 @@ import { formatDate, formatTime as formatUserTime } from '@/lib/dateTimeFormat';
 import { isArchiveLifecycleOrg } from '@/lib/archiveLifecycle';
 import Pax8OrgTab from '../organizations/Pax8OrgTab';
 import ExtensionSlotHost from '../extensions/ExtensionSlotHost';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type TabKey =
   | 'general' | 'contacts' | 'branding' | 'portal' | 'notifications' | 'security'
@@ -198,6 +202,8 @@ type OrgDetails = {
       elasticsearchPassword?: string;
       indexPrefix?: string;
     };
+    /** #6475 — org override of the interactive AI-approval timeout. Absent/`{}` = inherit. */
+    aiApprovals?: AiApprovalSettings;
   };
   billingContact?: {
     name?: string;
@@ -237,6 +243,7 @@ export async function runOrgNameSave(
 
 export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPageProps) {
   const { t } = useTranslation('settings');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   // Seeded SSR-safe with the default tab; the hash is applied client-side in
   // the effect below to avoid a hydration mismatch (same pattern as
   // PartnerSettingsPage). Also tracks back/forward via hashchange.
@@ -294,6 +301,12 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
   // partner-locked fields from this so a disabled control shows the value that is
   // actually in force (and re-posts it unchanged, which the API accepts).
   const [effectiveDefaults, setEffectiveDefaults] = useState<Record<string, unknown> | undefined>(undefined);
+  // #6475: the resolved interactive AI-approval timeout (org override, else
+  // partner default, else product default), for OrgAiApprovalTimeoutCard's
+  // "Inherit (…)" label. Null while unresolved (not yet fetched, or an older
+  // API build that doesn't send it) — the card hides the inherit value rather
+  // than guessing at a source in that case.
+  const [aiApprovalTimeout, setAiApprovalTimeout] = useState<ResolvedAiApprovalTimeout | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [copiedOrgId, setCopiedOrgId] = useState(false);
@@ -353,7 +366,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
           void navigateTo('/login', { replace: true });
           return;
         }
-        throw new Error(t('orgSettingsPage.errors.fetchDetails'));
+        throw new Error(stableT('orgSettingsPage.errors.fetchDetails'));
       }
       const data = await response.json();
       setOrgDetails(data);
@@ -367,6 +380,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
         const lockedList: string[] = effData.locked || [];
         setLocked(lockedList);
         setEffectiveDefaults(effData.effective?.defaults);
+        setAiApprovalTimeout(effData.aiApprovalTimeout ?? null);
         // Issue #2124: pins are inherit-with-override, NOT enforced-locked (see the
         // assertNotLocked exemption in the org PATCH). But `locked` still carries
         // `defaults.agentVersionPins` when the PARTNER set one — we use that purely
@@ -405,11 +419,11 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
           setPinnableVersions(null);
         });
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('orgSettingsPage.errors.generic'));
+      setError(err instanceof Error ? err.message : stableT('orgSettingsPage.errors.generic'));
     } finally {
       setLoading(false);
     }
-  }, [effectiveOrgId, t]);
+  }, [effectiveOrgId, stableT]);
 
   useEffect(() => {
     fetchOrgDetails();
@@ -652,7 +666,29 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
         // No onDirty: the tab owns its own draft AND its own save, so wiring
         // the page's dirty channel would strand it as permanently unsaved
         // (#3432).
-        return <OrgAiBudgetSettings orgId={effectiveOrgId} />;
+        return (
+          <>
+            <OrgAiBudgetSettings orgId={effectiveOrgId} />
+            {/* #6475 — a separate card, not folded into OrgAiBudgetSettings:
+                that one saves through PUT /ai/budget with different
+                semantics (touched-fields-only, its own lock model). This
+                goes through the page's wholesale settings PATCH instead, via
+                handleSave('aiApprovals', ...) below. */}
+            <OrgAiApprovalTimeoutCard
+              initialData={orgDetails?.settings?.aiApprovals}
+              effective={aiApprovalTimeout}
+              onSave={(data: AiApprovalSettings) => handleSave('aiApprovals', data)}
+            />
+            {/* Self-saving like OrgAiProcessingToggle: outside the page's
+                dirty/save cycle. Home for the org-level ML override; the
+                partner default lives on Partner settings → AI Features. */}
+            <OrgMlFeaturesCard
+              orgId={effectiveOrgId}
+              settings={(orgDetails?.settings ?? {}) as Record<string, unknown>}
+              onSaved={() => void fetchOrgDetails()}
+            />
+          </>
+        );
       case 'event-logs':
         return (
           <OrgEventLogSettings

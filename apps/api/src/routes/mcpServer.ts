@@ -49,13 +49,13 @@ import { resolveDeprecatedToolAlias } from '../services/aiToolAliases';
 import { MCP_SERVER_INSTRUCTIONS, listMcpPrompts, getMcpPrompt, hasMcpPrompt } from '../services/mcpGuidance';
 import { API_VERSION } from '../version';
 import { buildMcpToolPresentation } from '../services/mcpToolPresentation';
-import { decodeToolsListCursor, encodeToolsListCursor, mcpToolsListPageSize, negotiateMcpProtocolVersion, parseMcpProtocolVersionHeader } from '../services/mcpProtocol';
+import { computeToolsListCatalogFingerprint, decodeToolsListCursor, encodeToolsListCursor, mcpToolsListPageSize, negotiateMcpProtocolVersion, parseMcpProtocolVersionHeader } from '../services/mcpProtocol';
 import {
   beginMcpToolExecutionLedger,
   completeMcpToolExecutionLedger,
   type McpToolExecutionLedgerHandle,
 } from '../services/mcpToolExecutionLedger';
-import { McpExecutionOrgError, resolveMcpExecutionContext } from './mcpExecutionOrg';
+import { McpExecutionOrgError, resolveMcpExecutionContext, resolveMcpExecutionOrgId } from './mcpExecutionOrg';
 import { getRedis } from '../services/redis';
 import { rateLimiter } from '../services/rate-limit';
 import { getTrustedClientIp } from '../services/clientIp';
@@ -63,6 +63,7 @@ import { enforceIpAllowlist, IP_NOT_ALLOWED_BODY, isBlocked } from '../services/
 import { captureException, captureMessage } from '../services/sentry';
 import type { BootstrapTool } from '../modules/mcpInvites/types';
 import { BootstrapError } from '../modules/mcpInvites/types';
+import { canonicalPrincipalRef, parseUnattendedPrincipals } from '../services/mcpUnattendedPrincipals';
 
 export const mcpServerRoutes = new Hono();
 
@@ -94,6 +95,40 @@ function isExecuteToolAllowedInProd(toolName: string): boolean {
 
 function shouldRequireExecuteAdminInProd(): boolean {
   return process.env.NODE_ENV === 'production' && envFlag('MCP_REQUIRE_EXECUTE_ADMIN', true);
+}
+
+/**
+ * Operator opt-in (default: nobody): MCP_UNATTENDED_TIER3_PRINCIPALS names the
+ * specific principals for which the MCP interactive-approval gate is lifted,
+ * so core-registry Tier 3 tools/actions (and MCP_APPROVAL_REQUIRED_EXTRA_TOOLS,
+ * floored to Tier 3) are listed and callable without a human approval step.
+ * Comma-separated entries: `api_key:<api key id>` or
+ * `oauth_client_user:<OAuth client_id>/<user id>`. A public/DCR client_id is
+ * shared by every user and partner that consents to it, so OAuth entries bind
+ * the client AND the signed-in user (the token's signed `sub`); a client_id
+ * alone is never accepted. Every other principal keeps the default
+ * approval-only deny. Only Tier 3 is lifted; Tier 4 stays denied. Bootstrap
+ * (onboarding) and tenant (BYO MCP) tools stay approval-only (tenant tools
+ * run outside the Tier 3 ledger lifecycle). ai:execute, ai:execute_admin
+ * (production), MCP_EXECUTE_TOOL_ALLOWLIST (production), product RBAC,
+ * per-tool rate limits, the Tier 3 execution ledger and the audit log still
+ * apply. Read per call so the gate cannot be latched on by module load order.
+ */
+function mcpPrincipalRef(apiKey: McpApiKeyContext | undefined | null): string | null {
+  if (!apiKey) return null;
+  if (apiKey.oauthClientId) {
+    return apiKey.createdBy ? canonicalPrincipalRef('oauth_client_user', apiKey.oauthClientId, apiKey.createdBy) : null;
+  }
+  // OAuth bearers use a synthetic `oauth:<jti>` id; never treat it as a key id.
+  if (apiKey.oauthGrantId || apiKey.id.startsWith('oauth:')) return null;
+  return canonicalPrincipalRef('api_key', apiKey.id);
+}
+
+function isUnattendedTier3PrincipalOverMcp(apiKey: McpApiKeyContext | undefined | null): boolean {
+  const ref = mcpPrincipalRef(apiKey);
+  if (!ref) return false;
+  // Same parser as the boot warning (config/validate.ts), so the log and the gate agree.
+  return parseUnattendedPrincipals(process.env.MCP_UNATTENDED_TIER3_PRINCIPALS).principals.has(ref);
 }
 
 const MCP_MESSAGE_MAX_BODY_BYTES = envInt('MCP_MESSAGE_MAX_BODY_BYTES', 64 * 1024);
@@ -259,6 +294,10 @@ type McpApiKeyContext = {
   orgId: string | null;
   partnerId?: string | null;
   oauthGrantId?: string | null;
+  // Set by bearerTokenAuth for OAuth callers (the token's client_id claim).
+  oauthClientId?: string | null;
+  // API key creator, or the signed `sub` (user id) for OAuth bearers.
+  createdBy?: string;
 };
 
 type McpApiKeyWithAuthFields = McpApiKeyContext & {
@@ -924,7 +963,7 @@ async function handleJsonRpc(
         return jsonRpcResult(req.id, {});
 
       case 'tools/list':
-        return await handleToolsList(req.id, scopes, auth, req.params);
+        return await handleToolsList(req.id, scopes, auth, req.params, apiKey);
 
       case 'tools/call':
         return await handleToolsCall(req.id, req.params ?? {}, auth, scopes, apiKey, c, sessionId);
@@ -956,7 +995,11 @@ async function handleJsonRpc(
 // ============================================
 //
 // User decision, 2026-08-02: ALL Tier 3 tools require interactive approval —
-// full stop, no exceptions for tools that predate this change. The MCP
+// no exceptions for tools that predate this change. The ONLY exception is the
+// operator opt-in MCP_UNATTENDED_TIER3_PRINCIPALS: principals named there may
+// call core-registry Tier 3 (never Tier 4, tenant or bootstrap tools) without
+// approval; see isUnattendedTier3PrincipalOverMcp. Everything below describes
+// the default for every other principal. The MCP
 // server has NO interactive approval surface (the durable action_intents
 // Tier 3 approval workflow is an interactive-web-app-only construct), so
 // rather than continue trusting the API key holder at the scope level (the
@@ -1008,8 +1051,20 @@ const BOOTSTRAP_TOOL_TIER = 3;
  * this is unconditional and reuses the shared tier resolution), or an
  * explicit sub-Tier-3 extra.
  */
-function isMcpApprovalRequired(toolName: string, effectiveTier: number): boolean {
-  return effectiveTier === 3 || MCP_APPROVAL_REQUIRED_EXTRA_TOOLS[toolName] === true;
+function isMcpApprovalRequired(
+  toolName: string,
+  effectiveTier: number,
+  opts: { unattendedPrincipal: boolean } = { unattendedPrincipal: false },
+): boolean {
+  // Only Tier 3 is ever lifted (see MCP_UNATTENDED_TIER3_PRINCIPALS); Tier 4
+  // has no approval path and stays denied for everyone.
+  if (opts.unattendedPrincipal && effectiveTier === 3) return false;
+  return effectiveTier >= 3 || MCP_APPROVAL_REQUIRED_EXTRA_TOOLS[toolName] === true;
+}
+
+/** Tier floor MCP applies on top of the registry tier (3 for approval extras). */
+function mcpTierFloor(toolName: string): number {
+  return MCP_APPROVAL_REQUIRED_EXTRA_TOOLS[toolName] === true ? 3 : 0;
 }
 
 /**
@@ -1032,10 +1087,15 @@ function isToolWhollyGatedOverMcp(
   toolName: string,
   inputSchema: unknown,
   getTier: (name: string) => number | undefined,
+  unattendedPrincipal = false,
 ): boolean {
+  const baseTier = getTier(toolName);
+  // A designated unattended principal can call Tier 3 (incl. approval extras,
+  // floored to Tier 3), so only Tier 4+ stays wholly gated for it. The
+  // tier/scope/allowlist filter in handleToolsList still decides visibility.
+  if (unattendedPrincipal) return baseTier !== undefined && baseTier >= 4;
   if (MCP_APPROVAL_REQUIRED_EXTRA_TOOLS[toolName] === true) return true;
 
-  const baseTier = getTier(toolName);
   if (baseTier === undefined) return false;
   if (baseTier >= 3) return true;
 
@@ -1063,7 +1123,8 @@ function extractActionEnum(inputSchema: unknown): string[] | null {
  * entirely, see isToolWhollyGatedOverMcp) and for a tool with no gated
  * actions at all.
  */
-function gatedActionsForTool(toolName: string, inputSchema: unknown): string[] {
+function gatedActionsForTool(toolName: string, inputSchema: unknown, unattendedPrincipal = false): string[] {
+  if (unattendedPrincipal) return [];
   const actionEnum = extractActionEnum(inputSchema);
   if (!actionEnum) return [];
   const tier3Actions = new Set(TIER3_ACTIONS[toolName] ?? []);
@@ -1084,17 +1145,30 @@ function gatedActionsForTool(toolName: string, inputSchema: unknown): string[] {
 // or tools/call. Deferred to call time instead, so only a real request path
 // (or this file's own `mcpServer.test.ts`, which mocks the resolver/execute
 // modules directly) ever evaluates it.
-async function liveResolveTenantTools(auth: AuthContext): Promise<TenantToolDescriptor[]> {
+//
+// #6046: every tenant-tool resolution on this surface passes `targetOrgId` —
+// an org id that has ALREADY been access-checked by `resolveMcpExecutionOrgId`
+// (org-key / org-principal pin, else a caller-supplied orgId gated on
+// `auth.canAccessOrg`, else the caller's first accessible org). Without it the
+// resolver's partner-scope branch only matches partner-wide rows, so an
+// org-owned source was invisible to a partner-scoped MCP session. Never pass a
+// raw `toolInput.orgId` here; the resolver additionally re-derives the target
+// org's partner live and requires it to match `auth.partnerId`.
+async function liveResolveTenantTools(
+  auth: AuthContext,
+  targetOrgId: string | null,
+): Promise<TenantToolDescriptor[]> {
   const { resolveTenantTools } = await import('../services/toolSources/resolver');
-  return resolveTenantTools(auth);
+  return resolveTenantTools(auth, targetOrgId);
 }
 
 async function liveResolveTenantToolByName(
   auth: AuthContext,
   toolName: string,
+  targetOrgId: string | null,
 ): Promise<TenantToolDescriptor | null> {
   const { resolveTenantToolByName } = await import('../services/toolSources/resolver');
-  return resolveTenantToolByName(auth, toolName);
+  return resolveTenantToolByName(auth, toolName, targetOrgId);
 }
 
 // #6102: same lazy-import reasoning as `liveResolveTenantToolByName` above —
@@ -1103,9 +1177,10 @@ async function liveResolveTenantToolByName(
 async function liveResolveTenantToolHealthByName(
   auth: AuthContext,
   toolName: string,
+  targetOrgId: string | null,
 ): Promise<{ found: boolean; sourceStatus?: 'active' | 'error' | 'disabled' }> {
   const { resolveTenantToolHealthByName } = await import('../services/toolSources/resolver');
-  return resolveTenantToolHealthByName(auth, toolName);
+  return resolveTenantToolHealthByName(auth, toolName, targetOrgId);
 }
 
 async function liveExecuteTenantTool(
@@ -1144,12 +1219,20 @@ async function handleToolsList(
   scopes: string[],
   auth: AuthContext,
   params?: Record<string, unknown>,
+  apiKey?: McpApiKeyContext,
 ): Promise<JsonRpcResponse> {
+  const unattendedPrincipal = isUnattendedTier3PrincipalOverMcp(apiKey);
   const allTools = getToolDefinitions();
   const hasExecute = scopes.includes('ai:execute');
   const requireExecuteAdmin = shouldRequireExecuteAdminInProd();
   const hasExecuteAdmin = scopes.includes('ai:execute_admin');
   const hasWrite = hasExecute || scopes.includes('ai:write');
+  // Listed ⇒ callable: a designated principal only escapes the approval gate
+  // for a Tier 3 action it can also pass the scope/admin/allowlist gates for.
+  // Otherwise the tool is listed exactly as for any other principal.
+  const canRunTier3Unattended = (toolName: string) => unattendedPrincipal
+    && hasExecute && (!requireExecuteAdmin || hasExecuteAdmin)
+    && (process.env.NODE_ENV !== 'production' || isExecuteToolAllowedInProd(toolName));
 
   // Filter tools based on API key scopes.
   const scopedTools = allTools.filter((tool) => {
@@ -1157,10 +1240,11 @@ async function handleToolsList(
     // tier — see isToolWhollyGatedOverMcp) is never advertised: every call to
     // it would be denied by the tools/call gate below, so listing it is
     // exactly the advertised-but-dead pattern this payoff eliminates.
-    if (isToolWhollyGatedOverMcp(tool.name, tool.input_schema, getToolTier)) return false;
+    if (isToolWhollyGatedOverMcp(tool.name, tool.input_schema, getToolTier, canRunTier3Unattended(tool.name))) return false;
 
-    const tier = getToolTier(tool.name);
-    if (tier === undefined) return false;
+    const registryTier = getToolTier(tool.name);
+    if (registryTier === undefined) return false;
+    const tier = Math.max(registryTier, mcpTierFloor(tool.name));
 
     // Tier 1 (read-only) = ai:read is enough
     if (tier <= 1) return true;
@@ -1171,14 +1255,19 @@ async function handleToolsList(
     // multiplexer whose base tier is <3 can still surface here if only SOME
     // of its actions escalate to Tier 3, and those callers need ai:execute
     // to reach the tools/call gate at all, same as before this payoff.)
-    return hasExecute && (!requireExecuteAdmin || hasExecuteAdmin);
+    return hasExecute && (!requireExecuteAdmin || hasExecuteAdmin)
+      // Listed ⇒ callable: tools/call rejects a Tier 3 tool missing from the
+      // production allowlist, so don't advertise it. Only a whole-tool Tier 3
+      // (flat Tier 3 or an approval extra) is filtered here; a mixed
+      // multiplexer keeps its lower-tier actions.
+      && (tier < 3 || process.env.NODE_ENV !== 'production' || isExecuteToolAllowedInProd(tool.name));
   });
 
   const result = scopedTools.map((tool) => {
     // A mixed multiplexer (some but not all actions gated over MCP) stays
     // listed — its ungated actions (typically reads/drafts) still work —
     // but its MCP-visible description gains a note about which don't.
-    const gatedActions = gatedActionsForTool(tool.name, tool.input_schema);
+    const gatedActions = gatedActionsForTool(tool.name, tool.input_schema, canRunTier3Unattended(tool.name));
     const description = gatedActions.length > 0
       ? `${tool.description ?? ''} (Actions ${gatedActions.map((a) => `"${a}"`).join(', ')} require interactive approval and are not available over MCP — use the Breeze web app AI assistant for those.)`
       : tool.description ?? '';
@@ -1197,7 +1286,8 @@ async function handleToolsList(
   // them: they are NEVER advertised over MCP while this transport has no
   // interactive approval surface. Deliberately not a filtered loop — a loop
   // that can never push reads as if some bootstrap tool might be listed.
-  // `handleToolsCall` denies them with MCP_APPROVAL_REQUIRED to match.
+  // `handleToolsCall` denies them with MCP_APPROVAL_REQUIRED to match, with
+  // or without the MCP_UNATTENDED_TIER3_PRINCIPALS opt-in (onboarding-only tools).
 
   // Tenant (BYO MCP) tools — Task A10. Same scope formula as the core
   // registry above (tier 1 = ai:read; tier 2 = ai:write; tier 3 = ai:execute
@@ -1206,7 +1296,10 @@ async function handleToolsList(
   // than failing tools/list for the entire core registry.
   let tenantResult: Array<Omit<(typeof result)[number], 'inputSchema'> & { inputSchema: Record<string, unknown> }> = [];
   try {
-    const tenant = await liveResolveTenantTools(auth);
+    // #6046: the same access-checked default org tools/call falls back to when
+    // the caller supplies no `orgId` (no tool input exists at list time), so
+    // every org-owned tool listed here resolves on a bare tools/call.
+    const tenant = await liveResolveTenantTools(auth, resolveMcpExecutionOrgId(apiKey, auth, {}));
     tenantResult = tenant
       // #6401: tier-3 tenant descriptors are NEVER listed — same
       // advertised-but-dead invariant as isToolWhollyGatedOverMcp enforces for
@@ -1215,6 +1308,8 @@ async function handleToolsList(
       // (this transport has no interactive approval surface), so a listed
       // tier-3 tool could never actually be called. Revisit when tier-3-over-MCP
       // support lands (#6158) — do not widen this filter before then.
+      // (MCP_UNATTENDED_TIER3_PRINCIPALS does not apply to tenant tools — see
+      // handleTenantToolCall.)
       .filter((d) => d.tier <= 1 || (d.tier === 2 && hasWrite))
       .map((d) => ({
         ...buildMcpToolPresentation(d.definition, d.tier, 'integrations', { external: true }),
@@ -1230,12 +1325,32 @@ async function handleToolsList(
   const all = [...result.sort(byName), ...tenantResult.sort(byName)];
   const pageSize = mcpToolsListPageSize();
   if (pageSize <= 0) return jsonRpcResult(id, { tools: all });
-  // Offsets are best-effort across changes to the principal's visible tools,
-  // including tenant-tool resolution failures that temporarily omit those tools.
-  const offset = params?.cursor === undefined ? 0 : decodeToolsListCursor(params.cursor);
-  if (offset === null) return jsonRpcError(id, -32602, 'Invalid cursor');
+
+  // #6407: the catalog above is per-principal and can shift between pages
+  // (tenant-tool resolution failure, a scope/tenant-tool change mid-session).
+  // Bind the cursor to a fingerprint of THIS response's catalog + principal so
+  // a page-2 request can prove its offset still indexes the same list.
+  const principalRef = apiKey?.id ?? 'unauthenticated';
+  const catalogFingerprint = computeToolsListCatalogFingerprint(principalRef, all.map((tool) => tool.name));
+
+  let offset = 0;
+  if (params?.cursor !== undefined) {
+    const decoded = decodeToolsListCursor(params.cursor);
+    if (decoded === null) return jsonRpcError(id, -32602, 'Invalid cursor');
+    if (decoded.catalogFingerprint !== catalogFingerprint) {
+      return jsonRpcError(
+        id,
+        -32602,
+        'Tools list changed since this cursor was issued; call tools/list again without a cursor to restart enumeration',
+      );
+    }
+    offset = decoded.offset;
+  }
+
   const page = all.slice(offset, offset + pageSize);
-  const next = offset + pageSize < all.length ? encodeToolsListCursor(offset + pageSize) : undefined;
+  const next = offset + pageSize < all.length
+    ? encodeToolsListCursor(offset + pageSize, catalogFingerprint)
+    : undefined;
   return jsonRpcResult(id, next ? { tools: page, nextCursor: next } : { tools: page });
 }
 
@@ -1327,6 +1442,8 @@ async function handleToolsCall(
     (t) => t.definition.name === toolName,
   );
   if (bootstrapAuthTool) {
+    // Onboarding-only tools: the unattended opt-in does not apply (they are
+    // never listed, so listed ⇒ callable holds).
     if (isMcpApprovalRequired(toolName, BOOTSTRAP_TOOL_TIER)) {
       return jsonRpcResult(id, {
         content: [{ type: 'text', text: JSON.stringify(MCP_APPROVAL_REQUIRED_ERROR) }],
@@ -1383,19 +1500,31 @@ async function handleToolsCall(
     console.error('[MCP] Guardrail check returned a non-finite tier for tool:', toolName, guardrailCheck.tier);
     return jsonRpcError(id, -32000, 'Unable to evaluate tool guardrails');
   }
-  const tier = Math.max(baseTier, guardrailCheck.tier);
+  // MCP_APPROVAL_REQUIRED_EXTRA_TOOLS are Tier 3 over MCP (their registered
+  // tier understates unattended risk). Flooring them here means that under the
+  // MCP_UNATTENDED_TIER3_PRINCIPALS opt-in they still need ai:execute,
+  // ai:execute_admin (production), the production allowlist and the Tier 3
+  // ledger lifecycle, exactly like any other Tier 3 call.
+  const tier = Math.max(baseTier, guardrailCheck.tier, mcpTierFloor(toolName));
 
   // MCP interactive-approval-only gate (see the block comment above
   // MCP_APPROVAL_REQUIRED_EXTRA_TOOLS). Deliberately checked BEFORE the scope
   // gates below — this is an unconditional deny regardless of what scope the
   // caller holds, not "insufficient scope" (those gates report that
   // distinctly). executeTool is never reached for a gated tool/action.
-  if (isMcpApprovalRequired(toolName, tier)) {
+  // Only an effective Tier 3 call can be lifted (isMcpApprovalRequired re-checks
+  // this too); checking it here keeps the intent readable at the call site.
+  const unattendedPrincipal = tier === 3 && isUnattendedTier3PrincipalOverMcp(apiKey);
+  if (isMcpApprovalRequired(toolName, tier, { unattendedPrincipal })) {
     return jsonRpcResult(id, {
       content: [{ type: 'text', text: JSON.stringify(MCP_APPROVAL_REQUIRED_ERROR) }],
       isError: true,
     });
   }
+  // Past the gate with an effective Tier 3 call means approval was skipped for
+  // a named principal. Carried to the audit row so an unattended run is
+  // distinguishable from every other Tier 3 row in an investigation.
+  const approvalBypassPrincipal = unattendedPrincipal ? mcpPrincipalRef(apiKey) : null;
 
   const hasExecute = scopes.includes('ai:execute');
   const requireExecuteAdmin = shouldRequireExecuteAdminInProd();
@@ -1430,7 +1559,13 @@ async function handleToolsCall(
 
   // Per-tool rate limit
   try {
-    const rateLimitErr = await checkToolRateLimit(toolName, auth.user.id);
+    // #6476: the API key's org picks the toolRateLimitMultiplier (partner
+    // fallback for an org-less partner-scope caller). The counter stays per
+    // user per tool across orgs.
+    const rateLimitErr = await checkToolRateLimit(toolName, auth.user.id, {
+      orgId: apiKey?.orgId ?? auth.orgId ?? null,
+      partnerId: apiKey?.partnerId ?? auth.partnerId ?? null,
+    });
     if (rateLimitErr) {
       return jsonRpcError(id, -32000, rateLimitErr);
     }
@@ -1439,14 +1574,14 @@ async function handleToolsCall(
     return jsonRpcError(id, -32000, 'Unable to verify rate limits');
   }
 
-  // By this point every Tier 3 call (and the sub-Tier-3
-  // MCP_APPROVAL_REQUIRED_EXTRA_TOOLS) has already been denied by the
-  // isMcpApprovalRequired gate above — user decision 2026-08-02 replaced the
-  // old "MCP server auto-executes Tier 3 tools, API key holder trusted at the
-  // scope level" model with a hard fail-closed over MCP, because MCP has no
-  // interactive approval surface. Everything reaching this point is Tier ≤2
-  // (or a Tier 3 action that was itself downgraded by TIER1_ACTIONS/
-  // TIER2_ACTIONS), so auto-execution here is intentional and safe.
+  // By default every Tier 3 call (and every MCP_APPROVAL_REQUIRED_EXTRA_TOOLS
+  // entry, floored to Tier 3) has already been denied by the
+  // isMcpApprovalRequired gate above — user decision 2026-08-02, because MCP
+  // has no interactive approval surface. Under the operator opt-in
+  // MCP_UNATTENDED_TIER3_PRINCIPALS a Tier 3 call CAN reach this point, having
+  // passed ai:execute, ai:execute_admin (production), the production
+  // allowlist, RBAC and rate limits; it then runs through the fail-closed
+  // Tier 3 ledger lifecycle below. Treat this block as reachable by Tier 3.
 
   // Authoritative execution org (MCP-OAUTH-05): for device-targeted tools this
   // is resolved from the TARGETED DEVICES via the org+site access gate — NOT
@@ -1572,6 +1707,7 @@ async function handleToolsCall(
       requestedToolName,
       tier,
       toolInput,
+      approvalBypassPrincipal,
     },
     execute,
   );
@@ -1579,9 +1715,11 @@ async function handleToolsCall(
 
 /**
  * `tools/call` dispatch for a tenant (BYO MCP) tool — Task A10. Mirrors the
- * core `handleToolsCall` path's ORDER of checks (resolve → MCP approval gate
- * → scope gates → RBAC → rate limit → execution-org resolution → execute →
- * audit), but against the tenant descriptor's own tier and the tenant
+ * core `handleToolsCall` path's order of checks (resolve → MCP approval gate
+ * → scope gates → RBAC → rate limit → execute → audit), except that the
+ * execution org is resolved BEFORE the tool itself (#6046): it is the
+ * access-checked target org the tenant resolver needs to see org-owned tools.
+ * Checks run against the tenant descriptor's own tier and the tenant
  * (`toolSources/*`) guardrail adapters rather than the core registry's.
  *
  * Tier 3 external tools are denied over MCP exactly like a core Tier 3 tool
@@ -1598,7 +1736,30 @@ async function handleTenantToolCall(
   c?: Context,
   sessionId?: string,
 ): Promise<JsonRpcResponse> {
-  const d = await liveResolveTenantToolByName(auth, toolName);
+  // Authoritative execution org — same resolver core tools use. Tenant tools
+  // have no `deviceArgs` of their own, so device-target resolution is a no-op
+  // and this always falls back to the attribution-only path. Resolved FIRST
+  // (#6046) because it is also the access-checked `targetOrgId` the tenant
+  // resolver needs to see org-owned tools under a partner-scoped session; the
+  // dispatch-time reload in executeTenantToolDetailed re-applies the same org.
+  let executionOrgId: string | null;
+  try {
+    ({ orgId: executionOrgId } = await resolveMcpExecutionContext({
+      auth,
+      apiKey: apiKey ?? null,
+      toolName,
+      toolInput,
+      deviceArgsForTool: async () => undefined,
+    }));
+  } catch (err) {
+    if (err instanceof McpExecutionOrgError) {
+      return jsonRpcError(id, -32602, 'Invalid params');
+    }
+    console.error('[MCP] Failed to resolve execution org for tenant tool:', toolName, err);
+    return jsonRpcError(id, -32000, 'Unable to resolve execution organization');
+  }
+
+  const d = await liveResolveTenantToolByName(auth, toolName, executionOrgId);
   if (!d) {
     // #6102: distinguish "genuinely unknown/inaccessible" (still the same
     // -32602 below — no existence oracle for a caller without access) from
@@ -1615,7 +1776,7 @@ async function handleTenantToolCall(
     // this function.
     let health: { found: boolean; sourceStatus?: 'active' | 'error' | 'disabled' };
     try {
-      health = await liveResolveTenantToolHealthByName(auth, toolName);
+      health = await liveResolveTenantToolHealthByName(auth, toolName, executionOrgId);
     } catch (err) {
       console.error('[MCP] Tenant tool health check failed for:', toolName, err);
       return jsonRpcError(id, -32000, 'Unable to verify tool availability');
@@ -1632,7 +1793,10 @@ async function handleTenantToolCall(
 
   // Same unconditional interactive-approval-only gate as core (see
   // MCP_APPROVAL_REQUIRED_EXTRA_TOOLS's block comment) — checked BEFORE the
-  // scope gates below, same as core.
+  // scope gates below, same as core. The MCP_UNATTENDED_TIER3_PRINCIPALS opt-in is
+  // deliberately NOT honored here: tenant tools execute outside the shared
+  // fail-closed Tier 3 ledger lifecycle (runTier3ToolLifecycle), so tier-3
+  // tenant tools stay approval-only until they are routed through it.
   if (isMcpApprovalRequired(toolName, tier)) {
     return jsonRpcResult(id, {
       content: [{ type: 'text', text: JSON.stringify(MCP_APPROVAL_REQUIRED_ERROR) }],
@@ -1654,7 +1818,6 @@ async function handleTenantToolCall(
   if (tier === 2 && !hasWrite) {
     return jsonRpcError(id, -32603, `Tool "${toolName}" requires ai:write scope`);
   }
-
   // RBAC permission check
   try {
     const permError = await checkPermissionRequirements(auth, [tenantToolPermissionRequirement(tier)]);
@@ -1675,26 +1838,6 @@ async function handleTenantToolCall(
   } catch (err) {
     console.error('[MCP] Tenant tool rate limit check failed for:', toolName, err);
     return jsonRpcError(id, -32000, 'Unable to verify rate limits');
-  }
-
-  // Authoritative execution org — same resolver core tools use. Tenant tools
-  // have no `deviceArgs` of their own, so device-target resolution is a no-op
-  // and this always falls back to the attribution-only path.
-  let executionOrgId: string | null;
-  try {
-    ({ orgId: executionOrgId } = await resolveMcpExecutionContext({
-      auth,
-      apiKey: apiKey ?? null,
-      toolName,
-      toolInput,
-      deviceArgsForTool: async () => undefined,
-    }));
-  } catch (err) {
-    if (err instanceof McpExecutionOrgError) {
-      return jsonRpcError(id, -32602, 'Invalid params');
-    }
-    console.error('[MCP] Failed to resolve execution org for tenant tool:', toolName, err);
-    return jsonRpcError(id, -32000, 'Unable to resolve execution organization');
   }
 
   const startTime = Date.now();
@@ -1774,6 +1917,8 @@ function writeMcpToolAuditEvent(
     status: 'success' | 'failure';
     result?: string;
     error?: unknown;
+    /** See Tier3LifecycleContext.approvalBypassPrincipal. */
+    approvalBypassPrincipal?: string | null;
   },
 ): void {
   if (!c || !event.apiKey) return;
@@ -1796,6 +1941,9 @@ function writeMcpToolAuditEvent(
     details: {
       sessionId: event.sessionId ?? null,
       approvalId: null,
+      ...(event.approvalBypassPrincipal
+        ? { approvalBypass: 'unattended_principal', approvalBypassPrincipal: event.approvalBypassPrincipal }
+        : {}),
       oauthGrantId: event.apiKey.oauthGrantId ?? null,
       partnerId: event.auth.partnerId ?? event.apiKey.partnerId ?? null,
       orgId: orgId ?? null,
@@ -1836,6 +1984,11 @@ interface Tier3LifecycleContext {
   requestedToolName?: string;
   tier: number;
   toolInput: Record<string, unknown>;
+  /**
+   * Set only when the interactive-approval gate was lifted for this call by
+   * MCP_UNATTENDED_TIER3_PRINCIPALS: the principal ref that matched.
+   */
+  approvalBypassPrincipal?: string | null;
 }
 
 interface Tier3ExecutionOutcome {
@@ -1949,6 +2102,7 @@ async function finalizeTier3ToolLifecycle(
     requestedToolName: ctx.requestedToolName,
     tier: ctx.tier,
     toolInput: ctx.toolInput,
+    approvalBypassPrincipal: ctx.approvalBypassPrincipal ?? null,
     durationMs,
     status: outcome.status,
     result: outcome.status === 'success' ? outcome.ledgerResult : undefined,
@@ -2279,7 +2433,7 @@ export const SAFE_DEVICE_RESOURCE_FIELDS = [
   'architecture', 'agentVersion', 'status', 'lastSeenAt', 'enrolledAt',
   'enrolledBy', 'tags', 'customFields', 'managementPosture', 'tccPermissions',
   'desktopAccess', 'lastUser', 'uptimeSeconds', 'isHeadless', 'watchdogStatus',
-  'watchdogLastSeen', 'watchdogVersion', 'quarantinedAt', 'quarantinedReason',
+  'watchdogLastSeen', 'watchdogVersion', 'helperVersion', 'quarantinedAt', 'quarantinedReason',
   'createdAt', 'updatedAt',
 ] as const;
 

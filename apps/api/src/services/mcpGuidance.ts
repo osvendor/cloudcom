@@ -19,6 +19,9 @@ Partner (MSP) → Organization (customer) → Site (location) → Device Group �
 
 ${BREEZE_AI_GUARDRAILS_CORE}
 
+## Paged and large results
+List results carry hasMore and nextCursor. When hasMore is true and you need more, call the same tool again with cursor set to nextCursor and the same filters. A result with artifact.handle means the full output is stored: use read_artifact to page through it instead of re-running the query.
+
 ## Common workflows
 For frequent MSP tasks, use the guided prompts: breeze-fleet-triage, breeze-device-investigate, breeze-patch-remediate, breeze-incident-kickoff, breeze-turnkey-setup.`;
 
@@ -50,10 +53,10 @@ Do NOT perform any mutation. Rank findings by severity and lead with the most ur
     name: 'breeze-device-investigate',
     description: 'Deep-dive one device and summarize likely root cause (read-only).',
     arguments: [{ name: 'device', description: 'Device name, hostname, or id', required: true }],
-    referencedTools: ['resolve_device_context', 'query_devices', 'get_device_details', 'analyze_metrics', 'search_agent_logs', 'get_device_vulnerabilities'],
+    referencedTools: ['resolve_device_context', 'query_devices', 'get_device_details', 'get_device_hardware_health', 'analyze_metrics', 'search_agent_logs', 'get_device_vulnerabilities'],
     render: (a) => `Investigate the device "${a.device ?? '(unspecified)'}" in Breeze RMM. Steps:
 1. Resolve it with resolve_device_context (or query_devices to search by name); ECHO the resolved device + organization back to the user.
-2. Pull get_device_details, analyze_metrics, and recent logs via search_agent_logs.
+2. Pull get_device_details, get_device_hardware_health, analyze_metrics, and recent logs via search_agent_logs.
 3. Check get_device_vulnerabilities.
 4. Summarize the likely root cause and recommended next actions.
 This is a read-only investigation — do not run commands or mutations without explicit user confirmation.`,

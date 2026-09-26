@@ -3,6 +3,10 @@ import starlight from '@astrojs/starlight';
 
 export default defineConfig({
   site: 'https://docs.breezermm.com',
+  redirects: {
+    '/features/alert-templates': { status: 301, destination: '/features/monitors/' },
+    '/features/service-monitoring': { status: 301, destination: '/features/monitors/' },
+  },
   integrations: [
     starlight({
       title: 'Breeze RMM',
@@ -105,6 +109,7 @@ export default defineConfig({
               label: 'Billing & Invoicing',
               items: [
                 { slug: 'features/product-catalog' },
+                { slug: 'features/rates' },
                 { slug: 'features/invoices' },
                 { slug: 'features/quotes' },
                 { slug: 'features/contracts' },
@@ -121,9 +126,8 @@ export default defineConfig({
               items: [
                 { slug: 'features/alerts' },
                 { slug: 'features/monitors' },
-                { slug: 'features/alert-templates' },
                 { slug: 'features/network-monitors' },
-                { slug: 'features/service-monitoring' },
+                { slug: 'features/hardware-monitoring' },
                 { slug: 'features/performance-metrics' },
                 { slug: 'features/network-connections' },
                 { slug: 'features/snmp' },

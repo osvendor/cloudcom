@@ -2,6 +2,7 @@ package helper
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -29,7 +30,12 @@ func uninstallPackage() error {
 	if productCode == "" {
 		return nil // not installed
 	}
+	return uninstallProductCode(productCode)
+}
 
+// uninstallProductCode runs msiexec /x for one ProductCode. Exit 3010 (reboot
+// required) counts as success.
+func uninstallProductCode(productCode string) error {
 	cmd := exec.Command("msiexec", "/x", productCode, "/qn", "/norestart")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -78,9 +84,23 @@ func findHelperProductCode(displayName string) (string, error) {
 	return "", nil
 }
 
-// installPackage runs the MSI installer silently.
+// installPackage installs the helper MSI, removing an orphaned product
+// registration first when the binary is missing (#6927, see installMSI).
+func installPackage(msiPath, binaryPath string) error {
+	return installMSI(msiPath, binaryPath, msiOps{
+		binaryExists: func(path string) bool {
+			_, err := os.Stat(path)
+			return err == nil
+		},
+		findProductCode: func() (string, error) { return findHelperProductCode(helperDisplayName) },
+		uninstall:       uninstallProductCode,
+		install:         runMSIInstall,
+	})
+}
+
+// runMSIInstall runs the MSI installer silently.
 // Exit code 3010 means success but reboot required — treated as success.
-func installPackage(msiPath, _ string) error {
+func runMSIInstall(msiPath string) error {
 	cmd := exec.Command("msiexec", "/i", msiPath, "/qn", "/norestart")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -142,7 +162,7 @@ func stopByPIDIfOurs(pid int, binaryPath string) (bool, error) {
 		return false, nil
 	}
 	handle, err := windows.OpenProcess(
-		windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE,
+		windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE|windows.SYNCHRONIZE,
 		false, uint32(pid),
 	)
 	if err != nil {
@@ -164,8 +184,21 @@ func stopByPIDIfOurs(pid int, binaryPath string) (bool, error) {
 	if err := windows.TerminateProcess(handle, 0); err != nil {
 		return false, fmt.Errorf("TerminateProcess(%d): %w", pid, err)
 	}
+	// TerminateProcess only starts teardown. Wait (bounded) for the process to
+	// actually exit so its handles — including the helper's per-session
+	// single-instance mutex (#6251) — are released before a caller respawns.
+	// A timeout is not an error: the process is already being torn down.
+	_, _ = windows.WaitForSingleObject(handle, stopExitWait)
 	return true, nil
 }
+
+// stopExitWait bounds how long stopByPIDIfOurs waits for a terminated helper
+// to finish exiting. Callers stop helpers one after another while holding
+// Manager.mu on the heartbeat goroutine, so this stays short: a normal
+// TerminateProcess finishes well inside it, and the cost only adds up for a
+// process wedged in teardown. If a respawn still races the old mutex, the new
+// instance exits and the session watcher respawns on its next tick.
+const stopExitWait = 250 // milliseconds
 
 func spawnWithConfig(binaryPath, sessionKey, configPath string) (int, error) {
 	sessionNum, err := strconv.ParseUint(sessionKey, 10, 32)

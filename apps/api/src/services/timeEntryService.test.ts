@@ -595,6 +595,7 @@ describe('deleteTimeEntry', () => {
         id: 'te-1', userId: 'u-1', isApproved: false, partnerId: 'p-1',
         ticketId: null, billingStatus,
       }]);
+      dbMocks.deleteResult = [{ id: 'te-1', orgId: null }];
       await deleteTimeEntry('te-1', ACTOR);
       expect(dbMocks.deleteCalls).toBe(1);
       expect(emitMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -873,7 +874,8 @@ describe('time-entry audit mutation recording', () => {
     expect(failed.recordAuditMutation).not.toHaveBeenCalled();
   });
 
-  it('does not record delete when a concurrent delete leaves no returned row', async () => {
+  // #6620 — same zero-row race class as #6568/#6588/#6589, on the time entry delete path.
+  it('rejects with 409 ENTRY_DELETE_LOST when a concurrent delete leaves no returned row, and emits no side effects', async () => {
     const raced = actorWithRecorder();
     dbMocks.selectResults.push([{
       id: 'te-raced-delete',
@@ -886,9 +888,12 @@ describe('time-entry audit mutation recording', () => {
     }]);
     dbMocks.deleteResult = [];
 
-    await deleteTimeEntry('te-raced-delete', raced.actor);
+    await expect(deleteTimeEntry('te-raced-delete', raced.actor))
+      .rejects.toMatchObject({ status: 409, code: 'ENTRY_DELETE_LOST' });
 
     expect(raced.recordAuditMutation).not.toHaveBeenCalled();
+    expect(dbMocks.insertedValues).toHaveLength(0);
+    expect(emitMock).not.toHaveBeenCalled();
   });
 
   it('records only returned mixed-org bulk rows, preserving a NULL partner-level org', async () => {
@@ -1216,6 +1221,69 @@ describe('query helpers', () => {
     ]);
   });
 
+  describe('listBillables work-type and included-minutes dimensions (#4628 W04)', () => {
+    const TIME_ROW = {
+      date: new Date('2026-06-10T09:00:00Z'), orgName: 'Acme', ticketNumber: 'T-1',
+      description: 'On-site', technician: 'Pat', minutes: 60, billableMinutes: 60,
+      rate: '225.00', currencyCode: 'USD', billingStatus: 'not_billed', isApproved: true,
+    };
+    const PART_ROW = {
+      date: new Date('2026-06-10T12:00:00Z'), orgName: 'Acme', ticketNumber: 'T-1',
+      description: 'SSD', technician: 'Pat', quantity: '1.00', unitPrice: '200.00',
+      currencyCode: 'USD', billingStatus: 'not_billed',
+    };
+    const FROM = new Date('2026-06-01T00:00:00Z');
+    const TO = new Date('2026-06-30T00:00:00Z');
+
+    it('projects the work type name (partner-scoped) and coverage onto time rows', async () => {
+      dbMocks.selectResults.push([{ ...TIME_ROW, workTypeName: 'On-site', coverage: 'billable' }]);
+      dbMocks.selectResults.push([]);
+      const { rows } = await listBillables(FROM, TO);
+      expect(rows[0]).toMatchObject({ workTypeName: 'On-site', coverage: 'billable', includedMinutes: 0 });
+      // The name lookup must be keyed on the entry's partner too, like
+      // entrySelection(): work_types is partner-owned.
+      // Render the correlated read's chunks: real work_types columns carry a
+      // `name`, the mocked time_entries columns arrive as plain strings.
+      const chunks = ((dbMocks.selectArgs[0] as { workTypeName: { queryChunks: unknown[] } })
+        .workTypeName.queryChunks);
+      const rendered = chunks.map((c: any) =>
+        typeof c === 'string' ? `te.${c}`
+          : Array.isArray(c?.value) ? c.value.join('')
+            : typeof c?.name === 'string' ? `wt.${c.name}` : '').join('').replace(/\s+/g, ' ');
+      expect(rendered).toContain('wt.id = te.workTypeId');
+      expect(rendered).toContain('wt.partner_id = te.partnerId');
+    });
+
+    it('an entry with no work type reports null, not an empty string', async () => {
+      dbMocks.selectResults.push([{ ...TIME_ROW, workTypeName: null, coverage: null }]);
+      dbMocks.selectResults.push([]);
+      const { rows } = await listBillables(FROM, TO);
+      expect(rows[0]).toMatchObject({ workTypeName: null, coverage: null, includedMinutes: 0 });
+    });
+
+    it('an INCLUDED entry reports its ACTUAL minutes as includedMinutes, never the rounded quantity, and adds no money', async () => {
+      // An included row can still carry the card's rounding (billable_minutes
+      // 60 for 45 worked); included minutes stay on worked time, matching
+      // getTicketBillingSummary and the portal's coveredByContract bucket.
+      dbMocks.selectResults.push([{
+        ...TIME_ROW, minutes: 45, billableMinutes: 60, rate: null,
+        billingStatus: 'contract', workTypeName: 'Remote', coverage: 'included',
+      }]);
+      dbMocks.selectResults.push([]);
+      const { rows, totalsByCurrency } = await listBillables(FROM, TO);
+      expect(rows[0]).toMatchObject({ coverage: 'included', includedMinutes: 45, amount: '0.00', missingRate: false });
+      // Contributes a zero, exactly as every contract row always has.
+      expect(totalsByCurrency).toEqual([{ currencyCode: 'USD', amount: '0.00' }]);
+    });
+
+    it('part rows carry no work type, no coverage and no included minutes', async () => {
+      dbMocks.selectResults.push([]);
+      dbMocks.selectResults.push([PART_ROW]);
+      const { rows } = await listBillables(FROM, TO);
+      expect(rows[0]).toMatchObject({ kind: 'part', workTypeName: null, coverage: null, includedMinutes: 0 });
+    });
+  });
+
   it('listBillables rounds hours to two decimals before currency-aware labor amounts', async () => {
     dbMocks.selectResults.push([
       {
@@ -1351,6 +1419,7 @@ describe('time_entry feed comments', () => {
 
   it('deleteTimeEntry on a ticket-linked entry inserts a ticketComments row with removed wording', async () => {
     dbMocks.selectResults.push([{ id: 'te-4', userId: 'u-1', isApproved: false, partnerId: 'p-1', ticketId: 't-3', durationMinutes: 45 }]);
+    dbMocks.deleteResult = [{ id: 'te-4', orgId: null }];
     await deleteTimeEntry('te-4', ACTOR);
     const commentVals = dbMocks.insertedValues[0]!;
     expect(commentVals.ticketId).toBe('t-3');
@@ -1362,6 +1431,7 @@ describe('time_entry feed comments', () => {
 
   it('deleting a running (null-duration) entry produces "removed a time entry" with no duration', async () => {
     dbMocks.selectResults.push([{ id: 'te-5', userId: 'u-1', isApproved: false, partnerId: 'p-1', ticketId: 't-4', durationMinutes: null }]);
+    dbMocks.deleteResult = [{ id: 'te-5', orgId: null }];
     await deleteTimeEntry('te-5', ACTOR);
     const commentVals = dbMocks.insertedValues[0]!;
     expect(String(commentVals.content)).toBe('Tess removed a time entry');

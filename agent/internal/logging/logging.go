@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -373,8 +374,9 @@ func addField(fields map[string]any, groups []string, attr slog.Attr) {
 		keyParts = append(keyParts, attr.Key)
 	}
 
-	if attr.Value.Kind() == slog.KindGroup {
-		for _, nested := range attr.Value.Group() {
+	value := attr.Value.Resolve()
+	if value.Kind() == slog.KindGroup {
+		for _, nested := range value.Group() {
 			addField(fields, keyParts, nested)
 		}
 		return
@@ -383,7 +385,50 @@ func addField(fields map[string]any, groups []string, attr slog.Attr) {
 	if len(keyParts) == 0 {
 		return
 	}
-	fields[strings.Join(keyParts, ".")] = attr.Value.Any()
+	fields[strings.Join(keyParts, ".")] = shippableValue(value.Any())
+}
+
+// shippableValue converts values that encoding/json cannot represent into their
+// text. An error value (errors.New, fmt.Errorf, errors.Join, ...) has no exported
+// fields, so it marshals as {} and the message is lost from the shipped row.
+func shippableValue(v any) any {
+	if err, ok := v.(error); ok {
+		return errorText(err)
+	}
+	return v
+}
+
+// errorText returns err.Error(), or "<nil>" for a nil or typed-nil error.
+//
+// A typed-nil error is detected with reflect instead of calling Error and
+// recovering the nil-pointer fault. On Windows a recovered hardware fault can
+// corrupt the heap on AVX-512/AMX hosts (golang/go#81238), which crashed the
+// Windows agent tests (#6943). The recover stays only as a last resort for an
+// Error method that panics on its own.
+func errorText(err error) (text string) {
+	if isNilError(err) {
+		return "<nil>"
+	}
+	defer func() {
+		if recover() != nil {
+			text = "<nil>"
+		}
+	}()
+	return err.Error()
+}
+
+// isNilError reports whether err is nil or wraps a nil pointer, map, slice,
+// func, chan or interface value.
+func isNilError(err error) bool {
+	if err == nil {
+		return true
+	}
+	v := reflect.ValueOf(err)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface, reflect.UnsafePointer:
+		return v.IsNil()
+	}
+	return false
 }
 
 func extractComponent(fields map[string]any) string {

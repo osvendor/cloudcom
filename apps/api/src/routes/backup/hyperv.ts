@@ -8,6 +8,7 @@ import { requireMfa, requirePermission, requireScope } from '../../middleware/au
 import { executeCommand, CommandTypes } from '../../services/commandQueue';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { PERMISSIONS } from '../../services/permissions';
+import { dispatchTrackedDbRestore } from './dbRestoreJob';
 import { resolveScopedOrgId } from './helpers';
 import { resolveAllBackupAssignedDevices, resolveBackupConfigForDevice, effectiveBackupModes } from '../../services/featureConfigResolver';
 import { backupCommandResultSchema } from './resultSchemas';
@@ -441,6 +442,14 @@ hypervRoutes.post(
   }
 );
 
+// Mirrors routes/backup/restore.ts and routes/backup/vmrestore.ts: a device
+// that is offline is a routine, expected dispatch outcome for a
+// reject-on-offline restore command, not an infra failure — surface it as
+// 409 so callers/monitoring can distinguish it from a genuine enqueue error.
+function mapDispatchErrorStatus(error: string): number {
+  return error.startsWith('Device is ') ? 409 : 502;
+}
+
 // ── POST /hyperv/restore — Trigger VM restore (import) ──────────────
 
 hypervRoutes.post(
@@ -505,24 +514,41 @@ hypervRoutes.post(
       return c.json({ error: message, reason }, 422);
     }
 
-    const result = await executeCommand(
-      payload.deviceId,
-      CommandTypes.HYPERV_RESTORE,
-      {
+    // #6437: a real Hyper-V VM restore/import commonly runs well past 10
+    // minutes — the same shape of long-running restore that #6415/PR #6434
+    // gave a 24h ceiling to for whole-machine restores. `executeCommand`
+    // blocks the HTTP request on `waitForCommandResult(commandId, timeoutMs)`
+    // and terminalises the response as failed once `timeoutMs` elapses,
+    // independent of and much shorter than that ceiling — so a healthy
+    // restore was reported failed while the agent kept working. Dispatch
+    // async instead (the same D20 queued-ack + job-correlation pattern PR
+    // #5461 established for MSSQL_BACKUP/HYPERV_BACKUP): return as soon as
+    // the command is queued and let the stale command reaper own the
+    // deadline. The agent already reports its terminal result asynchronously
+    // over the command-result WS path — nothing on the agent side needs to
+    // change.
+    // #6974: track the restore in a restore_jobs row (linked by command id) so
+    // the terminal result is persisted by commandResultHandlers.hyperv_restore.
+    const queued = await dispatchTrackedDbRestore({
+      orgId,
+      snapshotId: snapshot.id,
+      deviceId: payload.deviceId,
+      userId: auth?.user?.id,
+      commandType: CommandTypes.HYPERV_RESTORE,
+      engine: 'hyperv',
+      targetConfig: { vmName: payload.vmName, generateNewId: payload.generateNewId },
+      buildPayload: (restoreJobId) => ({
+        restoreJobId,
         snapshotId: snapshot.providerSnapshotId,
         vmName: payload.vmName,
         generateNewId: payload.generateNewId,
         provider: backupProviderConfig.provider,
         providerConfig: backupProviderConfig.providerConfig,
-      },
-      { userId: auth?.user?.id, timeoutMs: 600000 }
-    );
+      }),
+    });
 
-    if (result.status === 'failed') {
-      return c.json(
-        { error: result.error || 'Hyper-V restore failed' },
-        500
-      );
+    if (!queued.ok) {
+      return c.json({ error: queued.error }, mapDispatchErrorStatus(queued.error) as any);
     }
 
     writeRouteAudit(c, {
@@ -533,15 +559,21 @@ hypervRoutes.post(
       details: {
         snapshotId: snapshot.id,
         vmName: payload.vmName,
+        commandId: queued.command.id,
+        restoreJobId: queued.restoreJobId,
       },
     });
 
-    try {
-      const data = result.stdout ? parseAgentJsonStdout(result.stdout) : null;
-      return c.json({ data });
-    } catch {
-      return c.json({ data: result.stdout });
-    }
+    return c.json({
+      data: {
+        commandId: queued.command.id,
+        restoreJobId: queued.restoreJobId,
+        status: queued.command.status,
+        deviceId: payload.deviceId,
+        snapshotId: snapshot.id,
+        vmName: payload.vmName,
+      },
+    }, 202);
   }
 );
 

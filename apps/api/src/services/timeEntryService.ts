@@ -62,6 +62,8 @@ export type TimeEntryServiceErrorCode =
   | 'PART_UPDATE_LOST'
   /** 409 — DELETE ... RETURNING matched zero rows (part re-pointed between the lock-read and the delete). */
   | 'PART_DELETE_LOST'
+  /** 409 — DELETE ... RETURNING matched zero rows (entry re-pointed between the lock-read and the delete). */
+  | 'ENTRY_DELETE_LOST'
   /**
    * 422 — `time_entries_billable_minutes_chk` rejected the write (#6463): the
    * TypeScript `computeBillableMinutes()` and the SQL `billableMinutesSql()`
@@ -1173,13 +1175,25 @@ export async function deleteTimeEntry(id: string, actor: TimeEntryActor) {
       'ENTRY_BILLED',
     );
   }
-  const deleted = await db
+  const [deletedRow] = await db
     .delete(timeEntries)
     .where(eq(timeEntries.id, id))
     .returning({ id: timeEntries.id, orgId: timeEntries.orgId });
-  if (deleted[0]) {
-    recordAuditMutation(actor, 'time_entry.deleted', deleted[0]);
+  if (!deletedRow) {
+    // The entry existed at the top of this call (getEntryOr404's FOR UPDATE
+    // re-read) but the DELETE matched zero rows — it was re-pointed out of
+    // this caller's visibility in between (org move, RLS context change).
+    // Reporting success here would tell the caller the row is gone when it
+    // is not, and would still fire the feed comment + event below. Same race
+    // class as deleteTicketPart (#6568/#6588/#6589), with its own code so
+    // callers can tell the two write paths apart.
+    throw new TimeEntryServiceError(
+      'Entry could not be deleted — reload and retry',
+      409,
+      'ENTRY_DELETE_LOST',
+    );
   }
+  recordAuditMutation(actor, 'time_entry.deleted', deletedRow);
 
   await insertTimeEntryFeedComment(
     entry.ticketId,
@@ -1694,6 +1708,18 @@ interface BillableRowBase {
   missingRate: boolean;
   currencyCode: string | null;
   billingStatus: BillingStatus;
+  /** #4628 W04 — the labour label as stamped; null for a part or an entry with none. */
+  workTypeName: string | null;
+  /** #4628 §3.4 — the card row's coverage as stamped; null for a part or a pre-feature entry. */
+  coverage: 'billable' | 'included' | 'non_billable' | null;
+  /**
+   * #4628 W04 — contract-covered time in ACTUAL minutes worked; 0 for every
+   * row that is not `included`, and for parts, so the column sums cleanly.
+   * Deliberately not the billed quantity: an included row can still carry the
+   * card's rounding, and getTicketBillingSummary / the portal's
+   * coveredByContract bucket report included time as worked time (§3.5).
+   */
+  includedMinutes: number;
 }
 
 export type BillableRow =
@@ -1747,7 +1773,15 @@ export async function listBillables(
       rate: timeEntries.hourlyRate,
       currencyCode: timeEntries.currencyCode,
       billingStatus: timeEntries.billingStatus,
-      isApproved: timeEntries.isApproved
+      isApproved: timeEntries.isApproved,
+      coverage: timeEntries.coverage,
+      // Correlated read, keyed on the entry's partner like entrySelection():
+      // keeps one row per entry and keeps archived labels on history.
+      workTypeName: sql<string | null>`(
+        SELECT ${workTypes.name} FROM ${workTypes}
+        WHERE ${workTypes.id} = ${timeEntries.workTypeId}
+          AND ${workTypes.partnerId} = ${timeEntries.partnerId}
+      )`
     })
     .from(timeEntries)
     .leftJoin(tickets, eq(timeEntries.ticketId, tickets.id))
@@ -1820,7 +1854,10 @@ export async function listBillables(
       missingRate,
       currencyCode: r.currencyCode,
       billingStatus: r.billingStatus,
-      isApproved: r.isApproved
+      isApproved: r.isApproved,
+      workTypeName: r.workTypeName ?? null,
+      coverage: r.coverage ?? null,
+      includedMinutes: r.coverage === 'included' ? (r.minutes ?? 0) : 0
     });
   }
   for (const r of partRows) {
@@ -1844,7 +1881,11 @@ export async function listBillables(
       missingRate: false,
       currencyCode: r.currencyCode,
       billingStatus: r.billingStatus,
-      isApproved: null
+      isApproved: null,
+      // A part has no labour dimension.
+      workTypeName: null,
+      coverage: null,
+      includedMinutes: 0
     });
   }
   rows.sort((a, b) => a.date.getTime() - b.date.getTime());

@@ -23,6 +23,7 @@ import AlertDeviceInfo from './AlertDeviceInfo';
 import { DelegateToOperatorButton } from '../aiOperator/DelegateToOperatorButton';
 import { extractServiceNameFromAlert } from '../aiOperator/alertServiceName';
 import {
+  anomalyDeepLinkHash,
   formatAnomalyConfidence,
   formatAnomalyType,
   formatAnomalyValue,
@@ -31,6 +32,7 @@ import {
 } from './alertMlContext';
 import { fillDevicePlaceholders, type AlertAiVerdictSummaryDto } from '@breeze/shared';
 import AlertVerdictBadge, { submitVerdictFeedback } from './AlertVerdictBadge';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type Alert = {
   id: string;
@@ -97,6 +99,7 @@ const statusIcons: Record<AlertStatus, typeof Bell> = {
 
 export default function AlertDetailPage({ alertId }: AlertDetailPageProps) {
   const { t } = useTranslation('alerts');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [alert, setAlert] = useState<Alert | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
@@ -114,13 +117,13 @@ export default function AlertDetailPage({ alertId }: AlertDetailPageProps) {
       const response = await fetchWithAuth(`/alerts/${alertId}`);
       if (!response.ok) {
         if (response.status === 404) {
-          throw new Error(t('alertDetailPage.alertNotFound'));
+          throw new Error(stableT('alertDetailPage.alertNotFound'));
         }
-        throw new Error(t('alertDetailPage.failedToFetchAlert'));
+        throw new Error(stableT('alertDetailPage.failedToFetchAlert'));
       }
 
       const data = await response.json();
-      const deviceName = data.device?.hostname || data.deviceName || t('alertDetailPage.unknownDevice');
+      const deviceName = data.device?.hostname || data.deviceName || stableT('alertDetailPage.unknownDevice');
       // Map API response to component structure
       setAlert({
         ...data,
@@ -133,11 +136,11 @@ export default function AlertDetailPage({ alertId }: AlertDetailPageProps) {
         anomalyContext: data.anomalyContext ?? normalizeMetricAnomalyContext(data.contextData ?? data.context),
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('alertDetailPage.failedToFetchAlert'));
+      setError(err instanceof Error ? err.message : stableT('alertDetailPage.failedToFetchAlert'));
     } finally {
       setLoading(false);
     }
-  }, [alertId, t]);
+  }, [alertId, stableT]);
 
   const fetchLinkedTickets = useCallback(async () => {
     try {
@@ -433,7 +436,7 @@ export default function AlertDetailPage({ alertId }: AlertDetailPageProps) {
             )}
           </div>
           <a
-            href={`/devices/${alert.deviceId}#anomalies${alert.anomalyContext.anomalyId ? `/${alert.anomalyContext.anomalyId}` : ''}`}
+            href={`/devices/${alert.deviceId}#${anomalyDeepLinkHash(alert.anomalyContext)}`}
             className="mt-4 inline-flex items-center gap-1 text-sm font-medium text-sky-700 hover:underline"
           >
             {t('alertDetailPage.openDeviceAnomalies')}

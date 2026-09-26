@@ -50,6 +50,10 @@ export interface PendingApproval {
   approvalScope?: AiApprovalScope;
   /** The intent's real server-side expiry (ISO), so the self-approve countdown reflects actual deadline. */
   intentExpiresAt?: string;
+  /** #6475 — the org's configured interactive-approval window (ms), sent on every approval card. */
+  approvalWindowMs?: number;
+  /** #6475 — this specific (legacy, non-intent) wait's real server-side expiry (ISO). */
+  approvalExpiresAt?: string;
   /**
    * #4888 — the run context a script launch will actually execute in, resolved
    * server-side. Present only for `run_script` / `execute_script_on_device`.
@@ -167,6 +171,23 @@ export function processStreamEvent(
       return currentAssistantId;
     }
 
+    // Sweep E6: `tool_use_start`'s `input` is always `{}` (the SDK hasn't
+    // finished streaming the tool's arguments yet at that point). This event
+    // arrives once they're known and fills in the SAME message row, so the
+    // live tool card's label (aiToolLabel, which needs `input.action` to
+    // tell a read from a write) matches what a history reload of this exact
+    // row would compute.
+    case 'tool_use_input': {
+      set((s) => ({
+        messages: s.messages.map((m) =>
+          m.role === 'tool_use' && m.toolUseId === event.toolUseId
+            ? { ...m, toolInput: Object.keys(event.input).length > 0 ? event.input : undefined }
+            : m
+        )
+      }));
+      return currentAssistantId;
+    }
+
     case 'tool_result': {
       const resultMsg: AiMessage = {
         id: `result-${event.toolUseId}`,
@@ -219,6 +240,8 @@ export function processStreamEvent(
           selfApprovalRequestId: event.selfApprovalRequestId,
           approvalScope: event.approvalScope,
           intentExpiresAt: event.intentExpiresAt,
+          approvalWindowMs: event.approvalWindowMs,
+          approvalExpiresAt: event.approvalExpiresAt,
           scriptRunContext: event.scriptRunContext ?? null,
         }
       }));

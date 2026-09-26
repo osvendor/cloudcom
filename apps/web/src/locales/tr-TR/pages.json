@@ -1,5 +1,6 @@
 {
   "titles": {
+    "adminMonitorConversion": "Eski uyarı dönüştürme",
     "notFound": "Sayfa bulunamadı",
     "serverError": "Bir şeyler ters gitti",
     "acceptInvite": "Daveti Kabul Et",
@@ -14,6 +15,7 @@
     "adminConnectedApps": "Bağlı uygulamalar (yönetici)",
     "adminLlmProviderCatalog": "LLM Sağlayıcı Kataloğu",
     "adminQuarantined": "Karantinaya alınmış cihazlar",
+    "adminSystem": "Sistem",
     "adminThirdPartyCatalog": "Üçüncü Taraf Kataloğu",
     "adminTrustAct": "Ortak güven eylemi",
     "adminTrustQueue": "Ortak güven kuyruğu",
@@ -130,8 +132,6 @@
     "settingsAiUsage": "Yapay Zeka Kullanımı",
     "settingsAiScriptAuthoring": "Betik yazımı",
     "settingsToolSources": "Araç Kaynakları",
-    "settingsAlertTemplatesDetail": "Uyarı Şablonu",
-    "settingsAlertTemplates": "Uyarı Şablonları",
     "settingsApiKeys": "API Anahtarları",
     "settingsBilling": "Faturalandırma Ayarları",
     "settingsCatalog": "Ürün Kataloğu",
@@ -236,8 +236,33 @@
       "ticketChecklistTemplates": {
         "title": "Bilet kontrol listesi şablonları",
         "description": "Teknisyenlerinizin herhangi bir bilete uygulayabileceği yeniden kullanılabilir adım listeleri."
+      },
+      "profile": {
+        "title": "Profilim"
+      },
+      "apiKeys": {
+        "title": "API anahtarları"
+      },
+      "partnerServicePrincipals": {
+        "title": "Hizmet asıları"
+      },
+      "alertTemplates": {
+        "title": "Uyarı şablonları"
       }
-    }
+    },
+    "groups": {
+      "account": "Hesap ve erişim",
+      "billing": "Faturalama ve hizmet masası",
+      "devices": "Cihazlar ve kayıt",
+      "data": "Otomasyon ve veri",
+      "ai": "Yapay zeka",
+      "integrations": "Entegrasyonlar"
+    },
+    "search": {
+      "label": "Ayarlarda ara",
+      "placeholder": "Ayarlarda ara…"
+    },
+    "noResults": "Aramanızla eşleşen ayar yok."
   },
   "settingsBillingPage": {
     "heading": "Faturalandırma ayarları",

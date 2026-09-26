@@ -1,5 +1,6 @@
 {
   "titles": {
+    "adminMonitorConversion": "Conversão de alertas legados",
     "notFound": "Página não encontrada",
     "serverError": "Algo deu errado",
     "acceptInvite": "Aceitar convite",
@@ -14,6 +15,7 @@
     "adminConnectedApps": "Aplicativos conectados (admin)",
     "adminLlmProviderCatalog": "Catálogo de provedores de LLM",
     "adminQuarantined": "Dispositivos em quarentena",
+    "adminSystem": "Sistema",
     "adminThirdPartyCatalog": "Catálogo de terceiros",
     "adminTrustAct": "Ação de confiança do parceiro",
     "adminTrustQueue": "Fila de confiança do parceiro",
@@ -130,8 +132,6 @@
     "settingsAiUsage": "Uso de IA",
     "settingsAiScriptAuthoring": "Criação de scripts",
     "settingsToolSources": "Fontes de ferramentas",
-    "settingsAlertTemplatesDetail": "Modelo de alerta",
-    "settingsAlertTemplates": "Modelos de alerta",
     "settingsApiKeys": "Chaves de API",
     "settingsBilling": "Configurações de faturamento",
     "settingsCatalog": "Catálogo de produtos",
@@ -236,8 +236,33 @@
       "ticketChecklistTemplates": {
         "title": "Modelos de checklist de chamados",
         "description": "Listas de etapas reutilizáveis que seus técnicos podem aplicar a qualquer chamado."
+      },
+      "profile": {
+        "title": "Meu perfil"
+      },
+      "apiKeys": {
+        "title": "Chaves de API"
+      },
+      "partnerServicePrincipals": {
+        "title": "Entidades de serviço"
+      },
+      "alertTemplates": {
+        "title": "Modelos de alerta"
       }
-    }
+    },
+    "groups": {
+      "account": "Conta e acesso",
+      "billing": "Faturamento e service desk",
+      "devices": "Dispositivos e inscrição",
+      "data": "Automação e dados",
+      "ai": "IA",
+      "integrations": "Integrações"
+    },
+    "search": {
+      "label": "Pesquisar configurações",
+      "placeholder": "Pesquisar configurações…"
+    },
+    "noResults": "Nenhuma configuração corresponde à sua pesquisa."
   },
   "settingsBillingPage": {
     "heading": "Configurações de faturamento",

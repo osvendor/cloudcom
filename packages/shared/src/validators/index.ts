@@ -41,6 +41,7 @@ export * from './scriptProposals';
 export * from './maintenanceWindow';
 export * from './agentVersionPins';
 export * from './enrollmentDefaults';
+export * from './aiApprovalSettings';
 export * from './softwareDetection';
 export * from './softwareDownloadPolicy';
 export * from './systemCleanup';
@@ -49,6 +50,7 @@ export * from './deviceRoles';
 export * from './deviceFunctions';
 export * from './customFieldImport';
 export * from './alertRuleConditions';
+export * from './complianceInlineSettings';
 
 // ============================================
 // Device Roles
@@ -568,7 +570,7 @@ export const deviceLifecycleInlineSettingsSchema = z
 export type DeviceLifecycleInlineSettings = z.infer<typeof deviceLifecycleInlineSettingsSchema>;
 
 export const addFeatureLinkSchema = z.object({
-  featureType: z.enum(['patch', 'alert_rule', 'backup', 'security', 'monitoring', 'maintenance', 'compliance', 'automation', 'event_log', 'software_policy', 'sensitive_data', 'peripheral_control', 'warranty', 'helper', 'remote_access', 'pam', 'onedrive_helper', 'vulnerability', 'device_lifecycle', 'monitors']),
+  featureType: z.enum(['patch', 'alert_rule', 'backup', 'security', 'monitoring', 'maintenance', 'compliance', 'automation', 'event_log', 'software_policy', 'sensitive_data', 'peripheral_control', 'warranty', 'helper', 'remote_access', 'pam', 'onedrive_helper', 'vulnerability', 'device_lifecycle', 'monitors', 'hardware_monitoring']),
   featurePolicyId: z.string().guid().optional(),
   inlineSettings: configFeatureInlineSettingsSchema.optional(),
 }).refine(
@@ -817,6 +819,8 @@ export const patchInlineSettingsSchema = z.object({
     seen.add(key);
   }
 });
+
+export * from './hardwareHealth';
 
 export const eventLogInlineSettingsSchema = z.object({
   retentionDays: z.number().int().min(7).max(365).default(30),
@@ -1325,3 +1329,6 @@ export * from './callerVerification';
 
 // Business reports (#3198 W02)
 export * from './businessReports';
+
+// Partner company-identity tolerant reader (#6228 W05)
+export * from './companyIdentity';

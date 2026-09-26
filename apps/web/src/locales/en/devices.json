@@ -133,7 +133,8 @@
     "thisOrganizationOnlyHasOneSite": "This organization only has one site. Add more sites from Settings → Organizations to enable moves.",
     "current": "(current)",
     "cancel": "Cancel",
-    "moving": "Moving..."
+    "moving": "Moving...",
+    "toADifferentSite": "to a different site."
   },
   "createGroupModal": {
     "failedToCreateGroup": "Failed to create group",
@@ -334,6 +335,7 @@
     "metricAnomalies": "Metric Anomalies",
     "anomalyDetectionIsDisabledForThis": "Anomaly detection is disabled for this organization.",
     "anomalyDetectionDisabled": "Anomaly detection disabled",
+    "anomalyDetectionDisabledHint": "Turn it on in <orgLink>organization settings</orgLink> → AI.",
     "showingTheLinkedAnomalyAndRecent": "Showing the linked anomaly and recent anomaly history",
     "openSignalsDetectedFromMetricRollups": "Open signals detected from metric rollups",
     "refreshAnomalies": "Refresh anomalies",
@@ -350,7 +352,51 @@
     "confidence": "Confidence",
     "dismiss": "Dismiss",
     "resolve": "Resolve",
-    "promote": "Promote"
+    "promote": "Promote",
+    "filterOpen": "Open",
+    "filterRecentlyClosed": "Recently closed",
+    "filterAll": "All",
+    "showRecentlyClosed": "Show recently closed",
+    "couldNotUpdateEpisode": "Could not update anomaly",
+    "episodeDismissed": "Dismissed for 7 days",
+    "episodeResolved": "Anomaly resolved",
+    "episodePromoted": "Anomaly promoted to alert",
+    "snoozeStopped": "Snoozing stopped",
+    "dismissFor7Days": "Dismiss for 7 days",
+    "promoteToAlert": "Promote to alert",
+    "stopSnoozing": "Stop snoozing",
+    "ongoingSince": "Ongoing since {{when}}",
+    "recurrenceNth": "{{nth}} time in 7 days",
+    "dismissedSnoozedUntil": "Dismissed · snoozed until {{when}}",
+    "detectionsCount": "{{count}} detections",
+    "closeReason": {
+      "cleared": "cleared",
+      "expiredOffline": "expired: device not seen",
+      "expiredNoData": "expired: no data for this metric",
+      "expiredOfflineSince": "expired: device not seen since {{when}}",
+      "detectionOff": "closed: detection turned off",
+      "user": "resolved",
+      "userDismissed": "dismissed",
+      "snoozed": "snoozed"
+    },
+    "processDetailNotAvailable": "Process detail not available for this metric.",
+    "topByAtPeak": "Top by {{dimension}} at peak: {{list}}",
+    "sentence": {
+      "spike": "{{metric}} has been {{range}} for {{duration}}, normally {{baseline}}.",
+      "processMax": "One process reached {{value}}, normally {{baseline}}.",
+      "processSum": "Top processes together used {{value}}, normally {{baseline}}.",
+      "drop": "{{metric}} dropped to {{value}} for {{duration}}, normally {{baseline}}.",
+      "growth": "{{metric}} grew from {{from}} to {{to}} over {{duration}}."
+    },
+    "membersColumns": {
+      "window": "Window",
+      "metric": "Metric",
+      "score": "Score"
+    },
+    "membersTruncated": "Showing the first {{count}} detections.",
+    "failedToLoadDetections": "Failed to load detections",
+    "legacyDetectionNote": "This detection predates episode grouping.",
+    "v1ShadowPerEpisodeNote": "This episode is also being scored by the v1 shadow model for comparison."
   },
   "deviceBillingCard": {
     "title": "Billing",
@@ -800,6 +846,7 @@
     }
   },
   "deviceFilesystemTab": {
+    "deviceIsOfflineScansRequireAConnectedAgent": "Device is offline. Scans require a connected agent.",
     "resultPartial": "Partially completed",
     "resultSkippedLinks": "Skipped links: {{count}}",
     "errorAgentUpdateRequired": "Update the agent to version {{minAgentVersion}} or later to run cleanup.",
@@ -908,7 +955,10 @@
     "historyKindFiles": "File cleanup",
     "historyKindSystem": "System cleanup",
     "historyReclaimed": "{{size}} reclaimed",
-    "historyCandidates": "{{count}} candidates",
+    "historyCandidates_one": "{{count}} candidate",
+    "historyCandidates_other": "{{count}} candidates",
+    "historyActions_one": "{{count}} action",
+    "historyActions_other": "{{count}} actions",
     "status": {
       "previewed": "Previewed",
       "running": "Running",
@@ -1046,6 +1096,7 @@
     "linkSpeed": "Link Speed"
   },
   "deviceInfoTab": {
+    "updateOfferWithheld": "Update offers are withheld from this device (since {{since}}): its agent build cannot be confirmed to accept the edition this server serves, so it stays on its current version. Recover it with an installer of the served edition or an agent release that reports its edition.",
     "gpu": "GPU",
     "text": "—",
     "failedToFetchDeviceDetails": "Failed to fetch device details",
@@ -1120,6 +1171,7 @@
     "agent": "Agent",
     "agentVersion": "Agent Version",
     "watchdogVersion": "Watchdog Version",
+    "helperVersion": "Helper Version",
     "status": "Status",
     "lastSeen": "Last Seen",
     "enrolled": "Enrolled",
@@ -1327,6 +1379,7 @@
     "moveUp": "Move up",
     "moveDown": "Move down",
     "hidden": "Hidden",
+    "customFields": "Custom Fields",
     "resetToDefaults": "Reset to defaults",
     "selected": "selected",
     "bulkActions": "Bulk Actions",
@@ -1384,6 +1437,8 @@
       "unifi": "UniFi",
       "manual": "Manual"
     },
+    "updateWithheld": "Updates withheld",
+    "updateWithheldTooltip": "The server is not offering updates to this device because its agent build cannot be confirmed to accept the served edition. It stays on its current version until recovered.",
     "agentVersionRelation": {
       "equalTooltip": "Matches the effective version {{version}}",
       "aheadTooltip": "Ahead of pin {{version}}",
@@ -2564,7 +2619,12 @@
         "checkCreated": "Network check added",
         "checkCreateFailed": "Couldn't add the network check",
         "checkRemoved": "Network check removed",
-        "checkRemoveFailed": "Couldn't remove the network check"
+        "checkRemoveFailed": "Couldn't remove the network check",
+        "siteChanged": "Moved to {{site}}.",
+        "siteChangeFailed": "Couldn't move the asset to the new site",
+        "siteChangedUnlinked": "The link to its agent device was removed because that device is in a different site.",
+        "siteChangedPolicies_one": "{{count}} topology monitoring policy was disabled.",
+        "siteChangedPolicies_other": "{{count}} topology monitoring policies were disabled."
       },
       "title": "{{name}} settings",
       "subtitle": "Manage each section independently.",
@@ -2594,7 +2654,9 @@
           "networkGear": "Network gear",
           "peripherals": "Peripherals",
           "other": "Other"
-        }
+        },
+        "site": "Site",
+        "changeSite": "Change site…"
       },
       "monitoring": {
         "description": "Configure SNMP collection and network checks.",
@@ -3357,5 +3419,57 @@
       "created": "Network asset created",
       "createFailed": "Failed to create network asset"
     }
+  },
+  "hardwareHealth": {
+    "title": "Storage & RAID",
+    "hardware": "Hardware",
+    "ok": "Healthy",
+    "warning": "Warning",
+    "critical": "Critical",
+    "unknown": "Unknown",
+    "loading": "Loading hardware health…",
+    "error": "Unable to load hardware health.",
+    "retry": "Retry",
+    "noReport": "No hardware health report received yet.",
+    "noTools": "No RAID or disk-health tooling detected — probed: {{sources}}",
+    "disabled": "Hardware monitoring is disabled by policy {{policy}}",
+    "collected": "Collected {{time}}",
+    "notSeen": "Not seen since {{time}}",
+    "predictive": "Predictive failure",
+    "virtualDisks": "Virtual disks",
+    "physicalDisks": "Physical disks",
+    "osDisks": "OS-visible disks",
+    "backed": "Backed by RAID virtual disk",
+    "enclosures": "Enclosures: {{total}}",
+    "identity": "Model / serial / firmware",
+    "diskIdentity": "Slot / model / serial / media / interface",
+    "size": "Size",
+    "state": "State",
+    "telemetry": "Temperature / media errors / other errors / power-on hours",
+    "progress": "{{name}} progress",
+    "sources": "Sources",
+    "unavailable": "Not installed",
+    "failed": "Failing: {{error}}",
+    "backingOff": "Backing off until {{time}}",
+    "superseded": "Superseded by {{winner}}",
+    "sourceSuperseded": "Superseded",
+    "sourceDisabled": "Disabled",
+    "partial": "Partial report",
+    "docs": "Installation guidance",
+    "events": "Hardware events",
+    "noEvents": "No hardware events recorded.",
+    "noComponents": "No storage components reported. Check source status below.",
+    "all": "All hardware health",
+    "managementController": "Management controller",
+    "bmcVendor": "Vendor",
+    "bmcFirmware": "Firmware",
+    "bmcIp": "IP address",
+    "bmcMac": "MAC address",
+    "bmcOtherSite": "Management controller found in site {{site}}",
+    "bmcObserved": "Last reported {{time}}; collected daily.",
+    "bmcHost": "Management controller for {{name}}",
+    "bmcAgentReport": "— reported by host agent",
+    "bmcAssociation": "This management controller is associated with its host and remains a separate network device.",
+    "bmcConfirmUnlink": "Remove the management-controller association? Auto-linking stays off for this asset until you link it again."
   }
 }

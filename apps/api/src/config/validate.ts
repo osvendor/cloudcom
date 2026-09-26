@@ -1,4 +1,5 @@
 import { isIP } from 'net';
+import { parseUnattendedPrincipals } from '../services/mcpUnattendedPrincipals';
 import { z } from 'zod';
 import { validateM365CustomerGraphReadRuntimeConfigAtBoot } from '../services/m365ControlPlane/runtimeConfig';
 import { validateM365CustomerGraphActionsRuntimeConfigAtBoot } from '../services/m365ControlPlane/writeActionRuntimeConfig';
@@ -668,6 +669,7 @@ const envObjectSchema = z
     // at runtime by aiWorkspaceEnabled() in env.ts. Validated here for boolean
     // format only — the production coupling rule is in the superRefine below.
     BREEZE_AI_WORKSPACE_ENABLED: z.string().optional(),
+    BREEZE_AI_ARTIFACT_CAPTURE_ENABLED: z.string().optional(),
     // 'vercel' | 'fake'. Resolved at runtime by resolveSandboxBackendName()
     // (services/workspace/sandboxBackend.ts), which refuses an unset value in
     // production; the superRefine below additionally refuses 'fake' there.
@@ -792,6 +794,10 @@ const envObjectSchema = z
     // matching superRefine block below for the exact pairing. None of these
     // are required at boot in development/test.
     //
+    // MCP unattended Tier 3 opt-in (routes/mcpServer.ts). Comma-separated
+    // `api_key:<id>` / `oauth_client_user:<client_id>/<user id>` entries;
+    // collectWarnings() logs the configured principals and malformed entries.
+    MCP_UNATTENDED_TIER3_PRINCIPALS: z.string().optional(),
     // OAuth (MCP) — required when MCP_OAUTH_ENABLED=true:
     MCP_OAUTH_ENABLED: z.string().optional(),
     OAUTH_JWKS_PRIVATE_JWK: z.string().optional(),
@@ -2149,6 +2155,32 @@ const envSchema = envObjectSchema
       }
     }
 
+    // BREEZE_AI_ARTIFACT_CAPTURE_ENABLED (#6732): large-tool-result capture
+    // independent of the workspace lane. Typo must fail at boot (reads as off
+    // otherwise), and `true` needs a reachable blob store on ANY deployment —
+    // otherwise every oversized tool result becomes artifact_store_unavailable.
+    const captureRaw = (data.BREEZE_AI_ARTIFACT_CAPTURE_ENABLED ?? '').trim().toLowerCase();
+    if (captureRaw && !boolValues.has(captureRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['BREEZE_AI_ARTIFACT_CAPTURE_ENABLED'],
+        message: 'BREEZE_AI_ARTIFACT_CAPTURE_ENABLED must be a boolean (true/false, 1/0, yes/no, on/off) when set. Defaults to false (large tool results are truncated, not stored).',
+      });
+    }
+    if (['true', '1', 'yes', 'on'].includes(captureRaw) && !(workspaceOn && hostedOn)) {
+      const capRegion = regionRaw === 'eu' ? 'EU' : 'US';
+      const capBucket = (data[`ARTIFACT_S3_BUCKET_${capRegion}` as 'ARTIFACT_S3_BUCKET_EU' | 'ARTIFACT_S3_BUCKET_US'] ?? '').trim() || (data.S3_BUCKET ?? '').trim();
+      const capAccess = (data.ARTIFACT_S3_ACCESS_KEY ?? '').trim() || (data.S3_ACCESS_KEY ?? '').trim();
+      const capSecret = (data.ARTIFACT_S3_SECRET_KEY ?? '').trim() || (data.S3_SECRET_KEY ?? '').trim();
+      if (!capBucket || !capAccess || !capSecret) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['BREEZE_AI_ARTIFACT_CAPTURE_ENABLED'],
+          message: `BREEZE_AI_ARTIFACT_CAPTURE_ENABLED=true requires an artifact blob store: set ARTIFACT_S3_BUCKET_${capRegion} (or S3_BUCKET) plus ARTIFACT_S3_ACCESS_KEY/ARTIFACT_S3_SECRET_KEY (or S3_ACCESS_KEY/S3_SECRET_KEY).`,
+        });
+      }
+    }
+
     // BREEZE_AI_SCRIPT_AUTHORING_ENABLED (AI script authoring W01b). Same
     // treatment: a typo must be caught at boot rather than silently reading as
     // off. Mirrors aiScriptAuthoringEnabled() in env.ts.
@@ -2441,6 +2473,26 @@ function collectWarnings(env: Record<string, string | undefined>): ConfigWarning
   const warnings: ConfigWarning[] = [];
   const nodeEnv = env.NODE_ENV ?? 'development';
   const isProduction = nodeEnv === 'production';
+
+  // MCP_UNATTENDED_TIER3_PRINCIPALS lifts interactive approval for the named
+  // principals, so a deploy that sets it must say so at boot, and an entry
+  // that can never match (a typo) must not look like a working allowlist.
+  const { principals: unattendedPrincipals, malformed } = parseUnattendedPrincipals(env.MCP_UNATTENDED_TIER3_PRINCIPALS);
+  {
+    const wellFormed = [...unattendedPrincipals];
+    if (wellFormed.length > 0) {
+      warnings.push({
+        key: 'MCP_UNATTENDED_TIER3_PRINCIPALS',
+        message: `MCP interactive approval is LIFTED for Tier 3 tools for ${wellFormed.length} principal(s): ${wellFormed.join(', ')}. Tier 4, tenant and bootstrap tools stay approval-only.`,
+      });
+    }
+    if (malformed.length > 0) {
+      warnings.push({
+        key: 'MCP_UNATTENDED_TIER3_PRINCIPALS',
+        message: `ignoring ${malformed.length} malformed entr${malformed.length === 1 ? 'y' : 'ies'} that can never match: ${malformed.join(', ')}. Each entry must be api_key:<api key id> or oauth_client_user:<client_id>/<user id>.`,
+      });
+    }
+  }
 
   // Production: FORCE_HTTPS should be true
   if (isProduction) {

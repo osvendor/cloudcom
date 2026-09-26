@@ -30,6 +30,7 @@ export const COLUMN_IDS = [
   'lastSeen',
   'agentVersion',
   'watchdogVersion',
+  'helperVersion',
   'serverUrl',
   'wanIp',
   'lanIp',
@@ -39,6 +40,7 @@ export const COLUMN_IDS = [
   'enrolled',
   'desktopAccess',
   'reliability',
+  'hardwareHealth',
   'vpn',
   // Manual-asset inventory fields (#4622 W04). `serial` is opt-in for agent
   // rows too (via device_hardware); `assetTag`/`location` are manual-only.
@@ -77,6 +79,7 @@ export const COLUMN_LABELS: Record<ColumnId, string> = {
   lastSeen: 'Last Seen',
   agentVersion: 'Agent Version',
   watchdogVersion: 'Watchdog Version',
+  helperVersion: 'Helper Version',
   serverUrl: 'Server',
   wanIp: 'WAN IP',
   lanIp: 'LAN IP',
@@ -86,6 +89,7 @@ export const COLUMN_LABELS: Record<ColumnId, string> = {
   enrolled: 'Enrolled',
   desktopAccess: 'Desktop Access',
   reliability: 'Reliability',
+  hardwareHealth: 'Hardware',
   vpn: 'VPN',
   serial: 'Serial',
   assetTag: 'Asset Tag',

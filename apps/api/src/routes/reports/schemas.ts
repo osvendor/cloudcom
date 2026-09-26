@@ -162,7 +162,12 @@ export const listReportsSchema = z.object({
   limit: z.string().optional(),
   orgId: z.string().guid().optional(),
   type: reportTypeSchema.optional(),
-  schedule: z.enum(['one_time', 'daily', 'weekly', 'monthly']).optional()
+  schedule: z.enum(['one_time', 'daily', 'weekly', 'monthly']).optional(),
+  // #3198 W03: `GET /reports` owner filter — 'partner' lists only
+  // partner-owned (all-organizations) reports, 'organization' only org-owned
+  // ones. It narrows the caller's listing; it never widens it (also applied
+  // by `GET /reports/templates`, which is org-owned only already).
+  ownerScope: z.enum(['organization', 'partner']).optional()
 });
 
 const createReportFields = {
@@ -246,6 +251,10 @@ export const generateReportSchema = z
 export const listRunsSchema = z.object({
   page: z.string().optional(),
   limit: z.string().optional(),
+  // #6771: a single-org run listing. The only way to list the runs of an
+  // out-of-service org the caller may read report history of; for an org
+  // token it must name the token's own org.
+  orgId: z.string().guid().optional(),
   reportId: z.string().guid().optional(),
   status: z.enum(['pending', 'running', 'completed', 'failed']).optional()
 });

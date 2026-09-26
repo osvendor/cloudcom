@@ -158,6 +158,7 @@ export const TOOL_CAPABILITY: Readonly<Record<string, AgentCapabilityId>> = {
 
   // ---- tickets ----
   manage_tickets: 'tickets',
+  manage_ticket_checklist: 'tickets',
   list_time_entries: 'tickets',
   get_running_timer: 'tickets',
   get_timesheet: 'tickets',
@@ -297,6 +298,7 @@ export const TOOL_CAPABILITY: Readonly<Record<string, AgentCapabilityId>> = {
   query_custom_fields: 'automations_reports',
   query_devices: 'automations_reports',
   get_device_details: 'automations_reports',
+  get_device_hardware_health: 'automations_reports',
   get_device_context: 'automations_reports',
   set_device_context: 'automations_reports',
   resolve_device_context: 'automations_reports',
@@ -366,6 +368,8 @@ export const TOOL_CAPABILITY: Readonly<Record<string, AgentCapabilityId>> = {
 
   // ---- workspace ----
   export_dataset: 'workspace',
+  // A-W05 (D13a): reads a stored tool-result artifact back.
+  read_artifact: 'workspace',
   // ---- workspace (execution plane W04) ----
   workspace_stage: 'workspace',
   workspace_run: 'workspace',

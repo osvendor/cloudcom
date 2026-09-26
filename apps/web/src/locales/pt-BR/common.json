@@ -67,6 +67,7 @@
     "fleetDesign": "Design de frota",
     "customFields": "Campos Personalizados",
     "savedFilters": "Filtros Salvos",
+    "moreSettings": "Mais configurações",
     "users": "Usuários",
     "roles": "Funções",
     "sso": "SSO",
@@ -98,7 +99,9 @@
     "serviceManagement": "Gestão de serviços",
     "ticketing": "Tickets",
     "deliverableTemplates": "Modelos de entregáveis",
-    "securityScans": "Varreduras de IOC"
+    "securityScans": "Varreduras de IOC",
+    "system": "Sistema",
+    "monitorConversion": "Conversão de monitores"
   },
   "documentTitles": {
     "dashboard": "Painel",
@@ -218,7 +221,7 @@
     "mcp": {
       "connecting": "Conectando um agente de IA?",
       "title": "Direcione seu agente de IA para cá",
-      "description": "Cole esta URL no seu cliente MCP (Claude.ai, ChatGPT, Cursor, …). Você voltará aqui para autorizar a conexão via OAuth."
+      "description": "Cole esta URL no seu cliente MCP (Claude.ai, ChatGPT, Cursor, …). Você voltará aqui para autorizar a conexão via OAuth. Prefere usar uma chave de API? Envie um cabeçalho X-API-Key com o escopo ai:read/ai:write."
     },
     "progress": {
       "count": "{{current}} de {{total}}",
@@ -1470,6 +1473,12 @@
           "editTitle": "Editar webhook"
         },
         "subtitle": "Entregue eventos a sistemas externos.",
+        "success": {
+          "created": "Webhook criado",
+          "disabled": "Webhook desativado",
+          "enabled": "Webhook ativado",
+          "updated": "Webhook atualizado"
+        },
         "title": "Webhooks"
       }
     },
@@ -2445,7 +2454,7 @@
         },
         "title": "Correções Sugeridas",
         "refresh": "Atualizar correções sugeridas",
-        "disabledTitle": "Correções sugeridas estão desativadas para esta organização",
+        "disabledTitle": "As correções sugeridas estão desativadas para esta organização. Ative-as em Configurações → Parceiro → Recursos de IA, ou para uma única organização na aba de IA dela.",
         "suggestionsDisabled": "Sugestões desativadas",
         "generate": "Gerar",
         "empty": "Ainda não há correções sugeridas.",

@@ -2,7 +2,9 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { CheckCircle2, Database, HardDrive, ShieldAlert } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useHashState } from '@/lib/useHashState';
+import { useOrgScope } from '@/hooks/useOrgScope';
 import { fetchWithAuth } from '../../stores/auth';
+import BackupHealthOverview from './BackupHealthOverview';
 import BackupOverviewContent from './BackupOverviewContent';
 import BackupVerificationOverview from './BackupVerificationOverview';
 import {
@@ -17,6 +19,7 @@ import {
   parseUsageHistory,
   statIconMap
 } from './backupDashboardHelpers';
+import { parseRestoreHash, type RestoreHashParams } from './restoreHash';
 import { useTranslation } from 'react-i18next';
 import { OrgRequiredGate } from '../shared/OrgRequiredGate';
 import '../../lib/i18n';
@@ -55,6 +58,13 @@ function isValidTab(hash: string): hash is BackupTab {
   return ALL_TABS.includes(hash as BackupTab);
 }
 
+// The restore tab's hash can carry a `?snapshot=…&paths=…` query (#6456), so
+// the tab match has to look only at the segment before it.
+function tabFromHash(hash: string): BackupTab | undefined {
+  const base = hash.split('?')[0];
+  return isValidTab(base) ? base : undefined;
+}
+
 function TabFallback() {
   const { t } = useTranslation('backup');
   return (
@@ -69,8 +79,13 @@ function TabFallback() {
 
 function BackupDashboardInner() {
   const { t } = useTranslation('backup');
+  const orgScope = useOrgScope();
   // SSR-safe hash tab (#2421): starts at the default, adopts the hash post-mount.
-  const [activeTab, setActiveTab] = useHashState<BackupTab>('overview', (h) => (isValidTab(h) ? h : undefined));
+  const [activeTab, setActiveTab] = useHashState<BackupTab>('overview', tabFromHash);
+  const [restoreHashParams] = useHashState<RestoreHashParams | null>(
+    null,
+    (h) => parseRestoreHash(h)
+  );
   const [stats, setStats] = useState<BackupStat[]>([]);
   const [recentJobs, setRecentJobs] = useState<BackupJob[]>([]);
   const [overdueDevices, setOverdueDevices] = useState<OverdueDevice[]>([]);
@@ -416,6 +431,7 @@ function BackupDashboardInner() {
           resolveJobStatus={resolveJobStatus}
           resolveProviderPercent={resolveProviderPercent}
           fetchOverview={fetchOverview}
+          healthOrgId={orgScope.scope === 'org' ? orgScope.orgId : null}
         />
       )}
 
@@ -429,7 +445,10 @@ function BackupDashboardInner() {
 
       {activeTab === 'restore' && (
         <Suspense fallback={<TabFallback />}>
-          <RestoreWizard />
+          <RestoreWizard
+            initialSnapshotId={restoreHashParams?.snapshotId}
+            initialSelectedPaths={restoreHashParams?.paths}
+          />
         </Suspense>
       )}
 
@@ -497,6 +516,18 @@ function BackupDashboardInner() {
 // the gate resolves loading/error/empty/fleet before the data component — with
 // all its fetch effects — ever mounts without an org.
 export default function BackupDashboard() {
+  const scope = useOrgScope();
+  // The org gate renders OrgRequiredState for scope 'all' (OrgRequiredGate.tsx:40),
+  // which would hide the very view all-organizations mode exists to show. The
+  // fleet view needs no org — and /backup/dashboard and /backup/usage-history
+  // both 400 without one — so it is resolved before the gate.
+  if (scope.status === 'resolved' && scope.scope === 'all') {
+    return (
+      <div className="space-y-6">
+        <BackupHealthOverview orgId={null} />
+      </div>
+    );
+  }
   return (
     <OrgRequiredGate>
       <BackupDashboardInner />

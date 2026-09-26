@@ -18,6 +18,7 @@
  * - registry_operations (Tier 1): Read or modify Windows registry keys/values
  */
 
+import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import {
   devices,
@@ -26,6 +27,7 @@ import {
   scriptVersions,
   scriptTemplates,
   scriptExecutions,
+  executionStatusEnum,
 } from '../db/schema';
 import { eq, and, desc, sql, ilike, inArray, isNull, or, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
@@ -42,6 +44,14 @@ import { loadTenantVariableScope } from './tenantVariableResolution';
 import { captureException } from './sentry';
 import { scriptNeedsVariableScope } from './sourcedParameters';
 import { deviceScopeCondition, siteScopeCondition } from './aiToolsSiteScope';
+import { shrinkToJsonBudget } from './aiToolOutput';
+import { sha256Content } from './scriptVersions';
+
+// Fix 4b: headroom under MAX_TOOL_RESULT_CHARS (8000) for the rest of the
+// get_script_execution envelope once stdout/stderr are counted at their
+// JSON-escaped cost, not their raw char count.
+const STDOUT_JSON_BUDGET_CHARS = 6_000;
+const STDERR_JSON_BUDGET_CHARS = 2_000;
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -107,6 +117,17 @@ async function verifyDeviceAccess(
       error: `Device ${device.hostname} is not online (status: ${device.status}). This tool needs a live connection; to run when the device reconnects use the Run Script / deployment tools instead.`,
     };
   return { device };
+}
+
+/**
+ * A partner-wide script (org_id NULL) owned by the caller's own partner: the
+ * same predicate as the scripts table's partner-wide SELECT branch, so the
+ * read tools show exactly the partner-wide rows run_script can execute and
+ * never another partner's. `breeze_current_partner_id()` is the session's own
+ * partner (empty, so no match, for a context without one).
+ */
+function ownPartnerWideScript(): SQL {
+  return and(isNull(scripts.orgId), sql`${scripts.partnerId} = public.breeze_current_partner_id()`)!;
 }
 
 /**
@@ -370,6 +391,14 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
 
   if (!script || !script.content) {
     return JSON.stringify({ error: 'Script not found or has no content' });
+  }
+
+  // Optional content pin. Hashed from THIS row, the one whose content is
+  // dispatched below, so a library edit between the caller's
+  // get_script_details and this call can never run unverified code.
+  if (typeof input.expectedContentSha256 === 'string'
+    && sha256Content(script.content) !== input.expectedContentSha256) {
+    return JSON.stringify({ error: 'script_content_mismatch' });
   }
 
   // This guard is NOT here because the intent-release worker runs under a
@@ -677,6 +706,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
           proposalId: { type: 'string', description: 'UUID of a reviewed AI-authored proposal to run. Mutually exclusive with scriptId; takes no parameters.' },
           deviceIds: { type: 'array', items: { type: 'string' }, description: 'Device UUIDs to run on' },
           parameters: { type: 'object', description: 'Script parameters (library scripts only)' },
+          expectedContentSha256: { type: 'string', description: 'Optional: contentSha256 from get_script_details. If the script changed, nothing runs and it returns error script_content_mismatch.' },
           // #4888 — see services/scriptRunRequest.ts. Shared with the three
           // other declarations of this tool's input shape so the model can
           // express a run context on every surface, not just some of them.
@@ -860,7 +890,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
           },
           limit: {
             type: 'number',
-            description: 'Maximum number of processes to return (default: 50, max: 200)'
+            description: 'Max processes to return (default 50, max 200)'
           }
         },
         required: ['action', 'deviceId']
@@ -918,14 +948,18 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
           category: { type: 'string', description: 'Filter by script category' },
           language: { type: 'string', enum: ['powershell', 'bash', 'python', 'cmd'], description: 'Filter by script language' },
           osType: { type: 'string', enum: ['windows', 'macos', 'linux'], description: 'Filter by OS type (scripts targeting this OS)' },
-          limit: { type: 'number', description: 'Max results to return (default 20, max 50)' },
+          ...pageParamSchema(15, 50),
         },
       },
     },
     handler: async (input, auth) => {
+      const page = readPageArgs('list_scripts', input, { defaultLimit: 15, maxLimit: 50 });
+      if (!page.ok) return JSON.stringify({ error: page.error, code: page.code });
+      const { limit, offset, fingerprint } = page;
+
       const conditions: SQL[] = [isNull(scripts.deletedAt)];
       const orgCondition = auth.orgCondition(scripts.orgId);
-      if (orgCondition) conditions.push(orgCondition);
+      if (orgCondition) conditions.push(or(orgCondition, ownPartnerWideScript())!);
 
       if (input.search) {
         const searchPattern = '%' + escapeLike(input.search as string) + '%';
@@ -934,8 +968,6 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       if (input.category) conditions.push(eq(scripts.category, input.category as string));
       if (input.language) conditions.push(eq(scripts.language, input.language as typeof scripts.language.enumValues[number]));
       if (input.osType) conditions.push(sql`${scripts.osTypes} @> ARRAY[${input.osType}]::text[]`);
-
-      const limit = Math.min(Math.max(1, Number(input.limit) || 20), 50);
 
       const results = await db
         .select({
@@ -949,10 +981,12 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
         })
         .from(scripts)
         .where(conditions.length > 0 ? and(...conditions) : undefined)
-        .orderBy(desc(scripts.updatedAt))
-        .limit(limit);
+        .orderBy(desc(scripts.updatedAt), desc(scripts.id))
+        .limit(limit + 1)
+        .offset(offset);
 
-      return JSON.stringify({ scripts: results, count: results.length });
+      const envelope = pageEnvelope({ key: 'scripts', items: results, limit, offset, fingerprint });
+      return JSON.stringify({ ...envelope, count: envelope.showing });
     },
   });
 
@@ -987,7 +1021,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       // Query script with org scoping
       const conditions: SQL[] = [eq(scripts.id, scriptId), isNull(scripts.deletedAt)];
       const orgCond = auth.orgCondition(scripts.orgId);
-      if (orgCond) conditions.push(orgCond);
+      if (orgCond) conditions.push(or(orgCond, ownPartnerWideScript())!);
 
       const [script] = await db
         .select()
@@ -998,6 +1032,12 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       if (!script) {
         return JSON.stringify({ error: 'Script not found or access denied' });
       }
+
+      const [headDigest] = await db
+        .select({ contentDigest: scriptVersions.contentDigest })
+        .from(scriptVersions)
+        .where(and(eq(scriptVersions.scriptId, script.id), eq(scriptVersions.version, script.version)))
+        .limit(1);
 
       const result: Record<string, unknown> = {
         id: script.id,
@@ -1011,6 +1051,11 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
         runAs: script.runAs,
         isSystem: script.isSystem,
         version: script.version,
+        // Digest of the head version's content (sha256 of NFC, CRLF->LF text;
+        // scriptVersions.sha256Content). Content itself is omitted over MCP, so
+        // this is how a caller pins exactly what run_script will execute. Null
+        // only for a legacy script with no version row.
+        contentSha256: headDigest?.contentDigest ?? null,
         createdBy: script.createdBy,
         createdAt: script.createdAt,
         updatedAt: script.updatedAt,
@@ -1060,12 +1105,10 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
         const [stats] = await db
           .select({
             totalExecutions: sql<number>`count(*)::int`,
-            completedCount: sql<number>`count(*) filter (where ${scriptExecutions.status} = 'completed')::int`,
-            failedCount: sql<number>`count(*) filter (where ${scriptExecutions.status} = 'failed')::int`,
-            pendingCount: sql<number>`count(*) filter (where ${scriptExecutions.status} = 'pending')::int`,
-            runningCount: sql<number>`count(*) filter (where ${scriptExecutions.status} = 'running')::int`,
-            timeoutCount: sql<number>`count(*) filter (where ${scriptExecutions.status} = 'timeout')::int`,
-            cancelledCount: sql<number>`count(*) filter (where ${scriptExecutions.status} = 'cancelled')::int`,
+            // One bucket per execution_status value, derived from the enum so a
+            // status added later is counted too (#5322: queued and cancelling
+            // runs were in totalExecutions but in no bucket).
+            ...executionStatusCountColumns(),
             avgDurationSeconds: sql<number>`avg(extract(epoch from (${scriptExecutions.completedAt} - ${scriptExecutions.startedAt})))::numeric(10,2)`,
           })
           .from(scriptExecutions)
@@ -1228,6 +1271,9 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
         type: 'object' as const,
         properties: {
           executionId: { type: 'string', description: 'UUID of the script execution to fetch' },
+          stdoutOffset: { type: 'number', description: 'Character offset into stdout (default 0)' },
+          stdoutMaxChars: { type: 'number', description: 'Max stdout chars to return (default 5000, max 5000)' },
+          stderrMaxChars: { type: 'number', description: 'Max stderr chars to return (default 1500, max 8000)' },
         },
         required: ['executionId'],
       },
@@ -1241,6 +1287,19 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       // the device-move restamp already maintain and which is NOT NULL for
       // every execution regardless of source.
       const orgCond = auth.orgCondition(scriptExecutions.orgId);
+
+      // A-W05 (5c): stdout/stderr are windowed at the SQL layer so a
+      // megabyte-scale execution log never has to round-trip through Node
+      // before being cut down to size.
+      const stdoutOffset = Math.max(0, Math.trunc(Number(input.stdoutOffset)) || 0);
+      // A-W05 (5c follow-up): the plan's 6000/2000 defaults measured 8 656
+      // raw chars once metadata/JSON overhead was included — over the 8 000
+      // budget. 5000/1500 measured 7 132; lowered accordingly.
+      // Fix 4b: lowered from 16000 to 5000 — the raw-char cap alone doesn't
+      // bound the JSON-escaped cost (control chars/backslashes), so it's
+      // shrunk further below by escaped length before it goes out.
+      const stdoutMax = Math.min(Math.max(1, Math.trunc(Number(input.stdoutMaxChars)) || 5000), 5000);
+      const stderrMax = Math.min(Math.max(1, Math.trunc(Number(input.stderrMaxChars)) || 1500), 8000);
 
       const [execution] = await db
         .select({
@@ -1260,8 +1319,10 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
           deviceSiteId: devices.siteId,
           status: scriptExecutions.status,
           exitCode: scriptExecutions.exitCode,
-          stdout: scriptExecutions.stdout,
-          stderr: scriptExecutions.stderr,
+          stdout: sql<string>`substr(coalesce(${scriptExecutions.stdout}, ''), ${stdoutOffset + 1}, ${stdoutMax})`,
+          stdoutChars: sql<number>`length(coalesce(${scriptExecutions.stdout}, ''))`,
+          stderr: sql<string>`left(coalesce(${scriptExecutions.stderr}, ''), ${stderrMax})`,
+          stderrChars: sql<number>`length(coalesce(${scriptExecutions.stderr}, ''))`,
           errorMessage: scriptExecutions.errorMessage,
           startedAt: scriptExecutions.startedAt,
           completedAt: scriptExecutions.completedAt,
@@ -1285,8 +1346,43 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
         return JSON.stringify({ error: 'Execution not found' });
       }
 
-      const { deviceSiteId: _siteId, ...result } = execution;
-      return JSON.stringify({ execution: shapeExecutionRow(result) });
+      const { deviceSiteId: _siteId, stdoutChars: stdoutCharsRaw, stderrChars: stderrCharsRaw, ...result } = execution;
+      const stdoutChars = Number(stdoutCharsRaw);
+      const stderrChars = Number(stderrCharsRaw);
+      // Fix 4b: a raw-char cap alone doesn't bound the JSON-escaped cost
+      // (control chars/backslashes can cost up to 6x their raw count once
+      // escaped), which can blow the overall compaction budget and get the
+      // whole result replaced by a digest — losing stdout the caller was
+      // told via stdoutNextOffset it could read. Shrink by escaped length,
+      // in whole code points, before computing the offset fields below.
+      const stdout = shrinkToJsonBudget(result.stdout, STDOUT_JSON_BUDGET_CHARS);
+      const stderr = shrinkToJsonBudget(result.stderr, STDERR_JSON_BUDGET_CHARS);
+      // Fix 5: `stdout`/`stderr` were windowed at the SQL layer with Postgres
+      // `substr`/`length`, which count CHARACTERS (Unicode code points) —
+      // never JS's UTF-16 `.length`, which counts 2 for an astral character
+      // like an emoji. Mixing the two units here would compute a
+      // stdoutNextOffset that lands mid-character on the next SQL substr.
+      const stdoutCodePoints = Array.from(stdout).length;
+      const stderrCodePoints = Array.from(stderr).length;
+      return JSON.stringify({
+        execution: shapeExecutionRow({
+          ...result,
+          stdout,
+          stderr,
+          stdoutChars,
+          stdoutOffset,
+          // `stdoutNextOffset` is the sibling key `compactToolResultForChat`
+          // (A-W05 Q3) keys off of to recognise this as a deliberately-sized
+          // window and never re-cut it during generic compaction.
+          stdoutNextOffset: stdoutOffset + stdoutCodePoints,
+          stdoutHasMore: stdoutOffset + stdoutCodePoints < stdoutChars,
+          stderrChars,
+          // stderr has no offset param (always read from 0); stderrNextOffset
+          // exists purely so the compactor's structural check protects it too.
+          stderrNextOffset: stderrCodePoints,
+          stderrTruncated: stderrCodePoints < stderrChars,
+        }),
+      });
     },
   });
 
@@ -1585,3 +1681,13 @@ function shapeExecutionRow(row: {
 // Extended by Task 21 (runScriptHandler) — keep as a plain object literal
 // rather than reassigning it, so later work can merge into the same export.
 export const __testOnly = { shapeExecutionRow, runScriptHandler };
+
+/** `<status>Count` for every execution_status value, e.g. `queuedCount`. */
+function executionStatusCountColumns(): Record<string, SQL<number>> {
+  return Object.fromEntries(
+    executionStatusEnum.enumValues.map((status) => [
+      `${status}Count`,
+      sql<number>`count(*) filter (where ${scriptExecutions.status} = ${status})::int`,
+    ]),
+  );
+}

@@ -35,10 +35,13 @@ import {
   partnerWideListTarget,
   systemPartnerWideListArm,
   PORTAL_SELF_SERVICE_REPORT,
+  REPORT_TENANT_INACTIVE,
   reportDefinitionMetadataProjection,
   reportOwnerCondition,
   reportOwnerOfRow,
   reportOwnerScopePredicate,
+  reportOwnerScopeListFilter,
+  resolveOrgReportAuthority,
   resolveReportOwnerAuthority,
   tenantAuthorizedReportCondition,
 } from './helpers';
@@ -146,7 +149,11 @@ async function resolveDefinitionListScope(
   }
 
   if (exactOrgId) {
-    const result = await resolveRequestReportAuthority(auth, exactOrgId, 'read');
+    // #6699 decision B: listing definitions is read-only history. #6771: an
+    // explicit orgId is also the ONLY way a partner lists an out-of-service
+    // org's definitions (the unfiltered listing below stays active-only);
+    // resolveOrgReportAuthority serves it from the verified history reach.
+    const result = await resolveOrgReportAuthority(auth, exactOrgId, 'read_history');
     const scope = liveScopeOf(result);
     if (!scope) {
       return { ok: false, error: 'Access to this organization denied' };
@@ -169,7 +176,7 @@ async function resolveDefinitionListScope(
     const authorityMap = await resolveRequestReportAuthorityMap(
       auth,
       orgIds,
-      'read',
+      'read_history',
     );
     const scopes: LiveSiteScopeV1[] = [];
     for (const result of authorityMap.values()) {
@@ -335,6 +342,14 @@ coreRoutes.get(
     const auth = c.get('auth');
     const query = c.req.valid('query');
     const { page, limit, offset } = getPagination(query);
+    // #3198 W03: `?ownerScope=partner` from a caller who may not see
+    // partner-owned rows (an org token, a 'selected' partner user) is an empty
+    // page — answered here, without a query. The SQL filter below would reach
+    // the same answer through the tenant predicate; this keeps the refusal
+    // independent of it.
+    if (query.ownerScope === 'partner' && auth.scope !== 'system' && !partnerWideListTarget(auth)) {
+      return c.json({ data: [], pagination: { page, limit, total: 0 } });
+    }
     const scopeResult = await resolveDefinitionListScope(auth, query.orgId, {
       includePartnerOwned: true,
     }, c.get('permissions') as UserPermissions | undefined);
@@ -355,6 +370,11 @@ coreRoutes.get(
 
     if (query.schedule) {
       conditions.push(eq(reports.schedule, query.schedule));
+    }
+
+    // #3198 W03: owner-axis filter. Narrowing only — see the helper.
+    if (query.ownerScope) {
+      conditions.push(reportOwnerScopeListFilter(query.ownerScope));
     }
 
     const whereCondition = and(...conditions);
@@ -408,6 +428,11 @@ coreRoutes.get(
     if (scopeResult.tenantCondition) {
       conditions.push(scopeResult.tenantCondition);
     }
+    // #3198 W03: the same owner filter as GET /reports. Narrowing only; the
+    // listing is org-owned already, so 'partner' is empty by construction.
+    if (query.ownerScope) {
+      conditions.push(reportOwnerScopeListFilter(query.ownerScope));
+    }
     const whereCondition = and(...conditions);
 
     const countResult = await db
@@ -447,10 +472,13 @@ coreRoutes.get(
       return c.notFound();
     }
 
+    // #6699 decision B: the definition and its recent runs are read-only
+    // history, still shown when the owner is out of service.
     const report = await getReportWithOrgCheck(
       reportId,
       auth,
       c.get('permissions') as UserPermissions | undefined,
+      'read_history',
     );
     if (!report) {
       return c.json({ error: 'Report not found' }, 404);
@@ -459,7 +487,7 @@ coreRoutes.get(
     const authorityResult = await resolveReportOwnerAuthority(
       auth,
       report.owner,
-      'read',
+      'read_history',
     );
     if (!authorityResult.ok || authorityResult.authority.scope.kind === 'legacy_unscoped') {
       return c.json({ error: 'Report not found' }, 404);
@@ -552,6 +580,9 @@ coreRoutes.post(
         auth.partnerId,
         'write',
       );
+      if (!partnerAuthority.ok && partnerAuthority.reason === 'tenant_inactive') {
+        return c.json(REPORT_TENANT_INACTIVE, 403);
+      }
       if (!partnerAuthority.ok) {
         return c.json(
           { error: 'Report scope is not authorized', reason: partnerAuthority.reason },
@@ -630,7 +661,9 @@ coreRoutes.post(
       'write',
     );
     if (!authorityResult.ok) {
-      return c.json({ error: 'Report scope is not authorized' }, 403);
+      return authorityResult.reason === 'tenant_inactive'
+        ? c.json(REPORT_TENANT_INACTIVE, 403)
+        : c.json({ error: 'Report scope is not authorized' }, 403);
     }
     const currentScope = liveScopeOf(authorityResult);
     if (!currentScope) {

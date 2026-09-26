@@ -226,8 +226,9 @@ import {
   stopDbPoolHealthMonitor,
 } from './db/dbPoolHealthMonitor';
 import { getWedgedBackendMinAgeMs } from './db/wedgedBackends';
+import { startRedisMemoryMonitor, stopRedisMemoryMonitor } from './services/redisMemoryMonitor';
 import { isBenignRejection, isRecoverablePostgresConnectionTeardown } from './services/rejectionSuppressions';
-import { partnerGuard } from './middleware/partnerGuard';
+import { partnerGuard, isPartnerGuardExemptPath } from './middleware/partnerGuard';
 import { API_VERSION } from './version';
 import {
   setWorkerReadinessTransitionHandler,
@@ -749,13 +750,7 @@ async function resolveFallbackOrgId(c: Context, path: string): Promise<string | 
 // propagates back through Hono's compose chain. Discarding the return causes
 // Hono to throw "Context is not finalized" and the request collapses to 500.
 api.use('*', async (c, next) => {
-  const path = c.req.path;
-  if (path.startsWith('/api/v1/auth')) return next();
-  if (path === '/api/v1/config' || path === '/api/v1/config/') return next();
-  if (path.startsWith('/api/v1/users/me')) return next();
-  if (path === '/api/v1/partner/me' || path.startsWith('/api/v1/partner/me/')) return next();
-  if (path.startsWith('/api/v1/agents/')) return next();
-  if (path.startsWith('/api/v1/internal/synthetic/')) return next();   // synthetic test router — self-gated (token + canary latch)
+  if (isPartnerGuardExemptPath(c.req.path)) return next();
   return partnerGuard(c, next);
 });
 
@@ -1377,6 +1372,7 @@ async function shutdownRuntime(signal: NodeJS.Signals): Promise<void> {
   // shutting down.
   stopDbPoolHealthMonitor();
   stopWedgedBackendMonitor();
+  stopRedisMemoryMonitor();
   if (auditRetryInterval) {
     clearInterval(auditRetryInterval);
     auditRetryInterval = null;
@@ -1735,6 +1731,22 @@ async function bootstrap(): Promise<void> {
   }
 
   await runStartupChecks();
+
+  // #6452 — Redis memory watchdog. Started after runStartupChecks so the
+  // client has had its first connect attempt; the watchdog itself tolerates
+  // Redis being down (a failed tick just counts against
+  // breeze_redis_memory_check_failures) and keeps retrying on its own
+  // interval, same as the other watchdogs below.
+  const redisMemoryIntervalMs = startRedisMemoryMonitor();
+  if (redisMemoryIntervalMs === null) {
+    console.warn(
+      '[redis-memory] Watchdog DISABLED via REDIS_MEMORY_MONITOR_DISABLED — a full '
+      + 'noeviction Redis instance will surface only as a failed login or a stuck '
+      + 'queue (#6452).',
+    );
+  } else {
+    console.log(`[redis-memory] Watchdog started (interval ${redisMemoryIntervalMs}ms)`);
+  }
 
   // #3128: advisory scan for PAM rules pinned to a risk tier no tool resolves
   // to any more. Tool tiers are static code, so a deploy is the only moment a

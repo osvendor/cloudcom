@@ -99,6 +99,7 @@
     "name": "Name",
     "principalDescription": "Beschreibung",
     "scopes": "Berechtigungsbereiche",
+    "noScopes": "Keine Berechtigungsbereiche gewährt",
     "sourceCidrs": "Quell-IPs oder CIDRs (eine pro Zeile)",
     "writeScopeRestrictionsRequired": "Der Bereich enrollment-keys:write erfordert ein Ablaufdatum und mindestens eine Quell-IP oder CIDR.",
     "expiresAt": "Läuft ab am",
@@ -329,11 +330,13 @@
     "exportFailed": "Der Export ist fehlgeschlagen",
     "title": "Export abrechenbarer Assets",
     "description": "Abzurechnende Zeiteinträge und Teile ab CSV (bis zu 366 Tage). Beinhaltet den Genehmigungsstatus.",
+    "columnsNote": "Enthält für jeden Zeiteintrag die Tätigkeitsart und die vertraglich enthaltenen Minuten.",
     "from": "Von",
     "to": "Zu",
     "allOrganizations": "Alle Organisationen",
     "exporting": "Exportieren…",
-    "downloadCsv": "Laden Sie CSV herunter"
+    "downloadCsv": "Laden Sie CSV herunter",
+    "seeBusinessReports": "Geschäftsberichte anzeigen"
   },
   "partnerSettingsCard": {
     "title": "Partnereinstellungen",
@@ -517,6 +520,25 @@
       "communications": "Kommunikation",
       "branding": "Branding"
     },
+    "aiFeatures": {
+      "anomalies": {
+        "title": "Anomalieerkennung",
+        "description": "Statistische Erkennung von ungewöhnlichem CPU-, Arbeitsspeicher-, Festplatten- und Netzwerkverhalten auf verwalteten Geräten. Dies sind die Standardwerte für jede Organisation; eine Organisation kann sie auf ihrer eigenen KI-Registerkarte überschreiben.",
+        "enabled": "Anomalien erkennen",
+        "enabledDescription": "Führt den Anomalie-Detektor alle 10 Minuten aus und zeigt Ergebnisse auf der Registerkarte „Anomalien“ jedes Geräts an.",
+        "createAlerts": "Alarme aus Anomalien erstellen",
+        "createAlertsDescription": "Wandelt bestätigte Anomalien in Alarme um, damit sie Ihre Benachrichtigungsrouten erreichen."
+      },
+      "inheritanceNote": "Änderungen gelten für jede Organisation, die keine eigene Überschreibung festgelegt hat.",
+      "saved": "Gespeichert",
+      "saveFailed": "Diese Einstellung konnte nicht geändert werden",
+      "remediation": {
+        "title": "Vorgeschlagene Korrekturen",
+        "description": "KI-generierte Korrekturvorschläge auf der Alarm-Detailseite. Dies ist der Standardwert für jede Organisation; eine Organisation kann ihn auf ihrer eigenen KI-Registerkarte überschreiben.",
+        "enabled": "Korrekturvorschläge erzeugen",
+        "enabledDescription": "Techniker dürfen auf der Detailseite eines Alarms Korrekturvorschläge erzeugen."
+      }
+    },
     "tabs": {
       "company": {
         "label": "Unternehmen",
@@ -567,6 +589,10 @@
         "label": "KI-Anbieter",
         "description": "Eigenen Anthropic-Schlüssel verwenden"
       },
+      "aiFeatures": {
+        "label": "KI-Funktionen",
+        "description": "Standardwerte für Anomalieerkennung und Korrekturvorschläge"
+      },
       "branding": {
         "label": "Branding",
         "description": "Logo und Farben"
@@ -578,6 +604,10 @@
       "modules": {
         "label": "Module",
         "description": "Service Desk, Abrechnung und Topologie ein/aus"
+      },
+      "aiApprovals": {
+        "label": "KI-Genehmigungs-Timeout",
+        "description": "Wie lange der KI-Chat auf die Genehmigung einer gesperrten Aktion wartet"
       }
     },
     "saved": "Partnereinstellungen gespeichert",
@@ -891,6 +921,7 @@
       "email_only_hint": "Hinweis nur per E-Mail",
       "resolution_note": "Lösungshinweis",
       "quote_number": "Angebotsnummer",
+      "quote_title": "Angebotstitel",
       "total": "Gesamtbetrag",
       "expiry_date": "Ablaufdatum",
       "accept_url": "Annahme-URL",
@@ -956,6 +987,16 @@
     }
   },
   "m365Mailbox": {
+    "consentNotCompleted": "Zustimmung nicht abgeschlossen",
+    "consentNotCompletedHint": "Die Microsoft-Anmeldung für dieses Postfach wurde nicht rechtzeitig abgeschlossen, daher wird es nicht von selbst verbunden. Wiederholen Sie die Zustimmung oder trennen Sie das Postfach.",
+    "retryConsent": "Zustimmung wiederholen",
+    "redirectUriLabel": "Umleitungs-URI zur Registrierung in der Microsoft Entra-App",
+    "redirectUriHint": "Sie muss exakt übereinstimmen, und Sie müssen Breeze beim Verbinden unter demselben Schema und Host öffnen, sonst kann die Anmeldung nicht abgeschlossen werden.",
+    "callbackReason": {
+      "binding_mismatch": "Microsoft 365-Verbindung fehlgeschlagen: Der Browser kam ohne sein Anmelde-Cookie zurück. Öffnen Sie Breeze unter derselben Adresse wie die Umleitungs-URI (Schema und Host müssen übereinstimmen), erlauben Sie Cookies und versuchen Sie es erneut.",
+      "invalid_callback": "Microsoft 365-Verbindung fehlgeschlagen: Microsoft hat eine unerwartete Antwort zurückgegeben. Versuchen Sie erneut, die Verbindung herzustellen.",
+      "expired": "Microsoft 365-Verbindung fehlgeschlagen: Der Anmeldelink ist abgelaufen oder wurde bereits verwendet. Versuchen Sie erneut, die Verbindung herzustellen."
+    },
     "connected": "Postfach verbunden",
     "consentGranted": "Zustimmung erteilt – Erweitern Sie das Postfach mit der Anwendungszugriffsrichtlinie unten und führen Sie dann einen erneuten Test durch",
     "consentAttention": "Die Zustimmung zum Postfach erfordert die Aufmerksamkeit des Administrators.",
@@ -984,6 +1025,38 @@
     "displayName": "Anzeigename (optional)",
     "namePlaceholder": "Unterstützung",
     "connect": "Verbinden"
+  },
+  "gmailMailbox": {
+    "title": "Google Workspace-Support-Postfach",
+    "description": "Verbinden Sie ein Google Workspace-Postfach, damit Kunden-E-Mails zu Tickets werden. Es wird die domänenweite Delegierung verwendet, daher sind keine MX- oder Weiterleitungsänderungen und keine OAuth-Weiterleitung nötig.",
+    "connectHint": "Das Postfach wird über die Google Workspace-Dienstkontoverbindung der ausgewählten Organisation gelesen, die damit die Anmeldedaten hält. Wählen Sie für ein Partner-Postfach (etwa Ihr eigenes help@) die Organisation, deren Workspace das Postfach enthält. Geben Sie das gemeinsame Support-Postfach ein, um es zu verbinden.",
+    "status": {
+      "pending_consent": "Ausstehend",
+      "connected": "Verbunden",
+      "error": "Aktion erforderlich",
+      "reauth_required": "Erneute Authentifizierung erforderlich",
+      "disabled": "Deaktiviert"
+    },
+    "reauthRequired": "Der Gmail-Abruf für dieses Postfach ist pausiert. Verbinden Sie es erneut, um fortzufahren: Das Dienstkonto muss eventuell neu autorisiert werden, seine Google Workspace-Verbindung ist möglicherweise inaktiv, oder das Postfach gehört jetzt zu einem anderen Google-Konto.",
+    "reconnect": "Wieder verbinden",
+    "reconnectNoOrg": "Dieser Verbindung fehlt ihre Organisation; sie kann hier nicht erneut verbunden werden.",
+    "disconnect": "Trennen",
+    "disconnected": "Postfach getrennt",
+    "disconnectFailed": "Verbindungstrennung fehlgeschlagen.",
+    "connected": "Postfach verbunden",
+    "connectFailed": "Das Gmail-Postfach konnte nicht verbunden werden.",
+    "empty": "Noch kein Gmail-Postfach verbunden.",
+    "loadError": "Gmail-Postfachverbindungen konnten nicht geladen werden. Aktualisieren Sie, um es erneut zu versuchen.",
+    "orgsLoadError": "Organisationen konnten nicht geladen werden. Aktualisieren Sie, um es erneut zu versuchen.",
+    "organization": "Organisation",
+    "selectOrg": "Organisation auswählen",
+    "address": "Postfachadresse",
+    "addressPlaceholder": "hilfe@example.com",
+    "displayName": "Anzeigename (optional)",
+    "namePlaceholder": "Unterstützung",
+    "connect": "Verbinden",
+    "credentialOrg": "Anmeldedaten: Google Workspace-Verbindung von {{org}}",
+    "credentialOrgUnknown": "eine Organisation, die Sie nicht sehen können"
   },
   "orgApprovalSecurityTab": {
     "title": "Genehmigungssicherheit",
@@ -1341,6 +1414,10 @@
         "enableNetworkVisibility": {
           "label": "Netzwerksichtbarkeit",
           "description": "Zeigt im Kundenportal den Netzwerkzustand und erkannte Assets schreibgeschützt an."
+        },
+        "enableNetworkAlerts": {
+          "label": "Netzwerkwarnungen",
+          "description": "Zeigt im Kundenportal die Anzahl aktiver Warnungen und verknüpfter offener Tickets für Netzwerk-Assets an."
         }
       }
     },
@@ -1660,6 +1737,8 @@
     "maxTurnsPerSession": "Maximale Umdrehungen pro Sitzung",
     "msgsMinPerUser": "Nachrichten/Minute pro Benutzer",
     "msgsHrPerOrg": "Nachrichten/Std. pro Organisation",
+    "toolRateLimitMultiplier": "Multiplikator für Tool-Ratenlimits",
+    "toolRateLimitMultiplierHelp": "Erhöht jedes KI- und MCP-Ratenlimit pro Tool um diesen Faktor (1–10). Ein Limit wird nie gesenkt oder entfernt.",
     "saveBudget": "Budget speichern",
     "savedSuccessfully": "Erfolgreich gespeichert",
     "allBudgetSettingsAreManagedByYourPartner": "Alle Budgeteinstellungen werden von Ihrem Partner verwaltet",
@@ -4026,7 +4105,7 @@
     "enforceSSOOnlyLogin": "Erzwingen Sie die Anmeldung nur für SSO",
     "usersMustUseSSOToSignInPasswordLoginWillBeDisabled": "Benutzer müssen SSO verwenden, um sich anzumelden. Die Passwortanmeldung wird deaktiviert.",
     "trustThisProvidersMFA": "Diesem Anbieter bei MFA vertrauen",
-    "trustThisProvidersMFAHelperText": "Wenn Ihr Identitätsanbieter meldet, dass eine Multi-Faktor-Authentifizierung verwendet wurde (`amr: mfa`), wird MFA in Breeze als erfüllt betrachtet. Ihr IdP muss den Anspruch `amr` in seinem ID-Token enthalten — die meisten erfordern, dass dies ausdrücklich aktiviert wird. Standardmäßig deaktiviert.",
+    "trustThisProvidersMFAHelperText": "Wenn Ihr Identitätsanbieter eine Multi-Faktor- oder phishing-resistente Authentifizierung (z. B. Passkey) meldet (`amr: mfa` / `amr: phr`), wird MFA in Breeze als erfüllt betrachtet. Ihr IdP muss den Anspruch `amr` in seinem ID-Token enthalten — die meisten erfordern, dass dies ausdrücklich aktiviert wird. Standardmäßig deaktiviert.",
     "warningSSOEnforcementEnabled": "Warnung: Durchsetzung von SSO aktiviert",
     "usersWillNotBeAbleToSignInWithPasswordsMakeSureYourSSOCo": "Benutzer können sich nicht mit Passwörtern anmelden. Stellen Sie sicher, dass Ihre SSO-Konfiguration ordnungsgemäß funktioniert, bevor Sie diese Option aktivieren. Erwägen Sie, mindestens ein Administratorkonto zu haben, das SSO für den Notfallzugriff umgehen kann.",
     "testing": "Testen...",
@@ -4597,7 +4676,32 @@
       "externalProcessing": "Sandbox-KI-Analyse zulassen",
       "externalProcessingDescription": "Ermöglicht es KI-Analyseläufen, für diese Organisation Code in einer isolierten Sandbox ohne Netzwerkzugriff auszuführen, gehostet in der Region dieser Organisation. Standardmäßig deaktiviert.",
       "externalProcessingSaved": "Gespeichert",
-      "externalProcessingSaveFailed": "Diese Einstellung konnte nicht geändert werden"
+      "externalProcessingSaveFailed": "Diese Einstellung konnte nicht geändert werden",
+      "mlFeatures": {
+        "title": "Anomalieerkennung",
+        "description": "Statistische Erkennung von ungewöhnlichem CPU-, Arbeitsspeicher-, Festplatten- und Netzwerkverhalten auf den Geräten dieser Organisation. Leer bedeutet, dass der Partner-Standardwert gilt.",
+        "anomaliesEnabled": "Anomalien erkennen",
+        "anomaliesEnabledDescription": "Führt den Anomalie-Detektor alle 10 Minuten aus und zeigt Ergebnisse auf der Registerkarte „Anomalien“ jedes Geräts an.",
+        "createAlerts": "Alarme aus Anomalien erstellen",
+        "createAlertsDescription": "Wandelt bestätigte Anomalien in Alarme um, damit sie Ihre Benachrichtigungsrouten erreichen.",
+        "inherit": "Erben",
+        "inheritOn": "Erben (an, {{from}})",
+        "inheritOff": "Erben (aus, {{from}})",
+        "fromPartner": "Partnereinstellung",
+        "fromDefault": "Plattform-Standardwert",
+        "on": "An",
+        "off": "Aus",
+        "saved": "Gespeichert",
+        "saveFailed": "Diese Einstellung konnte nicht geändert werden",
+        "killSwitch": "Die Anomalieerkennung ist für die gesamte Plattform vom Betreiber deaktiviert. Diese Einstellungen werden wirksam, sobald sie wieder aktiviert wird.",
+        "remediation": {
+          "title": "Vorgeschlagene Korrekturen",
+          "description": "KI-generierte Korrekturvorschläge für die Alarme dieser Organisation. Leer bedeutet, dass der Partner-Standardwert gilt.",
+          "enabled": "Korrekturvorschläge erzeugen",
+          "enabledDescription": "Techniker dürfen auf der Detailseite eines Alarms Korrekturvorschläge erzeugen.",
+          "killSwitch": "Vorgeschlagene Korrekturen sind vom Betreiber für die gesamte Plattform deaktiviert. Diese Einstellung wird wirksam, sobald sie wieder aktiviert werden."
+        }
+      }
     },
     "breadcrumbs": {
       "settings": "Einstellungen",
@@ -4861,12 +4965,14 @@
     "description": "Organisationen und Standorte aus einer CSV-Datei Ihres bisherigen RMM importieren.",
     "dropzone": "CSV-Datei hier ablegen oder klicken zum Auswählen",
     "dropzoneHint": "Spalten: Organisation (erforderlich), Standort, externe ID, externes System, Zeitzone",
+    "docsLink": "Importanleitung",
     "actions": {
       "close": "Schließen",
       "preview": "{{count}} Zeilen prüfen",
       "previewing": "Vorschau wird geladen…",
       "import": "{{count}} ausgewählte importieren",
-      "importing": "Import läuft…"
+      "importing": "Import läuft…",
+      "downloadSample": "Beispiel-CSV herunterladen"
     },
     "mapping": {
       "title": "Spaltenzuordnung",
@@ -5837,5 +5943,77 @@
   "ticketCategories": {
     "defaultWorkType": "Standard-Arbeitsart",
     "defaultWorkTypeHelp": "Wird verwendet, wenn für diese Kategorie Zeit ohne Arbeitsart erfasst wird."
+  },
+  "systemDeprecations": {
+    "title": "Abkündigungen",
+    "description": "API-Abkündigungen, die dieser Breeze-Version bekannt sind, und der aktuelle Stand dieser Bereitstellung zu jeder einzelnen. Dies ist ein reiner Lesebericht für Plattformadministratoren; hier wird nichts konfiguriert.",
+    "refresh": "Aktualisieren",
+    "loading": "Abkündigungen werden geladen…",
+    "errors": {
+      "load": "Der Abkündigungsbericht konnte nicht geladen werden."
+    },
+    "platformAdmin": {
+      "title": "Plattformadministratorzugriff erforderlich",
+      "description": "Dieser Bericht umfasst die gesamte Bereitstellung, daher können ihn nur Plattformadministratoren einsehen."
+    },
+    "manifestError": "Das Manifest für nicht kompatible Änderungen in diesem Image konnte nicht gelesen werden ({{error}}). Abkündigungen können nicht geprüft werden.",
+    "historyMissing": "Es konnte nicht ermittelt werden, welche Versionen diese Bereitstellung ausgeführt hat – es werden alle aktuell geltenden Abkündigungen angezeigt.",
+    "noReleaseVersion": "Dieses Image trägt keine Release-Version, daher wird jede Abkündigung im Manifest als möglicherweise überschritten angezeigt.",
+    "historyReason": "Grund: {{reason}}",
+    "summary": {
+      "imageVersion": "Laufende Version",
+      "unknownVersion": "Unbekannt ({{raw}})",
+      "lastRecorded": "Zuletzt erfasste Version",
+      "noneRecorded": "Keine erfasst",
+      "migrations": "Migrationen",
+      "migrationCounts": "{{applied}} angewendet, {{pending}} ausstehend",
+      "ledgerMissing": "Migrationsprotokoll nicht verfügbar ({{reason}})"
+    },
+    "table": {
+      "heading": "Stilllegungen",
+      "entry": "Eintrag",
+      "affected": "Betroffene Endpunkte und Felder",
+      "replacement": "Ersatz",
+      "deprecatedIn": "Abgekündigt in",
+      "removal": "Entfernung",
+      "status": "Status hier",
+      "wholeEndpoint": "Gesamter Endpunkt",
+      "notBefore": "Nicht vor {{date}}",
+      "empty": "Das Manifest listet keine Stilllegungen auf."
+    },
+    "status": {
+      "crossed": "Überschritten",
+      "possibly_crossed": "Möglicherweise überschritten",
+      "in_effect": "In Kraft",
+      "upcoming": "Bevorstehend"
+    },
+    "milestone": {
+      "deprecation": "Abkündigung",
+      "removal": "Entfernung"
+    },
+    "history": {
+      "heading": "Versionsverlauf",
+      "firstSeen": "Erstmals gesehen am {{date}}",
+      "none": "Für diese Bereitstellung sind keine Versionen erfasst."
+    }
+  },
+  "partnerAiApprovals": {
+    "timeoutLabel": "Zeitüberschreitung für interaktive Genehmigung",
+    "productDefault": "Produktstandard ({{minutes}} Minuten)",
+    "range": "Wählen Sie {{min}}-{{max}} Minuten.",
+    "description": "Wie lange ein laufender KI-Chat-Zug darauf wartet, dass jemand eine gesperrte (Stufe 2/3) Aktion genehmigt, bevor er aufgibt.",
+    "orgOverrideNote": "Organisationen können diesen Wert in ihren eigenen KI-Einstellungen überschreiben; der Organisationswert gewinnt, wenn er gesetzt ist.",
+    "notForUnattendedNote": "Dies ist nicht für nächtliche oder unbeaufsichtigte Arbeiten gedacht — langlaufende Arbeiten durchlaufen die Genehmigungswarteschlange mit eigener Ablaufzeit."
+  },
+  "orgAiApprovalTimeout": {
+    "title": "KI-Genehmigungs-Timeout",
+    "description": "Wie lange ein KI-Chat darauf wartet, dass jemand eine gesperrte (Stufe 2/3) Aktion genehmigt, bevor er aufgibt. Organisationen können hier den Partnerstandard überschreiben; der Organisationswert gewinnt, wenn er gesetzt ist.",
+    "fieldLabel": "Zeitüberschreitung für interaktive Genehmigung",
+    "inherit": "Übernehmen",
+    "inheritLabel": "Übernehmen ({{minutes}} Minuten, {{source}})",
+    "sourcePartner": "Partnerstandard",
+    "sourceDefault": "Produktstandard",
+    "range": "Wählen Sie {{min}}-{{max}} Minuten.",
+    "save": "Speichern"
   }
 }

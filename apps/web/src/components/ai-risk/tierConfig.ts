@@ -63,6 +63,7 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       // Devices & Hardware
       { name: 'query_devices', description: 'Search and filter devices', category: 'Devices & Hardware' },
       { name: 'get_device_details', description: 'Get comprehensive device info', category: 'Devices & Hardware' },
+      { name: 'get_device_hardware_health', description: 'Get RAID, disk and hardware collector health', category: 'Devices & Hardware' },
       { name: 'analyze_metrics', description: 'Time-series metrics analysis', category: 'Devices & Hardware' },
       { name: 'get_active_users', description: 'Active user sessions', category: 'Devices & Hardware' },
       { name: 'get_user_experience_metrics', description: 'Login performance and session trends', category: 'Devices & Hardware' },
@@ -157,8 +158,10 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'list_time_entries', description: 'List tracked time entries', category: 'Ticketing' },
       { name: 'get_running_timer', description: 'Get the current running timer', category: 'Ticketing' },
       { name: 'get_timesheet', description: 'Get a timesheet summary', category: 'Ticketing' },
+      { name: 'manage_ticket_checklist (list/list_templates/get_template)', description: 'View ticket checklist steps and checklist templates', category: 'Ticketing' },
       // AI Governance
       { name: 'list_ai_agents', description: 'List AI agents', category: 'AI Governance' },
+      { name: 'read_artifact', description: 'Read a stored tool-result artifact', category: 'AI Governance' },
       { name: 'list_ai_agent_runs', description: 'List AI agent runs', category: 'AI Governance' },
       { name: 'get_ai_agent_run', description: 'Get AI agent run details', category: 'AI Governance' },
       // Other
@@ -223,6 +226,7 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'manage_tickets (create/comment/assign/update_status/update_fields/link_alert/unlink_alert/create_from_alert/edit_comment/delete_comment)', description: 'Create and update support tickets', category: 'Ticketing' },
       { name: 'manage_tickets (log_time_entry/start_timer/stop_timer)', description: 'Track time against tickets', category: 'Ticketing' },
       { name: 'manage_tickets (link_device/draft)', description: 'AI ticket triage: link a device or store a reply/resolution-note draft', category: 'Ticketing' },
+      { name: 'manage_ticket_checklist (add_item/update_item/delete_item/reorder/apply_template)', description: 'Edit ticket checklist steps (ticking a step done stays human-only)', category: 'Ticketing' },
     ],
   },
   {
@@ -307,10 +311,15 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
 
 // ── Rate limit configuration ────────────────────────────────────────────────
 
+/**
+ * Display metadata for the AI Risk → Rate Limits tab. The NUMBERS (limit,
+ * window) are not here: since #6476 the tab reads the effective limits from
+ * `GET /ai/tool-rate-limits`, which applies the org's toolRateLimitMultiplier
+ * to TOOL_RATE_LIMITS (apps/api/src/services/aiToolRateLimits.ts). A tool the
+ * API returns without a row here still renders, under "Other" with no tier.
+ */
 export interface RateLimitConfig {
   toolName: string;
-  limit: number;
-  windowSeconds: number;
   tier: 1 | 2 | 3;
   permission: string;
   category: ToolCategory;
@@ -318,64 +327,112 @@ export interface RateLimitConfig {
 
 export const RATE_LIMIT_CONFIGS: RateLimitConfig[] = [
   // Remote Access & Control
-  { toolName: 'execute_command', limit: 10, windowSeconds: 300, tier: 3, permission: 'devices.execute', category: 'Remote Access & Control' },
-  { toolName: 'run_script', limit: 5, windowSeconds: 300, tier: 3, permission: 'scripts.execute', category: 'Remote Access & Control' },
-  { toolName: 'computer_control', limit: 20, windowSeconds: 300, tier: 3, permission: 'devices.execute + remote.access', category: 'Remote Access & Control' },
-  { toolName: 'take_screenshot', limit: 10, windowSeconds: 300, tier: 3, permission: 'devices.execute', category: 'Remote Access & Control' },
-  { toolName: 'analyze_screen', limit: 10, windowSeconds: 300, tier: 3, permission: 'devices.execute', category: 'Remote Access & Control' },
-  { toolName: 'create_remote_session', limit: 10, windowSeconds: 300, tier: 3, permission: 'devices.execute + remote.access', category: 'Remote Access & Control' },
-  { toolName: 'set_device_context', limit: 20, windowSeconds: 300, tier: 2, permission: 'devices.write', category: 'Devices & Hardware' },
-  { toolName: 'resolve_device_context', limit: 20, windowSeconds: 300, tier: 2, permission: 'devices.write', category: 'Devices & Hardware' },
+  { toolName: 'execute_command', tier: 3, permission: 'devices.execute', category: 'Remote Access & Control' },
+  { toolName: 'run_script', tier: 3, permission: 'scripts.execute', category: 'Remote Access & Control' },
+  { toolName: 'computer_control', tier: 3, permission: 'devices.execute + remote.access', category: 'Remote Access & Control' },
+  { toolName: 'take_screenshot', tier: 3, permission: 'devices.execute', category: 'Remote Access & Control' },
+  { toolName: 'analyze_screen', tier: 3, permission: 'devices.execute', category: 'Remote Access & Control' },
+  { toolName: 'create_remote_session', tier: 3, permission: 'devices.execute + remote.access', category: 'Remote Access & Control' },
+  { toolName: 'set_device_context', tier: 2, permission: 'devices.write', category: 'Devices & Hardware' },
+  { toolName: 'resolve_device_context', tier: 2, permission: 'devices.write', category: 'Devices & Hardware' },
   // Services & Processes
-  { toolName: 'manage_services', limit: 10, windowSeconds: 300, tier: 3, permission: 'devices.execute', category: 'Services & Processes' },
-  { toolName: 'manage_processes', limit: 15, windowSeconds: 300, tier: 1, permission: 'devices.read', category: 'Services & Processes' },
-  { toolName: 'manage_startup_items', limit: 5, windowSeconds: 600, tier: 3, permission: 'devices.execute', category: 'Services & Processes' },
-  { toolName: 'manage_scheduled_tasks', limit: 10, windowSeconds: 300, tier: 1, permission: 'devices.read', category: 'Services & Processes' },
+  { toolName: 'manage_services', tier: 3, permission: 'devices.execute', category: 'Services & Processes' },
+  { toolName: 'manage_processes', tier: 1, permission: 'devices.read', category: 'Services & Processes' },
+  { toolName: 'manage_startup_items', tier: 3, permission: 'devices.execute', category: 'Services & Processes' },
+  { toolName: 'manage_scheduled_tasks', tier: 1, permission: 'devices.read', category: 'Services & Processes' },
   // Security & Compliance
-  { toolName: 'security_scan', limit: 3, windowSeconds: 600, tier: 3, permission: 'devices.execute', category: 'Security & Compliance' },
+  { toolName: 'security_scan', tier: 3, permission: 'devices.execute', category: 'Security & Compliance' },
   // Files, Disk & Registry
-  { toolName: 'file_operations', limit: 20, windowSeconds: 300, tier: 3, permission: 'devices.execute', category: 'Files, Disk & Registry' },
-  { toolName: 'analyze_disk_usage', limit: 10, windowSeconds: 300, tier: 1, permission: 'devices.read', category: 'Files, Disk & Registry' },
-  { toolName: 'disk_cleanup', limit: 3, windowSeconds: 600, tier: 3, permission: 'devices.execute', category: 'Files, Disk & Registry' },
-  { toolName: 'system_cleanup', limit: 30, windowSeconds: 3600, tier: 3, permission: 'devices.execute', category: 'Files, Disk & Registry' },
-  { toolName: 'registry_operations', limit: 15, windowSeconds: 300, tier: 2, permission: 'devices.execute', category: 'Files, Disk & Registry' },
+  { toolName: 'file_operations', tier: 3, permission: 'devices.execute', category: 'Files, Disk & Registry' },
+  { toolName: 'analyze_disk_usage', tier: 1, permission: 'devices.read', category: 'Files, Disk & Registry' },
+  { toolName: 'disk_cleanup', tier: 3, permission: 'devices.execute', category: 'Files, Disk & Registry' },
+  { toolName: 'system_cleanup', tier: 3, permission: 'devices.execute', category: 'Files, Disk & Registry' },
+  { toolName: 'registry_operations', tier: 2, permission: 'devices.execute', category: 'Files, Disk & Registry' },
   // Network & DNS
-  { toolName: 'network_discovery', limit: 2, windowSeconds: 600, tier: 3, permission: 'devices.execute', category: 'Network & DNS' },
+  { toolName: 'network_discovery', tier: 3, permission: 'devices.execute', category: 'Network & DNS' },
   // Logs & Audit
-  { toolName: 'search_logs', limit: 30, windowSeconds: 300, tier: 1, permission: 'devices.read', category: 'Logs & Audit' },
-  { toolName: 'get_log_trends', limit: 20, windowSeconds: 300, tier: 1, permission: 'devices.read', category: 'Logs & Audit' },
-  { toolName: 'detect_log_correlations', limit: 10, windowSeconds: 300, tier: 2, permission: 'devices.read', category: 'Logs & Audit' },
-  { toolName: 'set_agent_log_level', limit: 5, windowSeconds: 600, tier: 2, permission: 'devices.execute', category: 'Logs & Audit' },
-  { toolName: 'capture_agent_pprof', limit: 3, windowSeconds: 600, tier: 2, permission: 'devices.execute', category: 'Logs & Audit' },
+  { toolName: 'search_logs', tier: 1, permission: 'devices.read', category: 'Logs & Audit' },
+  { toolName: 'get_log_trends', tier: 1, permission: 'devices.read', category: 'Logs & Audit' },
+  { toolName: 'detect_log_correlations', tier: 2, permission: 'devices.read', category: 'Logs & Audit' },
+  { toolName: 'set_agent_log_level', tier: 2, permission: 'devices.execute', category: 'Logs & Audit' },
+  { toolName: 'capture_agent_pprof', tier: 2, permission: 'devices.execute', category: 'Logs & Audit' },
   // Configuration Policies
-  { toolName: 'get_configuration_policy', limit: 30, windowSeconds: 300, tier: 1, permission: 'devices.read', category: 'Configuration Policies' },
-  { toolName: 'manage_configuration_policy', limit: 20, windowSeconds: 300, tier: 1, permission: 'devices.write', category: 'Configuration Policies' },
-  { toolName: 'configuration_policy_compliance', limit: 30, windowSeconds: 300, tier: 1, permission: 'devices.read', category: 'Configuration Policies' },
-  { toolName: 'apply_configuration_policy', limit: 10, windowSeconds: 300, tier: 2, permission: 'devices.write', category: 'Configuration Policies' },
-  { toolName: 'remove_configuration_policy_assignment', limit: 10, windowSeconds: 300, tier: 2, permission: 'devices.write', category: 'Configuration Policies' },
+  { toolName: 'get_configuration_policy', tier: 1, permission: 'devices.read', category: 'Configuration Policies' },
+  { toolName: 'manage_configuration_policy', tier: 1, permission: 'devices.write', category: 'Configuration Policies' },
+  { toolName: 'configuration_policy_compliance', tier: 1, permission: 'devices.read', category: 'Configuration Policies' },
+  { toolName: 'apply_configuration_policy', tier: 2, permission: 'devices.write', category: 'Configuration Policies' },
+  { toolName: 'remove_configuration_policy_assignment', tier: 2, permission: 'devices.write', category: 'Configuration Policies' },
   // Scripts & Automation
-  { toolName: 'execute_playbook', limit: 5, windowSeconds: 600, tier: 3, permission: 'devices.execute', category: 'Scripts & Automation' },
+  { toolName: 'execute_playbook', tier: 3, permission: 'devices.execute', category: 'Scripts & Automation' },
   // Other
-  { toolName: 'manage_tags', limit: 20, windowSeconds: 300, tier: 2, permission: 'devices.write', category: 'Other' },
+  { toolName: 'manage_tags', tier: 2, permission: 'devices.write', category: 'Other' },
   // Backup & Recovery
-  { toolName: 'trigger_backup', limit: 5, windowSeconds: 600, tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
-  { toolName: 'restore_snapshot', limit: 3, windowSeconds: 600, tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
+  { toolName: 'trigger_backup', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
+  { toolName: 'restore_snapshot', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
   // Monitoring & Analytics
-  { toolName: 'manage_monitors', limit: 10, windowSeconds: 300, tier: 1, permission: 'devices.write', category: 'Monitoring & Analytics' },
+  { toolName: 'manage_monitors', tier: 1, permission: 'devices.write', category: 'Monitoring & Analytics' },
   // Integrations
-  { toolName: 'test_webhook', limit: 5, windowSeconds: 300, tier: 2, permission: 'devices.write', category: 'Integrations' },
-  { toolName: 'trigger_agent_upgrade', limit: 5, windowSeconds: 600, tier: 3, permission: 'devices.execute', category: 'Integrations' },
-  { toolName: 'trigger_agent_restart', limit: 5, windowSeconds: 600, tier: 3, permission: 'devices.execute', category: 'Integrations' },
-  { toolName: 'manage_notification_channels', limit: 10, windowSeconds: 300, tier: 1, permission: 'alerts.read', category: 'Alerts & Notifications' },
-  { toolName: 'manage_saved_filters', limit: 15, windowSeconds: 300, tier: 1, permission: 'devices.read', category: 'Other' },
+  { toolName: 'test_webhook', tier: 2, permission: 'devices.write', category: 'Integrations' },
+  { toolName: 'trigger_agent_upgrade', tier: 3, permission: 'devices.execute', category: 'Integrations' },
+  { toolName: 'trigger_agent_restart', tier: 3, permission: 'devices.execute', category: 'Integrations' },
+  { toolName: 'manage_notification_channels', tier: 1, permission: 'alerts.read', category: 'Alerts & Notifications' },
+  { toolName: 'manage_saved_filters', tier: 1, permission: 'devices.read', category: 'Other' },
   // Fleet Operations
-  { toolName: 'manage_deployments', limit: 10, windowSeconds: 600, tier: 1, permission: 'devices.write', category: 'Fleet Operations' },
-  { toolName: 'manage_patches', limit: 15, windowSeconds: 300, tier: 1, permission: 'devices.read', category: 'Fleet Operations' },
-  { toolName: 'manage_groups', limit: 20, windowSeconds: 300, tier: 1, permission: 'devices.write', category: 'Fleet Operations' },
-  { toolName: 'manage_maintenance_windows', limit: 15, windowSeconds: 300, tier: 1, permission: 'devices.write', category: 'Fleet Operations' },
-  { toolName: 'manage_automations', limit: 10, windowSeconds: 600, tier: 1, permission: 'automations.write', category: 'Fleet Operations' },
-  { toolName: 'manage_alert_rules', limit: 15, windowSeconds: 300, tier: 1, permission: 'alerts.write', category: 'Alerts & Notifications' },
-  { toolName: 'generate_report', limit: 10, windowSeconds: 300, tier: 1, permission: 'reports.read', category: 'Fleet Operations' },
+  { toolName: 'manage_deployments', tier: 1, permission: 'devices.write', category: 'Fleet Operations' },
+  { toolName: 'manage_patches', tier: 1, permission: 'devices.read', category: 'Fleet Operations' },
+  { toolName: 'manage_groups', tier: 1, permission: 'devices.write', category: 'Fleet Operations' },
+  { toolName: 'manage_maintenance_windows', tier: 1, permission: 'devices.write', category: 'Fleet Operations' },
+  { toolName: 'manage_automations', tier: 1, permission: 'automations.write', category: 'Fleet Operations' },
+  { toolName: 'manage_alert_rules', tier: 1, permission: 'alerts.write', category: 'Alerts & Notifications' },
+  { toolName: 'generate_report', tier: 1, permission: 'reports.read', category: 'Fleet Operations' },
+  // The 33 entries below were missing outright (sweep E3, #6932): every
+  // rate-limited tool the API returns from GET /ai/tool-rate-limits that has
+  // no row here renders under "Other" with tier/permission "—", even though
+  // the tool IS registered. tier/permission sourced from the tool's own
+  // `registerTool({ tier })` call in services/aiTools*.ts and its entry in
+  // services/aiGuardrails.ts's TOOL_PERMISSIONS — completeness (every
+  // TOOL_RATE_LIMITS key present) and tier correctness are both enforced by
+  // aiGuardrailsTierConfig.parity.test.ts.
+  { toolName: 'cancel_script_execution', tier: 3, permission: 'scripts.execute', category: 'Remote Access & Control' },
+  // Security & Compliance
+  { toolName: 'apply_cis_remediation', tier: 3, permission: 'devices.execute', category: 'Security & Compliance' },
+  { toolName: 'get_cis_compliance', tier: 1, permission: 'devices.read', category: 'Security & Compliance' },
+  { toolName: 'get_cis_device_report', tier: 1, permission: 'devices.read', category: 'Security & Compliance' },
+  { toolName: 'assign_security_training', tier: 2, permission: 'users.write', category: 'Security & Compliance' },
+  { toolName: 'collect_evidence', tier: 2, permission: 'devices.execute', category: 'Security & Compliance' },
+  { toolName: 'execute_containment', tier: 3, permission: 'devices.execute', category: 'Security & Compliance' },
+  { toolName: 's1_isolate_device', tier: 3, permission: 'devices.execute', category: 'Security & Compliance' },
+  { toolName: 's1_threat_action', tier: 3, permission: 'devices.execute', category: 'Security & Compliance' },
+  { toolName: 'sync_huntress_data', tier: 2, permission: 'organizations.write', category: 'Security & Compliance' },
+  { toolName: 'remediate_software_violation', tier: 3, permission: 'devices.execute', category: 'Security & Compliance' },
+  // Backup & Recovery
+  { toolName: 'configure_backup_sla', tier: 2, permission: 'organizations.write', category: 'Backup & Recovery' },
+  { toolName: 'configure_vault', tier: 2, permission: 'organizations.write', category: 'Backup & Recovery' },
+  { toolName: 'trigger_vault_sync', tier: 2, permission: 'devices.execute', category: 'Backup & Recovery' },
+  { toolName: 'execute_dr_plan', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
+  { toolName: 'manage_dr_plan', tier: 2, permission: 'organizations.write', category: 'Backup & Recovery' },
+  { toolName: 'instant_boot_vm', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
+  { toolName: 'restore_as_vm', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
+  { toolName: 'manage_hyperv_vm', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
+  { toolName: 'trigger_hyperv_backup', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
+  { toolName: 'restore_hyperv_vm', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
+  { toolName: 'manage_hyperv_checkpoints', tier: 2, permission: 'devices.execute', category: 'Backup & Recovery' },
+  { toolName: 'trigger_mssql_backup', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
+  { toolName: 'restore_mssql_database', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
+  { toolName: 'verify_mssql_backup', tier: 2, permission: 'devices.execute', category: 'Backup & Recovery' },
+  // Monitoring & Analytics
+  { toolName: 'query_monitors', tier: 1, permission: 'devices.read', category: 'Monitoring & Analytics' },
+  { toolName: 'manage_service_monitors', tier: 1, permission: 'devices.read', category: 'Monitoring & Analytics' },
+  { toolName: 'get_service_monitoring_status', tier: 1, permission: 'devices.read', category: 'Monitoring & Analytics' },
+  // Integrations
+  { toolName: 'trigger_c2c_sync', tier: 2, permission: 'organizations.write', category: 'Integrations' },
+  { toolName: 'restore_c2c_items', tier: 3, permission: 'organizations.write', category: 'Integrations' },
+  // Alerts & Notifications
+  { toolName: 'manage_delivery', tier: 1, permission: 'alerts.read', category: 'Alerts & Notifications' },
+  // AI Governance
+  { toolName: 'manage_ai_agents', tier: 3, permission: 'ai_agents.write', category: 'AI Governance' },
+  // Other
+  { toolName: 'export_dataset', tier: 1, permission: 'devices.read', category: 'Other' },
 ];
 
 // ── RBAC mappings (flat reference, not rendered in grouped UI) ───────────────
@@ -384,6 +441,7 @@ export const RBAC_MAPPINGS: Record<string, string | Record<string, string>> = {
   // Device & metrics
   query_devices: 'devices.read',
   get_device_details: 'devices.read',
+  get_device_hardware_health: 'devices.read',
   analyze_metrics: 'devices.read',
   get_active_users: 'devices.read',
   get_user_experience_metrics: 'devices.read',

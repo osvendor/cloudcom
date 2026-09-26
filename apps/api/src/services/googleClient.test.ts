@@ -6,6 +6,7 @@ import {
   ALL_DWD_SCOPES_CSV,
   DIRECTORY_SCOPES,
   GMAIL_USER_SCOPES,
+  GMAIL_INBOUND_SCOPES,
   CALENDAR_SCOPES,
   LICENSING_SCOPES,
   REPORTS_SCOPES,
@@ -56,12 +57,16 @@ describe('normalizeGoogleError', () => {
 });
 
 describe('scopes', () => {
-  it('CSV includes the bounded usage-report scope with existing services', () => {
+  it('CSV includes inbound Gmail and bounded usage/audit report scopes', () => {
     expect(ALL_DWD_SCOPES_CSV).toBe(
-      [...DIRECTORY_SCOPES, ...GMAIL_USER_SCOPES, ...CALENDAR_SCOPES, ...LICENSING_SCOPES, ...REPORTS_SCOPES, ...AUDIT_REPORTS_SCOPES].join(','),
+      [...DIRECTORY_SCOPES, ...GMAIL_USER_SCOPES, ...GMAIL_INBOUND_SCOPES, ...CALENDAR_SCOPES, ...LICENSING_SCOPES, ...REPORTS_SCOPES, ...AUDIT_REPORTS_SCOPES].join(','),
     );
     expect(ALL_DWD_SCOPES_CSV).toContain('admin.directory.user');
     expect(ALL_DWD_SCOPES_CSV).toContain('gmail.settings.sharing');
+    expect(ALL_DWD_SCOPES_CSV).toContain('gmail.readonly'); // inbound connector read scope
+    expect(ALL_DWD_SCOPES_CSV).not.toContain('gmail.modify'); // least privilege: the connector never writes
+    expect(ALL_DWD_SCOPES_CSV).toContain('openid'); // inbound connector identity
+    expect(ALL_DWD_SCOPES_CSV).toContain('userinfo.email');
     expect(ALL_DWD_SCOPES_CSV).toContain('apps.licensing');
     expect(ALL_DWD_SCOPES_CSV).toContain('calendar.acls');
     expect(ALL_DWD_SCOPES_CSV).toContain('admin.reports.usage.readonly');

@@ -855,6 +855,7 @@
         "reorderSections": "Abschnitte konnten nicht neu angeordnet werden.",
         "saveCoverPage": "Das Deckblatt konnte nicht gespeichert werden",
         "saveCustomer": "Kunde konnte nicht geändert werden.",
+        "saveFooter": "Die Fußzeile konnte nicht gespeichert werden.",
         "saveTerms": "Die Bedingungen konnten nicht gespeichert werden.",
         "saveTitle": "Der Titel konnte nicht gespeichert werden.",
         "unitPriceZeroOrMore": "Geben Sie einen Stückpreis von 0 oder mehr ein.",
@@ -995,6 +996,15 @@
         "headerStyleAccent": "Akzent",
         "reshapedWarning": "Diese Tabelle überschritt das Limit von {{columns}} Spalten x {{rows}} Zeilen und wurde angepasst. Beim Speichern wird die gespeicherte Tabelle durch die hier angezeigte ersetzt."
       },
+      "footer": {
+        "title": "Fußzeile (jede Seite)",
+        "helper": "Eine kurze Zeile, die unten auf jeder Seite gedruckt wird – z. B. Gültigkeitsdaten. Leer lassen, um die Standard-Fußzeile zu verwenden. Kleingedrucktes gehört in die Allgemeinen Geschäftsbedingungen, nicht hierher.",
+        "placeholder": "Leer = Standard-Fußzeile verwenden",
+        "inheritedPartner": "Verwendet die Partner-Rechnungsfußzeile aus den Einstellungen: „{{text}}“",
+        "inheritedBrand": "Verwendet den Fußzeilentext des Markenkits: „{{text}}“",
+        "inheritedNone": "In den Einstellungen ist keine Standard-Fußzeile festgelegt – die Seitenfußzeile bleibt leer.",
+        "counter": "{{count}} / {{max}}"
+      },
       "terms": {
         "placeholder": "Zahlungsbedingungen, Lieferhinweise usw.",
         "title": "Allgemeine Geschäftsbedingungen (Klartext)",
@@ -1125,8 +1135,11 @@
         "recipientRequired": "Geben Sie mindestens einen Empfänger ein, um zu senden.",
         "signaturePreviewLabel": "Signatur (festgelegt unter Einstellungen → Branding):",
         "subjectLabel": "Betreff",
-        "subjectPlaceholder": "Angebot {{number}} von Ihrem Unternehmen",
-        "subjectPlaceholderNoNumber": "Angebot von Ihrem Unternehmen",
+        "subjectPartnerFallback": "Ihrem Unternehmen",
+        "subjectPlaceholder": "Angebot {{number}} von {{partner}}",
+        "subjectPlaceholderNoNumber": "Angebot von {{partner}}",
+        "subjectPlaceholderTemplate": "Verwendet den Betreff aus Ihrer Angebots-E-Mail-Vorlage",
+        "subjectPlaceholderTitled": "{{title}} — Angebot von {{partner}}",
         "title": "Dieses Angebot senden?",
         "toLabel": "An",
         "toPlaceholder": "Empfänger hinzufügen…",
@@ -2202,22 +2215,33 @@
       "taxId": "Steuer-ID",
       "taxRate": "Steuersatz (%)",
       "title": "Steuer"
+    },
+    "terms": {
+      "description": "Tage ab Rechnungsstellung, bis die Rechnungen dieser Organisation fällig sind. Leer lassen, um den Partnerstandard zu verwenden. Änderungen gelten für ab jetzt ausgestellte Rechnungen; ausgestellte Rechnungen behalten ihr Fälligkeitsdatum.",
+      "invalid": "Geben Sie eine ganze Zahl von 0 bis 365 Tagen ein.",
+      "partnerDefault": "Partnerstandard",
+      "paymentTermsDays": "Zahlungsbedingungen (Tage)",
+      "title": "Zahlungsbedingungen"
     }
   },
   "partnerBillingSettings": {
     "company": {
+      "addressInherited": "Wie in den Unternehmensdetails",
       "addressLine1": "Adresszeile 1",
       "addressLine2": "Adresszeile 2",
+      "addressTitle": "Adresse",
       "city": "Stadt",
       "country": "Land",
       "defaultTerms": "Standard-Geschäftsbedingungen",
       "defaultTermsPlaceholder": "Zahlungsbedingungen, Haftungsausschlüsse, Garantiebedingungen usw.",
       "description": "Wird in Angeboten und Rechnungen als Verkäufer angezeigt.",
+      "inheritedFromCompanyDetails": "Unternehmensdetails",
       "name": "Firmenname",
       "phone": "Telefon",
       "postal": "Postleitzahl",
       "region": "Bundesland/Region",
       "title": "Firmenkontakt",
+      "useCompanyAddress": "Unternehmensadresse verwenden",
       "website": "Website"
     },
     "defaults": {

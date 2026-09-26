@@ -43,7 +43,15 @@ const { settleMock } = vi.hoisted(() => ({ settleMock: vi.fn() }));
 vi.mock('../services/stripeSettle', () => ({ settleCheckoutSession: settleMock }));
 
 const { getPdfMock, renderPdfMock } = vi.hoisted(() => ({ getPdfMock: vi.fn(), renderPdfMock: vi.fn() }));
-vi.mock('../services/invoicePdf', () => ({ getInvoicePdf: getPdfMock, renderInvoicePdf: renderPdfMock }));
+vi.mock('../services/invoicePdf', () => ({
+  getInvoicePdf: getPdfMock, renderInvoicePdf: renderPdfMock,
+  // The db is mocked, so the ticket-label expression is never compiled here;
+  // the snapshot semantics are covered by invoiceTicketLabelSnapshot.integration
+  // and invoiceTicketHeaderSnapshot.integration.
+  invoiceLineTicketNumberSql: vi.fn(() => 'ticket_label_sql'),
+  invoiceLineTicketSubjectSql: vi.fn(() => 'ticket_subject_sql'),
+  invoiceLineTicketCategorySql: vi.fn(() => 'ticket_category_sql'),
+}));
 
 vi.mock('../services/portalUrl', () => ({ portalBase: () => 'https://portal.example.test/portal' }));
 vi.mock('../services/redis', () => ({ getRedis: () => null })); // limiter fails open
@@ -120,6 +128,30 @@ describe('GET /invoices/public/:token', () => {
     expect(data.invoice.invoiceNumber).toBe('INV-2026-0007');
     expect(data.branding.partnerName).toBe('Lantern MSP');
     expect(markViewedMock).toHaveBeenCalledWith(INV_ID, ORG_ID);
+  });
+
+  // #6227: an issued invoice renders the presentation frozen at issue, not the
+  // partner's live default (settings audit rule 6).
+  it("renders the invoice's frozen theme/page size, not the partner's current ones", async () => {
+    resolveMock.mockResolvedValue(invoice({ documentTheme: 'condensed', documentPageSize: 'letter' }));
+    dbResults.push(
+      [{ ...PARTNER_ROW[0], documentTheme: 'classic', documentPageSize: 'a4' }],
+      BRAND_ROW,
+      [{ name: 'RMM seat', quantity: '5' }],
+    );
+    const res = await app().request(`/invoices/public/${TOKEN}`);
+    expect(res.status).toBe(200);
+    const { data } = await res.json();
+    expect(data.branding).toMatchObject({ theme: 'condensed', pageSize: 'letter' });
+  });
+
+  it('a void invoice also keeps its frozen presentation', async () => {
+    resolveMock.mockResolvedValue(invoice({ status: 'void', documentTheme: 'condensed', documentPageSize: 'letter' }));
+    dbResults.push([{ ...PARTNER_ROW[0], documentTheme: 'classic', documentPageSize: 'a4' }], BRAND_ROW);
+    const res = await app().request(`/invoices/public/${TOKEN}`);
+    expect(res.status).toBe(200);
+    const { data } = await res.json();
+    expect(data.branding).toMatchObject({ theme: 'condensed', pageSize: 'letter' });
   });
 
   // #5856: the route selects ticketId/ticketSubject for grouping, but the wire

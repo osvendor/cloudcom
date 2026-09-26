@@ -433,6 +433,16 @@ describe('parts routes', () => {
 describe('GET /export/billables.csv', () => {
   beforeEach(resetMocks);
 
+  it('passes an end-of-day `to` so entries on the last day are exported (sweep C2)', async () => {
+    timeServiceMocks.listBillables.mockResolvedValue({ rows: [], totalsByCurrency: [] });
+    const res = await ticketsRoutes.request('/export/billables.csv?from=2026-06-01&to=2026-06-30');
+    expect(res.status).toBe(200);
+    const [from, to] = timeServiceMocks.listBillables.mock.calls[0]!;
+    expect((from as Date).toISOString()).toBe('2026-06-01T00:00:00.000Z');
+    // Same inclusive end as invoice assembly (`${to}T23:59:59Z`).
+    expect((to as Date).toISOString()).toBe('2026-06-30T23:59:59.000Z');
+  });
+
   it('returns CSV with headers and no cost_basis column', async () => {
     timeServiceMocks.listBillables.mockResolvedValue({
       rows: [{
@@ -450,7 +460,9 @@ describe('GET /export/billables.csv', () => {
     const body = await res.text();
     const headerLine = body.split('\n')[0];
     const dataLine = body.split('\n')[1]?.replaceAll('"', '');
-    expect(headerLine).toBe('"type","date","organization","ticket","description","technician","quantity","rate","amount","currency","billing_status","approved"');
+    // #4628 W04: work_type and included_minutes are APPENDED, never inserted —
+    // existing importers map this file by column index.
+    expect(headerLine).toBe('"type","date","organization","ticket","description","technician","quantity","rate","amount","currency","billing_status","approved","work_type","included_minutes"');
     expect(body).toContain('T-2026-0001');
     expect(dataLine).toContain(',62.50,USD,not_billed,');
     expect(body).not.toContain('cost');
@@ -487,6 +499,50 @@ describe('GET /export/billables.csv', () => {
     // the raw `body` for an unquoted ',0.00,USD,' would never match even
     // without the fix — assert against the de-quoted `dataLine` instead.
     expect(dataLine).not.toContain(',0.00,');
+  });
+
+  it('fills work_type and included_minutes as the LAST two cells of a time row (#4628 W04)', async () => {
+    timeServiceMocks.listBillables.mockResolvedValue({
+      rows: [{
+        kind: 'time', date: new Date('2026-06-10T10:00:00Z'), orgName: 'Acme',
+        ticketNumber: 'T-2026-0003', description: 'covered', technician: 'Tess',
+        quantity: '1.00', rate: null, amount: '0.00', missingRate: false,
+        currencyCode: 'USD', billingStatus: 'contract', isApproved: true,
+        workTypeName: 'Remote', coverage: 'included', includedMinutes: 45,
+      }],
+      totalsByCurrency: []
+    });
+    const res = await ticketsRoutes.request('/export/billables.csv?from=2026-06-01&to=2026-06-30');
+    const dataLine = (await res.text()).split('\n')[1]?.replaceAll('"', '');
+    expect(dataLine?.endsWith(',contract,true,Remote,45')).toBe(true);
+  });
+
+  it('leaves both new cells empty on a part row, and work_type empty on a time row with none (#4628 W04)', async () => {
+    timeServiceMocks.listBillables.mockResolvedValue({
+      rows: [
+        {
+          kind: 'time', date: new Date('2026-06-10T10:00:00Z'), orgName: 'Acme',
+          ticketNumber: 'T-2026-0004', description: 'labor', technician: 'Tess',
+          quantity: '1.00', rate: '100.00', amount: '100.00', missingRate: false,
+          currencyCode: 'USD', billingStatus: 'not_billed', isApproved: true,
+          workTypeName: null, coverage: 'billable', includedMinutes: 0,
+        },
+        {
+          kind: 'part', date: new Date('2026-06-10T11:00:00Z'), orgName: 'Acme',
+          ticketNumber: 'T-2026-0004', description: 'SSD', technician: 'Tess',
+          quantity: '1', rate: '200.00', amount: '200.00', missingRate: false,
+          currencyCode: 'USD', billingStatus: 'not_billed', isApproved: null,
+          workTypeName: null, coverage: null, includedMinutes: 0,
+        },
+      ],
+      totalsByCurrency: []
+    });
+    const res = await ticketsRoutes.request('/export/billables.csv?from=2026-06-01&to=2026-06-30');
+    const [, timeLine, partLine] = (await res.text()).split('\n').map((l) => l.replaceAll('"', ''));
+    // A time row always reports a count (0 when nothing was included) so the
+    // column sums cleanly; a part row has no labour dimension at all.
+    expect(timeLine?.endsWith(',not_billed,true,,0')).toBe(true);
+    expect(partLine?.endsWith(',not_billed,,,')).toBe(true);
   });
 
   it('rejects missing date params with 400', async () => {
@@ -570,7 +626,7 @@ describe('GET /export/billables.csv', () => {
 
     expect(res.status).toBe(200);
     expect(await res.text()).toBe(
-      '"type","date","organization","ticket","description","technician","quantity","rate","amount","currency","billing_status","approved"',
+      '"type","date","organization","ticket","description","technician","quantity","rate","amount","currency","billing_status","approved","work_type","included_minutes"',
     );
   });
 });

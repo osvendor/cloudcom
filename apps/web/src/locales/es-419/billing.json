@@ -855,6 +855,7 @@
         "reorderSections": "No se pudieron reordenar las secciones.",
         "saveCoverPage": "No se pudo guardar la portada",
         "saveCustomer": "No se pudo cambiar el cliente.",
+        "saveFooter": "No se pudo guardar el pie de página.",
         "saveTerms": "No se pudieron guardar los términos.",
         "saveTitle": "No se pudo guardar el título.",
         "unitPriceZeroOrMore": "Introduzca un precio unitario de 0 o más.",
@@ -995,6 +996,15 @@
         "headerStyleAccent": "Acento",
         "reshapedWarning": "Esta tabla no cabía en el límite de {{columns}} columnas x {{rows}} filas, así que se ajustó. Al guardar, se reemplaza la tabla almacenada por la que ves aquí."
       },
+      "footer": {
+        "title": "Línea de pie de página (todas las páginas)",
+        "helper": "Una línea corta impresa en la parte inferior de cada página, por ejemplo, fechas de vigencia. Déjelo en blanco para usar el pie de página predeterminado. La letra pequeña va en Términos y condiciones, no aquí.",
+        "placeholder": "En blanco = usar el pie de página predeterminado",
+        "inheritedPartner": "Usando el pie de página de factura del socio desde Configuración: “{{text}}”",
+        "inheritedBrand": "Usando el texto de pie de página del kit de marca: “{{text}}”",
+        "inheritedNone": "No hay un pie de página predeterminado establecido en Configuración; el pie de página quedará vacío.",
+        "counter": "{{count}} / {{max}}"
+      },
       "terms": {
         "placeholder": "Condiciones de pago, notas de entrega, etc.",
         "title": "Términos y condiciones (texto sin formato)",
@@ -1125,8 +1135,11 @@
         "recipientRequired": "Ingresa al menos un destinatario para enviar.",
         "signaturePreviewLabel": "Firma (configurada en Configuración → Marca):",
         "subjectLabel": "Asunto",
-        "subjectPlaceholder": "Propuesta {{number}} de tu empresa",
-        "subjectPlaceholderNoNumber": "Propuesta de tu empresa",
+        "subjectPartnerFallback": "tu empresa",
+        "subjectPlaceholder": "Propuesta {{number}} de {{partner}}",
+        "subjectPlaceholderNoNumber": "Propuesta de {{partner}}",
+        "subjectPlaceholderTemplate": "Usa el asunto de tu plantilla de correo de propuesta",
+        "subjectPlaceholderTitled": "{{title}} — propuesta de {{partner}}",
         "title": "¿Enviar esta propuesta?",
         "toLabel": "Para",
         "toPlaceholder": "Agregar destinatario…",
@@ -2202,22 +2215,33 @@
       "taxId": "Impuesto ID",
       "taxRate": "Tasa impositiva (%)",
       "title": "Impuesto"
+    },
+    "terms": {
+      "description": "Días desde la emisión hasta el vencimiento de las facturas de esta organización. Déjelo en blanco para usar el valor predeterminado del socio. Los cambios se aplican a las facturas emitidas a partir de ahora; las facturas emitidas conservan su fecha de vencimiento.",
+      "invalid": "Ingrese un número entero de días entre 0 y 365.",
+      "partnerDefault": "Valor predeterminado del socio",
+      "paymentTermsDays": "Condiciones de pago (días)",
+      "title": "Condiciones de pago"
     }
   },
   "partnerBillingSettings": {
     "company": {
+      "addressInherited": "Igual que en los detalles de la empresa",
       "addressLine1": "Dirección Línea 1",
       "addressLine2": "Línea de dirección 2",
+      "addressTitle": "Dirección",
       "city": "Ciudad",
       "country": "País",
       "defaultTerms": "Términos y condiciones predeterminados",
       "defaultTermsPlaceholder": "Condiciones de pago, exenciones de responsabilidad, lenguaje de garantía, etc.",
       "description": "Aparece como vendedor en cotizaciones y facturas.",
+      "inheritedFromCompanyDetails": "Detalles de la empresa",
       "name": "Nombre de empresa",
       "phone": "Teléfono",
       "postal": "Código Postal",
       "region": "Estado / región",
       "title": "Contacto de la empresa",
+      "useCompanyAddress": "Usar la dirección de la empresa",
       "website": "Sitio web"
     },
     "defaults": {

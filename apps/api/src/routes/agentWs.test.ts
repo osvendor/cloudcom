@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
+import { resetUnmatchedBackupProgressCache } from '../services/backupProgress';
 import { createHash } from 'node:crypto';
 vi.mock('../services/portalRemoteLease', () => ({ renewPortalRemoteLeaseIfPresent: vi.fn(async () => null) }));
 vi.mock('../services/portalRemoteAgent', () => ({ handlePortalRemoteAgentResult: vi.fn(async () => false) }));
@@ -376,7 +377,7 @@ vi.mock('../services/sentry', async (importOriginal) => {
 });
 
 import { db, runOutsideDbContext, withSystemDbAccessContext, withDbAccessContext } from '../db';
-import { devices, deviceCommands, scriptExecutions, supportSessions } from '../db/schema';
+import { devices, deviceCommands, discoveryJobs, scriptExecutions, supportSessions } from '../db/schema';
 import { captureException, captureMessage } from '../services/sentry';
 import {
   createAgentWsHandlers,
@@ -2115,6 +2116,41 @@ describe('agent websocket command results', () => {
     expect(ws.send).toHaveBeenCalledWith(expect.stringContaining('"ack"'));
   });
 
+  // #3530: the orphaned discovery path's mark-job-failed fallback used to only
+  // console.error; a failure there left the job 'running' with nothing reported.
+  it('reports an orphaned discovery result whose job cannot be marked failed', async () => {
+    const preValidatedAgent = { deviceId: 'device-123', orgId: 'org-123', partnerId: 'partner-123' };
+    const { handlers, ws } = await connectedAgent('agent-123', preValidatedAgent);
+    const jobId = '66666666-6666-4666-8666-666666666666';
+
+    // Every lookup misses except the discovery job, so the result is orphaned
+    // and lands on the discovery branch.
+    vi.mocked(db.select).mockImplementation((() => ({
+      from: (table: unknown) => {
+        const rows = table === discoveryJobs
+          ? [{ id: jobId, orgId: 'org-123', siteId: 'site-1', agentId: 'agent-123' }]
+          : [];
+        const tail: any = {
+          where: () => tail, innerJoin: () => tail, leftJoin: () => tail, orderBy: () => tail,
+          limit: () => Promise.resolve(rows),
+          then: (res: (v: unknown) => unknown, rej?: (e: unknown) => unknown) => Promise.resolve(rows).then(res, rej),
+        };
+        return tail;
+      },
+    })) as any);
+    const writeErr = new Error('db unavailable');
+    vi.mocked(db.update).mockReturnValue({
+      set: () => ({ where: () => Promise.reject(writeErr), returning: () => Promise.reject(writeErr) }),
+    } as any);
+
+    await handlers.onMessage({
+      data: JSON.stringify({ type: 'command_result', commandId: jobId, status: 'failed', error: 'scan aborted' })
+    } as any, ws as any);
+
+    expect(vi.mocked(captureException)).toHaveBeenCalledWith(writeErr, undefined,
+      { command_result_phase: 'discovery_mark_failed' });
+  });
+
   it('skips downstream processing when the command row was already completed by another result', async () => {
     const preValidatedAgent = { deviceId: 'device-123', orgId: 'org-123', partnerId: 'partner-123' };
     const { handlers, ws } = await connectedAgent('agent-123', preValidatedAgent);
@@ -2267,6 +2303,31 @@ describe('agent websocket command results', () => {
 
     expect(vi.mocked(enqueueSnmpPollResults)).not.toHaveBeenCalled();
     expect(ws.send).toHaveBeenCalledWith(expect.stringContaining('"ack"'));
+  });
+
+  // #5393: restore progress reuses backup_progress with a non-job commandId,
+  // emitted per file. Only the first drop may log; repeats are silent.
+  it('logs an unmatched backup_progress drop once, not per message (#5393)', async () => {
+    const preValidatedAgent = { deviceId: 'device-123', orgId: 'org-123', partnerId: 'partner-123' };
+    const handlers = createAgentWsHandlers('agent-5393', preValidatedAgent);
+    const ws = wsMock();
+    await connectAgentSocket(handlers, ws);
+    resetUnmatchedBackupProgressCache();
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => {});
+
+    for (let i = 0; i < 5; i++) {
+      await handlers.onMessage({
+        data: JSON.stringify({
+          type: 'backup_progress',
+          commandId: 'restore-5393-not-a-uuid',
+          progress: { filesDone: i },
+        })
+      } as any, ws as any);
+    }
+
+    const dropLogs = debugSpy.mock.calls.filter((c) => String(c[0]).includes('Dropping backup_progress'));
+    expect(dropLogs).toHaveLength(1);
+    debugSpy.mockRestore();
   });
 
   // H5: malformed term-* command_result is dropped without DB call
@@ -5577,5 +5638,61 @@ describe('#6607 — onOpen survives a markOnline DB failure', () => {
       // a live timer and a stale activeConnections entry into later suites.
       await handlers.onClose({} as never, ws as never);
     }
+  });
+});
+
+// #6836: same shape as #6607, but for onClose's markOffline path. The inner
+// try/catch there only covers the query/transition body — when the context
+// PROLOGUE itself fails (a `DbAccessContextPrologueTimeoutError`), the
+// rejection used to escape the whole `runWithAgentDbAccess` call, the WS
+// adapter drops the promise onClose returns, and it surfaced as a
+// process-level unhandled rejection while the device was never marked
+// offline here (left for the offline detector, which is the intended
+// fallback — just not via an unhandled rejection).
+describe('#6836 — onClose survives a markOffline context-prologue failure', () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(withDbAccessContext).mockImplementation((async (_ctx: any, fn: any) => fn()) as never);
+    vi.mocked(publishEvent).mockResolvedValue('event-id');
+  });
+
+  afterEach(() => {
+    vi.mocked(withDbAccessContext).mockImplementation((async (_ctx: any, fn: any) => fn()) as never);
+  });
+
+  it('resolves (does not reject) and reports the failure, leaving the row for the offline detector', async () => {
+    const markOfflineFailure = new Error(
+      'RLS GUC prologue for withDbAccessContext(agentWs.onClose.markOffline) did not complete within 15000ms',
+    );
+
+    // onOpen must succeed normally so the connection is registered as
+    // active — onClose's markOffline branch only runs for the current
+    // connection.
+    vi.mocked(db.update).mockReturnValue({ set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([]) }) } as never);
+    vi.mocked(db.select).mockReturnValue(selectAgentDevice([]) as never);
+
+    const handlers = createAgentWsHandlers('agent-6836', {
+      deviceId: 'device-6836', orgId: 'org-6836', partnerId: 'partner-6836',
+    });
+    const ws = wsMock();
+    await handlers.onOpen({}, ws as never);
+
+    // Now make only the onClose markOffline context prologue reject.
+    vi.mocked(withDbAccessContext).mockImplementation((async (ctx: any, fn: any) => {
+      if (ctx?.label === 'agentWs.onClose.markOffline') throw markOfflineFailure;
+      return fn();
+    }) as never);
+    transitionDeviceOfflineMock.mockClear();
+
+    // The bug: this rejected instead of resolving, which the WS adapter
+    // drops as a process-level unhandled rejection.
+    await expect(handlers.onClose({}, ws as never)).resolves.toBeUndefined();
+
+    // The offline detector remains the fallback — no transition attempted
+    // here since the context never opened to run the body.
+    expect(transitionDeviceOfflineMock).not.toHaveBeenCalled();
+
+    // The failure is reported, not swallowed.
+    expect(captureException).toHaveBeenCalledWith(markOfflineFailure);
   });
 });

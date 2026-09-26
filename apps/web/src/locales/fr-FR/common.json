@@ -67,6 +67,7 @@
     "fleetDesign": "Conception de flotte",
     "customFields": "Champs personnalisés",
     "savedFilters": "Filtres enregistrés",
+    "moreSettings": "Plus de paramètres",
     "users": "Utilisateurs",
     "roles": "Rôles",
     "sso": "SSO",
@@ -98,7 +99,9 @@
     "serviceManagement": "Gestion des services",
     "ticketing": "Tickets",
     "deliverableTemplates": "Modèles de livrables",
-    "securityScans": "Analyses IOC"
+    "securityScans": "Analyses IOC",
+    "system": "Système",
+    "monitorConversion": "Conversion des moniteurs"
   },
   "documentTitles": {
     "dashboard": "Tableau de bord",
@@ -218,7 +221,7 @@
     "mcp": {
       "connecting": "Connecter un agent IA ?",
       "title": "Adressez votre agent IA ici",
-      "description": "Collez ce URL dans votre client MCP (Claude.ai, ChatGPT, Cursor, ...). Vous serez renvoyé ici pour autoriser la connexion via OAuth."
+      "description": "Collez ce URL dans votre client MCP (Claude.ai, ChatGPT, Cursor, ...). Vous serez renvoyé ici pour autoriser la connexion via OAuth. Vous préférez une clé API ? Envoyez un en-tête X-API-Key avec le scope ai:read/ai:write."
     },
     "progress": {
       "count": "{{current}} de {{total}}",
@@ -1470,6 +1473,12 @@
           "editTitle": "Modifier le webhook"
         },
         "subtitle": "Livrez des événements vers des systèmes externes.",
+        "success": {
+          "created": "Webhook créé",
+          "disabled": "Webhook désactivé",
+          "enabled": "Webhook activé",
+          "updated": "Webhook mis à jour"
+        },
         "title": "Webhooks"
       }
     },
@@ -2445,7 +2454,7 @@
         },
         "title": "Suggestions de solutions",
         "refresh": "Actualiser les solutions suggérées",
-        "disabledTitle": "Les solutions proposées sont désactivées pour cette organisation",
+        "disabledTitle": "Les solutions proposées sont désactivées pour cette organisation. Activez-les dans Paramètres → Partenaire → Fonctionnalités IA, ou pour une seule organisation dans son onglet IA.",
         "suggestionsDisabled": "Suggestions désactivées",
         "generate": "Générer",
         "empty": "Aucune solution suggérée pour l’instant.",

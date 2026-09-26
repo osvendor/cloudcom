@@ -15,10 +15,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertCircle, History, Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { formatNumber } from '@/lib/i18n/format';
 import { fetchWithAuth } from '@/stores/auth';
 import '@/lib/i18n';
 import { formatBytes, formatDateTime } from './filesystemTabUtils';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 const PAGE_LIMIT = 20;
 // #6485 F-6: a run started elsewhere (the AI lane, another tech's tab) never
@@ -42,10 +42,10 @@ export type CleanupRunListItem = {
 };
 
 const statusClasses: Record<string, string> = {
-  previewed: 'bg-gray-500/15 text-gray-700 border-gray-500/30',
-  running: 'bg-blue-500/15 text-blue-700 border-blue-500/30',
-  executed: 'bg-green-500/15 text-green-700 border-green-500/30',
-  failed: 'bg-red-500/15 text-red-700 border-red-500/30',
+  previewed: 'bg-gray-500/15 text-gray-700 border-gray-500/30 dark:text-gray-300',
+  running: 'bg-blue-500/15 text-blue-700 border-blue-500/30 dark:text-blue-300',
+  executed: 'bg-green-500/15 text-green-700 border-green-500/30 dark:text-green-300',
+  failed: 'bg-red-500/15 text-red-700 border-red-500/30 dark:text-red-300',
 };
 
 function isAbort(error: unknown): boolean {
@@ -56,6 +56,7 @@ type Props = { deviceId: string; refreshToken: number };
 
 export default function CleanupRunHistory({ deviceId, refreshToken }: Props) {
   const { t } = useTranslation('devices');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [runs, setRuns] = useState<CleanupRunListItem[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -87,7 +88,7 @@ export default function CleanupRunHistory({ deviceId, refreshToken }: Props) {
           { signal: controller.signal },
         );
         if (controller.signal.aborted) return;
-        if (!response.ok) throw new Error(t('deviceFilesystemTab.historyFailed'));
+        if (!response.ok) throw new Error(stableT('deviceFilesystemTab.historyFailed'));
 
         const body = await response.json();
         const page = (body?.data?.runs ?? []) as CleanupRunListItem[];
@@ -96,12 +97,12 @@ export default function CleanupRunHistory({ deviceId, refreshToken }: Props) {
         setNextCursor((body?.data?.nextCursor ?? null) as string | null);
       } catch (err) {
         if (isAbort(err) || controller.signal.aborted) return;
-        setError(t('deviceFilesystemTab.historyFailed'));
+        setError(stableT('deviceFilesystemTab.historyFailed'));
       } finally {
         if (!controller.signal.aborted) setLoading(false);
       }
     },
-    [deviceId, t],
+    [deviceId, stableT],
   );
 
   useEffect(() => {
@@ -174,7 +175,9 @@ export default function CleanupRunHistory({ deviceId, refreshToken }: Props) {
                 {run.estimatedBytes > 0
                   ? ` · ${t('deviceFilesystemTab.historyReclaimable', { size: formatBytes(run.estimatedBytes) })}`
                   : ''}
-                {run.actionCount > 0 ? ` · ${formatNumber(run.actionCount)}` : ''}
+                {run.actionCount > 0
+                  ? ` · ${t('deviceFilesystemTab.historyActions', { count: run.actionCount })}`
+                  : ''}
               </p>
               {run.error && <p className="text-xs text-amber-700">{run.error}</p>}
             </div>

@@ -26,6 +26,7 @@ import {
   configurationPolicies,
   configPolicyEffectiveFeatureLinks,
   configPolicyEventLogSettings,
+  configPolicyHardwareMonitoringSettings,
   configPolicyMonitoringSettings,
   configPolicyMonitoringWatches,
   configPolicyOnedriveSettings,
@@ -63,7 +64,8 @@ import {
 } from '../../services/featureConfigResolver';
 import { resolveEffectiveWarrantyInlineSettings } from '../../services/warrantyPolicyResolution';
 import { warrantyHpCmslCollectionEffective } from '@breeze/shared/validators';
-import { policyOwnershipCondition } from '../../services/configPolicyOwnership';
+import { policyOwnershipCondition, withDevicePartnerPolicyVisibility } from '../../services/configPolicyOwnership';
+import { HARDWARE_MONITORING_DEFAULTS, hardwareMonitoringInlineSettingsSchema, type HardwareMonitoringInlineSettings } from '@breeze/shared';
 import { resolveUserGroupMembershipCached } from '../../services/onedriveGraph';
 import { captureException } from '../../services/sentry';
 import { getBinaryEdition } from '../../services/binaryEdition';
@@ -2032,6 +2034,167 @@ export async function buildEventLogConfigUpdate(deviceId: string): Promise<{
   };
 }
 
+type HardwareMonitoringPolicyView = { enabled: boolean; source: 'default' | 'policy'; policyName?: string };
+
+/**
+ * Resolve hardware-monitoring collection settings for a device via the full
+ * assignment hierarchy (device → device_group → site → org → partner),
+ * mirroring `resolveDeviceEventLogSettings`. Also returns provenance
+ * (`policy`/`default` + policy name) for Task 13's AI/read surfaces.
+ *
+ * Uses `withDevicePartnerPolicyVisibility` to temporarily widen visibility to
+ * the device's own partner on this transaction only — the settings table is
+ * reached through `configuration_policies`, whose RLS predicate is
+ * `breeze_has_org_access(org_id) OR breeze_has_partner_access(partner_id)`, and
+ * an org-scoped caller's context does not carry its own partner id in
+ * `accessiblePartnerIds`.
+ */
+async function resolveHardwareMonitoring(deviceId: string): Promise<{ settings: HardwareMonitoringInlineSettings; policy: HardwareMonitoringPolicyView }> {
+  const fallback = { settings: { ...HARDWARE_MONITORING_DEFAULTS }, policy: { enabled: HARDWARE_MONITORING_DEFAULTS.enabled, source: 'default' as const } };
+
+  const [device] = await db
+    .select({
+      orgId: devices.orgId,
+      siteId: devices.siteId,
+      deviceRole: devices.deviceRole,
+      osType: devices.osType,
+    })
+    .from(devices)
+    .where(eq(devices.id, deviceId))
+    .limit(1);
+
+  if (!device) return fallback;
+
+  const [org] = await db
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, device.orgId))
+    .limit(1);
+
+  const groupRows = await db
+    .select({ groupId: deviceGroupMemberships.groupId })
+    .from(deviceGroupMemberships)
+    .where(eq(deviceGroupMemberships.deviceId, deviceId));
+  const groupIds = groupRows.map((r) => r.groupId);
+
+  const targetConditions = [
+    and(eq(configPolicyAssignments.level, 'device'), eq(configPolicyAssignments.targetId, deviceId)),
+    and(eq(configPolicyAssignments.level, 'site'), eq(configPolicyAssignments.targetId, device.siteId)),
+    and(eq(configPolicyAssignments.level, 'organization'), eq(configPolicyAssignments.targetId, device.orgId)),
+  ];
+  if (groupIds.length > 0) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'device_group'), inArray(configPolicyAssignments.targetId, groupIds))!
+    );
+  }
+  if (org?.partnerId) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'partner'), eq(configPolicyAssignments.targetId, org.partnerId))!
+    );
+  }
+
+  const rows = await withDevicePartnerPolicyVisibility(db, org?.partnerId ?? null, async (executor) =>
+    executor
+      .select({
+        policyName: configurationPolicies.name,
+        level: configPolicyAssignments.level,
+        assignmentPriority: configPolicyAssignments.priority,
+        roleFilter: configPolicyAssignments.roleFilter,
+        osFilter: configPolicyAssignments.osFilter,
+        enabled: configPolicyHardwareMonitoringSettings.enabled,
+        pollIntervalMinutes: configPolicyHardwareMonitoringSettings.pollIntervalMinutes,
+        diskHealthIntervalMinutes: configPolicyHardwareMonitoringSettings.diskHealthIntervalMinutes,
+      })
+      .from(configPolicyAssignments)
+      .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
+      .innerJoin(configPolicyEffectiveFeatureLinks, and(
+        eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
+        eq(configPolicyEffectiveFeatureLinks.featureType, 'hardware_monitoring'),
+      ))
+      .innerJoin(configPolicyHardwareMonitoringSettings, eq(configPolicyHardwareMonitoringSettings.featureLinkId, configPolicyEffectiveFeatureLinks.id))
+      .where(and(
+        eq(configurationPolicies.status, 'active'),
+        policyOwnershipCondition({ orgId: device.orgId, partnerId: org?.partnerId ?? null }),
+        or(...targetConditions),
+        ...buildRoleOsFilterConditions({ deviceRole: device.deviceRole, osType: device.osType }),
+      ))
+  );
+
+  const eligible = rows.filter((r) =>
+    matchesRoleOsFilter(r, { deviceRole: device.deviceRole, osType: device.osType })
+  );
+  eligible.sort((a, b) => {
+    const levelDiff = (LEVEL_PRIORITY[b.level] ?? 0) - (LEVEL_PRIORITY[a.level] ?? 0);
+    if (levelDiff !== 0) return levelDiff;
+    return a.assignmentPriority - b.assignmentPriority;
+  });
+
+  const winner = eligible[0];
+  if (!winner) return fallback;
+  return {
+    settings: hardwareMonitoringInlineSettingsSchema.parse(winner),
+    policy: { enabled: winner.enabled, source: 'policy', policyName: winner.policyName },
+  };
+}
+
+export async function resolveDeviceHardwareMonitoringSettings(deviceId: string): Promise<HardwareMonitoringInlineSettings> {
+  return (await resolveHardwareMonitoring(deviceId)).settings;
+}
+
+export async function resolveDeviceHardwareMonitoringPolicy(deviceId: string): Promise<HardwareMonitoringPolicyView> {
+  return (await resolveHardwareMonitoring(deviceId)).policy;
+}
+
+export const HARDWARE_MONITORING_CACHE_TTL_SECONDS = 120;
+
+/**
+ * Resolve hardware-monitoring settings for a device with a 2-min Redis cache,
+ * matching `getDeviceEventLogSettings`.
+ */
+export async function getDeviceHardwareMonitoringSettings(deviceId: string): Promise<HardwareMonitoringInlineSettings> {
+  const redis = getRedis();
+  const cacheKey = `hwmon:settings:device:${deviceId}`;
+
+  if (redis) {
+    try {
+      const cached = await redis.get(cacheKey);
+      if (cached) return hardwareMonitoringInlineSettingsSchema.parse(JSON.parse(cached));
+    } catch (cacheErr) {
+      console.warn(`[hardware-health] settings cache read failed for device ${deviceId}:`, cacheErr);
+    }
+  }
+
+  const settings = await resolveDeviceHardwareMonitoringSettings(deviceId);
+
+  if (redis) {
+    try {
+      await redis.set(cacheKey, JSON.stringify(settings), 'EX', HARDWARE_MONITORING_CACHE_TTL_SECONDS);
+    } catch (cacheErr) {
+      console.warn(`[hardware-health] settings cache write failed for device ${deviceId}:`, cacheErr);
+    }
+  }
+
+  return settings;
+}
+
+/**
+ * Build hardware_monitoring config update payload for heartbeat response.
+ * Returns agent-facing settings, including defaults when no policy is assigned.
+ */
+export async function buildHardwareMonitoringConfigUpdate(deviceId: string): Promise<{
+  enabled: boolean;
+  poll_interval_minutes: number;
+  disk_health_interval_minutes: number;
+}> {
+  const settings = await getDeviceHardwareMonitoringSettings(deviceId);
+
+  return {
+    enabled: settings.enabled,
+    poll_interval_minutes: settings.pollIntervalMinutes,
+    disk_health_interval_minutes: settings.diskHealthIntervalMinutes,
+  };
+}
+
 /**
  * Org-scoped retention lookup for the event-log retention worker.
  *
@@ -2290,47 +2453,87 @@ function unionMonitoringWatches(
   return [...merged.values()];
 }
 
-async function resolveDeviceMonitoringSettings(deviceId: string): Promise<MonitoringConfigUpdate | null> {
+/**
+ * Outcome of resolving a device's monitoring config. Three states, because the
+ * wire has three meanings (#2949):
+ *  - `unresolved`   — the answer is unknown this cycle (the device vanished
+ *                     mid-resolution, #5677). The heartbeat must OMIT
+ *                     `monitoring_settings` so the agent keeps what it has.
+ *  - `none_applies` — resolution completed and authoritatively found no
+ *                     monitoring policy and no monitor-derived watch. The agent
+ *                     must be told `watches: []`, or a deleted / unassigned /
+ *                     deactivated policy's watches keep running forever.
+ *  - `resolved`     — a policy and/or monitors produced a watch set (possibly
+ *                     empty, e.g. a policy with zero enabled watches).
+ * A resolver that THROWS is the fourth case: heartbeat.ts catches it and omits
+ * the block, same as `unresolved`.
+ */
+type DeviceMonitoringResolution =
+  | { kind: 'unresolved' }
+  | { kind: 'none_applies'; settings: MonitoringConfigUpdate }
+  | { kind: 'resolved'; settings: MonitoringConfigUpdate };
+
+async function resolveDeviceMonitoringSettings(deviceId: string): Promise<DeviceMonitoringResolution> {
   // Monitors are the primary source and win the union (#5287 W04); the policy
   // tab is read FIRST only so its query sequence is untouched by this change —
   // helpers.partnerWidePolicies.test.ts pins that sequence and must stay green
   // unmodified. Both sources emit the same frozen `MonitoringWatchConfig`
   // shape; the union below is order-independent.
-  const policy = await resolvePolicyMonitoringSettings(deviceId);
+  const policyResult = await resolvePolicyMonitoringSettings(deviceId);
   const monitorResult = await resolveMonitorDerivedWatches(deviceId);
 
   // A device that vanished between authentication and here (raced a
-  // delete/org move) must NOT be folded into "resolved with zero
-  // monitor-derived watches": unioning `[]` into a truthy (possibly also
-  // empty) policy result would produce the #2949 "stop watching" clear
-  // signal for monitors this device still legitimately has, purely because
-  // of the race — not because resolution actually found zero (#5677). Omit
-  // the monitoring update entirely this heartbeat instead, same as
-  // `resolvePolicyMonitoringSettings` already does when its own device
-  // lookup misses.
-  if (monitorResult.kind === 'device_missing') {
+  // delete/org move) must NOT be folded into "resolved with zero watches":
+  // that would produce the #2949 "stop watching" clear signal for policies and
+  // monitors this device still legitimately has, purely because of the race —
+  // not because resolution actually found zero (#5677). Omit the monitoring
+  // update entirely this heartbeat instead. Either side missing the device
+  // makes the whole answer unreliable, so both are checked.
+  if (policyResult.kind === 'device_missing' || monitorResult.kind === 'device_missing') {
     // Surface this: the device just authenticated the heartbeat that reached
     // this code, so a vanish between then and here should be rare. Silently
     // omitting the monitoring update is the right behavior (see above), but
     // silent AND invisible would hide a real bug (e.g. a stale deviceId)
     // behind "just a benign race" forever (#5677 review).
     console.warn(`[monitoring] device vanished mid-resolution, omitting monitoring update for device ${deviceId}`);
-    return null;
+    return { kind: 'unresolved' };
   }
   const monitorWatches = monitorResult.watches;
+  const policy = policyResult.kind === 'resolved' ? policyResult.settings : null;
 
-  // Null ONLY when both sources are empty AND no policy resolved. A policy that
-  // resolved with zero enabled watches still returns `watches: []` below — that
-  // is the #2949 "stop watching" signal.
-  if (!policy && monitorWatches.length === 0) return null;
+  // Nothing applies: no policy resolved AND no monitor contributes a watch.
+  // This is an authoritative answer, so it is sent as an explicit empty watch
+  // set — the agent's ApplyConfig stops the monitor and drops every watch
+  // state on `watches: []` (agent/internal/monitoring/monitor.go), and has
+  // since monitoring first shipped. Omitting the key instead reads as "no
+  // change" on the agent and strands the last delivered watches (#2949).
+  if (!policy && monitorWatches.length === 0) {
+    return {
+      kind: 'none_applies',
+      settings: { check_interval_seconds: MONITOR_ONLY_CHECK_INTERVAL_SECONDS, watches: [] },
+    };
+  }
 
   return {
-    check_interval_seconds: policy?.check_interval_seconds ?? MONITOR_ONLY_CHECK_INTERVAL_SECONDS,
-    watches: unionMonitoringWatches(monitorWatches, policy?.watches ?? []),
+    kind: 'resolved',
+    settings: {
+      check_interval_seconds: policy?.check_interval_seconds ?? MONITOR_ONLY_CHECK_INTERVAL_SECONDS,
+      watches: unionMonitoringWatches(monitorWatches, policy?.watches ?? []),
+    },
   };
 }
 
-async function resolvePolicyMonitoringSettings(deviceId: string): Promise<MonitoringConfigUpdate | null> {
+/**
+ * Discriminated so a device the policy side cannot find is never read as
+ * "no policy applies" — the latter now sends the agent an explicit clear
+ * (#2949), the former must omit the update (#5677).
+ */
+type PolicyMonitoringResult =
+  | { kind: 'device_missing' }
+  | { kind: 'no_policy' }
+  | { kind: 'resolved'; settings: MonitoringConfigUpdate };
+
+async function resolvePolicyMonitoringSettings(deviceId: string): Promise<PolicyMonitoringResult> {
   // 1. Load device
   const [device] = await db
     .select({
@@ -2343,7 +2546,7 @@ async function resolvePolicyMonitoringSettings(deviceId: string): Promise<Monito
     .where(eq(devices.id, deviceId))
     .limit(1);
 
-  if (!device) return null;
+  if (!device) return { kind: 'device_missing' };
 
   // 2. Load org (for partnerId)
   const [org] = await db
@@ -2351,6 +2554,11 @@ async function resolvePolicyMonitoringSettings(deviceId: string): Promise<Monito
     .from(organizations)
     .where(eq(organizations.id, device.orgId))
     .limit(1);
+  // An org miss (deleted mid-race) would drop the partner-level target and
+  // the partner-wide ownership branch below, so a device whose only policy
+  // is partner-wide would resolve as `no_policy` and be sent the #2949 clear.
+  // The hierarchy is unknown this cycle — same answer as a device miss.
+  if (!org) return { kind: 'device_missing' };
 
   // 3. Load device group memberships
   const groupRows = await db
@@ -2414,7 +2622,7 @@ async function resolvePolicyMonitoringSettings(deviceId: string): Promise<Monito
     matchesRoleOsFilter(r, { deviceRole: device.deviceRole, osType: device.osType })
   );
 
-  if (eligibleRows.length === 0) return null;
+  if (eligibleRows.length === 0) return { kind: 'no_policy' };
 
   // 6. Sort by level priority DESC, then assignment priority ASC — first match wins
   eligibleRows.sort((a, b) => {
@@ -2424,7 +2632,7 @@ async function resolvePolicyMonitoringSettings(deviceId: string): Promise<Monito
   });
 
   const winner = eligibleRows[0];
-  if (!winner) return null;
+  if (!winner) return { kind: 'no_policy' };
 
   // 7. Load watches for the winning settings row
   const watches = await db
@@ -2439,29 +2647,32 @@ async function resolvePolicyMonitoringSettings(deviceId: string): Promise<Monito
 
   // A winning policy row with zero enabled watches is a valid resolution — it
   // means "clear whatever watches were previously delivered", not "no policy
-  // matched" (that case already returned null above at the empty-rows check).
+  // matched" (that case already returned `no_policy` above).
   // Collapsing both to null used to make heartbeat.ts omit monitoring_settings
   // from the payload, so the agent (which handles an empty array fine — see
   // agent/internal/monitoring/monitor.go ApplyConfig) could never be told to
   // stop watching something it was configured to watch on a prior heartbeat
   // (#2949).
   return {
-    check_interval_seconds: winner.checkIntervalSeconds,
-    watches: watches.map((w) => {
-      const entry: MonitoringWatchConfig = {
-        watch_type: w.watchType,
-        name: w.name,
-        alert_on_stop: w.alertOnStop,
-        alert_after_consecutive_failures: w.alertAfterConsecutiveFailures,
-        auto_restart: w.autoRestart,
-        max_restart_attempts: w.maxRestartAttempts,
-        restart_cooldown_seconds: w.restartCooldownSeconds,
-      };
-      if (w.cpuThresholdPercent != null) entry.cpu_threshold_percent = w.cpuThresholdPercent;
-      if (w.memoryThresholdMb != null) entry.memory_threshold_mb = w.memoryThresholdMb;
-      if (w.thresholdDurationSeconds) entry.threshold_duration_seconds = w.thresholdDurationSeconds;
-      return entry;
-    }),
+    kind: 'resolved',
+    settings: {
+      check_interval_seconds: winner.checkIntervalSeconds,
+      watches: watches.map((w) => {
+        const entry: MonitoringWatchConfig = {
+          watch_type: w.watchType,
+          name: w.name,
+          alert_on_stop: w.alertOnStop,
+          alert_after_consecutive_failures: w.alertAfterConsecutiveFailures,
+          auto_restart: w.autoRestart,
+          max_restart_attempts: w.maxRestartAttempts,
+          restart_cooldown_seconds: w.restartCooldownSeconds,
+        };
+        if (w.cpuThresholdPercent != null) entry.cpu_threshold_percent = w.cpuThresholdPercent;
+        if (w.memoryThresholdMb != null) entry.memory_threshold_mb = w.memoryThresholdMb;
+        if (w.thresholdDurationSeconds) entry.threshold_duration_seconds = w.thresholdDurationSeconds;
+        return entry;
+      }),
+    },
   };
 }
 
@@ -2483,18 +2694,23 @@ export async function buildMonitoringConfigUpdate(deviceId: string): Promise<Mon
     }
   }
 
-  const settings = await resolveDeviceMonitoringSettings(deviceId);
+  const resolution = await resolveDeviceMonitoringSettings(deviceId);
 
-  // Cache the result when non-null (null results are not cached to allow quick policy activation)
-  if (redis && settings) {
+  // `unresolved` → null: heartbeat.ts omits monitoring_settings this cycle.
+  if (resolution.kind === 'unresolved') return null;
+
+  // Only a `resolved` result is cached. `none_applies` is not, so a policy
+  // assigned to a device that had none activates on the very next heartbeat
+  // instead of waiting out the TTL (the same reason null was never cached).
+  if (redis && resolution.kind === 'resolved') {
     try {
-      await redis.set(cacheKey, JSON.stringify(settings), 'EX', MONITORING_CACHE_TTL_SECONDS);
+      await redis.set(cacheKey, JSON.stringify(resolution.settings), 'EX', MONITORING_CACHE_TTL_SECONDS);
     } catch (cacheErr) {
       console.warn(`[monitoring] Redis cache write failed for device ${deviceId}:`, cacheErr);
     }
   }
 
-  return settings;
+  return resolution.settings;
 }
 
 // ============================================

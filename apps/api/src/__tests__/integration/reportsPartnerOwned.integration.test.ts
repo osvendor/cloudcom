@@ -30,6 +30,7 @@ vi.mock('../../services/reportGenerationService', async (importOriginal) => {
 
 import { withSystemDbAccessContext } from '../../db';
 import {
+  partners,
   partnerUsers,
   permissions,
   reportRuns,
@@ -43,7 +44,7 @@ import { reportRoutes } from '../../routes/reports';
 import { authMiddleware } from '../../middleware/auth';
 import { createAccessToken } from '../../services/jwt';
 import { PARTNER_WIDE_WRITE_DENIED_MESSAGE } from '../../services/partnerWideAccess';
-import { siteScopeFingerprint } from '../../services/siteScope';
+import { resolveLivePartnerReportAuthority, siteScopeFingerprint } from '../../services/siteScope';
 import { generateReport } from '../../services/reportGenerationService';
 import {
   assignUserToOrganization,
@@ -394,6 +395,56 @@ describe('partner-owned report definitions through the real routes (#3198 W01/W0
     expect(adminDelete.status).toBe(200);
     expect(await adminDelete.json()).toEqual({ success: true });
     expect(await readDefinition(created.id)).toBeUndefined();
+  });
+
+  runDb('GET /reports?ownerScope= narrows by owner axis and never widens (#3198 W03)', async () => {
+    const fixture = await seedFixture();
+    const app = buildApp();
+    const partnerOwned = await createPartnerDefinition(app, fixture, 'Partner-owned for ownerScope filter');
+    const orgRes = await call(app, fixture.adminToken, 'POST', '/reports', {
+      ownerScope: 'organization',
+      orgId: fixture.orgA.id,
+      name: 'Org-owned for ownerScope filter',
+      type: 'device_inventory',
+    });
+    expect(orgRes.status, await orgRes.clone().text()).toBe(201);
+    const orgOwned = (await orgRes.json()) as { id: string };
+
+    type ListBody = { data: Array<{ id: string; orgId: string | null; partnerId: string | null }>; pagination: { total: number } };
+    const list = async (token: string, path: string) => {
+      const res = await call(app, token, 'GET', path);
+      expect(res.status, await res.clone().text()).toBe(200);
+      return (await res.json()) as ListBody;
+    };
+
+    // All-access partner admin: partner → only the partner-owned row, and the
+    // total counts the filtered set; organization → only org-owned rows.
+    const adminPartner = await list(fixture.adminToken, '/reports?ownerScope=partner&limit=100');
+    expect(adminPartner.data.map((r) => r.id)).toEqual([partnerOwned.id]);
+    expect(adminPartner.pagination.total).toBe(1);
+    expect(adminPartner.data[0]).toMatchObject({ orgId: null, partnerId: fixture.partner.id });
+    const adminOrg = await list(fixture.adminToken, '/reports?ownerScope=organization&limit=100');
+    expect(adminOrg.data.map((r) => r.id)).toEqual([orgOwned.id]);
+    // Unfiltered listing: both (the filter is the only difference).
+    const adminAll = await list(fixture.adminToken, '/reports?limit=100');
+    expect(adminAll.data.map((r) => r.id).sort()).toEqual([partnerOwned.id, orgOwned.id].sort());
+    // An explicit orgId excludes partner-owned rows, so partner + orgId is empty.
+    const adminPartnerOrg = await list(fixture.adminToken, `/reports?ownerScope=partner&orgId=${fixture.orgA.id}&limit=100`);
+    expect(adminPartnerOrg.data).toEqual([]);
+
+    // 'selected' partner user and org token: partner → nothing, never widened.
+    const selectedPartner = await list(fixture.selectedToken, '/reports?ownerScope=partner&limit=100');
+    expect(selectedPartner).toMatchObject({ data: [], pagination: { total: 0 } });
+    const orgPartner = await list(fixture.orgToken, '/reports?ownerScope=partner&limit=100');
+    expect(orgPartner).toMatchObject({ data: [], pagination: { total: 0 } });
+    // ...while their organization view still sees the org-owned row.
+    const selectedOrg = await list(fixture.selectedToken, '/reports?ownerScope=organization&limit=100');
+    expect(selectedOrg.data.map((r) => r.id)).toEqual([orgOwned.id]);
+    const orgOrg = await list(fixture.orgToken, '/reports?ownerScope=organization&limit=100');
+    expect(orgOrg.data.map((r) => r.id)).toEqual([orgOwned.id]);
+
+    const bad = await call(app, fixture.adminToken, 'GET', '/reports?ownerScope=everyone');
+    expect(bad.status).toBe(400);
   });
 
   runDb('a selected partner user cannot list, read or download partner-owned RUNS; an all admin can (#3198 W02, addendum B2)', async () => {
@@ -942,5 +993,61 @@ describe('business report types are MSP-staff-only (#3198 W02, ruling F1)', () =
     );
     expect(await runsFor(id)).toEqual([expect.objectContaining({ status: 'completed', executionScopeUserId: fixture.admin.id })]);
     expect(generateReportSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // #6699 - abuse containment. Same definition, same still-'active' admin with
+  // org_access='all'; only the owning partner is suspended. The worker must
+  // refuse at the live-authority step with a permanent reason, never reaching
+  // the generator, and must not rethrow. The deny row carries W02's
+  // partner_wide visibility envelope (partnerDenyEnvelope), so the refusal
+  // stays readable in the partner's run history.
+  runDb('processRunScheduledReport refuses a partner-owned definition once its partner is suspended (#6699)', async () => {
+    const fixture = await seedFixture();
+    const app = buildApp();
+    const created = await createPartnerDefinition(app, fixture, 'Suspended partner AR aging');
+
+    await getTestDb()
+      .update(partners)
+      .set({ status: 'suspended' })
+      .where(eq(partners.id, fixture.partner.id));
+
+    await expect(
+      withSystemDbAccessContext(() =>
+        processRunScheduledReport(
+          { type: 'run-scheduled-report', reportId: created.id, occurrenceKey: 1 },
+          { finalAttempt: false },
+        ),
+      ),
+    ).resolves.toBeUndefined();
+    expect(generateReportSpy).not.toHaveBeenCalled();
+
+    const runs = await runsFor(created.id);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({
+      status: 'failed',
+      errorMessage: 'scope_tenant_inactive',
+      requestedByKind: 'user',
+      requestedByUserId: fixture.admin.id,
+      executionScopeKind: 'partner_wide',
+    });
+  });
+
+  // #6699 decision B: the suspended partner's definitions and run history stay
+  // readable ('read_history'); every producing action is refused.
+  runDb('a suspended partner keeps read_history but loses read/write/export/delete (#6699 decision B)', async () => {
+    const fixture = await seedFixture();
+    await getTestDb()
+      .update(partners)
+      .set({ status: 'suspended' })
+      .where(eq(partners.id, fixture.partner.id));
+
+    await expect(
+      resolveLivePartnerReportAuthority(fixture.admin.id, fixture.partner.id, 'read_history'),
+    ).resolves.toMatchObject({ ok: true, authority: { scope: { kind: 'partner_wide' } } });
+    for (const action of ['read', 'write', 'export', 'delete'] as const) {
+      await expect(
+        resolveLivePartnerReportAuthority(fixture.admin.id, fixture.partner.id, action),
+      ).resolves.toEqual({ ok: false, reason: 'tenant_inactive' });
+    }
   });
 });

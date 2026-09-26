@@ -13,6 +13,27 @@ This guide records how the CloudCom fork differs from LanternOps/Breeze and how 
 
 ## Change register
 
+### LanternOps v0.117.0 intake
+
+The intake pins upstream `880eaba02361001ecd6a5dc6863deab51d578e53` and retains
+the CloudCom 0.116.5 agent fixes for the intended 0.117.5 build. Heartbeat startup
+starts both native target reconciliation and upstream hardware collection.
+Google DWD scopes now share upstream's central declaration, including Cloud
+Command usage/audit reads and the new inbound Gmail connector. Existing OAuth
+connections remain separate from DWD.
+
+Cloud Command declares organization merge policies for all nine owned tables.
+Connections, pending consent and tenant-specific directory state remain with
+the source organization until its erasure; they are never repointed to a new
+organization. Reconnect providers explicitly on the surviving organization.
+This protects organization-bound credentials, browser consent and cached tenant
+data. The merged registry test checks this boundary.
+
+Upstream removes six legacy labour-pricing columns. A pre-upgrade database
+backup and migration verification are required; reverting application code alone
+cannot recover the previous database schema. Source integration and passing
+focused tests do not establish production deployment or endpoint update status.
+
 Managed viewer routing correction (2026-09-24): `scripts/cloudcom/rustdesk/launch-managed.ps1`
 and its dependency-free regression test pin private routing per viewer process and
 validate bundle fingerprints. See [launch and release acceptance](cloudcom-managed-viewer-launch.md).

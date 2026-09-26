@@ -74,6 +74,8 @@ import {
 import {
   logSessionAudit,
   classifyConsentDenyAction,
+  isUnsolicitedConsentReason,
+  UNSOLICITED_CONSENT_REASONS,
   resolveConsentMarkerSessionId,
   parseDesktopStartCommandId,
 } from './remote/helpers';
@@ -186,6 +188,14 @@ function inferRestoreCommandType(restoreJob: {
   }
   if (restoreJob.restoreType === 'bare_metal') {
     return 'bmr_recover';
+  }
+  // #6974: application-level restores (routes/backup/{mssql,hyperv}.ts) stamp
+  // `targetConfig.engine`; check it before the `hypervisor` heuristic below.
+  if (targetConfig.engine === 'mssql') {
+    return 'mssql_restore';
+  }
+  if (targetConfig.engine === 'hyperv') {
+    return 'hyperv_restore';
   }
   if (targetConfig.mode === 'instant_boot') {
     return 'vm_instant_boot';
@@ -1638,7 +1648,9 @@ export async function processOrphanedCommandResult(
           })
           .where(eq(discoveryJobs.id, discoveryJob.id));
       } catch (dbErr) {
+        // #3530: the orphaned-result twin of the registry handler's fallback.
         console.error(`[AgentWs] Additionally failed to mark discovery job ${discoveryJob.id} as failed:`, dbErr);
+        captureException(dbErr, undefined, { command_result_phase: 'discovery_mark_failed' });
       }
     }
     return;
@@ -3148,11 +3160,22 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
               try {
                 await runWithAgentDbAccess('agentWs.desktop.webrtcAnswer', async () => {
                   // A consent-mode generation may become active only when the
-                  // exact agent result carries the explicit user-grant marker.
-                  // Notify/off generations do not require that marker.
-                  const consentPredicate = fastResult.consentReason === 'user'
+                  // exact agent result carries a consent marker it is entitled
+                  // to: 'user' (the end user allowed), or — #6819 — an
+                  // unsolicited-consent reason (helper_absent / timeout) when
+                  // THIS start shipped consentUnavailableBehavior='proceed'. A
+                  // NULL/'block' binding fails closed. Notify/off generations
+                  // need no marker. Older agents send 'user' for every
+                  // consent-mode start; that path is unchanged.
+                  const consentReason = fastResult.consentReason;
+                  const consentPredicate = consentReason === 'user'
                     ? []
-                    : [ne(remoteSessions.desktopPromptMode, 'consent')];
+                    : isUnsolicitedConsentReason(consentReason)
+                      ? [or(
+                          ne(remoteSessions.desktopPromptMode, 'consent'),
+                          eq(remoteSessions.desktopConsentUnavailableBehavior, 'proceed'),
+                        )]
+                      : [ne(remoteSessions.desktopPromptMode, 'consent')];
                   const [updated] = await db
                     .update(remoteSessions)
                     .set({
@@ -3175,6 +3198,7 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
                       userId: remoteSessions.userId,
                       type: remoteSessions.type,
                       promptMode: remoteSessions.desktopPromptMode,
+                      consentUnavailableBehavior: remoteSessions.desktopConsentUnavailableBehavior,
                     });
 
                   if (updated) {
@@ -3202,7 +3226,36 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
                         undefined,
                         'agent',
                       );
+                    } else if (isUnsolicitedConsentReason(consentReason) && updated.promptMode === 'consent') {
+                      // #6819: nobody was asked, or nobody answered, and the
+                      // policy fallback let the session proceed. Audit it as a
+                      // bypass carrying the true reason — never as a grant.
+                      await logSessionAudit(
+                        'session_consent_bypassed',
+                        authenticatedAgent.deviceId,
+                        updated.orgId,
+                        {
+                          sessionId,
+                          type: updated.type,
+                          reason: consentReason,
+                          outcome: 'proceeded',
+                          consentUnavailableBehavior: updated.consentUnavailableBehavior,
+                          sessionOwnerId: updated.userId,
+                          deviceId: authenticatedAgent.deviceId,
+                          startCommandId: fastCommandId,
+                          promptMode: updated.promptMode,
+                          reportedBy: 'authenticated_agent',
+                        },
+                        undefined,
+                        'agent',
+                      );
                     }
+                  } else if (isUnsolicitedConsentReason(consentReason)) {
+                    // Distinct from the generic miss below: this is also what a
+                    // refused unsolicited-consent activation looks like (#6819 —
+                    // the start did not bind a `proceed` fallback), so keep it
+                    // greppable and carry the reason.
+                    console.warn(`[AgentWs] Session ${sessionId} not activated: consentReason=${consentReason} requires a bound consentUnavailableBehavior=proceed on the current start (or the session was not found / not owned by agent ${agentId})`);
                   } else {
                     console.warn(`[AgentWs] Session ${sessionId} not found or not owned by agent ${agentId}`);
                   }
@@ -3340,6 +3393,9 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
                 progress: progressMessage.progress ?? {},
               });
               if (!applied.applied) {
+                // #5393: a repeat of an already-reported unmatched commandId
+                // (restore progress is emitted per file) is dropped silently.
+                if (applied.suppressed) return;
                 // agent-mismatch is a real anomaly (an agent pinging another
                 // device's job) and stays at warn. invalid-payload joins it:
                 // since #3006 it means an agent is sending progress this server
@@ -3504,36 +3560,49 @@ onClose: async (_event: unknown, ws: WSContext) => {
         // Update device status to offline (but preserve 'updating' — let
         // the offline detector handle the timeout for stale updating devices)
         if (agentDb) {
-          await runWithAgentDbAccess('agentWs.onClose.markOffline', async () => {
-            try {
-              const [current] = await db
-                .select({ id: devices.id, siteId: devices.siteId, status: devices.status, hostname: devices.hostname })
-                .from(devices)
-                .where(eq(devices.agentId, agentId))
-                .limit(1);
-              if (!current) {
-                console.warn(`[AgentWs] Device not found for agent ${agentId} on disconnect, skipping status update`);
-                return;
+          // #6836: the inner try/catch below only covers the query/transition
+          // body. When the context PROLOGUE itself fails (observed: a
+          // `DbAccessContextPrologueTimeoutError` during a Postgres stall),
+          // the rejection escapes this whole `runWithAgentDbAccess` call, the
+          // WS adapter drops the promise onClose returns, and it surfaces as
+          // a process-level unhandled rejection — while the device is never
+          // marked offline here. Wrap the entire call: log, report, and fall
+          // back to the offline detector rather than let the rejection escape.
+          try {
+            await runWithAgentDbAccess('agentWs.onClose.markOffline', async () => {
+              try {
+                const [current] = await db
+                  .select({ id: devices.id, siteId: devices.siteId, status: devices.status, hostname: devices.hostname })
+                  .from(devices)
+                  .where(eq(devices.agentId, agentId))
+                  .limit(1);
+                if (!current) {
+                  console.warn(`[AgentWs] Device not found for agent ${agentId} on disconnect, skipping status update`);
+                  return;
+                }
+                if (current.status === 'updating') {
+                  console.log(`[AgentWs] Preserving 'updating' status for agent ${agentId} on disconnect`);
+                  return;
+                }
+                // No publishEvent('device.offline') here: when the row actually
+                // flips, transitionDeviceOffline persists an 'offline-event'
+                // effect whose worker publishes it (offlineTransitionEffects.ts).
+                // Publishing here too fired webhooks/automations twice (#6566).
+                await transitionDeviceOffline(agentId, ['online']);
+              } catch (err) {
+                console.error(`[AgentWs] Failed to check status for ${agentId} on disconnect, falling back to offline:`, err);
+                captureException(err instanceof Error ? err : new Error(String(err)));
+                // The effect path publishes device.offline (see above).
+                await transitionDeviceOffline(agentId, ['online']).catch(fallbackErr => {
+                  console.error(`[AgentWs] Failed to transition ${agentId} offline on fallback:`, fallbackErr);
+                  captureException(fallbackErr instanceof Error ? fallbackErr : new Error(String(fallbackErr)));
+                });
               }
-              if (current.status === 'updating') {
-                console.log(`[AgentWs] Preserving 'updating' status for agent ${agentId} on disconnect`);
-                return;
-              }
-              // No publishEvent('device.offline') here: when the row actually
-              // flips, transitionDeviceOffline persists an 'offline-event'
-              // effect whose worker publishes it (offlineTransitionEffects.ts).
-              // Publishing here too fired webhooks/automations twice (#6566).
-              await transitionDeviceOffline(agentId, ['online']);
-            } catch (err) {
-              console.error(`[AgentWs] Failed to check status for ${agentId} on disconnect, falling back to offline:`, err);
-              captureException(err instanceof Error ? err : new Error(String(err)));
-              // The effect path publishes device.offline (see above).
-              await transitionDeviceOffline(agentId, ['online']).catch(fallbackErr => {
-                console.error(`[AgentWs] Failed to transition ${agentId} offline on fallback:`, fallbackErr);
-                captureException(fallbackErr instanceof Error ? fallbackErr : new Error(String(fallbackErr)));
-              });
-            }
-          });
+            });
+          } catch (err) {
+            console.error(`[AgentWs] agentWs.onClose.markOffline failed for agent ${agentId}; offline detector will correct status:`, err);
+            captureException(err instanceof Error ? err : new Error(String(err)));
+          }
         }
       } else {
         console.log(`Agent ${agentId} stale connection closed (newer connection active). Active connections: ${activeConnections.size}`);
@@ -3730,10 +3799,13 @@ const desktopCommandResultSchema = z.object({
     error: z.string().max(8192).optional(),
     candidate: z.unknown().optional(),
     // Consent gate markers (Task 9). `reason` accompanies a `consent_denied`
-    // event; `consentReason` rides alongside a successful start when a consent
-    // prompt was allowed by the user.
+    // event; `consentReason` rides alongside a successful consent-mode start:
+    // 'user' when the end user allowed it, or (#6819) 'helper_absent' /
+    // 'timeout' when consent could not be solicited and the start's
+    // consentUnavailableBehavior='proceed' let it through. Older agents send
+    // 'user' for all three.
     reason: z.enum(['user', 'timeout', 'no_user', 'helper_absent']).optional(),
-    consentReason: z.literal('user').optional(),
+    consentReason: z.enum(['user', ...UNSOLICITED_CONSENT_REASONS] as const).optional(),
     // Desk-stop confirmations from fielded agents send {"stopped": true}
     // (agent/internal/heartbeat/handlers_desktop.go). Not consumed
     // server-side, but must be accepted so the result isn't dropped as

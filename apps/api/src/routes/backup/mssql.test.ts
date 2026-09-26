@@ -9,6 +9,11 @@ const SNAPSHOT_DB_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 vi.mock('../../services', () => ({}));
 
 const executeCommandMock = vi.fn();
+const queueCommandForExecutionMock = vi.fn();
+const dispatchTrackedDbRestoreMock = vi.fn();
+vi.mock('./dbRestoreJob', () => ({
+  dispatchTrackedDbRestore: (...args: unknown[]) => dispatchTrackedDbRestoreMock(...(args as [])),
+}));
 const authorizeResilienceResourcesMock = vi.fn();
 const resolveBackupConfigForDeviceMock = vi.fn();
 const resolveAllBackupAssignedDevicesMock = vi.fn();
@@ -112,6 +117,7 @@ vi.mock('../../db/schema/applicationBackup', () => ({
 
 vi.mock('../../services/commandQueue', () => ({
   executeCommand: (...args: unknown[]) => executeCommandMock(...(args as [])),
+  queueCommandForExecution: (...args: unknown[]) => queueCommandForExecutionMock(...(args as [])),
   CommandTypes: {
     MSSQL_DISCOVER: 'MSSQL_DISCOVER',
     MSSQL_BACKUP: 'MSSQL_BACKUP',
@@ -175,6 +181,8 @@ describe('mssql routes', () => {
     selectMock.mockReset();
     insertMock.mockReset();
     executeCommandMock.mockReset();
+    queueCommandForExecutionMock.mockReset();
+    dispatchTrackedDbRestoreMock.mockReset();
     resolveBackupConfigForDeviceMock.mockReset();
     resolveAllBackupAssignedDevicesMock.mockReset();
     applyBackupCommandResultToJobMock.mockReset();
@@ -218,6 +226,7 @@ describe('mssql routes', () => {
     expect(selectMock).not.toHaveBeenCalled();
     expect(insertMock).not.toHaveBeenCalled();
     expect(executeCommandMock).not.toHaveBeenCalled();
+    expect(queueCommandForExecutionMock).not.toHaveBeenCalled();
   });
 
   it('returns an empty MSSQL instance list', async () => {
@@ -582,7 +591,12 @@ describe('mssql routes', () => {
     });
   });
 
-  it('restores MSSQL from snapshot metadata instead of a local backup path', async () => {
+  // #6437: a real MSSQL restore can run well past 10 minutes, so the route
+  // must dispatch async (queueCommandForExecution) and return as soon as the
+  // command is queued, instead of blocking the HTTP request on
+  // executeCommand's 10-minute waitForCommandResult poll — which terminalised
+  // any longer-running restore as failed regardless of the reaper's ceiling.
+  it('dispatches MSSQL restore asynchronously instead of blocking on executeCommand', async () => {
     selectMock.mockReturnValueOnce(chainMock([{
         id: 'snapshot-db-1',
         providerSnapshotId: 'provider-snapshot-1',
@@ -598,9 +612,10 @@ describe('mssql routes', () => {
     // already does — resolveBackupProviderConfig looks up the destination
     // config the BACKUP wrote this snapshot to.
     queueDestinationConfigSelect();
-    executeCommandMock.mockResolvedValueOnce({
-      status: 'completed',
-      stdout: JSON.stringify({ status: 'completed' }),
+    dispatchTrackedDbRestoreMock.mockResolvedValueOnce({
+      ok: true,
+      command: { id: 'command-1', status: 'sent' },
+      restoreJobId: 'restore-job-1',
     });
 
     const res = await app.request('/backup/mssql/restore', {
@@ -613,20 +628,102 @@ describe('mssql routes', () => {
       }),
     });
 
-    expect(res.status).toBe(200);
-    expect(executeCommandMock).toHaveBeenCalledWith(
-      DEVICE_ID,
-      'MSSQL_RESTORE',
-      expect.objectContaining({
-        instance: 'MSSQLSERVER',
-        snapshotId: 'provider-snapshot-1',
-        backupFileName: 'AppDb_full_20260331.bak',
+    expect(res.status).toBe(202);
+    const body = await res.json();
+    expect(body.data).toEqual(expect.objectContaining({
+      commandId: 'command-1',
+      restoreJobId: 'restore-job-1',
+      status: 'sent',
+      deviceId: DEVICE_ID,
+      targetDatabase: 'AppDb_Restore',
+    }));
+    // executeCommand must NOT be used for restore dispatch any more — it is
+    // the synchronous, 10-minute-bounded path this fix removes.
+    expect(executeCommandMock).not.toHaveBeenCalled();
+    // #6974: dispatched through the restore_jobs-tracked helper so the
+    // terminal result is persisted (commandResultHandlers.mssql_restore).
+    expect(queueCommandForExecutionMock).not.toHaveBeenCalled();
+    const opts = dispatchTrackedDbRestoreMock.mock.lastCall?.[0] as any;
+    expect(opts).toEqual(expect.objectContaining({
+      orgId: ORG_ID,
+      snapshotId: 'snapshot-db-1',
+      deviceId: DEVICE_ID,
+      userId: 'user-123',
+      commandType: 'MSSQL_RESTORE',
+      engine: 'mssql',
+    }));
+    // The restore job id must be stamped into the command payload.
+    expect(opts.buildPayload('restore-job-1')).toEqual(expect.objectContaining({
+      restoreJobId: 'restore-job-1',
+      instance: 'MSSQLSERVER',
+      snapshotId: 'provider-snapshot-1',
+      backupFileName: 'AppDb_full_20260331.bak',
+      targetDatabase: 'AppDb_Restore',
+      provider: 'local',
+      providerConfig: { path: '/tmp/backups' },
+    }));
+  });
+
+  it('reports a 502 when MSSQL restore fails to dispatch for a non-offline reason', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{
+        id: 'snapshot-db-1',
+        providerSnapshotId: 'provider-snapshot-1',
+        metadata: {
+          backupKind: 'mssql_database',
+          instance: 'MSSQLSERVER',
+          backupFileName: 'AppDb_full_20260331.bak',
+        },
+        configId: 'config-1',
+    }]));
+    queueDestinationConfigSelect();
+    dispatchTrackedDbRestoreMock.mockResolvedValueOnce({ ok: false, error: 'Failed to enqueue command' });
+
+    const res = await app.request('/backup/mssql/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        deviceId: DEVICE_ID,
+        snapshotId: SNAPSHOT_DB_ID,
         targetDatabase: 'AppDb_Restore',
-        provider: 'local',
-        providerConfig: { path: '/tmp/backups' },
       }),
-      expect.objectContaining({ userId: 'user-123' })
-    );
+    });
+
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: 'Failed to enqueue command' });
+  });
+
+  // Mirrors routes/backup/restore.ts / vmrestore.ts: a device that is offline
+  // is a routine, expected dispatch outcome — not the same as a genuine
+  // enqueue/infra failure — so it must map to 409, not the blanket 502.
+  it('reports a 409 when the target device is offline', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{
+        id: 'snapshot-db-1',
+        providerSnapshotId: 'provider-snapshot-1',
+        metadata: {
+          backupKind: 'mssql_database',
+          instance: 'MSSQLSERVER',
+          backupFileName: 'AppDb_full_20260331.bak',
+        },
+        configId: 'config-1',
+    }]));
+    queueDestinationConfigSelect();
+    dispatchTrackedDbRestoreMock.mockResolvedValueOnce({
+      ok: false,
+      error: 'Device is offline, cannot execute command',
+    });
+
+    const res = await app.request('/backup/mssql/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        deviceId: DEVICE_ID,
+        snapshotId: SNAPSHOT_DB_ID,
+        targetDatabase: 'AppDb_Restore',
+      }),
+    });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'Device is offline, cannot execute command' });
   });
 
   // D20b item D: a snapshot that predates destination tracking (configId

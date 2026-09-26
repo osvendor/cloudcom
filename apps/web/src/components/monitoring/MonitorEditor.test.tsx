@@ -224,6 +224,51 @@ describe('MonitorEditor (#5289)', () => {
     expect(screen.getByTestId('monitor-editor-error')).not.toHaveTextContent('INVALID_MONITOR:');
   });
 
+  it('blocks the save on a condition the shared schema rejects and says why (#6371 W05c2 Task 12)', async () => {
+    fetchMock.mockImplementation(async (input: string) => defaultFetchImpl(input));
+    render(<MonitorEditor />);
+    await waitFor(() => expect(screen.getByTestId('monitor-editor')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByTestId('monitor-editor-kind'), { target: { value: 'disk' } });
+    fireEvent.change(screen.getByTestId('monitor-editor-name'), { target: { value: 'Disk full' } });
+    // percentThresholdCondition caps value at 100.
+    fireEvent.change(screen.getByTestId('condition-field-value'), { target: { value: '150' } });
+    // submit() rather than a click: the input's native max=100 would block a
+    // click-submit before react-hook-form's resolver ever runs.
+    fireEvent.submit(screen.getByTestId('monitor-editor-save').closest('form')!);
+
+    expect(await screen.findByTestId('monitor-editor-condition-error')).toHaveTextContent(
+      'Some condition values are missing or out of range',
+    );
+    expect(
+      fetchMock.mock.calls.some(([, init]) => ['POST', 'PATCH'].includes(String((init as RequestInit)?.method))),
+    ).toBe(false);
+  });
+
+  it('blocks the save on a Restart service response with no service name (D1)', async () => {
+    fetchMock.mockImplementation(async (input: string) => defaultFetchImpl(input));
+    render(<MonitorEditor />);
+    await waitFor(() => expect(screen.getByTestId('monitor-editor')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByTestId('monitor-editor-kind'), { target: { value: 'disk' } });
+    fireEvent.change(screen.getByTestId('monitor-editor-name'), { target: { value: 'Disk full' } });
+
+    fireEvent.click(screen.getAllByRole('button', { name: /add action/i })[0]);
+    const actionTypeSelect = screen.getByRole('option', { name: 'Execute Command' }).closest('select')!;
+    fireEvent.change(actionTypeSelect, { target: { value: 'execute_command' } });
+    fireEvent.click(screen.getByTestId('restart-0-toggle'));
+
+    fireEvent.submit(screen.getByTestId('monitor-editor-save').closest('form')!);
+
+    // sweep F2: the specific reason, not the generic "missing or out of range" fallback.
+    expect(await screen.findByTestId('monitor-editor-responses-error')).toHaveTextContent(
+      'Restart service requires a service name',
+    );
+    expect(
+      fetchMock.mock.calls.some(([, init]) => ['POST', 'PATCH'].includes(String((init as RequestInit)?.method))),
+    ).toBe(false);
+  });
+
   it('create mode: switching kind to disk renders its fields with defaults and submits the right condition + ownerScope', async () => {
     fetchMock.mockImplementation(async (input: string, init?: RequestInit) => {
       if (init?.method === 'POST' && input === '/monitor-definitions') return json({ data: { id: 'new-1' } }, true, 201);

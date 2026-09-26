@@ -1,5 +1,5 @@
 import type { MlFeedbackEventInput } from '@breeze/shared';
-import { emitMlFeedbackEvent } from './mlFeedback';
+import { emitMlFeedbackEvent, emitMlFeedbackEvents } from './mlFeedback';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -88,16 +88,16 @@ export async function emitAnomalyFeedback(options: {
  * W03 (spec §8.3): the ONE episode-level label row per human resolve/dismiss,
  * beside the per-member `anomaly` rows emitted by `emitAnomalyFeedback`. Not
  * best-effort: the label is written from inside the episode action's request
- * transaction (wired by a later wave), so a lost label must roll the action
- * back rather than fail silently. Only resolve/dismiss emit it — promote and
- * unsnooze never close an episode.
+ * transaction (`resolveEpisode` / `dismissEpisode` in
+ * `metricAnomalyEpisodeActions.ts`, called right after `labelMembers`), so a
+ * lost label must roll the action back rather than fail silently. Only
+ * resolve/dismiss emit it — promote and unsnooze never close an episode.
  *
  * Deviation from the original plan: the plan called for the batch throwing
  * writer `emitMlFeedbackEvents` from a parallel, not-yet-merged wave. This
  * uses the existing singular throwing writer `emitMlFeedbackEvent` instead
  * (same non-best-effort semantics as `emitDeviceReliabilityFeedback` /
- * `emitUserRiskFeedback` below). No caller wires this in yet — see the PR
- * description.
+ * `emitUserRiskFeedback` below).
  */
 export async function emitAnomalyEpisodeFeedback(options: {
   orgId: string;
@@ -120,6 +120,41 @@ export async function emitAnomalyEpisodeFeedback(options: {
     occurredAt: options.occurredAt,
   });
   return result.inserted ? 1 : 0;
+}
+
+/**
+ * Spec §8.3 — one `anomaly` feedback row per member an episode action
+ * cascaded to, so `/analytics/anomalies/evaluation` (joins feedback to
+ * metric_anomalies.id) and the v1-shadow overlap keep their labels.
+ * NOT best-effort: throws, so the episode action rolls back with it.
+ */
+export async function emitAnomalyEpisodeMemberFeedback(options: {
+  orgId: string;
+  episodeId: string;
+  members: ReadonlyArray<{ id: string; metricName: string; anomalyType: string }>;
+  outcome: 'dismissed' | 'promoted' | 'resolved';
+  actorUserId?: string | null;
+  occurredAt: Date;
+  metadata?: Record<string, unknown>;
+}): Promise<number> {
+  const actorUserId = actorUserIdOrNull(options.actorUserId);
+  const { inserted } = await emitMlFeedbackEvents(options.members.map((member) => ({
+    orgId: options.orgId,
+    sourceType: 'anomaly' as const,
+    sourceId: member.id,
+    eventType: `anomaly.${options.outcome}` as const,
+    dedupeKey: `episode:${options.episodeId}`,
+    outcome: options.outcome,
+    actorUserId,
+    metadata: {
+      ...(options.metadata ?? {}),
+      episodeId: options.episodeId,
+      metricName: member.metricName,
+      anomalyType: member.anomalyType,
+    },
+    occurredAt: options.occurredAt,
+  })));
+  return inserted;
 }
 
 export async function emitRcaFeedback(options: {

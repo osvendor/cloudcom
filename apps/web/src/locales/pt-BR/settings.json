@@ -99,6 +99,7 @@
     "name": "Nome",
     "principalDescription": "Descrição",
     "scopes": "Escopos",
+    "noScopes": "Nenhum escopo concedido",
     "sourceCidrs": "IPs ou CIDRs de origem (um por linha)",
     "writeScopeRestrictionsRequired": "O escopo enrollment-keys:write exige uma data de expiração e pelo menos um IP ou CIDR de origem.",
     "expiresAt": "Expira em",
@@ -329,11 +330,13 @@
     "exportFailed": "Falha na exportação",
     "title": "Exportação de faturáveis",
     "description": "Lançamentos de tempo e peças faturáveis em CSV (até 366 dias). Inclui o status de aprovação.",
+    "columnsNote": "Inclui o tipo de trabalho e os minutos cobertos pelo contrato de cada lançamento de tempo.",
     "from": "De",
     "to": "Até",
     "allOrganizations": "Todas as organizações",
     "exporting": "Exportando…",
-    "downloadCsv": "Baixar CSV"
+    "downloadCsv": "Baixar CSV",
+    "seeBusinessReports": "Ver relatórios de negócio"
   },
   "partnerSettingsCard": {
     "title": "Configurações do parceiro",
@@ -517,6 +520,25 @@
       "communications": "Comunicações",
       "branding": "Identidade visual"
     },
+    "aiFeatures": {
+      "anomalies": {
+        "title": "Detecção de anomalias",
+        "description": "Detecção estatística de comportamento incomum de CPU, memória, disco e rede em dispositivos gerenciados. Esses são os padrões para todas as organizações; uma organização pode substituí-los em sua própria aba de IA.",
+        "enabled": "Detectar anomalias",
+        "enabledDescription": "Executa o detector de anomalias a cada 10 minutos e exibe os resultados na aba Anomalias de cada dispositivo.",
+        "createAlerts": "Criar alertas a partir de anomalias",
+        "createAlertsDescription": "Converte anomalias confirmadas em alertas para que cheguem às suas rotas de notificação."
+      },
+      "inheritanceNote": "As alterações se aplicam a todas as organizações que não definiram sua própria substituição.",
+      "saved": "Salvo",
+      "saveFailed": "Não foi possível alterar esta configuração",
+      "remediation": {
+        "title": "Correções sugeridas",
+        "description": "Sugestões de correção geradas por IA na página de detalhes do alerta. Este é o padrão para todas as organizações; uma organização pode substituí-lo na própria aba de IA.",
+        "enabled": "Gerar correções sugeridas",
+        "enabledDescription": "Permite que técnicos gerem correções sugeridas para um alerta na página de detalhes."
+      }
+    },
     "tabs": {
       "company": {
         "label": "Empresa",
@@ -567,6 +589,10 @@
         "label": "Provedor de IA",
         "description": "Use sua própria chave Anthropic"
       },
+      "aiFeatures": {
+        "label": "Recursos de IA",
+        "description": "Padrões de detecção de anomalias e correções sugeridas"
+      },
       "branding": {
         "label": "Identidade visual",
         "description": "Logotipo e cores"
@@ -578,6 +604,10 @@
       "modules": {
         "label": "Módulos",
         "description": "Central de serviços, faturamento e topologia ativados/desativados"
+      },
+      "aiApprovals": {
+        "label": "Tempo limite de aprovação de IA",
+        "description": "Quanto tempo o chat de IA aguarda a aprovação de uma ação restrita"
       }
     },
     "saved": "Configurações do parceiro salvas",
@@ -891,6 +921,7 @@
       "email_only_hint": "Aviso só por e-mail",
       "resolution_note": "Nota de resolução",
       "quote_number": "Número da proposta",
+      "quote_title": "Título da proposta",
       "total": "Total",
       "expiry_date": "Data de validade",
       "accept_url": "URL de aceitação",
@@ -956,6 +987,16 @@
     }
   },
   "m365Mailbox": {
+    "consentNotCompleted": "Consentimento não concluído",
+    "consentNotCompletedHint": "O login da Microsoft para esta caixa de correio não foi concluído a tempo, então ela não será conectada sozinha. Tente o consentimento novamente ou desconecte-a.",
+    "retryConsent": "Tentar consentimento novamente",
+    "redirectUriLabel": "URI de redirecionamento a registrar no aplicativo do Microsoft Entra",
+    "redirectUriHint": "Ele precisa corresponder exatamente, e você precisa abrir o Breeze com o mesmo esquema e host ao conectar; caso contrário, o login não pode ser concluído.",
+    "callbackReason": {
+      "binding_mismatch": "Falha na conexão com o Microsoft 365: o navegador voltou sem o cookie de login. Abra o Breeze no mesmo endereço do URI de redirecionamento (esquema e host precisam corresponder), permita cookies e tente novamente.",
+      "invalid_callback": "Falha na conexão com o Microsoft 365: a Microsoft retornou uma resposta inesperada. Tente conectar novamente.",
+      "expired": "Falha na conexão com o Microsoft 365: o link de login expirou ou já foi usado. Tente conectar novamente."
+    },
     "connected": "Caixa de correio conectada",
     "consentGranted": "Consentimento concedido — restrinja a caixa de correio com a Política de Acesso ao Aplicativo abaixo e teste novamente",
     "consentAttention": "O consentimento da caixa de correio requer atenção do administrador.",
@@ -984,6 +1025,38 @@
     "displayName": "Nome de exibição (opcional)",
     "namePlaceholder": "Suporte",
     "connect": "Conectar"
+  },
+  "gmailMailbox": {
+    "title": "Caixa de suporte do Google Workspace",
+    "description": "Conecte uma caixa de correio do Google Workspace para que os e-mails dos clientes virem tickets. É usada a delegação em todo o domínio, então não há alterações de MX ou encaminhamento nem redirecionamento OAuth.",
+    "connectHint": "A caixa de correio é lida com a conexão de conta de serviço do Google Workspace da organização selecionada, que passa a guardar a credencial. Para uma caixa do parceiro (como o seu próprio help@), escolha a organização cujo Workspace contém a caixa. Informe a caixa de suporte compartilhada para conectá-la.",
+    "status": {
+      "pending_consent": "Pendente",
+      "connected": "Conectada",
+      "error": "Requer atenção",
+      "reauth_required": "Nova autenticação necessária",
+      "disabled": "Desativada"
+    },
+    "reauthRequired": "A leitura do Gmail está pausada para esta caixa. Reconecte-a para retomar: a conta de serviço pode precisar de nova autorização, a conexão do Google Workspace pode estar inativa ou a caixa pode agora corresponder a outra conta Google.",
+    "reconnect": "Reconectar",
+    "reconnectNoOrg": "Esta conexão está sem organização e não pode ser reconectada aqui.",
+    "disconnect": "Desconectar",
+    "disconnected": "Caixa de correio desconectada",
+    "disconnectFailed": "Falha ao desconectar.",
+    "connected": "Caixa de correio conectada",
+    "connectFailed": "Não foi possível conectar a caixa do Gmail.",
+    "empty": "Nenhuma caixa do Gmail conectada ainda.",
+    "loadError": "Não foi possível carregar as conexões de caixas do Gmail. Atualize para tentar novamente.",
+    "orgsLoadError": "Não foi possível carregar as organizações. Atualize para tentar novamente.",
+    "organization": "Organização",
+    "selectOrg": "Selecione uma organização",
+    "address": "Endereço da caixa de correio",
+    "addressPlaceholder": "suporte@example.com",
+    "displayName": "Nome de exibição (opcional)",
+    "namePlaceholder": "Suporte",
+    "connect": "Conectar",
+    "credentialOrg": "Credencial: conexão do Google Workspace de {{org}}",
+    "credentialOrgUnknown": "uma organização que você não pode ver"
   },
   "orgApprovalSecurityTab": {
     "title": "Segurança de aprovação",
@@ -1341,6 +1414,10 @@
         "enableNetworkVisibility": {
           "label": "Visibilidade de rede",
           "description": "Exibe no portal do cliente a integridade da rede e os ativos descobertos em modo somente leitura."
+        },
+        "enableNetworkAlerts": {
+          "label": "Alertas de rede",
+          "description": "Exibe no portal do cliente a contagem de alertas ativos e os chamados abertos vinculados aos ativos de rede."
         }
       }
     },
@@ -1660,6 +1737,8 @@
     "maxTurnsPerSession": "Máximo de turnos por sessão",
     "msgsMinPerUser": "Mensagens/minuto por usuário",
     "msgsHrPerOrg": "Mensagens/hora por organização",
+    "toolRateLimitMultiplier": "Multiplicador de limite de taxa por ferramenta",
+    "toolRateLimitMultiplierHelp": "Aumenta cada limite de taxa de IA e MCP por ferramenta por este fator (1–10). Nunca reduz nem remove um limite.",
     "saveBudget": "Salvar orçamento",
     "savedSuccessfully": "Salvo com sucesso",
     "allBudgetSettingsAreManagedByYourPartner": "Todas as configurações de orçamento são gerenciadas pelo seu parceiro",
@@ -4026,7 +4105,7 @@
     "enforceSSOOnlyLogin": "Aplicar login somente SSO",
     "usersMustUseSSOToSignInPasswordLoginWillBeDisabled": "Os usuários devem usar o SSO para fazer login. O login com senha será desativado.",
     "trustThisProvidersMFA": "Confiar na MFA deste provedor",
-    "trustThisProvidersMFAHelperText": "Quando seu provedor de identidade informa que a autenticação multifator foi usada (`amr: mfa`), a MFA é considerada satisfeita no Breeze. Seu IdP deve incluir a declaração `amr` em seu token de ID — a maioria exige que isso seja habilitado explicitamente. Desativado por padrão.",
+    "trustThisProvidersMFAHelperText": "Quando seu provedor de identidade informa que foi usada autenticação multifator ou resistente a phishing (por exemplo, uma chave de acesso) (`amr: mfa` / `amr: phr`), a MFA é considerada satisfeita no Breeze. Seu IdP deve incluir a declaração `amr` em seu token de ID — a maioria exige que isso seja habilitado explicitamente. Desativado por padrão.",
     "warningSSOEnforcementEnabled": "Aviso: aplicação de SSO ativada",
     "usersWillNotBeAbleToSignInWithPasswordsMakeSureYourSSOCo": "Os usuários não poderão fazer login com senhas. Certifique-se de que sua configuração de SSO esteja funcionando corretamente antes de ativar esta opção. Considere ter pelo menos uma conta de administrador que possa ignorar o SSO para acesso de emergência.",
     "testing": "Testando...",
@@ -4650,7 +4729,32 @@
       "externalProcessing": "Permitir análise de IA em sandbox",
       "externalProcessingDescription": "Permite que execuções de análise de IA rodem código para esta organização em uma sandbox isolada, sem acesso à rede, hospedada na região desta organização. Desativado por padrão.",
       "externalProcessingSaved": "Salvo",
-      "externalProcessingSaveFailed": "Não foi possível alterar esta configuração"
+      "externalProcessingSaveFailed": "Não foi possível alterar esta configuração",
+      "mlFeatures": {
+        "title": "Detecção de anomalias",
+        "description": "Detecção estatística de comportamento incomum de CPU, memória, disco e rede nos dispositivos desta organização. Deixe em branco para aplicar o padrão do parceiro.",
+        "anomaliesEnabled": "Detectar anomalias",
+        "anomaliesEnabledDescription": "Executa o detector de anomalias a cada 10 minutos e exibe os resultados na aba Anomalias de cada dispositivo.",
+        "createAlerts": "Criar alertas a partir de anomalias",
+        "createAlertsDescription": "Converte anomalias confirmadas em alertas para que cheguem às suas rotas de notificação.",
+        "inherit": "Herdar",
+        "inheritOn": "Herdar (ativado, {{from}})",
+        "inheritOff": "Herdar (desativado, {{from}})",
+        "fromPartner": "configuração do parceiro",
+        "fromDefault": "padrão da plataforma",
+        "on": "Ativado",
+        "off": "Desativado",
+        "saved": "Salvo",
+        "saveFailed": "Não foi possível alterar esta configuração",
+        "killSwitch": "A detecção de anomalias está desativada para toda a plataforma pelo operador. Essas configurações terão efeito quando ela for reativada.",
+        "remediation": {
+          "title": "Correções sugeridas",
+          "description": "Sugestões de correção geradas por IA para os alertas desta organização. Em branco significa que o padrão do parceiro se aplica.",
+          "enabled": "Gerar correções sugeridas",
+          "enabledDescription": "Permite que técnicos gerem correções sugeridas para um alerta na página de detalhes.",
+          "killSwitch": "As correções sugeridas foram desativadas para toda a plataforma pelo operador. Esta configuração terá efeito quando forem reativadas."
+        }
+      }
     },
     "breadcrumbs": {
       "settings": "Configurações",
@@ -4914,12 +5018,14 @@
     "description": "Importe organizações e locais a partir de um CSV exportado do seu RMM anterior.",
     "dropzone": "Solte um arquivo CSV aqui ou clique para procurar",
     "dropzoneHint": "Colunas: organização (obrigatória), local, ID externo, sistema externo, fuso horário",
+    "docsLink": "Guia de importação",
     "actions": {
       "close": "Fechar",
       "preview": "Pré-visualizar {{count}} linhas",
       "previewing": "Pré-visualizando…",
       "import": "Importar {{count}} selecionadas",
-      "importing": "Importando…"
+      "importing": "Importando…",
+      "downloadSample": "Baixar CSV de exemplo"
     },
     "mapping": {
       "title": "Mapeamento de colunas",
@@ -5837,5 +5943,77 @@
   "ticketCategories": {
     "defaultWorkType": "Tipo de trabalho padrão",
     "defaultWorkTypeHelp": "Usado quando o tempo é registrado para esta categoria sem um tipo de trabalho."
+  },
+  "systemDeprecations": {
+    "title": "Descontinuações",
+    "description": "Descontinuações de API que esta versão do Breeze conhece, e a situação desta implantação em cada uma delas. Este é um relatório somente leitura para administradores de plataforma; nada aqui é configurado.",
+    "refresh": "Atualizar",
+    "loading": "Carregando descontinuações…",
+    "errors": {
+      "load": "Não foi possível carregar o relatório de descontinuações."
+    },
+    "platformAdmin": {
+      "title": "Acesso de administrador de plataforma necessário",
+      "description": "Este relatório abrange toda a implantação, então somente administradores de plataforma podem visualizá-lo."
+    },
+    "manifestError": "Não foi possível ler o manifesto de mudanças incompatíveis nesta imagem ({{error}}). Não é possível verificar as descontinuações.",
+    "historyMissing": "Não foi possível determinar quais versões esta implantação executou — mostrando todas as descontinuações em vigor.",
+    "noReleaseVersion": "Esta imagem não traz uma versão de lançamento, então toda descontinuação no manifesto é mostrada como possivelmente ultrapassada.",
+    "historyReason": "Motivo: {{reason}}",
+    "summary": {
+      "imageVersion": "Versão em execução",
+      "unknownVersion": "Desconhecida ({{raw}})",
+      "lastRecorded": "Última versão registrada",
+      "noneRecorded": "Nenhuma registrada",
+      "migrations": "Migrações",
+      "migrationCounts": "{{applied}} aplicadas, {{pending}} pendentes",
+      "ledgerMissing": "Registro de migrações indisponível ({{reason}})"
+    },
+    "table": {
+      "heading": "Retiradas",
+      "entry": "Entrada",
+      "affected": "Endpoints e campos afetados",
+      "replacement": "Substituição",
+      "deprecatedIn": "Descontinuado em",
+      "removal": "Remoção",
+      "status": "Status aqui",
+      "wholeEndpoint": "Endpoint inteiro",
+      "notBefore": "Não antes de {{date}}",
+      "empty": "O manifesto não lista nenhuma retirada."
+    },
+    "status": {
+      "crossed": "Ultrapassado",
+      "possibly_crossed": "Possivelmente ultrapassado",
+      "in_effect": "Em vigor",
+      "upcoming": "Em breve"
+    },
+    "milestone": {
+      "deprecation": "descontinuação",
+      "removal": "remoção"
+    },
+    "history": {
+      "heading": "Histórico de versões",
+      "firstSeen": "Visto pela primeira vez em {{date}}",
+      "none": "Nenhuma versão registrada para esta implantação."
+    }
+  },
+  "partnerAiApprovals": {
+    "timeoutLabel": "Tempo limite de aprovação interativa",
+    "productDefault": "Padrão do produto ({{minutes}} minutos)",
+    "range": "Escolha entre {{min}} e {{max}} minutos.",
+    "description": "Por quanto tempo uma conversa de IA em andamento aguarda que alguém aprove uma ação restrita (Nível 2/3) antes de desistir.",
+    "orgOverrideNote": "As organizações podem substituir esse valor em suas próprias configurações de IA; o valor da organização prevalece quando definido.",
+    "notForUnattendedNote": "Isso não é para trabalho noturno ou não supervisionado — o trabalho de longa duração passa pela fila de aprovações, que tem seu próprio vencimento."
+  },
+  "orgAiApprovalTimeout": {
+    "title": "Tempo limite de aprovação de IA",
+    "description": "Por quanto tempo um chat de IA aguarda que alguém aprove uma ação restrita (Nível 2/3) antes de desistir. As organizações podem substituir o padrão do parceiro aqui; o valor da organização prevalece quando definido.",
+    "fieldLabel": "Tempo limite de aprovação interativa",
+    "inherit": "Herdar",
+    "inheritLabel": "Herdar ({{minutes}} minutos, {{source}})",
+    "sourcePartner": "padrão do parceiro",
+    "sourceDefault": "padrão do produto",
+    "range": "Escolha entre {{min}} e {{max}} minutos.",
+    "save": "Salvar"
   }
 }

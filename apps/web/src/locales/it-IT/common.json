@@ -67,6 +67,7 @@
     "fleetDesign": "Progettazione flotta",
     "customFields": "Campi personalizzati",
     "savedFilters": "Filtri salvati",
+    "moreSettings": "Altre impostazioni",
     "users": "Utenti",
     "roles": "Ruoli",
     "sso": "SSO",
@@ -98,7 +99,9 @@
     "serviceManagement": "Gestione servizi",
     "ticketing": "Ticket",
     "deliverableTemplates": "Modelli di consegna",
-    "securityScans": "Scansioni IOC"
+    "securityScans": "Scansioni IOC",
+    "system": "Sistema",
+    "monitorConversion": "Conversione monitor"
   },
   "documentTitles": {
     "dashboard": "Dashboard",
@@ -218,7 +221,7 @@
     "mcp": {
       "connecting": "Stai connettendo un agente AI?",
       "title": "Indirizza qui il tuo agente AI",
-      "description": "Incolla questo URL nel tuo client MCP (Claude.ai, ChatGPT, Cursor, ...). Verrai rimandato qui per autorizzare la connessione tramite OAuth."
+      "description": "Incolla questo URL nel tuo client MCP (Claude.ai, ChatGPT, Cursor, ...). Verrai rimandato qui per autorizzare la connessione tramite OAuth. Preferisci una chiave API? Invia un header X-API-Key con lo scope ai:read/ai:write."
     },
     "progress": {
       "count": "{{current}} di {{total}}",
@@ -1470,6 +1473,12 @@
           "editTitle": "Modifica webhook"
         },
         "subtitle": "Invia eventi a sistemi esterni.",
+        "success": {
+          "created": "Webhook creato",
+          "disabled": "Webhook disabilitato",
+          "enabled": "Webhook abilitato",
+          "updated": "Webhook aggiornato"
+        },
         "title": "Webhook"
       }
     },
@@ -2445,7 +2454,7 @@
         },
         "title": "Correzioni suggerite",
         "refresh": "Aggiorna le correzioni suggerite",
-        "disabledTitle": "Le correzioni suggerite sono disabilitate per questa organizzazione",
+        "disabledTitle": "Le correzioni suggerite sono disattivate per questa organizzazione. Attivale in Impostazioni → Partner → Funzionalità IA, oppure per una singola organizzazione nella sua scheda IA.",
         "suggestionsDisabled": "Suggerimenti disabilitati",
         "generate": "Genera",
         "empty": "Nessuna soluzione suggerita ancora.",

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   COLUMN_IDS,
+  COLUMN_LABELS,
   COLUMN_STORAGE_KEY,
   DEFAULT_VISIBLE_COLUMNS,
   isValidColumnId,
@@ -74,6 +75,8 @@ describe('columnVisibility', () => {
       }
       expect(got.size).toBe(DEFAULT_VISIBLE_COLUMNS.length);
       expect(got.has('watchdogVersion')).toBe(false);
+      // #6751: helper version is opt-in, like watchdog version.
+      expect(got.has('helperVersion')).toBe(false);
     });
 
     it('returns the stored visible flags', () => {
@@ -280,5 +283,14 @@ describe('columnVisibility', () => {
       // full catalog is represented.
       expect(new Set(order).size).toBe(COLUMN_IDS.length);
     });
+  });
+
+  it('registers Hardware without enabling it for existing users', () => {
+    expect(COLUMN_IDS).toContain('hardwareHealth');
+    expect(COLUMN_LABELS.hardwareHealth).toBe('Hardware');
+    expect(DEFAULT_VISIBLE_COLUMNS).not.toContain('hardwareHealth');
+    expect(readColumnVisibility().has('hardwareHealth')).toBe(false);
+    writeColumnVisibility([...DEFAULT_VISIBLE_COLUMNS, 'hardwareHealth']);
+    expect(readColumnVisibility().has('hardwareHealth')).toBe(true);
   });
 });

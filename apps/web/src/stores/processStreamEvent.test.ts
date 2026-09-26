@@ -158,6 +158,51 @@ describe('approval_required — approvalScope passthrough (#5600)', () => {
   });
 });
 
+/**
+ * #6475 — the org-configured interactive-approval window/deadline has to
+ * survive the store hop just like scriptRunContext/approvalScope above:
+ * AiApprovalDialog reads these off pendingApproval to widen its countdown
+ * past the hard-coded 5 minutes, and a dropped field here would silently
+ * revert every org's configured timeout back to 5 minutes in the UI even
+ * though the server is enforcing the real one.
+ */
+describe('approval_required — approvalWindowMs / approvalExpiresAt passthrough (#6475)', () => {
+  it('carries approvalWindowMs and approvalExpiresAt into pendingApproval (legacy non-intent path)', () => {
+    const state = makeState();
+    let patch: Partial<StreamableState> = {};
+    processStreamEvent(
+      {
+        type: 'approval_required', executionId: 'e1', toolName: 'file_operations',
+        input: { action: 'read' }, description: 'Read a file',
+        approvalWindowMs: 30 * 60 * 1000, approvalExpiresAt: '2026-09-23T12:30:00.000Z',
+      },
+      (fn) => { patch = { ...patch, ...fn({ ...state, ...patch }) }; },
+      () => ({ ...state, ...patch }),
+      null,
+    );
+    expect(patch.pendingApproval).toMatchObject({
+      approvalWindowMs: 30 * 60 * 1000,
+      approvalExpiresAt: '2026-09-23T12:30:00.000Z',
+    });
+  });
+
+  it('leaves both undefined when the event omits them (older API build)', () => {
+    const state = makeState();
+    let patch: Partial<StreamableState> = {};
+    processStreamEvent(
+      {
+        type: 'approval_required', executionId: 'e1', toolName: 'file_operations',
+        input: { action: 'read' }, description: 'Read a file',
+      },
+      (fn) => { patch = { ...patch, ...fn({ ...state, ...patch }) }; },
+      () => ({ ...state, ...patch }),
+      null,
+    );
+    expect(patch.pendingApproval?.approvalWindowMs).toBeUndefined();
+    expect(patch.pendingApproval?.approvalExpiresAt).toBeUndefined();
+  });
+});
+
 describe('plan-mode step sequencing under approval-gated ordering', () => {
   // API sequence for an approval-gated step is now:
   //   approval_required -> (possibly multi-minute wait) -> plan_step_start -> execute -> plan_step_complete
@@ -477,6 +522,55 @@ describe('execution-plane run events (spec §5.5)', () => {
     );
     expect(patch.chatRuns!.r1!.progress).toHaveLength(1);
     expect(patch.chatRuns!.r1!.status).toBe('failed');
+  });
+});
+
+/**
+ * Sweep E6 — `tool_use_start`'s `input` is always `{}` (the SDK hasn't
+ * finished streaming the tool's real arguments at content_block_start).
+ * `tool_use_input` arrives once they're known and must patch the SAME
+ * message row in place, not append a new one — the label/verb computation
+ * (`aiToolLabel`) reads `toolInput` off that row.
+ */
+describe('tool_use_input backfills the tool_use row (sweep E6)', () => {
+  function run(events: Parameters<typeof processStreamEvent>[0][]) {
+    const state = makeState();
+    let patch: Partial<StreamableState> = {};
+    let current: string | null = null;
+    for (const ev of events) {
+      current = processStreamEvent(
+        ev,
+        (fn) => { patch = { ...patch, ...fn({ ...state, ...patch }) }; },
+        () => ({ ...state, ...patch }),
+        current,
+      );
+    }
+    return patch;
+  }
+
+  it('fills in the real input on the matching tool_use message, without adding a row', () => {
+    const patch = run([
+      { type: 'tool_use_start', toolUseId: 'tu-1', toolName: 'manage_alerts', input: {} },
+      { type: 'tool_use_input', toolUseId: 'tu-1', input: { action: 'list' } },
+    ]);
+
+    expect(patch.messages).toHaveLength(1);
+    expect(patch.messages?.[0]).toMatchObject({
+      role: 'tool_use',
+      toolUseId: 'tu-1',
+      toolInput: { action: 'list' },
+    });
+  });
+
+  it('does not touch an unrelated tool_use row', () => {
+    const patch = run([
+      { type: 'tool_use_start', toolUseId: 'tu-1', toolName: 'manage_alerts', input: {} },
+      { type: 'tool_use_start', toolUseId: 'tu-2', toolName: 'get_device_context', input: {} },
+      { type: 'tool_use_input', toolUseId: 'tu-1', input: { action: 'list' } },
+    ]);
+
+    const other = patch.messages?.find((m) => m.toolUseId === 'tu-2');
+    expect(other?.toolInput).toBeUndefined();
   });
 });
 

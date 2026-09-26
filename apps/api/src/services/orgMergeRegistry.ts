@@ -8,6 +8,12 @@
  * loudly if a table is missing a policy, or if a policy names a table that
  * isn't actually in scope.
  *
+ * Extension-owned org-cascade tables (#4165) are classified in the extension's
+ * manifest (`tenancy.orgMergePolicies`) and folded in by getOrgMergePolicies()
+ * via `getExtensionOrgMergePolicies()` — never listed here. The in-process
+ * contract for the built-ins lives in `extensions/builtinExtensions.test.ts`
+ * and `orgMergeExtensionTables.integration.test.ts`.
+ *
  * This registry does not execute anything — it only classifies. The merge
  * engine (Task 2) and the hand-written executors (Task 3, `orgMerge.ts`
  * CUSTOM_EXECUTORS) consume it.
@@ -18,6 +24,8 @@
  * is a plain column name.
  */
 import { __testOnly as tenantCascadeTestOnly } from './tenantCascade';
+import type { ExtensionOrgMergePolicy } from '@breeze/extension-sdk';
+import { getExtensionOrgMergePolicies } from '../extensions/tenancyRegistry';
 
 export type OrgMergePolicy =
   | { kind: 'repoint' }
@@ -493,6 +501,13 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   tenant_variables: { kind: 'repoint-dedupe', key: ['key'] }, // verified: tenant_variables_org_key_uniq (org_id, key) WHERE org_id IS NOT NULL — trivially true for org-scoped rows
   catalog_item_org_pricing: { kind: 'repoint-dedupe', key: ['catalog_item_id'] }, // verified: catalog_item_org_pricing_item_org_uq (catalog_item_id, org_id)
   ticket_form_org_links: { kind: 'repoint-dedupe', key: ['form_id'] }, // verified: ticket_form_org_links_form_org_uq (form_id, org_id)
+  // #6592: Gmail mailbox connections carry org_id; repoint them to the survivor
+  // instead of letting the FK cascade delete them with the loser org. Plain
+  // repoint (no dedupe): the only unique is (partner_id, mailbox_address), which
+  // does NOT include org_id, and a merge is within one partner — so two orgs can
+  // never already hold the same partner+mailbox, and repointing org_id cannot
+  // create a collision. Microsoft rows have org_id NULL and are not matched.
+  ticket_mailbox_connections: { kind: 'repoint' }, // Gmail rows carry org_id; plain repoint to the survivor preserves the cursor/sub/generation. Safety against a survivor credential that reads a DIFFERENT Google account is enforced at POLL time: every sweep verifies the mailbox's live immutable sub against the stored google_account_sub before ingesting and goes reauth_required on a mismatch, and a sweep already in flight when the merge commits stops at its next generation check, which also requires the org it loaded the credential for (sweepOneGmail). m365 rows carry org_id NULL and never merge.
   oauth_client_blocks: { kind: 'repoint-dedupe', key: ['client_id'] }, // verified: oauth_client_blocks_org_client_uniq (org_id, client_id) — migrations/2026-05-07, not in Drizzle schema
   sso_verified_domains: { kind: 'repoint-dedupe', key: ['domain'] }, // verified: sso_verified_domains_org_domain_idx (org_id, domain)
   alert_correlation_groups: { kind: 'repoint-dedupe', key: ['group_key'] }, // verified: alert_correlation_groups_org_key_uq (org_id, group_key)
@@ -804,6 +819,9 @@ const REPOINT_TABLES: readonly string[] = [
   "device_group_memberships",
   "device_groups",
   "device_hardware",
+  "device_hardware_components",
+  "device_hardware_events",
+  "device_hardware_health",
   "device_ip_history",
   "device_link_groups",
   "device_metrics",
@@ -842,6 +860,7 @@ const REPOINT_TABLES: readonly string[] = [
   "fleet_remediation_run_targets",
   "fleet_remediation_runs",
   "group_membership_log",
+  "hardware_alert_retirement_outbox",
   "huntress_agents",
   "huntress_incidents",
   "huntress_integrations",
@@ -856,6 +875,7 @@ const REPOINT_TABLES: readonly string[] = [
   "invoice_payments",
   "invoice_stripe_payments",
   "invoices",
+  "legacy_labour_pricing_archive",
   "local_vaults",
   "log_correlation_rules",
   "log_correlations",
@@ -1083,7 +1103,41 @@ export function getOrgMergePolicies(): ReadonlyMap<string, OrgMergePolicy> {
     }
     map.set(t, { kind: 'repoint' });
   }
+  // Extension-owned org-cascade tables (#4165). `getOrgCascadeDeleteOrder()`
+  // folds every published extension's `orgCascadeDeleteTables` into the walk,
+  // so their policies have to come from the same declarations. The hook only
+  // ADDS entries for extension tables: it can never reclassify a core table
+  // (a collision throws), and it never supplies a default — an extension
+  // cascade table without a declared policy throws inside
+  // getExtensionOrgMergePolicies(), so "no policy = error" still holds for
+  // core and extension tables alike.
+  for (const [t, policy] of getExtensionOrgMergePolicies()) {
+    if (map.has(t)) {
+      throw new Error(
+        `orgMergeRegistry: extension merge policy for '${t}' collides with the core registry — an extension cannot reclassify a core table`,
+      );
+    }
+    map.set(t, fromExtensionPolicy(policy));
+  }
   return map;
+}
+
+/**
+ * Translate a manifest-declared policy into the engine's union. The SDK schema
+ * admits only bare column names and `[a-z0-9_]` literals, so the `keyWhere`
+ * built here (which the executors splice with `sql.raw`) can carry no
+ * manifest-supplied SQL.
+ */
+function fromExtensionPolicy(policy: ExtensionOrgMergePolicy): OrgMergePolicy {
+  if (policy.kind !== 'repoint-dedupe' || !policy.where) {
+    return policy.kind === 'repoint-dedupe' ? { kind: 'repoint-dedupe', key: policy.key } : policy;
+  }
+  const literals = policy.where.in.map((v) => `'${v}'`).join(', ');
+  return {
+    kind: 'repoint-dedupe',
+    key: policy.key,
+    keyWhere: `{${policy.where.column}} IN (${literals})`,
+  };
 }
 
 /**

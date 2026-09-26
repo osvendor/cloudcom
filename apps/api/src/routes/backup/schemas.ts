@@ -1,11 +1,12 @@
 import { z } from 'zod';
-import { coerceS3EndpointUrl, deriveS3RegionFromEndpoint, optionalQueryBoolean } from '@breeze/shared';
+import { EXTERNAL_BACKUP_STATUSES, coerceS3EndpointUrl, deriveS3RegionFromEndpoint, optionalQueryBoolean } from '@breeze/shared';
 import {
   backupRetentionSchema as sharedBackupRetentionSchema,
   backupRetentionUpdateSchema as sharedBackupRetentionUpdateSchema,
   backupScheduleSchema as sharedBackupScheduleSchema,
 } from '@breeze/shared/validators';
 import { drRestoreConfigSchema } from '../../services/drBareMetalRebuildStep';
+import { BACKUP_HEALTH_MAX_LIMIT } from '../../services/backupHealthCursor';
 
 const queryBoolean = z.preprocess((value) => {
   if (typeof value === 'boolean') return value;
@@ -253,6 +254,24 @@ export const backupHealthQuerySchema = z.object({
   refresh: queryBoolean.optional()
 });
 
+/** Comma-separated enum list in a query string: `?health=critical,warning`. */
+const csvEnum = <T extends readonly [string, ...string[]]>(values: T) =>
+  z.preprocess(
+    (v) => (typeof v === 'string' ? v.split(',').map((s) => s.trim()).filter(Boolean) : v),
+    z.array(z.enum(values)).min(1),
+  );
+
+export const backupHealthDevicesQuerySchema = z.object({
+  orgId: z.string().uuid().optional(),
+  source: csvEnum(['breeze', 'provider'] as const).optional(),
+  health: csvEnum(['healthy', 'warning', 'critical', 'unknown'] as const).optional(),
+  status: csvEnum([...EXTERNAL_BACKUP_STATUSES] as unknown as [string, ...string[]]).optional(),
+  withBackup: queryBoolean.optional(),
+  search: z.string().trim().max(200).optional(),
+  cursor: z.string().max(4096).optional(),
+  limit: z.coerce.number().int().min(1).max(BACKUP_HEALTH_MAX_LIMIT).optional(),
+});
+
 export const recoveryReadinessQuerySchema = z.object({
   refresh: queryBoolean.optional(),
   deviceId: z.string().optional()
@@ -351,6 +370,10 @@ export const bmrRecoveryListSchema = z.object({
 export const bmrExchangeSchema = z.object({
   code: z.string().min(1).max(32),
   capabilities: z.array(z.string().min(1).max(64)).max(16).optional(),
+  // #5629: the recovery console's own version, so the server can refuse a
+  // too-old ISO before the one-time code is claimed. Optional — media that
+  // predates this field is still gated only by the console after exchange.
+  helperVersion: z.string().min(1).max(64).optional(),
 });
 
 // W09a (#6464) Task 6: bound the agent-reported `result` payload so an

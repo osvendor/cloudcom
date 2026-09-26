@@ -1,5 +1,7 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
+import { ERROR_CODES } from '@breeze/shared';
+import { jsonError } from '../../lib/jsonError';
 import { z } from 'zod';
 import { and, eq, sql, desc, gte, lte, inArray, type SQL } from 'drizzle-orm';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
@@ -40,6 +42,7 @@ import {
 } from './helpers';
 import {
   assertDesktopStartIntentCurrent,
+  boundConsentUnavailableBehavior,
   commitDesktopStartIntent,
   formatDesktopGeneration,
   startIntentDenialCode,
@@ -89,7 +92,7 @@ function currentSessionSiteDenial(
 ): Response | null {
   const perms = c.get('permissions') as UserPermissions | undefined;
   if (perms?.allowedSiteIds && (typeof device.siteId !== 'string' || !canAccessSite(perms, device.siteId))) {
-    return c.json({ error: 'Access to this site denied' }, 403);
+    return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access to this site denied');
   }
   return null;
 }
@@ -140,12 +143,12 @@ sessionRoutes.delete(
         .limit(1)
         .for('update');
       if (!device || !auth.canAccessOrg(device.orgId)) {
-        return c.json({ error: 'Device not found or access denied' }, 404);
+        return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'Device not found or access denied');
       }
       if (perms?.allowedSiteIds && (
         typeof device.siteId !== 'string' || !canAccessSite(perms, device.siteId)
       )) {
-        return c.json({ error: 'Access to this site denied' }, 403);
+        return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access to this site denied');
       }
       conditions.push(eq(remoteSessions.deviceId, deviceId));
     } else if (perms?.allowedSiteIds) {
@@ -155,7 +158,7 @@ sessionRoutes.delete(
       // the caller's allowed sites. `allowedSiteIds` is only set for org-scope
       // users, so `auth.orgId` is present here. Finding #1.
       if (!auth.orgId) {
-        return c.json({ error: 'Organization context required' }, 403);
+        return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Organization context required');
       }
       if (perms.allowedSiteIds.length === 0) {
         return c.json({ cleaned: 0, ids: [] });
@@ -175,7 +178,7 @@ sessionRoutes.delete(
     // Scope by org access
     if (auth.scope === 'organization') {
       if (!auth.orgId) {
-        return c.json({ error: 'Organization context required' }, 403);
+        return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Organization context required');
       }
       conditions.push(eq(remoteSessions.orgId, auth.orgId));
     } else if (auth.scope === 'partner') {
@@ -219,10 +222,10 @@ sessionRoutes.post(
     // Verify device access
     const device = await getDeviceWithOrgCheck(data.deviceId, auth, c.get('permissions') as UserPermissions | undefined);
     if (device === 'SITE_ACCESS_DENIED') {
-      return c.json({ error: 'Access to this site denied' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access to this site denied');
     }
     if (!device) {
-      return c.json({ error: 'Device not found or access denied' }, 404);
+      return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'Device not found or access denied');
     }
 
     // Check device is online
@@ -398,7 +401,7 @@ sessionRoutes.get(
     // Filter by org access based on scope
     if (auth.scope === 'organization') {
     if (!auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Organization context required');
     }
     conditions.push(eq(devices.orgId, auth.orgId));
   } else if (auth.scope === 'partner') {
@@ -418,11 +421,15 @@ sessionRoutes.get(
 
     if (perms?.allowedSiteIds) {
       if (!auth.orgId) {
-        return c.json({ error: 'Organization context required' }, 403);
+        return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Organization context required');
       }
       const allowedDeviceIds = await resolveSiteAllowedDeviceIds(auth.orgId, perms);
       if (query.deviceId && !allowedDeviceIds!.includes(query.deviceId)) {
-        return c.json({ error: 'Device not found or access denied' }, 403);
+        // D13: 403 must pair with ACCESS_DENIED, not NOT_FOUND — the prose is
+        // deliberately ambiguous about whether the device exists (info-hiding),
+        // but the CODE has to agree with the STATUS or a client mapping errors
+        // by code alone renders a 403 as a 404-shaped "not found" state.
+        return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Device not found or access denied');
       }
       if (!allowedDeviceIds || allowedDeviceIds.length === 0) {
         return c.json({
@@ -536,7 +543,7 @@ sessionRoutes.get(
     // Filter by org access based on scope
     if (auth.scope === 'organization') {
     if (!auth.orgId) {
-      return c.json({ error: 'Organization context required' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Organization context required');
     }
     conditions.push(eq(devices.orgId, auth.orgId));
   } else if (auth.scope === 'partner') {
@@ -557,11 +564,15 @@ sessionRoutes.get(
 
     if (perms?.allowedSiteIds) {
       if (!auth.orgId) {
-        return c.json({ error: 'Organization context required' }, 403);
+        return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Organization context required');
       }
       const allowedDeviceIds = await resolveSiteAllowedDeviceIds(auth.orgId, perms);
       if (query.deviceId && !allowedDeviceIds!.includes(query.deviceId)) {
-        return c.json({ error: 'Device not found or access denied' }, 403);
+        // D13: 403 must pair with ACCESS_DENIED, not NOT_FOUND — the prose is
+        // deliberately ambiguous about whether the device exists (info-hiding),
+        // but the CODE has to agree with the STATUS or a client mapping errors
+        // by code alone renders a 403 as a 404-shaped "not found" state.
+        return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Device not found or access denied');
       }
       if (!allowedDeviceIds || allowedDeviceIds.length === 0) {
         return c.json({
@@ -580,7 +591,7 @@ sessionRoutes.get(
 
     if (query.userId) {
       if (auth.scope !== 'system' && query.userId !== auth.user.id) {
-        return c.json({ error: 'Access denied' }, 403);
+        return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
       }
       conditions.push(eq(remoteSessions.userId, query.userId));
     }
@@ -698,7 +709,7 @@ sessionRoutes.get(
 
     const result = await getSessionWithOrgCheck(sessionId, auth);
     if (!result) {
-      return c.json({ error: 'Session not found' }, 404);
+      return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'Session not found');
     }
 
     const { session, device } = result;
@@ -709,11 +720,11 @@ sessionRoutes.get(
     // webrtcOffer/answer/iceCandidates/recordingUrl. Fail closed on null siteId.
     const perms = c.get('permissions') as UserPermissions | undefined;
     if (perms?.allowedSiteIds && (typeof device.siteId !== 'string' || !canAccessSite(perms, device.siteId))) {
-      return c.json({ error: 'Access to this site denied' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access to this site denied');
     }
 
     if (!hasSessionOwnership(auth, session.userId)) {
-      return c.json({ error: 'Access denied' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
     }
 
     // Get user info
@@ -765,12 +776,12 @@ sessionRoutes.post(
 
     const result = await getSessionWithOrgCheck(sessionId, auth);
     if (!result) {
-      return c.json({ error: 'Session not found' }, 404);
+      return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'Session not found');
     }
 
     const { session, device } = result;
     if (!hasSessionOwnership(auth, session.userId)) {
-      return c.json({ error: 'Access denied' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
     }
 
     if (session.type !== 'terminal' && session.type !== 'desktop') {
@@ -816,12 +827,12 @@ sessionRoutes.post(
 
     const result = await getSessionWithOrgCheck(sessionId, auth);
     if (!result) {
-      return c.json({ error: 'Session not found' }, 404);
+      return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'Session not found');
     }
 
     const { session, device } = result;
     if (!hasSessionOwnership(auth, session.userId)) {
-      return c.json({ error: 'Access denied' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
     }
 
     if (session.type !== 'desktop') {
@@ -863,7 +874,7 @@ sessionRoutes.get(
 
     const result = await getSessionWithOrgCheck(sessionId, auth);
     if (!result) {
-      return c.json({ error: 'Session not found' }, 404);
+      return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'Session not found');
     }
 
     const { session, device } = result;
@@ -872,7 +883,7 @@ sessionRoutes.get(
     }
 
     if (!hasSessionOwnership(auth, session.userId)) {
-      return c.json({ error: 'Access denied' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
     }
 
     if (!['pending', 'connecting', 'active', 'disconnected'].includes(session.status)) {
@@ -909,7 +920,7 @@ sessionRoutes.post(
 
     const result = await getSessionWithOrgCheck(sessionId, auth);
     if (!result) {
-      return c.json({ error: 'Session not found' }, 404);
+      return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'Session not found');
     }
 
     const { session, device } = result;
@@ -920,11 +931,11 @@ sessionRoutes.post(
     // siteId is treated as denied for a site-restricted caller. Finding #2.
     const perms = c.get('permissions') as UserPermissions | undefined;
     if (perms?.allowedSiteIds && (typeof device.siteId !== 'string' || !canAccessSite(perms, device.siteId))) {
-      return c.json({ error: 'Access to this site denied' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access to this site denied');
     }
 
     if (!hasSessionOwnership(auth, session.userId)) {
-      return c.json({ error: 'Access denied' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
     }
 
     // Re-enforce the remote-access policy at offer time, not just at session
@@ -962,7 +973,7 @@ sessionRoutes.post(
       console.error(`[Remote] Device ${device.id} has no agentId, cannot send start_desktop for session ${sessionId}`);
       // 500, not 502: this is our own state defect (a device row with no
       // agentId), and a 502 body is replaced by Cloudflare's branded page.
-      return c.json({ error: 'Device has no agent connection identifier', code: 'agent_execution_failed' }, 500);
+      return jsonError(c, 500, ERROR_CODES.AGENT_EXECUTION_FAILED, 'Device has no agent connection identifier');
     }
 
     // Look up GPU vendor from device hardware inventory
@@ -1009,12 +1020,15 @@ sessionRoutes.post(
       sessionId,
       startCommandId,
       promptMode,
+      // Bound with the generation so the answer path can refuse an
+      // unsolicited-consent start this policy did not allow (#6819).
+      consentUnavailableBehavior: boundConsentUnavailableBehavior(prompt),
       offer: data.offer,
     });
 
     if (!startIntent.ok) {
       if (startIntent.reason === 'not_found') {
-        return c.json({ error: 'Session not found' }, 404);
+        return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'Session not found');
       }
       if (startIntent.reason === 'terminal') {
         return c.json({
@@ -1022,7 +1036,7 @@ sessionRoutes.post(
           code: 'SESSION_TERMINAL',
         }, 409);
       }
-      return c.json({ error: 'Session state changed while submitting offer' }, 409);
+      return jsonError(c, 409, ERROR_CODES.CONFLICT, 'Session state changed while submitting offer');
     }
 
     const startGeneration = startIntent.generation;
@@ -1093,7 +1107,7 @@ sessionRoutes.post(
       console.warn(`[Remote] Agent ${device.agentId} not connected, cannot send start_desktop for session ${sessionId}`);
       // 503, not 502: the device is temporarily unreachable, which is exactly
       // what 503 means — and unlike 502 the body survives Cloudflare.
-      return c.json({ error: 'Agent is not currently connected. Please verify the device is online and try again.', code: 'device_unreachable' }, 503);
+      return jsonError(c, 503, ERROR_CODES.DEVICE_UNREACHABLE, 'Agent is not currently connected. Please verify the device is online and try again.');
     }
 
     return c.json({
@@ -1146,7 +1160,7 @@ sessionRoutes.post(
       case 'revoked':
         return c.json({ status: 'revoked', reason: result.reason }, 403);
       case 'forbidden':
-        return c.json({ error: 'Access denied' }, 403);
+        return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
       default:
         return c.json({
           error: 'Unable to verify session authorization right now.',
@@ -1169,12 +1183,12 @@ sessionRoutes.post(
 
     const result = await getSessionWithOrgCheck(sessionId, auth);
     if (!result) {
-      return c.json({ error: 'Session not found' }, 404);
+      return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'Session not found');
     }
 
     const { session, device } = result;
     if (!hasSessionOwnership(auth, session.userId)) {
-      return c.json({ error: 'Access denied' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
     }
     const capabilityDenial = await currentSessionCapabilityDenial(c, session, device);
     if (capabilityDenial) return capabilityDenial;
@@ -1233,12 +1247,12 @@ sessionRoutes.post(
 
     const result = await getSessionWithOrgCheck(sessionId, auth);
     if (!result) {
-      return c.json({ error: 'Session not found' }, 404);
+      return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'Session not found');
     }
 
     const { session, device } = result;
     if (!hasSessionOwnership(auth, session.userId)) {
-      return c.json({ error: 'Access denied' }, 403);
+      return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
     }
 
     // Re-enforce the CURRENT site ceiling: a caller narrowed away from this
@@ -1313,7 +1327,7 @@ sessionRoutes.post(
         .where(eq(remoteSessions.id, sessionId))
         .limit(1);
       if (!current) {
-        return c.json({ error: 'Session not found' }, 404);
+        return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'Session not found');
       }
       return c.json({
         error: 'Session is already ended',

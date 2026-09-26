@@ -106,6 +106,7 @@ describe('OrgAiBudgetSettings — partner locks', () => {
         'aiBudgets.enabled', 'aiBudgets.monthlyBudgetCents', 'aiBudgets.dailyBudgetCents',
         'aiBudgets.maxTurnsPerSession', 'aiBudgets.messagesPerMinutePerUser',
         'aiBudgets.messagesPerHourPerOrg', 'aiBudgets.approvalMode', 'aiBudgets.alertThresholdPercents',
+        'aiBudgets.toolRateLimitMultiplier',
       ],
     );
     const { findByTestId } = renderTab();
@@ -278,5 +279,83 @@ describe('OrgAiBudgetSettings — save failures are surfaced', () => {
     // The form is still editable and still holds what the user typed — a
     // failed save must not look like a successful one.
     expect((getByTestId('org-ai-budget-monthly') as HTMLInputElement).value).toBe('25');
+  });
+});
+
+describe('OrgAiBudgetSettings — per-tool rate-limit multiplier (#6476)', () => {
+  it('renders empty with a "Default (1)" placeholder when inherited', async () => {
+    mockEffective({ ...DEFAULT_BUDGET, toolRateLimitMultiplier: 1 });
+    const { findByTestId } = renderTab();
+
+    const input = (await findByTestId('org-ai-budget-tool-rate-limit-multiplier')) as HTMLInputElement;
+    expect(input.value).toBe('');
+    expect(input.placeholder).toBe('Default (1)');
+    expect(input.min).toBe('1');
+    expect(input.max).toBe('10');
+  });
+
+  it('sends the multiplier when the user sets it', async () => {
+    mockEffective({ ...DEFAULT_BUDGET, toolRateLimitMultiplier: 1 });
+    const { findByTestId, getByTestId } = renderTab();
+
+    const input = (await findByTestId('org-ai-budget-tool-rate-limit-multiplier')) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '3' } });
+    fireEvent.click(getByTestId('org-ai-budget-save'));
+
+    await waitFor(() => expect(budgetPut().body).toEqual({ toolRateLimitMultiplier: 3 }));
+  });
+
+  it('is disabled and never sent when the partner locks it', async () => {
+    mockEffective({ ...DEFAULT_BUDGET, toolRateLimitMultiplier: 2 }, ['aiBudgets.toolRateLimitMultiplier']);
+    const { findByTestId, getByTestId } = renderTab();
+
+    const input = (await findByTestId('org-ai-budget-tool-rate-limit-multiplier')) as HTMLInputElement;
+    expect(input.disabled).toBe(true);
+    expect(input.value).toBe('2');
+    expect(getByTestId('org-ai-budget-locked-toolRateLimitMultiplier').textContent).toContain('Managed by partner');
+  });
+
+  it('highlights the field and shows its readable message on an out-of-range 400 (sweep E2)', async () => {
+    fetchWithAuth.mockImplementation((url: string, init?: RequestInit) => {
+      if (url === '/orgs/organizations/org-1/effective-settings' && !init) {
+        return Promise.resolve(jsonRes({ effective: { aiBudgets: { ...DEFAULT_BUDGET, toolRateLimitMultiplier: 1 } }, locked: [] }));
+      }
+      return Promise.resolve(jsonRes({
+        error: 'toolRateLimitMultiplier: Too big: expected number to be <=10',
+        details: {
+          formErrors: [],
+          fieldErrors: { toolRateLimitMultiplier: ['Too big: expected number to be <=10'] },
+        },
+      }, 400));
+    });
+    const { findByTestId, getByTestId } = renderTab();
+
+    const input = (await findByTestId('org-ai-budget-tool-rate-limit-multiplier')) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '15' } });
+    fireEvent.click(getByTestId('org-ai-budget-save'));
+
+    // The field itself is marked invalid and carries its own readable text —
+    // not the raw `toolRateLimitMultiplier: …` key.
+    await waitFor(() => expect(input.getAttribute('aria-invalid')).toBe('true'));
+    expect(input.className).toContain('border-destructive');
+    expect(getByTestId('org-ai-budget-error-toolRateLimitMultiplier').textContent).toBe(
+      'Too big: expected number to be <=10',
+    );
+
+    // sweep F8: the toast must not lead with the raw field-path key either.
+    await waitFor(() =>
+      expect(showToast).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'error', message: 'Too big: expected number to be <=10' }),
+      ),
+    );
+    expect(
+      (vi.mocked(showToast).mock.calls as Array<[{ message: string }]>).some(([arg]) =>
+        arg.message.startsWith('toolRateLimitMultiplier:'),
+      ),
+    ).toBe(false);
+
+    // Editing the field again clears the highlight.
+    fireEvent.change(input, { target: { value: '5' } });
+    expect(input.getAttribute('aria-invalid')).toBeNull();
   });
 });

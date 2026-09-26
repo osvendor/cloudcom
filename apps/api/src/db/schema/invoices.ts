@@ -88,6 +88,14 @@ export const invoices = pgTable('invoices', {
   // reads ONLY this column afterwards, so a later partner-default change cannot
   // alter what a sanctioned re-render produces.
   deviceAppendix: boolean('device_appendix'),
+  // #6227 presentation snapshot. NULL on a draft = preview the partner's live
+  // document_theme / document_page_size; both issue writers (issueInvoice and
+  // the quote-accept direct issue) freeze the RESOLVED values here, and every
+  // renderer reads them through resolveInvoicePresentation afterwards.
+  // CHECK-constrained to the documentThemes vocabulary (migration
+  // 2026-10-29-100100-invoice-presentation-snapshot).
+  documentTheme: varchar('document_theme', { length: 16 }),
+  documentPageSize: varchar('document_page_size', { length: 8 }),
   // #3205 W07: 1 = billing evidence captured at generation or interactive
   // contract-line materialization. NULL = no evidence capture recorded. Invoice-level `recorded` flag — never
   // derived from an evidence row count.
@@ -148,6 +156,16 @@ export const invoiceLines = pgTable('invoice_lines', {
   catalogItemId: uuid('catalog_item_id'),
   parentLineId: uuid('parent_line_id').references((): AnyPgColumn => invoiceLines.id, { onDelete: 'cascade' }),
   ticketId: uuid('ticket_id'),
+  // The "Ticket #…" label frozen at issue (settings audit rule 6, sweep C4).
+  // NULL on a draft — renderers read the ticket's live number instead
+  // (invoiceTicketNumberSql). Stamped once by issueInvoice; never restamped.
+  ticketLabel: varchar('ticket_label', { length: 50 }),
+  // The ticket subject + category name the line's group header prints, frozen
+  // at issue beside ticket_label (#6955 / #6674, same rule 6). NULL on a draft —
+  // renderers read tickets / ticket_categories live instead. Stamped once by
+  // issueInvoice; never restamped.
+  ticketSubject: varchar('ticket_subject', { length: 255 }),
+  ticketCategory: varchar('ticket_category', { length: 100 }),
   // Title (mirrors catalog name). Nullable for legacy lines created before the
   // split, where `description` holds the title and the renderer falls back to it.
   name: varchar('name', { length: 255 }),

@@ -76,6 +76,27 @@ describe('PartnerBillingSettingsPage', () => {
     expect(screen.queryByTestId('billing-connections-tab-placeholder')).not.toBeInTheDocument();
   });
 
+  it('the Connections tab has no editable fields, so it must not render the Save button either (G2-3)', async () => {
+    fetchMock.mockResolvedValue(json({ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 }));
+    renderPage();
+    await userEvent.click(await screen.findByTestId('billing-settings-tab-connections'));
+    expect(await screen.findByTestId('billing-connections-tab')).toBeInTheDocument();
+    expect(screen.queryByTestId('partner-billing-save')).not.toBeInTheDocument();
+  });
+
+  it('blank company name shows the partner name it falls back to on documents (sweep C3)', async () => {
+    fetchMock.mockResolvedValue(json({
+      currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30,
+      name: 'Default Partner', billingCompanyName: null,
+    }));
+    renderPage();
+    await gotoDocumentsTab();
+    await waitFor(() =>
+      expect(screen.getByTestId('partner-billing-company-name')).toHaveAttribute('placeholder', 'Default Partner'),
+    );
+    expect((screen.getByTestId('partner-billing-company-name') as HTMLInputElement).value).toBe('');
+  });
+
   it('loads and shows the seller company name', async () => {
     fetchMock.mockResolvedValue(json({
       currencyCode: 'USD', defaultTaxRate: null, invoiceNumberPrefix: 'INV',

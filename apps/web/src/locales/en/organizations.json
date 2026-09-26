@@ -88,7 +88,8 @@
         "viewAll": "View all alerts"
       },
       "lastActivity": "Last activity {{date}}",
-      "noSummary": "Summary counts are unavailable right now."
+      "noSummary": "Summary counts are unavailable right now.",
+      "archivedNotice": "Overview data isn't shown for archived organizations."
     },
     "archived": {
       "banner": "This organization is archived and read only. Restore it to make changes.",
@@ -96,7 +97,26 @@
     },
     "lifecycle": {
       "inaccessible": "This organization is {{status}}, so its live data is not available. You can still see it in the organizations list.",
+      "unknownTitle": "Inactive organization",
+      "inaccessibleHistoryOnly": "This organization is inactive, so its live data is not available. Its report history can still be read below.",
+      "genericStatusLabel": "inactive",
       "backToList": "Back to organizations"
+    },
+    "reportHistory": {
+      "title": "Report history",
+      "loading": "Loading report history…",
+      "readOnlyNote": "Read-only: this organization is {{status}}. Reports can't be generated, scheduled or downloaded.",
+      "forbidden": "You don't have access to this organization's report history.",
+      "error": "Could not load report history.",
+      "empty": "No reports or report runs found.",
+      "definitionsTitle": "Report definitions",
+      "definitionsEmpty": "No report definitions.",
+      "runsTitle": "Recent runs",
+      "runsEmpty": "No report runs.",
+      "lastGenerated": "Last generated {{date}}",
+      "neverGenerated": "Never generated",
+      "rowCount_one": "{{count}} row",
+      "rowCount_other": "{{count}} rows"
     },
     "unavailable": {
       "title": "Not available in this workspace",

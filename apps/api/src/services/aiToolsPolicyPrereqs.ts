@@ -36,6 +36,22 @@ import {
   resolvePeripheralPolicyDeviceIds,
   schedulePeripheralPolicyDevices,
 } from '../jobs/peripheralJobs';
+import { resolveWritableToolOrgId } from './aiToolWriteOrg';
+import type { ToolExecutionContext } from './toolExecutionContext';
+
+/**
+ * #6911: `manage_update_rings:create`, `manage_software_policies:create` and
+ * `manage_peripheral_policies:create` are user-owned on release
+ * (`USER_OWNED_RELEASE_ACTIONS` in `jobs/intentReleaseWorker.ts`) — each
+ * writes `auth.user.id` into a `created_by` `users` FK
+ * (`patch_policies` / `software_policies` / `peripheral_policies`). Under the
+ * rebuilt agent auth that id is an `aiAgents.id`, so refuse rather than write
+ * a row whose owner the worker and this handler's auth disagree about.
+ * Mirrors `aiToolsFleet.ts`'s `approverReleaseMismatch`.
+ */
+function approverReleaseMismatch(auth: AuthContext, context: ToolExecutionContext | undefined): boolean {
+  return !!context?.approverRelease && context.approverRelease.approverUserId !== auth.user.id;
+}
 
 /**
  * Defense-in-depth (#1317): the manage_update_rings AI tool writes `autoApprove`
@@ -93,11 +109,11 @@ function resolveS3ProviderConfig(
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
-type Handler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
-
-function getOrgId(auth: AuthContext): string | null {
-  return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
-}
+type Handler = (
+  input: Record<string, unknown>,
+  auth: AuthContext,
+  context?: ToolExecutionContext,
+) => Promise<string>;
 
 function orgWhere(auth: AuthContext, orgIdCol: any): SQL | undefined {
   return auth.orgCondition(orgIdCol) ?? undefined;
@@ -151,9 +167,9 @@ function backupProfileWhere(auth: AuthContext): SQL | undefined {
 }
 
 function safeHandler(toolName: string, fn: Handler): Handler {
-  return async (input, auth) => {
+  return async (input, auth, context) => {
     try {
-      return await fn(input, auth);
+      return await fn(input, auth, context);
     } catch (err: unknown) {
       const code = pgErrorCode(err);
       // Log BEFORE the pg-code early returns — those branches return without
@@ -204,12 +220,12 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           excludeCategories: { type: 'array', items: { type: 'string' }, description: 'Patch categories to exclude' },
           autoApprove: { type: 'object', description: "enabled, severities, deferralDays, thirdPartyApps, thirdPartyDeferralDays. Enabled needs severities or thirdPartyApps; omitted third-party fields persist." },
           enabled: { type: 'boolean', description: 'Whether ring is active (for update)' },
-          limit: { type: 'number', description: 'Max results for list (default 25)' },
+          limit: { type: 'number', description: 'Max results for list (default 25, max 100)' },
         },
         required: ['action'],
       },
     },
-    handler: safeHandler('manage_update_rings', async (input, auth) => {
+    handler: safeHandler('manage_update_rings', async (input, auth, context) => {
       const action = input.action as string;
 
       if (auth.scope === 'organization') {
@@ -261,6 +277,10 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (action === 'create') {
+        // #6911: user-owned on release — see approverReleaseMismatch.
+        if (approverReleaseMismatch(auth, context)) {
+          return JSON.stringify({ error: 'approver_auth_mismatch', action });
+        }
         if (!partnerId) return JSON.stringify({ error: 'Partner context required' });
         // Rings are partner-owned by construction — they govern patching for
         // every org under the partner (security review 2026-08-16 §1.1 #3).
@@ -359,7 +379,7 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         properties: {
           action: { type: 'string', enum: ['list', 'get', 'create', 'update'], description: 'Action to perform' },
           policyId: { type: 'string', description: 'Software policy UUID (required for get/update)' },
-          ownerScope: { type: 'string', enum: ['organization', 'partner'], description: "Create ownership: organization (default, current org) or partner (all-org template; requires full partner org access)." },
+          ownerScope: { type: 'string', enum: ['organization', 'partner'], description: "Create ownership: organization (default; needs orgId unless one org accessible) or partner (all-org template; requires full partner org access)." },
           name: { type: 'string', description: 'Policy name (required for create)' },
           description: { type: 'string', description: 'Policy description' },
           mode: { type: 'string', enum: ['allowlist', 'blocklist', 'audit'], description: 'Policy mode (required for create)' },
@@ -367,18 +387,21 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           enforceMode: { type: 'boolean', description: 'Whether to enforce (block/uninstall) or just alert (default: false)' },
           remediationOptions: { type: 'object', description: "Options: autoUninstall, notifyUser, gracePeriod, cooldownMinutes, maintenanceWindowOnly. autoInstall is forbidden here; arming installs needs a human with MFA." },
           isActive: { type: 'boolean', description: 'Active state (for update)' },
-          limit: { type: 'number', description: 'Max results for list (default 25)' },
+          limit: { type: 'number', description: 'Max results for list (default 25, max 100)' },
+          orgId: {
+            type: 'string',
+            description: 'Organization UUID that will own the new policy (create with ownerScope "organization" only). Required unless you can access exactly one organization.',
+          },
         },
         required: ['action'],
       },
     },
-    handler: safeHandler('manage_software_policies', async (input, auth) => {
+    handler: safeHandler('manage_software_policies', async (input, auth, context) => {
       const action = input.action as string;
       // Reads (list/get) are not gated by the site-ceiling — only create/update/delete.
       if (action !== 'list' && action !== 'get' && !canMutateOrgWideGovernance(auth)) {
         return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
       }
-      const orgId = getOrgId(auth);
 
       if (action === 'list') {
         const conditions: SQL[] = [];
@@ -419,6 +442,10 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (action === 'create') {
+        // #6911: user-owned on release — see approverReleaseMismatch.
+        if (approverReleaseMismatch(auth, context)) {
+          return JSON.stringify({ error: 'approver_auth_mismatch', action });
+        }
         // Ownership axis (#2126): partner-wide templates apply to every org
         // under the partner, so creation is gated on the same capability as
         // the HTTP route. The partner is derived from the caller's own token.
@@ -430,8 +457,9 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           }
           owner = { orgId: null, partnerId: auth.partnerId };
         } else {
-          if (!orgId) return JSON.stringify({ error: 'Organization context required' });
-          owner = { orgId, partnerId: null };
+          const resolvedSoftwarePolicyOrg = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined);
+          if (!resolvedSoftwarePolicyOrg.orgId) return JSON.stringify({ error: resolvedSoftwarePolicyOrg.error ?? 'Organization context required' });
+          owner = { orgId: resolvedSoftwarePolicyOrg.orgId, partnerId: null };
         }
         if (!input.name) return JSON.stringify({ error: 'name is required' });
         if (!input.mode) return JSON.stringify({ error: 'mode is required (allowlist, blocklist, or audit)' });
@@ -559,18 +587,21 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           action_type: { type: 'string', enum: ['allow', 'block', 'read_only', 'alert'], description: 'Action to take (required for create). Named action_type to avoid collision with action param.' },
           exceptions: { type: 'array', items: { type: 'object' }, description: 'Exception rules: [{ vendor?, product?, serialNumber?, allow: true, reason?, expiresAt? }]' },
           isActive: { type: 'boolean', description: 'Active state (for update)' },
-          limit: { type: 'number', description: 'Max results for list (default 25)' },
+          limit: { type: 'number', description: 'Max results for list (default 25, max 100)' },
+          orgId: {
+            type: 'string',
+            description: 'Organization UUID that will own the new policy (create only). Required unless you can access exactly one organization.',
+          },
         },
         required: ['action'],
       },
     },
-    handler: safeHandler('manage_peripheral_policies', async (input, auth) => {
+    handler: safeHandler('manage_peripheral_policies', async (input, auth, context) => {
       const action = input.action as string;
       // Reads (list/get) are not gated by the site-ceiling — only create/update/delete.
       if (action !== 'list' && action !== 'get' && !canMutateOrgWideGovernance(auth)) {
         return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
       }
-      const orgId = getOrgId(auth);
 
       if (action === 'list') {
         const conditions: SQL[] = [];
@@ -610,7 +641,13 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (action === 'create') {
-        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        // #6911: user-owned on release — see approverReleaseMismatch.
+        if (approverReleaseMismatch(auth, context)) {
+          return JSON.stringify({ error: 'approver_auth_mismatch', action });
+        }
+        const resolvedPeripheralOrg = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined);
+        if (!resolvedPeripheralOrg.orgId) return JSON.stringify({ error: resolvedPeripheralOrg.error ?? 'Organization context required' });
+        const orgId = resolvedPeripheralOrg.orgId;
         if (!input.name) return JSON.stringify({ error: 'name is required' });
         if (!input.deviceClass) return JSON.stringify({ error: 'deviceClass is required (storage, all_usb, bluetooth, thunderbolt)' });
         if (!input.action_type) return JSON.stringify({ error: 'action_type is required (allow, block, read_only, alert)' });
@@ -696,9 +733,13 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           profileId: { type: 'string', description: 'Backup profile UUID (required for get/update/delete)' },
           name: { type: 'string', description: 'Profile name (required for create)' },
           description: { type: 'string', description: 'Optional description' },
-          ownerScope: { type: 'string', enum: ['organization', 'partner'], description: 'create only: "organization" (default, current org) or "partner" ("all orgs" — requires full partner access)' },
+          ownerScope: { type: 'string', enum: ['organization', 'partner'], description: 'create only: "organization" (default; needs orgId unless you can access exactly one organization) or "partner" ("all orgs" — requires full partner access)' },
           selections: { type: 'object', description: 'Backup sources: file, system_image, mssql, hyperv. At least one enabled; file requires paths.' },
           isActive: { type: 'boolean', description: 'Active state' },
+          orgId: {
+            type: 'string',
+            description: 'Organization UUID that will own the new profile (create with ownerScope "organization" only). Required unless you can access exactly one organization.',
+          },
         },
         required: ['action'],
       },
@@ -763,9 +804,9 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           }
           owner = { orgId: null, partnerId: auth.partnerId };
         } else {
-          const orgId = getOrgId(auth);
-          if (!orgId) return JSON.stringify({ error: 'Organization context required' });
-          owner = { orgId, partnerId: null };
+          const resolvedProfileOrg = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined);
+          if (!resolvedProfileOrg.orgId) return JSON.stringify({ error: resolvedProfileOrg.error ?? 'Organization context required' });
+          owner = { orgId: resolvedProfileOrg.orgId, partnerId: null };
         }
         const [profile] = await db
           .insert(backupProfiles)
@@ -879,7 +920,11 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           compression: { type: 'boolean', description: 'Enable compression (default: true)' },
           encryption: { type: 'boolean', description: 'Enable encryption (default: true)' },
           isActive: { type: 'boolean', description: 'Active state (for update)' },
-          limit: { type: 'number', description: 'Max results for list (default 25)' },
+          limit: { type: 'number', description: 'Max results for list (default 25, max 100)' },
+          orgId: {
+            type: 'string',
+            description: 'Organization UUID that will own the new backup config (create only). Required unless you can access exactly one organization.',
+          },
         },
         required: ['action'],
       },
@@ -890,7 +935,6 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
       if (action !== 'list' && action !== 'get' && !canMutateOrgWideGovernance(auth)) {
         return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
       }
-      const orgId = getOrgId(auth);
 
       if (action === 'list') {
         const conditions: SQL[] = [];
@@ -933,7 +977,9 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (action === 'create') {
-        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
+        const resolvedConfigOrg = resolveWritableToolOrgId(auth, typeof input.orgId === 'string' && input.orgId ? input.orgId : undefined);
+        if (!resolvedConfigOrg.orgId) return JSON.stringify({ error: resolvedConfigOrg.error ?? 'Organization context required' });
+        const orgId = resolvedConfigOrg.orgId;
         if (!input.name) return JSON.stringify({ error: 'name is required' });
         if (!input.type) return JSON.stringify({ error: 'type is required (file, system_image, database, application)' });
         if (!input.provider) return JSON.stringify({ error: 'provider is required (s3, azure_blob, google_cloud, backblaze, local)' });

@@ -6,10 +6,16 @@ import { fetchWithAuth } from '../../stores/auth';
 import { installAstroClientRouterStandIn, type ClientRouterStandIn } from '../../__tests__/astroClientRouterStandIn';
 
 // Org scope, so the fleet-view gate stays open and the data paths under test run.
+const scopeState = vi.hoisted(() => ({ scope: 'org' as 'org' | 'all', orgId: 'org-1' as string | null }));
 vi.mock('@/hooks/useOrgScope', () => ({
-  useOrgScope: () => ({ ready: true, status: 'resolved', scope: 'org', orgId: 'org-1', org: null, error: null }),
-  getOrgScope: () => ({ ready: true, status: 'resolved', scope: 'org', orgId: 'org-1', org: null, error: null }),
+  useOrgScope: () => (scopeState.scope === 'all'
+    ? { ready: true, status: 'resolved', scope: 'all', orgId: null, org: null, error: null }
+    : { ready: true, status: 'resolved', scope: 'org', orgId: scopeState.orgId, org: null, error: null }),
+  getOrgScope: () => (scopeState.scope === 'all'
+    ? { ready: true, status: 'resolved', scope: 'all', orgId: null, org: null, error: null }
+    : { ready: true, status: 'resolved', scope: 'org', orgId: scopeState.orgId, org: null, error: null }),
 }));
+vi.mock('./BackupHealthOverview', () => ({ default: () => <div data-testid="stub-health-overview" /> }));
 vi.mock('../../stores/auth', () => ({
   registerOrgIdProvider: vi.fn(),
   fetchWithAuth: vi.fn()
@@ -42,6 +48,8 @@ const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500):
 describe('BackupDashboard usage history chart', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    scopeState.scope = 'org';
+    scopeState.orgId = 'org-1';
     window.location.hash = '';
     HTMLDialogElement.prototype.showModal = vi.fn(function showModal(this: HTMLDialogElement) {
       this.setAttribute('open', '');
@@ -114,6 +122,23 @@ describe('BackupDashboard usage history chart', () => {
     expect(await screen.findByLabelText('Storage usage trend by provider over time')).not.toBeNull();
     expect(screen.getByText(/Chunk retry exceeded threshold/i)).toBeTruthy();
     expect(screen.queryByText('Chart placeholder: integrate provider usage history.')).toBeNull();
+
+    // G3-4 (#6496): with real provider rows present, the "no storage
+    // providers configured" empty state must not render alongside them.
+    expect(screen.getByText('S3')).toBeTruthy();
+    expect(screen.getByText('Local')).toBeTruthy();
+    expect(screen.queryByText(/No storage providers configured yet/i)).toBeNull();
+
+    // #6496: the chart axis dates must use the app's own long date format
+    // (e.g. "Feb 1, 2026"), not the runtime default short-numeric US locale
+    // (e.g. "2/1/2026"). Assert the shape rather than an exact day, since the
+    // UTC timestamps land on different local calendar days depending on the
+    // test runner's timezone.
+    const longDatePattern = /^[A-Z][a-z]{2} \d{1,2}, 2026$/;
+    const shortNumericPattern = /^\d{1,2}\/\d{1,2}\/2026$/;
+    const axisLabels = screen.getAllByText(longDatePattern);
+    expect(axisLabels.length).toBe(2);
+    expect(screen.queryByText(shortNumericPattern)).toBeNull();
   });
 
   it('shows the recovery bootstrap tab', async () => {
@@ -239,7 +264,9 @@ describe('BackupDashboard usage history chart', () => {
       fireEvent.click(link);
 
       expect(await screen.findByText('File Restore Wizard Stub')).toBeTruthy();
-      expect(window.location.hash).toBe('#restore');
+      // #6456: the snapshot being browsed is carried into the Restore tab's
+      // hash so the wizard doesn't make the operator re-pick it.
+      expect(window.location.hash).toBe('#restore?snapshot=snap-1');
     } finally {
       router.uninstall();
     }
@@ -444,5 +471,23 @@ describe('BackupDashboard usage history chart', () => {
     await screen.findByText('edge-02');
     expect(screen.getByText('Partial')).toBeTruthy();
     expect(screen.queryByText('Warning')).toBeNull();
+  });
+
+  it('renders the health view alone in all-organizations mode, calling neither org-only endpoint', async () => {
+    scopeState.scope = 'all';
+    fetchWithAuthMock.mockResolvedValue(makeJsonResponse({ data: {} }));
+    render(<BackupDashboard />);
+    expect(await screen.findByTestId('stub-health-overview')).toBeInTheDocument();
+    const urls = fetchWithAuthMock.mock.calls.map(([u]) => String(u));
+    expect(urls).not.toContain('/backup/dashboard');
+    expect(urls.some((u) => u.startsWith('/backup/usage-history'))).toBe(false);
+  });
+
+  it('renders the health view above the tiles in org mode and still loads the dashboard', async () => {
+    scopeState.scope = 'org';
+    fetchWithAuthMock.mockResolvedValue(makeJsonResponse({ data: {} }));
+    render(<BackupDashboard />);
+    expect(await screen.findByTestId('stub-health-overview')).toBeInTheDocument();
+    expect(fetchWithAuthMock.mock.calls.map(([u]) => String(u))).toContain('/backup/dashboard');
   });
 });

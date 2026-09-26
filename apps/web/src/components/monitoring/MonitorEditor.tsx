@@ -13,6 +13,8 @@ import {
   monitorKindSchema,
   monitorSeveritySchema,
   monitorDeliveryModeSchema,
+  monitorConditionSchemas,
+  monitorResponsesSchema,
   MONITOR_KINDS,
   type MonitorKind,
   type MonitorDeliveryMode,
@@ -33,6 +35,7 @@ import ActionsEditor, {
   type SoftwareCatalogItem,
 } from '../automations/ActionsEditor';
 import MonitorConditionFields from './MonitorConditionFields';
+import { RestartResponseFields } from './MonitorAuthoringFields';
 import DeployMonitorDialog from './DeployMonitorDialog';
 import MonitorDevicesTable from './MonitorDevicesTable';
 import MonitorActivityTab from './MonitorActivityTab';
@@ -43,6 +46,7 @@ import Breadcrumbs from '../layout/Breadcrumbs';
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import { i18n } from '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -97,26 +101,60 @@ export interface MonitorFormValues {
 // for the business rules (delivery channels required, ai_triage needs an
 // agent, recurrence threshold/window set together); this schema only catches
 // shape errors early.
-const monitorFormSchema = z.object({
-  name: z.string().min(1),
-  description: z.string().optional(),
-  kind: monitorKindSchema,
-  enabled: z.boolean(),
-  condition: z.record(z.string(), z.unknown()),
-  severity: monitorSeveritySchema,
-  cooldownMinutes: z.number().int().min(0).max(1440),
-  autoResolve: z.boolean(),
-  responses: z.array(z.record(z.string(), z.unknown())),
-  deliveryMode: monitorDeliveryModeSchema,
-  deliveryChannelIds: z.array(z.string()),
-  escalationPolicyId: z.string().nullable().optional(),
-  recurrenceThreshold: z.number().int().min(2).max(100).nullable().optional(),
-  recurrenceWindowDays: z.number().int().min(1).max(365).nullable().optional(),
-  recurrenceActions: z.array(z.record(z.string(), z.unknown())),
-  pauseResponsesOnEscalation: z.boolean(),
-  aiAgentId: z.string().nullable().optional(),
-  ownerScope: z.enum(['organization', 'partner']).optional(),
-});
+// Marks the specific "restart service needs a name" zod issue so the error
+// rendering (below) can show it instead of the generic invalidResponses copy.
+const RESTART_SERVICE_NAME_ISSUE = 'restartServiceRequiresName';
+
+const monitorFormSchema = z
+  .object({
+    name: z.string().min(1),
+    description: z.string().optional(),
+    kind: monitorKindSchema,
+    enabled: z.boolean(),
+    condition: z.record(z.string(), z.unknown()),
+    severity: monitorSeveritySchema,
+    cooldownMinutes: z.number().int().min(0).max(1440),
+    autoResolve: z.boolean(),
+    responses: z.array(z.record(z.string(), z.unknown())),
+    deliveryMode: monitorDeliveryModeSchema,
+    deliveryChannelIds: z.array(z.string()),
+    escalationPolicyId: z.string().nullable().optional(),
+    recurrenceThreshold: z.number().int().min(2).max(100).nullable().optional(),
+    recurrenceWindowDays: z.number().int().min(1).max(365).nullable().optional(),
+    recurrenceActions: z.array(z.record(z.string(), z.unknown())),
+    pauseResponsesOnEscalation: z.boolean(),
+    aiAgentId: z.string().nullable().optional(),
+    ownerScope: z.enum(['organization', 'partner']).optional(),
+  })
+  // Shape-only above; these two rules pull in the REAL shared per-kind
+  // condition schema and the shared responses schema (composite children,
+  // restart-service bounds) so a bad composite child or an out-of-range
+  // restart limit surfaces on the field, not only after the server 400s.
+  .superRefine((value, ctx) => {
+    const condition = monitorConditionSchemas[value.kind].safeParse(value.condition);
+    if (!condition.success) ctx.addIssue({ code: 'custom', path: ['condition'], message: 'Invalid condition' });
+    const responses = monitorResponsesSchema.safeParse(value.responses);
+    if (!responses.success) ctx.addIssue({ code: 'custom', path: ['responses'], message: 'Invalid responses' });
+    // D1: a `restart_service` response carries no service name of its own — it
+    // compiles to `auto_restart: true` on the delivered watch, which only ever
+    // targets the service named on the monitor's own `service`-kind condition
+    // (see automationActions.ts). Without this check the editor happily saves a
+    // restart response on a monitor with no service name at all (any non-service
+    // kind, or a service monitor whose name is still blank mid-edit), and at
+    // runtime automationRuntime.executeCommandAction reports it "succeeded" while
+    // doing nothing (~L1615). Block Save instead of shipping an inert action.
+    const hasRestartServiceResponse = value.responses.some(
+      (response) => (response as { kind?: unknown }).kind === 'restart_service',
+    );
+    const conditionServiceName = (value.condition as { serviceName?: unknown })?.serviceName;
+    const hasServiceName =
+      typeof conditionServiceName === 'string' && conditionServiceName.trim().length > 0;
+    if (hasRestartServiceResponse && !hasServiceName) {
+      // Sentinel picked up by the error rendering below (sweep F2) so the
+      // specific reason reaches the user instead of the generic fallback.
+      ctx.addIssue({ code: 'custom', path: ['responses'], message: RESTART_SERVICE_NAME_ISSUE });
+    }
+  });
 
 const DEFAULT_VALUES: MonitorFormValues = {
   name: '',
@@ -187,6 +225,7 @@ export async function attachAfterCreate(
 
 export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
   const { t } = useTranslation(['monitoring', 'common']);
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const isNew = !monitorId;
   const jwt = useJwtClaims();
   const currentPartnerId = jwt.status === 'resolved' ? jwt.claims.partnerId : null;
@@ -339,7 +378,7 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
       setLoading(true);
       setError(undefined);
       const response = await fetchWithAuth(`/monitor-definitions/${monitorId}`);
-      if (!response.ok) throw new Error(t('monitoring:editor.errors.load'));
+      if (!response.ok) throw new Error(stableT('monitoring:editor.errors.load'));
       const data = await response.json();
       const monitor = data?.data ?? data;
       setAttachments(Array.isArray(monitor.attachments) ? monitor.attachments : []);
@@ -367,11 +406,11 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
         aiAgentId: monitor.aiAgentId ?? null,
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('monitoring:editor.errors.load'));
+      setError(err instanceof Error ? err.message : stableT('monitoring:editor.errors.load'));
     } finally {
       setLoading(false);
     }
-  }, [isNew, monitorId, reset, t]);
+  }, [isNew, monitorId, reset, stableT]);
 
   useEffect(() => {
     void fetchKinds();
@@ -738,6 +777,11 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
               </select>
             </div>
             <MonitorConditionFields kind={watchKind} name="condition" />
+            {errors.condition && (
+              <p role="alert" data-testid="monitor-editor-condition-error" className="text-sm text-destructive">
+                {t('monitoring:editor.errors.invalidCondition')}
+              </p>
+            )}
           </section>
 
           <section className="space-y-3">
@@ -810,6 +854,14 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
               notificationChannels={notificationChannels}
               softwareCatalog={softwareCatalog}
             />
+            <RestartResponseFields />
+            {errors.responses && (
+              <p role="alert" data-testid="monitor-editor-responses-error" className="text-sm text-destructive">
+                {(errors.responses.root?.message ?? errors.responses.message) === RESTART_SERVICE_NAME_ISSUE
+                  ? t('monitoring:editor.errors.restartServiceRequiresName')
+                  : t('monitoring:editor.errors.invalidResponses')}
+              </p>
+            )}
           </section>
 
           <section className="space-y-3">

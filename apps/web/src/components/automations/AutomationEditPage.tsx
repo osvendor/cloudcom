@@ -7,13 +7,15 @@ import { fetchAllSites } from '@/lib/fetchAllSites';
 import { useOrgStore } from '../../stores/orgStore';
 import { useDefaultOwnerScope } from '@/hooks/useDefaultOwnerScope';
 import type { DeploymentTargetConfig } from '@breeze/shared';
-import { extractApiError } from '@/lib/apiError';
+import { ActionError, runAction } from '@/lib/runAction';
+import { showToast } from '../shared/Toast';
 import { navigateTo } from '@/lib/navigation';
 import Breadcrumbs from '../layout/Breadcrumbs';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 type Site = { id: string; name: string };
 type Group = { id: string; name: string };
@@ -160,6 +162,7 @@ function buildActionPayload(action: ActionFormValues) {
 
 export default function AutomationEditPage({ automationId, isNew = false }: AutomationEditPageProps) {
   const { t } = useTranslation('scripts');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [loading, setLoading] = useState(!isNew);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
@@ -192,7 +195,7 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
       setError(undefined);
       const response = await fetchWithAuth(`/automations/${automationId}`);
       if (!response.ok) {
-        throw new Error(t('automationEditPage.errors.fetch'));
+        throw new Error(stableT('automationEditPage.errors.fetch'));
       }
       const data = await response.json();
       const automation = data.automation ?? data;
@@ -235,7 +238,10 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
         description: asString(automation.description),
         triggerType,
         cronExpression: asString(trigger.cronExpression) ?? asString(trigger.cron),
-        eventType: asString(trigger.eventType),
+        eventType: asString(trigger.eventType) ?? asString(trigger.event),
+        // #6367 W05c2: round-trip the stored filter untouched. Absent stays
+        // absent so an automation with no filter never gains an empty `{}`.
+        eventFilter: isPlainRecord(trigger.filter) ? trigger.filter : undefined,
         webhookSecret: asString(trigger.secret) ?? asString(trigger.webhookSecret),
         conditions: Array.isArray(automation.conditions) ? automation.conditions : [],
         targetConfig,
@@ -246,11 +252,11 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
 
       setWebhookUrl(asString(trigger.webhookUrl));
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('automationEditPage.errors.generic'));
+      setError(err instanceof Error ? err.message : stableT('automationEditPage.errors.generic'));
     } finally {
       setLoading(false);
     }
-  }, [automationId, isNew, t]);
+  }, [automationId, isNew, stableT]);
 
   const fetchSites = useCallback(async () => {
     try {
@@ -334,7 +340,12 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
           : values.triggerType === 'event'
             ? {
                 type: 'event',
-                eventType: values.eventType
+                eventType: values.eventType,
+                // #6367 W05c2: existing non-alert filters (ruleId,
+                // configPolicyAlertRuleId, nested device.* keys, …) stay
+                // intact even though their controls are hidden — only the
+                // form itself edits `eventFilter`.
+                ...(values.eventFilter ? { filter: values.eventFilter } : {})
               }
             : values.triggerType === 'webhook'
               ? {
@@ -369,18 +380,16 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
       const url = isNew ? '/automations' : `/automations/${automationId}`;
       const method = isNew ? 'POST' : 'PUT';
 
-      const response = await fetchWithAuth(url, {
-        method,
-        body: JSON.stringify(payload)
+      await runAction({
+        request: () => fetchWithAuth(url, { method, body: JSON.stringify(payload) }),
+        errorFallback: t('automationEditPage.errors.save'),
+        successMessage: t('common:states.saved'),
       });
-
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(extractApiError(data, t('automationEditPage.errors.save')));
-      }
 
       void navigateTo('/jobs');
     } catch (err) {
+      if (err instanceof ActionError && err.status === 401) return;
+      if (!(err instanceof ActionError)) showToast({ type: 'error', message: t('automationEditPage.errors.generic') });
       setError(err instanceof Error ? err.message : t('automationEditPage.errors.generic'));
     } finally {
       setSaving(false);

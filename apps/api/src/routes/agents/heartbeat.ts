@@ -29,6 +29,7 @@ import {
   normalizeAgentArchitecture,
   compareAgentVersions,
   buildEventLogConfigUpdate,
+  buildHardwareMonitoringConfigUpdate,
   buildMonitoringConfigUpdate,
   buildHelperConfigUpdate,
   buildPamConfigUpdate,
@@ -101,6 +102,8 @@ export function detectWatchdogStateCollapse(
 // so a later regression to an incompatible build re-warns instead of being
 // permanently consumed by the first episode.
 const warnedEditionWithheldDevices = new Set<string>();
+// Persisted reason code (devices.update_offer_withheld_reason, #6449).
+const EDITION_OFFER_WITHHELD_REASON = 'edition_unconfirmed';
 // Separate dedupe for the far more severe failover-recovery withhold (device
 // stuck OFFLINE, not idling) — its error must not be suppressed by an earlier
 // routine offer-withhold warn for the same device.
@@ -918,6 +921,23 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     updatedAt: new Date()
   };
 
+  // #6449 — persist the edition-gate withhold on the device row so stranded
+  // devices are visible in the UI (the log/Sentry above are once per process
+  // for the whole fleet). Same predicate + same beat-payload inputs as the
+  // offer gate further down. Written ONLY on a state transition (compared to
+  // the row this beat already loaded), so a steady-state beat — withheld or
+  // healthy — adds no column write to the hot path; `since` therefore holds
+  // when the episode began, not the last beat.
+  const withholdReason =
+    normalizeAgentArchitecture(device.architecture) &&
+    !agentAcceptsServedEdition({ reportedEdition: data.agentEdition, agentVersion: data.agentVersion })
+      ? EDITION_OFFER_WITHHELD_REASON
+      : null;
+  if ((device.updateOfferWithheldReason ?? null) !== withholdReason) {
+    deviceUpdates.updateOfferWithheldReason = withholdReason;
+    deviceUpdates.updateOfferWithheldSince = withholdReason ? new Date() : null;
+  }
+
   // #800 Layer C — recovery side. If the asymmetry detector previously
   // set mainAgentSilentSince (watchdog kept reporting while we went
   // dark), clear it now that the main agent is heartbeating again. No
@@ -950,6 +970,16 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // leaves the stored value untouched.
   if (data.backupVersion) {
     deviceUpdates.backupVersion = data.backupVersion;
+  }
+
+  // Persist the installed Breeze Assist helper version (#6751) — it was read
+  // for helperUpgradeTo below and then discarded, so a helper stuck behind the
+  // promoted release was invisible. Written only on change: helperVersion is a
+  // filter field, and an unconditional write would make every heartbeat look
+  // like a filterable change (dynamic-group re-evaluation below). Absent (old
+  // agent, or helper not installed) leaves the stored value untouched.
+  if (data.helperVersion && data.helperVersion !== device.helperVersion) {
+    deviceUpdates.helperVersion = data.helperVersion;
   }
 
   // Rollback protocol v1 agents must replace this as a complete snapshot on
@@ -1253,7 +1283,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     // group in the org, plus a peripheral-policy enqueue per membership flip),
     // so it belongs on the queue — see jobs/deviceGroupJobs.ts for the full
     // rationale. `requestDeviceGroupReevaluation` never rejects.
-    const filterableChangedFields = (['hostname', 'osVersion', 'osBuild', 'deviceRole'] as const)
+    const filterableChangedFields = (['hostname', 'osVersion', 'osBuild', 'deviceRole', 'helperVersion'] as const)
       .filter((field) => deviceUpdates[field] !== undefined);
     if (filterableChangedFields.length > 0) {
       void requestDeviceGroupReevaluation({
@@ -2074,6 +2104,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     pamSettings: { uacInterceptionEnabled: boolean } | null;
     patchSourceSettings: { exclusiveWindowsUpdate: boolean } | null;
     warrantySettings: { hpCmslEnabled: boolean } | null;
+    hardwareMonitoringSettings: Awaited<ReturnType<typeof buildHardwareMonitoringConfigUpdate>> | null;
   };
   let policyConfigs: PolicyConfigUpdates = {
     eventLogSettings: null,
@@ -2081,6 +2112,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     pamSettings: null,
     patchSourceSettings: null,
     warrantySettings: null,
+    hardwareMonitoringSettings: null,
   };
   try {
     policyConfigs = await withSystemDbAccessContext(async (): Promise<PolicyConfigUpdates> => {
@@ -2089,6 +2121,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       let pamSettings: { uacInterceptionEnabled: boolean } | null = null;
       let patchSourceSettings: { exclusiveWindowsUpdate: boolean } | null = null;
       let warrantySettings: { hpCmslEnabled: boolean } | null = null;
+      let hardwareMonitoringSettings: Awaited<ReturnType<typeof buildHardwareMonitoringConfigUpdate>> | null = null;
 
       // Sentry on all four, not just pam/patch_source. Losing an event_log or
       // monitoring policy is precisely the invisible failure #2930 is about:
@@ -2098,6 +2131,13 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         eventLogSettings = await buildEventLogConfigUpdate(scoped.deviceId);
       } catch (err) {
         console.error(`[agents] failed to build event log config update for ${agentId}:`, err);
+        captureException(err);
+      }
+
+      try {
+        hardwareMonitoringSettings = await buildHardwareMonitoringConfigUpdate(scoped.deviceId);
+      } catch (err) {
+        console.error(`[agents] failed to build hardware monitoring config update for ${agentId}:`, err);
         captureException(err);
       }
 
@@ -2149,7 +2189,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         captureException(err);
       }
 
-      return { eventLogSettings, monitoringSettings, pamSettings, patchSourceSettings, warrantySettings };
+      return { eventLogSettings, monitoringSettings, pamSettings, patchSourceSettings, warrantySettings, hardwareMonitoringSettings };
     });
   } catch (err) {
     // Transaction setup/commit failure — see the note above. Every resolver's
@@ -2158,12 +2198,20 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     console.error(`[agents] policy config context failed for ${agentId} — omitting config updates this heartbeat:`, err);
     captureException(err);
   }
-  const { eventLogSettings, monitoringSettings, pamSettings, patchSourceSettings, warrantySettings } = policyConfigs;
+  const { eventLogSettings, monitoringSettings, pamSettings, patchSourceSettings, warrantySettings, hardwareMonitoringSettings } = policyConfigs;
 
   const policyConfigUpdate: Record<string, unknown> = {};
   if (eventLogSettings) {
     policyConfigUpdate.event_log_settings = eventLogSettings;
   }
+  if (hardwareMonitoringSettings) {
+    policyConfigUpdate.hardware_monitoring_settings = hardwareMonitoringSettings;
+  }
+  // null = couldn't resolve this cycle (device vanished mid-resolution, #5677,
+  // or the resolver threw) → omit, and the agent keeps its watches. "No
+  // monitoring policy applies" is NOT null: it arrives as `{ watches: [] }`
+  // and must be sent, because the agent reads an absent key as "no change"
+  // and would otherwise keep a deleted policy's watches forever (#2949).
   if (monitoringSettings) {
     policyConfigUpdate.monitoring_settings = monitoringSettings;
   }

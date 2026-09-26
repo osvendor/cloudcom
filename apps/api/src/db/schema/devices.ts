@@ -194,6 +194,9 @@ export const devices = pgTable('devices', {
   // Nullable: old agents and devices without the backup binary installed
   // never report one.
   backupVersion: varchar('backup_version', { length: 50 }),
+  // Installed Breeze Assist (user helper) version from the heartbeat (#6751).
+  // Nullable: old agents and devices without the helper never report one.
+  helperVersion: varchar('helper_version', { length: 50 }),
   // #2288 — the control-plane URL the agent last heartbeated to. Reported by
   // the agent; shows fleet position during a server URL migration.
   agentServerUrl: varchar('agent_server_url', { length: 512 }),
@@ -254,6 +257,12 @@ export const devices = pgTable('devices', {
   // never cleared on a dispatched-but-failed dance so a broken device is
   // handled by an operator, not an uninstall/reinstall retry loop.
   editionMigrationDispatchedAt: timestamp('edition_migration_dispatched_at', { withTimezone: true }),
+  // #6449 — why the server is withholding update offers from this device.
+  // NULL = offers flowing. 'edition_unconfirmed' = the artifact-edition gate
+  // (agentAcceptsServedEdition, #4072) refused. Written by the heartbeat ONLY
+  // on a state change; `since` is when the current episode began.
+  updateOfferWithheldReason: varchar('update_offer_withheld_reason', { length: 50 }),
+  updateOfferWithheldSince: timestamp('update_offer_withheld_since', { withTimezone: true }),
   // Enrollment idempotency (#2764): uninstall intent stamped by the agent's
   // graceful-uninstall notify path (Task 5/6); reaper decommissions once past
   // grace with no re-enrollment heartbeat. possibleReplacementOfDeviceId links

@@ -27,6 +27,7 @@ import (
 	"github.com/breeze-rmm/agent/internal/authstate"
 	"github.com/breeze-rmm/agent/internal/backupipc"
 	"github.com/breeze-rmm/agent/internal/collectors"
+	"github.com/breeze-rmm/agent/internal/collectors/hwhealth"
 	"github.com/breeze-rmm/agent/internal/collectors/networkcontext"
 	"github.com/breeze-rmm/agent/internal/config"
 	"github.com/breeze-rmm/agent/internal/desktopfence"
@@ -324,6 +325,9 @@ type helperLifecycleController interface {
 	RenewLease(sessionID uint32, role ipc.HelperRole, opID string, ttl time.Duration) error
 	ReleaseLease(sessionID uint32, role ipc.HelperRole, opID string)
 	WaitForHelperReady(ctx context.Context, key sessionbroker.HelperKey) sessionbroker.HelperWaitResult
+	// HelperRoleAvailable reports whether key's session can host that helper
+	// role right now (a user-role helper needs a signed-in user).
+	HelperRoleAvailable(key sessionbroker.HelperKey) (bool, error)
 }
 
 // lifecycleMode returns the resolved helper lifecycle mode, or "" when no
@@ -401,6 +405,20 @@ type Heartbeat struct {
 	lastReliabilityUpdate time.Time
 	lastHardwareUpdate    time.Time // stamped at startup; gate then re-runs every 24 h
 	lastPatchUpdate       time.Time // stamped at startup; gate then re-runs every PatchScanIntervalHours
+	// Hardware health (RAID/disk) collection state. hwContext/hwCancel bound
+	// in-flight collect/upload work so shutdown can cancel it; hwStarted /
+	// hwRunning / hwStopping / hwDisabled* gate dispatch (see hardware_health.go).
+	hwhealthCol        *hwhealth.Collector
+	hwConfig           hwhealth.Config
+	lastHwRaidRun      time.Time
+	lastHwDiskRun      time.Time
+	hwContext          context.Context
+	hwCancel           context.CancelFunc
+	hwStarted          bool
+	hwRunning          bool
+	hwStopping         bool
+	hwDisabledQueued   bool
+	hwDisabledSnapshot *hwhealth.Snapshot
 	// #2728 — a patch submission that fails (e.g. a fleet-wide 429 from the
 	// per-org rate limiter) used to leave posture stale for a full scan
 	// interval, because lastPatchUpdate was stamped at dispatch time whether or
@@ -937,7 +955,10 @@ func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureStri
 		pamReconciliationBlocked:       make(map[string]struct{}),
 		pamReconciliationWake:          make(chan struct{}, 1),
 		desktopTargets:                 make(map[string]string),
+		hwhealthCol:                    hwhealth.New(hwhealth.Options{DataDir: config.GetDataDir(), ExtraToolDirs: cfg.Hardware.ToolDirs}),
+		hwConfig:                       hwhealth.Config{Enabled: true, PollInterval: 10 * time.Minute, DiskHealthInterval: time.Hour},
 	}
+	h.hwContext, h.hwCancel = context.WithCancel(context.Background())
 	h.accepting.Store(true)
 	h.isService = cfg.IsService
 	h.isHeadless = cfg.IsHeadless
@@ -1765,6 +1786,7 @@ func bootstrapThenListenWithRetry(ctx context.Context, bootstrap func() error, l
 
 func (h *Heartbeat) Start() {
 	go h.reconcileNativeRustDeskTarget()
+	h.startHardwareHealth()
 	h.startPamReconciliationRetryLoop()
 
 	// Issue #2621 — before the first heartbeat, finish any credential rotation
@@ -1973,6 +1995,7 @@ func (h *Heartbeat) Start() {
 			patchIntervalHours := clampPatchScanIntervalHours(h.config.PatchScanIntervalHours)
 			patchInterval := time.Duration(patchIntervalHours) * time.Hour
 			shouldSendPatch := h.claimPatchScanLocked(now, patchInterval)
+			hwTiers := h.hardwareTiersLocked(now, false)
 			h.mu.Unlock()
 
 			// Check for recent boot every few minutes (not every heartbeat tick).
@@ -2056,6 +2079,9 @@ func (h *Heartbeat) Start() {
 			if shouldSendPatch {
 				go h.sendPatchInventory()
 			}
+			if hwTiers != nil {
+				h.dispatchHardwareHealth(hwTiers)
+			}
 		case <-h.stopChan:
 			return
 		}
@@ -2071,6 +2097,7 @@ func (h *Heartbeat) StopAcceptingCommands() {
 // DrainAndWait waits for all in-flight commands and inventory goroutines to complete,
 // respecting the context deadline.
 func (h *Heartbeat) DrainAndWait(ctx context.Context) {
+	h.stopHardwareHealth()
 	log.Info("draining in-flight commands and inventory goroutines")
 	h.pool.Drain(ctx)
 	h.wg.Wait()
@@ -2091,6 +2118,7 @@ func (h *Heartbeat) DrainAndWait(ctx context.Context) {
 
 func (h *Heartbeat) Stop() {
 	h.stopOnce.Do(func() {
+		h.stopHardwareHealth()
 		shutdownTimeout := h.shutdownTimeout
 		if shutdownTimeout <= 0 {
 			shutdownTimeout = 5 * time.Second
@@ -2256,7 +2284,11 @@ func (h *Heartbeat) sendInventoryData(endpoint string, payload any, label string
 		"Authorization": {h.authHeader()},
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	parent := context.Background()
+	if endpoint == "hardware-health" && h.hwContext != nil {
+		parent = h.hwContext
+	}
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 
 	resp, err := httputil.Do(ctx, h.httpClient(), "PUT", url, body, headers, h.retryCfg)
@@ -2271,6 +2303,9 @@ func (h *Heartbeat) sendInventoryData(endpoint string, payload any, label string
 		return nil
 	} else {
 		log.Warn("inventory send failed", "label", label, "status", resp.StatusCode)
+	}
+	if endpoint == "hardware-health" {
+		return &hardwareSubmissionError{status: resp.StatusCode}
 	}
 	return fmt.Errorf("inventory send failed for %s: status %d", label, resp.StatusCode)
 }
@@ -2946,6 +2981,14 @@ func (h *Heartbeat) applyConfigUpdate(update map[string]any) {
 
 	if raw, ok := update["networkContext"]; ok {
 		h.applyNetworkContextConfig(raw)
+	}
+
+	hwRaw, hasHW := update["hardware_monitoring_settings"]
+	if !hasHW {
+		hwRaw, hasHW = update["hardwareMonitoringSettings"]
+	}
+	if hasHW {
+		h.applyHardwareMonitoringConfig(hwRaw)
 	}
 
 	// Apply event_log_settings if present
@@ -5017,21 +5060,11 @@ func (h *Heartbeat) processHeartbeatResponse(response *HeartbeatResponse) {
 		go h.reconcilePendingRotation()
 	}
 
-	// Handle helper upgrade if requested
-	if !rollbackActive && response.HelperUpgradeTo != "" {
-		installedHelper := h.helperMgr.InstalledVersion()
-		if allowed, reason := helperUpgradeAllowed(response.HelperUpgradeTo, installedHelper, h.helperMgr.IsInstalled()); !allowed {
-			// SECURITY: never auto-downgrade the helper. The signed manifest
-			// only binds manifest.Release == requested version, so a
-			// compromised/MITM'd control plane could replay an older,
-			// validly-signed, known-vulnerable helper release.
-			log.Error("SECURITY: refusing server-directed helper update",
-				"installedVersion", installedHelper,
-				"targetVersion", response.HelperUpgradeTo,
-				"reason", reason)
-		} else {
-			h.helperMgr.CheckUpdate(response.HelperUpgradeTo)
-		}
+	// Handle helper upgrade if requested, or its withdrawal (#6927).
+	// Nil-checked here, not in applyHelperOffer: a nil *helper.Manager in the
+	// interface would not compare equal to nil there.
+	if !rollbackActive && h.helperMgr != nil {
+		applyHelperOffer(h.helperMgr, response.HelperUpgradeTo)
 	}
 
 	// Handle watchdog upgrade if requested. The server only sets
@@ -6599,6 +6632,7 @@ func (h *Heartbeat) executePatchInstallCommand(payload map[string]any, rollback 
 
 	results := make([]map[string]any, 0, len(refs))
 	successCount := 0
+	skippedCount := 0
 	failedCount := 0
 	rebootRequired := false
 
@@ -6639,6 +6673,20 @@ func (h *Heartbeat) executePatchInstallCommand(payload map[string]any, rollback 
 			continue
 		}
 
+		if installResult.Skipped {
+			// Nothing to do — already current / no longer offered (#6910).
+			// Visible in results[] with its reason, but neither an install
+			// nor a failure, so it cannot fail the job or raise an alert.
+			skippedCount++
+			result := patchCommandResultFields(ref, installID)
+			result["status"] = "skipped"
+			result["skipReason"] = installResult.SkipReason
+			result["rebootRequired"] = false
+			result["message"] = installResult.Message
+			results = append(results, result)
+			continue
+		}
+
 		successCount++
 		rebootRequired = rebootRequired || installResult.RebootRequired
 		result := patchCommandResultFields(ref, installID)
@@ -6651,6 +6699,7 @@ func (h *Heartbeat) executePatchInstallCommand(payload map[string]any, rollback 
 	summary := map[string]any{
 		"success":        failedCount == 0,
 		"installedCount": successCount,
+		"skippedCount":   skippedCount,
 		"failedCount":    failedCount,
 		"rebootRequired": rebootRequired,
 		"results":        results,
@@ -6661,7 +6710,9 @@ func (h *Heartbeat) executePatchInstallCommand(payload map[string]any, rollback 
 
 	// Post-install rescan: trigger an immediate patch inventory so the
 	// dashboard reflects the new state without waiting up to 15 minutes.
-	if successCount > 0 {
+	// A skipped item also means the inventory is stale (the update was
+	// superseded, or the package is already current), so it rescans too.
+	if successCount > 0 || skippedCount > 0 {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {

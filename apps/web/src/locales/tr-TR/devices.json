@@ -133,7 +133,8 @@
     "thisOrganizationOnlyHasOneSite": "Bu kuruluşun yalnızca bir sitesi var. Taşımayı etkinleştirmek için Ayarlar → Kuruluşlar'dan daha fazla site ekleyin.",
     "current": "(güncel)",
     "cancel": "İptal",
-    "moving": "Taşınıyor..."
+    "moving": "Taşınıyor...",
+    "toADifferentSite": "farklı bir siteye taşı."
   },
   "createGroupModal": {
     "failedToCreateGroup": "Grup oluşturulamadı",
@@ -334,6 +335,7 @@
     "metricAnomalies": "Metrik Anomaliler",
     "anomalyDetectionIsDisabledForThis": "Bu kuruluş için anormallik algılama devre dışı bırakıldı.",
     "anomalyDetectionDisabled": "Anormallik algılama devre dışı",
+    "anomalyDetectionDisabledHint": "Bunu <orgLink>organizasyon ayarları</orgLink> → Yapay Zeka bölümünden açabilirsiniz.",
     "showingTheLinkedAnomalyAndRecent": "Bağlantılı anormalliği ve yakın zamandaki anormallik geçmişini gösterme",
     "openSignalsDetectedFromMetricRollups": "Metrik toplamalardan açık sinyaller algılandı",
     "refreshAnomalies": "Anormallikleri yenile",
@@ -350,7 +352,51 @@
     "confidence": "Güven",
     "dismiss": "Kapat",
     "resolve": "Çöz",
-    "promote": "Tanıt"
+    "promote": "Tanıt",
+    "filterOpen": "Açık",
+    "filterRecentlyClosed": "Son kapatılanlar",
+    "filterAll": "Tümü",
+    "showRecentlyClosed": "Son kapatılanları göster",
+    "couldNotUpdateEpisode": "Anomali güncellenemedi",
+    "episodeDismissed": "7 gün boyunca yoksayıldı",
+    "episodeResolved": "Anomali çözüldü",
+    "episodePromoted": "Anomali uyarıya yükseltildi",
+    "snoozeStopped": "Erteleme durduruldu",
+    "dismissFor7Days": "7 gün yoksay",
+    "promoteToAlert": "Uyarıya yükselt",
+    "stopSnoozing": "Ertelemeyi durdur",
+    "ongoingSince": "{{when}} tarihinden beri sürüyor",
+    "recurrenceNth": "7 günde {{nth}} kez",
+    "dismissedSnoozedUntil": "Yoksayıldı · {{when}} tarihine kadar ertelendi",
+    "detectionsCount": "{{count}} tespit",
+    "closeReason": {
+      "cleared": "temizlendi",
+      "expiredOffline": "süresi doldu: cihaz görülmedi",
+      "expiredNoData": "süresi doldu: bu metrik için veri yok",
+      "expiredOfflineSince": "süresi doldu: cihaz {{when}} tarihinden beri görülmedi",
+      "detectionOff": "kapatıldı: algılama kapatıldı",
+      "user": "çözüldü",
+      "userDismissed": "yoksayıldı",
+      "snoozed": "ertelendi"
+    },
+    "processDetailNotAvailable": "Bu metrik için işlem ayrıntısı yok.",
+    "topByAtPeak": "Zirvede {{dimension}} bazında en yüksek: {{list}}",
+    "sentence": {
+      "spike": "{{metric}}, {{duration}} boyunca {{range}} seviyesindeydi, normalde {{baseline}}.",
+      "processMax": "Bir işlem {{value}} değerine ulaştı, normalde {{baseline}}.",
+      "processSum": "En üst işlemler birlikte {{value}} kullandı, normalde {{baseline}}.",
+      "drop": "{{metric}}, {{duration}} boyunca {{value}} değerine düştü, normalde {{baseline}}.",
+      "growth": "{{metric}}, {{duration}} içinde {{from}} değerinden {{to}} değerine yükseldi."
+    },
+    "membersColumns": {
+      "window": "Pencere",
+      "metric": "Metrik",
+      "score": "Skor"
+    },
+    "membersTruncated": "İlk {{count}} tespit gösteriliyor.",
+    "failedToLoadDetections": "Tespitler yüklenemedi",
+    "legacyDetectionNote": "Bu tespit, olay gruplamasından öncesine ait.",
+    "v1ShadowPerEpisodeNote": "Bu bölüm karşılaştırma için v1 gölge modeli tarafından da puanlanıyor."
   },
   "deviceBillingCard": {
     "title": "Faturalama",
@@ -800,6 +846,7 @@
     }
   },
   "deviceFilesystemTab": {
+    "deviceIsOfflineScansRequireAConnectedAgent": "Cihaz çevrimdışı. Taramalar için bağlı bir aracı gerekir.",
     "resultPartial": "Kısmen tamamlandı",
     "resultSkippedLinks": "Atlanan bağlantılar: {{count}}",
     "errorAgentUpdateRequired": "Temizliği çalıştırmak için aracıyı {{minAgentVersion}} veya sonraki bir sürüme güncelleyin.",
@@ -908,7 +955,10 @@
     "historyKindFiles": "Dosya temizliği",
     "historyKindSystem": "Sistem temizliği",
     "historyReclaimed": "{{size}} geri kazanıldı",
-    "historyCandidates": "{{count}} aday",
+    "historyCandidates_one": "{{count}} aday",
+    "historyCandidates_other": "{{count}} aday",
+    "historyActions_one": "{{count}} işlem",
+    "historyActions_other": "{{count}} işlem",
     "status": {
       "previewed": "Önizlendi",
       "running": "Çalışıyor",
@@ -1046,6 +1096,7 @@
     "linkSpeed": "Bağlantı Hızı"
   },
   "deviceInfoTab": {
+    "updateOfferWithheld": "Bu cihaz için güncelleme teklifleri durduruldu ({{since}} tarihinden beri): aracı sürümünün bu sunucunun sunduğu sürümü kabul ettiği doğrulanamıyor, bu nedenle mevcut sürümünde kalıyor. Sunulan sürümün yükleyicisiyle veya sürümünü bildiren bir aracı sürümüyle kurtarın.",
     "gpu": "GPU",
     "text": "—",
     "failedToFetchDeviceDetails": "Cihaz ayrıntıları getirilemedi",
@@ -1120,6 +1171,7 @@
     "agent": "Temsilci",
     "agentVersion": "Temsilci Sürümü",
     "watchdogVersion": "Watchdog Sürümü",
+    "helperVersion": "Yardımcı Sürümü",
     "status": "Durum",
     "lastSeen": "Son Görülme",
     "enrolled": "Kayıtlı",
@@ -1327,6 +1379,7 @@
     "moveUp": "Yukarı git",
     "moveDown": "Aşağıya taşı",
     "hidden": "Gizli",
+    "customFields": "Özel Alanlar",
     "resetToDefaults": "Varsayılanlara sıfırla",
     "selected": "seçildi",
     "bulkActions": "Toplu İşlemler",
@@ -1384,6 +1437,8 @@
       "unifi": "UniFi",
       "manual": "Manuel"
     },
+    "updateWithheld": "Güncellemeler durduruldu",
+    "updateWithheldTooltip": "Sunucu, aracı sürümünün sunulan sürümü kabul ettiği doğrulanamadığı için bu cihaza güncelleme sunmuyor. Kurtarılana kadar mevcut sürümünde kalır.",
     "agentVersionRelation": {
       "equalTooltip": "Etkin sürümle eşleşiyor: {{version}}",
       "aheadTooltip": "{{version}} sabitlemesinin ilerisinde",
@@ -2657,7 +2712,9 @@
           "networkGear": "Ağ cihazları",
           "peripherals": "Çevre birimleri",
           "other": "Diğer"
-        }
+        },
+        "site": "Site",
+        "changeSite": "Siteyi değiştir…"
       },
       "monitoring": {
         "description": "SNMP veri toplamayı ve ağ kontrollerini yapılandırın.",
@@ -2769,7 +2826,12 @@
         "checkCreated": "Ağ kontrolü eklendi",
         "checkCreateFailed": "Ağ kontrolü eklenemedi",
         "checkRemoved": "Ağ kontrolü kaldırıldı",
-        "checkRemoveFailed": "Ağ kontrolü kaldırılamadı"
+        "checkRemoveFailed": "Ağ kontrolü kaldırılamadı",
+        "siteChanged": "{{site}} sitesine taşındı.",
+        "siteChangeFailed": "Varlık yeni siteye taşınamadı",
+        "siteChangedUnlinked": "Aracı cihazıyla olan bağlantı kaldırıldı çünkü o cihaz farklı bir sitede.",
+        "siteChangedPolicies_one": "{{count}} topoloji izleme ilkesi devre dışı bırakıldı.",
+        "siteChangedPolicies_other": "{{count}} topoloji izleme ilkesi devre dışı bırakıldı."
       }
     },
     "header": {
@@ -3357,5 +3419,57 @@
       "created": "Ağ varlığı oluşturuldu",
       "createFailed": "Ağ varlığı oluşturulamadı"
     }
+  },
+  "hardwareHealth": {
+    "title": "Depolama ve RAID",
+    "hardware": "Donanım",
+    "ok": "Sağlıklı",
+    "warning": "Uyarı",
+    "critical": "Kritik",
+    "unknown": "Bilinmiyor",
+    "loading": "Donanım durumu yükleniyor…",
+    "error": "Donanım durumu yüklenemedi.",
+    "retry": "Yeniden dene",
+    "noReport": "Henüz donanım raporu alınmadı.",
+    "noTools": "RAID veya disk aracı algılanmadı — denenenler: {{sources}}",
+    "disabled": "Donanım izleme {{policy}} ilkesiyle devre dışı",
+    "collected": "Toplandı: {{time}}",
+    "notSeen": "Son görülme: {{time}}",
+    "predictive": "Öngörülen arıza",
+    "virtualDisks": "Sanal diskler",
+    "physicalDisks": "Fiziksel diskler",
+    "osDisks": "İşletim sisteminde görünen diskler",
+    "backed": "RAID sanal diski tarafından sağlanır",
+    "enclosures": "Muhafazalar: {{total}}",
+    "identity": "Model / seri / ürün yazılımı",
+    "diskIdentity": "Yuva / model / seri / ortam / arabirim",
+    "size": "Boyut",
+    "state": "Durum",
+    "telemetry": "Sıcaklık / ortam hataları / diğer hatalar / çalışma saati",
+    "progress": "{{name}} ilerlemesi",
+    "sources": "Kaynaklar",
+    "unavailable": "Yüklü değil",
+    "failed": "Hata: {{error}}",
+    "backingOff": "{{time}} tarihine kadar beklemede",
+    "superseded": "Yerine kullanılan {{winner}}",
+    "sourceSuperseded": "Yerine başka kaynak kullanılıyor",
+    "sourceDisabled": "Devre dışı",
+    "partial": "Kısmi rapor",
+    "docs": "Kurulum rehberi",
+    "events": "Donanım olayları",
+    "noEvents": "Donanım olayı kaydedilmedi.",
+    "noComponents": "Bileşen bildirilmedi. Kaynakları kontrol edin.",
+    "all": "Tüm donanım durumları",
+    "managementController": "Yönetim denetleyicisi",
+    "bmcVendor": "Üretici",
+    "bmcFirmware": "Donanım yazılımı",
+    "bmcIp": "IP adresi",
+    "bmcMac": "MAC adresi",
+    "bmcOtherSite": "{{site}} sitesinde yönetim denetleyicisi bulundu",
+    "bmcObserved": "Son bildirim: {{time}}; günlük toplanır.",
+    "bmcHost": "{{name}} için yönetim denetleyicisi",
+    "bmcAgentReport": "— ana makine aracısı tarafından bildirildi",
+    "bmcAssociation": "Bu yönetim denetleyicisi ana makinesiyle ilişkilidir ve ayrı bir ağ cihazı olarak kalır.",
+    "bmcConfirmUnlink": "Yönetim denetleyicisi ilişkisi kaldırılsın mı? Bu varlığı yeniden bağlayana kadar otomatik bağlantı kapalı kalır."
   }
 }

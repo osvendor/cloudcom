@@ -863,6 +863,7 @@
         "reorderSections": "Bölümler yeniden sıralanamadı.",
         "saveCoverPage": "Kapak sayfası kaydedilemedi",
         "saveCustomer": "Müşteri değiştirilemedi.",
+        "saveFooter": "Altbilgi satırı kaydedilemedi.",
         "saveTerms": "Şartlar kaydedilemedi.",
         "saveTitle": "Başlık kaydedilemedi.",
         "unitPriceZeroOrMore": "0 veya daha fazla birim fiyat girin.",
@@ -1003,6 +1004,15 @@
         "headerStyleAccent": "Vurgulu",
         "reshapedWarning": "Bu tablo {{columns}} sütun x {{rows}} satır sınırına sığmadığı için yeniden düzenlendi. Kaydetmek, kayıtlı tabloyu burada gördüğünüzle değiştirir."
       },
+      "footer": {
+        "title": "Altbilgi satırı (her sayfa)",
+        "helper": "Her sayfanın altında yazdırılan kısa bir satır — örn. geçerlilik tarihleri. Varsayılan altbilgiyi kullanmak için boş bırakın. Küçük yazılar buraya değil Şartlar ve Koşullar'a eklenmelidir.",
+        "placeholder": "Boş = varsayılan altbilgiyi kullan",
+        "inheritedPartner": "Ayarlar'daki ortak fatura altbilgisi kullanılıyor: “{{text}}”",
+        "inheritedBrand": "Marka kiti altbilgi metni kullanılıyor: “{{text}}”",
+        "inheritedNone": "Ayarlar'da varsayılan bir altbilgi ayarlanmamış — sayfa altbilgisi boş olacak.",
+        "counter": "{{count}} / {{max}}"
+      },
       "terms": {
         "placeholder": "Ödeme koşulları, teslimat notları vb.",
         "title": "Şartlar ve Koşullar (düz metin)",
@@ -1125,8 +1135,11 @@
         "recipientRequired": "Gönderilecek en az bir alıcı girin.",
         "signaturePreviewLabel": "İmza (Ayarlar → Markalama bölümünde ayarlanır):",
         "subjectLabel": "Konu",
-        "subjectPlaceholder": "Şirketinizden {{number}} teklifi",
-        "subjectPlaceholderNoNumber": "Şirketinizden teklif",
+        "subjectPartnerFallback": "Şirketiniz",
+        "subjectPlaceholder": "{{partner}} tarafından {{number}} teklifi",
+        "subjectPlaceholderNoNumber": "{{partner}} tarafından teklif",
+        "subjectPlaceholderTemplate": "Teklif e-posta şablonunuzdaki konuyu kullanır",
+        "subjectPlaceholderTitled": "{{title}} — {{partner}} tarafından teklif",
         "title": "Bu teklif gönderilsin mi?",
         "toLabel": "Kime",
         "toPlaceholder": "Alıcı ekle…",
@@ -2202,22 +2215,33 @@
       "taxId": "Vergi Numarası",
       "taxRate": "Vergi oranı (%)",
       "title": "Vergi"
+    },
+    "terms": {
+      "description": "Bu kuruluşun faturalarının düzenlenmesinden vadesine kadar geçen gün sayısı. İş ortağı varsayılanını kullanmak için boş bırakın. Değişiklikler bundan sonra düzenlenen faturalara uygulanır; düzenlenmiş faturalar vade tarihlerini korur.",
+      "invalid": "0 ile 365 arasında tam sayı olarak gün girin.",
+      "partnerDefault": "İş ortağı varsayılanı",
+      "paymentTermsDays": "Ödeme koşulları (gün)",
+      "title": "Ödeme koşulları"
     }
   },
   "partnerBillingSettings": {
     "company": {
+      "addressInherited": "Şirket bilgileriyle aynı",
       "addressLine1": "Adres satırı 1",
       "addressLine2": "Adres satırı 2",
+      "addressTitle": "Adres",
       "city": "Şehir",
       "country": "Ülke",
       "defaultTerms": "Varsayılan şartlar ve koşullar",
       "defaultTermsPlaceholder": "Ödeme koşulları, sorumluluk reddi beyanları, garanti dili vb.",
       "description": "Tekliflerde ve faturalarda satıcı olarak gösterilir.",
+      "inheritedFromCompanyDetails": "Şirket bilgileri",
       "name": "Şirket adı",
       "phone": "Telefon",
       "postal": "Posta kodu",
       "region": "Eyalet / bölge",
       "title": "Şirket iletişim bilgileri",
+      "useCompanyAddress": "Şirket adresini kullan",
       "website": "Web sitesi"
     },
     "defaults": {

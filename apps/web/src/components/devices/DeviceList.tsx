@@ -33,7 +33,10 @@ import type {
   RemoteAccessPolicy,
   VpnPresence,
   FilterConditionGroup,
+  HardwareHealth,
 } from "@breeze/shared";
+import { HARDWARE_HEALTH_RANK } from "@breeze/shared";
+import ComponentStatePill from "./hardware/ComponentStatePill";
 import {
   matchesMergedListFilters,
   sortByDisplayName,
@@ -82,6 +85,11 @@ import {
   writeColumnVisibility,
   type ColumnId,
 } from "./columnVisibility";
+import {
+  readVisibleCustomFieldKeys,
+  writeVisibleCustomFieldKeys,
+} from "./customFieldColumnVisibility";
+import { useCustomFieldDefinitionsStore } from "../../stores/customFieldDefinitions";
 import {
   densityTableClasses,
   readDensity,
@@ -192,7 +200,11 @@ export type Device = {
   siteId: string;
   siteName: string;
   agentVersion: string;
+  /** Why the server withholds update offers from this device (#6449); null/absent = offers flowing. */
+  updateOfferWithheldReason?: string | null;
   watchdogVersion?: string | null;
+  /** Installed Breeze Assist helper version (devices.helper_version, #6751). */
+  helperVersion?: string | null;
   /**
    * Control-plane URL the agent last heartbeated to (devices.agent_server_url,
    * #2288). The opt-in Server column renders only its hostname. Any current
@@ -222,6 +234,12 @@ export type Device = {
    */
   maintenanceUntil?: string | null;
   tags: string[];
+  /**
+   * Custom field values (#6594), agent rows only — keyed by fieldKey, same
+   * shape DeviceInfoTab reads for the device-detail "Custom fields" section.
+   * Powers the opt-in custom field columns; undefined for network/manual rows.
+   */
+  customFields?: Record<string, unknown> | null;
   lastUser?: string;
   uptimeSeconds?: number;
   enrolledAt?: string;
@@ -325,6 +343,12 @@ export type Device = {
   /** Reliability trend from the same subsystem; drives the small arrow indicator. */
   reliabilityTrend?: "improving" | "stable" | "degrading" | null;
   /**
+   * Hardware & RAID health rollup (#6854 W04). Null/undefined when no report
+   * has been received yet — the Hardware column renders a dash.
+   */
+  hardwareHealth?: HardwareHealth | null;
+  hardwareHealthSummary?: Record<string, number> | null;
+  /**
    * Current-state power/battery snapshot (#2142). null/undefined = no data
    * reported yet (old agent or network device) → the Power column renders a
    * dash. { present: false } = a real no-battery desktop → also a dash.
@@ -419,6 +443,7 @@ const AGENT_ONLY_COLUMNS: ReadonlySet<ColumnId> = new Set<ColumnId>([
   "diskTotal",
   "agentVersion",
   "watchdogVersion",
+  "helperVersion",
   "serverUrl",
   "wanIp",
   "lastUser",
@@ -426,6 +451,7 @@ const AGENT_ONLY_COLUMNS: ReadonlySet<ColumnId> = new Set<ColumnId>([
   "enrolled",
   "desktopAccess",
   "reliability",
+  "hardwareHealth",
   "vpn",
 ]);
 
@@ -728,6 +754,7 @@ const sortValue: Record<ColumnId, (d: Device) => string | number | null> = {
   lastSeen: (d) => new Date(d.lastSeen).getTime() || null,
   agentVersion: (d) => d.agentVersion || null,
   watchdogVersion: (d) => d.watchdogVersion?.trim() || null,
+  helperVersion: (d) => d.helperVersion?.trim() || null,
   // IP columns (#2503) sort as strings through the shared numeric collator,
   // which happens to give correct dotted-quad ordering: it compares digit runs
   // numerically, so 192.168.1.9 < 192.168.1.10 and 10.x < 192.x. Missing
@@ -746,6 +773,10 @@ const sortValue: Record<ColumnId, (d: Device) => string | number | null> = {
   // sorts as a blank-last null to match the dash the cell renders (#1284).
   reliability: (d) =>
     typeof d.reliabilityScore === "number" ? d.reliabilityScore : null,
+  // Sort by severity rank, not alphabetically ("critical" < "ok" < "unknown"
+  // < "warning" would otherwise put the worst rows in the middle).
+  hardwareHealth: (d) =>
+    d.hardwareHealth ? HARDWARE_HEALTH_RANK[d.hardwareHealth] : null,
   // Sort by the first badge's provider label — active VPNs sort ahead of
   // running-but-disconnected ones because vpnList orders them first. Devices
   // with no VPN at all sort blanks-last (null) to match the dash the cell
@@ -832,6 +863,42 @@ export default function DeviceList({
   );
   const [columnsMenuOpen, setColumnsMenuOpen] = useState(false);
   const columnsMenuRef = useRef<HTMLDivElement>(null);
+  // Custom field columns (#6594) — additive, NOT part of ColumnId/COLUMN_IDS
+  // (see customFieldColumnVisibility.ts for why). Definitions come from the
+  // same store the advanced filter picker uses; visibility is a separate,
+  // independently persisted set of fieldKeys.
+  // The catalog is fetched under the AMBIENT org scope, so it must never be
+  // read or requested from a pinned single-org surface (the org record's
+  // Devices tab): that would leak the switcher's org into a page pinned to a
+  // different one. Custom-field columns are simply unavailable there.
+  const storedCustomFieldDefinitions = useCustomFieldDefinitionsStore((s) => s.definitions);
+  const customFieldDefinitions = useMemo(
+    () => (forceSingleOrg ? [] : storedCustomFieldDefinitions),
+    [forceSingleOrg, storedCustomFieldDefinitions],
+  );
+  const fetchCustomFieldDefinitions = useCustomFieldDefinitionsStore(
+    (s) => s.fetchCustomFieldDefinitions,
+  );
+  useEffect(() => {
+    if (!forceSingleOrg) void fetchCustomFieldDefinitions();
+  }, [fetchCustomFieldDefinitions, forceSingleOrg]);
+  const [visibleCustomFieldKeys, setVisibleCustomFieldKeys] = useState<
+    ReadonlySet<string>
+  >(() => readVisibleCustomFieldKeys());
+  const toggleCustomFieldColumn = (fieldKey: string) => {
+    setVisibleCustomFieldKeys((prev) => {
+      const next = new Set(prev);
+      if (next.has(fieldKey)) next.delete(fieldKey);
+      else next.add(fieldKey);
+      writeVisibleCustomFieldKeys(next);
+      return next;
+    });
+  };
+  // Definitions currently both known to the org/partner AND toggled on —
+  // a stale key from localStorage (field deleted since) silently drops.
+  const visibleCustomFieldDefs = customFieldDefinitions.filter((d) =>
+    visibleCustomFieldKeys.has(d.fieldKey),
+  );
   // Table density reflects the account-wide preference (breeze.density),
   // which is now set from the top-bar theme/display menu. Subscribe so the
   // table re-renders when it changes, without a reload.
@@ -1406,7 +1473,7 @@ export default function DeviceList({
     const d = new Date(iso);
     return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString();
   };
-  const fmtWatchdogVersion = (raw: string | null | undefined) => {
+  const fmtOptionalVersion = (raw: string | null | undefined) => {
     const version = raw?.trim();
     return version ? version : t("deviceList.nA");
   };
@@ -1967,6 +2034,17 @@ export default function DeviceList({
           device.agentVersion,
           effectiveVersion,
         );
+        // #6449: the server is withholding update offers from this device
+        // (edition gate) — it will idle on this version, so say so.
+        const withheldBadge = device.updateOfferWithheldReason ? (
+          <span
+            data-testid={`device-${device.id}-update-withheld`}
+            title={t("deviceList.updateWithheldTooltip")}
+            className="ml-1.5 rounded bg-warning/15 px-1.5 py-0.5 text-xs font-medium text-warning"
+          >
+            {t("deviceList.updateWithheld")}
+          </span>
+        ) : null;
         if (relation === "unknown") {
           return (
             <td
@@ -1975,6 +2053,7 @@ export default function DeviceList({
               className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap"
             >
               {device.agentVersion || dash}
+              {withheldBadge}
             </td>
           );
         }
@@ -1997,6 +2076,7 @@ export default function DeviceList({
             >
               {device.agentVersion}
             </span>
+            {withheldBadge}
           </td>
         );
       },
@@ -2013,7 +2093,24 @@ export default function DeviceList({
           key="watchdogVersion"
           className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap"
         >
-          {agentCell(device, fmtWatchdogVersion(device.watchdogVersion))}
+          {agentCell(device, fmtOptionalVersion(device.watchdogVersion))}
+        </td>
+      ),
+    },
+    helperVersion: {
+      header: () =>
+        sortHeader(
+          "helperVersion",
+          "Helper Version",
+          "Sort by helper version",
+        ),
+      cell: (device) => (
+        <td
+          key="helperVersion"
+          data-testid={`device-${device.id}-helper-version`}
+          className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap"
+        >
+          {agentCell(device, fmtOptionalVersion(device.helperVersion))}
         </td>
       ),
     },
@@ -2221,6 +2318,31 @@ export default function DeviceList({
         );
       },
     },
+    hardwareHealth: {
+      header: () => sortHeader("hardwareHealth", t("hardwareHealth.hardware"), "Sort by hardware health"),
+      cell: (device) => (
+        <td
+          key="hardwareHealth"
+          className="px-3 py-3 text-sm"
+          data-testid={`device-${device.id}-hardware-health`}
+        >
+          {agentCell(
+            device,
+            device.hardwareHealth ? (
+              <ComponentStatePill
+                health={device.hardwareHealth}
+                title={Object.entries(device.hardwareHealthSummary ?? {})
+                  .filter(([, count]) => typeof count === "number" && Number.isFinite(count))
+                  .map(([label, count]) => `${label}: ${count}`)
+                  .join(" · ")}
+              />
+            ) : (
+              dash
+            ),
+          )}
+        </td>
+      ),
+    },
     vpn: {
       header: () => sortHeader("vpn", "VPN", "Sort by VPN provider"),
       cell: (device) => {
@@ -2323,6 +2445,36 @@ export default function DeviceList({
         );
       },
     },
+  };
+
+  // Custom field columns (#6594) — additive, rendered after the static
+  // columns (see customFieldColumnVisibility.ts for why they're not folded
+  // into columnDefs above). No sort support in this slice: sortField/
+  // sortValue are keyed by the closed ColumnId union, and threading a
+  // per-org dynamic key through them is the same exhaustive-Record problem
+  // this design sidesteps.
+  const formatCustomFieldValue = (value: unknown): React.ReactNode => {
+    if (value === null || value === undefined || value === "") return dash;
+    if (typeof value === "boolean") return value ? t("common:labels.yes") : t("common:labels.no");
+    if (Array.isArray(value)) return value.length > 0 ? value.join(", ") : dash;
+    return String(value);
+  };
+  const customColumnHeader = (def: (typeof visibleCustomFieldDefs)[number]) => (
+    <th key={`custom.${def.fieldKey}`} className="px-3 py-3 text-left text-xs font-medium text-muted-foreground">
+      {def.name}
+    </th>
+  );
+  const customColumnCell = (def: (typeof visibleCustomFieldDefs)[number], device: Device) => {
+    const value = device.customFields?.[def.fieldKey];
+    return (
+      <td
+        key={`custom.${def.fieldKey}`}
+        className="max-w-[200px] px-3 py-3 text-sm text-muted-foreground"
+        data-testid={`device-${device.id}-custom-${def.fieldKey}`}
+      >
+        <span className="block truncate">{formatCustomFieldValue(value)}</span>
+      </td>
+    );
   };
 
   // Bulk-menu Compare item. DeviceCompare accepts at most COMPARE_MAX_DEVICES,
@@ -2523,6 +2675,29 @@ export default function DeviceList({
                         <span>{COLUMN_LABELS[id]}</span>
                       </label>
                     ))}
+                  {customFieldDefinitions.length > 0 && (
+                    <>
+                      <hr className="my-1" />
+                      <p className="px-2 pt-0.5 pb-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                        {t("deviceList.customFields")}{" "}
+                      </p>
+                      {customFieldDefinitions.map((def) => (
+                        <label
+                          key={def.id}
+                          className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-muted"
+                        >
+                          <input
+                            type="checkbox"
+                            data-testid={`custom-column-toggle-${def.fieldKey}`}
+                            checked={visibleCustomFieldKeys.has(def.fieldKey)}
+                            onChange={() => toggleCustomFieldColumn(def.fieldKey)}
+                            className="h-4 w-4 rounded border-border"
+                          />
+                          <span>{def.name}</span>
+                        </label>
+                      ))}
+                    </>
+                  )}
                   <hr className="my-1" />
                   <button
                     type="button"
@@ -2743,6 +2918,7 @@ export default function DeviceList({
                 />
               </th>
               {renderedColumns.map((id) => columnDefs[id].header())}
+              {visibleCustomFieldDefs.map((def) => customColumnHeader(def))}
               <th className="px-3 py-3 text-right">
                 {t("deviceList.actions")}
               </th>
@@ -2754,6 +2930,7 @@ export default function DeviceList({
                 <td
                   colSpan={
                     renderedColumns.length +
+                    visibleCustomFieldDefs.length +
                     2 /* checkbox + Actions; renderedColumns already drops flag-gated columns */
                   }
                   className="px-3 py-6 text-center text-sm text-muted-foreground"
@@ -2860,6 +3037,7 @@ export default function DeviceList({
                       </div>
                     </td>
                     {renderedColumns.map((id) => columnDefs[id].cell(device))}
+                    {visibleCustomFieldDefs.map((def) => customColumnCell(def, device))}
                     <td
                       className="px-3 py-3 text-sm"
                       onClick={(e) => e.stopPropagation()}
@@ -3212,7 +3390,7 @@ export default function DeviceList({
                       >
                         <td
                           colSpan={
-                            renderedColumns.length + 2 /* checkbox + Actions */
+                            renderedColumns.length + visibleCustomFieldDefs.length + 2 /* checkbox + Actions */
                           }
                           className="border-l-2 border-l-primary/40 px-3 py-1.5"
                         >
@@ -3245,7 +3423,7 @@ export default function DeviceList({
                     >
                       <td
                         colSpan={
-                          renderedColumns.length + 2 /* checkbox + Actions */
+                          renderedColumns.length + visibleCustomFieldDefs.length + 2 /* checkbox + Actions */
                         }
                         className="px-3 py-1.5"
                       >

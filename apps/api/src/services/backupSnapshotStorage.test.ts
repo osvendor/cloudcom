@@ -17,6 +17,32 @@ vi.mock('./recoveryMediaService', () => ({
   })),
 }));
 
+// #6843: the local GC walk must read each directory's entries via
+// fs.opendir's async-iterable Dir (entries pulled from the OS incrementally)
+// rather than fs.readdir({ withFileTypes: true }) (the whole directory
+// materialized into one array before any entry is yielded) — the same
+// memory-shape gap #6834 removed from the S3 listing path. Spies delegate to
+// the real implementation so every other test in this file (real-filesystem
+// fixtures) is unaffected; only the two dedicated tests below assert on them.
+const { readdirSpy, opendirSpy } = vi.hoisted(() => ({
+  readdirSpy: vi.fn(),
+  opendirSpy: vi.fn(),
+}));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    readdir: (...args: Parameters<typeof actual.readdir>) => {
+      readdirSpy(...args);
+      return actual.readdir(...args);
+    },
+    opendir: (...args: Parameters<typeof actual.opendir>) => {
+      opendirSpy(...args);
+      return actual.opendir(...args);
+    },
+  };
+});
+
 import {
   applyBackupSnapshotImmutability,
   backupLayoutManifestKey,
@@ -26,6 +52,7 @@ import {
   deleteBackupObjectKeys,
   fetchBackupObjectBytes,
   fetchBackupObjectText,
+  iterateBackupObjectsUnderPrefix,
   listBackupObjectsUnderPrefix,
 } from './backupSnapshotStorage';
 
@@ -316,6 +343,75 @@ describe('backup snapshot storage', () => {
     });
   });
 
+  // #6834: the GC sweep streams listings instead of materialising a whole
+  // bucket, so the iterator must fetch a page only when the consumer asks.
+  describe('iterateBackupObjectsUnderPrefix — streamed S3 paging (#6834)', () => {
+    it('yields one page per ListObjectsV2 call and requests the next page only after the previous one is consumed', async () => {
+      sendMock
+        .mockImplementationOnce(async (command) => {
+          expect(command.input.ContinuationToken).toBeUndefined();
+          return {
+            Contents: [{ Key: 'snapshots/a/manifest.json', LastModified: new Date('2026-01-01') }],
+            IsTruncated: true,
+            NextContinuationToken: 'tok-2',
+          };
+        })
+        .mockImplementationOnce(async (command) => {
+          expect(command.input.ContinuationToken).toBe('tok-2');
+          return {
+            Contents: [
+              { Key: 'snapshots/b/files/x', LastModified: new Date('2026-01-02') },
+              { Key: 'snapshots-old/lookalike', LastModified: new Date('2020-01-01') },
+            ],
+            IsTruncated: false,
+          };
+        });
+
+      const iterator = iterateBackupObjectsUnderPrefix({
+        provider: 's3',
+        providerConfig: { bucket: 'backups', region: 'us-east-1' },
+        prefix: 'snapshots',
+      });
+
+      const first = await iterator.next();
+      expect(first.value).toEqual([{ key: 'snapshots/a/manifest.json', lastModified: new Date('2026-01-01') }]);
+      expect(sendMock).toHaveBeenCalledTimes(1); // page 2 not fetched yet
+
+      const second = await iterator.next();
+      expect(second.value).toEqual([{ key: 'snapshots/b/files/x', lastModified: new Date('2026-01-02') }]);
+      expect(sendMock).toHaveBeenCalledTimes(2);
+
+      expect((await iterator.next()).done).toBe(true);
+    });
+
+    it('scopes a per-snapshot re-list to exactly `snapshots/<id>/`', async () => {
+      sendMock.mockImplementationOnce(async (command) => {
+        expect(command.input.Prefix).toBe('snapshots/abc/');
+        return {
+          Contents: [
+            { Key: 'snapshots/abc/files/1', LastModified: new Date('2026-01-01') },
+            { Key: 'snapshots/abc-2/files/1', LastModified: new Date('2026-01-01') }, // sibling id — filtered
+          ],
+          IsTruncated: false,
+        };
+      });
+
+      const pages = [];
+      for await (const page of iterateBackupObjectsUnderPrefix({
+        provider: 's3',
+        providerConfig: { bucket: 'backups', region: 'us-east-1' },
+        prefix: 'snapshots/abc',
+      })) pages.push(page);
+
+      expect(pages).toEqual([[{ key: 'snapshots/abc/files/1', lastModified: new Date('2026-01-01') }]]);
+    });
+
+    it('rejects an unsupported provider on first iteration (fail-closed)', async () => {
+      const iterator = iterateBackupObjectsUnderPrefix({ provider: 'azure', providerConfig: {}, prefix: 'snapshots' });
+      await expect(iterator.next()).rejects.toThrow('does not support object listing for GC');
+    });
+  });
+
   // S3 delete-response classification: a per-key error in response.Errors
   // (e.g. object-lock rejection) must be counted as FAILED, never silently
   // treated as deleted; deletes batch by 1000 keys per DeleteObjectsCommand.
@@ -433,6 +529,43 @@ describe('local-provider GC I/O (real filesystem)', () => {
       expect(item.lastModified).toBeInstanceOf(Date);
       expect(Number.isNaN(item.lastModified!.getTime())).toBe(false);
     }
+  });
+
+  it('streams the local walk in pages of at most 1000 keys, covering every file exactly once (#6834)', async () => {
+    const bulkDir = join(root, 'snapshots', 'snapB', 'files');
+    await mkdir(bulkDir, { recursive: true });
+    await Promise.all(Array.from({ length: 2100 }, (_, i) => writeFile(join(bulkDir, `f${i}.dat`), '')));
+
+    const pageSizes: number[] = [];
+    const keys: string[] = [];
+    for await (const page of iterateBackupObjectsUnderPrefix({
+      provider: 'local',
+      providerConfig: { path: root },
+      prefix: 'snapshots/snapB',
+    })) {
+      pageSizes.push(page.length);
+      for (const item of page) keys.push(item.key);
+    }
+
+    expect(Math.max(...pageSizes)).toBeLessThanOrEqual(1000);
+    expect(keys.length).toBe(2100);
+    expect(new Set(keys).size).toBe(2100);
+    expect(keys.every((k) => k.startsWith('snapshots/snapB/files/'))).toBe(true);
+  });
+
+  it('streams local directory entries via opendir, never materializing a whole directory via readdir (#6843)', async () => {
+    readdirSpy.mockClear();
+    opendirSpy.mockClear();
+
+    const listing = await listBackupObjectsUnderPrefix({
+      provider: 'local',
+      providerConfig: { path: root },
+      prefix: 'snapshots',
+    });
+
+    expect(listing.length).toBeGreaterThan(0);
+    expect(readdirSpy).not.toHaveBeenCalled();
+    expect(opendirSpy).toHaveBeenCalled();
   });
 
   it('fetches a local object as text', async () => {

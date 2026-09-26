@@ -34,6 +34,9 @@ import { FilterBuilder, DEFAULT_FILTER_FIELDS } from '../filters/FilterBuilder';
 import { FilterPreview } from '../filters/FilterPreview';
 import { useFilterPreview } from '../../hooks/useFilterPreview';
 import { useTranslation } from 'react-i18next';
+import { useStableT } from '@/lib/i18n/useStableT';
+import { isBusinessReportType } from './businessReportAccess';
+import { BUSINESS_REFUSED_CONFIG_KEYS, omitConfigKeys } from './businessReportConfig';
 
 type BuilderReportType = 'devices' | 'alerts' | 'patches' | 'compliance' | 'activity';
 type ReportBuilderType = BuilderReportType | LegacyReportType;
@@ -108,6 +111,19 @@ type ReportBuilderProps = {
    * to schema defaults on the next edit.
    */
   baseConfig?: Record<string, unknown>;
+  /**
+   * The report being edited is partner-owned (`orgId` null, covers all the
+   * partner's organizations, #3198). Its PUT must OMIT `orgId` entirely: the
+   * API answers 400 `report_ownership_immutable` for any `orgId` on a
+   * partner-owned row, `null` included, and ownership never changes on edit.
+   */
+  partnerOwned?: boolean;
+  /**
+   * The caller's own options (rendered outside the builder, e.g. a business
+   * report's options panel on the edit page) are invalid: submit is disabled
+   * and a submission is ignored, so a value the API would 400 on never leaves.
+   */
+  submitBlocked?: boolean;
   onSubmit?: (values: ReportBuilderFormValues) => void | Promise<void>;
   onPreview?: (values: ReportBuilderFormValues) => void | Promise<void>;
   onCancel?: () => void;
@@ -742,11 +758,16 @@ export default function ReportBuilder({
   defaultValues,
   reportId,
   baseConfig,
+  partnerOwned = false,
+  submitBlocked = false,
   onSubmit,
   onPreview,
   onCancel
 }: ReportBuilderProps) {
   const { t } = useTranslation('reports');
+  // Effects use the stable translator so a locale change does not re-run them
+  // (#3632); JSX keeps the plain `t` so rendered text still re-translates.
+  const stableT = useStableT(t);
   const { currentOrgId } = useOrgStore();
   const defaultsAppliedRef = useRef(false);
   const initialType = normalizeBuilderType(defaultValues?.builderType ?? defaultValues?.type);
@@ -775,6 +796,14 @@ export default function ReportBuilder({
   const [emailRecipients, setEmailRecipients] = useState<string[]>(defaultValues?.emailRecipients ?? []);
   const [contacts, setContacts] = useState<ContactOption[]>([]);
   const [selectedContactIds, setSelectedContactIds] = useState<Set<string>>(new Set());
+  // Contact recipients are refused by the API for every business report type
+  // (409 `report_type_partner_only_delivery`, org-owned included) and for any
+  // partner-owned report (409 `partner_owned_report`: contact recipients hang
+  // off an org-only composite FK). A picker that can only 409 is a silent
+  // failure, so both skip the contacts fetch and deliver through the
+  // free-text email list alone, which the worker already sends to.
+  const businessType = isBusinessReportType(defaultValues?.type);
+  const contactRecipientsRefused = businessType || partnerOwned;
   const [saveTemplate, setSaveTemplate] = useState(defaultValues?.saveTemplate ?? false);
   const [templateName, setTemplateName] = useState(defaultValues?.templateName ?? '');
   const [emailInput, setEmailInput] = useState('');
@@ -821,7 +850,7 @@ export default function ReportBuilder({
   }, [defaultValues]);
 
   useEffect(() => {
-    if (!currentOrgId || !reportId || schedule === 'one_time') return;
+    if (!currentOrgId || !reportId || schedule === 'one_time' || contactRecipientsRefused) return;
 
     void Promise.all([
       fetchWithAuth(`/orgs/organizations/${currentOrgId}/contacts`),
@@ -847,9 +876,9 @@ export default function ReportBuilder({
         )
       );
     }).catch(() => {
-      setError(t('reports.reportBuilder.recipients.loadFailed'));
+      setError(stableT('reports.reportBuilder.recipients.loadFailed'));
     });
-  }, [currentOrgId, reportId, schedule, t]);
+  }, [currentOrgId, reportId, schedule, contactRecipientsRefused, stableT]);
 
   const fieldDefinitions = fieldDefinitionsByType[builderType];
   const dataSourceFields = dataSourceFieldsByType[builderType];
@@ -986,7 +1015,7 @@ export default function ReportBuilder({
         };
 
         if (!response.ok) {
-          throw new Error(payload.error || t('reports.reportBuilder.errors.loadLivePreview'));
+          throw new Error(payload.error || stableT('reports.reportBuilder.errors.loadLivePreview'));
         }
 
         if (!mounted || previewRequestIdRef.current !== requestId) return;
@@ -1005,7 +1034,7 @@ export default function ReportBuilder({
         if (!mounted || previewRequestIdRef.current !== requestId) return;
         setLivePreviewRows([]);
         setLivePreviewSummary(null);
-        setLivePreviewError(err instanceof Error ? err.message : t('reports.reportBuilder.errors.loadLivePreview'));
+        setLivePreviewError(err instanceof Error ? err.message : stableT('reports.reportBuilder.errors.loadLivePreview'));
       } finally {
         if (!mounted || previewRequestIdRef.current !== requestId) return;
         setLivePreviewLoading(false);
@@ -1016,7 +1045,7 @@ export default function ReportBuilder({
       mounted = false;
       window.clearTimeout(timer);
     };
-  }, [builderType, currentOrgId, dataSource, defaultValues?.dateRange, defaultValues?.filters, exportFormats, filterConditions, mode, t]);
+  }, [builderType, currentOrgId, dataSource, defaultValues?.dateRange, defaultValues?.filters, exportFormats, filterConditions, mode, stableT]);
 
   const normalizedPreviewRows = useMemo(
     () => livePreviewRows.map(row => normalizePreviewRow(builderType, row)),
@@ -1379,6 +1408,7 @@ export default function ReportBuilder({
 
   const handleFormSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (submitBlocked) return;
     setError(undefined);
     setEmailError(undefined);
 
@@ -1399,36 +1429,55 @@ export default function ReportBuilder({
 
     const values = buildFormValues();
     const primaryFormat = values.format ?? 'pdf';
+    // Business report types (#3198) are builder-opaque: their options come from
+    // their own form via `baseConfig`, and the server REFUSES the builder's
+    // selectors on them (dateRange/filters/… → 400) and narrows `groupBy` to an
+    // enum (the builder's free-text `''` → 400). So for those types the builder
+    // contributes ONLY the delivery keys it genuinely owns — the cadence detail
+    // the schedule worker reads (`schedule`) and the free-text
+    // `emailRecipients` (their only delivery path) — never its presentation
+    // state, selectors or groupBy; baseConfig wins, minus any refused key.
+    const isBusiness = isBusinessReportType(defaultValues?.type);
+    const scheduleDetail = {
+      time: scheduleTime,
+      day: scheduleDay,
+      date: scheduleDate
+    };
 
     const payload = {
       name: values.name || 'Untitled Report',
-      type: values.type,
+      // A business type has no builder equivalent (the builder would name a
+      // legacy type like alert_summary); send the report's own type. PUT ignores
+      // `type` today, but the body must not claim a different one.
+      type: isBusiness && defaultValues?.type ? defaultValues.type : values.type,
       schedule: values.schedule,
       format: primaryFormat,
-      ...(currentOrgId ? { orgId: currentOrgId } : {}),
-      config: {
-        // Keys the builder doesn't own (posture thresholds, executive-summary
-        // settings) come first so live builder state below still wins.
-        ...baseConfig,
-        builderType,
-        dataSource,
-        columns: selectedFields,
-        filterConditions,
-        groupBy,
-        aggregation,
-        chartType,
-        schedule: {
-          time: scheduleTime,
-          day: scheduleDay,
-          date: scheduleDate
-        },
-        exportFormats,
-        emailRecipients,
-        saveTemplate,
-        templateName: saveTemplate ? templateName : undefined,
-        legacyFilters: defaultValues?.filters,
-        dateRange: defaultValues?.dateRange
-      }
+      ...(currentOrgId && !partnerOwned ? { orgId: currentOrgId } : {}),
+      config: isBusiness
+        ? {
+            ...omitConfigKeys(baseConfig, BUSINESS_REFUSED_CONFIG_KEYS),
+            schedule: scheduleDetail,
+            emailRecipients
+          }
+        : {
+            // Keys the builder doesn't own (posture thresholds, executive-summary
+            // settings) come first so live builder state below still wins.
+            ...baseConfig,
+            builderType,
+            dataSource,
+            columns: selectedFields,
+            filterConditions,
+            groupBy,
+            aggregation,
+            chartType,
+            schedule: scheduleDetail,
+            exportFormats,
+            emailRecipients,
+            saveTemplate,
+            templateName: saveTemplate ? templateName : undefined,
+            legacyFilters: defaultValues?.filters,
+            dateRange: defaultValues?.dateRange
+          }
     };
 
     setSaving(true);
@@ -1713,7 +1762,14 @@ export default function ReportBuilder({
           )}
         </div>
 
-        <div className="rounded-lg border bg-card p-6 shadow-xs space-y-4">
+        {/* Dead for a business type: its own options form owns period/groupBy/etc,
+            and the submit path (handleFormSubmit above) never includes this
+            builder's dataSource/columns/filters/groupBy/chartType state in the
+            payload for isBusiness — see the businessConfig() comment on
+            ReportEditPage. Rendering these anyway is misleading (sweep #B1). */}
+        {!businessType && (
+        <>
+        <div data-testid="report-builder-generic-sections" className="rounded-lg border bg-card p-6 shadow-xs space-y-4">
           <div className="flex items-center gap-2">
             <Monitor className="h-4 w-4 text-muted-foreground" />
             <div>
@@ -2104,6 +2160,8 @@ export default function ReportBuilder({
             })}
           </div>
         </div>
+        </>
+        )}
 
         {showDelivery && (
           <div className="rounded-lg border bg-card p-6 shadow-xs space-y-5">
@@ -2209,6 +2267,14 @@ export default function ReportBuilder({
                 <p className="text-xs font-medium text-muted-foreground">{t('reports.reportBuilder.emailDistributionList')}</p>
               </div>
               <div className="space-y-3">
+                {contactRecipientsRefused ? (
+                  <p data-testid="report-partner-recipients-note" className="text-xs text-muted-foreground">
+                    {businessType
+                      ? t('reports.reportBuilder.recipients.businessEmailOnly')
+                      : t('reports.reportBuilder.recipients.partnerOwnedEmailOnly')}
+                  </p>
+                ) : (
+                <>
                 <p className="text-xs font-medium text-muted-foreground">
                   {t('reports.reportBuilder.recipients.contacts')}
                 </p>
@@ -2235,17 +2301,21 @@ export default function ReportBuilder({
                     </label>
                   ))}
                 </div>
+                </>
+                )}
 
                 {emailRecipients.length > 0 && (
                   <div>
                     <p className="text-xs font-medium text-muted-foreground">
-                      {t('reports.reportBuilder.recipients.legacy')}
+                      {contactRecipientsRefused
+                        ? t('reports.reportBuilder.recipients.emailAddresses')
+                        : t('reports.reportBuilder.recipients.legacy')}
                     </p>
                     {emailRecipients.map(email => (
                       <div key={email} className="flex items-center justify-between gap-3 py-2">
                         <span className="text-sm">{email}</span>
                         <div className="flex items-center gap-2">
-                          {reportId && (
+                          {reportId && !contactRecipientsRefused && (
                             <button
                               type="button"
                               data-testid={`report-recipient-convert-${email}`}
@@ -2317,7 +2387,7 @@ export default function ReportBuilder({
           <button
             data-testid="report-builder-submit"
             type="submit"
-            disabled={saving}
+            disabled={saving || submitBlocked}
             className="flex h-11 w-full items-center justify-center gap-2 rounded-md bg-primary text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:opacity-60 sm:w-auto sm:px-6"
           >
             {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
@@ -2330,7 +2400,12 @@ export default function ReportBuilder({
         </div>
       </div>
 
-      <div className="space-y-6 lg:sticky lg:top-6 self-start">
+      {/* Dead for a business type: the preview below reflects builder
+          state (dataSource/columns/chartType) that a business report's own
+          options form doesn't populate, so it renders stale/generic content
+          (sweep F1 — the #B1 fix above hid the input sections but not this). */}
+      {!businessType && (
+      <div data-testid="report-builder-live-preview" className="space-y-6 lg:sticky lg:top-6 self-start">
         <div className="rounded-lg border bg-card p-6 shadow-xs space-y-5">
           <div className="flex items-center justify-between">
             <div>
@@ -2404,6 +2479,7 @@ export default function ReportBuilder({
           </div>
         </div>
       </div>
+      )}
     </form>
   );
 }

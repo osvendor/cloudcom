@@ -9,6 +9,11 @@ const VM_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 vi.mock('../../services', () => ({}));
 
 const executeCommandMock = vi.fn();
+const queueCommandForExecutionMock = vi.fn();
+const dispatchTrackedDbRestoreMock = vi.fn();
+vi.mock('./dbRestoreJob', () => ({
+  dispatchTrackedDbRestore: (...args: unknown[]) => dispatchTrackedDbRestoreMock(...(args as [])),
+}));
 const authorizeResilienceResourcesMock = vi.fn();
 const resolveAllBackupAssignedDevicesMock = vi.fn();
 
@@ -135,6 +140,7 @@ vi.mock('../../services/backupProgress', async (importOriginal) => {
 
 vi.mock('../../services/commandQueue', () => ({
   executeCommand: (...args: unknown[]) => executeCommandMock(...(args as [])),
+  queueCommandForExecution: (...args: unknown[]) => queueCommandForExecutionMock(...(args as [])),
   CommandTypes: {
     HYPERV_DISCOVER: 'HYPERV_DISCOVER',
     HYPERV_BACKUP: 'HYPERV_BACKUP',
@@ -220,6 +226,7 @@ describe('hyperv routes', () => {
     expect(selectMock).not.toHaveBeenCalled();
     expect(insertMock).not.toHaveBeenCalled();
     expect(executeCommandMock).not.toHaveBeenCalled();
+    expect(queueCommandForExecutionMock).not.toHaveBeenCalled();
   });
 
   it('returns an empty Hyper-V VM list', async () => {
@@ -473,7 +480,12 @@ describe('hyperv routes', () => {
     expect(applyBackupStartedAckMock).toHaveBeenCalledWith({ jobId, deviceId: DEVICE_ID, queued: true });
   });
 
-  it('dispatches Hyper-V restore using a backup_snapshots UUID', async () => {
+  // #6437: a real Hyper-V VM restore can run well past 10 minutes, so the
+  // route must dispatch async (queueCommandForExecution) and return as soon
+  // as the command is queued, instead of blocking the HTTP request on
+  // executeCommand's 10-minute waitForCommandResult poll — which terminalised
+  // any longer-running restore as failed regardless of the reaper's ceiling.
+  it('dispatches Hyper-V restore asynchronously instead of blocking on executeCommand', async () => {
     selectMock.mockReturnValueOnce(
       chainMock([
           {
@@ -489,9 +501,10 @@ describe('hyperv routes', () => {
     // already does — resolveBackupProviderConfig looks up the destination
     // config the BACKUP wrote this snapshot to.
     queueDestinationConfigSelect();
-    executeCommandMock.mockResolvedValueOnce({
-      status: 'completed',
-      stdout: JSON.stringify({ status: 'completed' }),
+    dispatchTrackedDbRestoreMock.mockResolvedValueOnce({
+      ok: true,
+      command: { id: 'command-1', status: 'sent' },
+      restoreJobId: 'restore-job-1',
     });
 
     const res = await app.request('/backup/hyperv/restore', {
@@ -505,19 +518,103 @@ describe('hyperv routes', () => {
       }),
     });
 
-    expect(res.status).toBe(200);
-    expect(executeCommandMock).toHaveBeenCalledWith(
-      DEVICE_ID,
-      'HYPERV_RESTORE',
-      {
-        snapshotId: 'hyperv-accounting-1',
+    expect(res.status).toBe(202);
+    const body = await res.json();
+    expect(body.data).toEqual(expect.objectContaining({
+      commandId: 'command-1',
+      restoreJobId: 'restore-job-1',
+      status: 'sent',
+      deviceId: DEVICE_ID,
+      vmName: 'Recovered VM',
+    }));
+    // executeCommand must NOT be used for restore dispatch any more — it is
+    // the synchronous, 10-minute-bounded path this fix removes.
+    expect(executeCommandMock).not.toHaveBeenCalled();
+    // #6974: dispatched through the restore_jobs-tracked helper so the
+    // terminal result is persisted (commandResultHandlers.hyperv_restore).
+    expect(queueCommandForExecutionMock).not.toHaveBeenCalled();
+    const opts = dispatchTrackedDbRestoreMock.mock.lastCall?.[0] as any;
+    expect(opts).toEqual(expect.objectContaining({
+      orgId: ORG_ID,
+      snapshotId: '55555555-5555-4555-8555-555555555555',
+      deviceId: DEVICE_ID,
+      userId: 'user-123',
+      commandType: 'HYPERV_RESTORE',
+      engine: 'hyperv',
+    }));
+    // The restore job id must be stamped into the command payload.
+    expect(opts.buildPayload('restore-job-1')).toEqual({
+      restoreJobId: 'restore-job-1',
+      snapshotId: 'hyperv-accounting-1',
+      vmName: 'Recovered VM',
+      generateNewId: true,
+      provider: 'local',
+      providerConfig: { path: '/tmp/backups' },
+    });
+  });
+
+  it('reports a 502 when Hyper-V restore fails to dispatch for a non-offline reason', async () => {
+    selectMock.mockReturnValueOnce(
+      chainMock([
+          {
+            id: '55555555-5555-4555-8555-555555555555',
+            providerSnapshotId: 'hyperv-accounting-1',
+            metadata: { backupKind: 'hyperv_export' },
+            configId: 'config-1',
+          },
+      ])
+    );
+    queueDestinationConfigSelect();
+    dispatchTrackedDbRestoreMock.mockResolvedValueOnce({ ok: false, error: 'Failed to enqueue command' });
+
+    const res = await app.request('/backup/hyperv/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        deviceId: DEVICE_ID,
+        snapshotId: '55555555-5555-4555-8555-555555555555',
         vmName: 'Recovered VM',
         generateNewId: true,
-        provider: 'local',
-        providerConfig: { path: '/tmp/backups' },
-      },
-      expect.objectContaining({ userId: 'user-123' })
+      }),
+    });
+
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: 'Failed to enqueue command' });
+  });
+
+  // Mirrors routes/backup/restore.ts / vmrestore.ts: a device that is offline
+  // is a routine, expected dispatch outcome — not the same as a genuine
+  // enqueue/infra failure — so it must map to 409, not the blanket 502.
+  it('reports a 409 when the target device is offline', async () => {
+    selectMock.mockReturnValueOnce(
+      chainMock([
+          {
+            id: '55555555-5555-4555-8555-555555555555',
+            providerSnapshotId: 'hyperv-accounting-1',
+            metadata: { backupKind: 'hyperv_export' },
+            configId: 'config-1',
+          },
+      ])
     );
+    queueDestinationConfigSelect();
+    dispatchTrackedDbRestoreMock.mockResolvedValueOnce({
+      ok: false,
+      error: 'Device is offline, cannot execute command',
+    });
+
+    const res = await app.request('/backup/hyperv/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        deviceId: DEVICE_ID,
+        snapshotId: '55555555-5555-4555-8555-555555555555',
+        vmName: 'Recovered VM',
+        generateNewId: true,
+      }),
+    });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'Device is offline, cannot execute command' });
   });
 
   // D20b item D: a snapshot that predates destination tracking (configId

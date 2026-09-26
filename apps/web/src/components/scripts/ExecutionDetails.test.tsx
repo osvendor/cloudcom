@@ -72,7 +72,7 @@ describe('ExecutionDetails custom-field write summary', () => {
 
     expect(screen.getByTestId('exec-custom-fields-applied')).toBeInTheDocument();
     expect(screen.getByTestId('exec-custom-fields-rejected')).toHaveTextContent('asset_tag');
-    expect(screen.getByTestId('exec-custom-fields-rejected')).toHaveTextContent('No matching field definition');
+    expect(screen.getByTestId('exec-custom-fields-rejected')).toHaveTextContent('No custom field with this key');
   });
 
   it('falls back to the raw reason code for a reason with no translation', () => {
@@ -224,5 +224,28 @@ describe('ExecutionDetails Stop affordance', () => {
     await user.click(screen.getByTestId('confirm-stop'));
 
     expect(onCancel).toHaveBeenCalledWith(expect.objectContaining({ id: 'exec-1' }), 5);
+  });
+});
+
+describe('ExecutionDetails empty stdout (sweep E5)', () => {
+  it('shows "No output" in the open section body, not also "(empty)" in its header', () => {
+    // stderr gets real content so its own (unrelated) collapsed "(empty)"
+    // marker can't interfere with the assertion below.
+    renderExecution({ stdout: undefined, stderr: 'a warning' });
+
+    // The stdout section is `defaultOpen`, so the body's own "No output"
+    // message is visible; the header marker used to render at the same time
+    // and say the identical thing twice.
+    expect(screen.getByText('No output')).toBeInTheDocument();
+    expect(screen.queryByText('(empty)')).toBeNull();
+  });
+
+  it('still shows the "(empty)" marker on a collapsed empty section', () => {
+    // stderr has no content and defaults to collapsed — the header marker is
+    // the only signal of emptiness a collapsed section gives, so it must
+    // still render there.
+    renderExecution({ stdout: 'ok' });
+
+    expect(screen.getByText('(empty)')).toBeInTheDocument();
   });
 });

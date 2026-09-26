@@ -46,6 +46,48 @@ describe('createTimeEntrySchema', () => {
     const futureEnd = new Date(Date.now() + 40 * 60_000).toISOString();
     expect(createTimeEntrySchema.safeParse({ startedAt: future, endedAt: futureEnd }).success).toBe(false);
   });
+
+  // Paper cut G2-4 (#6497): a missing startedAt/endedAt previously coerced
+  // `undefined` into an Invalid Date and reported the confusing/self-contradictory
+  // zod v4 message "Expected date, received Date". Missing fields must instead
+  // say plainly that they are required.
+  it('reports a clear "required" message when startedAt/endedAt are missing, not a coercion error', () => {
+    const r = createTimeEntrySchema.safeParse({});
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      const messages = r.error.issues.map((i) => i.message).join(' | ');
+      expect(messages).not.toMatch(/received Date/i);
+      expect(messages).not.toMatch(/expected date/i);
+      expect(messages).toMatch(/startedAt is required/i);
+      expect(messages).toMatch(/endedAt is required/i);
+    }
+  });
+
+  // A `null`/`false`/`0` sentinel must be rejected the same as a missing
+  // field, not silently coerced by `new Date(null|false|0)` into a "valid"
+  // 1970-01-01 epoch date (review finding on #6497 G2-4: this previously
+  // produced a fully valid time entry with no error, since epoch trivially
+  // passes the endedAt > startedAt and not-far-future refinements).
+  it('rejects null/false/0 startedAt-endedAt sentinels instead of silently coercing to epoch', () => {
+    for (const bad of [null, false, 0]) {
+      const r = createTimeEntrySchema.safeParse({ startedAt: bad, endedAt: '2026-06-11T09:30:00Z' });
+      expect(r.success, `startedAt=${JSON.stringify(bad)} must be rejected`).toBe(false);
+      if (!r.success) {
+        const messages = r.error.issues.map((i) => i.message).join(' | ');
+        expect(messages).not.toMatch(/received Date/i);
+      }
+    }
+  });
+
+  it('reports a clear "must be a valid date" message for a garbage-but-present value', () => {
+    const r = createTimeEntrySchema.safeParse({ startedAt: 'not-a-date', endedAt: '2026-06-11T09:30:00Z' });
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      const messages = r.error.issues.map((i) => i.message).join(' | ');
+      expect(messages).toMatch(/startedAt must be a valid date/i);
+      expect(messages).not.toMatch(/received Date/i);
+    }
+  });
 });
 
 describe('startTimerSchema', () => {
@@ -154,6 +196,42 @@ describe('billablesExportQuerySchema', () => {
 
   it('accepts an 11-month range (within 366-day cap)', () => {
     expect(billablesExportQuerySchema.safeParse({ from: '2026-01-01', to: '2026-12-01' }).success).toBe(true);
+  });
+
+  // Sweep C2: a date-only `to` is inclusive of that whole UTC day, the same
+  // rule invoice assembly uses (`${to}T23:59:59Z`, invoiceService.assembleDraftFromOrg).
+  // listBillables filters startedAt with gte(from) / lte(to), mirrored here.
+  it('includes an entry at 15:00 on the `to` day and excludes the next day', () => {
+    const parsed = billablesExportQuerySchema.parse({ from: '2026-06-01', to: '2026-06-30' });
+    const inRange = (iso: string) => {
+      const t = new Date(iso).getTime();
+      return t >= parsed.from.getTime() && t <= parsed.to.getTime();
+    };
+    expect(parsed.from.toISOString()).toBe('2026-06-01T00:00:00.000Z');
+    expect(parsed.to.toISOString()).toBe('2026-06-30T23:59:59.000Z');
+    expect(inRange('2026-06-30T15:00:00Z')).toBe(true);
+    expect(inRange('2026-07-01T00:00:00Z')).toBe(false);
+    expect(inRange('2026-07-01T15:00:00Z')).toBe(false);
+  });
+
+  it('accepts a single-day range (from = to)', () => {
+    expect(billablesExportQuerySchema.safeParse({ from: '2026-06-30', to: '2026-06-30' }).success).toBe(true);
+  });
+
+  it('keeps the 366-day cap on whole calendar days', () => {
+    // 366 inclusive days (non-leap year + 1 day) is allowed; 367 is not.
+    expect(billablesExportQuerySchema.safeParse({ from: '2026-01-01', to: '2027-01-01' }).success).toBe(true);
+    expect(billablesExportQuerySchema.safeParse({ from: '2026-01-01', to: '2027-01-02' }).success).toBe(false);
+  });
+
+  it('full timestamps: a `to` exactly 366×24h after `from` is still accepted, one second more is not', () => {
+    expect(billablesExportQuerySchema.safeParse({ from: '2026-01-01T00:00:00Z', to: '2027-01-02T00:00:00Z' }).success).toBe(true);
+    expect(billablesExportQuerySchema.safeParse({ from: '2026-01-01T00:00:00Z', to: '2027-01-02T00:00:01Z' }).success).toBe(false);
+  });
+
+  it('leaves a full timestamp `to` untouched', () => {
+    const parsed = billablesExportQuerySchema.parse({ from: '2026-06-01', to: '2026-06-30T12:00:00Z' });
+    expect(parsed.to.toISOString()).toBe('2026-06-30T12:00:00.000Z');
   });
 });
 

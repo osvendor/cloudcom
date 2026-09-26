@@ -2,7 +2,15 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 
 const fetchWithAuth = vi.fn();
-vi.mock('../../stores/auth', () => ({ fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a) }));
+// No JWT/user in this fixture (equivalent to a not-yet-resolved session), so
+// the #3198 Business group (partner-scope gated) stays hidden and every
+// existing assertion here is about the General section only.
+vi.mock('../../stores/auth', () => ({
+  fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a),
+  useAuthStore: Object.assign((selector: (s: { tokens?: unknown; user?: unknown }) => unknown) => selector({}), {
+    getState: () => ({}),
+  }),
+}));
 vi.mock('../../stores/orgStore', () => ({ useOrgStore: () => ({ currentOrgId: 'org-1' }) }));
 vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
 vi.mock('../shared/Toast', () => ({ showToast: vi.fn() }));
@@ -123,5 +131,30 @@ describe('ReportTemplates — saved reports merged into curated cards', () => {
 
     expect(await screen.findByText('Quarterly board pack')).toBeTruthy();
     expect(screen.getAllByText('Hardware Lifecycle Report')).toHaveLength(1);
+  });
+
+  it('does not warn about a missing i18n key for a server-synced template (sweep B2)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    mockSavedReports([
+      {
+        // A unique id — the missing-key handler dedupes by `${ns}:${key}` for
+        // the lifetime of the module, so reusing an id another test in this
+        // file already rendered would mask a regression here.
+        id: 'b2c3d4e5-1122-4a6b-8c7d-000000000001',
+        name: 'Quarterly board pack',
+        description: 'A custom quarterly summary.',
+        type: 'executive_summary',
+        schedule: 'quarterly',
+        format: 'pdf',
+        config: { dateRange: { preset: 'last_90_days' } }
+      }
+    ]);
+    render(<ReportTemplates />);
+
+    expect(await screen.findByText('Quarterly board pack')).toBeTruthy();
+    expect(await screen.findByText('A custom quarterly summary.')).toBeTruthy();
+    const i18nWarnings = warn.mock.calls.filter(([msg]) => typeof msg === 'string' && msg.includes('[i18n] missing key'));
+    expect(i18nWarnings).toEqual([]);
+    warn.mockRestore();
   });
 });

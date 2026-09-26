@@ -33,6 +33,13 @@ const FIXTURE_ROOT = resolve(__dirname, 'fixtures/no-silent-mutations/src');
 // WS-A "targeted set": files that have ADOPTED runAction and must not regress
 // to silent mutations. Grows as more handlers migrate (see the backlog).
 const TARGET_GLOBS = [
+  'src/components/monitoring/conversion/ConversionLedger.tsx',
+  'src/components/monitoring/conversion/NeedsConversionPanel.tsx',
+  'src/components/monitoring/conversion/ConversionPendingBanner.tsx',
+  'src/components/admin/MonitorConversionAdmin.tsx',
+  'src/components/configurationPolicies/featureTabs/useFeatureLink.ts',
+  // Per-rule legacy convert (POST /monitor-definitions/convert-from-rule).
+  'src/components/monitoring/LegacyRulesTable.tsx',
   // Disk Cleanup v2 W01: scan and cleanup-preview failures must surface.
   'src/components/devices/DeviceFilesystemTab.tsx',
   // Disk Cleanup v2 W03: cleanup-execute moved into this panel.
@@ -119,6 +126,9 @@ const TARGET_GLOBS = [
   // drawer needs its own entry or its mutations are invisible to it.
   'src/components/aiAgents/ImpactWeightsDrawer.tsx',
   'src/components/devices/DeviceInfoTab.tsx',
+  // Metric anomaly episodes W04: card actions (dismiss/resolve/promote/unsnooze)
+  // are the only mutation surface for the rewritten panel.
+  'src/components/devices/AnomalyEpisodeCard.tsx',
   // Fleet Designer W02 (#5652): the Function field's PUT is its own file.
   'src/components/devices/DeviceFunctionField.tsx',
   'src/components/devices/DevicePatchStatusTab.tsx',
@@ -240,6 +250,23 @@ const TARGET_GLOBS = [
   // page-level error banner was painted behind the scrim — an unrecoverable
   // silent failure, not merely an unguarded one.
   'src/components/configurationPolicies/ConfigurationPoliciesPage.tsx',
+  // #3531: destructive confirmations whose failures rendered behind the z-50 modal.
+  'src/components/settings/ApiKeysPage.tsx',
+  'src/components/admin/QuarantinedDevices.tsx',
+  'src/components/automations/AutomationsPage.tsx',
+  // #5313: create-monitor and site-edit saves confirmed nothing on 2xx.
+  'src/components/monitors/CreateMonitorForm.tsx',
+  'src/components/settings/SiteDetailPage.tsx',
+  'src/components/automations/PoliciesPage.tsx',
+  // #3531 sweep: the same hidden-failure pattern (destructive action behind an
+  // open overlay, or console-only failure) found outside the original four.
+  'src/components/auditBaselines/BaselineList.tsx',
+  'src/components/remote/RemoteToolsPage.tsx',
+  'src/components/discovery/NetworkBaselinesPanel.tsx',
+  'src/components/sensitiveData/PoliciesTab.tsx',
+  'src/components/settings/EnrollmentKeyManager.tsx',
+  'src/components/settings/UsersPage.tsx',
+  'src/components/webhooks/WebhooksPage.tsx',
   // Quick Support: the create/end mutations mint and revoke live remote-access
   // codes, so a silent failure would leave a tech reading out a dead code or
   // believing a session was torn down when it wasn't.
@@ -288,6 +315,11 @@ const TARGET_GLOBS = [
   // so a slow response invited a duplicate-creating double click. The mount at
   // /reports/builder passed no onSubmit, the only success path.
   'src/components/reports/ReportBuilder.tsx',
+  // Business reports (#3198 W03): the curated-template create POST is the only
+  // mutation in this file and it is runAction-wrapped. A partner-wide create
+  // that 403s on the all-organizations access gate must never look identical
+  // to one that succeeded.
+  'src/components/reports/ReportTemplates.tsx',
   // QuickBooks connection panel (Phase D): connect/disconnect/push-mode/settings
   // -refresh already routed through runAction, but the file was never guarded —
   // so the pull-payments PATCH and the "Sync now" enqueue would have shipped
@@ -389,6 +421,27 @@ const TARGET_GLOBS = [
   'src/components/security/SecurityScanManager.tsx',
   'src/components/security/ThreatList.tsx',
   'src/components/security/ThreatDetail.tsx',
+  // Alert workflows typed filter (#6367 W05c2 Task 9): the save handler now
+  // wraps its create/update POST/PUT in runAction — a silent failure here is
+  // a tech believing a workflow's severity/kind restriction is live when the
+  // save never landed.
+  'src/components/automations/AutomationEditPage.tsx',
+  // Device Monitoring tab (#6367 W05c2 Task 10): the escalation reset POST.
+  'src/components/devices/DeviceMonitoringTab.tsx',
+  // Library Recommended strip (#6367 W05c2 Task 13): the feature-link write
+  // that attaches built-ins to a policy.
+  'src/components/monitoring/RecommendedMonitors.tsx',
+  // Backup provider integration (W03, #6011): these three write partner-level
+  // connector credentials and the customer→org mapping that decides whose
+  // backup data lands in whose tenant. A silent failure here is invisible until
+  // a customer's devices quietly stop appearing.
+  'src/components/integrations/BackupProvidersIntegration.tsx',
+  'src/components/integrations/BackupProviderConnectionCard.tsx',
+  'src/components/integrations/BackupProviderCustomerMapping.tsx',
+  // Device-tab external backup (W03, #6011): Unlink detaches a provider row
+  // from a Breeze device; a silent failure leaves the tech believing the link
+  // is gone while alerts keep firing against it.
+  'src/components/backup/ExternalBackupCard.tsx',
 ];
 
 const absoluteFiles: string[] = TARGET_GLOBS.map((rel) => resolve(WEB_ROOT, '..', rel));
@@ -748,7 +801,21 @@ describe('no silent mutations in targeted set', () => {
     // Accept on behalf adds quotes/AcceptOnBehalfDialog.tsx: 160 → 161.
     // Decline on behalf (#6634) adds quotes/DeclineOnBehalfDialog.tsx: 161 → 162.
     // Accept-on-behalf evidence (#6633) adds quotes/AcceptanceEvidenceControl.tsx: 162 → 163.
-    expect(absoluteFiles.length).toBe(163);
+    // Metric anomaly episodes W04 adds devices/AnomalyEpisodeCard.tsx: 163 → 164.
+    // Business reports (#3198 W03) add reports/ReportTemplates.tsx: 164 → 165.
+    // Alerting W05c2 adopts the shared feature-link mutation hook: 165 → 166.
+    // W05c2 adds NeedsConversionPanel, ConversionPendingBanner, MonitorConversionAdmin: 166 → 169.
+    // Persistent conversion history adds ConversionLedger (Undo): 169 → 170.
+    // LegacyRulesTable (per-rule convert) joins the guard: 170 → 171.
+    // Alert workflows typed filter (W05c2 Task 9) adds automations/AutomationEditPage.tsx: 171 → 172.
+    // W05c2 Tasks 10 + 13 add devices/DeviceMonitoringTab.tsx and monitoring/RecommendedMonitors.tsx: 172 → 174.
+    // #3531 adds ApiKeysPage, QuarantinedDevices, AutomationsPage, PoliciesPage: 174 → 178.
+    // #3531 sweep adds BaselineList, RemoteToolsPage, NetworkBaselinesPanel,
+    // sensitiveData/PoliciesTab, EnrollmentKeyManager, UsersPage, WebhooksPage: 178 → 185.
+    // Backup provider integration (W03 #6011) adds three adopters: 185 → 188.
+    // 188 -> 189: ExternalBackupCard.tsx (W03 Task 12, #6011) added to TARGET_GLOBS.
+    // #5313 adds monitors/CreateMonitorForm.tsx and settings/SiteDetailPage.tsx: 189 → 191.
+    expect(absoluteFiles.length).toBe(191);
     for (const f of absoluteFiles) {
       expect(() => statSync(f)).not.toThrow();
     }

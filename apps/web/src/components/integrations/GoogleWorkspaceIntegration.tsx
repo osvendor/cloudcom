@@ -9,6 +9,7 @@ import {
   Unplug,
   Users,
 } from "lucide-react";
+import { GOOGLE_DWD_SCOPES_CSV } from "@breeze/shared";
 import { fetchWithAuth } from "../../stores/auth";
 import { runAction } from "../../lib/runAction";
 import { formatDateTime } from "@/lib/dateTimeFormat";
@@ -30,23 +31,6 @@ type SaveState = {
   status: "idle" | "saving" | "saved" | "error";
   message?: string;
 };
-
-// The exact domain-wide-delegation OAuth scopes the Google identity tools use.
-// Keep in sync with ALL_DWD_SCOPES_CSV in apps/api/src/services/googleClient.ts.
-const GOOGLE_DWD_SCOPES_CSV = [
-  "https://www.googleapis.com/auth/admin.directory.user",
-  "https://www.googleapis.com/auth/admin.directory.user.security",
-  "https://www.googleapis.com/auth/admin.directory.user.alias",
-  "https://www.googleapis.com/auth/admin.directory.group",
-  "https://www.googleapis.com/auth/admin.directory.group.member",
-  "https://www.googleapis.com/auth/admin.directory.device.mobile.action",
-  "https://www.googleapis.com/auth/gmail.settings.basic",
-  "https://www.googleapis.com/auth/gmail.settings.sharing",
-  "https://www.googleapis.com/auth/calendar.acls",
-  "https://www.googleapis.com/auth/apps.licensing",
-  "https://www.googleapis.com/auth/admin.reports.usage.readonly",
-  "https://www.googleapis.com/auth/admin.reports.audit.readonly",
-].join(",");
 
 export default function GoogleWorkspaceIntegration() {
   const { t } = useTranslation("integrations");

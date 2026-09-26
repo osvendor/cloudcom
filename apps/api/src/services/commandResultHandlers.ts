@@ -54,6 +54,7 @@ import { PG_UUID_REGEX, UUID_REGEX } from '../utils/uuid';
 // while the REST path rejected at 1 MB. The byte-accurate one wins.
 import { commandResultSchema } from '../routes/agents/schemas';
 import { applyAutomationActionTerminal } from './automationActionResults';
+import { evaluateScriptExitCodeAlert, type ScriptTriggerType } from './scriptExitCodeAlerts';
 import { enqueueScriptVerify } from './scriptProposals/verify';
 import { handlePeripheralPolicyResultV2 } from './peripheralPolicyState';
 import {
@@ -187,7 +188,9 @@ async function handleDiscoveryResult({ agentId, command, result, commandId }: Pa
           })
           .where(eq(discoveryJobs.id, expectedJobId));
       } catch (dbErr) {
+        // #3530: without this the job stays 'running' with nothing reported.
         console.error(`[AgentWs] Additionally failed to mark discovery job ${expectedJobId} as failed:`, dbErr);
+        captureException(dbErr, undefined, { command_result_phase: 'discovery_mark_failed' });
       }
     }
   }
@@ -425,10 +428,38 @@ function terminalExecutionProjection() {
     id: scriptExecutions.id,
     scriptId: scriptExecutions.scriptId,
     proposalId: scriptExecutions.proposalId,
+    // #6690: the exit-code alert needs the execution's own org and trigger lane.
+    orgId: scriptExecutions.orgId,
+    triggerType: scriptExecutions.triggerType,
   } as const;
 }
 
-async function handleScriptResult({ agentId, command, result, resolvedDeviceId, stdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+type TerminalExecution = {
+  id: string;
+  scriptId: string | null;
+  proposalId: string | null;
+  orgId: string;
+  triggerType: ScriptTriggerType;
+};
+
+function isCustomFieldWritesEnvelope(value: unknown): boolean {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && 'customFieldWrites' in value;
+}
+
+async function handleScriptResult({ agentId, command, result, resolvedDeviceId, stdout: transportStdout }: Parameters<CommandResultHandler>[0]): Promise<void> {
+  // #6537 — both ingest transports fall back to `JSON.stringify(result.result)`
+  // when the agent sent no stdout (generic handlers deliver their structured
+  // output that way). The agent sends no stdout at all when every line a script
+  // printed was a `::breeze:custom-fields::` marker it stripped, so the
+  // transport synthesized the #2698 customFieldWrites envelope as "output".
+  // Persisting that showed the operator `{"customFieldWrites":…}` as what the
+  // script printed — which reads as proof the write landed even when every
+  // field was rejected. Narrowed to exactly that envelope so no other caller's
+  // stdout changes meaning.
+  const stdout = result.stdout === undefined && isCustomFieldWritesEnvelope(result.result)
+    ? undefined
+    : transportStdout;
   // Which write we are on, for the shared catch below. This function now runs a
   // five-step compare-and-swap ladder inside ONE try; without a phase tag every
   // failure reaches Sentry with the same three context fields and the same
@@ -545,7 +576,7 @@ async function handleScriptResult({ agentId, command, result, resolvedDeviceId, 
       const markerCommandId = typeof rawMarkerCommandId === 'string' ? rawMarkerCommandId : null;
 
       phase = 'cancel-confirm-cas';
-      let cancelClosed: Array<{ id: string; scriptId: string | null; proposalId: string | null }> = [];
+      let cancelClosed: TerminalExecution[] = [];
       let cancelConfirmed = false;
       if (cancelledMarker && markerCommandId) {
         cancelClosed = await db
@@ -573,7 +604,7 @@ async function handleScriptResult({ agentId, command, result, resolvedDeviceId, 
           .returning(terminalExecutionProjection());
       }
 
-      let updatedExecutions: Array<{ id: string; scriptId: string | null; proposalId: string | null }> = [];
+      let updatedExecutions: TerminalExecution[] = [];
       let effectiveExecution = cancelClosed[0] ?? null;
 
       if (cancelClosed.length === 0) {
@@ -755,6 +786,22 @@ async function handleScriptResult({ agentId, command, result, resolvedDeviceId, 
           completedAt: executionValues.completedAt,
         });
 
+        // #6690 — the script's opt-in exit-code → alert mapping. Runs after the
+        // execution row above is written; never throws (own savepoint + catch).
+        // Only a real exit code is a verdict: a proven cancel, a timeout or a
+        // failure to run neither raises nor clears the alert.
+        if (!cancelConfirmed && result.status === 'completed' && typeof result.exitCode === 'number') {
+          await evaluateScriptExitCodeAlert({
+            executionId: effectiveExecution.id,
+            scriptId: effectiveExecution.scriptId,
+            orgId: effectiveExecution.orgId,
+            deviceId: resolvedDeviceId,
+            triggerType: effectiveExecution.triggerType,
+            exitCode: result.exitCode,
+            stderr: executionValues.stderr,
+          });
+        }
+
         if (effectiveExecution.proposalId) {
           // W03 (#5612, spec §4.9): the proposal's verification claim is
           // evaluated AFTER the execution reaches a terminal state, by an
@@ -844,7 +891,10 @@ async function handleSensitiveDataResult({ agentId, command, result, stdout }: P
       error: result.error,
     } as any);
   } catch (err) {
+    // #3530: the command is already terminal, so a swallowed failure here loses
+    // the result with no trace outside the container log. Report it.
     console.error(`[AgentWs] Failed to process sensitive data result for ${agentId}:`, err);
+    captureException(err, undefined, { command_result_phase: 'sensitive_data_result' });
   }
 }
 
@@ -860,7 +910,10 @@ async function handleCisResult({ agentId, command, result, stdout }: Parameters<
       error: result.error,
     } as any);
   } catch (err) {
+    // #3530: the command is already terminal, so a swallowed failure here loses
+    // the result with no trace outside the container log. Report it.
     console.error(`[AgentWs] Failed to process CIS result for ${agentId}:`, err);
+    captureException(err, undefined, { command_result_phase: 'cis_result' });
   }
 }
 
@@ -1154,6 +1207,9 @@ export const commandResultHandlers: Record<string, CommandResultHandler> = {
   vm_restore_from_backup: handleVmRestoreResult,
   vm_instant_boot: handleVmRestoreResult,
   bmr_recover: handleVmRestoreResult,
+  // #6974: async-dispatched (#6437); the restore_jobs row is linked by command id.
+  mssql_restore: handleVmRestoreResult,
+  hyperv_restore: handleVmRestoreResult,
   bare_metal_rebuild: handleBareMetalRebuildResult,
   hyperv_backup: handleProviderBackedBackupResult,
   mssql_backup: handleProviderBackedBackupResult,

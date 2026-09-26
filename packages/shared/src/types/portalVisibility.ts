@@ -319,3 +319,53 @@ export type NetworkOverviewDto =
       snmpDevicesPolling: null;
       monitorsDown: null;
     };
+
+/** Mirrors alert_severity (apps/api/src/db/schema/alerts.ts); ranked critical > high > medium > low > info. */
+export type NetworkAssetAlertSeverity = 'critical' | 'high' | 'medium' | 'low' | 'info';
+
+export interface NetworkAssetRowDto {
+  id: string;
+  hostname: string | null;
+  /** Technician-set display name; often more useful than hostname, which is frequently null. */
+  label: string | null;
+  ipAddress: string | null;
+  macAddress: string | null;
+  assetType: string;
+  /** null = unverified; never conflated with offline. */
+  onlineState: 'online' | 'offline' | null;
+  lastSeenAt: string | null;
+  firstSeenAt: string;
+  manufacturer: string | null;
+  model: string | null;
+  siteName: string;
+  /**
+   * Alert/ticket enrichment (#5861 PR 3). Present -- zero-filled when the
+   * asset has no active alerts -- whenever the org's enable_network_alerts
+   * flag is on; omitted entirely (never null-filled) when the flag is off,
+   * mirroring the optional `service?` pattern on DashboardDto.
+   */
+  activeAlertCount?: number;
+  /** Highest severity among this asset's active network-monitor alerts; null when activeAlertCount is 0. */
+  highestAlertSeverity?: NetworkAssetAlertSeverity | null;
+  /** Distinct non-terminal tickets linked (via ticket_alert_links) to this asset's active alerts. */
+  openTicketCount?: number;
+}
+
+/**
+ * Customer-safe Network Visibility per-asset list (#5861, PR 2).
+ *
+ * `no_data` and `not_enabled` carry an empty list, never a partial or
+ * synthetic one, mirroring the `not_enabled`/`no_data`/`ok` contract from
+ * NetworkOverviewDto.
+ */
+export type NetworkAssetsDto =
+  | {
+      dataStatus: 'ok';
+      data: NetworkAssetRowDto[];
+      pagination: PaginationDto;
+    }
+  | {
+      dataStatus: 'no_data' | 'not_enabled';
+      data: [];
+      pagination: PaginationDto;
+    };

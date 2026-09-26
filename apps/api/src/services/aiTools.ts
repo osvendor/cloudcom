@@ -12,6 +12,7 @@ import { devices } from '../db/schema';
 import { eq, and, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import { validateToolInput } from './aiToolSchemas';
+import { setToolPaginationHintResolver } from './aiToolOutput';
 import type { CaptureScope } from './artifacts/toolResultCapture';
 import { captureContextFrom, captureLargeToolResult } from './artifacts/toolResultCapture';
 import { captureException } from './sentry';
@@ -92,6 +93,7 @@ import { registerQuoteTools } from './aiToolsQuotes';
 import { registerOrgTools } from './aiToolsOrgs';
 import { registerPamTools } from './aiToolsPam';
 import { registerExportTools } from './aiToolsExport';
+import { registerArtifactTools } from './aiToolsArtifacts';
 // M365 helpdesk tools are session-aware (handler signature includes a sessionId)
 // so they are NOT registered in the `aiTools` execution registry — they run via
 // makeSessionAwareHandler in the SDK server. Their tiers still must be visible to
@@ -125,8 +127,10 @@ export interface AiTool {
    * TRAP — WRAPPERS SILENTLY TRUNCATE IT. A handler produced by a wrapper that
    * returns `async (input, auth) => …` drops the third argument with NO compile
    * error, because a two-parameter function is always assignable here. The
-   * `safeHandler` wrappers in `aiToolsBackupVm.ts`, `aiToolsPolicyPrereqs.ts`,
-   * `aiToolsC2C.ts` and `aiToolsConfigPolicy.ts` are all shaped that way. If a
+   * `safeHandler` wrappers in `aiToolsBackupVm.ts`, `aiToolsC2C.ts` and
+   * `aiToolsConfigPolicy.ts` are all shaped that way (#6911 widened
+   * `aiToolsPolicyPrereqs.ts`'s wrapper to accept and forward `context`, so it
+   * no longer belongs on this list). If a
    * tool registered through one of those ever needs the context, the WRAPPER
    * must accept and forward a third argument too — widening the inner handler
    * alone will read `undefined` forever. (No current consumer is wrapped:
@@ -252,35 +256,9 @@ export async function enforceDeviceArgs(
  */
 export { findAlertWithAccess } from './aiToolsAlerts';
 
-export function resolveWritableToolOrgId(
-  auth: AuthContext,
-  inputOrgId?: string
-): { orgId?: string; error?: string } {
-  if (auth.scope === 'organization') {
-    if (!auth.orgId) return { error: 'Organization context required' };
-    if (inputOrgId && inputOrgId !== auth.orgId) {
-      return { error: 'Cannot access another organization' };
-    }
-    return { orgId: auth.orgId };
-  }
-
-  if (inputOrgId) {
-    if (!auth.canAccessOrg(inputOrgId)) {
-      return { error: 'Access denied to this organization' };
-    }
-    return { orgId: inputOrgId };
-  }
-
-  if (auth.orgId) {
-    return { orgId: auth.orgId };
-  }
-
-  if (Array.isArray(auth.accessibleOrgIds) && auth.accessibleOrgIds.length === 1) {
-    return { orgId: auth.accessibleOrgIds[0] };
-  }
-
-  return { error: 'orgId is required for this operation' };
-}
+// Moved to a leaf module so domain tool files this hub imports can use it
+// without an ESM cycle (#6667); re-exported so existing importers keep working.
+export { resolveWritableToolOrgId } from './aiToolWriteOrg';
 
 // ============================================
 // Tool Registry
@@ -352,6 +330,17 @@ registerVulnerabilityTools(aiTools);
 registerWorkspaceTools(aiTools);
 registerM365Tools(aiTools);
 registerExportTools(aiTools);
+registerArtifactTools(aiTools);
+
+// A-W05 (D12): the compactor's truncation guidance follows the tool's real
+// paging shape. Covers extension-contributed tools too — they live in the
+// contribution registry, not this map.
+setToolPaginationHintResolver((name) => {
+  const core = aiTools.get(name)?.definition.input_schema as { properties?: Record<string, unknown> } | undefined;
+  const ext = core ? undefined : (resolveExtensionTool(name, extensionContributionRegistry)?.definition.input_schema as { properties?: Record<string, unknown> } | undefined);
+  const props = (core ?? ext)?.properties ?? {};
+  return 'cursor' in props ? 'cursor' : 'limit' in props ? 'limit' : 'none';
+});
 
 // ============================================
 // Exports
@@ -496,6 +485,7 @@ export function requiresLiveSession(
 export const HELPER_TOOL_SCOPING: Record<string, 'deviceId' | 'deviceIds'> = {
   // Read-only (Phase 0 `basic` set).
   get_device_details: 'deviceId',
+  get_device_hardware_health: 'deviceId',
   analyze_metrics: 'deviceId',
   analyze_disk_usage: 'deviceId',
   get_cis_device_report: 'deviceId',
@@ -628,13 +618,27 @@ export async function executeTool(
   const gate = await enforceDeviceArgs(tool, effectiveInput, auth);
   if (!gate.ok) return JSON.stringify({ error: gate.error });
 
+  // A-W05 (D13a/Q4): `read_artifact` must read with the SAME anchor capture
+  // would write with — the exact org/run/session this call is attributed to,
+  // never "any session belonging to this user". Computed here, BEFORE the
+  // handler runs (capture's own computation below runs AFTER, for a
+  // different purpose), and threaded through `context.captureAnchor`.
+  //
+  // Name-gated to `read_artifact` rather than folded into every call's
+  // context: every other core handler's `context` argument must keep its
+  // existing identity — `aiTools.executeToolGate.test.ts` asserts a
+  // caller-supplied context is passed through with `toBe` (reference)
+  // equality, and a context rebuilt for every call would break that.
+  const captureAnchor = toolName === 'read_artifact' ? captureContextFrom(auth, opts, toolName) : null;
+  const handlerContext = captureAnchor ? { ...opts?.context, captureAnchor } : opts?.context;
+
   // Only CORE handlers receive the execution context. Extension handlers are
   // third-party code and are called with exactly two arguments — not merely
   // typed without a third one, since a handler written `(input, auth, ...rest)`
   // or reading `arguments` would otherwise capture pre-verified release
   // material the host never intended to hand out.
   const rawResult = coreTool
-    ? await coreTool.handler(effectiveInput, auth, opts?.context)
+    ? await coreTool.handler(effectiveInput, auth, handlerContext)
     : await (tool as RegistryAiTool).handler(effectiveInput, auth);
 
   // Large-result capture (execution-plane spec §5.2). HERE, after the handler

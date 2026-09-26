@@ -177,6 +177,7 @@ vi.mock('./helpers', () => ({
   normalizeAgentArchitecture: vi.fn((s: string) => s),
   compareAgentVersions: vi.fn(() => 0),
   buildEventLogConfigUpdate: vi.fn(() => undefined),
+  buildHardwareMonitoringConfigUpdate: vi.fn(),
   buildMonitoringConfigUpdate: vi.fn(() => undefined),
   buildHelperConfigUpdate: vi.fn(() => undefined),
   buildPamConfigUpdate: vi.fn(async () => ({ uacInterceptionEnabled: false })),
@@ -2209,6 +2210,99 @@ describe('POST /agents/:id/heartbeat — artifact-edition offer gate (#4072)', (
     }
   });
 
+  describe('persisted withheld state (#6449)', () => {
+    function primeWithRow(row: Record<string, unknown>) {
+      selectMock.mockReturnValueOnce(selectChainResolving([{ ...agentDeviceRow, ...row }]));
+      selectMock.mockReturnValue(selectChainResolving([{ version: '0.66.0' }]));
+    }
+    function captureSet() {
+      const setSpy = vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) }));
+      updateMock.mockReturnValue({ set: setSpy });
+      return setSpy;
+    }
+    const setCalls = (spy: ReturnType<typeof captureSet>) =>
+      spy.mock.calls.map((c) => (c as unknown[])[0] as Record<string, unknown>);
+
+    it('stamps reason + since on the device row when the offer is first withheld', async () => {
+      const { agentAcceptsServedEdition } = await import('./helpers');
+      vi.mocked(agentAcceptsServedEdition).mockImplementation(() => false);
+      const setSpy = captureSet();
+      primeWithRow({ updateOfferWithheldReason: null, updateOfferWithheldSince: null });
+
+      expect((await beat()).status).toBe(200);
+      const withheld = setCalls(setSpy).find((s) => 'updateOfferWithheldReason' in s);
+      expect(withheld?.updateOfferWithheldReason).toBe('edition_unconfirmed');
+      expect(withheld?.updateOfferWithheldSince).toBeInstanceOf(Date);
+    });
+
+    it('does NOT rewrite the columns while the state is unchanged (no hot-path write amplification)', async () => {
+      const { agentAcceptsServedEdition } = await import('./helpers');
+      vi.mocked(agentAcceptsServedEdition).mockImplementation(() => false);
+      const setSpy = captureSet();
+      primeWithRow({
+        updateOfferWithheldReason: 'edition_unconfirmed',
+        updateOfferWithheldSince: new Date('2026-10-01T00:00:00Z'),
+      });
+
+      expect((await beat()).status).toBe(200);
+      for (const s of setCalls(setSpy)) {
+        expect(s).not.toHaveProperty('updateOfferWithheldReason');
+        expect(s).not.toHaveProperty('updateOfferWithheldSince');
+      }
+    });
+
+    it('clears both columns once the device accepts the served edition again', async () => {
+      const setSpy = captureSet(); // gate is permissive (true) by default
+      primeWithRow({
+        updateOfferWithheldReason: 'edition_unconfirmed',
+        updateOfferWithheldSince: new Date('2026-10-01T00:00:00Z'),
+      });
+
+      expect((await beat()).status).toBe(200);
+      const cleared = setCalls(setSpy).find((s) => 'updateOfferWithheldReason' in s);
+      expect(cleared?.updateOfferWithheldReason).toBeNull();
+      expect(cleared?.updateOfferWithheldSince).toBeNull();
+    });
+
+    it('does not flag a device with no resolvable architecture (no build to offer, gate never applied)', async () => {
+      const { agentAcceptsServedEdition, normalizeAgentArchitecture } = await import('./helpers');
+      vi.mocked(agentAcceptsServedEdition).mockImplementation(() => false);
+      vi.mocked(normalizeAgentArchitecture).mockImplementation((() => null) as never);
+      const setSpy = captureSet();
+      try {
+        primeWithRow({ updateOfferWithheldReason: null, updateOfferWithheldSince: null });
+        expect((await beat()).status).toBe(200);
+        for (const s of setCalls(setSpy)) {
+          expect(s).not.toHaveProperty('updateOfferWithheldReason');
+        }
+      } finally {
+        vi.mocked(normalizeAgentArchitecture).mockImplementation(((s: string) => s) as never);
+      }
+    });
+
+    it('feeds the persisted verdict from THIS beat’s payload edition + version', async () => {
+      const { agentAcceptsServedEdition } = await import('./helpers');
+      captureSet();
+      primeWithRow({ updateOfferWithheldReason: null, agentEdition: 'stale-stored' });
+      await beat({ agentEdition: 'self-host' });
+      const calls = vi.mocked(agentAcceptsServedEdition).mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      for (const [arg] of calls) {
+        expect(arg).toEqual({ reportedEdition: 'self-host', agentVersion: '0.105.1' });
+      }
+    });
+
+    it('writes nothing for a healthy device that was never withheld', async () => {
+      const setSpy = captureSet();
+      primeWithRow({ updateOfferWithheldReason: null, updateOfferWithheldSince: null });
+
+      expect((await beat()).status).toBe(200);
+      for (const s of setCalls(setSpy)) {
+        expect(s).not.toHaveProperty('updateOfferWithheldReason');
+      }
+    });
+  });
+
   describe('watchdog failover branch', () => {
     const sixteenMinutesAgo = new Date(Date.now() - 16 * 60 * 1000);
 
@@ -3400,6 +3494,30 @@ describe('POST /agents/:id/heartbeat — uacInterceptionEnabled delivery', () =>
     expect(configUpdate?.event_log_settings).toBeUndefined();
   });
 
+  it('delivers hardware settings from the post-scoped policy block', async () => {
+    const { buildHardwareMonitoringConfigUpdate } = await import('./helpers');
+    vi.mocked(buildHardwareMonitoringConfigUpdate).mockResolvedValueOnce({ enabled: false, poll_interval_minutes: 20, disk_health_interval_minutes: 120 });
+    const res = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as Record<string, any>).configUpdate.hardware_monitoring_settings).toEqual({ enabled: false, poll_interval_minutes: 20, disk_health_interval_minutes: 120 });
+  });
+
+  it('omits hardware settings when its resolver fails', async () => {
+    const { buildHardwareMonitoringConfigUpdate } = await import('./helpers');
+    vi.mocked(buildHardwareMonitoringConfigUpdate).mockRejectedValueOnce(new Error('resolver unavailable'));
+    const res = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as Record<string, any>).configUpdate ?? {}).not.toHaveProperty('hardware_monitoring_settings');
+  });
+
   it('includes monitoring_settings in configUpdate when the resolver succeeds', async () => {
     const { buildMonitoringConfigUpdate } = await import('./helpers');
     const settings = {
@@ -3428,6 +3546,43 @@ describe('POST /agents/:id/heartbeat — uacInterceptionEnabled delivery', () =>
     const body = (await resp.json()) as Record<string, unknown>;
     const configUpdate = body.configUpdate as Record<string, unknown> | null;
     expect(configUpdate?.monitoring_settings).toEqual(settings);
+  });
+
+  it('delivers an explicit empty watch set (the #2949 clear) rather than dropping it as falsy', async () => {
+    // "No monitoring policy applies" resolves to `{ watches: [] }`. The
+    // agent treats an ABSENT key as "no change", so this object must reach
+    // the wire — a truthiness slip here would strand a deleted policy's
+    // watches on the agent again.
+    const { buildMonitoringConfigUpdate } = await import('./helpers');
+    const cleared = { check_interval_seconds: 60, watches: [] };
+    vi.mocked(buildMonitoringConfigUpdate).mockResolvedValueOnce(cleared as any);
+
+    const resp = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as Record<string, unknown>;
+    const configUpdate = body.configUpdate as Record<string, unknown> | null;
+    expect(configUpdate?.monitoring_settings).toEqual(cleared);
+  });
+
+  it('omits monitoring_settings when the resolver returns null (device vanished mid-resolution, #5677)', async () => {
+    const { buildMonitoringConfigUpdate } = await import('./helpers');
+    vi.mocked(buildMonitoringConfigUpdate).mockResolvedValueOnce(null);
+
+    const resp = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as Record<string, unknown>;
+    const configUpdate = body.configUpdate as Record<string, unknown> | null;
+    expect(configUpdate).not.toHaveProperty('monitoring_settings');
   });
 
   it('omits monitoring_settings when the resolver throws (no unintended revert)', async () => {
@@ -4066,6 +4221,87 @@ describe('POST /agents/:id/heartbeat — backupVersion telemetry', () => {
     expect(resp.status).toBe(200);
     const updateArg = (setSpy.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
     expect(updateArg).not.toHaveProperty('backupVersion');
+  });
+});
+
+describe('POST /agents/:id/heartbeat — helperVersion persistence (#6751)', () => {
+  // The agent reports the installed Breeze Assist helper version so the server
+  // can compute helperUpgradeTo. Until #6751 it was used for that and dropped,
+  // so a helper stuck behind the promoted release was invisible in the portal.
+  // Unlike watchdog/backup it is also a filter field, so it is written only on
+  // change: an unconditional write would make every heartbeat look like a
+  // filterable change and enqueue a dynamic-group re-evaluation (#4630).
+  const deviceRow = {
+    id: 'device-1', orgId: 'org-1', siteId: 'site-1', hostname: 'host',
+    osType: 'windows', architecture: 'amd64', agentVersion: '0.66.0',
+    helperVersion: '0.65.0', deviceRoleSource: 'auto',
+    lastSeenAt: new Date(), mainAgentSilentSince: null,
+  };
+
+  function arrange(setSpy: ReturnType<typeof vi.fn>) {
+    vi.clearAllMocks();
+    requestDeviceGroupReevaluationMock.mockResolvedValue('job-1');
+    getActiveTrustKeysetMock.mockResolvedValue([]);
+    selectMock.mockReturnValueOnce(selectChainResolving([deviceRow]));
+    selectMock.mockReturnValue(selectChainResolving([]));
+    updateMock.mockReturnValue({ set: setSpy });
+    insertMock.mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) });
+  }
+
+  async function post(body: Record<string, unknown>) {
+    return buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ role: 'agent', metrics: minimalHeartbeatBody.metrics, ...body }),
+    });
+  }
+
+  it('persists a changed helperVersion and enqueues a dynamic-group re-evaluation for it', async () => {
+    const setSpy = vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) }));
+    arrange(setSpy);
+
+    const resp = await post({ agentVersion: '0.66.0', helperVersion: '0.66.0' });
+
+    expect(resp.status).toBe(200);
+    const updateArg = (setSpy.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
+    expect(updateArg.helperVersion).toBe('0.66.0');
+    expect(requestDeviceGroupReevaluationMock).toHaveBeenCalledWith(
+      expect.objectContaining({ deviceId: 'device-1', changedFields: ['helperVersion'] }),
+    );
+  });
+
+  it('reports helperVersion alongside other filterable fields changed in the same heartbeat', async () => {
+    const setSpy = vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) }));
+    arrange(setSpy);
+
+    const resp = await post({ agentVersion: '0.66.0', helperVersion: '0.66.0', hostname: 'new-host' });
+
+    expect(resp.status).toBe(200);
+    const request = requestDeviceGroupReevaluationMock.mock.calls[0]?.[0];
+    expect(request?.changedFields).toEqual(expect.arrayContaining(['hostname', 'helperVersion']));
+  });
+
+  it('does not rewrite or re-evaluate when the agent re-reports the stored helperVersion (steady state)', async () => {
+    const setSpy = vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) }));
+    arrange(setSpy);
+
+    const resp = await post({ agentVersion: '0.66.0', helperVersion: '0.65.0' });
+
+    expect(resp.status).toBe(200);
+    const updateArg = (setSpy.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
+    expect(updateArg).not.toHaveProperty('helperVersion');
+    expect(requestDeviceGroupReevaluationMock).not.toHaveBeenCalled();
+  });
+
+  it('leaves the stored helperVersion untouched when the agent omits it (old agent, or helper not installed)', async () => {
+    const setSpy = vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) }));
+    arrange(setSpy);
+
+    const resp = await post({ agentVersion: '0.66.0' });
+
+    expect(resp.status).toBe(200);
+    const updateArg = (setSpy.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
+    expect(updateArg).not.toHaveProperty('helperVersion');
   });
 });
 

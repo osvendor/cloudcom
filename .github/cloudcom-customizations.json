@@ -5,7 +5,7 @@
       "id": "managed-rustdesk-viewer-routing",
       "requiredFiles": [
         "scripts/cloudcom/rustdesk/build-viewer-msi.ps1",
-          "scripts/cloudcom/rustdesk/build-managed-client-local.ps1",
+        "scripts/cloudcom/rustdesk/build-managed-client-local.ps1",
         "scripts/cloudcom/rustdesk/ManagedViewerLauncher.cs",
         "docs/cloudcom-managed-viewer-msi.md",
         "scripts/cloudcom/rustdesk/launch-managed.ps1",
@@ -13,8 +13,14 @@
         "docs/cloudcom-managed-viewer-launch.md"
       ],
       "hooks": [
-        { "file": ".github/workflows/cloudcom-ci.yml", "contains": "./scripts/cloudcom/rustdesk/launch-managed.test.ps1" },
-        { "file": "scripts/cloudcom/rustdesk/launch-managed.ps1", "contains": "$start.EnvironmentVariables['RUSTDESK_APPNAME'] = $route" }
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "./scripts/cloudcom/rustdesk/launch-managed.test.ps1"
+        },
+        {
+          "file": "scripts/cloudcom/rustdesk/launch-managed.ps1",
+          "contains": "$start.EnvironmentVariables['RUSTDESK_APPNAME'] = $route"
+        }
       ]
     },
     {
@@ -195,7 +201,7 @@
       "hooks": [
         {
           "file": "packages/ext-cloud-command/src/server/index.ts",
-          "contains": "mountMicrosoftRoutes(app, administration ? createAdministrationServices(context, fetch, administration) : microsoft)"
+          "contains": "mountMicrosoftRoutes(app, microsoftServices)"
         },
         {
           "file": "packages/ext-cloud-command/src/web/index.ts",
@@ -208,6 +214,10 @@
         {
           "file": "packages/ext-cloud-command/manifest.json",
           "contains": "cloudcommand-connect-page"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/server/index.ts",
+          "contains": "mountDirectorySnapshotRoutes(app, context, microsoftServices)"
         }
       ]
     },
@@ -328,23 +338,86 @@
         "apps/web/src/components/integrations/GoogleWorkspaceIntegration.test.tsx"
       ],
       "hooks": [
-        { "file": "packages/ext-cloud-command/src/server/index.ts", "contains": "mountGoogleRoutes(app, google)" },
-        { "file": "packages/ext-cloud-command/src/web/index.ts", "contains": "import './google'" },
-        { "file": "packages/ext-cloud-command/manifest.json", "contains": "cloudcommand-google-page" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.directory" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.members" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.mailboxSettings" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.storage" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.activity" },
-        { "file": "apps/api/src/services/googleClient.ts", "contains": "admin.reports.usage.readonly" },
-        { "file": "apps/api/src/services/googleClient.ts", "contains": "admin.reports.audit.readonly" },
-        { "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx", "contains": "admin.reports.usage.readonly" },
-        { "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx", "contains": "admin.reports.audit.readonly" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.setSuspended" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.auditSuspension" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.updateProfile" },
-        { "file": "apps/api/src/extensions/builtinRegistry.ts", "contains": "nativeGoogleServices.auditProfile" },
-        { "file": ".github/workflows/cloudcom-ci.yml", "contains": "cloudCommandGoogle.test.ts" }
+        {
+          "file": "packages/ext-cloud-command/src/server/index.ts",
+          "contains": "mountGoogleRoutes(app, google)"
+        },
+        {
+          "file": "packages/ext-cloud-command/src/web/index.ts",
+          "contains": "import './google'"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand-google-page"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.directory"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.members"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.mailboxSettings"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.storage"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.activity"
+        },
+        {
+          "file": "packages/shared/src/constants/googleDwdScopes.ts",
+          "contains": "admin.reports.usage.readonly"
+        },
+        {
+          "file": "packages/shared/src/constants/googleDwdScopes.ts",
+          "contains": "admin.reports.audit.readonly"
+        },
+        {
+          "file": "packages/shared/src/constants/googleDwdScopes.ts",
+          "contains": "admin.reports.usage.readonly"
+        },
+        {
+          "file": "packages/shared/src/constants/googleDwdScopes.ts",
+          "contains": "admin.reports.audit.readonly"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.setSuspended"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.auditSuspension"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.updateProfile"
+        },
+        {
+          "file": "apps/api/src/extensions/builtinRegistry.ts",
+          "contains": "nativeGoogleServices.auditProfile"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "cloudCommandGoogle.test.ts"
+        },
+        {
+          "file": "apps/api/src/services/googleClient.ts",
+          "contains": "REPORTS_SCOPES"
+        },
+        {
+          "file": "apps/api/src/services/googleClient.ts",
+          "contains": "AUDIT_REPORTS_SCOPES"
+        },
+        {
+          "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx",
+          "contains": "GOOGLE_DWD_SCOPES_CSV"
+        }
       ]
     },
     {
@@ -362,12 +435,30 @@
         "docs/cloudcom-upstream-maintenance.md"
       ],
       "hooks": [
-        { "file": "apps/api/src/routes/google.ts", "contains": "googleRoutes.route('/', cloudCommandGoogleOAuthRoutes)" },
-        { "file": "apps/api/src/extensions/cloudCommandGoogle.ts", "contains": "loadGoogleOAuth(auth, input.orgId)" },
-        { "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx", "contains": "Authorize Google Workspace" },
-        { "file": "packages/ext-cloud-command/manifest.json", "contains": "cloudcommand_google_oauth_connections" },
-        { "file": ".github/workflows/cloudcom-ci.yml", "contains": "src/routes/cloudCommandGoogleOAuth.test.ts" },
-        { "file": "scripts/cloudcom/test-threecx-rls.sh", "contains": "cloudCommandGoogleOAuth.integration.test.ts" }
+        {
+          "file": "apps/api/src/routes/google.ts",
+          "contains": "googleRoutes.route('/', cloudCommandGoogleOAuthRoutes)"
+        },
+        {
+          "file": "apps/api/src/extensions/cloudCommandGoogle.ts",
+          "contains": "loadGoogleOAuth(auth, input.orgId)"
+        },
+        {
+          "file": "apps/web/src/components/integrations/GoogleWorkspaceIntegration.tsx",
+          "contains": "Authorize Google Workspace"
+        },
+        {
+          "file": "packages/ext-cloud-command/manifest.json",
+          "contains": "cloudcommand_google_oauth_connections"
+        },
+        {
+          "file": ".github/workflows/cloudcom-ci.yml",
+          "contains": "src/routes/cloudCommandGoogleOAuth.test.ts"
+        },
+        {
+          "file": "scripts/cloudcom/test-threecx-rls.sh",
+          "contains": "cloudCommandGoogleOAuth.integration.test.ts"
+        }
       ]
     },
     {

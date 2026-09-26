@@ -116,6 +116,40 @@ describe('DeviceInfoTab — OS version display', () => {
   });
 });
 
+describe('DeviceInfoTab — update offers withheld (#6449)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function load(extra: Record<string, unknown>) {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({ ...baseDeviceInfoPayload, agentVersion: '0.106.0', ...extra });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+  }
+
+  it('shows the withheld notice with the since-date when offers are withheld', async () => {
+    load({
+      updateOfferWithheldReason: 'edition_unconfirmed',
+      updateOfferWithheldSince: '2026-10-01T00:00:00.000Z',
+    });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    expect(await screen.findByTestId('update-offer-withheld')).toBeInTheDocument();
+  });
+
+  it('shows no notice for a healthy device', async () => {
+    load({ updateOfferWithheldReason: null, updateOfferWithheldSince: null });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    await screen.findByText('Operating System');
+    expect(screen.queryByTestId('update-offer-withheld')).toBeNull();
+  });
+});
+
 describe('DeviceInfoTab — hardware summary display', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -384,6 +418,50 @@ describe('DeviceInfoTab — watchdog version display', () => {
 
     await screen.findByText('Watchdog Version');
     expect(screen.getByText('Not Installed')).toBeInTheDocument();
+  });
+});
+
+describe('DeviceInfoTab — helper version display (#6751)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function mockDevice(helperVersion: string | null) {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({
+          ...baseDeviceInfoPayload,
+          agentVersion: '0.70.0',
+          watchdogVersion: '0.70.0',
+          helperVersion,
+        });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+  }
+
+  it('shows the helper version the agent reported', async () => {
+    mockDevice('0.69.4');
+
+    render(<DeviceInfoTab deviceId={deviceId} />);
+
+    const label = await screen.findByText('Helper Version');
+    expect(label.parentElement).toHaveTextContent('0.69.4');
+  });
+
+  it('shows a dash (not "Not Installed") when no helper version has been reported', async () => {
+    // null means "not reported" — an old agent, or the helper is absent — so
+    // the row must not claim the helper is uninstalled.
+    mockDevice(null);
+
+    render(<DeviceInfoTab deviceId={deviceId} />);
+
+    const label = await screen.findByText('Helper Version');
+    expect(label.parentElement).toHaveTextContent('—');
+    expect(label.parentElement).not.toHaveTextContent('Not Installed');
   });
 });
 

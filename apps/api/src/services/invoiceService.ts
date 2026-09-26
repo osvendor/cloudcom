@@ -4,11 +4,12 @@ import { assertInTransaction, db, getCurrentDbAccessContext, runOutsideDbContext
 import { requestLikeFromSnapshot, writeAuditEvent } from './auditEvents';
 import {
   invoices, invoiceLines, invoiceLineDevices, invoicePayments, invoiceStripePayments, organizations, partners,
-  catalogBundleComponents, catalogItems, contracts, contractLines, timeEntries, ticketParts, tickets, ticketCategories,
+  catalogBundleComponents, catalogItems, contracts, contractLines, timeEntries, ticketParts, tickets,
   accountingEntityMappings, accountingConnections, portalBranding
 } from '../db/schema';
 import { getConnection } from './stripeConnectService';
 import { computeLineTotal, computeInvoiceTotals, resolveEffectiveTaxRate, deriveInvoiceStatus, toCents, fromCents } from './invoiceMath';
+import { computeDueDate, resolveInvoiceTermsDays } from './invoiceTerms';
 import { resolvePrice, computeBundleEconomics, CatalogServiceError, type CatalogActor } from './catalogService';
 import { snapshotCost } from './catalogPricing';
 // formatInvoiceNumber is shared with the standalone allocator; issueInvoice
@@ -16,8 +17,9 @@ import { snapshotCost } from './catalogPricing';
 // to keep allocation atomic with the number write inside its single transaction.
 import { formatInvoiceNumber } from './invoiceNumbers';
 import { emitInvoiceEvent } from './invoiceEvents';
-import { resolveInvoiceFooter, resolveDraftBillTo } from './invoicePdf';
-import { resolveOrgTaxRate, OrgNotVisibleForTaxError } from './taxRateResolver';
+import { resolveInvoiceFooter, resolveDraftBillTo, invoiceTicketNumberSql, invoiceTicketCategorySql, invoiceLineTicketNumberSql, invoiceLineTicketSubjectSql, invoiceLineTicketCategorySql } from './invoicePdf';
+import { resolveOrgTaxRate, resolveOrgTaxRateOn, OrgNotVisibleForTaxError, PartnerNotVisibleForTaxError } from './taxRateResolver';
+import { stampedPresentation } from './invoicePresentation';
 import { enqueueInvoicePdfRender } from '../jobs/invoiceWorker';
 import {
   enqueueAccountingInvoicePush, enqueueAccountingInvoiceVoid,
@@ -186,16 +188,37 @@ export async function createManualInvoice(input: { orgId: string; siteId?: strin
   return rows[0]!;
 }
 
-/** Draft-time effective tax rate: org rate or 0. The partner default is applied
- *  authoritatively at issue (system context, where the partner row is readable). */
-async function effectiveRateForOrg(orgId: string, dbc: DbExecutor = db): Promise<string> {
-  const [org] = await dbc.select({ taxExempt: organizations.taxExempt, taxRate: organizations.taxRate })
-    .from(organizations).where(eq(organizations.id, orgId)).limit(1);
-  return resolveEffectiveTaxRate({ taxExempt: org?.taxExempt ?? false, orgRate: org?.taxRate ?? null, partnerRate: null });
+/** Draft-time effective tax rate, org → partner → 0 (#6227, settings audit M18) —
+ *  the SAME precedence issue applies, through the shared resolver core, so a
+ *  draft's persisted totals match what issue will charge (until a rate changes;
+ *  issue still re-resolves and stamps the rate current at issue).
+ *
+ *  resolveOrgTaxRateOn reads on `dbc` — the caller's locked transaction — and
+ *  never escalates: resolveOrgTaxRate's partner-axis escape would open a second
+ *  pooled transaction while this one holds the invoice row lock (quorum
+ *  amendment 6). An invisible org maps to the usual 404; an invisible partner
+ *  (PartnerNotVisibleForTaxError — a caller without partner/system scope, which
+ *  no current path is) propagates as a 500 rather than silently dropping the
+ *  partner rate. Returns the persisted numeric(8,5) fraction, never null. */
+async function effectiveRateForOrg(inv: { orgId: string; partnerId: string }, dbc: DbExecutor = db): Promise<string> {
+  try {
+    return (await resolveOrgTaxRateOn(dbc, { orgId: inv.orgId, partnerId: inv.partnerId })) ?? NO_TAX_RATE;
+  } catch (err) {
+    if (err instanceof OrgNotVisibleForTaxError) {
+      throw new InvoiceServiceError('Organization not found', 404, 'ORG_NOT_FOUND');
+    }
+    if (err instanceof PartnerNotVisibleForTaxError) {
+      // Unreachable from today's partner/system-scoped callers — if it fires, a
+      // new caller broke that assumption. Log the context so the 500 is traceable.
+      console.error('[invoiceService] DRAFT_TAX_PARTNER_NOT_VISIBLE', { orgId: inv.orgId, partnerId: inv.partnerId });
+    }
+    throw err;
+  }
 }
+const NO_TAX_RATE = resolveEffectiveTaxRate({ taxExempt: true, orgRate: null, partnerRate: null });
 
 /** Recompute subtotal/tax/total/balance from the invoice's current lines. Draft-time
- *  uses the org's effective rate; on issue the snapshotted tax_rate is passed instead.
+ *  uses the org → partner effective rate; on issue the snapshotted tax_rate is passed instead.
  *  Writers holding the invoice row lock pass their `tx` so the recompute stays inside
  *  the same transaction (a global-db call here would escape the lock scope). */
 export async function recomputeInvoiceTotals(invoiceId: string, taxRateOverride?: string | null, dbc: DbExecutor = db) {
@@ -207,7 +230,7 @@ export async function recomputeInvoiceTotals(invoiceId: string, taxRateOverride?
   const lines = await dbc.select({
     lineTotal: invoiceLines.lineTotal, taxable: invoiceLines.taxable, customerVisible: invoiceLines.customerVisible
   }).from(invoiceLines).where(eq(invoiceLines.invoiceId, invoiceId));
-  const taxRate = taxRateOverride !== undefined ? taxRateOverride : await effectiveRateForOrg(inv.orgId, dbc);
+  const taxRate = taxRateOverride !== undefined ? taxRateOverride : await effectiveRateForOrg(inv, dbc);
   const totals = computeInvoiceTotals(lines, taxRate, inv.currencyCode);
   const balance = fromCents(toCents(totals.total) - toCents(inv.amountPaid));
   await dbc.update(invoices).set({
@@ -540,7 +563,8 @@ export async function deleteDraftInvoice(invoiceId: string, actor: InvoiceActor)
 
 /** Draft-only header edit (notes/site/dueDate/termsAndConditions). Only provided fields are written;
  *  siteId can be explicitly set to null to clear it. issue() overwrites dueDate
- *  with issueDate + partner terms, so a draft dueDate is advisory until then. */
+ *  with issueDate + the resolved payment terms (org override ?? partner default,
+ *  resolveInvoiceTermsDays), so a draft dueDate is advisory until then. */
 export async function updateInvoice(
   invoiceId: string,
   patch: { notes?: string; siteId?: string | null; dueDate?: string; termsAndConditions?: string | null },
@@ -731,16 +755,15 @@ export async function getInvoice(invoiceId: string, actor: InvoiceActor) {
   const inv = await getOwnedInvoiceOr404(invoiceId); requireInvoiceAccess(actor, inv);
   const rawLines = await db.select({
     ...getTableColumns(invoiceLines),
-    ticketNumber: sql<string | null>`COALESCE(${tickets.ticketNumber}, ${tickets.internalNumber})`,
-    ticketSubject: tickets.subject,
-    ticketCategory: sql<string | null>`COALESCE(${ticketCategories.name}, ${tickets.category})`,
+    ticketNumber: invoiceLineTicketNumberSql(inv.status),
+    ticketSubject: invoiceLineTicketSubjectSql(inv.status),
+    ticketCategory: invoiceLineTicketCategorySql(inv.status),
   }).from(invoiceLines)
     .leftJoin(tickets, and(
       eq(invoiceLines.ticketId, tickets.id),
       eq(tickets.orgId, inv.orgId),
       isNull(tickets.deletedAt),
     ))
-    .leftJoin(ticketCategories, eq(tickets.categoryId, ticketCategories.id))
     .where(eq(invoiceLines.invoiceId, invoiceId))
     .orderBy(invoiceLines.sortOrder);
 
@@ -786,14 +809,12 @@ export async function getInvoice(invoiceId: string, actor: InvoiceActor) {
     displayInvoice = { ...inv, billToName: resolved.billToName };
     billToEmail = resolved.billToEmail;
   }
-  // #6338: a DRAFT's committed tax_rate is ORG-level only (effectiveRateForOrg
-  // passes partnerRate: null), so a draft for an org whose own rate is blank
-  // shows $0.00 tax while issueInvoice applies the PARTNER default — the tech
-  // approves $200.00 and issues $215.00, and the summary meanwhile claims "no
-  // tax rate is set" when one plainly is. Surface the rate that WILL apply at
-  // issue, READ-ONLY: `invoice.taxRate`, recomputeInvoiceTotals and the
-  // issue-time math are all untouched (routing draft totals through the shared
-  // resolver is still M18's job — see taxRateResolver's docstring).
+  // #6338: surface the rate that WILL apply at issue, READ-ONLY. Since #6227
+  // (M18) a draft's committed tax_rate already resolves org → partner at every
+  // recompute, but it is only as fresh as the draft's LAST mutation: a partner
+  // or org rate changed since then is not on the row until the next line edit,
+  // while issueInvoice re-resolves at issue. This preview is the live value, so
+  // the editor can flag the difference before the tech issues.
   //
   // Resolved by the ONE shared resolver, so tax_exempt and an org-level rate
   // win over the partner default exactly as they will at issue. Drafts only:
@@ -947,9 +968,9 @@ export async function getCustomerInvoice(
   if (orgId !== undefined && inv.orgId !== orgId) throw new InvoiceServiceError('Invoice not found', 404, 'INVOICE_NOT_FOUND');
   const rows = await db.select({
     ticketId: invoiceLines.ticketId,
-    ticketNumber: sql<string | null>`COALESCE(${tickets.ticketNumber}, ${tickets.internalNumber})`,
-    ticketSubject: tickets.subject,
-    ticketCategory: sql<string | null>`COALESCE(${ticketCategories.name}, ${tickets.category})`,
+    ticketNumber: invoiceLineTicketNumberSql(inv.status),
+    ticketSubject: invoiceLineTicketSubjectSql(inv.status),
+    ticketCategory: invoiceLineTicketCategorySql(inv.status),
     name: invoiceLines.name,
     description: invoiceLines.description,
     quantity: invoiceLines.quantity,
@@ -961,7 +982,7 @@ export async function getCustomerInvoice(
     eq(tickets.id, invoiceLines.ticketId),
     eq(tickets.orgId, inv.orgId),
     isNull(tickets.deletedAt),
-  )).leftJoin(ticketCategories, eq(tickets.categoryId, ticketCategories.id))
+  ))
   .where(and(
     eq(invoiceLines.invoiceId, invoiceId),
     eq(invoiceLines.orgId, inv.orgId),
@@ -1073,6 +1094,7 @@ const orgBillingProjection = () => ({
   billingAddressCity: organizations.billingAddressCity, billingAddressRegion: organizations.billingAddressRegion,
   billingAddressPostalCode: organizations.billingAddressPostalCode, billingAddressCountry: organizations.billingAddressCountry,
   currencyCode: organizations.currencyCode,
+  invoiceTermsDays: organizations.invoiceTermsDays,
 });
 
 export async function updateOrgBillingSettings(
@@ -1080,6 +1102,7 @@ export async function updateOrgBillingSettings(
   patch: {
     billingProfileId?: string | null;
     taxId?: string | null; taxExempt?: boolean; taxRate?: number | null;
+    invoiceTermsDays?: number | null;
     billingContactEmail?: string | null; billingContactName?: string | null;
     billingAddressLine1?: string | null; billingAddressLine2?: string | null;
     billingAddressCity?: string | null; billingAddressRegion?: string | null;
@@ -1129,6 +1152,8 @@ export async function updateOrgBillingSettings(
   if (patch.taxId !== undefined) set.taxId = patch.taxId;
   if (patch.taxExempt !== undefined) set.taxExempt = patch.taxExempt;
   if (patch.taxRate !== undefined) set.taxRate = patch.taxRate === null ? null : Number(patch.taxRate).toFixed(5);
+  // #6229: null = inherit the partner default; 0 is a real value (due on receipt).
+  if (patch.invoiceTermsDays !== undefined) set.invoiceTermsDays = patch.invoiceTermsDays;
   // billingContact is a jsonb bag other importers (e.g. QuickBooks) also write.
   // It is written by the contacts compat service rather than here (#3258), so
   // the `contacts` row stays in step with the blob. `mergeBillingContact` keeps
@@ -1451,7 +1476,9 @@ export async function issueInvoice(invoiceId: string, actor: InvoiceActor) {
       .from(portalBranding).where(eq(portalBranding.orgId, inv.orgId)).limit(1);
     const taxRate = resolveEffectiveTaxRate({ taxExempt: org?.taxExempt ?? false, orgRate: org?.taxRate ?? null, partnerRate: partner?.defaultTaxRate ?? null });
     const issueDate = new Date();
-    const dueDate = new Date(issueDate.getTime() + (partner?.invoiceTermsDays ?? 30) * 86400000);
+    // Settings consolidation W06 (#6229): org override ?? partner default ?? 30,
+    // frozen here as due_date. Issued invoices are never restamped.
+    const dueDate = computeDueDate(issueDate, resolveInvoiceTermsDays(org?.invoiceTermsDays, partner?.invoiceTermsDays));
     const year = issueDate.getUTCFullYear();
 
     const { subtotal, taxTotal, total } = computeInvoiceTotals(lines, taxRate, inv.currencyCode);
@@ -1478,7 +1505,7 @@ export async function issueInvoice(invoiceId: string, actor: InvoiceActor) {
       // header currency is a snapshot and must survive issue verbatim — totals
       // above are already rounded with inv.currencyCode, so header and totals agree.
       status: 'sent', invoiceNumber: number,
-      issueDate: issueDate.toISOString().slice(0, 10), dueDate: dueDate.toISOString().slice(0, 10),
+      issueDate: issueDate.toISOString().slice(0, 10), dueDate,
       taxRate, subtotal, taxTotal, total, balance: total,
       billToName: org?.name ?? null, billToAddress, billToTaxId: org?.taxId ?? null,
       billToTaxExempt: org?.taxExempt ?? false,
@@ -1507,6 +1534,12 @@ export async function issueInvoice(invoiceId: string, actor: InvoiceActor) {
       // sanctioned re-render produces. Same two-writer rule document_locale
       // follows, for the same reason.
       deviceAppendix: inv.deviceAppendix ?? partner?.invoiceDeviceAppendix ?? false,
+      // #6227 presentation snapshot (settings audit rule 6): freeze the theme
+      // and page size the customer will see, through the ONE resolver. A draft
+      // carries NULL (live partner preview), so this resolves the partner's
+      // current values; `inv` first keeps the same `??` two-writer rule as
+      // documentLocale. Same `partner` row read above — no new read or lock.
+      ...stampedPresentation(inv, partner),
       updatedAt: issueDate
     }).where(and(eq(invoices.id, invoiceId), eq(invoices.status, 'draft'))).returning({ id: invoices.id });
     // Guarded write: impossible to miss while we hold the row lock and asserted
@@ -1514,6 +1547,28 @@ export async function issueInvoice(invoiceId: string, actor: InvoiceActor) {
     if (updated.length !== 1) {
       throw new InvoiceServiceError('Invoice changed under the issuance lock', 500, 'CONCURRENT_MODIFICATION');
     }
+
+    // Ticket-label snapshot (settings audit rule 6, sweep C4): freeze the
+    // "Ticket #…" each line prints, beside the presentation snapshot above.
+    // Same join predicate as the draft readers (same org, not soft-deleted), so
+    // the issued document shows exactly what the draft previewed. The lines are
+    // already locked above; tickets is only read — no new lock class.
+    // The group header's subject + category are frozen in the same statement
+    // (#6955 / #6674). This tx is SYSTEM scope, so the partner-axis
+    // ticket_categories row resolves whoever issues — the org-scoped portal,
+    // which cannot read that table, then renders the stamp.
+    await db.update(invoiceLines).set({
+      ticketLabel: invoiceTicketNumberSql(),
+      ticketSubject: sql`${tickets.subject}`,
+      ticketCategory: invoiceTicketCategorySql(),
+    })
+      .from(tickets)
+      .where(and(
+        eq(invoiceLines.invoiceId, invoiceId),
+        eq(invoiceLines.ticketId, tickets.id),
+        eq(tickets.orgId, inv.orgId),
+        isNull(tickets.deletedAt),
+      ));
 
     // Guarded source flips (belt-and-braces under the held locks — also stops
     // an unconditional flip of a deleted/foreign/already-billed row).

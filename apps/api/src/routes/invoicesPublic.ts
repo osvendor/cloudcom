@@ -4,18 +4,18 @@ import { zValidator } from '../lib/validation';
 import { and, eq, sql, isNull } from 'drizzle-orm';
 import { computeChargeNow } from '@breeze/shared';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
-import { invoices, invoiceLines, invoiceStripePayments, tickets, ticketCategories } from '../db/schema';
+import { invoices, invoiceLines, invoiceStripePayments, tickets } from '../db/schema';
 import { partners } from '../db/schema/orgs';
 import { portalBranding } from '../db/schema/portal';
 import { resolveInvoiceByLinkToken, getOrMintInvoiceLink, buildPublicInvoiceUrl } from '../services/invoiceLinkToken';
 import { toCustomerInvoiceHeader, toCustomerInvoiceLine, markViewed } from '../services/invoiceService';
-import { getInvoicePdf, renderInvoicePdf } from '../services/invoicePdf';
+import { getInvoicePdf, renderInvoicePdf, invoiceLineTicketNumberSql, invoiceLineTicketSubjectSql, invoiceLineTicketCategorySql } from '../services/invoicePdf';
 import { createInvoicePayLink } from '../services/invoiceCheckout';
 import { CUSTOMER_SAFE_CURRENCY_UNSUPPORTED_MESSAGE } from '../services/stripeCheckoutErrors';
 import { settleCheckoutSession } from '../services/stripeSettle';
 import { InvoiceServiceError } from '../services/invoiceTypes';
 import { safeContentDispositionFilename } from '../utils/httpHeaders';
-import { resolveThemeId, resolvePageSize } from '../services/documentThemes';
+import { resolveInvoicePresentation } from '../services/invoicePresentation';
 import { portalBase } from '../services/portalUrl';
 import { getRedis } from '../services/redis';
 import { rateLimiter } from '../services/rate-limit';
@@ -121,15 +121,15 @@ invoicesPublicRoutes.get('/:token', zValidator('param', tokenParam), async (c) =
           replaced: inv.replacedByInvoiceId != null,
         },
         lines: [], chargeNow: null, payable: false,
-        branding: brandingBlock(partner, brand),
+        branding: brandingBlock(inv, partner, brand),
       };
     }
 
     const rows = await db.select({
       ticketId: invoiceLines.ticketId,
-      ticketNumber: sql<string | null>`COALESCE(${tickets.ticketNumber}, ${tickets.internalNumber})`,
-      ticketSubject: tickets.subject,
-      ticketCategory: sql<string | null>`COALESCE(${ticketCategories.name}, ${tickets.category})`,
+      ticketNumber: invoiceLineTicketNumberSql(inv.status),
+      ticketSubject: invoiceLineTicketSubjectSql(inv.status),
+      ticketCategory: invoiceLineTicketCategorySql(inv.status),
       name: invoiceLines.name,
       description: invoiceLines.description,
       quantity: invoiceLines.quantity,
@@ -143,7 +143,6 @@ invoicesPublicRoutes.get('/:token', zValidator('param', tokenParam), async (c) =
         eq(tickets.orgId, inv.orgId),
         isNull(tickets.deletedAt),
       ))
-      .leftJoin(ticketCategories, eq(tickets.categoryId, ticketCategories.id))
       .where(and(eq(invoiceLines.invoiceId, inv.id), eq(invoiceLines.customerVisible, true)))
       .orderBy(invoiceLines.sortOrder);
 
@@ -161,13 +160,14 @@ invoicesPublicRoutes.get('/:token', zValidator('param', tokenParam), async (c) =
       lines: rows.map(toCustomerInvoiceLine),
       chargeNow,
       payable: PAYABLE.has(inv.status) && Number(inv.balance) > 0,
-      branding: brandingBlock(partner, brand),
+      branding: brandingBlock(inv, partner, brand),
     };
   }));
   return c.json({ data });
 });
 
 function brandingBlock(
+  inv: { documentTheme: string | null; documentPageSize: string | null },
   partner: { name: string; billingEmail: string | null; documentTheme: string | null; documentPageSize: string | null } | undefined,
   brand: { logoUrl: string | null; primaryColor: string | null } | undefined,
 ) {
@@ -176,8 +176,9 @@ function brandingBlock(
     contactEmail: partner?.billingEmail ?? null,
     logoUrl: brand?.logoUrl ?? null,
     primaryColor: brand?.primaryColor ?? null,
-    theme: resolveThemeId(partner?.documentTheme),
-    pageSize: resolvePageSize(partner?.documentPageSize),
+    // #6227: the invoice's issue-time snapshot (every non-draft invoice carries
+    // one since 2026-10-29-100100), partner live values only as the fallback.
+    ...resolveInvoicePresentation(inv, partner),
   };
 }
 

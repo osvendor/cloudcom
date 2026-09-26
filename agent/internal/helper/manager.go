@@ -2,6 +2,7 @@ package helper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -61,6 +62,13 @@ type SpawnFunc func(sessionKey string, binaryPath string, args ...string) (pid i
 
 // ErrNoActiveSession is returned by SpawnFunc when no user session is available.
 var ErrNoActiveSession = fmt.Errorf("no active user session")
+
+// ErrNotInstalled: Breeze Assist is enabled by policy but the helper binary is
+// not on disk (never installed, or a failed in-place update removed it).
+// Callers must not spawn, must not count it as a crash, and must not log it
+// as an error on every heartbeat — the server's HelperUpgradeTo bootstrap
+// offer is the only thing that resolves it (#6872).
+var ErrNotInstalled = errors.New("breeze assist is not installed")
 
 // Option configures a Manager.
 type Option func(*Manager)
@@ -163,7 +171,15 @@ type Manager struct {
 	// that enforces signed-manifest + SHA-256 verification and control-plane
 	// origin. Tests inject a stub. It is NEVER the old unverified fetch.
 	downloadFunc func(version string) (string, error)
-	agentVersion string
+	// binaryVersionFunc reads the version stamped into the installed helper
+	// binary (Windows file version resource, macOS Info.plist). It is the
+	// authoritative "installed version" and is independent of whether any
+	// helper process is running or has written a status file (#6252). Nil, or
+	// errBinaryVersionUnsupported, means the platform cannot read it.
+	binaryVersionFunc func(path string) (string, error)
+	// lastBinaryVersionErr dedupes the unreadable-version warning. Guarded by mu.
+	lastBinaryVersionErr string
+	agentVersion         string
 	// manifestKeys and requireManifestSigningKeyID are PROVIDERS, not values:
 	// both underlying config fields are mutable at runtime and the verified
 	// downloader must re-read them on every download. See WithManifestKeys.
@@ -172,11 +188,24 @@ type Manager struct {
 
 	requireManifestSigningKeyID func() bool
 
+	// now is the clock for the abandon cooldown; nil means time.Now (tests inject).
+	now func() time.Time
+
+	// Install/update failure accounting, shared by the first-install branch of
+	// Apply and applyPendingUpdate — see install_retry.go (#6927).
 	pendingHelperVersion string
 	updateFailures       int
-	abandonedVersion     string // version we gave up updating to
+	failuresVersion      string    // version updateFailures counts against
+	abandonedVersion     string    // version we gave up installing/updating to
+	abandonedAt          time.Time // when abandonedVersion was set; retried after helperAbandonRetryAfter
 
 	legacyAutoStartCleaned bool
+
+	// notInstalledWarned: the "enabled but not installed, waiting for the
+	// server" warning has fired for the current not-installed episode. Reset
+	// when the binary appears or the policy turns off, so the log carries one
+	// line per transition instead of one per heartbeat (#6872).
+	notInstalledWarned bool
 }
 
 // New creates a new helper Manager. serverURL is a provider (func() string) so
@@ -194,6 +223,7 @@ func New(ctx context.Context, serverURL func() string, authToken *secmem.SecureS
 		sessions:          make(map[string]*sessionState),
 		isOurProcessFunc:  isOurProcess,
 		stopIfOursFunc:    stopByPIDIfOurs,
+		binaryVersionFunc: readBinaryVersion,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -316,16 +346,39 @@ func (m *Manager) Apply(settings *Settings) {
 		// supplies one when bootstrapping a first install, and it is processed
 		// before this Apply call within the same heartbeat. Without it we fail
 		// closed rather than fetch unverified bytes.
+		// #6927: the install shares the update path's failure budget. Once the
+		// pending version has failed maxHelperInstallFailures times it is
+		// abandoned (pending cleared) and we fall through to the waiting branch.
+		m.abandonIfExhaustedLocked()
 		if m.pendingHelperVersion == "" {
-			log.Debug("breeze assist enabled but no signed target version yet; deferring install")
-		} else if err := m.downloadAndInstall(m.pendingHelperVersion); err != nil {
+			if !m.notInstalledWarned {
+				log.Warn(m.notInstalledReasonLocked())
+				m.notInstalledWarned = true
+			}
+			// #6872: nothing to configure, spawn, or watch. A watcher left over
+			// from an installed state must not keep respawning a missing binary.
+			for _, state := range m.sessions {
+				m.stopSessionWatcher(state)
+			}
+			return
+		}
+		if err := m.downloadAndInstall(m.pendingHelperVersion); err != nil {
+			m.recordInstallFailureLocked(m.pendingHelperVersion)
 			// downloadAndInstall wraps the verified downloader's error, which for
 			// any transport failure is a *url.Error carrying the presigned
 			// helper-asset URL. This log line ships, so it must be redacted.
 			key, value := updater.SafeDownloadErrorFields(err)
-			log.Error("failed to install breeze assist", key, value)
+			log.Error("failed to install breeze assist", key, value,
+				"targetVersion", m.pendingHelperVersion, "failures", m.updateFailures)
 			return
 		}
+		m.clearInstallFailuresLocked()
+		for _, state := range m.sessions {
+			state.watcherGaveUp = false // new binary — give it a fresh chance (#6872)
+		}
+	}
+	if !settings.Enabled || m.isInstalled() {
+		m.notInstalledWarned = false
 	}
 
 	activeSessions := m.sessionEnumerator.ActiveSessions()
@@ -384,8 +437,13 @@ func (m *Manager) Apply(settings *Settings) {
 			}
 
 			if err := m.ensureRunningSession(state); err != nil {
-				log.Error("failed to start breeze assist", "session", si.Key, "error", err.Error())
+				if errors.Is(err, ErrNotInstalled) {
+					log.Debug("breeze assist not installed; skipping spawn", "session", si.Key)
+				} else {
+					log.Error("failed to start breeze assist", "session", si.Key, "error", err.Error())
+				}
 			} else {
+				m.reapDuplicateHelpersLocked(state)
 				m.startSessionWatcher(state)
 			}
 			continue
@@ -470,7 +528,8 @@ func (m *Manager) uninstallLocked() {
 
 	m.pendingHelperVersion = ""
 	m.abandonedVersion = ""
-	m.updateFailures = 0
+	m.abandonedAt = time.Time{}
+	m.clearInstallFailuresLocked()
 
 	log.Info("breeze assist uninstalled")
 }
@@ -569,6 +628,11 @@ func (m *Manager) ensureRunningSession(state *sessionState) error {
 	if state.pid > 0 && state.pid != state.spawnedPID && m.isOurProcessFunc(state.pid, m.binaryPath) {
 		return nil
 	}
+	// #6872: nothing to spawn. Checked BEFORE watcherGaveUp so a device that
+	// burned its retries against a missing binary recovers on install.
+	if !m.isInstalled() {
+		return ErrNotInstalled
+	}
 	if state.watcherGaveUp {
 		return fmt.Errorf("helper keeps crashing, not respawning until next update")
 	}
@@ -629,6 +693,7 @@ func (m *Manager) ensureStoppedSession(state *sessionState) error {
 	// Kill by spawned PID (authoritative) and status-file PID if different.
 	// stopIfOursFunc verifies helper identity on the same handle it terminates
 	// with, so PID reuse can't redirect the kill (#2531).
+	stopped := make(map[int]bool, 2)
 	for _, pid := range []int{state.spawnedPID, state.pid} {
 		if pid <= 0 {
 			continue
@@ -636,6 +701,23 @@ func (m *Manager) ensureStoppedSession(state *sessionState) error {
 		if _, err := m.stopIfOursFunc(pid, m.binaryPath); err != nil {
 			return err
 		}
+		stopped[pid] = true
+	}
+	// Then every helper still running in the session, whoever started it
+	// (#6251). The tracked PIDs above are frequently unknown: a helper launched
+	// through the user-role helper reports PID 0, a fresh agent process
+	// remembers nothing it spawned before a restart, and an older helper may
+	// write its status file somewhere this agent does not read. Stopping by PID
+	// alone then silently stops nothing, leaving the old instance running
+	// beside the one respawned next.
+	for _, inst := range m.helperInstancesInSession(state.key) {
+		if stopped[inst.PID] {
+			continue
+		}
+		if _, err := m.stopIfOursFunc(inst.PID, m.binaryPath); err != nil {
+			return err
+		}
+		stopped[inst.PID] = true
 	}
 	state.spawnedPID = 0
 	return nil
@@ -703,30 +785,70 @@ func (m *Manager) downloadAndInstall(version string) error {
 		return fmt.Errorf("install helper package: %w", err)
 	}
 
+	// The package manager's exit code is not proof the binary was replaced
+	// (#6252: msiexec exit 0 left breeze-helper.exe on the old version through
+	// six releases). Where the on-disk version is readable, it must now be the
+	// target; a mismatch is a failed install so the caller rolls back, counts
+	// it toward the retry cap, and stops claiming success.
+	//
+	// On a platform that CAN read the version (Windows, macOS), a read failure
+	// right after install is also a failure: accepting it would clear the
+	// pending update with the result unproven, which is the #6252 blind spot
+	// again. A transient failure (AV scanning the fresh binary) is retried by
+	// applyPendingUpdate on a later heartbeat, up to the failure cap.
+	onDisk, err := m.readBinaryVersion()
+	switch {
+	case errors.Is(err, errBinaryVersionUnsupported):
+		// Linux: no version metadata; the package manager result stands.
+	case err != nil:
+		return fmt.Errorf("%w: on-disk version unreadable after install (target %q): %v",
+			errHelperInstallNotApplied, version, err)
+	case !helperVersionsMatch(onDisk, version):
+		return fmt.Errorf("%w: on-disk version %q, target %q (msiexec may have skipped the upgrade or deferred file replacement until reboot)",
+			errHelperInstallNotApplied, onDisk, version)
+	}
+
 	log.Info("helper installed", "path", m.binaryPath, "version", version)
 	return nil
+}
+
+// readBinaryVersion reads the installed helper binary's stamped version.
+func (m *Manager) readBinaryVersion() (string, error) {
+	if m.binaryVersionFunc == nil {
+		return "", errBinaryVersionUnsupported
+	}
+	return m.binaryVersionFunc(m.binaryPath)
 }
 
 // CheckUpdate stores a pending Helper version upgrade.
 func (m *Manager) CheckUpdate(targetVersion string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if targetVersion == m.abandonedVersion {
-		return // already failed for this version, don't retry
+	if m.isAbandonedLocked(targetVersion) {
+		return // already failed for this version; retried after the cooldown
 	}
 	if m.pendingHelperVersion != targetVersion {
 		log.Info("helper update pending", "targetVersion", targetVersion)
 		m.pendingHelperVersion = targetVersion
-		m.updateFailures = 0
+		// The failure count follows its version (see recordInstallFailureLocked):
+		// a different version starts fresh, but the same version re-offered
+		// after a withdrawal keeps its count so a flapping offer cannot
+		// defeat the cap.
+		if m.failuresVersion != targetVersion {
+			m.clearInstallFailuresLocked()
+		}
 		// Only clear abandonedVersion when a genuinely different version is
 		// requested. This prevents re-triggering a failed update.
 		if m.abandonedVersion != "" && targetVersion != m.abandonedVersion {
 			m.abandonedVersion = ""
+			m.abandonedAt = time.Time{}
 		}
 	}
 }
 
-// InstalledVersion returns the first readable per-session helper version.
+// InstalledVersion returns the installed helper version: the version stamped
+// into the on-disk binary where the platform can read it, otherwise the first
+// readable per-session helper status version.
 func (m *Manager) InstalledVersion() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -734,6 +856,28 @@ func (m *Manager) InstalledVersion() string {
 }
 
 func (m *Manager) installedVersionLocked() string {
+	// The on-disk binary is authoritative (#6252). The status files below are
+	// written by a RUNNING helper, so they are empty whenever no helper has run
+	// in a tracked session yet — a new Windows session id after logoff/logon,
+	// a WTS blip that dropped the session, a crash-looping helper — and they
+	// lag the binary after an install until the old process restarts. An
+	// empty version made the heartbeat downgrade guard refuse every update as
+	// invalid_current, and made helperSupportsConfigFlag spawn the helper
+	// without --config, so it wrote its status to the legacy root file this
+	// function ignores once sessions/ exists: the version could never recover.
+	if v, err := m.readBinaryVersion(); err == nil && strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	} else if err != nil && !errors.Is(err, errBinaryVersionUnsupported) && m.isInstalled() {
+		// Warn (shipped) but only when the error changes: this runs every
+		// heartbeat and per session, and a persistently unreadable version
+		// must be visible server-side without flooding the log.
+		if msg := err.Error(); msg != m.lastBinaryVersionErr {
+			m.lastBinaryVersionErr = msg
+			log.Warn("helper binary version unreadable, falling back to session status", "path", m.binaryPath, "error", msg)
+		}
+	} else {
+		m.lastBinaryVersionErr = ""
+	}
 	for _, state := range m.sessions {
 		status, err := ReadStatus(state.configPath)
 		if err != nil {
@@ -764,22 +908,14 @@ func (m *Manager) applyPendingUpdate() {
 		return
 	}
 
-	if installed := m.installedVersionLocked(); installed == m.pendingHelperVersion {
+	if installed := m.installedVersionLocked(); installed == m.pendingHelperVersion || helperVersionsMatch(installed, m.pendingHelperVersion) {
 		log.Info("helper already at target version, clearing pending update", "version", installed)
 		m.pendingHelperVersion = ""
-		m.updateFailures = 0
+		m.clearInstallFailuresLocked()
 		return
 	}
 
-	const maxUpdateFailures = 3
-	if m.updateFailures >= maxUpdateFailures {
-		log.Warn("helper update abandoned after repeated failures, clearing pending update",
-			"targetVersion", m.pendingHelperVersion,
-			"failures", m.updateFailures,
-		)
-		m.abandonedVersion = m.pendingHelperVersion
-		m.pendingHelperVersion = ""
-		m.updateFailures = 0
+	if m.abandonIfExhaustedLocked() {
 		return
 	}
 
@@ -813,10 +949,11 @@ func (m *Manager) applyPendingUpdate() {
 	}
 
 	if err := m.downloadAndInstall(m.pendingHelperVersion); err != nil {
-		m.updateFailures++
+		m.recordInstallFailureLocked(m.pendingHelperVersion)
 		// Same presigned-URL hazard as the install path above.
 		key, value := updater.SafeDownloadErrorFields(err)
-		log.Error("failed to install helper update", key, value, "failures", m.updateFailures)
+		log.Error("failed to install helper update", key, value,
+			"targetVersion", m.pendingHelperVersion, "failures", m.updateFailures)
 		if restoreErr := restoreBackup(backupPath, m.binaryPath); restoreErr != nil {
 			log.Error("failed to rollback helper", "error", restoreErr.Error())
 		}
@@ -850,6 +987,7 @@ func (m *Manager) applyPendingUpdate() {
 
 	log.Info("helper updated successfully", "requestedVersion", m.pendingHelperVersion)
 	m.pendingHelperVersion = ""
+	m.clearInstallFailuresLocked()
 	_ = os.Remove(backupPath)
 }
 
@@ -868,7 +1006,14 @@ func (m *Manager) Shutdown() {
 
 func (m *Manager) startSessionWatcher(state *sessionState) {
 	if state.watcher != nil {
-		return
+		select {
+		case <-state.watcher.done:
+			// Exited on its own — ErrNotInstalled (#6872) or gave up — so a
+			// fresh one can take over.
+			state.watcher = nil
+		default:
+			return
+		}
 	}
 	w := newSessionWatcher(m.ctx, m, state)
 	state.watcher = w

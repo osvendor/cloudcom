@@ -855,6 +855,7 @@
         "reorderSections": "Não foi possível reordenar as seções.",
         "saveCoverPage": "Não foi possível salvar a página de capa",
         "saveCustomer": "Não foi possível alterar o cliente.",
+        "saveFooter": "Não foi possível salvar o rodapé.",
         "saveTerms": "Não foi possível salvar os termos.",
         "saveTitle": "Não foi possível salvar o título.",
         "unitPriceZeroOrMore": "Informe um preço unitário de 0 ou mais.",
@@ -995,6 +996,15 @@
         "headerStyleAccent": "Destaque",
         "reshapedWarning": "Esta tabela excedia o limite de {{columns}} colunas x {{rows}} linhas e foi ajustada. Salvar substitui a tabela armazenada pela exibida aqui."
       },
+      "footer": {
+        "title": "Linha de rodapé (todas as páginas)",
+        "helper": "Uma linha curta impressa na parte inferior de cada página — por exemplo, datas de validade. Deixe em branco para usar o rodapé padrão. Letras miúdas vão em Termos e Condições, não aqui.",
+        "placeholder": "Em branco = usar o rodapé padrão",
+        "inheritedPartner": "Usando o rodapé de fatura do parceiro das Configurações: “{{text}}”",
+        "inheritedBrand": "Usando o texto de rodapé do kit de marca: “{{text}}”",
+        "inheritedNone": "Nenhum rodapé padrão definido nas Configurações — o rodapé da página ficará vazio.",
+        "counter": "{{count}} / {{max}}"
+      },
       "terms": {
         "placeholder": "Condições de pagamento, observações de entrega, etc.",
         "title": "Termos e Condições (texto simples)",
@@ -1125,8 +1135,11 @@
         "recipientRequired": "Informe pelo menos um destinatário para enviar.",
         "signaturePreviewLabel": "Assinatura (definida em Configurações → Marca):",
         "subjectLabel": "Assunto",
-        "subjectPlaceholder": "Proposta {{number}} da sua empresa",
-        "subjectPlaceholderNoNumber": "Proposta da sua empresa",
+        "subjectPartnerFallback": "sua empresa",
+        "subjectPlaceholder": "Proposta {{number}} de {{partner}}",
+        "subjectPlaceholderNoNumber": "Proposta de {{partner}}",
+        "subjectPlaceholderTemplate": "Usa o assunto do seu modelo de e-mail de proposta",
+        "subjectPlaceholderTitled": "{{title}} — proposta de {{partner}}",
         "title": "Enviar esta proposta?",
         "toLabel": "Para",
         "toPlaceholder": "Adicionar destinatário…",
@@ -2202,22 +2215,33 @@
       "taxId": "ID fiscal",
       "taxRate": "Alíquota de imposto (%)",
       "title": "Imposto"
+    },
+    "terms": {
+      "description": "Dias entre a emissão e o vencimento das faturas desta organização. Deixe em branco para usar o padrão do parceiro. As alterações valem para faturas emitidas a partir de agora; faturas já emitidas mantêm a data de vencimento.",
+      "invalid": "Informe um número inteiro de dias entre 0 e 365.",
+      "partnerDefault": "Padrão do parceiro",
+      "paymentTermsDays": "Prazo de pagamento (dias)",
+      "title": "Prazo de pagamento"
     }
   },
   "partnerBillingSettings": {
     "company": {
+      "addressInherited": "Igual aos dados da empresa",
       "addressLine1": "Endereço - linha 1",
       "addressLine2": "Endereço - linha 2",
+      "addressTitle": "Endereço",
       "city": "Cidade",
       "country": "País",
       "defaultTerms": "Termos e condições padrão",
       "defaultTermsPlaceholder": "Termos de pagamento, avisos legais, condições de garantia etc.",
       "description": "Exibido como vendedor nas cotações e faturas.",
+      "inheritedFromCompanyDetails": "Dados da empresa",
       "name": "Nome da empresa",
       "phone": "Telefone",
       "postal": "CEP",
       "region": "Estado / região",
       "title": "Contato da empresa",
+      "useCompanyAddress": "Usar o endereço da empresa",
       "website": "Site"
     },
     "defaults": {

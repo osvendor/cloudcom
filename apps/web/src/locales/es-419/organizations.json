@@ -88,7 +88,8 @@
         "viewAll": "Ver todas las alertas"
       },
       "lastActivity": "Última actividad {{date}}",
-      "noSummary": "Los totales de resumen no están disponibles en este momento."
+      "noSummary": "Los totales de resumen no están disponibles en este momento.",
+      "archivedNotice": "Los datos de resumen no se muestran para organizaciones archivadas."
     },
     "archived": {
       "banner": "Esta organización está archivada y es de solo lectura. Restáurela para realizar cambios.",
@@ -96,7 +97,26 @@
     },
     "lifecycle": {
       "inaccessible": "Esta organización está {{status}}, por lo que sus datos en vivo no están disponibles. Aún puede verla en la lista de organizaciones.",
+      "unknownTitle": "Organización inactiva",
+      "inaccessibleHistoryOnly": "Esta organización está inactiva, por lo que sus datos en vivo no están disponibles. Su historial de informes aún se puede consultar a continuación.",
+      "genericStatusLabel": "inactiva",
       "backToList": "Volver a organizaciones"
+    },
+    "reportHistory": {
+      "title": "Historial de informes",
+      "loading": "Cargando historial de informes…",
+      "readOnlyNote": "Solo lectura: esta organización está {{status}}. Los informes no se pueden generar, programar ni descargar.",
+      "forbidden": "No tiene acceso al historial de informes de esta organización.",
+      "error": "No se pudo cargar el historial de informes.",
+      "empty": "No se encontraron informes ni ejecuciones de informes.",
+      "definitionsTitle": "Definiciones de informes",
+      "definitionsEmpty": "No hay definiciones de informes.",
+      "runsTitle": "Ejecuciones recientes",
+      "runsEmpty": "No hay ejecuciones de informes.",
+      "lastGenerated": "Generado por última vez el {{date}}",
+      "neverGenerated": "Nunca generado",
+      "rowCount_one": "{{count}} fila",
+      "rowCount_other": "{{count}} filas"
     },
     "unavailable": {
       "title": "No disponible en este espacio de trabajo",

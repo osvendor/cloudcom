@@ -1,5 +1,6 @@
 {
   "titles": {
+    "adminMonitorConversion": "Conversion des alertes héritées",
     "notFound": "Page introuvable",
     "serverError": "Une erreur est survenue",
     "acceptInvite": "Accepter l'invitation",
@@ -14,6 +15,7 @@
     "adminConnectedApps": "Applications connectées (admin)",
     "adminLlmProviderCatalog": "Catalogue des fournisseurs LLM",
     "adminQuarantined": "Appareils en quarantaine",
+    "adminSystem": "Système",
     "adminThirdPartyCatalog": "Catalogue tiers",
     "adminTrustAct": "Action de confiance du partenaire",
     "adminTrustQueue": "File d'attente de confiance du partenaire",
@@ -130,8 +132,6 @@
     "settingsAiUsage": "Utilisation de l’IA",
     "settingsAiScriptAuthoring": "Rédaction de scripts",
     "settingsToolSources": "Sources d'outils",
-    "settingsAlertTemplatesDetail": "Modèle d'alerte",
-    "settingsAlertTemplates": "Modèles d'alerte",
     "settingsApiKeys": "Clés API",
     "settingsBilling": "Paramètres de facturation",
     "settingsCatalog": "Catalogue de produits",
@@ -236,8 +236,33 @@
       "ticketChecklistTemplates": {
         "title": "Modèles de liste de contrôle de tickets",
         "description": "Des listes d'étapes réutilisables que vos techniciens peuvent appliquer à n'importe quel ticket."
+      },
+      "profile": {
+        "title": "Mon profil"
+      },
+      "apiKeys": {
+        "title": "Clés API"
+      },
+      "partnerServicePrincipals": {
+        "title": "Principaux de service"
+      },
+      "alertTemplates": {
+        "title": "Modèles d’alertes"
       }
-    }
+    },
+    "groups": {
+      "account": "Compte et accès",
+      "billing": "Facturation et service desk",
+      "devices": "Appareils et inscription",
+      "data": "Automatisation et données",
+      "ai": "IA",
+      "integrations": "Intégrations"
+    },
+    "search": {
+      "label": "Rechercher des paramètres",
+      "placeholder": "Rechercher des paramètres…"
+    },
+    "noResults": "Aucun paramètre ne correspond à votre recherche."
   },
   "settingsBillingPage": {
     "heading": "Paramètres de facturation",

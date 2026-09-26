@@ -92,6 +92,17 @@
       "cloudcommand_google_oauth_connections",
       "cloudcommand_google_oauth_attempts"
     ],
+    "orgMergePolicies": {
+      "cloudcommand_threecx_connections": { "kind": "leave-for-erasure", "note": "Credentials are bound to the source organization; reconnect explicitly on the surviving organization." },
+      "cloudcommand_microsoft_connections": { "kind": "leave-for-erasure", "note": "Tenant authorization remains bound to the source organization; reconnect explicitly." },
+      "cloudcommand_microsoft_admin_connections": { "kind": "leave-for-erasure", "note": "Enterprise application credentials and tenant authority must not move across organizations." },
+      "cloudcommand_microsoft_admin_consent": { "kind": "leave-for-erasure", "note": "Pending consent is bound to its initiating organization and actor." },
+      "cloudcommand_microsoft_directory_preferences": { "kind": "leave-for-erasure", "note": "Directory user identifiers belong to the source tenant connection." },
+      "cloudcommand_microsoft_directory_layouts": { "kind": "leave-for-erasure", "note": "Saved views remain scoped to the source organization and technician." },
+      "cloudcommand_microsoft_directory_snapshots": { "kind": "leave-for-erasure", "note": "Cached directory data is bound to the source tenant and credential version; regenerate after reconnecting." },
+      "cloudcommand_google_oauth_connections": { "kind": "leave-for-erasure", "note": "Refresh tokens use organization-bound authenticated encryption and require fresh consent." },
+      "cloudcommand_google_oauth_attempts": { "kind": "leave-for-erasure", "note": "PKCE and browser consent state are bound to the source organization." }
+    },
     "deviceCascadeDeleteTables": [],
     "deviceOrgDenormalizedTables": [],
     "nonTenantTables": [],

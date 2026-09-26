@@ -99,6 +99,7 @@
     "name": "Nom",
     "principalDescription": "Description",
     "scopes": "Portées",
+    "noScopes": "Aucune portée accordée",
     "sourceCidrs": "IP ou CIDR sources (une par ligne)",
     "writeScopeRestrictionsRequired": "La portée enrollment-keys:write exige une date d'expiration et au moins une IP ou un CIDR source.",
     "expiresAt": "Expire le",
@@ -329,11 +330,13 @@
     "exportFailed": "Échec de l’exportation",
     "title": "Exportation de comptes facturables",
     "description": "Les entrées et parties en temps facturable sont CSV (jusqu’à 366 jours). Inclut le statut d’approbation.",
+    "columnsNote": "Comprend le type de travail et les minutes incluses au contrat pour chaque saisie de temps.",
     "from": "De",
     "to": "À",
     "allOrganizations": "Toutes les organisations",
     "exporting": "Exporter...",
-    "downloadCsv": "Télécharger CSV"
+    "downloadCsv": "Télécharger CSV",
+    "seeBusinessReports": "Voir les rapports d’affaires"
   },
   "partnerSettingsCard": {
     "title": "Paramètres partenaires",
@@ -517,6 +520,25 @@
       "communications": "Communications",
       "branding": "Image de marque"
     },
+    "aiFeatures": {
+      "anomalies": {
+        "title": "Détection des anomalies",
+        "description": "Détection statistique de comportements inhabituels du CPU, de la mémoire, du disque et du réseau sur les appareils gérés. Il s'agit des valeurs par défaut pour chaque organisation ; une organisation peut les remplacer depuis son propre onglet IA.",
+        "enabled": "Détecter les anomalies",
+        "enabledDescription": "Exécute le détecteur d'anomalies toutes les 10 minutes et affiche les résultats dans l'onglet Anomalies de chaque appareil.",
+        "createAlerts": "Créer des alertes à partir des anomalies",
+        "createAlertsDescription": "Transforme les anomalies confirmées en alertes afin qu'elles atteignent vos itinéraires de notification."
+      },
+      "inheritanceNote": "Les modifications s'appliquent à chaque organisation qui n'a pas défini son propre remplacement.",
+      "saved": "Enregistré",
+      "saveFailed": "Impossible de modifier ce paramètre",
+      "remediation": {
+        "title": "Solutions proposées",
+        "description": "Suggestions de correction générées par l'IA sur la page de détail de l'alerte. C'est la valeur par défaut pour chaque organisation; une organisation peut la remplacer dans son propre onglet IA.",
+        "enabled": "Générer des solutions proposées",
+        "enabledDescription": "Permettre aux techniciens de générer des solutions proposées pour une alerte depuis sa page de détail."
+      }
+    },
     "tabs": {
       "company": {
         "label": "Entreprise",
@@ -567,6 +589,10 @@
         "label": "Fournisseur d'IA",
         "description": "Utilisez votre propre clé Anthropic"
       },
+      "aiFeatures": {
+        "label": "Fonctionnalités IA",
+        "description": "Valeurs par défaut de la détection d'anomalies et des solutions proposées"
+      },
       "branding": {
         "label": "Image de marque",
         "description": "Logo et couleurs"
@@ -578,6 +604,10 @@
       "modules": {
         "label": "Modules",
         "description": "Bureau de service, facturation et topologie activés/désactivés"
+      },
+      "aiApprovals": {
+        "label": "Délai d'approbation IA",
+        "description": "Durée d'attente du clavardage IA pour l'approbation d'une action contrôlée"
       }
     },
     "saved": "Paramètres partenaires enregistrés",
@@ -891,6 +921,7 @@
       "email_only_hint": "Indication courriel uniquement",
       "resolution_note": "Note de résolution",
       "quote_number": "Numéro de soumission",
+      "quote_title": "Titre de la proposition",
       "total": "Total",
       "expiry_date": "Date d'expiration",
       "accept_url": "URL d'acceptation",
@@ -956,6 +987,16 @@
     }
   },
   "m365Mailbox": {
+    "consentNotCompleted": "Consentement non terminé",
+    "consentNotCompletedHint": "La connexion Microsoft pour cette boîte aux lettres n’a pas été terminée à temps; elle ne se connectera donc pas d’elle-même. Relancez le consentement ou déconnectez-la.",
+    "retryConsent": "Relancer le consentement",
+    "redirectUriLabel": "URI de redirection à inscrire dans l’application Microsoft Entra",
+    "redirectUriHint": "Elle doit correspondre exactement, et vous devez ouvrir Breeze avec le même schéma et le même hôte lors de la connexion, sinon la connexion ne peut pas aboutir.",
+    "callbackReason": {
+      "binding_mismatch": "Échec de la connexion à Microsoft 365 : le navigateur est revenu sans son témoin de connexion. Ouvrez Breeze à la même adresse que l’URI de redirection (le schéma et l’hôte doivent correspondre), autorisez les témoins et réessayez.",
+      "invalid_callback": "Échec de la connexion à Microsoft 365 : Microsoft a renvoyé une réponse inattendue. Réessayez la connexion.",
+      "expired": "Échec de la connexion à Microsoft 365 : le lien de connexion a expiré ou a déjà été utilisé. Réessayez la connexion."
+    },
     "connected": "Boîte aux lettres connectée",
     "consentGranted": "Consentement accordé — repérez la boîte aux lettres avec la politique d’accès à l’application ci-dessous, puis retestez",
     "consentAttention": "Le consentement de la boîte aux lettres nécessite l’attention de l’administrateur.",
@@ -984,6 +1025,38 @@
     "displayName": "Nom d’affichage (optionnel)",
     "namePlaceholder": "Soutien",
     "connect": "Connecter"
+  },
+  "gmailMailbox": {
+    "title": "Boîte aux lettres d'assistance Google Workspace",
+    "description": "Connectez une boîte aux lettres Google Workspace pour que les courriels des clients deviennent des tickets. La délégation à l'échelle du domaine est utilisée : aucune modification MX ou de transfert, et aucune redirection OAuth.",
+    "connectHint": "La boîte aux lettres est lue avec la connexion par compte de service Google Workspace de l'organisation sélectionnée, qui détient donc ses identifiants. Pour une boîte aux lettres appartenant au partenaire (comme votre propre help@), choisissez l'organisation dont l'espace Workspace contient la boîte. Saisissez la boîte aux lettres d'assistance partagée pour la connecter.",
+    "status": {
+      "pending_consent": "En attente",
+      "connected": "Connectée",
+      "error": "Besoin d’attention",
+      "reauth_required": "Réauthentification requise",
+      "disabled": "Désactivée"
+    },
+    "reauthRequired": "La relève Gmail est suspendue pour cette boîte aux lettres. Reconnectez-la pour reprendre : le compte de service doit peut-être être réautorisé, sa connexion Google Workspace est peut-être inactive, ou la boîte correspond désormais à un autre compte Google.",
+    "reconnect": "Reconnecter",
+    "reconnectNoOrg": "Cette connexion n'a plus d'organisation et ne peut pas être reconnectée ici.",
+    "disconnect": "Déconnecter",
+    "disconnected": "Boîte aux lettres déconnectée",
+    "disconnectFailed": "Échec de la déconnexion.",
+    "connected": "Boîte aux lettres connectée",
+    "connectFailed": "Impossible de connecter la boîte aux lettres Gmail.",
+    "empty": "Aucune boîte aux lettres Gmail connectée pour l'instant.",
+    "loadError": "Impossible de charger les connexions de boîtes aux lettres Gmail. Actualisez pour réessayer.",
+    "orgsLoadError": "Impossible de charger les organisations. Actualisez pour réessayer.",
+    "organization": "Organisation",
+    "selectOrg": "Sélectionnez une organisation",
+    "address": "Adresse de boîte aux lettres",
+    "addressPlaceholder": "assistance@example.com",
+    "displayName": "Nom d’affichage (optionnel)",
+    "namePlaceholder": "Soutien",
+    "connect": "Connecter",
+    "credentialOrg": "Identifiants : connexion Google Workspace de {{org}}",
+    "credentialOrgUnknown": "une organisation que vous ne pouvez pas voir"
   },
   "orgApprovalSecurityTab": {
     "title": "Sécurité de l’approbation",
@@ -1341,6 +1414,10 @@
         "enableNetworkVisibility": {
           "label": "Visibilité réseau",
           "description": "Affiche dans le portail client l’état du réseau et les actifs découverts en lecture seule."
+        },
+        "enableNetworkAlerts": {
+          "label": "Alertes réseau",
+          "description": "Affiche dans le portail client le nombre d'alertes actives et les tickets ouverts liés aux actifs réseau."
         }
       }
     },
@@ -1660,6 +1737,8 @@
     "maxTurnsPerSession": "Nombre maximal de tours par session",
     "msgsMinPerUser": "Messages par Min par utilisateur",
     "msgsHrPerOrg": "Messages et RH par organisation",
+    "toolRateLimitMultiplier": "Multiplicateur des limites de débit par outil",
+    "toolRateLimitMultiplierHelp": "Augmente chaque limite de débit IA et MCP par outil selon ce facteur (1–10). Ne réduit ni ne supprime jamais une limite.",
     "saveBudget": "Économiser le budget",
     "savedSuccessfully": "Enregistré avec succès",
     "allBudgetSettingsAreManagedByYourPartner": "Tous les réglages budgétaires sont gérés par votre partenaire",
@@ -4021,7 +4100,7 @@
     "enforceSSOOnlyLogin": "Imposer la connexion SSO uniquement",
     "usersMustUseSSOToSignInPasswordLoginWillBeDisabled": "Les utilisateurs doivent utiliser SSO pour se connecter. La connexion par mot de passe sera désactivée.",
     "trustThisProvidersMFA": "Faire confiance au MFA de ce fournisseur",
-    "trustThisProvidersMFAHelperText": "Lorsque votre fournisseur d'identité indique que l'authentification multifacteur a été utilisée (`amr: mfa`), le MFA est considéré comme satisfait dans Breeze. Votre IdP doit inclure la revendication `amr` dans son jeton d'ID — la plupart exigent une activation explicite. Désactivé par défaut.",
+    "trustThisProvidersMFAHelperText": "Lorsque votre fournisseur d'identité indique qu'une authentification multifacteur ou résistante à l'hameçonnage (p. ex. une clé d'accès) a été utilisée (`amr: mfa` / `amr: phr`), le MFA est considéré comme satisfait dans Breeze. Votre IdP doit inclure la revendication `amr` dans son jeton d'ID — la plupart exigent une activation explicite. Désactivé par défaut.",
     "warningSSOEnforcementEnabled": "Avertissement : application obligatoire du SSO activée",
     "usersWillNotBeAbleToSignInWithPasswordsMakeSureYourSSOCo": "Les utilisateurs ne pourront pas se connecter avec des mots de passe. Assurez-vous que votre configuration SSO fonctionne correctement avant d’activer cette option. Envisagez d’avoir au moins un compte administrateur capable de contourner SSO pour un accès d’urgence.",
     "testing": "Test...",
@@ -4645,7 +4724,32 @@
       "externalProcessing": "Autoriser l’analyse IA en bac à sable",
       "externalProcessingDescription": "Permet aux exécutions d’analyse IA d’exécuter du code pour cette organisation dans un bac à sable isolé, sans accès réseau, hébergé dans la région de cette organisation. Désactivé par défaut.",
       "externalProcessingSaved": "Enregistré",
-      "externalProcessingSaveFailed": "Impossible de modifier ce paramètre"
+      "externalProcessingSaveFailed": "Impossible de modifier ce paramètre",
+      "mlFeatures": {
+        "title": "Détection des anomalies",
+        "description": "Détection statistique de comportements inhabituels du CPU, de la mémoire, du disque et du réseau sur les appareils de cette organisation. Laisser vide applique la valeur par défaut du partenaire.",
+        "anomaliesEnabled": "Détecter les anomalies",
+        "anomaliesEnabledDescription": "Exécute le détecteur d'anomalies toutes les 10 minutes et affiche les résultats dans l'onglet Anomalies de chaque appareil.",
+        "createAlerts": "Créer des alertes à partir des anomalies",
+        "createAlertsDescription": "Transforme les anomalies confirmées en alertes afin qu'elles atteignent vos itinéraires de notification.",
+        "inherit": "Hériter",
+        "inheritOn": "Hériter (activé, {{from}})",
+        "inheritOff": "Hériter (désactivé, {{from}})",
+        "fromPartner": "paramètre du partenaire",
+        "fromDefault": "valeur par défaut de la plateforme",
+        "on": "Activé",
+        "off": "Désactivé",
+        "saved": "Enregistré",
+        "saveFailed": "Impossible de modifier ce paramètre",
+        "killSwitch": "La détection des anomalies est désactivée pour toute la plateforme par l'opérateur. Ces paramètres prendront effet lorsqu'elle sera réactivée.",
+        "remediation": {
+          "title": "Solutions proposées",
+          "description": "Suggestions de correction générées par l'IA pour les alertes de cette organisation. Vide signifie que la valeur par défaut du partenaire s'applique.",
+          "enabled": "Générer des solutions proposées",
+          "enabledDescription": "Permettre aux techniciens de générer des solutions proposées pour une alerte depuis sa page de détail.",
+          "killSwitch": "Les solutions proposées sont désactivées pour toute la plateforme par l'opérateur. Ce paramètre prendra effet lorsqu'elles seront réactivées."
+        }
+      }
     },
     "breadcrumbs": {
       "settings": "Paramètres",
@@ -4909,12 +5013,14 @@
     "description": "Importez des organisations et des sites depuis un CSV exporté de votre ancien RMM.",
     "dropzone": "Déposez un fichier CSV ici ou cliquez pour parcourir",
     "dropzoneHint": "Colonnes : organisation (obligatoire), site, ID externe, système externe, fuseau horaire",
+    "docsLink": "Guide d’importation",
     "actions": {
       "close": "Fermer",
       "preview": "Prévisualiser {{count}} lignes",
       "previewing": "Prévisualisation…",
       "import": "Importer {{count}} sélectionnées",
-      "importing": "Import en cours…"
+      "importing": "Import en cours…",
+      "downloadSample": "Télécharger un exemple de CSV"
     },
     "mapping": {
       "title": "Correspondance des colonnes",
@@ -5837,5 +5943,77 @@
   "ticketCategories": {
     "defaultWorkType": "Type de travail par défaut",
     "defaultWorkTypeHelp": "Utilisé lorsque du temps est enregistré pour cette catégorie sans type de travail."
+  },
+  "systemDeprecations": {
+    "title": "Dépréciations",
+    "description": "Retraits d'API connus par cette version de Breeze, et où en est ce déploiement pour chacun. Il s'agit d'un rapport en lecture seule pour les administrateurs de la plateforme; rien n'est configuré ici.",
+    "refresh": "Actualiser",
+    "loading": "Chargement des dépréciations…",
+    "errors": {
+      "load": "Impossible de charger le rapport de dépréciations."
+    },
+    "platformAdmin": {
+      "title": "Accès administrateur de la plateforme requis",
+      "description": "Ce rapport couvre l'ensemble du déploiement; seuls les administrateurs de la plateforme peuvent le consulter."
+    },
+    "manifestError": "Le manifeste des changements majeurs de cette image n'a pu être lu ({{error}}). Les retraits ne peuvent pas être vérifiés.",
+    "historyMissing": "Impossible de déterminer quelles versions ce déploiement a exécutées — tous les retraits en vigueur sont affichés.",
+    "noReleaseVersion": "Cette image ne comporte pas de version de publication; chaque retrait du manifeste est donc affiché comme potentiellement franchi.",
+    "historyReason": "Raison : {{reason}}",
+    "summary": {
+      "imageVersion": "Version en cours d'exécution",
+      "unknownVersion": "Inconnue ({{raw}})",
+      "lastRecorded": "Dernière version enregistrée",
+      "noneRecorded": "Aucune enregistrée",
+      "migrations": "État des migrations",
+      "migrationCounts": "{{applied}} appliquées, {{pending}} en attente",
+      "ledgerMissing": "Registre des migrations non disponible ({{reason}})"
+    },
+    "table": {
+      "heading": "Retraits",
+      "entry": "Entrée",
+      "affected": "Points de terminaison et champs touchés",
+      "replacement": "Remplacement",
+      "deprecatedIn": "Déprécié dans",
+      "removal": "Suppression",
+      "status": "Statut ici",
+      "wholeEndpoint": "Point de terminaison complet",
+      "notBefore": "Pas avant le {{date}}",
+      "empty": "Le manifeste ne répertorie aucun retrait."
+    },
+    "status": {
+      "crossed": "Franchi",
+      "possibly_crossed": "Peut-être franchi",
+      "in_effect": "En vigueur",
+      "upcoming": "À venir"
+    },
+    "milestone": {
+      "deprecation": "dépréciation",
+      "removal": "suppression"
+    },
+    "history": {
+      "heading": "Historique des versions",
+      "firstSeen": "Vu pour la première fois le {{date}}",
+      "none": "Aucune version enregistrée pour ce déploiement."
+    }
+  },
+  "partnerAiApprovals": {
+    "timeoutLabel": "Délai d'approbation interactive",
+    "productDefault": "Valeur par défaut du produit ({{minutes}} minutes)",
+    "range": "Choisissez {{min}}-{{max}} minutes.",
+    "description": "Durée pendant laquelle un tour de clavardage IA en cours attend qu'une personne approuve une action contrôlée (niveau 2/3) avant d'abandonner.",
+    "orgOverrideNote": "Les organisations peuvent remplacer cette valeur depuis leurs propres paramètres IA ; la valeur de l'organisation prévaut si elle est définie.",
+    "notForUnattendedNote": "Ceci n'est pas destiné au travail de nuit ou sans surveillance — le travail de longue durée passe par la file d'approbations, qui a son propre délai d'expiration."
+  },
+  "orgAiApprovalTimeout": {
+    "title": "Délai d'approbation IA",
+    "description": "Durée pendant laquelle un clavardage IA attend qu'une personne approuve une action contrôlée (niveau 2/3) avant d'abandonner. Les organisations peuvent remplacer ici la valeur par défaut du partenaire ; la valeur de l'organisation prévaut si elle est définie.",
+    "fieldLabel": "Délai d'approbation interactive",
+    "inherit": "Hériter",
+    "inheritLabel": "Hériter ({{minutes}} minutes, {{source}})",
+    "sourcePartner": "valeur par défaut du partenaire",
+    "sourceDefault": "valeur par défaut du produit",
+    "range": "Choisissez {{min}}-{{max}} minutes.",
+    "save": "Enregistrer"
   }
 }

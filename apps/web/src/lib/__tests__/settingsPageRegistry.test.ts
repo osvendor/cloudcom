@@ -12,7 +12,9 @@ const SIDEBAR_PATH = join(WEB_SRC, 'components/layout/Sidebar.tsx');
 // The account-menu links (profile/api-keys/partner-service-principals) live in
 // the header dropdown, not the Settings sidebar section. Both are legitimate,
 // pre-existing reachability sources this guard must also recognize.
-const SETTINGS_INDEX_PATH = join(WEB_SRC, 'pages/settings/index.astro');
+// #6220: the index page renders the settings catalogue, so the catalogue is the
+// source of its links.
+const SETTINGS_INDEX_PATH = join(WEB_SRC, 'lib/settingsCatalog.ts');
 const HEADER_PATH = join(WEB_SRC, 'components/layout/Header.tsx');
 
 // Every entry here is a filed, justified exception — not a place to silence a
@@ -24,11 +26,6 @@ const ALLOWLIST: Record<string, string> = {
   // The settings landing page itself — reached by navigating to /settings,
   // not by a link *inside* Sidebar/index/Header (self-referential).
   'index.astro': 'the settings index/landing page itself, not a link target',
-  // Reached from the Alerts feature (AlertTemplateList.tsx breadcrumb/nav), not
-  // from the Settings nav surfaces this guard scans — pre-existing, out of
-  // scope for the billing/ticketing settings consolidation wave.
-  'alert-templates/index.astro': 'reached via the Alerts feature (AlertTemplateList.tsx), not Settings nav',
-  'alert-templates/[id].astro': 'reached via the Alerts feature (AlertTemplateEditor.tsx), not Settings nav',
 };
 
 function walk(dir: string, base = dir): string[] {

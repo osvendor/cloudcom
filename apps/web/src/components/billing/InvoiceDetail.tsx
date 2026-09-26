@@ -32,6 +32,7 @@ import AccountingSyncCard from './AccountingSyncCard';
 import { MarginPanel, MarginToggle, useShowMargin } from './billingUi';
 import { computeChargeNow } from '@breeze/shared';
 import InvoiceLineDevices from './InvoiceLineDevices';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -48,6 +49,7 @@ interface Props {
 
 export default function InvoiceDetail({ detail, onChanged, actionsInHeader = false }: Props) {
   const { t } = useTranslation('billing');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { can } = usePermissions();
   const { invoice, lines } = detail;
   const currency = invoice.currencyCode;
@@ -125,13 +127,13 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
       // An operator must NOT read "No payments recorded" when the fetch actually
       // failed — surface a visible error (with inline retry) and a toast.
       setPaymentsError(true);
-      handleActionError(new Error(res.statusText), t('invoiceDetail.payments.loadFailed'));
+      handleActionError(new Error(res.statusText), stableT('invoiceDetail.payments.loadFailed'));
       return;
     }
     setPaymentsError(false);
     const body = (await res.json()) as { data: InvoicePayment[] };
     setPayments(body.data ?? []);
-  }, [invoice.id, t]);
+  }, [invoice.id, stableT]);
 
   useEffect(() => { void loadPayments(); }, [loadPayments]);
 
@@ -422,6 +424,20 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                     className={`border-t ${l.parentLineId ? 'bg-muted/20 text-xs text-muted-foreground' : ''}`}
                   >
                     <td className={`px-3 py-2 ${l.parentLineId ? 'pl-8' : ''}`}>
+                      {/* sweep F9: Preview/PDF/portal already show the frozen
+                          `ticketLabel` (#6940) via this same `ticketNumber`
+                          API field — the default view was the one surface
+                          still silent about it. */}
+                      {l.ticketNumber && (
+                        <div className="mb-1 text-xs">
+                          <span
+                            data-testid={`invoice-detail-line-ticket-${l.id}`}
+                            className="inline-flex items-center rounded bg-primary/10 px-1.5 py-0.5 font-medium text-primary"
+                          >
+                            {t('invoiceDocument.ticketHeader', { number: l.ticketNumber })}
+                          </span>
+                        </div>
+                      )}
                       <span className={l.parentLineId ? '' : 'font-medium text-foreground'}>
                         {l.parentLineId ? <span aria-hidden="true">↳ </span> : ''}{lineTitle(l)}
                       </span>

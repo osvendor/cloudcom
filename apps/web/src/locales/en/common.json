@@ -68,6 +68,7 @@
     "customFields": "Custom Fields",
     "variables": "Variables",
     "savedFilters": "Saved Filters",
+    "moreSettings": "More settings",
     "users": "Users",
     "roles": "Roles",
     "sso": "SSO",
@@ -98,7 +99,9 @@
     "serviceManagement": "Service Management",
     "ticketing": "Ticketing",
     "deliverableTemplates": "Deliverable Templates",
-    "securityScans": "IOC Scans"
+    "securityScans": "IOC Scans",
+    "system": "System",
+    "monitorConversion": "Monitor Conversion"
   },
   "documentTitles": {
     "dashboard": "Dashboard",
@@ -218,7 +221,7 @@
     "mcp": {
       "connecting": "Connecting an AI agent?",
       "title": "Direct your AI agent here",
-      "description": "Paste this URL into your MCP client (Claude.ai, ChatGPT, Cursor, …). You'll be sent back here to authorize the connection via OAuth."
+      "description": "Paste this URL into your MCP client (Claude.ai, ChatGPT, Cursor, …). You'll be sent back here to authorize the connection via OAuth. Prefer an API key instead? Send an X-API-Key header with ai:read/ai:write scope."
     },
     "progress": {
       "count": "{{current}} of {{total}}",
@@ -1470,6 +1473,12 @@
           "editTitle": "Edit Webhook"
         },
         "subtitle": "Deliver events to external systems.",
+        "success": {
+          "created": "Webhook created",
+          "disabled": "Webhook disabled",
+          "enabled": "Webhook enabled",
+          "updated": "Webhook updated"
+        },
         "title": "Webhooks"
       }
     },
@@ -2445,7 +2454,7 @@
         },
         "title": "Suggested Fixes",
         "refresh": "Refresh suggested fixes",
-        "disabledTitle": "Suggested fixes are disabled for this organization",
+        "disabledTitle": "Suggested fixes are off for this organization. Turn them on in Settings → Partner → AI Features, or for one organization on its AI tab.",
         "suggestionsDisabled": "Suggestions disabled",
         "generate": "Generate",
         "empty": "No suggested fixes yet.",

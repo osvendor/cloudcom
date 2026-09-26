@@ -1,5 +1,6 @@
 {
   "titles": {
+    "adminMonitorConversion": "Conversione avvisi legacy",
     "notFound": "Pagina non trovata",
     "serverError": "Qualcosa è andato storto",
     "acceptInvite": "Accetta invito",
@@ -14,6 +15,7 @@
     "adminConnectedApps": "App connesse (admin)",
     "adminLlmProviderCatalog": "Catalogo dei fornitori LLM",
     "adminQuarantined": "Dispositivi in quarantena",
+    "adminSystem": "Sistema",
     "adminThirdPartyCatalog": "Catalogo di terze parti",
     "adminTrustAct": "Azione di attendibilità del partner",
     "adminTrustQueue": "Coda di attendibilità del partner",
@@ -130,8 +132,6 @@
     "settingsAiUsage": "Utilizzo AI",
     "settingsAiScriptAuthoring": "Creazione di script",
     "settingsToolSources": "Fonti degli strumenti",
-    "settingsAlertTemplatesDetail": "Modello di avviso",
-    "settingsAlertTemplates": "Modelli di avviso",
     "settingsApiKeys": "Chiavi API",
     "settingsBilling": "Impostazioni di fatturazione",
     "settingsCatalog": "Catalogo prodotti",
@@ -236,8 +236,33 @@
       "ticketChecklistTemplates": {
         "title": "Modelli di checklist per i ticket",
         "description": "Elenchi di passaggi riutilizzabili che i tuoi tecnici possono applicare a qualsiasi ticket."
+      },
+      "profile": {
+        "title": "Il mio profilo"
+      },
+      "apiKeys": {
+        "title": "Chiavi API"
+      },
+      "partnerServicePrincipals": {
+        "title": "Entità servizio"
+      },
+      "alertTemplates": {
+        "title": "Modelli di avviso"
       }
-    }
+    },
+    "groups": {
+      "account": "Account e accesso",
+      "billing": "Fatturazione e service desk",
+      "devices": "Dispositivi e registrazione",
+      "data": "Automazione e dati",
+      "ai": "IA",
+      "integrations": "Integrazioni"
+    },
+    "search": {
+      "label": "Cerca impostazioni",
+      "placeholder": "Cerca impostazioni…"
+    },
+    "noResults": "Nessuna impostazione corrisponde alla ricerca."
   },
   "settingsBillingPage": {
     "heading": "Impostazioni di fatturazione",

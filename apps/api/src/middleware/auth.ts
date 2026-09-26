@@ -3,6 +3,7 @@ import { HTTPException } from 'hono/http-exception';
 import { verifyToken, TokenPayload } from '../services/jwt';
 import { getBoundMobileDeviceBlock, mobileDeviceBlockedResponse } from './mobileDeviceBlocked';
 import { getUserPermissions, hasPermission, canAccessOrg, canAccessSite, UserPermissions } from '../services/permissions';
+import { normalizeSiteAllowlist } from '../services/siteAllowlist';
 import { isTokenIssuedBeforePasswordChange, isUserTokenRevoked } from '../services/tokenRevocation';
 import { db, runOutsideDbContext, withDbAccessContext, withSystemDbAccessContext, type DbAccessContext, type DbAccessScope } from '../db';
 import { users, partnerUsers, organizations } from '../db/schema';
@@ -13,10 +14,16 @@ import type { PartnerTrustState } from '../db/schema/orgs';
 import { ENABLE_2FA } from '../routes/auth/schemas';
 import { assertActiveTenantContext, TenantInactiveError } from '../services/tenantStatus';
 import { writeAuditEvent } from '../services/auditEvents';
-import { withSentryRequestScope } from '../services/sentry';
+import { captureException, withSentryRequestScope } from '../services/sentry';
 import { getEffectiveMfaPolicy } from '../services/mfaPolicy';
 import { ipAllowlistGuard } from './ipAllowlistGuard';
 import { isSelfManagedDbContextRoute } from './selfManagedDbContextRoutes';
+import { isReportHistoryReadRoute } from './reportHistoryRoutes';
+import {
+  computeReportHistoryReach,
+  EMPTY_REPORT_HISTORY_REACH,
+  type ReportHistoryReach,
+} from '../services/reportHistoryAccess';
 
 /**
  * The transports/actors that can produce an AuthContext.
@@ -152,6 +159,21 @@ export interface AuthContext {
   partnerOrgAccess?: 'all' | 'selected' | 'none' | null;
 
   /**
+   * #6771. The report-history capability: the caller's OWN out-of-service
+   * orgs (suspended / churned / offboarding / archived) whose report
+   * definitions and run metadata it may READ, with its live scope in each.
+   * Deliberately NOT part of `accessibleOrgIds` / `canAccessOrg` /
+   * `orgCondition` — those stay active/trial-only for every route.
+   *
+   * Set ONLY by `authMiddleware`, ONLY for partner-scope requests to the
+   * report-history GET routes (`isReportHistoryReadRoute`); undefined
+   * everywhere else. Consume it only through `services/reportHistoryAccess.ts`
+   * and the history branches of `routes/reports/helpers.ts`, for the
+   * 'read_history' action.
+   */
+  reportHistory?: ReportHistoryReach;
+
+  /**
    * Helper to get the org filter condition for any table.
    * Returns undefined for system scope (no filter needed).
    *
@@ -232,10 +254,12 @@ declare module 'hono' {
 export function siteAccessCheck(
   allowedSiteIds?: string[]
 ): (siteId: string | null | undefined) => boolean {
+  // A malformed (non-array, e.g. null) allowlist denies every site (#6790).
+  const allowed = normalizeSiteAllowlist(allowedSiteIds);
   return (siteId) => {
-    if (!allowedSiteIds) return true;
+    if (allowed === undefined) return true;
     if (!siteId) return false;
-    return allowedSiteIds.includes(siteId);
+    return allowed.includes(siteId);
   };
 }
 
@@ -246,10 +270,20 @@ export function siteAccessCheck(
  *
  * Path is the API path *after* the `/api/v1` mount, e.g. `/auth/mfa/setup`.
  */
-export function isMfaEnrollmentExemptPath(path: string): boolean {
+export function isMfaEnrollmentExemptPath(path: string, method?: string): boolean {
   // Strip the /api/v1 prefix if present so the check works whether Hono
   // gives us the absolute path or a sub-app path.
   const rel = path.startsWith('/api/v1') ? path.slice('/api/v1'.length) : path;
+
+  // READ of the caller's own partner status (#6627). The account-inactive
+  // screen's only call; partnerGuard already skips it so a pending/suspended
+  // partner can learn its status. Without this a pending hosted partner whose
+  // role forces MFA got 428 here, the inactive screen had nothing to render,
+  // and the user bounced /account/inactive → / → 403 PARTNER_INACTIVE →
+  // /account/inactive forever. It returns only id/name/slug/status and the
+  // operator-set status CTA — no tenant data. Exact path and GET/HEAD only:
+  // any write, sub-path or sibling /partner route stays behind the gate.
+  if (rel === '/partner/me' && (method === 'GET' || method === 'HEAD')) return true;
 
   if (rel === '/auth/logout') return true;
   // The CF-Access-fronted twin of /auth/logout: it durably revokes refresh
@@ -480,6 +514,8 @@ export function buildDbAccessContext(args: {
   accessibleOrgIds: string[] | null;
   partnerId: string | null;
   userId: string | null;
+  /** #6771 — see `DbAccessContext.reportHistoryOrgIds`. Omitted = none. */
+  reportHistoryOrgIds?: readonly string[];
 }): DbAccessContext {
   return {
     scope: args.scope,
@@ -488,6 +524,9 @@ export function buildDbAccessContext(args: {
     accessiblePartnerIds: computeAccessiblePartnerIds(args.scope, args.partnerId),
     userId: args.userId,
     currentPartnerId: args.partnerId ?? null,
+    ...(args.scope === 'partner' && args.reportHistoryOrgIds && args.reportHistoryOrgIds.length > 0
+      ? { reportHistoryOrgIds: args.reportHistoryOrgIds }
+      : {}),
   };
 }
 
@@ -512,6 +551,9 @@ export function dbAccessContextFromAuth(auth: AuthContext): DbAccessContext {
     // AI agents carry a synthetic user record for audit attribution only. It
     // must never reach breeze.user_id or satisfy Shape-6 user-scoped RLS.
     userId: auth.principal?.kind === 'ai_agent' ? null : auth.user?.id ?? null,
+    // #6771: re-entering the request's context re-enters its report-history
+    // grant too (only ever set on the report-history GET routes).
+    reportHistoryOrgIds: auth.reportHistory?.orgIds,
   });
 }
 
@@ -678,7 +720,7 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
   // getEffectiveOrgSettings query, and hot polled exempt routes
   // (/users/me, /auth/mfa/*) must not pay that DB cost on every request
   // (the US DB has a ~25-connection ceiling).
-  if (ENABLE_2FA && !user.mfaEnabled && !isMfaEnrollmentExemptPath(c.req.path)) {
+  if (ENABLE_2FA && !user.mfaEnabled && !isMfaEnrollmentExemptPath(c.req.path, c.req.method)) {
     const policy = await getEffectiveMfaPolicy({
       scope: payload.scope,
       userId: user.id,
@@ -754,6 +796,33 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
   }
   const canAccessSite = siteAccessCheck(allowedSiteIds);
 
+  // #6771 — the report-history capability, computed ONLY for a partner-scope
+  // request to one of the report-history GET routes. Like
+  // computeAccessibleOrgIds it reads under its own short system transaction
+  // here, BEFORE the request transaction opens, so the history routes never
+  // need a system escape later. It never touches `accessibleOrgIds`.
+  // A failure degrades to "no history" (fail closed) rather than failing a
+  // request that may only be listing active orgs — but it is never silent.
+  let reportHistory: ReportHistoryReach | undefined;
+  if (
+    payload.scope === 'partner'
+    && payload.partnerId
+    && partnerOrgAccess !== null
+    && isReportHistoryReadRoute(c.req.method, c.req.path)
+  ) {
+    try {
+      reportHistory = await computeReportHistoryReach({ partnerId: payload.partnerId, userId: user.id });
+    } catch (err) {
+      console.error('[authMiddleware] report-history reach lookup failed; serving no history', {
+        userId: user.id,
+        partnerId: payload.partnerId,
+        err,
+      });
+      captureException(err);
+      reportHistory = EMPTY_REPORT_HISTORY_REACH;
+    }
+  }
+
   c.set('auth', {
     // The interactive session JWT path — the one place a real human at a
     // browser produces an AuthContext.
@@ -773,7 +842,8 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
     orgCondition,
     canAccessOrg,
     allowedSiteIds,
-    canAccessSite
+    canAccessSite,
+    ...(reportHistory ? { reportHistory } : {}),
   });
 
   // The return value matters: ipAllowlistGuard returns its deny/error
@@ -806,7 +876,8 @@ export async function authMiddleware(c: Context, next: Next): Promise<void | Res
         orgId: payload.orgId,
         accessibleOrgIds,
         partnerId: payload.partnerId,
-        userId: user.id
+        userId: user.id,
+        reportHistoryOrgIds: reportHistory?.orgIds,
       }),
       next
     );

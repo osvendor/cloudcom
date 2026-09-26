@@ -133,7 +133,8 @@
     "thisOrganizationOnlyHasOneSite": "Esta organização tem apenas um site. Adicione outros sites em Configurações → Organizações para permitir movimentações.",
     "current": "(atual)",
     "cancel": "Cancelar",
-    "moving": "Movendo..."
+    "moving": "Movendo...",
+    "toADifferentSite": "para outro site."
   },
   "createGroupModal": {
     "failedToCreateGroup": "Falha ao criar o grupo",
@@ -334,6 +335,7 @@
     "metricAnomalies": "Anomalias de métricas",
     "anomalyDetectionIsDisabledForThis": "A detecção de anomalias está desativada para esta organização.",
     "anomalyDetectionDisabled": "Detecção de anomalias desativada",
+    "anomalyDetectionDisabledHint": "Ative em <orgLink>configurações da organização</orgLink> → IA.",
     "showingTheLinkedAnomalyAndRecent": "Exibindo a anomalia vinculada e o histórico recente de anomalias",
     "openSignalsDetectedFromMetricRollups": "Sinais abertos detectados nas agregações de métricas",
     "refreshAnomalies": "Atualizar anomalias",
@@ -350,7 +352,51 @@
     "confidence": "Confiança",
     "dismiss": "Descartar",
     "resolve": "Resolver",
-    "promote": "Promover"
+    "promote": "Promover",
+    "filterOpen": "Abertas",
+    "filterRecentlyClosed": "Fechadas recentemente",
+    "filterAll": "Todas",
+    "showRecentlyClosed": "Mostrar fechadas recentemente",
+    "couldNotUpdateEpisode": "Não foi possível atualizar a anomalia",
+    "episodeDismissed": "Descartada por 7 dias",
+    "episodeResolved": "Anomalia resolvida",
+    "episodePromoted": "Anomalia promovida a alerta",
+    "snoozeStopped": "Silenciamento interrompido",
+    "dismissFor7Days": "Descartar por 7 dias",
+    "promoteToAlert": "Promover a alerta",
+    "stopSnoozing": "Interromper silenciamento",
+    "ongoingSince": "Em andamento desde {{when}}",
+    "recurrenceNth": "{{nth}} vez em 7 dias",
+    "dismissedSnoozedUntil": "Descartada · silenciada até {{when}}",
+    "detectionsCount": "{{count}} detecções",
+    "closeReason": {
+      "cleared": "resolvida",
+      "expiredOffline": "expirada: dispositivo não visto",
+      "expiredNoData": "expirada: sem dados para esta métrica",
+      "expiredOfflineSince": "expirada: dispositivo não visto desde {{when}}",
+      "detectionOff": "fechada: detecção desativada",
+      "user": "resolvida",
+      "userDismissed": "descartada",
+      "snoozed": "silenciada"
+    },
+    "processDetailNotAvailable": "Detalhe de processo não disponível para esta métrica.",
+    "topByAtPeak": "Principais por {{dimension}} no pico: {{list}}",
+    "sentence": {
+      "spike": "{{metric}} ficou em {{range}} por {{duration}}, normalmente {{baseline}}.",
+      "processMax": "Um processo atingiu {{value}}, normalmente {{baseline}}.",
+      "processSum": "Os principais processos juntos usaram {{value}}, normalmente {{baseline}}.",
+      "drop": "{{metric}} caiu para {{value}} por {{duration}}, normalmente {{baseline}}.",
+      "growth": "{{metric}} cresceu de {{from}} para {{to}} em {{duration}}."
+    },
+    "membersColumns": {
+      "window": "Janela",
+      "metric": "Métrica",
+      "score": "Pontuação"
+    },
+    "membersTruncated": "Exibindo as primeiras {{count}} detecções.",
+    "failedToLoadDetections": "Não foi possível carregar as detecções",
+    "legacyDetectionNote": "Esta detecção é anterior ao agrupamento por episódios.",
+    "v1ShadowPerEpisodeNote": "Este episódio também está sendo avaliado pelo modelo sombra v1 para comparação."
   },
   "deviceBillingCard": {
     "title": "Faturamento",
@@ -800,6 +846,7 @@
     }
   },
   "deviceFilesystemTab": {
+    "deviceIsOfflineScansRequireAConnectedAgent": "O dispositivo está offline. As varreduras exigem um agente conectado.",
     "resultPartial": "Parcialmente concluído",
     "resultSkippedLinks": "Links ignorados: {{count}}",
     "errorAgentUpdateRequired": "Atualize o agente para a versão {{minAgentVersion}} ou posterior para executar a limpeza.",
@@ -908,7 +955,10 @@
     "historyKindFiles": "Limpeza de arquivos",
     "historyKindSystem": "Limpeza do sistema",
     "historyReclaimed": "{{size}} recuperados",
-    "historyCandidates": "{{count}} candidatos",
+    "historyCandidates_one": "{{count}} candidato",
+    "historyCandidates_other": "{{count}} candidatos",
+    "historyActions_one": "{{count}} ação",
+    "historyActions_other": "{{count}} ações",
     "status": {
       "previewed": "Prévia",
       "running": "Em execução",
@@ -1046,6 +1096,7 @@
     "linkSpeed": "Velocidade do link"
   },
   "deviceInfoTab": {
+    "updateOfferWithheld": "As ofertas de atualização estão retidas para este dispositivo (desde {{since}}): não é possível confirmar que a build do agente aceita a edição servida por este servidor, então ele permanece na versão atual. Recupere-o com um instalador da edição servida ou uma versão do agente que informe sua edição.",
     "gpu": "GPU",
     "text": "—",
     "failedToFetchDeviceDetails": "Falha ao buscar os detalhes do dispositivo",
@@ -1120,6 +1171,7 @@
     "agent": "Agente",
     "agentVersion": "Versão do agente",
     "watchdogVersion": "Versão do watchdog",
+    "helperVersion": "Versão do assistente",
     "status": "Status",
     "lastSeen": "Visto por último",
     "enrolled": "Registrado",
@@ -1327,6 +1379,7 @@
     "moveUp": "Mover para cima",
     "moveDown": "Mover para baixo",
     "hidden": "Ocultos",
+    "customFields": "Campos personalizados",
     "resetToDefaults": "Redefinir para padrões",
     "selected": "selecionado",
     "bulkActions": "Ações em massa",
@@ -1384,6 +1437,8 @@
       "unifi": "UniFi",
       "manual": "Manual"
     },
+    "updateWithheld": "Atualizações retidas",
+    "updateWithheldTooltip": "O servidor não está oferecendo atualizações a este dispositivo porque não é possível confirmar que a build do agente aceita a edição servida. Ele permanece na versão atual até ser recuperado.",
     "agentVersionRelation": {
       "equalTooltip": "Corresponde à versão efetiva {{version}}",
       "aheadTooltip": "À frente do pin {{version}}",
@@ -2657,7 +2712,9 @@
           "networkGear": "Equipamentos de rede",
           "peripherals": "Periféricos",
           "other": "Outros"
-        }
+        },
+        "site": "Local",
+        "changeSite": "Alterar local…"
       },
       "monitoring": {
         "description": "Configure a coleta SNMP e as verificações de rede.",
@@ -2769,7 +2826,12 @@
         "checkCreated": "Verificação de rede adicionada",
         "checkCreateFailed": "Não foi possível adicionar a verificação de rede",
         "checkRemoved": "Verificação de rede removida",
-        "checkRemoveFailed": "Não foi possível remover a verificação de rede"
+        "checkRemoveFailed": "Não foi possível remover a verificação de rede",
+        "siteChanged": "Movido para {{site}}.",
+        "siteChangeFailed": "Não foi possível mover o ativo para o novo site",
+        "siteChangedUnlinked": "O vínculo com o dispositivo com agente foi removido porque esse dispositivo está em outro site.",
+        "siteChangedPolicies_one": "{{count}} política de monitoramento de topologia foi desativada.",
+        "siteChangedPolicies_other": "{{count}} políticas de monitoramento de topologia foram desativadas."
       }
     },
     "header": {
@@ -3357,5 +3419,57 @@
       "created": "Ativo de rede criado",
       "createFailed": "Falha ao criar o ativo de rede"
     }
+  },
+  "hardwareHealth": {
+    "title": "Armazenamento e RAID",
+    "hardware": "Equipamento",
+    "ok": "Saudável",
+    "warning": "Aviso",
+    "critical": "Crítico",
+    "unknown": "Desconhecido",
+    "loading": "Carregando integridade do hardware…",
+    "error": "Não foi possível carregar a integridade do hardware.",
+    "retry": "Tentar novamente",
+    "noReport": "Nenhum relatório de hardware recebido ainda.",
+    "noTools": "Nenhuma ferramenta de RAID ou discos detectada — verificadas: {{sources}}",
+    "disabled": "O monitoramento de hardware está desativado pela política {{policy}}",
+    "collected": "Coletado {{time}}",
+    "notSeen": "Não visto desde {{time}}",
+    "predictive": "Falha preditiva",
+    "virtualDisks": "Discos virtuais",
+    "physicalDisks": "Discos físicos",
+    "osDisks": "Discos visíveis ao SO",
+    "backed": "Baseado em disco virtual RAID",
+    "enclosures": "Gabinetes: {{total}}",
+    "identity": "Modelo / série / firmware",
+    "diskIdentity": "Slot / modelo / série / mídia / interface",
+    "size": "Tamanho",
+    "state": "Estado",
+    "telemetry": "Temperatura / erros de mídia / outros erros / horas ligado",
+    "progress": "Progresso de {{name}}",
+    "sources": "Fontes",
+    "unavailable": "Não instalado",
+    "failed": "Falhando: {{error}}",
+    "backingOff": "Em espera até {{time}}",
+    "superseded": "Substituído por {{winner}}",
+    "sourceSuperseded": "Substituído",
+    "sourceDisabled": "Desativado",
+    "partial": "Relatório parcial",
+    "docs": "Guia de instalação",
+    "events": "Eventos de hardware",
+    "noEvents": "Nenhum evento de hardware registrado.",
+    "noComponents": "Nenhum componente informado. Verifique as fontes.",
+    "all": "Todos os estados de hardware",
+    "managementController": "Controlador de gerenciamento",
+    "bmcVendor": "Fabricante",
+    "bmcFirmware": "Versão do firmware",
+    "bmcIp": "Endereço IP",
+    "bmcMac": "Endereço MAC",
+    "bmcOtherSite": "Controlador de gerenciamento encontrado no site {{site}}",
+    "bmcObserved": "Último relatório: {{time}}; coleta diária.",
+    "bmcHost": "Controlador de gerenciamento de {{name}}",
+    "bmcAgentReport": "— informado pelo agente do host",
+    "bmcAssociation": "Este controlador de gerenciamento está associado ao host e continua sendo um dispositivo de rede separado.",
+    "bmcConfirmUnlink": "Remover a associação do controlador de gerenciamento? A vinculação automática permanece desativada para este ativo até que você o vincule novamente."
   }
 }

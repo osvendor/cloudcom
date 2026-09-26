@@ -33,6 +33,8 @@ import {
   partnerWideListTarget,
   systemPartnerWideListArm,
   PORTAL_SELF_SERVICE_REPORT,
+  REPORT_TENANT_INACTIVE,
+  resolveOrgReportAuthority,
 } from './helpers';
 import { downloadQuerySchema, listRunsSchema } from './schemas';
 // Execution plane W05 (spec §6.3) — attach an analysis artifact by reference.
@@ -90,7 +92,10 @@ runsRoutes.post(
 
     // Ruling P8b: a type whose read permissions the caller lacks is hidden by
     // the loader, so generate-by-id on it answers 404 (not the 403 below).
-    const report = await getReportWithOrgCheck(reportId, auth, permissions);
+    // #6699 decision B: loaded as 'read_history' so an out-of-service owner
+    // gets the explicit tenant_inactive 403 below; the live 'read' resolution
+    // below is what refuses it.
+    const report = await getReportWithOrgCheck(reportId, auth, permissions, 'read_history');
     if (!report) {
       return c.json({ error: 'Report not found' }, 404);
     }
@@ -140,6 +145,9 @@ runsRoutes.post(
     const liveResult = owner.partnerId !== undefined
       ? await resolveRequestPartnerReportAuthority(auth, owner.partnerId, 'read')
       : await resolveRequestReportAuthority(auth, owner.orgId, 'read');
+    if (!liveResult.ok && liveResult.reason === 'tenant_inactive') {
+      return c.json(REPORT_TENANT_INACTIVE, 403);
+    }
     if (!liveResult.ok || liveResult.authority.scope.kind === 'legacy_unscoped') {
       return c.json({ error: 'Access to report scope denied' }, 403);
     }
@@ -313,7 +321,12 @@ runsRoutes.get(
       if (!auth.orgId) {
         return c.json({ error: 'Organization context required' }, 403);
       }
-      const result = await resolveRequestReportAuthority(auth, auth.orgId, 'read');
+      // #6771: an org token may only name its own org.
+      if (query.orgId && query.orgId !== auth.orgId) {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+      // #6699 decision B: listing runs is read-only history.
+      const result = await resolveRequestReportAuthority(auth, auth.orgId, 'read_history');
       if (!result.ok || result.authority.scope.kind === 'legacy_unscoped') {
         return c.json({ data: [], pagination: { page, limit, total: 0 } });
       }
@@ -325,12 +338,23 @@ runsRoutes.get(
         reportRuns,
         result.authority.scope,
       );
+    } else if (auth.scope === 'partner' && query.orgId) {
+      // #6771: a single-org run listing — the ONLY way a partner lists an
+      // out-of-service org's runs (served from the verified report-history
+      // reach by resolveOrgReportAuthority; the unfiltered listing below stays
+      // active-only). Org-owned runs only, like GET /reports?orgId=.
+      const result = await resolveOrgReportAuthority(auth, query.orgId, 'read_history');
+      if (!result.ok || result.authority.scope.kind === 'legacy_unscoped') {
+        return c.json({ error: 'Access to this organization denied' }, 403);
+      }
+      conditions.push(eq(reports.orgId, query.orgId));
+      runScopePredicate = reportRunScopeSqlPredicate(reportRuns, result.authority.scope);
     } else if (auth.scope === 'partner') {
       const orgIds = auth.accessibleOrgIds ?? [];
       const authorityMap = await resolveRequestReportAuthorityMap(
         auth,
         orgIds,
-        'read',
+        'read_history',
       );
       const scopes: LiveSiteScopeV1[] = [];
       for (const result of authorityMap.values()) {
@@ -357,6 +381,10 @@ runsRoutes.get(
         // exactly the pre-W01 three-argument call.
         ...(partnerWide ? [partnerWide] : []),
       );
+    } else if (query.orgId) {
+      // System scope, single org (#6771 parity with GET /reports?orgId=).
+      conditions.push(eq(reports.orgId, query.orgId));
+      runScopePredicate = unrestrictedReportRunScopeSqlPredicate(reportRuns);
     } else {
       // System scope. #3198 W02 (addendum B7, ruling P9): partner-owned runs
       // with a well-formed partner_wide envelope list too (the run carries its
@@ -550,7 +578,8 @@ runsRoutes.get(
     const access = await getReportRunWithOrgCheck(
       runId,
       auth,
-      'read',
+      // #6699 decision B: run detail/result metadata is read-only history.
+      'read_history',
       c.get('permissions') as UserPermissions | undefined,
     );
     if (!access) {

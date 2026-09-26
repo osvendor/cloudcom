@@ -29,10 +29,9 @@ import { DeviceClassSegment } from './DeviceClassSegment';
 import {
   filterDevicesByClass,
   countDevicesByClass,
-  readDeviceClassFromHash,
-  writeDeviceClassToHash,
   type DeviceClassFilter,
 } from './deviceClassFilter';
+import { useDeviceClassFilter } from './useDeviceClassFilter';
 import { fetchWithAuth, handleSessionExpired } from '../../stores/auth';
 import { runAction } from '../../lib/runAction';
 import { fetchAllDevices, fetchAllNetworkDevices, fetchAllManualAssets } from '../../lib/devicesFetch';
@@ -62,6 +61,7 @@ import { asList } from '@/lib/asList';
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { useStableT } from '@/lib/i18n/useStableT';
 
 // vm_host member role (#2308): unknown values degrade to "ungrouped" (null) by
 // design — a wrong nesting would be worse than none — but the degradation must
@@ -265,6 +265,7 @@ function AddAssetMenu({
 
 export default function DevicesPage() {
   const { t } = useTranslation('devices');
+  const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   // Org scope is shown by the always-visible top-bar switcher (scope pill +
   // org picker); the page header no longer repeats it. orgStoreOrgs is still
   // used to name orgs in the run-script confirm dialog.
@@ -385,20 +386,26 @@ export default function DevicesPage() {
   // v2 chip bar seeds its filter from the URL hash so a filtered view is
   // shareable; the legacy DeviceFilterBar owns its own state and ignores it.
   const [advancedFilter, setAdvancedFilter] = useHashState<FilterConditionGroup | null>(null, (h) => decodeFilterFromHash(h) ?? undefined);
-  // [ All | Agent | Network ] class segment (#1424). Seeded from the hash so a
-  // chosen class is shareable; a pure client-side narrowing of the merged list.
+  // [ All | Agent | Network ] class segment (#1424). Hash-seeded so a chosen
+  // class is shareable; with no hash key it opens on the user's last choice,
+  // else Agent (#5874). See useDeviceClassFilter for why it isn't useHashState.
   // Only meaningful when the network arm is enabled (otherwise the list is
   // agent-only and the segment is hidden).
-  const [deviceClassFilter, setDeviceClassFilter] = useHashState<DeviceClassFilter>('all', (h) => readDeviceClassFromHash(h));
-  const handleDeviceClassChange = useCallback((next: DeviceClassFilter) => {
-    setDeviceClassFilter(next);
-    writeDeviceClassToHash(next);
-  }, []);
+  const [deviceClassFilter, handleDeviceClassChange] = useDeviceClassFilter();
   // Inline ("instant") client-side filters — shared between DeviceFilterToolbar
   // (the controls) and DeviceList (the filtering) so each dimension has a single
   // source of truth. This is the hybrid model's client half; the group above is
   // its server half.
   const [listFilters, setListFilters] = useState<ListFilters>(DEFAULT_LIST_FILTERS);
+  // Server-side hardware health rollup filter (#6854 W04). Not persisted to
+  // the URL hash — this is a fleet-wide server predicate, not view state.
+  const [hardwareHealth, setHardwareHealth] = useState<'' | 'warning' | 'critical' | 'unknown'>('');
+  // Bumped on every fetchDevices invocation and on unmount, so a late-landing
+  // fetch started before a filter change (e.g. the background refresh timer
+  // racing a hardwareHealth edit) can detect it is stale and skip its
+  // setState calls rather than clobbering a newer, more-filtered result.
+  const deviceFetchGeneration = useRef(0);
+  useEffect(() => () => { deviceFetchGeneration.current += 1; }, []);
   const filtersV2 = typeof window !== 'undefined' ? isFiltersV2Enabled() : false;
   // #3205 W06: a coverage-notice deep link pins the org in the hash. Adoption is a
   // LAYOUT effect, and its position above useAdvancedFilterIds is load-bearing:
@@ -558,9 +565,14 @@ export default function DevicesPage() {
   // The merged list narrowed by class only — what the table receives.
   // DeviceList applies the shared predicate itself (it owns paging), while the
   // grid below applies it here; both start from the same class-narrowed set.
+  // The segment only renders when the list carries a non-agent arm. When it is
+  // hidden, a remembered/deep-linked Network or Manual choice would empty the
+  // list with no control to undo it, so the class filter stands down.
+  const showDeviceClassSegment = ENABLE_NETWORK_DEVICES_IN_LIST || deviceClassCounts.manual > 0;
+  const effectiveDeviceClass: DeviceClassFilter = showDeviceClassSegment ? deviceClassFilter : 'all';
   const classFilteredDevices = useMemo(
-    () => filterDevicesByClass(devices, deviceClassFilter),
-    [devices, deviceClassFilter]
+    () => filterDevicesByClass(devices, effectiveDeviceClass),
+    [devices, effectiveDeviceClass]
   );
   // Non-agent rows (network OR manual, #4622) the active filters hide only
   // because they ask about agent-only things (filter fields like
@@ -623,6 +635,8 @@ export default function DevicesPage() {
 
   const fetchDevices = useCallback(async (signal?: AbortSignal, opts?: { background?: boolean }) => {
     const background = opts?.background === true;
+    const generation = ++deviceFetchGeneration.current;
+    const isCurrentDeviceFetch = () => generation === deviceFetchGeneration.current && !signal?.aborted;
     try {
       if (background) setRefreshing(true);
       else setLoading(true);
@@ -642,6 +656,7 @@ export default function DevicesPage() {
       const [devicesResult, networkResult, manualResult, orgsResponse, sitesResult, groupsResponse] = await Promise.all([
         fetchAllDevices({
           includeDecommissioned: true,
+          hardwareHealth: hardwareHealth || undefined,
           signal,
           // Surface the silent-cap case (#778 review). Without this, hitting
           // the safety ceiling would render an incomplete device list and
@@ -649,7 +664,7 @@ export default function DevicesPage() {
           onTruncated: ({ actualCount }) => {
             showToast({
               type: 'error',
-              message: t('devicesPage.toasts.listTruncated', { count: actualCount }),
+              message: stableT('devicesPage.toasts.listTruncated', { count: actualCount }),
               duration: 8000
             });
           }
@@ -714,7 +729,7 @@ export default function DevicesPage() {
 
         return {
           id: d.id as string,
-          hostname: (d.hostname ?? t('devicesPage.unknownDevice')) as string,
+          hostname: (d.hostname ?? stableT('devicesPage.unknownDevice')) as string,
           displayName: typeof d.displayName === 'string' ? d.displayName : undefined,
           os: (d.osType ?? d.os ?? 'windows') as OSType,
           osVersion: (d.osVersion ?? '') as string,
@@ -727,7 +742,9 @@ export default function DevicesPage() {
           siteId: (d.siteId ?? '') as string,
           siteName: '', // Will be resolved from sites
           agentVersion: (d.agentVersion ?? '') as string,
+          updateOfferWithheldReason: (d.updateOfferWithheldReason ?? null) as string | null,
           watchdogVersion: (d.watchdogVersion ?? null) as string | null,
+          helperVersion: (d.helperVersion ?? null) as string | null,
           agentServerUrl: (d.agentServerUrl ?? null) as string | null,
           // Opt-in WAN/LAN IP columns (#2503). Both are string-or-null on the
           // wire; anything else degrades to null so a malformed value renders
@@ -788,6 +805,19 @@ export default function DevicesPage() {
             d.reliabilityTrend === 'degrading'
               ? d.reliabilityTrend
               : null,
+          // Hardware & RAID rollup (#6854 W04): null until a report arrives.
+          // The API summary is `{counts, controllerNames}`; the web Device
+          // field is the flat numeric counts record the column tooltip reads.
+          hardwareHealth:
+            d.hardwareHealth === 'ok' || d.hardwareHealth === 'warning' ||
+            d.hardwareHealth === 'critical' || d.hardwareHealth === 'unknown'
+              ? d.hardwareHealth
+              : null,
+          hardwareHealthSummary: asRecord(d.hardwareHealthSummary)
+            ? Object.fromEntries(Object.entries(
+                asRecord(asRecord(d.hardwareHealthSummary)?.counts) ?? asRecord(d.hardwareHealthSummary)!,
+              ).filter((entry): entry is [string, number] =>
+                typeof entry[1] === 'number' && Number.isFinite(entry[1]))) : null,
           // RDS per-session helper mode (Task 12): validated against the known
           // values so an unexpected API value falls back to null rather than
           // leaking through the type — Tasks 13/14 gate the session picker on
@@ -796,6 +826,10 @@ export default function DevicesPage() {
             d.helperLifecycleMode === 'always-on' || d.helperLifecycleMode === 'on-demand'
               ? d.helperLifecycleMode
               : null,
+          // Custom field values (#6594) — powers the opt-in custom field
+          // columns. Agent rows only; the API's customFields column is
+          // already selected in the list query (routes/devices/core.ts).
+          customFields: (asRecord(d.customFields) ?? null) as Record<string, unknown> | null,
         };
       });
 
@@ -805,7 +839,7 @@ export default function DevicesPage() {
         id: d.id as string,
         deviceClass: (d.deviceClass as DeviceClass) ?? 'network',
         assetType: (d.assetType as DeviceRole | undefined) ?? 'unknown',
-        hostname: (d.hostname ?? t('devicesPage.unknownDevice')) as string,
+        hostname: (d.hostname ?? stableT('devicesPage.unknownDevice')) as string,
         displayName: typeof d.displayName === 'string' ? d.displayName : undefined,
         // No OS for a network device; the OS column renders "—" for network rows.
         os: '' as OSType,
@@ -820,6 +854,7 @@ export default function DevicesPage() {
         siteName: '',
         agentVersion: '',
         watchdogVersion: null,
+        helperVersion: null,
         // A discovered asset never authenticates to the control plane, so it
         // has no WAN address; its discovered `ipAddress` IS its LAN address,
         // which is exactly what the LAN IP column wants (#2503).
@@ -849,7 +884,7 @@ export default function DevicesPage() {
         id: d.id as string,
         deviceClass: 'manual' as const,
         assetType: (d.assetType as DeviceRole | undefined) ?? 'unknown',
-        hostname: (d.hostname ?? t('devicesPage.unknownDevice')) as string,
+        hostname: (d.hostname ?? stableT('devicesPage.unknownDevice')) as string,
         displayName: typeof d.displayName === 'string' ? d.displayName : undefined,
         os: '' as OSType,
         osVersion: '',
@@ -863,6 +898,7 @@ export default function DevicesPage() {
         siteName: '',
         agentVersion: '',
         watchdogVersion: null,
+        helperVersion: null,
         wanIp: null,
         lanIp: null,
         macAddress: null,
@@ -880,7 +916,13 @@ export default function DevicesPage() {
         enrolledAt: d.enrolledAt as string | undefined,
       }));
 
-      const allTransformed = [...transformedDevices, ...transformedNetworkDevices, ...transformedManualAssets];
+      // A hardware filter is agent-only (network/manual rows carry no
+      // hardware rollup); the server already filtered transformedDevices, but
+      // the merged view must not let unfiltered network/manual rows leak back
+      // in as false negatives for the selected filter.
+      const allTransformed = hardwareHealth
+        ? transformedDevices.filter(d => d.hardwareHealth === hardwareHealth)
+        : [...transformedDevices, ...transformedNetworkDevices, ...transformedManualAssets];
 
       // Fetch orgs for org name lookup
       let orgsList: Org[] = [];
@@ -901,8 +943,8 @@ export default function DevicesPage() {
       // Assign org and site names to devices (agent + network arms).
       const devicesWithNames = allTransformed.map(device => ({
         ...device,
-        orgName: orgMap.get(device.orgId) ?? t('devicesPage.unknownOrg'),
-        siteName: siteMap.get(device.siteId) ?? t('devicesPage.unknownSite')
+        orgName: orgMap.get(device.orgId) ?? stableT('devicesPage.unknownOrg'),
+        siteName: siteMap.get(device.siteId) ?? stableT('devicesPage.unknownSite')
       }));
 
       // Fetch groups for group filter
@@ -922,6 +964,7 @@ export default function DevicesPage() {
         }
       }
 
+      if (!isCurrentDeviceFetch()) return;
       setDeviceGroups(groupsList);
       setGroupMembershipMap(memberMap);
       setDevices(devicesWithNames);
@@ -944,7 +987,7 @@ export default function DevicesPage() {
             }
             const body = await res.json();
             const data = body?.data;
-            if (data && typeof data === 'object' && !Array.isArray(data)) {
+            if (isCurrentDeviceFetch() && data && typeof data === 'object' && !Array.isArray(data)) {
               setEffectiveAgentVersionByOrgId(data);
             }
           })
@@ -957,12 +1000,13 @@ export default function DevicesPage() {
       // Aborts are expected when the component unmounts mid-walk — drop
       // them silently rather than rendering a misleading error banner.
       if (err instanceof Error && err.name === 'AbortError') return;
+      if (!isCurrentDeviceFetch()) return;
       if (background) {
         // The whole point of a background refresh is to keep the last-good
         // list on screen. Swapping it for the full-page error card would
         // throw away data the user was already looking at over a transient
         // blip, so report the failure without tearing the page down.
-        showToast({ type: 'error', message: t('devicesPage.toasts.refreshFailed') });
+        showToast({ type: 'error', message: stableT('devicesPage.toasts.refreshFailed') });
         return;
       }
       setError(err);
@@ -976,7 +1020,7 @@ export default function DevicesPage() {
         else setLoading(false);
       }
     }
-  }, [t]);
+  }, [stableT, hardwareHealth]);
 
   /**
    * The post-change refresh — use this, not `fetchDevices`, anywhere something
@@ -2269,6 +2313,21 @@ export default function DevicesPage() {
         </div>
       </div>
 
+      <label className="flex items-center gap-2 text-sm">
+        <span>{t('hardwareHealth.hardware')}</span>
+        <select data-testid="hardware-health-filter" value={hardwareHealth}
+          className="rounded-md border bg-background px-3 py-2"
+          onChange={event => {
+            const next = event.target.value;
+            if (next === '' || next === 'warning' || next === 'critical' || next === 'unknown') setHardwareHealth(next);
+          }}>
+          <option value="">{t('hardwareHealth.all')}</option>
+          <option value="warning">{t('hardwareHealth.warning')}</option>
+          <option value="critical">{t('hardwareHealth.critical')}</option>
+          <option value="unknown">{t('hardwareHealth.unknown')}</option>
+        </select>
+      </label>
+
       {filtersV2 ? (
         <DeviceFilterToolbar
           value={advancedFilter}
@@ -2300,7 +2359,7 @@ export default function DevicesPage() {
           its count) on an org that has manual assets but the network arm off.
           Narrows both views: the table via classFilteredDevices, the grid via
           gridDevices (same class rule over the filtered fleet). */}
-      {(ENABLE_NETWORK_DEVICES_IN_LIST || deviceClassCounts.manual > 0) && (
+      {showDeviceClassSegment && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
           <DeviceClassSegment
             value={deviceClassFilter}

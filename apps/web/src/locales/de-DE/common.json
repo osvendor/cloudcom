@@ -15,7 +15,7 @@
     "fleetPosture": "Flottenstatus",
     "dashboard": "Dashboard",
     "devices": "Geräte & Assets",
-    "alerts": "Warnmeldungen",
+    "alerts": "Warnungen",
     "approvals": "Genehmigungen",
     "pendingApprovals": "{{count}} ausstehende Genehmigungen",
     "pendingApprovals_one": "{{count}} ausstehende Genehmigung",
@@ -67,6 +67,7 @@
     "fleetDesign": "Flottendesign",
     "customFields": "Benutzerdefinierte Felder",
     "savedFilters": "Gespeicherte Filter",
+    "moreSettings": "Weitere Einstellungen",
     "users": "Benutzer",
     "roles": "Rollen",
     "sso": "SSO",
@@ -98,7 +99,9 @@
     "serviceManagement": "Service-Management",
     "ticketing": "Ticketing",
     "deliverableTemplates": "Liefervorlagen",
-    "securityScans": "IOC-Scans"
+    "securityScans": "IOC-Scans",
+    "system": "System",
+    "monitorConversion": "Monitor-Konvertierung"
   },
   "documentTitles": {
     "dashboard": "Dashboard",
@@ -218,7 +221,7 @@
     "mcp": {
       "connecting": "Möchten Sie einen KI-Agenten verbinden?",
       "title": "KI-Agenten hierher weiterleiten",
-      "description": "Fügen Sie diese URL in Ihren MCP-Client (Claude.ai, ChatGPT, Cursor, …) ein. Sie werden hierher zurückgeleitet, um die Verbindung über OAuth zu autorisieren."
+      "description": "Fügen Sie diese URL in Ihren MCP-Client (Claude.ai, ChatGPT, Cursor, …) ein. Sie werden hierher zurückgeleitet, um die Verbindung über OAuth zu autorisieren. Bevorzugen Sie einen API-Schlüssel? Senden Sie einen X-API-Key-Header mit dem Bereich ai:read/ai:write."
     },
     "progress": {
       "count": "{{current}} von {{total}}",
@@ -1470,6 +1473,12 @@
           "editTitle": "Webhook bearbeiten"
         },
         "subtitle": "Übermitteln Sie Ereignisse an externe Systeme.",
+        "success": {
+          "created": "Webhook erstellt",
+          "disabled": "Webhook deaktiviert",
+          "enabled": "Webhook aktiviert",
+          "updated": "Webhook aktualisiert"
+        },
         "title": "Webhooks"
       }
     },
@@ -2445,7 +2454,7 @@
         },
         "title": "Vorgeschlagene Korrekturen",
         "refresh": "Aktualisieren Sie die vorgeschlagenen Korrekturen",
-        "disabledTitle": "Vorgeschlagene Korrekturen sind für diese Organisation deaktiviert",
+        "disabledTitle": "Vorgeschlagene Korrekturen sind für diese Organisation deaktiviert. Aktivieren Sie sie unter Einstellungen → Partner → KI-Funktionen oder für eine einzelne Organisation auf ihrer KI-Registerkarte.",
         "suggestionsDisabled": "Vorschläge deaktiviert",
         "generate": "Generieren",
         "empty": "Noch keine Lösungsvorschläge.",
