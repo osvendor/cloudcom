@@ -840,7 +840,7 @@ export const portalApi = {
     config: ApiRequestConfig = {},
   ): Promise<ApiResponse<RemoteSession>> =>
     apiPost<RemoteSession>('/portal/remote/sessions', { deviceId, transport }, config),
-  getRemoteSession: (id: string, config: ApiRequestConfig = {}) => apiGet<{ session: { id: string; status: string; hostname: string; webrtcAnswer: string | null; terminationPhase: string }; iceServers: RTCIceServer[] }>(`/portal/remote/sessions/${encodeURIComponent(id)}`, config),
+  getRemoteSession: (id: string, config: ApiRequestConfig = {}, includeIce = false) => apiGet<{ session: { id: string; status: string; hostname: string; webrtcAnswer: string | null; terminationPhase: string }; iceServers: RTCIceServer[] }>(`/portal/remote/sessions/${encodeURIComponent(id)}${includeIce ? '?includeIce=1' : ''}`, config),
   submitRemoteOffer: (id: string, offer: string, config: ApiRequestConfig = {}) => apiPost<{ success: true }>(`/portal/remote/sessions/${encodeURIComponent(id)}/offer`, { offer }, config),
   endRemoteSession: (id: string, config: ApiRequestConfig = {}) => apiPost<{ success: true; terminationPhase: string }>(`/portal/remote/sessions/${encodeURIComponent(id)}/end`, {}, config),
 

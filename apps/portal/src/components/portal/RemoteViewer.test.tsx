@@ -45,6 +45,15 @@ describe('customer remote viewer lifecycle', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Access revoked');
   });
 
+  it('requests relay credentials at bootstrap and leaves subsequent polling metadata-only', async () => {
+    render(<RemoteViewer sessionId="session" />); await flush();
+    expect(portalApi.getRemoteSession).toHaveBeenNthCalledWith(1, 'session', expect.any(Object), true);
+    expect(portalApi.getRemoteSession).toHaveBeenNthCalledWith(2, 'session', expect.any(Object), false);
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(vi.mocked(portalApi.getRemoteSession).mock.calls.slice(1).every(call => call[2] === false)).toBe(true);
+    expect(screen.getByRole('status')).toHaveTextContent('Connected');
+  });
+
   it('releases held keys on blur and closes locally even when end fails', async () => {
     render(<RemoteViewer sessionId="session" />); await flush();
     fireEvent.keyDown(screen.getByTestId('remote-video'), { code: 'KeyA', key: 'a' });

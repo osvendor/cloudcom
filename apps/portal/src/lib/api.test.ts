@@ -60,6 +60,21 @@ describe('portalApi.getTicketForms request path', () => {
   });
 });
 
+describe('portalApi remote-session ICE opt-in', () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('opts in only for bootstrap, leaving status polls without credential minting', async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ session: {}, iceServers: [] }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await portalApi.getRemoteSession('session', {}, true);
+    await portalApi.getRemoteSession('session');
+    const bootstrap = new URL(String(fetchMock.mock.calls[0][0]), 'https://portal.example.test');
+    const poll = new URL(String(fetchMock.mock.calls[1][0]), 'https://portal.example.test');
+    expect(bootstrap.pathname + bootstrap.search).toBe('/api/v1/portal/remote/sessions/session?includeIce=1');
+    expect(poll.pathname + poll.search).toBe('/api/v1/portal/remote/sessions/session');
+  });
+});
+
 describe('portalApi backup request paths', () => {
   afterEach(() => {
     vi.unstubAllGlobals();

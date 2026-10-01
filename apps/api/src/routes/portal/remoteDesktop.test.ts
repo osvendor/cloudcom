@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 const m = vi.hoisted(() => ({
   selectLimit: vi.fn(), execute: vi.fn(), contextEvents: [] as string[], authorize: vi.fn(), create: vi.fn(),
   commit: vi.fn(), end: vi.fn(), lease: vi.fn(), touch: vi.fn(), policy: vi.fn(), prompt: vi.fn(), dispatch: vi.fn(), audit: vi.fn(), expire: vi.fn(),
+  ice: vi.fn(), mintLimit: vi.fn(),
 }));
 vi.mock('../../db', () => ({
   withDbAccessContext: async (_ctx: unknown, fn: () => Promise<unknown>) => { m.contextEvents.push('tx-open'); try { return await fn(); } finally { m.contextEvents.push('tx-close'); } },
@@ -19,12 +20,13 @@ vi.mock('../../services/portalNativeAdmission', () => ({ expireStaleNativeSessio
 vi.mock('../../services/portalRemoteLease', () => ({ preparePortalRemoteLease: m.lease, touchPortalRemoteViewer: m.touch }));
 vi.mock('../../services/remoteAccessPolicy', () => ({ resolveDesktopSessionPolicy: m.policy }));
 vi.mock('../../services/agentCommandRelay', () => ({ dispatchCommandToAgent: (...a: unknown[]) => { m.contextEvents.push('dispatch'); return m.dispatch(...a); } }));
-vi.mock('../remote/helpers', () => ({ createDesktopStartCommandId: () => 'desk-start-11111111-1111-4111-8111-111111111111-33333333-3333-4333-8333-333333333333', getIceServers: () => [], resolveRemoteSessionPromptConfig: m.prompt }));
+vi.mock('../remote/helpers', () => ({ createDesktopStartCommandId: () => 'desk-start-11111111-1111-4111-8111-111111111111-33333333-3333-4333-8333-333333333333', getIceServers: m.ice, checkTurnCredentialMintRateLimit: m.mintLimit, resolveRemoteSessionPromptConfig: m.prompt }));
 vi.mock('./helpers', () => ({ validatePortalCookieCsrfRequest: () => null, writePortalAudit: m.audit }));
 vi.mock('./remoteRateLimit', () => ({ portalRemoteStartRateLimit: async (_c: unknown, next: () => Promise<void>) => next() }));
 vi.mock('../../services/remoteDesktopTerminalIntent', () => ({ buildStopDesktopCommand: (id: string, generation: bigint) => ({ id: `desk-stop-${id}-${generation}`, type: 'stop_desktop', payload: { sessionId: id, terminalGeneration: generation.toString() } }) }));
 
 import { portalDesktopRoutes } from './remoteDesktop';
+import { RemoteSessionPromptPolicyError } from '../remote/consentGate';
 
 const SESSION = '11111111-1111-4111-8111-111111111111';
 const DEVICE = '22222222-2222-4222-8222-222222222222';
@@ -44,6 +46,8 @@ beforeEach(() => {
   m.lease.mockImplementation(async () => { m.contextEvents.push('lease'); return { ok: true, lease: { token: 'opaque', expiresAt: Date.now() + 60_000, hardDeadline: Date.now() + 60_000, renewEverySec: 20, graceSec: 15 } }; });
   m.touch.mockResolvedValue({ ok: true }); m.policy.mockResolvedValue({ idleTimeoutMinutes: 5, maxSessionDurationHours: 1 });
   m.prompt.mockResolvedValue({ mode: 'off' }); m.dispatch.mockResolvedValue({ status: 'sent' });
+  m.ice.mockReturnValue([{ urls: 'turn:relay.example.test', credential: 'test-credential' }]);
+  m.mintLimit.mockResolvedValue({ allowed: true });
   m.end.mockResolvedValue({ ok: true, terminalGeneration: 3n });
 });
 
@@ -62,8 +66,9 @@ describe('portal desktop routes', () => {
 
   it('refuses an expired assignment on a live read and fences it through end', async () => {
     m.authorize.mockResolvedValue({ ok: false, reason: 'assignment_unavailable' });
-    const response = await request(`/remote/sessions/${SESSION}`);
+    const response = await request(`/remote/sessions/${SESSION}?includeIce=1`);
     expect(response.status).toBe(403); expect(m.end).toHaveBeenCalledWith(SESSION, expect.objectContaining({ id: principal.id, orgId: principal.orgId, authEpoch: 3 }));
+    expect(m.ice).not.toHaveBeenCalled(); expect(m.mintLimit).not.toHaveBeenCalled();
   });
 
   it('requires both agent protocol declarations before creating a portal session', async () => {
@@ -95,9 +100,71 @@ describe('portal desktop routes', () => {
   });
 
   it('passes the consent prompt contract to the agent start command', async () => {
+    const capable = row();
+    m.selectLimit.mockResolvedValue([{ ...capable, device: { ...capable.device, consentPromptProtocolVersion: 1 } }]);
     m.prompt.mockResolvedValue({ mode: 'consent', consentUnavailableBehavior: 'deny', notifyOnEnd: true, showIndicator: true });
     await request(`/remote/sessions/${SESSION}/offer`, { method: 'POST', body: JSON.stringify({ offer: 'v=0' }) });
     expect(m.dispatch).toHaveBeenCalledWith('agent-1', expect.objectContaining({ payload: expect.objectContaining({ prompt: expect.objectContaining({ mode: 'consent', technicianName: 'Customer', consentTimeoutMs: 30000 }) }) }));
+  });
+
+  it.each([undefined, null, 0, 2])('refuses consent before dispatch when the agent reports protocol %s', async version => {
+    const unsupported = row();
+    m.selectLimit.mockResolvedValue([{ ...unsupported, device: { ...unsupported.device, consentPromptProtocolVersion: version } }]);
+    m.prompt.mockResolvedValue({ mode: 'consent' });
+    const response = await request(`/remote/sessions/${SESSION}/offer`, { method: 'POST', body: JSON.stringify({ offer: 'v=0' }) });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: 'CONSENT_UPGRADE_REQUIRED' });
+    expect(m.commit).not.toHaveBeenCalled(); expect(m.lease).not.toHaveBeenCalled(); expect(m.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('fails closed with a clear response when prompt policy cannot be established', async () => {
+    m.prompt.mockRejectedValueOnce(new RemoteSessionPromptPolicyError(DEVICE, 'unavailable'));
+    const response = await request(`/remote/sessions/${SESSION}/offer`, { method: 'POST', body: JSON.stringify({ offer: 'v=0' }) });
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ code: 'REMOTE_PROMPT_POLICY_UNAVAILABLE' });
+    expect(m.commit).not.toHaveBeenCalled(); expect(m.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('mints ICE credentials only for an authorized explicit bootstrap request', async () => {
+    const response = await request(`/remote/sessions/${SESSION}?includeIce=1`);
+    expect(response.status).toBe(200);
+    expect(m.authorize).toHaveBeenCalled();
+    expect(m.mintLimit).toHaveBeenCalledWith(`portal:${principal.id}`);
+    expect(m.ice).toHaveBeenCalledWith({ sessionId: SESSION, userId: `portal:${principal.id}`, deviceId: DEVICE });
+    expect((await response.json()).iceServers).toHaveLength(1);
+  });
+
+  it('keeps ordinary presence polling independent of the ICE mint budget', async () => {
+    m.selectLimit.mockResolvedValue([row({ status: 'active' })]);
+    m.mintLimit.mockResolvedValue({ allowed: false });
+    const response = await request(`/remote/sessions/${SESSION}`);
+    expect(response.status).toBe(200);
+    expect(m.touch).toHaveBeenCalled();
+    expect(m.mintLimit).not.toHaveBeenCalled(); expect(m.ice).not.toHaveBeenCalled();
+    expect((await response.json()).iceServers).toEqual([]);
+  });
+
+  it('refuses a rate-limited bootstrap without minting credentials', async () => {
+    m.mintLimit.mockResolvedValue({ allowed: false });
+    const response = await request(`/remote/sessions/${SESSION}?includeIce=1`);
+    expect(response.status).toBe(429);
+    expect((await response.json()).code).toBe('RATE_LIMITED');
+    expect(m.ice).not.toHaveBeenCalled();
+  });
+
+  it.each(['disconnected', 'failed', 'denied'])('keeps %s status readable without issuing ICE credentials', async status => {
+    m.selectLimit.mockResolvedValue([row({ status, terminationPhase: 'confirmed' })]);
+    const response = await request(`/remote/sessions/${SESSION}?includeIce=1`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ session: { status, terminationPhase: 'confirmed' }, iceServers: [] });
+    expect(m.mintLimit).not.toHaveBeenCalled(); expect(m.ice).not.toHaveBeenCalled();
+  });
+
+  it('does not issue ICE while an active row has a pending termination fence', async () => {
+    m.selectLimit.mockResolvedValue([row({ status: 'active', terminationPhase: 'pending' })]);
+    const response = await request(`/remote/sessions/${SESSION}?includeIce=1`);
+    expect(response.status).toBe(200); expect(m.ice).not.toHaveBeenCalled();
+    expect(m.touch).not.toHaveBeenCalled();
   });
 
   it('retries a pending terminal fence with the same stop identity', async () => {

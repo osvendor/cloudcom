@@ -45,8 +45,8 @@ export default function RemoteViewer({ sessionId }: { sessionId: string }) {
     let cancelled = false;
     mounted.current = true; closed.current = false;
     const current = () => !cancelled && !closed.current;
-    const read = async () => {
-      const response = await portalApi.getRemoteSession(sessionId, OPTIONS);
+    const read = async (includeIce = false) => {
+      const response = await portalApi.getRemoteSession(sessionId, OPTIONS, includeIce);
       if (!current()) return null;
       if (!response.data || !remoteSessionIsLive(response.data.session.status, response.data.session.terminationPhase)) {
         fail(response.error ?? 'Remote access has ended.'); return null;
@@ -54,7 +54,9 @@ export default function RemoteViewer({ sessionId }: { sessionId: string }) {
       return response.data;
     };
     const connect = async () => {
-      const first = await read();
+      // Mint relay credentials only for connection bootstrap, never for the
+      // answer/presence polls that continue throughout a healthy session.
+      const first = await read(true);
       if (!first || !current()) return;
       const connection = new RTCPeerConnection({ iceServers: first.iceServers ?? [] });
       peer.current = connection;
