@@ -65,7 +65,11 @@ import {
 } from '../../db/schema';
 import { createOrganization, createPartner, createUser } from './db-utils';
 import { getTestDb } from './setup';
-import { upsertConnection } from '../../services/accounting/accountingConnectionService';
+import {
+  getConnectionProviderForMapping,
+  getConnectionProvidersForMappings,
+  upsertConnection,
+} from '../../services/accounting/accountingConnectionService';
 import type { AccountingConnection } from '../../services/accounting/accountingConnectionService';
 import type { DbContextRunner } from '../../services/accounting/dbContextGuard';
 import type {
@@ -289,8 +293,9 @@ function paymentLine(overrides: Partial<ChangeSetPaymentLine> = {}): ChangeSetPa
     amountMinor: 4000,
     currency: 'USD',
     txnDate: '2026-09-02',
-    remotePaymentSyncToken: '0',
+    remotePaymentVersion: '0',
     paymentMethodName: 'Check',
+    method: 'check',
     paymentRefNum: '10441',
     breezePaymentId: null,
     ...overrides,
@@ -344,7 +349,7 @@ async function recordAndPush(
   const mapping = await loadOnePaymentMapping(fx);
   const create = stubCreatePayment(async () => ({
     id: opts.remotePaymentId ?? '181',
-    syncToken: opts.syncToken ?? '0',
+    remoteVersion: opts.syncToken ?? '0',
   }));
   const outcome = await pushPaymentToAccounting(mapping.id, fx.partnerId, systemRunner);
   return { recorded, mappingId: mapping.id, paymentId: recorded.audit.paymentId, outcome, create };
@@ -484,7 +489,7 @@ describe('QuickBooks payment push — real Postgres', () => {
       amount: '40.00',
       currencyCode: 'USD',
       txnDate: '2026-09-02',
-      privateNote: buildPaymentPrivateNote(paymentId),
+      marker: buildPaymentPrivateNote(paymentId),
     });
 
     const mapping = await loadOnePaymentMapping(fx);
@@ -522,7 +527,7 @@ describe('QuickBooks payment push — real Postgres', () => {
 
     blocked.mockRestore();
     await setClaimedAt(mappingId, new Date(Date.now() - PAYMENT_CLAIM_LEASE_MS - 1000));
-    const create = stubCreatePayment(async () => ({ id: '181', syncToken: '0' }));
+    const create = stubCreatePayment(async () => ({ id: '181', remoteVersion: '0' }));
 
     expect(await pushPaymentToAccounting(mappingId, fx.partnerId, systemRunner)).toBe('pushed');
     expect(create).toHaveBeenCalledTimes(1);
@@ -539,7 +544,7 @@ describe('QuickBooks payment push — real Postgres', () => {
 
     const echo = await applyAccountingPayment(
       fx.conn,
-      paymentLine({ remotePaymentId: '181', remoteInvoiceId: '145', remotePaymentSyncToken: '0', breezePaymentId: paymentId }),
+      paymentLine({ remotePaymentId: '181', remoteInvoiceId: '145', remotePaymentVersion: '0', breezePaymentId: paymentId }),
       systemRunner,
       fx.conn.realmIdFingerprint,
     );
@@ -566,12 +571,12 @@ describe('QuickBooks payment push — real Postgres', () => {
     const create = stubCreatePayment(async () => {
       const applied = await applyAccountingPayment(
         fx.conn,
-        paymentLine({ remotePaymentId: '181', remotePaymentSyncToken: '4', breezePaymentId: paymentId }),
+        paymentLine({ remotePaymentId: '181', remotePaymentVersion: '4', breezePaymentId: paymentId }),
         systemRunner,
         fx.conn.realmIdFingerprint,
       );
       adoption = applied.outcome;
-      return { id: '181', syncToken: '0' };
+      return { id: '181', remoteVersion: '0' };
     });
 
     expect(await pushPaymentToAccounting(mappingId, fx.partnerId, systemRunner)).toBe('already_adopted');
@@ -600,7 +605,7 @@ describe('QuickBooks payment push — real Postgres', () => {
       await withSystemDbAccessContext(() => db
         .update(invoicePayments).set({ amount: '60.00' }).where(eq(invoicePayments.id, paymentId))
         .returning({ id: invoicePayments.id }));
-      return { id: '181', syncToken: '0' };
+      return { id: '181', remoteVersion: '0' };
     });
 
     expect(await pushPaymentToAccounting(mappingId, fx.partnerId, systemRunner)).toBe('diverged');
@@ -611,9 +616,9 @@ describe('QuickBooks payment push — real Postgres', () => {
       syncStatus: 'error',
       pendingOp: null,
       claimedAt: null,
-      lastError: partialRefundDivergenceMessage('40.00'),
+      lastError: partialRefundDivergenceMessage('40.00', 'QuickBooks'),
     });
-    expect(partialRefundDivergenceMessage('40.00')).toBe(
+    expect(partialRefundDivergenceMessage('40.00', 'QuickBooks')).toBe(
       'Refunded in Stripe, total 40.00; record the refund in QuickBooks '
       + '(this QuickBooks payment still shows the full amount)',
     );
@@ -663,11 +668,17 @@ describe('QuickBooks payment push — real Postgres', () => {
 
     const owed = await withSystemDbAccessContext(() => listOwedPaymentMappings(db, new Date()));
     expect(owed).toEqual([{ id: mapping.id, partnerId: fx.partnerId, pendingOp: 'delete' }]);
+    // Xero W01: the sweep's capability filter and the audit label read the
+    // row's OWN connection provider (provider column only) — real-join proof.
+    expect(await withSystemDbAccessContext(() => getConnectionProvidersForMappings(db, [mapping.id])))
+      .toEqual(new Map([[mapping.id, 'quickbooks']]));
+    expect(await withSystemDbAccessContext(() => getConnectionProviderForMapping(db, mapping.id, fx.partnerId)))
+      .toBe('quickbooks');
 
     // And the delete really clears the outbox row.
     const del = stubDeletePayment(async () => 'deleted');
     expect(await deletePaymentInAccounting(mapping.id, fx.partnerId, systemRunner)).toBe('deleted');
-    expect(del.mock.calls[0]![1]).toEqual({ remotePaymentId: '181', syncToken: '0' });
+    expect(del.mock.calls[0]![1]).toEqual({ remotePaymentId: '181', remoteVersion: '0' });
     expect(await loadPaymentMappings(fx)).toEqual([]);
   });
 
@@ -710,7 +721,7 @@ describe('QuickBooks payment push — real Postgres', () => {
     // fills the remote id in — the un-parking move.
     const adopted = await applyAccountingPayment(
       fx.conn,
-      paymentLine({ remotePaymentId: '181', remotePaymentSyncToken: '7', breezePaymentId: paymentId }),
+      paymentLine({ remotePaymentId: '181', remotePaymentVersion: '7', breezePaymentId: paymentId }),
       systemRunner,
       fx.conn.realmIdFingerprint,
     );
@@ -722,7 +733,7 @@ describe('QuickBooks payment push — real Postgres', () => {
 
     const del = stubDeletePayment(async () => 'deleted');
     expect(await deletePaymentInAccounting(mappingId, fx.partnerId, systemRunner)).toBe('deleted');
-    expect(del.mock.calls[0]![1]).toEqual({ remotePaymentId: '181', syncToken: '7' });
+    expect(del.mock.calls[0]![1]).toEqual({ remotePaymentId: '181', remoteVersion: '7' });
     expect(await loadPaymentMappings(fx)).toEqual([]);
   });
 
@@ -763,7 +774,7 @@ describe('QuickBooks payment push — real Postgres', () => {
     const create = stubCreatePayment(async () => {
       // The operator voids while QuickBooks is creating the Payment.
       await withSystemDbAccessContext(() => voidPayment(paymentId, fx.actor));
-      return { id: '181', syncToken: '2' };
+      return { id: '181', remoteVersion: '2' };
     });
 
     expect(await pushPaymentToAccounting(mappingId, fx.partnerId, systemRunner)).toBe('converted_to_delete');
@@ -820,7 +831,7 @@ describe('QuickBooks payment push — real Postgres', () => {
       pendingOp: 'push', syncStatus: 'pending', linkStatus: 'create_new', lastError: null, claimedAt: null,
     });
 
-    const create = stubCreatePayment(async () => ({ id: '182', syncToken: '0' }));
+    const create = stubCreatePayment(async () => ({ id: '182', remoteVersion: '0' }));
     // `vi.spyOn` on an already-spied method reuses the SAME spy, so the first
     // push's call is still on it. Clear the log (the implementation survives)
     // so the count below really counts the RE-push.
@@ -985,7 +996,7 @@ describe('QuickBooks payment push — real Postgres', () => {
 
     for (let attempt = 1; attempt <= PAYMENT_PUSH_MAX_ATTEMPTS; attempt++) {
       await expect(pushPaymentToAccounting(mappingId, fx.partnerId, systemRunner))
-        .rejects.toMatchObject({ code: 'quickbooks_error' });
+        .rejects.toMatchObject({ code: 'provider_error' });
       const row = await loadOnePaymentMapping(fx);
       expect(row.syncAttempts).toBe(attempt);
       // The lease is released every time, which is what lets the NEXT attempt
@@ -1113,7 +1124,7 @@ describe('QuickBooks payment push — real Postgres', () => {
 
     // The badge and the refusal are the same fact: QuickBooks OWNS its row.
     await expect(withSystemDbAccessContext(() => voidPayment(pulled.invoicePaymentId!, fx.actor)))
-      .rejects.toMatchObject({ status: 409, code: 'QUICKBOOKS_OWNED_PAYMENT' });
+      .rejects.toMatchObject({ status: 409, code: 'PROVIDER_OWNED_PAYMENT' });
     expect(await loadPayments(invoiceId)).toHaveLength(2);
 
     // ...while the Breeze-origin one is still hand-voidable, and the void
@@ -1147,6 +1158,44 @@ describe('QuickBooks payment push — real Postgres', () => {
     expect(mappings).toHaveLength(2);
     expect(mappings.every((m) => m.pendingOp === 'push' && m.breezeOrigin)).toBe(true);
     expect(new Set(mappings.map((m) => m.id))).toEqual(new Set(first));
+  });
+
+  runDb('stamps the horizon from the DATABASE clock, so an API clock running ahead cannot drop the next payment (#7293)', async () => {
+    // `invoice_payments.created_at` comes from Postgres `now()`. If
+    // `upsertConnection` stamped `push_payments_since` from Node's clock, then
+    // any skew with Node ahead would put a payment recorded right after connecting
+    // "before" the horizon, and it would silently never be pushed. The test stack
+    // runs 5-12 ms behind Node, which made this suite flake. Pinning Node's Date
+    // a minute ahead ONLY while the connection is written makes that skew
+    // deterministic. Postgres never sees the fake clock.
+    const realNow = Date.now();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    let seeded: Awaited<ReturnType<typeof seedPushable>>;
+    try {
+      vi.setSystemTime(realNow + 60_000);
+      seeded = await seedPushable();
+    } finally {
+      vi.useRealTimers();
+    }
+    const { fx, invoiceId } = seeded;
+
+    // Positive control: the skew really is on the stamped horizon's side. The
+    // horizon must read back at or before the DB clock, never a minute ahead.
+    const [conn] = await withSystemDbAccessContext(() => db
+      .select({
+        since: accountingConnections.pushPaymentsSince,
+        dbNow: sql<string>`now()::text`,
+      })
+      .from(accountingConnections)
+      .where(eq(accountingConnections.id, fx.conn.id)));
+    expect(conn!.since!.getTime()).toBeLessThanOrEqual(new Date(conn!.dbNow).getTime());
+
+    await withSystemDbAccessContext(() => recordPayment(
+      invoiceId, { amount: 40, method: 'check', receivedAt: '2026-09-02' }, fx.actor,
+    ));
+
+    const mapping = await loadOnePaymentMapping(fx);
+    expect(mapping).toMatchObject({ breezeEntityType: 'payment', pendingOp: 'push', syncStatus: 'pending' });
   });
 
   runDb('the push horizon is an inclusive UTC boundary, whatever the session time zone', async () => {

@@ -89,19 +89,6 @@ vi.mock('../services/sso', () => ({
     }
     return { ok: true };
   }),
-  // Real logic (not a stub), same reasoning as above: this is the conversion
-  // that puts the session's created_at on the same clock as the id_token's
-  // auth_time. A stub returning `undefined` would make the freshness bound
-  // NaN-ish and the timezone test below meaningless.
-  //
-  // Wrapped in vi.fn() so the CALL ITSELF is observable. Every value-based
-  // assertion about this conversion is vacuous under TZ=UTC — the offset is 0,
-  // so the converted bound and a naive `.getTime()` are the SAME number and a
-  // reverted call site still passes. That is exactly how the missing conversion
-  // shipped past a green (UTC) CI run. Asserting that the route CALLED this,
-  // with the session's own createdAt, has teeth in every host timezone.
-  utcMsFromOffsetlessTimestamp: vi.fn((value: Date) =>
-    value.getTime() - value.getTimezoneOffset() * 60_000),
   mapUserAttributes: vi.fn(),
   discoverOIDCConfig: vi.fn(),
   // Real logic (not a stub) — getOIDCConfig (defined in sso.ts, not mocked)
@@ -226,13 +213,12 @@ import {
   exchangeCodeForTokens,
   getUserInfo,
   mapUserAttributes,
-  utcMsFromOffsetlessTimestamp,
   verifyIdTokenSignature,
 } from '../services/sso';
 import { mintStepUpGrant } from '../services/mfaStepUpGrant';
 import { writeRouteAudit } from '../services/auditEvents';
 import { authMiddleware } from '../middleware/auth';
-import { pgOffsetlessTimestamp } from '../testUtils/pgOffsetlessTimestamp';
+import { withHostTimeZone } from '../testUtils/hostTimeZone';
 
 const USER_ID = '00000000-0000-4000-8000-000000000020';
 const OTHER_USER_ID = '00000000-0000-4000-8000-0000000000aa';
@@ -508,14 +494,13 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
   //   2. users                  (validateSessionBinding: the bound user)
   //   3. organizationUsers      (validateSessionBinding: org-axis membership)
   //   4. userSsoIdentities      (reauth branch: (provider, sub) ownership)
+  //   5. users + user_passkeys  (#4045: userIsMfaProtected picks the purpose)
   // Every test funnels through here so that ordering lives in one place.
   const primeReauthCallback = (opts: {
-    // A TRUE epoch. It is deliberately not a Date: the row's created_at is
-    // built from it via pgOffsetlessTimestamp so that every test in this suite
-    // sees the session exactly as postgres.js delivers it from a `timestamp
-    // without time zone` column, rather than the true-instant Date a hand-rolled
-    // `new Date(...)` would produce. Handing in a Date here is what let the
-    // freshness bound be compared on the wrong clock with the suite still green.
+    // Epoch ms of the /reauth/start click. The row's created_at is
+    // `new Date(sessionCreatedAtMs)`: Drizzle decodes the offsetless
+    // `sso_sessions.created_at` column as UTC, so that is the Date the route
+    // receives on any host.
     sessionCreatedAtMs?: number;
     idClaims?: Record<string, unknown>;
     sessionOverrides?: Record<string, unknown>;
@@ -526,6 +511,9 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
     // undefined = the identity belongs to the reauth user; [] = no identity.
     identityRows?: Array<{ userId: string }>;
     provider?: Record<string, unknown>;
+    // #4045: the userIsMfaProtected probe that picks the grant's purpose.
+    // undefined = no factor (enroll_first_factor).
+    protection?: { mfaEnabled: boolean; passkeyCount: number };
   } = {}) => {
     const {
       sessionCreatedAtMs = Date.now(),
@@ -534,6 +522,7 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
       membership = [{ userId: USER_ID }],
       identityRows = [{ userId: USER_ID }],
       provider = ACTIVE_OIDC_PROVIDER,
+      protection = { mfaEnabled: false, passkeyCount: 0 },
     } = opts;
     const idClaims = opts.idClaims ?? {
       sub: EXTERNAL_ID,
@@ -565,7 +554,7 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
       initiatingAuthEpoch: 3,
       initiatingMfaEpoch: 1,
       initiatingSessionId: SID,
-      createdAt: pgOffsetlessTimestamp(sessionCreatedAtMs),
+      createdAt: new Date(sessionCreatedAtMs),
       expiresAt: new Date(Date.now() + 10 * 60 * 1000),
       ...sessionOverrides,
     };
@@ -580,7 +569,8 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
       .mockReturnValueOnce(sel([provider]))
       .mockReturnValueOnce(sel(reauthUser ? [reauthUser] : []))
       .mockReturnValueOnce(sel(membership))
-      .mockReturnValueOnce(sel(identityRows));
+      .mockReturnValueOnce(sel(identityRows))
+      .mockReturnValueOnce(sel([protection]));
 
     return { session, idClaims };
   };
@@ -649,8 +639,7 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
 
     const res = await doCallback();
 
-    // The TRUE epoch of the click — not `createdAt.getTime()`, which is that
-    // epoch plus the host's UTC offset (see the timezone test below).
+    // The epoch of the click itself (see the host-zone tests below).
     expect(assertFreshIdpAuthentication).toHaveBeenCalledWith(idClaims, sessionCreatedAtMs);
     expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
   });
@@ -674,54 +663,49 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
     expect(mintStepUpGrant).not.toHaveBeenCalled();
   });
 
-  // sso_sessions.created_at is `timestamp without time zone`, and postgres.js
-  // parses an offsetless value as LOCAL time — so `createdAt.getTime()` is the
-  // true epoch plus the HOST's UTC offset, while the id_token's auth_time is a
-  // true UTC epoch. Comparing the two directly is dead on arrival west of UTC
-  // (bound lands in the future, every attempt reads stale) and silently
-  // permissive east of it (window widens by the offset, so a cached IdP session
-  // that old is accepted as fresh).
-  //
-  // This test is the reason the fixture takes an epoch rather than a Date: it
-  // only has teeth when the session row is built the way the driver builds it.
-  //
-  // It is deliberately NOT written as an arithmetic comparison of the bound
-  // against `createdAt.getTime()`. Under TZ=UTC the host offset is zero, so
-  // those two numbers are identical and every such assertion passes with or
-  // without the conversion — which is exactly how this shipped past a green CI
-  // run on UTC runners. The load-bearing assertions here are therefore about
-  // the CALL: the route must hand the raw `createdAt` Date to
-  // utcMsFromOffsetlessTimestamp and use that function's return value as the
-  // bound. Deleting the conversion at the call site fails this in every
-  // timezone, UTC included.
-  it('compares auth_time against the click on the SAME clock, whatever the host timezone', async () => {
-    const sessionCreatedAtMs = Date.now() - 60_000;
-    const { session } = primeReauthCallback({
-      sessionCreatedAtMs,
-      // 30s after the click: unambiguously fresh on a correct clock.
-      idClaims: { sub: EXTERNAL_ID, email: 'tech@acme.example', auth_time: Math.floor(sessionCreatedAtMs / 1000) + 30 }
+  // The freshness bound is `created_at`, compared with the id_token's
+  // `auth_time` epoch. Neither may move with the API host's zone: west of UTC
+  // a moved bound would admit an IdP session cached before the click, east of
+  // UTC it would refuse a genuine re-authentication.
+  const HOSTS = ['America/Denver', 'Asia/Tokyo'] as const;
+
+  it.each(HOSTS)('refuses an IdP auth_time an hour older than the click on a %s host', async (zone) => {
+    await withHostTimeZone(zone, async () => {
+      const sessionCreatedAtMs = Date.now() - 60_000;
+      primeReauthCallback({
+        sessionCreatedAtMs,
+        idClaims: {
+          sub: EXTERNAL_ID,
+          email: 'tech@acme.example',
+          auth_time: Math.floor(sessionCreatedAtMs / 1000) - 3600,
+        },
+      });
+
+      const res = await doCallback();
+
+      expect(vi.mocked(assertFreshIdpAuthentication).mock.calls.at(-1)?.[1]).toBe(sessionCreatedAtMs);
+      expect(res.headers.get('location')).toContain('ssoReauthError=reauth_not_fresh');
+      expect(mintStepUpGrant).not.toHaveBeenCalled();
     });
+  });
 
-    const res = await doCallback();
+  it.each(HOSTS)('accepts an IdP auth_time from after the click on a %s host', async (zone) => {
+    await withHostTimeZone(zone, async () => {
+      const sessionCreatedAtMs = Date.now() - 60_000;
+      primeReauthCallback({
+        sessionCreatedAtMs,
+        idClaims: {
+          sub: EXTERNAL_ID,
+          email: 'tech@acme.example',
+          auth_time: Math.floor(sessionCreatedAtMs / 1000) + 30,
+        },
+      });
 
-    // TZ-independent teeth #1: the conversion ran, on the session's OWN
-    // created_at Date (not on `Date.now()`, not on a pre-converted number).
-    expect(utcMsFromOffsetlessTimestamp).toHaveBeenCalledWith(session.createdAt);
+      const res = await doCallback();
 
-    const [, boundMs] = vi.mocked(assertFreshIdpAuthentication).mock.calls.at(-1)!;
-    // TZ-independent teeth #2: the bound the freshness check received is the
-    // value that conversion RETURNED — so the two calls are wired together
-    // rather than coincidentally agreeing on a UTC host.
-    const converted = vi.mocked(utcMsFromOffsetlessTimestamp).mock.results.at(-1)!;
-    expect(converted.type).toBe('return');
-    expect(boundMs).toBe(converted.value);
-
-    // And, on a correct clock, that bound is the true epoch of the click.
-    expect(boundMs).toBe(sessionCreatedAtMs);
-    expect(session.createdAt.getTime() - boundMs).toBe(session.createdAt.getTimezoneOffset() * 60_000);
-
-    expect(assertFreshIdpAuthentication).toHaveLastReturnedWith({ ok: true });
-    expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
+      expect(vi.mocked(assertFreshIdpAuthentication).mock.calls.at(-1)?.[1]).toBe(sessionCreatedAtMs);
+      expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
+    });
   });
 
   // ── Identity: stricter than link mode's email comparison ─────────────────
@@ -924,24 +908,76 @@ describe('GET /sso/callback — reauth mode (#4018)', () => {
     expect(mintStepUpGrant).not.toHaveBeenCalled();
   });
 
-  // Pins the CURRENT mint-site contract, deliberately without changing it.
-  // Neither /sso/reauth/start nor this callback consults userIsMfaProtected, so
-  // a passwordless account that already holds TOTP still gets a live grant; only
-  // resolveEnrollmentStepUp refuses to spend it. That is safe today because
-  // there is exactly one redemption site. A SECOND redemption site added later
-  // would inherit a grant that should never have existed — this test is here so
-  // that change has to be deliberate.
-  it('mints even for an already-protected account: the refusal lives at redemption, not here', async () => {
-    primeReauthCallback({
-      reauthUser: { ...ACTIVE_REAUTH_USER, mfaEnabled: true },
-    });
+  // #4045: the mint site now picks the grant's PURPOSE from the account's
+  // factor state (via the same userIsMfaProtected predicate both redemption
+  // sites use). An unprotected account gets enroll_first_factor — the only
+  // thing it can do is enroll. A protected account gets sso_reauth_manage_factor
+  // — it may stand in for the PASSWORD leg of recovery-code rotation, passkey
+  // deletion and MFA disable, and can never enroll. The grant stays bound to the
+  // INITIATING epochs, so a factor added between /reauth/start and here makes
+  // it dead on arrival whichever purpose was chosen.
+  it('mints sso_reauth_manage_factor (never enroll_first_factor) for a TOTP-protected account', async () => {
+    primeReauthCallback({ protection: { mfaEnabled: true, passkeyCount: 0 } });
 
     const res = await doCallback();
+
+    expect(mintStepUpGrant).toHaveBeenCalledTimes(1);
+    expect(mintStepUpGrant).toHaveBeenCalledWith({
+      userId: USER_ID,
+      operation: 'sso_reauth_manage_factor',
+      authEpoch: 3,
+      mfaEpoch: 1,
+      sid: SID,
+    });
+    expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
+  });
+
+  it('mints sso_reauth_manage_factor for a passkey-only account', async () => {
+    primeReauthCallback({ protection: { mfaEnabled: false, passkeyCount: 2 } });
+
+    await doCallback();
+
+    expect(mintStepUpGrant).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: USER_ID, operation: 'sso_reauth_manage_factor' })
+    );
+  });
+
+  // PR #7371 review: userIsMfaProtected THROWS on a missing row (it refuses to
+  // report "unprotected" when it could not look). Unhandled, that reached the
+  // callback's generic catch, which redirects to /login with the raw
+  // error.message — an internal diagnostic carrying the user's UUID — and
+  // dropped an already-signed-in user off the profile page.
+  it('fails closed on the profile page, without leaking the probe error, when the protection probe throws', async () => {
+    primeReauthCallback();
+    // Replace the queued protection row with "no row", so the probe throws.
+    vi.mocked(db.select).mockReset()
+      .mockReturnValueOnce(sel([ACTIVE_OIDC_PROVIDER]))
+      .mockReturnValueOnce(sel([ACTIVE_REAUTH_USER]))
+      .mockReturnValueOnce(sel([{ userId: USER_ID }]))
+      .mockReturnValueOnce(sel([{ userId: USER_ID }]))
+      .mockReturnValue(sel([]));
+
+    const res = await doCallback();
+
+    expect(mintStepUpGrant).not.toHaveBeenCalled();
+    expect(res.headers.get('location')).toBe('/settings/profile?ssoReauthError=reauth_unavailable');
+    expect(writeRouteAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: 'sso.reauth.rejected',
+        details: expect.objectContaining({ reason: 'protection_probe_failed' }),
+      })
+    );
+  });
+
+  it('still mints enroll_first_factor for an account with no factor', async () => {
+    primeReauthCallback({ protection: { mfaEnabled: false, passkeyCount: 0 } });
+
+    await doCallback();
 
     expect(mintStepUpGrant).toHaveBeenCalledWith(
       expect.objectContaining({ userId: USER_ID, operation: 'enroll_first_factor' })
     );
-    expect(res.headers.get('location')).toBe('/settings/profile#ssoReauthGrant=grant-abc');
   });
 
   it('never mints login tokens, creates users, or links identities in reauth mode', async () => {

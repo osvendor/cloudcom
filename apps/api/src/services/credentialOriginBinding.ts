@@ -1,3 +1,5 @@
+import { isEncryptedSecret } from './secretCrypto';
+
 /**
  * Whether replacing one HTTP(S) endpoint with another crosses an origin
  * boundary. URL.origin normalizes host case and default ports while retaining
@@ -14,6 +16,21 @@ export function urlOriginChanged(current: string, next: string): boolean {
   } catch {
     return true;
   }
+}
+
+/**
+ * Whether `next` contains any member `existing` does not have (trimmed,
+ * exact-match comparison). For destination shapes that are a SET of hosts
+ * rather than one URL — a discovery profile's `subnets`, for instance, where
+ * "the destination" is everything the job probes — a credential must not
+ * follow the set to a member it has never reached before. Removing members
+ * only narrows the destination, so it is never itself a change: a PATCH that
+ * drops subnets sends the stored secret nowhere new and needs no
+ * re-confirmation, mirroring `urlOriginChanged`'s single-URL contract.
+ */
+export function destinationSetGainedMembers(existing: readonly string[], next: readonly string[]): boolean {
+  const existingSet = new Set(existing.map((value) => value.trim()));
+  return next.some((value) => !existingSet.has(value.trim()));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -55,4 +72,58 @@ export function webhookOriginChangeWouldRetainAuthorization(
   const existingHeaders = headerValues(existing.headers);
   if (existingHeaders.length > 0 && !('headers' in patch)) return true;
   return headerValues(patch.headers).some(isMaskedSecret);
+}
+
+export interface SettingsSecretDestination {
+  /** Path of the object holding the destination URL and its credentials. */
+  path: readonly string[];
+  urlKey: string;
+  secretKeys: readonly string[];
+}
+
+function valueAt(value: unknown, path: readonly string[]): unknown {
+  let current = value;
+  for (const part of path) {
+    if (!isRecord(current)) return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+/**
+ * Origin binding for a secret kept inside a settings JSON blob: true when the
+ * incoming settings point a destination at a different origin while a stored
+ * credential for it would be kept (masked marker, omitted key, or the sealed
+ * value echoed back) rather than entered again. A stored credential with no
+ * recorded destination fails closed. Evaluate on the raw request, before
+ * `restoreMaskedSettingsSecrets`.
+ */
+export function settingsSecretWouldFollowNewOrigin(
+  incoming: unknown,
+  stored: unknown,
+  destinations: readonly SettingsSecretDestination[],
+  isMaskedSecret: (value: unknown) => boolean,
+): boolean {
+  for (const destination of destinations) {
+    const next = valueAt(incoming, destination.path);
+    if (!isRecord(next)) continue;
+    const nextUrl = next[destination.urlKey];
+    if (typeof nextUrl !== 'string' || nextUrl.trim().length === 0) continue;
+
+    const current = valueAt(stored, destination.path);
+    const currentRecord = isRecord(current) ? current : {};
+    const currentUrl = currentRecord[destination.urlKey];
+
+    const carriesStoredSecret = destination.secretKeys.some((secretKey) => {
+      const storedSecret = currentRecord[secretKey];
+      if (typeof storedSecret !== 'string' || storedSecret.length === 0) return false;
+      if (!(secretKey in next) || next[secretKey] === undefined || next[secretKey] === null) return true;
+      const value = next[secretKey];
+      return isMaskedSecret(value) || (typeof value === 'string' && isEncryptedSecret(value));
+    });
+    if (!carriesStoredSecret) continue;
+
+    if (typeof currentUrl !== 'string' || urlOriginChanged(currentUrl, nextUrl)) return true;
+  }
+  return false;
 }

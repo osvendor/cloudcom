@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import type { SQL } from 'drizzle-orm';
 
 const ORG_ID = '11111111-1111-4111-8111-111111111111';
 const DEVICE_ID = '33333333-3333-4333-8333-333333333333';
@@ -60,6 +62,7 @@ vi.mock('../../services/permissions', () => ({
 
 import { db } from '../../db';
 import { metricsRoutes } from './metrics';
+import { withHostTimeZone } from '../../testUtils/hostTimeZone';
 
 function createChain(result: unknown = []) {
   const chain: Record<string, any> = {};
@@ -208,6 +211,47 @@ describe('device metrics route', () => {
     expect(vi.mocked(db.select)).toHaveBeenCalledTimes(3);
   });
 
+  it.each(['America/Denver', 'Asia/Tokyo'] as const)(
+    'reads one-minute raw bucket text as UTC on a %s host',
+    async (zone) => {
+      await withHostTimeZone(zone, async () => {
+        mockSelectOnce([DEVICE]);
+        mockSelectOnce([SITE]);
+        mockSelectOnce([rawMetricBucket({ bucket: '2026-06-18 12:00:00' })]);
+
+        const res = await app.request(
+          `/devices/${DEVICE_ID}/metrics?interval=1m&startDate=2026-06-18T00:00:00.000Z&endDate=2026-06-19T00:00:00.000Z`,
+          { method: 'GET', headers: { Authorization: 'Bearer t' } }
+        );
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.data[0].timestamp).toBe('2026-06-18T12:00:00.000Z');
+      });
+    }
+  );
+
+  it.each(['America/Denver', 'Asia/Tokyo'] as const)(
+    'buckets raw fallback text as UTC on a %s host',
+    async (zone) => {
+      await withHostTimeZone(zone, async () => {
+        mockSelectOnce([DEVICE]);
+        mockSelectOnce([SITE]);
+        mockSelectOnce([]);
+        mockSelectOnce([rawMetricBucket({ bucket: '2026-06-18 12:00:00' })]);
+
+        const res = await app.request(
+          `/devices/${DEVICE_ID}/metrics?range=7d&endDate=2026-06-19T00:00:00.000Z`,
+          { method: 'GET', headers: { Authorization: 'Bearer t' } }
+        );
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.data[0].timestamp).toBe('2026-06-18T12:00:00.000Z');
+      });
+    }
+  );
+
   it('does not query metrics when site scope denies the device', async () => {
     allowedSiteIds = ['55555555-5555-4555-8555-555555555555'];
     mockSelectOnce([DEVICE]);
@@ -220,5 +264,51 @@ describe('device metrics route', () => {
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({ error: 'Access to this site denied' });
     expect(vi.mocked(db.select)).toHaveBeenCalledTimes(1);
+  });
+
+  // #4513: the raw fallback used to return one row per MINUTE and re-bucket in
+  // JS — the default 24h view pulled 1,440 rows to draw 288 points, and a 30d
+  // fallback pulled ~43k to draw 30. The bucket must be computed in SQL at the
+  // requested width so the row count matches what the chart draws.
+  describe('raw fallback bucketing (#4513)', () => {
+    const dialect = new PgDialect();
+    const rawSelectSql = (callIndex: number) => {
+      const fields = vi.mocked(db.select).mock.calls[callIndex]?.[0] as unknown as { bucket: SQL } | undefined;
+      expect(fields?.bucket).toBeDefined();
+      return dialect.sqlToQuery(fields!.bucket).sql;
+    };
+    const rawGroupBySql = () => {
+      const chain = vi.mocked(db.select).mock.results.at(-1)?.value as { groupBy: ReturnType<typeof vi.fn> };
+      return dialect.sqlToQuery(chain.groupBy.mock.calls[0]![0] as SQL).sql;
+    };
+
+    beforeEach(() => {
+      vi.mocked(db.select).mockImplementation(() => createChain([]) as never);
+    });
+
+    it.each([
+      ['interval=5m', 300, 3],
+      ['interval=1h', 3600, 4],
+      ['interval=1d', 86400, 4],
+      ['interval=1m', 60, 3],
+    ])('groups raw rows at the requested width (%s -> %is)', async (query, seconds, selectCalls) => {
+      mockSelectOnce([DEVICE]);
+      mockSelectOnce([SITE]);
+      if (selectCalls === 4) mockSelectOnce([]); // empty rollups -> raw fallback
+      mockSelectOnce([rawMetricBucket()]);
+
+      const res = await app.request(
+        `/devices/${DEVICE_ID}/metrics?${query}&startDate=2026-06-18T00:00:00.000Z&endDate=2026-06-19T00:00:00.000Z`,
+        { method: 'GET', headers: { Authorization: 'Bearer t' } }
+      );
+
+      expect(res.status).toBe(200);
+      expect(vi.mocked(db.select)).toHaveBeenCalledTimes(selectCalls);
+      const bucketSql = rawSelectSql(selectCalls - 1);
+      expect(bucketSql).toContain('date_bin');
+      expect(bucketSql).toContain(`secs => ${seconds}`);
+      expect(bucketSql).not.toContain("date_trunc('minute'");
+      expect(rawGroupBySql()).toContain(`secs => ${seconds}`);
+    });
   });
 });

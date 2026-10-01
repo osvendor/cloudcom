@@ -9,12 +9,19 @@
  * - safeParseJson(): utility for parsing tool output
  */
 
-import { db, withDbAccessContext, withSystemDbAccessContext, runOutsideDbContext } from '../db';
+import {
+  db,
+  withDbAccessContext,
+  withSystemDbAccessContext,
+  runOutsideDbContext,
+  assertOutsideHeldDbContext,
+} from '../db';
 import { actionIntents } from '../db/schema/actionIntents';
 import { aiSessions, aiMessages, aiToolExecutions, aiActionPlans, devices, deviceSessions, approvalRequests } from '../db/schema';
 import { eq, and, isNull } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import type { AiPageContext, AiApprovalMode } from '@breeze/shared/types/ai';
+import { DIAGNOSTIC_STATES } from '@breeze/shared/validators/topology';
 import { checkGuardrails, checkToolPermission, checkToolRateLimit, checkPermissionRequirements } from './aiGuardrails';
 import { attachProposalToSession, loadProposalGuardrailContext } from './scriptProposals';
 import {
@@ -60,6 +67,7 @@ import {
   type ToolHandoffStatus,
 } from './aiToolHandoff';
 import { computeEffectDigestForRelease, hasPinnedDigest } from './actionIntents/effectDigest';
+import { requiresPinnedEffectDigest } from './actionIntents/pinnedEffectPolicy';
 import type { ToolExecutionContext } from './toolExecutionContext';
 import {
   assertNoPlaintextSecret,
@@ -71,6 +79,7 @@ import { TEMP_PASSWORD_ENC_KEY } from './actionIntents/resultSecrets';
 import { captureException } from './sentry';
 import { recordActionIntentMetric } from './actionIntents/metrics';
 import { resolveLlmConfigForOrg, type UsableLlmConfig } from './llm/llmConfigResolver';
+import { llmUnusableCode } from './llm/llmAvailability';
 import { resolveLiveSessionToolAuthority } from './aiSessionLiveAuthority';
 
 const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -202,26 +211,17 @@ export async function waitForTurnToSettle(session: ActiveSession, timeoutMs: num
  * How long the shared route helper below waits for a settled turn to conclude
  * (covers the model emitting its closing message) before giving up.
  *
- * KNOWN GAP (#1105-class, flagged in review): all four callers below run
- * inside the request's ambient withDbAccessContext transaction (set up by
- * authMiddleware / clientAiAuthMiddleware / helperAuth), and none of the four
- * routes is registered in middleware/selfManagedDbContextRoutes.ts. This wait
- * does no DB work itself, but it still pins that transaction's pooled
- * connection idle-in-transaction for its full duration — runOutsideDbContext
- * cannot release it (it only re-routes NEW queries to the pool; the
- * connection itself stays checked out by the outer `baseDb.transaction(...)`
- * callback until the whole handler returns). A client that keeps resending
- * a message while a session sits blocked on approval can hold one pooled
- * connection per in-flight request for up to this long — against the prod
- * 25-connection ceiling, that's a real amplification risk under the same
- * class this codebase already fixed for the OIDC/SFTP/notification-test
- * routes (see selfManagedDbContextRoutes.ts). The correct fix is the same
- * one: register these four routes as self-managed and have each wrap its own
- * DB calls in short-lived withDbAccessContext blocks around this wait — out
- * of scope for this change (touches auth/RLS context on four hot routes,
- * needs its own dedicated PR + tests). Kept intentionally short here as an
- * interim bound on the worst case; do not raise this back toward the
- * original 15s without doing that conversion first.
+ * The wait does no DB work, and it must never run inside a held request
+ * transaction: before #3127 all four callers ran it inside the ambient
+ * withDbAccessContext opened by their auth middleware, pinning one pooled
+ * connection idle-in-transaction per resent message for the whole wait (the
+ * #1105 class — runOutsideDbContext cannot release a connection the outer
+ * transaction already holds). The four message-send routes are now registered
+ * in middleware/selfManagedDbContextRoutes.ts and run the wait between two
+ * short contexts; settleBlockedTurnForNewMessage trips
+ * assertOutsideHeldDbContext if a caller regresses that. The 3s bound (cut from
+ * 15s as the interim mitigation) is kept: it is also the user-visible delay
+ * before a still-concluding turn falls back to a 409.
  */
 export const TURN_SETTLE_WAIT_MS = 3_000;
 
@@ -240,12 +240,16 @@ export type BlockedTurnSettleResult =
  * the assistant can answer the new message instead of going mute behind the
  * approval. Used by routes/ai.ts, routes/clientAi/sessions.ts,
  * routes/scriptAi.ts, and routes/helper/index.ts — keep them in sync through
- * this helper, not four hand-rolled copies.
+ * this helper, not four hand-rolled copies. Callers must not hold a DB access
+ * context (see TURN_SETTLE_WAIT_MS).
  */
 export async function settleBlockedTurnForNewMessage(
   session: ActiveSession,
   timeoutMs = TURN_SETTLE_WAIT_MS,
 ): Promise<BlockedTurnSettleResult> {
+  // #3127: checked before settling anything, so a strict-mode trip leaves the
+  // session's approval waits untouched.
+  assertOutsideHeldDbContext('settleBlockedTurnForNewMessage');
   if (!settleApprovalWaits(session)) return 'not_blocked_on_approvals';
   return (await waitForTurnToSettle(session, timeoutMs)) ? 'concluded' : 'still_processing';
 }
@@ -400,6 +404,11 @@ export async function runPreFlightChecks(
       error: 'AI configuration could not be loaded. Try again.',
       status: 503,
     };
+  }
+  // The script builder always runs the Agent SDK; chat can also run on the
+  // platform's OpenAI-compatible provider.
+  if (llmUnusableCode(resolved, session.type === 'script_builder' ? 'agent_sdk' : 'chat') === 'ai_not_configured') {
+    return { ok: false, error: 'ai_not_configured', status: 503 };
   }
   if (resolved.source === 'unavailable') {
     return { ok: false, error: 'ai_unavailable', status: 503 };
@@ -728,6 +737,16 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
     // Reject unknown tools (defense-in-depth — SDK whitelist should already filter)
     if (!TOOL_TIERS[toolName] && !tenant) {
       return { allowed: false, error: `Unknown tool: ${toolName}` };
+    }
+
+    // Topology M4 Task 3 (#6000): the host execution gate for an investigation
+    // turn. The SDK already exposes only topology tools; this re-checks the
+    // allowlist, consumes the six-read budget (refused attempts included) and
+    // re-asserts the live investigation scope BEFORE guardrails run.
+    if (session.topologyTurnSealed) return { allowed: false, error: 'This topology investigation has ended.' };
+    if (session.topologyInvestigation) {
+      const verdict = await session.topologyInvestigation.beforeToolCall(stripMcpPrefix(mcpToolName ?? toolName));
+      if (!verdict.allowed) return { allowed: false, error: verdict.error };
     }
 
     // Allowlist check runs on the EXPOSED name, not the handler name. The two
@@ -1452,6 +1471,12 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
               ...(scriptProposal ? { scriptProposal } : {}),
             });
           } else {
+          // Topology M4-D3 (#6000): the approver must read the PINNED effect —
+          // the server-materialized arguments and approval text the digest
+          // binds — never the model's raw input.
+          const pinnedCard = toolName === 'diagnose_connectivity'
+            ? await loadPinnedApprovalCard(session.orgId, intent.id)
+            : null;
           // Emit approval_required event via session event bus. `intentBacked:
           // true` always means the four-eyes waiting state UNLESS
           // selfApprovalRequestId is also set — in that case the sole-operator
@@ -1491,8 +1516,8 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
             // countdown/progress bar is not pinned to a client-side 5 minutes.
             approvalWindowMs: session.approvalWaitBudgetMs,
             toolName,
-            input,
-            description,
+            input: pinnedCard ? pinnedCard.input : input,
+            description: pinnedCard ? pinnedCard.description : description,
             deviceContext,
             intentBacked: true,
           });
@@ -1736,6 +1761,30 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           // worker failed CLOSED (a recompute never equals `undefined`, so
           // every pinned release would have been content_changed). One
           // predicate, one behavior, in one place.
+          // Mandatory pin (M4-D3): same explicit refusal as the durable worker.
+          if (!hasPinnedDigest(intentRow) && requiresPinnedEffectDigest(intentRow.actionName)) {
+            const requiredCasWon = await transitionIntentAndPublish(
+              intent.id,
+              'failed',
+              { errorCode: 'digest_required' },
+              session.orgId,
+              'intent_failed',
+            );
+            if (!requiredCasWon) {
+              reportLostTerminalCas({
+                intentId: intent.id,
+                orgId: session.orgId,
+                toolName,
+                intendedStatus: 'failed',
+                casLabel: 'ai_sdk_inline_digest_required',
+                executed: false,
+              });
+            }
+            return await failMatchedPlanStep({
+              allowed: false,
+              error: 'This action requires a pinned effect and could not be verified; it was not executed.',
+            });
+          }
           if (hasPinnedDigest(intentRow)) {
             const recomputed = await runOutsideDbContext(() =>
               withSystemDbAccessContext(() =>
@@ -2250,8 +2299,87 @@ export async function attachChatProposalToSession(
   }
 }
 
+/**
+ * Topology M4 Task 3: a tool result inside an investigation turn is model
+ * input only. It never reaches SSE or ai_messages (only a fixed progress
+ * phase does), and the execution audit row records the call without its
+ * site-scoped output — org-level AI analytics are not site-authorized.
+ */
+/**
+ * The stored (immutable) arguments and approval text of a pinned-effect intent
+ * (topology M4-D3). A read failure yields an EMPTY input and a fixed text —
+ * never the model's input — the approval stays bound to the pinned digest
+ * server-side either way.
+ */
+async function loadPinnedApprovalCard(orgId: string, intentId: string): Promise<{ input: Record<string, unknown>; description: string }> {
+  const fallback = { input: {}, description: 'Run one approved topology connectivity check' };
+  try {
+    const [row] = await withDbAccessContext(
+      { scope: 'organization', orgId, accessibleOrgIds: [orgId] },
+      () => db.select({ arguments: actionIntents.arguments, reason: actionIntents.reason })
+        .from(actionIntents).where(eq(actionIntents.id, intentId)).limit(1),
+    );
+    if (!row || !row.arguments || typeof row.arguments !== 'object') return fallback;
+    return { input: row.arguments as Record<string, unknown>, description: typeof row.reason === 'string' && row.reason ? row.reason : fallback.description };
+  } catch (err) {
+    console.error('[AI-SDK] Failed to read the pinned approval effect:', err instanceof Error ? err.message : err);
+    return fallback;
+  }
+}
+
+const TOPOLOGY_RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const TOPOLOGY_RUN_STATES: ReadonlySet<string> = new Set(DIAGNOSTIC_STATES);
+
+/**
+ * The accepted run of an approved `diagnose_connectivity` release, reduced to
+ * id + state (M4 Task 5) so the Explain panel can follow it through the
+ * ordinary site-authorized run route. Anything else — a refusal, an error, a
+ * malformed or extra field — publishes nothing.
+ */
+function approvedTopologyRun(toolName: string, output: string, isError: boolean): { runId: string; state: string } | null {
+  if (toolName !== 'diagnose_connectivity' || isError) return null;
+  const parsed = safeParseJson(output) as { runId?: unknown; state?: unknown } | null;
+  if (!parsed || typeof parsed !== 'object') return null;
+  const { runId, state } = parsed;
+  if (typeof runId !== 'string' || !TOPOLOGY_RUN_ID.test(runId) || typeof state !== 'string' || !TOPOLOGY_RUN_STATES.has(state)) return null;
+  return { runId, state };
+}
+
+async function topologyPostToolUse(session: ActiveSession, toolName: string, input: Record<string, unknown>, output: string, isError: boolean, durationMs: number): Promise<void> {
+  session.pendingTurnToolExecutionCount += 1;
+  const toolUseId = session.toolUseIdQueue.shift();
+  if (toolUseId) session.toolUseNames?.delete(toolUseId);
+  session.eventBus.publish({ type: 'topology_progress', phase: 'analyzing' });
+  const run = approvedTopologyRun(toolName, output, isError);
+  if (run) session.eventBus.publish({ type: 'topology_diagnostic_run', ...run });
+  try {
+    await withDbAccessContext(
+      { scope: 'organization', orgId: session.orgId, accessibleOrgIds: [session.orgId] },
+      () => db.insert(aiToolExecutions).values({
+        sessionId: session.breezeSessionId,
+        toolName,
+        toolInput: redactSensitiveToolInput(input),
+        toolOutput: { topologyInvestigation: true, outputWithheld: true },
+        status: isError ? 'failed' : 'completed',
+        durationMs,
+        completedAt: new Date(),
+      }),
+    );
+  } catch (err) {
+    console.error(`[AI-SDK] Failed to save topology tool execution record for ${toolName}:`, err instanceof Error ? err.message : err);
+  }
+}
+
 export function createSessionPostToolUse(session: ActiveSession): PostToolUseCallback {
   return async (toolName, input, output, isError, durationMs, sealed, handoff) => {
+    // A timed-out topology turn (C1): its gate is gone, so a tool that was
+    // still in flight must not fall through to the generic path and persist
+    // its raw output.
+    if (session.topologyTurnSealed) return;
+    if (session.topologyInvestigation) {
+      await topologyPostToolUse(session, toolName, input, output, isError, durationMs);
+      return;
+    }
     // Count this tool call toward the turn's tool_execution_count rollup
     // (consumed by streamingSessionManager's `result` handler) regardless of
     // whether the DB writes below succeed — postToolUse only fires for a tool
@@ -2755,8 +2883,22 @@ function matchPlanStep(
 /**
  * Abort the active plan for a session. Updates DB status to 'aborted',
  * emits plan_complete event, and clears session plan state.
+ *
+ * If the plan is still waiting for approval, the pending approval is settled
+ * as rejected FIRST, synchronously and before any await (#7085). Otherwise
+ * the `waitForPlanApproval` resolver stays live on the session and a later
+ * `POST /ai/sessions/:id/approve-plan` resolves it with `true` — and the agent
+ * runs the plan the user aborted (or paused). Doing it before the DB write
+ * also closes the window where an approve lands while the abort write is
+ * still in flight.
  */
 export async function abortActivePlan(session: ActiveSession): Promise<boolean> {
+  const resolver = session.planApprovalResolver;
+  if (resolver) {
+    session.planApprovalResolver = null;
+    resolver(false);
+  }
+
   const planId = session.activePlanId;
   if (!planId) return false;
 

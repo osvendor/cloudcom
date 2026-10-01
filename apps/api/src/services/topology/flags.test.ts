@@ -24,6 +24,7 @@ import {
   getTopologyCapabilities,
   loadTopologyFlags,
   resolveTopologyFlags,
+  topologyPhysicalExposed,
   withResolvedTopologyFlags,
   type TopologyRequestContextLike,
 } from './flags';
@@ -234,8 +235,8 @@ describe('topology capabilities', () => {
         physical: true,
         interfaceHealth: true,
         diagnostics: true,
-        ai: true,
       },
+      true,
     );
 
     expect(capabilities.collection).toEqual({ available: true, reason: null });
@@ -243,6 +244,31 @@ describe('topology capabilities', () => {
     expect(capabilities.interfaceHealth).toEqual({ available: true, reason: null });
     expect(capabilities.diagnostics).toEqual({ available: true, reason: null });
     expect(capabilities.ai).toEqual({ available: true, reason: null });
+  });
+
+  it('derives AI readiness from the policy argument, never an agent capability (M4-D4)', () => {
+    expect(getTopologyCapabilities(allFlags, true, {}).ai).toEqual({ available: false, reason: 'ai_unavailable' });
+    expect(getTopologyCapabilities(allFlags, true, {}, true).ai).toEqual({ available: true, reason: null });
+    expect(getTopologyCapabilities({ ...allFlags, ai: false }, true, {}, true).ai).toEqual({ available: false, reason: 'ai_disabled' });
+  });
+
+  it('names a server with no model provider as ai_not_configured, behind the flags', () => {
+    expect(getTopologyCapabilities(allFlags, true, {}, false, true).ai).toEqual({ available: false, reason: 'ai_not_configured' });
+    expect(getTopologyCapabilities({ ...allFlags, ai: false }, true, {}, false, true).ai).toEqual({ available: false, reason: 'ai_disabled' });
+    expect(getTopologyCapabilities({ ...allFlags, materialization: false }, true, {}, false, true).ai).toEqual({ available: false, reason: 'materialization_disabled' });
+  });
+});
+
+describe('physical exposure (D9/D15.4)', () => {
+  const base = resolveTopologyFlags({});
+  it('is the deployed capability materialization && physical, independent of collectors', () => {
+    expect(topologyPhysicalExposed({ ...base, materialization: true, physical: true })).toBe(true);
+    expect(topologyPhysicalExposed({ ...base, materialization: true, physical: false })).toBe(false);
+    expect(topologyPhysicalExposed({ ...base, materialization: false, physical: true })).toBe(false);
+  });
+  it('reports the settings capability from the same predicate', () => {
+    const capabilities = getTopologyCapabilities({ ...base, materialization: true, physical: true }, true, { physical: topologyPhysicalExposed({ ...base, materialization: true, physical: true }) });
+    expect(capabilities.physical).toEqual({ available: true, reason: null });
   });
 });
 

@@ -44,7 +44,8 @@ Get-AuthenticodeSignature "C:\Program Files\Breeze Helper\breeze-helper.exe" | F
 ```
 
 ```bash
-# macOS agent
+# macOS agent (runs from /usr/local/bin/breeze-agent on most Macs; from
+# /Library/Breeze/bin/breeze-agent if it moved there -- see macOS Permissions)
 codesign --verify --deep --strict --verbose=2 /usr/local/bin/breeze-agent
 spctl --assess --type execute --verbose /usr/local/bin/breeze-agent
 ```
@@ -85,7 +86,7 @@ Use the platform sections below to unblock the fleet while the vendor submission
 | OS | Default Path |
 |---|---|
 | Linux | `/usr/local/bin/breeze-agent` |
-| macOS | `/usr/local/bin/breeze-agent` |
+| macOS | `/usr/local/bin/breeze-agent` on most Macs; `/Library/Breeze/bin/breeze-agent` if the agent has moved there (see [macOS Permissions](/agents/macos-permissions/#agent-path-usrlocalbin-or-librarybreezebin)) -- exclude both paths |
 | Windows | `C:\Program Files\Breeze\breeze-agent.exe` |
 
 ### Companion Windows Executables
@@ -255,7 +256,8 @@ For MDM-managed fleets, deploy the binary via your MDM profile to bypass Gatekee
 XProtect performs signature-based malware checks. It does not typically flag custom Go binaries, but if it does:
 
 ```bash
-# Check if the binary is quarantined
+# Check if the binary is quarantined (use /Library/Breeze/bin/breeze-agent
+# instead if the agent has moved there -- see macOS Permissions)
 xattr -l /usr/local/bin/breeze-agent
 
 # Remove all extended attributes
@@ -268,8 +270,9 @@ For products like CrowdStrike, SentinelOne, or Jamf Protect, add these exclusion
 
 | Exclusion Type | Value |
 |---|---|
-| Process | `/usr/local/bin/breeze-agent` |
+| Process | `/usr/local/bin/breeze-agent` and `/Library/Breeze/bin/breeze-agent` (the agent runs from one or the other depending on the Mac -- see [macOS Permissions](/agents/macos-permissions/#agent-path-usrlocalbin-or-librarybreezebin)) |
 | Process | `/Applications/Breeze Helper.app/Contents/MacOS/breeze-helper` |
+| Directory | `/Library/Breeze/bin/` (only needed if the agent runs from there; do not exclude all of `/usr/local/bin/`, since that directory holds unrelated binaries too) |
 | Directory | `/Library/Application Support/Breeze/` |
 | Directory | `/Applications/Breeze Helper.app/` |
 | Directory | `/etc/breeze/` (if symlinked) |
@@ -408,10 +411,12 @@ For quick reference, here are the minimum exclusions needed per platform:
   </TabItem>
   <TabItem label="macOS">
     **Processes:**
-    - `/usr/local/bin/breeze-agent`
+    - `/usr/local/bin/breeze-agent` (most Macs)
+    - `/Library/Breeze/bin/breeze-agent` (Macs where the agent has moved -- see [macOS Permissions](/agents/macos-permissions/#agent-path-usrlocalbin-or-librarybreezebin))
     - `/Applications/Breeze Helper.app/Contents/MacOS/breeze-helper`
 
     **Directories:**
+    - `/Library/Breeze/bin/` (only if the agent runs from there)
     - `/Library/Application Support/Breeze/`
     - `/Applications/Breeze Helper.app/`
   </TabItem>

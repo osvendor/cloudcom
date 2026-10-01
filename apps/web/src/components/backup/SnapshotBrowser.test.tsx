@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import SnapshotBrowser from './SnapshotBrowser';
@@ -154,6 +154,21 @@ describe('SnapshotBrowser', () => {
     render(<SnapshotBrowser />);
 
     await screen.findByText('report.txt');
+    // `findByText` resolves as soon as the browse-load commit reaches the DOM,
+    // but that same commit also schedules SnapshotBrowser's selection-reset
+    // effect (keyed on the newly-loaded tree id — see the comment above
+    // `restoreLinkSnapshotId` in SnapshotBrowser.tsx). That effect is a
+    // passive effect and isn't guaranteed to have run yet: under CI load it
+    // can still be pending here, and if it fires *after* the click below it
+    // clobbers the selection an instant after it was set. Flushing a
+    // macrotask first lets that effect settle before we interact, so the
+    // click always lands after the reset instead of racing it. Confirmed as
+    // the real failure mode from CI (run 36269173200, attempt 1): the
+    // captured href was `#restore?snapshot=snap-1` with no `paths=` at all —
+    // the click never stuck.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
     fireEvent.click(screen.getByLabelText('Select report.txt'));
 
     const link = screen.getByTestId('snapshot-browser-restore-link');
@@ -204,6 +219,67 @@ describe('SnapshotBrowser', () => {
 
     expect(await screen.findByText(/Provider immutability was requested by policy/i)).toBeTruthy();
     expect(screen.getByText(/Bucket object lock no longer enabled/i)).toBeTruthy();
+  });
+
+  it('names the device in the snapshot picker and the details card', async () => {
+    const base = {
+      createdAt: '2026-03-31T00:00:00Z',
+      sizeBytes: 1048576,
+      fileCount: 5,
+      location: null,
+      expiresAt: null,
+      legalHold: false,
+      legalHoldReason: null,
+      isImmutable: false,
+      immutableUntil: null,
+      immutabilityEnforcement: null,
+      requestedImmutabilityEnforcement: null,
+      immutabilityFallbackReason: null,
+    };
+    fetchMock.mockImplementationOnce(async () => makeJsonResponse({
+      data: [
+        { ...base, id: 'snap-1', label: 'Nightly', deviceName: 'Mac Mini' },
+        { ...base, id: 'snap-2', label: 'Whole machine', backupType: 'system_image', deviceName: 'SRV01' },
+      ],
+    }));
+
+    render(<SnapshotBrowser />);
+
+    expect(await screen.findByRole('option', { name: 'Mac Mini — Nightly' })).toBeTruthy();
+    expect(screen.getByRole('option', { name: 'SRV01 — Whole machine — System image' })).toBeTruthy();
+    expect((await screen.findByTestId('snapshot-device-name')).textContent).toBe('Mac Mini');
+  });
+
+  it('labels the storage location in the details card', async () => {
+    render(<SnapshotBrowser />);
+
+    await screen.findByText(/Snapshot Details/i);
+    const location = screen.getByTestId('snapshot-location');
+    expect(location.textContent).toContain('Location:');
+    expect(location.textContent).toContain('snapshots/provider-snap-1');
+  });
+
+  it('says the file index is unavailable (not "still processing") when the API reports manifestUnavailable', async () => {
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input) === '/backup/snapshots/snap-1/browse') {
+        return makeJsonResponse({ snapshotId: 'snap-1', manifestUnavailable: true, data: [] });
+      }
+      return base(input, init);
+    });
+
+    render(<SnapshotBrowser />);
+
+    expect(await screen.findByText(/file index isn't available/i)).toBeTruthy();
+    expect(screen.queryByText(/may still be processing/i)).toBeNull();
+  });
+
+  it('gives the snapshot picker and the immutability select accessible names', async () => {
+    render(<SnapshotBrowser />);
+
+    await screen.findByText(/Protection Controls/i);
+    expect(screen.getByRole('combobox', { name: 'Snapshot' })).toBeTruthy();
+    expect(screen.getByRole('combobox', { name: 'Immutability enforcement' })).toBeTruthy();
   });
 
   it('badges a system_image snapshot with its backup type', async () => {

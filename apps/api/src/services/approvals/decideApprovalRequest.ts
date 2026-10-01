@@ -34,6 +34,7 @@ import {
   isAgentIntentDecideAuthorized,
   isOrgWideGovernanceIntent,
 } from '../actionIntents/intentApprovers';
+import { isSoleOperatorSelfApprovalForbidden } from '../actionIntents/selfApprovalPolicy';
 import { buildAuthContextForIntent } from '../actionIntents/actorContext';
 import {
   effectiveTargetDeviceId,
@@ -51,6 +52,11 @@ import { PERMISSION_GRANTS, requiredAssurance, type RiskTier, type ApprovalProof
 import { scriptProposals } from '../../db/schema/scriptProposals';
 import { loadProposalRow } from '../scriptProposals/queries';
 import { resolveStrictAcknowledgement } from './strictAcknowledgement';
+import {
+  FRESH_APPROVER_FACTOR_MIN_LEVEL,
+  isFreshApproverFactor,
+  requiresFreshApproverFactor,
+} from '../actionIntents/freshApproverFactor';
 
 /**
  * The approvals DECIDE core (P2-2 #4189), lifted verbatim out of
@@ -282,6 +288,9 @@ export function serialize(
     expiresAt: r.expiresAt.toISOString(),
     decidedAt: r.decidedAt?.toISOString() ?? null,
     decisionReason: r.decisionReason ?? null,
+    // Set on a `denied` row whose approver approved but the server refused
+    // it (see approvalRequests.refusalReason).
+    refusalReason: r.refusalReason ?? null,
     executionId: r.executionId ?? null,
     intentId: r.intentId ?? null,
     approvalScope,
@@ -436,7 +445,7 @@ async function redeemGrantForDecide(input: {
   if (isApprove && decision.decidedAssuranceLevel < decision.requiredLevel) {
     // An ENFORCING partner whose floor now outranks what the grant proves:
     // refuse, so the operator runs a ceremony that can actually clear it.
-    if (isEnforcing(policy, new Date())) return null;
+    if (isEnforcing(policy, new Date(), input.riskTier)) return null;
     decision.graceDowngrade = true;
   }
   return decision;
@@ -884,6 +893,28 @@ export async function decideApprovalRequest(
         // WebAuthn challenge. Gated to `approved` only — a deny stays available
         // in every case, since denying only cancels the action.
         if (linkedIntent.requestedByUserId === userId) {
+          // A PAM elevation intent can never be
+          // self-approved, even by a genuine sole operator. The fan-out never
+          // creates the requester-owned row for these; this refuses anyway.
+          if (isSoleOperatorSelfApprovalForbidden(linkedIntent.actionName)) {
+            recordActionIntentEvent({
+              orgId: linkedIntent.orgId,
+              intentId: linkedIntent.id,
+              actionName: linkedIntent.actionName,
+              argumentDigest: linkedIntent.argumentDigest,
+              source: linkedIntent.source,
+              outcome: 'approver_unauthorized',
+              actorId: userId,
+              details: { approvalId: existing.id, errorCode: 'self_approval_forbidden' },
+            });
+            return {
+              httpStatus: 403,
+              body: {
+                error: 'self_approval_forbidden',
+                message: 'This action needs an approver other than the person who requested it.',
+              },
+            };
+          }
           // Review finding #3: the SAME filters the fan-out applied
           // (intentService.ts) — not just the org-wide-governance ceiling, but
           // ALSO the STRICT-proposal `alsoRequire: scripts:write` narrowing
@@ -1029,10 +1060,16 @@ export async function decideApprovalRequest(
   // single-use WebAuthn challenge / mobile nonce cannot be consumed again per
   // row. Nothing else about this handler changes; see `preverifiedAssurance`
   // on `DecideApprovalInput` for the full list of gates that still run.
-  const isPartnerEnforcingForSupervised =
-    !input.preverifiedAssurance && isSupervisedSelfDecide && status === 'approved'
-      ? isEnforcing(await loadPartnerPolicy(input.auth.partnerId ?? null), new Date())
-      : false;
+  const checksSupervisedPolicy =
+    !input.preverifiedAssurance && isSupervisedSelfDecide && status === 'approved';
+  // Kept (not just the boolean) so the plain-click shortcut below can apply
+  // the partner's raise-only floor when it records a grace downgrade.
+  const supervisedPartnerPolicy = checksSupervisedPolicy
+    ? await loadPartnerPolicy(input.auth.partnerId ?? null)
+    : null;
+  const isPartnerEnforcingForSupervised = checksSupervisedPolicy
+    ? isEnforcing(supervisedPartnerPolicy, new Date(), existing.riskTier as RiskTier)
+    : false;
   // #5601: a presented grant suppresses the shortcut for the same reason a
   // presented proof does — a credential the caller offered must be ADJUDICATED
   // (accepted, or refused with 403), never silently dropped on the floor while
@@ -1049,6 +1086,20 @@ export async function decideApprovalRequest(
     assurance = input.preverifiedAssurance;
   } else if (skipAssuranceLadder) {
     assurance = resolveApprovalAssurance(existing.riskTier as RiskTier);
+    if (status === 'approved') {
+      // The shortcut only runs when the partner is NOT enforcing, so an
+      // approve below the (partner-raised) floor is exactly the ladder's
+      // "under-assured but allowed" case. Flag it the same way so the
+      // downgrade is recorded explicitly rather than only being derivable
+      // from level < floor. The recorded level/factor are untouched.
+      assurance.requiredLevel = requiredAssurance(
+        existing.riskTier as RiskTier,
+        supervisedPartnerPolicy?.floorOverrides ?? null,
+      );
+      if (assurance.decidedAssuranceLevel < assurance.requiredLevel) {
+        assurance.graceDowngrade = true;
+      }
+    }
   } else if (presentedGrantId !== undefined && proof === undefined && status === 'approved') {
     // #5601 REDEEM PATH. Replaces the ceremony, never the authorization: every
     // other gate in this handler (human principal, row pending/expiry, live
@@ -1161,6 +1212,40 @@ export async function decideApprovalRequest(
     }
   }
 
+  // Topology M4-D3 (#6000): a tool listed in FRESH_APPROVER_FACTOR_TOOLS is
+  // approved only with a hardware-backed factor assertion (>= L3) made for
+  // THIS decision — not a supervised session tap, not a reused step-up grant.
+  // The release path re-reads exactly this recorded factor instead of trusting
+  // any session `mfa` claim (a durable release's rebuilt auth synthesizes one).
+  // Approve-only: a deny is never blocked. Checked BEFORE the CAS so an
+  // under-assured approve never flips the row; the client runs the ceremony on
+  // `step_up_required` and retries.
+  if (
+    linkedIntent
+    && status === 'approved'
+    && requiresFreshApproverFactor(linkedIntent.actionName)
+    && !isFreshApproverFactor({
+      decidedVia: assurance.decidedVia,
+      decidedAssuranceLevel: assurance.decidedAssuranceLevel,
+      stepUpGrantReuse: assurance.stepUpGrantReuse === true,
+    })
+  ) {
+    recordActionIntentEvent({
+      orgId: linkedIntent.orgId,
+      intentId: linkedIntent.id,
+      actionName: linkedIntent.actionName,
+      argumentDigest: linkedIntent.argumentDigest,
+      source: linkedIntent.source,
+      outcome: 'approver_unauthorized',
+      actorId: userId,
+      details: { approvalId: existing.id, errorCode: 'fresh_mfa_required' },
+    });
+    return {
+      httpStatus: 403,
+      body: { error: 'step_up_required', requiredLevel: FRESH_APPROVER_FACTOR_MIN_LEVEL, reason: 'fresh_mfa_required' },
+    };
+  }
+
   // Task 6: the ENTIRE decision write — approval-row CAS, the ai_tool_executions
   // mirror, and the action-intents fan-in (intent CAS + release_by stamp +
   // sibling expiry + intent_approved outbox insert) — commits as ONE
@@ -1186,7 +1271,9 @@ export async function decideApprovalRequest(
         lostRace: false;
         updated: typeof approvalRequests.$inferSelect;
         wonIntent: boolean;
-        enforcementStatus: 'pending_dispatch' | 'cleanup_pending' | null;
+        enforcementStatus: 'pending_dispatch' | 'cleanup_pending' | 'refused' | null;
+        /** Set with enforcementStatus 'refused': why the approve did not take effect. */
+        refusalReason: string | null;
       };
 
   let writeResult: DecideWriteResult;
@@ -1258,9 +1345,10 @@ export async function decideApprovalRequest(
             // was written), and the caller gets a plain 409 below.
             return { lostRace: true };
           }
-          const updated = casRows[0]!;
+          let updated = casRows[0]!;
 
-          let enforcementStatus: 'pending_dispatch' | 'cleanup_pending' | null = null;
+          let enforcementStatus: 'pending_dispatch' | 'cleanup_pending' | 'refused' | null = null;
+          let refusalReason: string | null = null;
           if (updated.elevationRequestId) {
             const now = new Date();
             const expiresAt = status === 'approved'
@@ -1316,6 +1404,11 @@ export async function decideApprovalRequest(
                   source: 'mobile_approval',
                   approval_request_id: updated.id,
                   ...(status === 'denied' && reason ? { reason } : {}),
+                  // Inline literal, not a helper spread: the elevation_audit
+                  // writer inventory (pamAuditExport) reads these keys statically.
+                  ...(assurance.graceDowngrade
+                    ? { assurance_downgraded_grace: true, required_assurance_level: assurance.requiredLevel }
+                    : {}),
                 },
                 occurredAt: now,
               });
@@ -1332,9 +1425,34 @@ export async function decideApprovalRequest(
                 decision: status,
                 expiresAt,
               });
-              enforcementStatus = actuation.desiredState === 'active'
-                ? 'pending_dispatch'
-                : 'cleanup_pending';
+              enforcementStatus = actuation.refusalReason
+                ? 'refused'
+                : actuation.desiredState === 'active'
+                  ? 'pending_dispatch'
+                  : 'cleanup_pending';
+              refusalReason = actuation.refusalReason ?? null;
+
+              // The approve was refused and the elevation is now denied, so
+              // this row must not read as approved to anyone who reads it (the
+              // mobile app and the inbox's Recent panel read `status`). Same
+              // transaction, and the CAS above already holds this row's lock.
+              // decided_* keep recording the approver's approve;
+              // refusal_reason is what marks it as refused rather than denied
+              // by the approver.
+              if (refusalReason && status === 'approved') {
+                const [refused] = await tx
+                  .update(approvalRequests)
+                  .set({ status: 'denied', refusalReason })
+                  .where(and(eq(approvalRequests.id, updated.id), eq(approvalRequests.status, 'approved')))
+                  .returning();
+                if (!refused) {
+                  // Unreachable: this transaction wrote 'approved' to the row
+                  // and holds its lock. Roll back rather than commit an
+                  // approval row that reads as approved.
+                  throw new Error(`refused approve could not be stored on approval ${updated.id}`);
+                }
+                updated = refused;
+              }
 
               await tx
                 .update(approvalRequests)
@@ -1482,7 +1600,7 @@ export async function decideApprovalRequest(
             }
           }
 
-          return { lostRace: false, updated, wonIntent, enforcementStatus };
+          return { lostRace: false, updated, wonIntent, enforcementStatus, refusalReason };
         }),
       ),
     );
@@ -1495,7 +1613,7 @@ export async function decideApprovalRequest(
     return { httpStatus: 409, body: { error: 'Already decided', finalStatus: 'expired' } };
   }
 
-  const { updated, wonIntent, enforcementStatus } = writeResult;
+  const { updated, wonIntent, enforcementStatus, refusalReason } = writeResult;
 
   // Action intents (spec §4 / §3.4): post-commit audit/metrics projection for
   // the intent fan-in that already committed (or rolled back) as part of the
@@ -1532,6 +1650,11 @@ export async function decideApprovalRequest(
         decidedAssuranceLevel: assurance.decidedAssuranceLevel,
         decidedVia: assurance.decidedVia,
         ...(supervisedSelfApproval ? { approvalMethod: 'supervised_self' as const } : {}),
+        // Approved below the required floor because the partner is not
+        // enforcing approver assurance (off, or inside its grace window).
+        ...(assurance.graceDowngrade
+          ? { assuranceDowngradedGrace: true, requiredAssuranceLevel: assurance.requiredLevel }
+          : {}),
         // #5601: a redeemed row keeps the honest level/factor above (they
         // describe a real ceremony), so THIS is the only thing that says a
         // second ceremony did not happen. Emitted only on reuse, so a fresh
@@ -1602,6 +1725,9 @@ export async function decideApprovalRequest(
         decidedTargetRef?.orgId ?? null,
       ),
       ...(enforcementStatus ? { enforcementStatus } : {}),
+      // The approve was refused (the linked elevation is now denied): the
+      // approver's client shows this instead of reporting an approval.
+      ...(refusalReason ? { reason: refusalReason } : {}),
       // #5601: present only when a genuine ceremony just minted one. The
       // client caches it and presents it on the next approve in this window
       // instead of prompting for another passkey scan.

@@ -23,6 +23,7 @@ import {
   ChevronsLeft,
   ChevronsDownUp,
   ShieldCheck,
+  ClipboardList,
   KeyRound,
   LayoutTemplate,
   Package,
@@ -60,6 +61,7 @@ import {
   TrendingUp,
   Power,
   ServerCog,
+  Inbox,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useUiStore } from '../../stores/uiStore';
@@ -68,7 +70,7 @@ import { SIDEBAR_CYCLE_MODE_EVENT } from '../../lib/keyboard/useGlobalShortcuts'
 import type { PermissionGrant } from '@breeze/shared';
 import { fetchWithAuth, useAuthStore } from '../../stores/auth';
 import { SERVICE_MANAGEMENT_MODES, useOrgStore, type ServiceManagementMode } from '../../stores/orgStore';
-import { useToolSourcesGate } from '../../stores/featuresStore';
+import { useToolSourcesGate, usePreAssignmentGate } from '../../stores/featuresStore';
 import { isNavGateVisible } from '../../lib/navGates';
 import { sidebarSettingsEntries } from '../../lib/settingsCatalog';
 import { WEB_VERSION } from '../../lib/version';
@@ -167,6 +169,7 @@ type NavItem = {
   requiresAiForOffice?: boolean;
   /** #5216 W01: gated on the SERVER's TOOL_SOURCES_ENABLED via /config. */
   requiresToolSources?: boolean;
+  requiresPreAssignment?: boolean;
   // Hidden unless the user holds this permission (e.g. billing nav gated on
   // invoices:read). UX only — the route still enforces it server-side. While
   // the permission set is still loading, the item stays hidden. Typed as the
@@ -185,6 +188,10 @@ type NavItem = {
   requiresModule?: 'service_management';
   children?: readonly { name: string; href: string }[];
   loading?: boolean;
+  // Hidden unless the user may administer partner-wide state (see navGates.ts).
+  requiresPartnerWideAdmin?: boolean;
+  // Additional permissions the user must all hold (see navGates.ts).
+  alsoRequiredPermissions?: readonly PermissionGrant[];
 };
 
 // ---------------------------------------------------------------------------
@@ -270,12 +277,18 @@ export const navSections: NavSection[] = [
     // Everything here reads/writes device state, gated on devices:read server-side.
     items: [
       { name: 'Device Groups', labelKey: 'nav.deviceGroups', href: '/devices/groups', icon: LayoutGrid, requiredPermission: { resource: 'devices', action: 'read' } },
+      // Parked devices waiting for assignment — full partner admins only; the
+      // pre-assignment routes also require devices:write and organizations:write.
+      { name: 'Unassigned Devices', labelKey: 'nav.unassignedDevices', href: '/devices/unassigned', icon: Inbox, partnerScopeOnly: true, requiresPreAssignment: true, requiresPartnerWideAdmin: true, requiredPermission: { resource: 'devices', action: 'write' }, alsoRequiredPermissions: [{ resource: 'organizations', action: 'write' }] },
       { name: 'Config Policies', labelKey: 'nav.configPolicies', href: '/configuration-policies', icon: Layers, requiredPermission: { resource: 'devices', action: 'read' } },
-      // One page with Inventory + Policies tabs; /software-inventory and
-      // /software-policies are aliases (see pathAliases).
+      // Three distinct pages: /software is the catalog (Catalog + Deployments),
+      // /software-inventory and /software-policies mount SoftwarePage (#7123).
       { name: 'Software', labelKey: 'nav.software', href: '/software', icon: Package, requiredPermission: { resource: 'devices', action: 'read' } },
-      // #5288 — the Monitoring hub: Network today, Monitors (W02) and Delivery tabs.
-      { name: 'Network Monitor', labelKey: 'nav.networkMonitor', href: '/monitoring', icon: Activity, requiredPermission: { resource: 'devices', action: 'read' } },
+      { name: 'Software Inventory', labelKey: 'nav.softwareInventory', href: '/software-inventory', icon: ClipboardList, requiredPermission: { resource: 'devices', action: 'read' } },
+      { name: 'Software Policies', labelKey: 'nav.softwarePolicies', href: '/software-policies', icon: ShieldCheck, requiredPermission: { resource: 'devices', action: 'read' } },
+      // The Network page: assets, SNMP templates and check results;
+      // checks are authored under Alerts → Monitors (W05e).
+      { name: 'Network', labelKey: 'nav.networkMonitor', href: '/monitoring', icon: Activity, requiredPermission: { resource: 'devices', action: 'read' } },
       { name: 'Network Discovery', labelKey: 'nav.networkDiscovery', href: '/discovery', icon: Network, requiredPermission: { resource: 'devices', action: 'read' } },
       { name: 'OneDrive', labelKey: 'nav.oneDrive', href: '/onedrive', icon: Cloud, requiredPermission: { resource: 'devices', action: 'read' } },
     ],
@@ -362,6 +375,7 @@ export const navSections: NavSection[] = [
       // Fleet migration/decommission posture report (#3244) — backed by
       // GET /devices/management-posture/summary, which enforces devices:read.
       { name: 'Fleet Posture', labelKey: 'nav.fleetPosture', href: '/devices/posture', icon: Radar, requiredPermission: { resource: 'devices', action: 'read' } },
+      { name: 'Time Sync', labelKey: 'nav.timeSync', href: '/devices/time', icon: Radar, requiredPermission: { resource: 'devices', action: 'read' } },
       { name: 'Audit Trail', labelKey: 'nav.auditTrail', href: '/audit', icon: FileText, requiredPermission: { resource: 'audit', action: 'read' } },
       { name: 'Event Logs', labelKey: 'nav.eventLogs', href: '/logs', icon: ScrollText, requiredPermission: { resource: 'audit', action: 'read' } },
     ],
@@ -471,8 +485,6 @@ const allNavItems: NavItem[] = [
 
 // Path aliases (highlight a different nav item for certain paths)
 const pathAliases: Record<string, string> = {
-  '/software-inventory': '/software',
-  '/software-policies': '/software',
   // The Agreements nav item points at the Templates tab; the Signed tab is a
   // sibling route, not a child, so prefix matching would leave the item
   // unhighlighted there.
@@ -585,6 +597,7 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
   const navScrollRef = useSidebarScrollPersist();
   const isPlatformAdmin = useAuthStore((s) => s.user?.isPlatformAdmin === true);
   const permissions = useAuthStore((s) => s.user?.permissions);
+  const canManagePartnerWide = useAuthStore((s) => s.user?.canManagePartnerWide);
 
   // Runtime-extension navigation (see the comment above `navSections`).
   // `useExtensionNavigation` never throws — an empty list here (registry
@@ -620,6 +633,7 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
   // #5216 W01 — the server kill switch, read from /config through the shared
   // features store (the same one registration/aiOperatorTasks use).
   const { enabled: toolSourcesEnabled } = useToolSourcesGate();
+  const { enabled: preAssignmentEnabled } = usePreAssignmentGate();
   // #5075 W04 — persisted, so the first paint after a reload already has the
   // right sections; the /orgs/partners/me effect below refreshes it.
   const serviceManagementMode = useOrgStore((state) => state.serviceManagementMode);
@@ -835,8 +849,10 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
       permissions,
       getScope: () => getJwtClaims().scope,
       toolSourcesEnabled,
+      preAssignmentEnabled,
       aiForOfficeEnabled,
       serviceManagementMode,
+      canManagePartnerWide,
     });
 
   const renderNavItem = (item: NavItem, forMobileOverlay = false) => {
@@ -1031,7 +1047,7 @@ export default function Sidebar({ currentPath: initialPath = '/' }: SidebarProps
         ) : (
           <button
             onClick={() => toggleSection(section.id)}
-            className="flex items-center justify-between w-full px-2 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground/70 hover:text-muted-foreground cursor-pointer transition-colors"
+            className="flex items-center justify-between w-full px-2 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground cursor-pointer transition-colors"
             style={{ fontSize: '12px' }}
           >
             <span>{section.labelKey ? t(/* i18n-dynamic */ section.labelKey, { defaultValue: section.label }) : section.label}</span>

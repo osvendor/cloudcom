@@ -31,7 +31,6 @@
     "alertsDetail": "Detalles de la alerta",
     "alertsMonitors": "Alertas – Monitores",
     "alertsMonitorDetail": "Alertas – Monitor",
-    "alertsRules": "Alertas – Reglas heredadas",
     "alerts": "Alertas",
     "analytics": "Analítica",
     "approvals": "Aprobaciones",
@@ -61,6 +60,7 @@
     "contractsNew": "Nuevo contrato",
     "devicesCompare": "Comparación de dispositivos",
     "devicesGroups": "Grupos de dispositivos",
+    "devicesUnassigned": "Dispositivos sin asignar",
     "devicesDetail": "Detalles del dispositivo",
     "devices": "Dispositivos y activos",
     "devicesNetworkDetail": "Detalles del dispositivo de red",
@@ -79,7 +79,7 @@
     "integrationsWebhooks": "Webhooks",
     "login": "Iniciar sesión",
     "logs": "Registros",
-    "monitoring": "Monitoreo",
+    "monitoring": "Red",
     "oauthConsent": "Autorizar acceso",
     "onedrive": "OneDrive",
     "organizations": "Organizaciones",
@@ -108,6 +108,7 @@
     "reportsDetailEdit": "Editar informe",
     "reports": "Informes",
     "reportsNew": "Crear informe",
+    "reportsSeriesEdit": "Editar informe multiorganización",
     "reportsTemplates": "Plantillas de informes",
     "resetPassword": "Restablecer contraseña",
     "scriptsDetail": "Editar script",
@@ -169,7 +170,8 @@
     "agreementTemplateNew": "Nueva plantilla de acuerdo",
     "signedAgreements": "Acuerdos firmados",
     "settingsTicketing": "Configuración de tickets",
-    "securityScans": "Escaneos de IOC"
+    "securityScans": "Escaneos de IOC",
+    "devicesTime": "Sincronización de hora"
   },
   "layout": {
     "metaDescription": "Breeze RMM - Monitoreo y Gestión Remota",

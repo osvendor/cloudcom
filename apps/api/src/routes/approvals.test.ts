@@ -1730,7 +1730,16 @@ describe('#1254 PAM mobile bridge: mirror decision back to elevation', () => {
     // audit, and sibling expiry.
     const casReturning = vi.fn().mockResolvedValue([updatedRow]);
     const casSet = vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ returning: casReturning }) });
-    const siblingExpireSet = vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) });
+    // Every later approval_requests write in the transaction: the refusal
+    // write-back (awaited through `.returning()`, echoing the row with the
+    // written values) and the sibling expiry (awaited bare).
+    const siblingExpireSet = vi.fn((values: Record<string, unknown>) => ({
+      where: vi.fn(() =>
+        Object.assign(Promise.resolve(undefined), {
+          returning: vi.fn().mockResolvedValue([{ ...updatedRow, ...values }]),
+        }),
+      ),
+    }));
     let updateCall = 0;
     const mainTx = {
       update: vi.fn(() => {
@@ -1769,6 +1778,108 @@ describe('#1254 PAM mobile bridge: mirror decision back to elevation', () => {
     // user's request context, so the write must be system-scoped.
     expect(siblingExpireSet).toHaveBeenCalledWith(expect.objectContaining({ status: 'expired' }));
     expect(pamLifecycleMocks.createPamDecisionIntent).toHaveBeenCalledOnce();
+  });
+
+  it('an approve refused for an unverifiable target reports refused with the reason', async () => {
+    const refusal = 'Target identity could not be verified on the device; re-request elevation.';
+    mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+    mockElevationTx([{ id: 'elev-1', orgId: 'org-9', deviceId: 'dev-1', revision: 1 }]);
+    pamLifecycleMocks.createPamDecisionIntent.mockResolvedValueOnce({
+      actuationId: '',
+      elevationRequestId: 'elev-1',
+      requestRevision: 1,
+      generation: 0,
+      desiredState: 'cleanup',
+      refusalReason: refusal,
+    });
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.enforcementStatus).toBe('refused');
+    // The client has nothing else to show the approver why their approve did
+    // not take effect.
+    expect(body.reason).toBe(refusal);
+  });
+
+  // The approval row itself must say the approve did not take effect: the
+  // mobile app and the inbox's Recent panel read `approval.status`, not
+  // `enforcementStatus`.
+  it('an approve refused for an unverifiable target is stored and returned as denied, with the refusal reason', async () => {
+    const refusal = 'Target identity could not be verified on the device; re-request elevation.';
+    const { siblingExpireSet } = mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+    mockElevationTx([{ id: 'elev-1', orgId: 'org-9', deviceId: 'dev-1', revision: 1 }]);
+    pamLifecycleMocks.createPamDecisionIntent.mockResolvedValueOnce({
+      actuationId: '',
+      elevationRequestId: 'elev-1',
+      requestRevision: 1,
+      generation: 0,
+      desiredState: 'cleanup',
+      refusalReason: refusal,
+    });
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+
+    // Written in the decide transaction: the row leaves 'approved' for
+    // 'denied' and records why.
+    expect(siblingExpireSet).toHaveBeenCalledWith({ status: 'denied', refusalReason: refusal });
+    expect(body.approval.status).toBe('denied');
+    expect(body.approval.refusalReason).toBe(refusal);
+    // The approver's own decision stays on the row: who (the row's user) and
+    // when. `decisionReason` is the approver's reason, never the refusal.
+    expect(body.approval.decidedAt).toEqual(expect.any(String));
+    expect(body.approval.decisionReason).toBeNull();
+  });
+
+  it('a normal elevation approve carries no refusal reason', async () => {
+    const { siblingExpireSet } = mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+    mockElevationTx([{ id: 'elev-1', orgId: 'org-9' }]);
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.enforcementStatus).toBe('pending_dispatch');
+    expect(body).not.toHaveProperty('reason');
+    expect(body.approval.status).toBe('approved');
+    expect(body.approval.refusalReason).toBeNull();
+    expect(siblingExpireSet).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'denied' }));
+  });
+
+  it('flags a grace-allowed under-assured approve in the elevation audit details', async () => {
+    mockDecideWithElevation({ status: 'pending', riskTier: 'high', elevationRequestId: 'elev-1' });
+    const tx = mockElevationTx([{ id: 'elev-1', orgId: 'org-9' }]);
+    vi.mocked(assertApprovalAssurance).mockResolvedValueOnce({
+      requiredLevel: 3,
+      decidedAssuranceLevel: 1,
+      decidedVia: 'session_tap',
+      authenticatorDeviceId: null,
+      graceDowngrade: true,
+    });
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(tx.auditValues).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'approved',
+        details: expect.objectContaining({
+          assurance_downgraded_grace: true,
+          required_assurance_level: 3,
+        }),
+      }),
+    );
+  });
+
+  it('omits the grace marker from the elevation audit details when assurance met the floor', async () => {
+    mockDecideWithElevation({ status: 'pending', riskTier: 'medium', elevationRequestId: 'elev-1' });
+    const tx = mockElevationTx([{ id: 'elev-1', orgId: 'org-9' }]);
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    const details = (tx.auditValues.mock.calls[0]![0] as { details: Record<string, unknown> }).details;
+    expect(details).not.toHaveProperty('assurance_downgraded_grace');
+    expect(details).not.toHaveProperty('required_assurance_level');
   });
 
   it('deny mirrors elevation to denied', async () => {
@@ -2121,6 +2232,44 @@ describe('Task 5: decide-handler bound to action_intents', () => {
     );
   });
 
+  it('marks a grace-allowed under-assured four-eyes approve in the intent event details', async () => {
+    mockDecideWithIntent({ requestedByUserId: 'requester-1' });
+    mockIntentFanInTx();
+    vi.mocked(assertApprovalAssurance).mockResolvedValueOnce({
+      requiredLevel: 3,
+      decidedAssuranceLevel: 1,
+      decidedVia: 'session_tap',
+      authenticatorDeviceId: null,
+      graceDowngrade: true,
+    });
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(recordActionIntentEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: 'approved',
+        details: expect.objectContaining({
+          decidedAssuranceLevel: 1,
+          decidedVia: 'session_tap',
+          assuranceDowngradedGrace: true,
+          requiredAssuranceLevel: 3,
+        }),
+      }),
+    );
+  });
+
+  it('leaves the grace marker off a four-eyes approve whose assurance met the floor', async () => {
+    mockDecideWithIntent({ requestedByUserId: 'requester-1' });
+    mockIntentFanInTx();
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    const call = vi.mocked(recordActionIntentEvent).mock.calls.find(([e]) => e.outcome === 'approved');
+    expect(call).toBeDefined();
+    expect(call![0].details).not.toHaveProperty('assuranceDowngradedGrace');
+    expect(call![0].details).not.toHaveProperty('requiredAssuranceLevel');
+  });
+
   it('refuses an intent-linked APPROVE (403) when the decider no longer holds approvals:decide', async () => {
     // A demoted approver: their fanned-out row is still visible (they keep org
     // membership) but they lost approvals:decide. The decide-time re-check must
@@ -2369,6 +2518,42 @@ describe('Task 5: decide-handler bound to action_intents', () => {
         details: expect.objectContaining({ errorCode: 'not_sole_approver' }),
       }),
     );
+  });
+
+  // Decide-side twin of the fan-out exclusion: even a sole operator (the
+  // only eligible approver) may not approve their own PAM elevation intent.
+  // The fan-out never creates the requester-owned row; this refuses anyway.
+  it('refuses a sole-operator self-approve of request_elevation (403 self_approval_forbidden)', async () => {
+    mockDecideWithIntent({ requestedByUserId: TEST_USER.id, actionName: 'request_elevation' });
+    // Refused before the assurance ladder, so no L3 proof is ever consulted
+    // (and none can be burned). The module-default approver set is
+    // [TEST_USER] — a genuine sole operator.
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body.error).toBe('self_approval_forbidden');
+    expect(db.transaction).not.toHaveBeenCalled();
+    expect(assertApprovalAssurance).not.toHaveBeenCalled();
+    expect(recordActionIntentEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: 'approver_unauthorized',
+        actorId: TEST_USER.id,
+        details: expect.objectContaining({ errorCode: 'self_approval_forbidden' }),
+      }),
+    );
+  });
+
+  it('still allows a self-DENY of a request_elevation intent', async () => {
+    mockDecideWithIntent({ requestedByUserId: TEST_USER.id, actionName: 'request_elevation' });
+    mockIntentFanInTx();
+
+    const res = await buildApp().request('/approvals/appr-1/deny', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason: 'changed my mind' }),
+    });
+    expect(res.status).toBe(200);
   });
 
   it('refuses a self-approve BEFORE consuming an assurance proof (no WebAuthn challenge burned)', async () => {
@@ -2703,6 +2888,62 @@ describe('Task 6: supervised intent plain-decide branch', () => {
     // Gated to approve-only — a deny never spends a partner-policy read.
     expect(loadPartnerPolicy).not.toHaveBeenCalled();
     expect(assertApprovalAssurance).not.toHaveBeenCalled();
+  });
+
+  it('marks a plain-click supervised approve below the risk floor as a grace downgrade, recording the same L1/session_tap', async () => {
+    mockDecideWithSupervisedIntent({ riskTier: 'high' });
+    const { approvalCasSet } = mockSupervisedFanInTx();
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    // The recorded level/factor are unchanged by the marker.
+    expect(approvalCasSet).toHaveBeenCalledWith(
+      expect.objectContaining({ decidedAssuranceLevel: 1, decidedVia: 'session_tap' }),
+    );
+    expect(recordActionIntentEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: 'approved',
+        details: expect.objectContaining({
+          approvalMethod: 'supervised_self',
+          decidedAssuranceLevel: 1,
+          assuranceDowngradedGrace: true,
+          requiredAssuranceLevel: 3,
+        }),
+      }),
+    );
+  });
+
+  it('applies the partner raise-only floor when deciding the supervised grace marker', async () => {
+    mockDecideWithSupervisedIntent({ riskTier: 'low' });
+    mockSupervisedFanInTx();
+    vi.mocked(loadPartnerPolicy).mockResolvedValueOnce({
+      partnerId: 'partner-123',
+      floorOverrides: { low: 2 },
+      requireEnrollment: false,
+      enforceFrom: null,
+    } as any);
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(recordActionIntentEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        details: expect.objectContaining({
+          assuranceDowngradedGrace: true,
+          requiredAssuranceLevel: 2,
+        }),
+      }),
+    );
+  });
+
+  it('leaves the grace marker off a supervised approve whose floor is L1', async () => {
+    mockDecideWithSupervisedIntent({ riskTier: 'low' });
+    mockSupervisedFanInTx();
+
+    const res = await buildApp().request('/approvals/appr-1/approve', { method: 'POST' });
+    expect(res.status).toBe(200);
+    const call = vi.mocked(recordActionIntentEvent).mock.calls.find(([e]) => e.outcome === 'approved');
+    expect(call).toBeDefined();
+    expect(call![0].details).not.toHaveProperty('assuranceDowngradedGrace');
   });
 
   it('records session_tap/L1 (no proof consumed) on a supervised approve', async () => {
@@ -3111,6 +3352,24 @@ describe('POST /approvals/:id/report-suspicious', () => {
       'self-reported suspicious approval',
     );
     expect(db.insert).toHaveBeenCalled();
+  });
+
+  // The pending check above the flip is a separate read. A decide that
+  // commits between the two (for example an approve stored as denied because
+  // the server refused it) must keep its outcome: the flip may only move a
+  // row that is still pending.
+  it('flips a non-intent row to reported only while it is still pending', async () => {
+    const { approvalUpdateSet } = wireRevocationStubs({ existing: baseRow });
+
+    const res = await buildApp().request('/approvals/a1/report-suspicious', { method: 'POST' });
+    expect(res.status).toBe(204);
+    expect(approvalUpdateSet.mock.results[0]!.value.where).toHaveBeenCalledWith(
+      and(
+        eq(approvalRequests.id, 'a1'),
+        eq(approvalRequests.userId, TEST_USER.id),
+        eq(approvalRequests.status, 'pending'),
+      ),
+    );
   });
 
   it('returns 404 when the approval does not exist for this user', async () => {
@@ -4301,6 +4560,31 @@ describe('GET /approvals/pending?view=recent (#6022)', () => {
       status: 'denied',
       reason: 'Not during change freeze',
     });
+  });
+
+  // An elevation approve the server refused is stored as denied with its
+  // refusal reason; Recent must say why, not "denied" with no reason.
+  it('reports a refused elevation approve with the refusal reason', async () => {
+    const refusal = 'Target identity could not be verified on the device; re-request elevation.';
+    mockRecentJoinResolves([
+      {
+        approval: buildPendingApproval({
+          id: 'a-refused',
+          intentId: null,
+          elevationRequestId: 'elev-1',
+          status: 'denied',
+          decidedAt: new Date(),
+          decisionReason: null,
+          refusalReason: refusal,
+        }),
+        intent: null,
+      },
+    ]);
+
+    const body = await (await buildApp().request('/approvals/pending?view=recent')).json();
+    expect(body.approvals).toHaveLength(1);
+    expect(body.approvals[0].refusalReason).toBe(refusal);
+    expect(body.approvals[0].intentOutcome).toMatchObject({ status: 'denied', reason: refusal });
   });
 
   it('never reports an unlinked row as outcome-less', async () => {

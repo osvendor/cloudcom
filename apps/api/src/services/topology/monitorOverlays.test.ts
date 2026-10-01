@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { graphNodeSchema } from '@breeze/shared';
 import type { TopologyRequestContext } from './access';
+import { withHostTimeZone } from '../../testUtils/hostTimeZone';
 
 const mocks = vi.hoisted(() => ({ execute: vi.fn(), transaction: vi.fn() }));
 vi.mock('../../db', () => ({ db: { execute: mocks.execute, transaction: mocks.transaction } }));
@@ -105,6 +106,25 @@ describe('readTopologyMonitorOverlays binding query', () => {
   });
 });
 
+describe('readTopologyMonitorOverlays offsetless result timestamps', () => {
+  it.each(['America/Denver', 'Asia/Tokyo'] as const)(
+    'reads network_monitor_results.timestamp text as UTC on a %s host',
+    async (zone) => {
+      // offsetless `timestamp` text from a raw query; read as UTC
+      const observed = '2026-09-17 11:59:40.250';
+      mocks.execute
+        .mockResolvedValueOnce([bindingRow({ resultAt: observed })])
+        .mockResolvedValueOnce([{ monitorId: MONITOR, count: '0' }]);
+      await withHostTimeZone(zone, async () => {
+        const [overlay] = await readTopologyMonitorOverlays(context(), [{ kind: 'node', id: NODE }], { now: NOW });
+        expect(overlay).toMatchObject({ freshness: 'fresh', coverage: 'monitored' });
+        expect(overlay?.provenance.observedAt).toBe('2026-09-17T11:59:40.250Z');
+        expect(overlay?.freshUntil).toBe('2026-09-17T12:02:40.250Z');
+      });
+    },
+  );
+});
+
 describe('readTopologyMonitorOverlays attribution', () => {
   it('reports a fresh online monitor as healthy and names the supplying monitor', async () => {
     mocks.execute.mockResolvedValueOnce([bindingRow()]).mockResolvedValueOnce([{ monitorId: MONITOR, count: '0' }]);
@@ -119,6 +139,8 @@ describe('readTopologyMonitorOverlays attribution', () => {
       observedAt: RECENT,
     });
     expect(overlay?.activeAlertCount).toBe(0);
+    // M3-D10: the fresh result lapses max(3 × 60 s, 60 s) after observation, without a revision write.
+    expect(overlay?.freshUntil).toBe(new Date(Date.parse(RECENT) + 180_000).toISOString());
   });
 
   it('downgrades an offline monitor to a failed check and a degraded monitor to degraded', async () => {
@@ -273,6 +295,7 @@ describe('overlayHealthSummary', () => {
         monitorId: MONITOR, monitorName: 'Gateway ping', monitorType: 'icmp_ping', destination: '192.0.2.1',
         runId: null, resultId: RESULT, originDeviceId: DEVICE, originNodeId: ORIGIN_NODE, observedAt: RECENT,
       },
+      freshUntil: null,
     });
 
     expect(summary).toEqual({

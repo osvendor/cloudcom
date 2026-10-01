@@ -22,23 +22,56 @@ import { Steps, Aside } from '@astrojs/starlight/components';
 
 2. **Diff your Compose files against the tagged release** and merge the required changes before pulling images; follow [Compose file changes](#compose-file-changes), preserving your local configuration. Back up `.env`, the active Compose files, and overrides alongside the database backup.
 
-3. **Update the version in `.env`**
+3. **Check how your images are pinned**
 
    ```bash
-   # Set to the version you want (e.g. 0.11.3)
-   BREEZE_VERSION=0.11.3
+   grep '^BREEZE_API_IMAGE_REF=' .env
    ```
 
-   This also selects the agent release your fleet is offered, so set it to a version that is **published** on GitHub, not one that has only been tagged. See [Binary Distribution](/deploy/binaries/#github-mode-default).
+   - **Digest-pinned** — the value ends in `@sha256:…`. Every install made with `guided-setup.sh` for v0.112.0 or later looks like this. Follow step 4a.
+   - **Tag-form** — the value ends in `:${BREEZE_VERSION}` (older installs, and manual installs that never switched). Follow step 4b.
 
-4. **Pull and restart**
+   <Aside type="caution" title="On a digest-pinned install, `docker compose pull` does not upgrade">
+     The image refs name exact digests, so `docker compose pull` fetches the release you already run, and editing `BREEZE_VERSION` alone leaves the old images running. `BREEZE_VERSION` also selects the agent release your fleet is offered, so a hand-edited value can move agents ahead of the server.
+   </Aside>
+
+4. **Move to the new release**
+
+   **4a. Digest-pinned: run `guided-setup.sh --upgrade`**
+
+   ```bash
+   # Fetch the current installer. --upgrade is new; an older copy does not have it.
+   curl -fsSLO https://raw.githubusercontent.com/lanternops/breeze/main/scripts/guided-setup.sh
+
+   # Run from the directory that holds docker-compose.yml and .env, or pass --work-dir.
+   bash guided-setup.sh --upgrade 0.118.2   # omit the version to use the latest release
+   ```
+
+   The script:
+   - downloads the target release's signed image inventory and verifies it against `RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS`, the same fail-closed check as a fresh install;
+   - backs up `.env`, then rewrites `BREEZE_VERSION` and the four `BREEZE_*_IMAGE_REF` digests together. If verification fails, `.env` is left unchanged and nothing is pulled;
+   - prints links to the target release's `docker-compose.yml` and `.env.example`. It never edits your Compose file, so complete step 2 for the target release;
+   - pulls the verified images, runs `docker compose up -d`, and waits for the API to report healthy.
+
+   Add `-y` to run it without prompts, for example from a script. Add `--no-up` to update `.env` only and restart later. The script refuses a target older than your current `BREEZE_VERSION`. Migrations are forward-only, so restore the matching database backup before you pass `--allow-downgrade`. Targets older than 0.112.0 are always refused, because release signatures do not cover those images; `--allow-unverified-release` does not apply to `--upgrade`. It also re-pins the digests when `BREEZE_VERSION` already names the target, which repairs an install where only `BREEZE_VERSION` was edited.
+
+   If you run the manual verifier instead, follow [Signed, digest-pinned image references](/deploy/production/#signed-digest-pinned-image-references-v01120-and-later) and update `BREEZE_VERSION` and all four refs together.
+
+   **4b. Tag-form: set the version, then pull and restart**
+
+   ```bash
+   # In .env: set to the version you want (e.g. 0.118.2)
+   BREEZE_VERSION=0.118.2
+   ```
 
    ```bash
    docker compose pull
    docker compose up -d
    ```
 
-   This pulls the new API, web, and binaries images and restarts all services.
+   `BREEZE_VERSION` also selects the agent release your fleet is offered, so set it to a version that is **published** on GitHub, not one that has only been tagged. See [Binary Distribution](/deploy/binaries/#github-mode-default).
+
+   Either path pulls the new API, web, and binaries images and restarts all services.
    Database migrations run automatically on API startup when `AUTO_MIGRATE=true` (the default).
 
    **Expected downtime**: Typically **5--15 seconds** while containers restart. If the new version includes database migrations, the API container will take additional time to apply them before accepting traffic -- usually under 60 seconds for routine schema changes, but potentially several minutes for large data migrations. Agents continue running independently during this window and reconnect automatically.
@@ -55,6 +88,8 @@ import { Steps, Aside } from '@astrojs/starlight/components';
    # Check agent version (on the device)
    breeze-agent version
    ```
+
+   `/health` reports the version baked into the running API image. If it does not match `BREEZE_VERSION` in `.env`, the image was not upgraded. The API logs `[version] BREEZE_VERSION=… but this API image is …` at startup, and **Administration → System → Connections** shows the same warning. This requires the Compose change described in [APP_VERSION comes from the image](#next-release--app_version-comes-from-the-image).
 
    Also sign in through your public URL and confirm agents resume checking in. `/health` bypasses the HTTPS redirect and can stay healthy while a stale proxy address sends other requests into a redirect loop.
 
@@ -84,6 +119,10 @@ This only reads. It does not run migrations or record a version. It exits 0. Add
 
 The report never blocks the API from starting. If the deployment has no recorded version history (the first upgrade to a version with this check, or a database the check could not read), the report lists every retirement in effect for the new image and marks it as possibly crossed. It does not report "no issues" in that case.
 
+### In the web UI
+
+Platform administrators can see the same information at **Administration → System** (`/admin/system`, v0.117.0+). The **Deprecations** tab lists every retirement the running image knows about with its status for this deployment (crossed, possibly crossed, in effect, or upcoming), along with the running version, the last version recorded, the applied and pending migration counts, and the deployment's version history. The **Connections** tab shows each integration the API container is configured for, grouped by area, as enabled, disabled, misconfigured, or required but missing. It reads the API container's environment only, never shows secret values, and does not contact the services themselves, so "enabled" means configured, not reachable. Both tabs are read-only.
+
 ## Compose file changes
 
 `docker compose pull` updates images; it does **not** download a new `docker-compose.yml`, override file, or `.env.example`. Current images can therefore run with old network settings or missing environment mappings. Review the configuration shipped with **every target release**, including when skipping versions; the entries below highlight changes that need operator action, not a complete Compose changelog.
@@ -100,7 +139,7 @@ curl --fail --show-error --location \
 
 `diff` exits with status 1 when differences exist; a failed download must be resolved before continuing. If you deploy `deploy/docker-compose.prod.yml` or additional override files, compare those same paths at the same tag too. Review the tagged `.env.example` and any configuration files referenced by changed services.
 
-Merge the required changes into your backed-up local files, preserving custom services, domains, mounts, secrets, and proxy topology. Do not overwrite `.env` with `.env.example`. Add required variables to both `.env` and the appropriate service's `environment:` mapping; setting `.env` alone does not pass a variable to the container. For digest-pinned deployments, update the image references to the target release as well as `BREEZE_VERSION`.
+Merge the required changes into your backed-up local files, preserving custom services, domains, mounts, secrets, and proxy topology. Do not overwrite `.env` with `.env.example`. Add required variables to both `.env` and the appropriate service's `environment:` mapping; setting `.env` alone does not pass a variable to the container. For digest-pinned deployments, update the image references to the target release as well as `BREEZE_VERSION`. `guided-setup.sh --upgrade` does this for you (step 4a).
 
 Validate the merged configuration before the pull/restart step:
 
@@ -109,6 +148,34 @@ docker compose config --quiet
 ```
 
 Use the same `-f` options and profiles you normally deploy for validation, pull, and restart so your overrides are included. Validation checks the Compose configuration; it does not prove that a trusted proxy address matches the running proxy.
+
+### Next release — `APP_VERSION` comes from the image
+
+Earlier Compose files set `APP_VERSION: ${BREEZE_VERSION...}` in the API environment. That value replaced the version baked into the image, so `/health`, the upgrade preflight, and the recorded version history reported whatever `.env` said, even when the running image was older. The shipped `docker-compose.yml` and `deploy/docker-compose.prod.yml` no longer set it.
+
+| Change | Required action |
+|---|---|
+| The `APP_VERSION:` line is removed from the shared API environment block (`x-api-env` in `docker-compose.yml`, the API environment in `deploy/docker-compose.prod.yml`). | Delete the `APP_VERSION:` line from your own Compose file. Keep `BREEZE_VERSION:`, which still selects the agent release. Until you remove the line, `/health` keeps reporting `BREEZE_VERSION` and the version-mismatch warning cannot fire. |
+
+### Next release — coturn relays again
+
+| Change | Required action |
+|---|---|
+| The v0.118.0 coturn configuration listed `denied-peer-ip=::`. coturn reads an all-zero address as "no bound", so that one entry refused every peer and relayed (TURN) connections could not be set up. The entry is removed from `docker/turnserver.conf`, `docker-compose.yml` and `deploy/docker-compose.prod.yml`; coturn already refuses the unspecified address on its own. | Delete the `denied-peer-ip=::` line (`'--denied-peer-ip=::'` in a Compose file) from your coturn configuration and restart coturn, even if you skip this release. Do not replace it with `0.0.0.0` or a range starting at `::`. |
+### Next release — coturn refuses IPv4-mapped and NAT64 peers
+
+| Change | Required action |
+|---|---|
+| The two `denied-peer-ip` lines that v0.118.0 shipped commented out are now active in `docker/turnserver.conf`, `docker-compose.yml` and `deploy/docker-compose.prod.yml`: `::ffff:0:0-::ffff:ffff:ffff` (IPv4-mapped IPv6) and `64:ff9b::-64:ff9b::ffff:ffff` (NAT64 well-known prefix). Relay-to-relay sessions are unaffected. | Nothing if you use the bundled coturn with the shipped files. If you run your own coturn, add both lines from [TURN Server](/deploy/turn-server/#install-and-configure-coturn) and restart it. **Never deny the relay's own public IP.** |
+
+### v0.118.0 — coturn peer restrictions and API stop grace
+
+The [v0.118.0 Compose files](https://github.com/LanternOps/breeze/blob/v0.118.0/docker-compose.yml) and `docker/turnserver.conf` change two things:
+
+| Change | Required action |
+|---|---|
+| coturn relays only to public addresses: `denied-peer-ip` rules for loopback, private, CGNAT, link-local, documentation and reserved ranges (IPv4 and IPv6), plus `no-tcp-relay`. `verbose` is turned off. | Nothing if you use the bundled coturn with the shipped files. If you run your own coturn, apply the same rules from [TURN Server](/deploy/turn-server/#install-and-configure-coturn). **Never deny the relay's own public IP**: relay-to-relay traffic targets it. The IPv4-mapped and NAT64 lines ship commented out; enable them only after checking relay-to-relay on your deployment. |
+| The `api` service (and `worker`) has `stop_grace_period: 90s`, so background work in the process can finish during a restart. | Copy it into your own Compose file if you maintain one. |
 
 ### v0.95.0 — stable Caddy address and proxy trust
 
@@ -127,6 +194,117 @@ Changing an existing network's IPAM/subnet requires recreating that network duri
 Before upgrading a proxy-fronted deployment to **v0.103.0 or later**, verify that `TRUSTED_PROXY_CIDRS` matches the proxy that directly connects to the API. That release's TRANSPORT-001 enforcement only honors forwarded HTTPS headers from trusted peers; a stale address can cause repeated `308` redirects for the UI and agents while `/health` still returns `200`. After restarting, check public sign-in and agent check-ins as well as API logs for `[proxy-trust]` or `[force-https]` warnings (available from v0.104.0).
 
 ## Version-specific notes
+
+### v0.118.0 — legacy alerting retired, network checks become monitors
+
+<Aside type="caution" title="Before you upgrade: convert everything on v0.117.0">
+  While you are still on **v0.117.0**, open **Alerts → Monitors → Needs conversion**, run **Convert everything**, and review every refusal. After this upgrade, **Undo** in conversion history is no longer available for legacy alert rules, templates, inline policy rules or service/process watches, so fix anything you want to keep while you can still roll a conversion back. Then take a database backup.
+</Aside>
+
+**Upgrade order.**
+
+<Steps>
+1. On v0.117.0, run **Convert everything** and review the refusals (above).
+2. Back up the database.
+3. Set `BREEZE_VERSION` to the new release in `.env`, then run `docker compose pull api web portal && docker compose up -d`.
+4. Merge the [Compose file changes](#v01180--coturn-peer-restrictions-and-api-stop-grace) if you maintain your own Compose file or coturn configuration.
+5. Let every agent and Breeze Helper update to 0.118.0, then rebuild any recovery media you keep.
+</Steps>
+
+**Update every agent and Helper.** Many changes in this release take effect on a device only once it runs the 0.118 agent and Helper. Until then, the device keeps its previous behaviour. This covers installer secret handling, Windows local file and pipe checks, PAM file-hash pinning, the new restore path, the Hyper-V, restore-as-VM and instant-boot fixes, consent-prompt reporting, memory module inventory and the macOS binary move. A few paths refuse older agents rather than fall back; they are listed below.
+
+#### Alerting and network checks
+
+- **Legacy alerting is retired.** The policy **Alerts** and **Service & Process Monitoring** tabs are gone, and `/alerts/rules` redirects to **Alerts → Monitors**. Writes under `/alerts/rules*` and `/alert-templates*`, and writes to the retired `alert_rule` and `monitoring` policy feature types, return `410 Gone`. Reads still work, so history stays available.
+- **First boot converts what is left.** The API converts any remaining legacy sources for each partner and retires the ones it cannot convert, with a reason for each. A dismissible banner under **Alerts → Monitors** lists them. Recreate what you need as monitors before you dismiss it. Open alerts from retired sources stay open until someone resolves them. Set `BREEZE_LEGACY_ALERTING_SWEEP=false` to skip the conversion at boot; the API still counts what is left.
+- **Leftovers are logged on every boot.** If any legacy policy alert rules or service/process watches are still unretired after the sweep, the API logs the counts at error level on every start. Nothing evaluates them any more. Restart the API to run the sweep again (after removing `BREEZE_LEGACY_ALERTING_SWEEP=false` if you set it), or run **Convert everything**.
+- **Review alert routing before you upgrade.** Queued legacy alerts and unconverted standalone rules no longer use their old per-rule delivery settings. Delivery follows the monitor's settings, your routing rows and the explicit **Everything else** row. An alert that matches no destination sends no notification.
+- **Network checks move to Monitors.** You now create and edit network checks as `network_check` monitors under **Alerts → Monitors**. **Network → Results** is read-only and offers conversion of existing checks. Checks you have not converted keep polling and alerting. Creating or editing a check through the old endpoints returns `410`. An asset cannot be deleted while it still has active or retained checks (`409`). The boot sweep never converts or retires network checks. See [Network Monitors](/features/network-monitors/).
+- **Maintenance windows suppress monitor alerts again.** On v0.117.0, **Suppress alerts** in a maintenance window did not stop monitor alerts, including alerts from rules converted to monitors. Expect fewer alerts during maintenance than on v0.117.0.
+- **Some monitor thresholds now fire.** Bandwidth, disk I/O, network-error and patch-compliance monitors now evaluate in the units they display. Bandwidth thresholds had been compared about 8× too high, so a bandwidth monitor that never fired may fire now.
+
+#### Dynamic groups as execution targets
+
+Dynamic groups whose rules match on a field the device reports about itself no longer act as execution targets. These fields are hostname, display name, tags, device role, last user, agent version, Helper version, installed software (installed or not installed), and any custom field.
+
+- **Affected:** scripts, automations, software policies and update rings. The automation, software, remote-access, PAM, maintenance, OneDrive and Assist policy features also skip such groups.
+- **Not affected:** patch and backup assignments still resolve through these groups. So does every non-execution use of a dynamic group, such as views, filters and reports.
+- **Visible in the audit log.** Each skipped group is logged with the fields that caused it. Where the request is interactive, the response also carries a warning.
+
+To keep targeting these devices, rebuild the group on fields Breeze accepts for targeting, such as site, organization, OS, hardware, network facts or metrics. Or use a static group. See [Device Groups](/features/device-groups/#dynamic-groups-as-execution-targets).
+
+#### Backups, restores and DR
+
+- **DR plan steps cannot store credentials.** A step whose restore settings include a recovery token or storage credentials fails when it runs. The upgrade removes those keys from saved steps, and saving a step that includes them is rejected. Open each affected step and save it again without credentials. Breeze resolves the storage destination from the snapshot when the step runs. See [Disaster Recovery](/backup/disaster-recovery/).
+- **Commands queued across an org merge or device move.** A backup, restore or verify command that is still queued when its device changes organization is not delivered. This includes devices moved by an organization merge. The command is expired with a reason. Run it again after the move.
+- **Restores no longer receive storage credentials.** A restore, verify or test-restore command no longer carries the storage destination. With the 0.118 backup helper, the device fetches each file it needs through a short-lived, read-only link that Breeze issues for that command and device only. Devices whose backup helper predates 0.118 keep using the previous path until they update. See [Restoring from Backup](/backup/restoring/#how-restores-reach-storage).
+- **Restore as VM and instant boot report failures.** A restore as VM that cannot place every file now fails before any VM is created, instead of reporting success. Instant boot runs its background sync inside the command, and an incomplete sync reports the VM as degraded. Hyper-V restore refuses a VM name that already exists.
+- **New run state: completed with errors.** A backup run that produced a snapshot but could not read or upload some files (up to 10%) is now **Completed with errors**, not **Completed**. API consumers see the new status value `completed_with_errors`. See [Monitoring Backups](/backup/monitoring/).
+- **Legal hold blocks erasure.** Erasing an organization's data is refused (`409`) while any of its snapshots is under legal hold, and a legal hold cannot be placed on an organization that is being erased. Permanently deleting a device is refused while one of its snapshots is under legal hold or inside its immutability window.
+- **Storage cannot be shared across partners.** A bucket, endpoint or local path already used by an organization under another partner is refused. Organizations under the same partner can still share one.
+- **Cove name matches are no longer mapped automatically.** Only a Cove customer whose external code is set to a Breeze organization ID is mapped on sync. Map name-only matches yourself. Mappings made before this release are not changed. See [Third-Party Backup Providers](/backup/backup-providers/#mapping-customers-to-organizations).
+- **Recovery bundles verify their helper.** A recovery bundle's launch script checks the included helper binary's signature before running it. Bundles need [recovery signing](/backup/bare-metal-recovery/#recovery-bundle-signing) configured on the server when they are built, and the machine that runs them needs `minisign` (plus `curl` on Linux and macOS). **Rebuild recovery bundles after upgrading.** The recovery console also no longer relaxes its HTTPS requirement for `breeze.insecure=1` in interactive mode.
+
+#### Agent
+
+- **Windows: linked data and log directories are replaced.** If `C:\ProgramData\Breeze\data` or `C:\ProgramData\Breeze\logs` is a junction or symbolic link, the installer and the agent replace it with a real directory that only SYSTEM and Administrators can write to. Files in the old link target are not moved or copied, so copy anything you need first. If the link cannot be removed, **the agent refuses to start** and writes the reason to `C:\ProgramData\Breeze\logs\agent-start-failed.txt`. Remove the link by hand, then start the service.
+- **macOS: agent binaries move only when `/usr/local/bin` is unsafe.** Agents 0.118.0 through 0.118.2 moved the agent and watchdog binaries from `/usr/local/bin` to `/Library/Breeze/bin` on every Mac, on first start, which broke Full Disk Access for anyone on that path (macOS ties FDA to a bare binary's file path, not its identity). **Upgrade straight to 0.118.3 or later** — do not promote 0.118.0-0.118.2 to Macs you cannot touch. From 0.118.3, the agent moves only when `/usr/local/bin` (or a directory above it) is not owned by root, or is group- or world-writable — the known case is Homebrew on Intel Macs, which hands that directory to an admin user. A stock Mac (root-owned, non-writable `/usr/local/bin`) never moves and keeps all of its grants. Only a Mac that does move needs Full Disk Access re-granted for `/Library/Breeze/bin/breeze-agent`; the agent logs a warning when it moves and reports a `macos_fda_relocation` self-health warning until the grant lands. A Mac already moved by 0.118.0-0.118.2 stays at `/Library/Breeze/bin` on 0.118.3+ — it is not moved back, so a re-grant already done keeps holding. See [macOS Permissions](/agents/macos-permissions/#after-an-agent-relocation).
+- **Helper token file.** On Linux and macOS, the Helper token moves to `helper_token.yaml`.
+
+#### Access, MFA and limits
+
+- **Account changes reach delegated access.** A password change or reset, or an MFA factor reset, ends that user's live remote sessions and invalidates the API keys they created before the change. A role change revokes the user's refresh tokens. Service-principal keys are not affected, and the upgrade itself revokes nothing.
+- **More actions need a fresh MFA check:**
+  - revealing a disk-encryption key;
+  - report email recipients;
+  - partner billing profiles and work types;
+  - org billing-profile assignment and org billing settings;
+  - linking a backup-provider device;
+  - topology template library changes;
+  - software-policy executable rules, which also need `pam:manage_policy`;
+  - AI script policy changes;
+  - deactivating a policy.
+- **Permissions.** System Tools file-content and registry reads need `devices:execute`, and so do sensitive event-log channels (Security, PowerShell, Sysmon). Reads of the agent's own configuration directory and the SAM and SECURITY registry hives are always refused. Enrollment short codes are shown only to users who can create or rotate enrollment keys. Role, MFA-reset and member actions require the caller to hold every permission of the target user's role.
+- **PAM and AI approvals.** An approval for a specific executable without its file hash is denied with a reason. AI elevation requests always wait for a human approver, and a requester cannot approve their own elevation. AI ticket comments are private unless approved as customer-visible. Newly discovered MCP tools must be reviewed before they are enabled.
+- **Enrollment and installers.** Rotating an enrollment link issues a new short code, so the old `/s/` and `/i/` links return `404`. A custom-field value used in installer arguments must not contain spaces, quotes or backslashes; otherwise that device's install fails as an unresolved field.
+- **Stored credentials stay tied to their destination.** Changing a tool source, backup S3 endpoint, log-forwarding URL or monitoring integration URL to a new origin requires re-entering its credential. Changing an SNMP discovery profile's subnets, exclusions or site requires re-entering or clearing its SNMP secrets.
+- **Remote sessions.** Where the remote-access policy requires consent or an on-screen notice, desktop sessions over the WebSocket fallback to agents older than 0.118 are refused until the agent updates.
+- **New limits.** Most can be tuned; see [Environment Variables → Agent traffic and ingest budgets](/deploy/environment/#agent-traffic-and-ingest-budgets).
+  - public downloads: 600 requests per 5 minutes per route per IP;
+  - TURN credentials: 30 per 10 minutes per user;
+  - password-reset emails: one per account per 5 minutes;
+  - agent WebSocket messages, plus daily agent log, event-log and change-log ingest (`429` when exceeded);
+  - Helper screenshots;
+  - pending log-forwarding jobs per organization;
+  - the partner's organization limit when creating organizations.
+
+#### Other behaviour changes
+
+- Public invoice and quote links stop working while the owning partner is not active.
+- Adopting a sending domain that already exists at the email provider needs a DNS TXT record at `_breeze-verify.<domain>`, or the domain listed in `EMAIL_DOMAINS_ADOPT_EXISTING_ALLOWLIST`. Otherwise provisioning ends as `provider_conflict`.
+- Organization-scoped users cannot set audit-log retention below 90 days.
+- Revoking a topology template is final.
+- Inviting an address that already belongs to another tenant returns the normal success response.
+- Public download routes, including `install.sh` and `uninstall.sh`, return `503` while Redis is unavailable.
+- With `BINARY_SOURCE=local`, the Breeze Helper download is checked against the signed release manifest and returns `503` on a mismatch. Keep the manifest files next to the Helper binaries (`HELPER_BINARY_DIR` is respected).
+- Notification channel settings (webhook URLs, bot tokens, routing keys) move to their own table, which only the channel's owner can read. The old column is kept for rollback and is dropped in the next release.
+
+#### Environment variables
+
+**No new required variables.** New optional ones all have defaults; see [Environment Variables](/deploy/environment/#agent-traffic-and-ingest-budgets). The four `OFFLINE_DETECTOR_REEVAL_*` variables no longer do anything: the job that read them was retired with legacy alerting. You can remove them.
+
+#### Migrations
+
+All migrations are idempotent and apply on boot. Migrations that change rows report their counts in the API log. Read these before upgrading:
+
+- **One accounting connection per partner.** The API does not start if any partner has more than one accounting connection. Disconnect the extra provider first.
+- **Backup snapshot index.** A new unique index on backup snapshots is built without blocking writes. If duplicate snapshot rows exist, the API logs a warning with the count and skips the index, and tries again on every start until the duplicates are resolved. If an interrupted build left an invalid index, the migration stops with an error. Run `DROP INDEX CONCURRENTLY backup_snapshots_storage_identity_snapshot_id_uq` and restart.
+- **Elevation audit index.** Same pattern. If an interrupted build left the index invalid, run `DROP INDEX CONCURRENTLY public.elevation_audit_org_created_id_idx` and restart.
+- **Stored storage destinations are cleared.** Storage destinations are removed from **finished** device commands, and credential keys from DR plan steps. On an install with a long command history, the first boot takes longer. Queued commands are left alone and cleared when they finish.
+- **Patch job results index.** Built without blocking writes, but it can take a while on a large table.
+- **Network checks.** A new asset/organization constraint on network checks stops the migration if existing rows already break that pairing. It converts and retires nothing.
+
+**Rolling back** to v0.117.0 means restoring the database backup you took before upgrading, together with the v0.117.0 images.
 
 ### v0.117.0 — legacy labour-pricing columns dropped
 
@@ -564,12 +742,15 @@ None are required. Full descriptions are in [Environment Variables](/deploy/envi
 `.env.example` and `deploy/docker-compose.prod.yml` now expect **signed,
 digest-pinned image references** (`ghcr.io/lanternops/breeze/api@sha256:…`)
 resolved from the release's signed image inventory. The guided installer
-resolves and verifies them itself for 0.112.0 and later (fail-closed), and
-falls back to tag-tracking refs for older releases. **Existing installs whose
+resolves and verifies them itself for 0.112.0 and later (fail-closed). The
+current installer refuses releases older than 0.112.0 unless you pass
+`--allow-unverified-release`; with that flag it warns and uses tag-tracking refs.
+**Existing installs whose
 `.env` still carries `…/api:${BREEZE_VERSION}` refs keep working with the
 upgrade steps at the top of this page.** If you have already switched to digest
 pins, update the four `BREEZE_*_IMAGE_REF` lines from the new release's
 inventory on every upgrade — bumping `BREEZE_VERSION` alone changes nothing.
+`guided-setup.sh --upgrade` does this in one command (step 4a above).
 See [Signed, digest-pinned image references](/deploy/production/#signed-digest-pinned-image-references-v01120-and-later).
 
 Rotating `RELEASE_ARTIFACT_MANIFEST_PUBLIC_KEYS` is a fleet re-enrollment:
@@ -1180,8 +1361,11 @@ For production deployments where any downtime is unacceptable, you can perform a
 ## Checking Versions
 
 ```bash
-# API version
+# API version (the running image's baked version)
 curl -s https://breeze.yourdomain.com/health | jq .version
+
+# The version .env says is deployed; must match the line above
+grep '^BREEZE_VERSION=' .env
 
 # Agent version (on the device)
 breeze-agent version

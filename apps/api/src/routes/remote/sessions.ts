@@ -34,12 +34,21 @@ import {
   hasSessionOwnership,
   checkSessionRateLimit,
   checkUserSessionRateLimit,
+  checkTurnCredentialMintRateLimit,
   logSessionAudit,
   buildRemoteSessionPromptPayload,
   createDesktopStartCommandId,
   MAX_ACTIVE_REMOTE_SESSIONS_PER_ORG,
   MAX_ACTIVE_REMOTE_SESSIONS_PER_USER
 } from './helpers';
+import {
+  CONSENT_UPGRADE_REQUIRED_CODE,
+  CONSENT_UPGRADE_REQUIRED_MESSAGE,
+  REMOTE_PROMPT_POLICY_UNAVAILABLE_CODE,
+  REMOTE_PROMPT_POLICY_UNAVAILABLE_MESSAGE,
+  RemoteSessionPromptPolicyError,
+  requiresConsentCapableAgent,
+} from './consentGate';
 import {
   assertDesktopStartIntentCurrent,
   boundConsentUnavailableBehavior,
@@ -107,7 +116,10 @@ async function currentSessionCapabilityDenial(
   const capability = session.type === 'desktop' ? 'webrtcDesktop' : 'remoteTools';
   const policy = await checkRemoteAccess(device.id, capability);
   if (!policy.allowed) {
-    return c.json({ error: policy.reason ?? 'Remote access is disabled by policy' }, 403);
+    return c.json({
+      error: policy.reason ?? 'Remote access is disabled by policy',
+      ...(policy.code ? { code: policy.code } : {}),
+    }, 403);
   }
   return null;
 }
@@ -241,7 +253,8 @@ sessionRoutes.post(
       if (!policyCheck.allowed) {
         return c.json({
           error: policyCheck.reason,
-          code: 'REMOTE_ACCESS_POLICY_DENIED',
+          // A parked device carries its own code (DEVICE_PENDING_ASSIGNMENT).
+          code: policyCheck.code ?? 'REMOTE_ACCESS_POLICY_DENIED',
           capability,
           policyName: policyCheck.policyName,
         }, 403);
@@ -304,6 +317,13 @@ sessionRoutes.post(
           and(
             eq(remoteSessions.deviceId, data.deviceId),
             eq(remoteSessions.type, data.type),
+            // Caller-owned only: this is a same-caller reconnect cleanup (a
+            // browser hard-refresh dropping the old tab's WS), not a
+            // cross-user termination primitive. Without this predicate any
+            // caller with org access to the device could disconnect and
+            // agent-stop a colleague's in-progress session just by starting
+            // a same-type session of their own.
+            eq(remoteSessions.userId, auth.user.id),
             inArray(remoteSessions.status, ['pending', 'connecting', 'active'])
           )
         ) as unknown as Promise<unknown> & {
@@ -886,7 +906,11 @@ sessionRoutes.get(
       return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
     }
 
-    if (!['pending', 'connecting', 'active', 'disconnected'].includes(session.status)) {
+    // `disconnected` is intentionally excluded — a
+    // historical, ended session must not be able to mint fresh TURN
+    // credentials indefinitely. This mirrors the live-state check the WS
+    // twin (`desktopWs.ts`) already applies before it reaches `getIceServers`.
+    if (!['pending', 'connecting', 'active'].includes(session.status)) {
       return c.json({
         error: 'Cannot fetch ICE servers for session in current state',
         status: session.status
@@ -894,6 +918,14 @@ sessionRoutes.get(
     }
     const capabilityDenial = await currentSessionCapabilityDenial(c, session, device);
     if (capabilityDenial) return capabilityDenial;
+
+    // bound how often
+    // a single caller can mint TURN credentials, independent of session
+    // state, so a live/owned session can't be used to hammer the relay quota.
+    const mintRateLimit = await checkTurnCredentialMintRateLimit(auth.user.id);
+    if (!mintRateLimit.allowed) {
+      return jsonError(c, 429, ERROR_CODES.RATE_LIMITED, 'Too many ICE server requests. Please try again later.');
+    }
 
     return c.json({
       iceServers: getIceServers({
@@ -938,6 +970,20 @@ sessionRoutes.post(
       return jsonError(c, 403, ERROR_CODES.ACCESS_DENIED, 'Access denied');
     }
 
+    // WebRTC offer/answer is a desktop-stream primitive (screen view + input).
+    // Its siblings (ws-ticket, connect-code) already refuse a non-desktop
+    // session explicitly; this route derived its capability from
+    // `session.type` below with no such guard, so a `type:'terminal'` session
+    // — created under a policy that allows `remoteTools` but NOT
+    // `webrtcDesktop` — could still reach the desktop-capable path once its
+    // type happened not to equal `'desktop'` in the ternary below (any
+    // non-desktop type silently fell through to `remoteTools`, the wrong
+    // capability for a WebRTC offer). Reject explicitly instead of letting
+    // the type flow into the capability ternary.
+    if (session.type !== 'desktop') {
+      return c.json({ error: 'WebRTC offer only supported for desktop sessions' }, 400);
+    }
+
     // Re-enforce the remote-access policy at offer time, not just at session
     // creation. Disabling the webrtcDesktop / remoteTools policy must stop a
     // holder of an existing session from (re)starting a live stream — the
@@ -949,7 +995,8 @@ sessionRoutes.post(
       if (!policyCheck.allowed) {
         return c.json({
           error: policyCheck.reason,
-          code: 'REMOTE_ACCESS_POLICY_DENIED',
+          // A parked device carries its own code (DEVICE_PENDING_ASSIGNMENT).
+          code: policyCheck.code ?? 'REMOTE_ACCESS_POLICY_DENIED',
           capability,
           policyName: policyCheck.policyName,
         }, 403);
@@ -1007,7 +1054,29 @@ sessionRoutes.post(
     // untrusted. Undefined when the policy is `off` (a fully silent session
     // ships no prompt block at all). Shared with the viewer-token WS offer
     // handler (desktopWs.ts). Remote-session consent.
-    const prompt = await buildRemoteSessionPromptPayload(device, session.userId);
+    let prompt: Awaited<ReturnType<typeof buildRemoteSessionPromptPayload>>;
+    try {
+      prompt = await buildRemoteSessionPromptPayload(device, session.userId);
+    } catch (error) {
+      // The prompt policy could not be established; starting anyway could drop
+      // a consent requirement, so refuse (the resolver already logged it).
+      if (error instanceof RemoteSessionPromptPolicyError) {
+        return c.json({
+          error: REMOTE_PROMPT_POLICY_UNAVAILABLE_MESSAGE,
+          code: REMOTE_PROMPT_POLICY_UNAVAILABLE_CODE,
+        }, 503);
+      }
+      throw error;
+    }
+    // A consent-mode start needs an agent that runs the consent prompt; an
+    // older agent drops the prompt block and streams without asking. Refuse
+    // before the start intent is committed or anything is dispatched.
+    if (requiresConsentCapableAgent(prompt, device)) {
+      return c.json({
+        error: CONSENT_UPGRADE_REQUIRED_MESSAGE,
+        code: CONSENT_UPGRADE_REQUIRED_CODE,
+      }, 409);
+    }
     const promptMode = prompt?.mode === 'consent' || prompt?.mode === 'notify' ? prompt.mode : 'off';
     const startCommandId = createDesktopStartCommandId(sessionId);
 

@@ -73,6 +73,12 @@ vi.mock('./llm/llmConfigResolver', () => ({
   resolveLlmConfigForOrg: (...args: unknown[]) => mockResolveLlmConfigForOrg(...args),
 }));
 
+// The real decision, observed: which transport a session type is checked for.
+vi.mock('./llm/llmAvailability', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./llm/llmAvailability')>();
+  return { ...actual, llmUnusableCode: vi.fn(actual.llmUnusableCode) };
+});
+
 const mockCheckAiRateLimit = vi.fn();
 const mockCheckBudget = vi.fn();
 const mockGetRemainingBudgetUsd = vi.fn();
@@ -438,6 +444,33 @@ describe('runPreFlightChecks', () => {
       expect(mockCheckBudget).not.toHaveBeenCalled();
     },
   );
+
+  it('returns the ai_not_configured 503 contract when the platform path has no model key, before any spend', async () => {
+    vi.stubEnv('ANTHROPIC_AUTH_TOKEN', '');
+    vi.stubEnv('CLAUDE_CODE_OAUTH_TOKEN', '');
+    try {
+      mockResolveLlmConfigForOrg.mockResolvedValue({ source: 'platform', apiKey: undefined, model: 'claude-sonnet-4-6' });
+
+      const result = await runPreFlightChecks('session-1', 'hello', auth);
+
+      expect(result).toEqual({ ok: false, error: 'ai_not_configured', status: 503 });
+      expect(mockCheckAiRateLimit).not.toHaveBeenCalled();
+      expect(mockCheckBudget).not.toHaveBeenCalled();
+      expect(mockSanitizeUserMessage).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('checks a script-builder session against the Agent SDK transport, every other session against chat', async () => {
+    const { llmUnusableCode } = await import('./llm/llmAvailability');
+    mockGetSession.mockResolvedValueOnce(makeSession({ type: 'script_builder' }));
+    await runPreFlightChecks('session-1', 'hello', auth);
+    expect(llmUnusableCode).toHaveBeenLastCalledWith(expect.objectContaining({ source: 'platform' }), 'agent_sdk');
+    mockGetSession.mockResolvedValueOnce(makeSession({ type: 'general' }));
+    await runPreFlightChecks('session-1', 'hello', auth);
+    expect(llmUnusableCode).toHaveBeenLastCalledWith(expect.objectContaining({ source: 'platform' }), 'chat');
+  });
 
   it('captures resolver failures and returns a generic retryable 503', async () => {
     const error = new Error('raw resolver failure');
@@ -3693,6 +3726,38 @@ describe('Task 2: plan index advances only once the step is authorized', () => {
       { id: 'intent-plan-digest-mismatch', orgId: 'org-1', taskId: null },
       'intent_failed',
     );
+  });
+
+  // Topology M4-D3 (#6000): the inline release refuses a mandatory-pin tool
+  // with no pinned digest — same explicit refusal as the durable worker.
+  it('CASes to failed:digest_required and never recomputes when diagnose_connectivity carries no digest', async () => {
+    vi.mocked(checkGuardrails).mockReturnValue({
+      allowed: true, tier: 3, requiresApproval: true, description: 'Topology diagnostic',
+    } as any);
+    mockInsertReturning({ id: 'exec-topology-unpinned' });
+    mockCreateActionIntent.mockResolvedValue(
+      makeIntentSnapshot({ id: 'intent-topology-unpinned', approvalRequestIds: ['appr-topology-unpinned'] }),
+    );
+    mockWaitForIntentDecision.mockResolvedValue('approved');
+    mockTransitionIntent.mockResolvedValue(true);
+    const selectChain: Record<string, unknown> = {
+      from: vi.fn(() => selectChain),
+      where: vi.fn(() => selectChain),
+      limit: vi.fn(async () => [{
+        id: 'intent-topology-unpinned', boundArgumentDigest: 'digest', actionName: 'diagnose_connectivity',
+        arguments: { site_id: 's' }, effectDigest: null,
+      }]),
+    };
+    vi.mocked(db.select).mockReturnValue(selectChain as any);
+    mockComputeEffectDigest.mockClear();
+
+    // The mocked registry only knows ordinary tools; the refusal keys off the
+    // STORED intent's action name, which is what the release actually runs.
+    const result = await createSessionPreToolUse(makeActiveSession())('execute_command', { command: 'whoami' });
+
+    expect(result).toEqual({ allowed: false, error: 'This action requires a pinned effect and could not be verified; it was not executed.' });
+    expect(mockComputeEffectDigest).not.toHaveBeenCalled();
+    expect(mockTransitionIntent).toHaveBeenCalledWith('intent-topology-unpinned', 'executing', 'failed', { errorCode: 'digest_required' });
   });
 
   // #5232, `executed: false` branch. The other half of `reportLostTerminalCas`:

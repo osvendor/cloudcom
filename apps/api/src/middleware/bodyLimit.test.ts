@@ -7,6 +7,10 @@ const MB = 1024 * 1024;
 const KB = 1024;
 
 describe('bodyLimitForPath', () => {
+  it('keeps the 1MB default on the public Xero webhook (Xero W05 refinement 8)', () => {
+    expect(bodyLimitForPath('/api/v1/webhooks/xero')).toMatchObject({ rule: 'default', maxSize: 1 * MB });
+  });
+
   it('applies the tight 1MB default to ordinary routes', () => {
     expect(bodyLimitForPath('/api/v1/devices')).toEqual({
       rule: 'default',
@@ -194,6 +198,22 @@ describe('bodyLimitForPath', () => {
     expect(bodyLimitForPath('/api/v1/contracts/contract-templates/tpl-1/versions').maxSize).toBe(1 * MB);
   });
 
+  it('allows a 4 MiB adjacency report plus envelope on topology/adjacency only', () => {
+    expect(bodyLimitForPath('/api/v1/agents/agent-1/topology/adjacency')).toEqual({
+      rule: 'agent-topology-adjacency', maxSize: 4 * MB + 64 * KB, error: 'Adjacency report too large (max 4 MiB)',
+    });
+    expect(bodyLimitForPath('/api/v1/agents/agent-1/topology/adjacency/extra').maxSize).toBe(1 * MB);
+    expect(bodyLimitForPath('/api/v1/agents/agent-1/topology').maxSize).toBe(1 * MB);
+  });
+
+  it('allows the 8 MiB topologyV1 companion plus the legacy telemetry body on unifi-telemetry only', () => {
+    expect(bodyLimitForPath('/api/v1/agents/agent-1/unifi-telemetry')).toEqual({
+      rule: 'agent-unifi-telemetry', maxSize: 9 * MB, error: 'UniFi telemetry too large (max 8 MiB topology + 1 MiB telemetry)',
+    });
+    expect(bodyLimitForPath('/api/v1/agents/agent-1/unifi-telemetry/extra').maxSize).toBe(1 * MB);
+    expect(bodyLimitForPath('/api/v1/agents/agent-1/unifi-collectors').maxSize).toBe(1 * MB);
+  });
+
   it('allows exactly 2 MiB on hardware-health without widening sibling paths', () => {
     expect(bodyLimitForPath('/api/v1/agents/agent-1/hardware-health')).toEqual({
       rule: 'agent-hardware-health',
@@ -228,6 +248,7 @@ describe('bodyLimitForPath', () => {
       'contract-template': '/api/v1/contracts/contract-templates/tpl-1/versions/upload',
       'agent-ingest': '/api/v1/agents/agent-1/software',
       'agent-hardware-health': '/api/v1/agents/agent-1/hardware-health',
+      'agent-time-status': '/api/v1/agents/agent-1/time-status',
     };
     for (const [rule, path] of Object.entries(sampled)) {
       expect({ path, rule: bodyLimitForPath(path).rule }).toEqual({ path, rule });
@@ -341,6 +362,11 @@ const ROUTE_LEVEL_BODY_LIMITS: Record<
     paths: ['/api/v1/agents/agent-1/hardware-health'],
     globalMaxSize: 2 * MB,
     note: 'carved out — 2MB hardware/RAID snapshot ingest (#6856); route and gate agree at 2MB.',
+  },
+  'agents/timeStatus.ts': {
+    paths: ['/api/v1/agents/agent-1/time-status'],
+    globalMaxSize: 512 * 1024,
+    note: 'Time status route and global gate both enforce 512 KiB.',
   },
   'agents/logs.ts': {
     paths: ['/api/v1/agents/agent-1/logs'],

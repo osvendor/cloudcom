@@ -7,10 +7,11 @@
 
 import type Anthropic from '@anthropic-ai/sdk';
 import type { AiToolDomain } from '@breeze/shared';
-import { db } from '../db';
+import { db, hasDbAccessContext, withDbAccessContext } from '../db';
 import { devices } from '../db/schema';
 import { eq, and, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
+import { dbAccessContextFromAuth } from '../middleware/auth';
 import { validateToolInput } from './aiToolSchemas';
 import { setToolPaginationHintResolver } from './aiToolOutput';
 import type { CaptureScope } from './artifacts/toolResultCapture';
@@ -56,6 +57,7 @@ import { registerDRTools } from './aiToolsDR';
 // New domain modules
 import { registerDeviceTools } from './aiToolsDevice';
 import { registerNetworkTools } from './aiToolsNetwork';
+import { registerTopologyTools } from './aiToolsTopology';
 import { registerSentinelOneTools } from './aiToolsSentinelOne';
 import { registerHuntressTools } from './aiToolsHuntress';
 import { registerSecurityTools } from './aiToolsSecurity';
@@ -70,6 +72,7 @@ import { registerPlaybookTools } from './aiToolsPlaybooks';
 import { registerAlertTools } from './aiToolsAlerts';
 import { registerDeliveryTools } from './aiToolsDelivery';
 import { registerRemediationTools } from './aiToolsRemediation';
+import { registerFixMemoryTools } from './aiToolsFixMemory';
 import { registerIncidentTools } from './aiToolsIncident';
 import { registerPerformanceTools } from './aiToolsPerformance';
 import { registerUserRiskTools } from './aiToolsUserRisk';
@@ -100,6 +103,7 @@ import { registerArtifactTools } from './aiToolsArtifacts';
 // getToolTier so checkGuardrails can gate them; import the tier tables for fallback.
 import { m365ToolSearchHints, m365ToolTiers, registerM365Tools } from './aiToolsM365';
 import { googleToolSearchHints, googleToolTiers } from './aiToolsGoogle';
+import { authorizeTopologyAiToolCall, isTopologyAiToolName, topologyAiAliasScope, type TopologyToolBinding } from './topology/aiToolGate';
 // ============================================
 // Shared Types
 // ============================================
@@ -161,6 +165,28 @@ export interface AiTool {
    * capture exists for.
    */
   captureExempt?: boolean;
+  /**
+   * The handler opens its OWN short DB contexts and must not run inside a
+   * caller-opened per-call transaction (#7128). Set it only for a handler
+   * that hands work to another process and then WAITS on it — `propose_script`
+   * commits a proposal, enqueues its review, and polls up to 45 s for the
+   * worker's verdict.
+   *
+   * Under the default per-call transaction such a handler is broken twice:
+   * the other process cannot see the uncommitted row it was handed, and the
+   * pooled connection sits idle-in-transaction for the whole wait (#1105).
+   * `runOutsideDbContext` inside the handler cannot fix either — it re-routes
+   * new queries but cannot release the caller's transaction.
+   *
+   * Honoured by the SDK tool wrapper (`aiAgentSdkTools.ts` `makeToolHandler`,
+   * i.e. chat and agent runs), which then opens no transaction around
+   * `executeTool`; `executeTool` runs its own DB-touching phases (the
+   * `deviceArgs` gate, result capture) in a short caller-scoped context when
+   * none is held. A caller that holds a request-wide transaction anyway (the
+   * MCP route's auth middleware) still holds it — the handler must check
+   * `hasDbAccessContext()` and not wait under it.
+   */
+  selfManagedDbContext?: true;
 }
 
 // ============================================
@@ -182,7 +208,8 @@ export async function verifyDeviceAccess(
   if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
     return { error: 'Device not found or access denied' };
   }
-  const conditions: SQL[] = [eq(devices.id, deviceId)];
+  // Never a device parked in a holding org, whatever the caller's scope.
+  const conditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
   const orgCond = auth.orgCondition(devices.orgId);
   if (orgCond) conditions.push(orgCond);
   const [device] = await db.select().from(devices).where(and(...conditions)).limit(1);
@@ -270,6 +297,7 @@ export { resolveWritableToolOrgId } from './aiToolWriteOrg';
 // modules that still import `aiTools/hasCoreAiToolName` from here.
 export { aiTools, hasCoreAiToolName } from './aiToolNames';
 import { aiTools, hasCoreAiToolName, registerReservedAiToolNamePredicate } from './aiToolNames';
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 
 // Register all domain modules
 registerAgentLogTools(aiTools);
@@ -291,6 +319,7 @@ registerMonitoringTools(aiTools);
 registerMonitorTools(aiTools);
 registerDeviceTools(aiTools);
 registerNetworkTools(aiTools);
+registerTopologyTools(aiTools);
 registerSentinelOneTools(aiTools);
 registerHuntressTools(aiTools);
 registerSecurityTools(aiTools);
@@ -312,6 +341,7 @@ registerDeliverableTools(aiTools);
 registerQuoteTools(aiTools);
 registerOrgTools(aiTools);
 registerRemediationTools(aiTools);
+registerFixMemoryTools(aiTools);
 registerIncidentTools(aiTools);
 registerPerformanceTools(aiTools);
 registerUserRiskTools(aiTools);
@@ -453,6 +483,9 @@ export function getToolSearchHint(toolName: string): string | undefined {
 }
 
 export function getToolAlwaysLoad(toolName: string): boolean {
+  // Approval-mode prompts instruct the model to call this chat-only tool by
+  // name, so it is never deferred behind tool search (A-W04).
+  if (toolName === 'propose_action_plan') return true;
   return aiTools.get(toolName)?.alwaysLoad === true;
 }
 
@@ -486,6 +519,8 @@ export const HELPER_TOOL_SCOPING: Record<string, 'deviceId' | 'deviceIds'> = {
   // Read-only (Phase 0 `basic` set).
   get_device_details: 'deviceId',
   get_device_hardware_health: 'deviceId',
+  get_device_time_status: 'deviceId',
+  list_time_sync_issues: 'deviceId',
   analyze_metrics: 'deviceId',
   analyze_disk_usage: 'deviceId',
   get_cis_device_report: 'deviceId',
@@ -561,6 +596,13 @@ export type ExecuteToolOptions = {
    * for unrelated per-invocation inputs.
    */
   capture?: CaptureScope;
+  /**
+   * Topology M4-D1 (#6000): where a topology tool call comes from — a pointer
+   * to server state (the active chat session, or the MCP key's own site
+   * restriction), never a site. The gate resolves and authorizes the pinned
+   * site; topology tools refuse when this is absent. Ignored by every other tool.
+   */
+  topologyBinding?: TopologyToolBinding;
 };
 
 export async function executeTool(
@@ -612,10 +654,21 @@ export async function executeTool(
     return JSON.stringify({ error: validation.error });
   }
 
+  // A self-managed tool (#7128) may arrive with no DB context at all — the SDK
+  // wrapper deliberately opens none for it. This dispatcher's own DB phases
+  // then each run in a SHORT context built from the caller's auth (the same
+  // builder the wrapper would have used), so they are never contextless
+  // (RLS-denied) and never held across the handler. Every other tool, and any
+  // call that already holds a context, is untouched: the check short-circuits
+  // on the flag before it ever consults the context store.
+  const ownContext = coreTool?.selfManagedDbContext === true && !hasDbAccessContext();
+  const inDispatchContext = <T>(fn: () => Promise<T>): Promise<T> =>
+    ownContext ? withDbAccessContext(dbAccessContextFromAuth(auth), fn) : fn();
+
   // Structural device-tenant gate: any id named in `tool.deviceArgs` is
   // org+site-checked before the handler runs, so a tool can't reach a device
   // outside the caller's scope even if its handler forgets to check.
-  const gate = await enforceDeviceArgs(tool, effectiveInput, auth);
+  const gate = await inDispatchContext(() => enforceDeviceArgs(tool, effectiveInput, auth));
   if (!gate.ok) return JSON.stringify({ error: gate.error });
 
   // A-W05 (D13a/Q4): `read_artifact` must read with the SAME anchor capture
@@ -630,7 +683,19 @@ export async function executeTool(
   // caller-supplied context is passed through with `toBe` (reference)
   // equality, and a context rebuilt for every call would break that.
   const captureAnchor = toolName === 'read_artifact' ? captureContextFrom(auth, opts, toolName) : null;
-  const handlerContext = captureAnchor ? { ...opts?.context, captureAnchor } : opts?.context;
+  let handlerContext = captureAnchor ? { ...opts?.context, captureAnchor } : opts?.context;
+
+  // Topology M4-D1 (#6000): every topology tool runs only against the site a
+  // server-owned context pins — the active topology session, or a one-site
+  // MCP key. The gate issues the handler's site context; any caller-supplied
+  // `topologyRequest` is discarded (overwritten below, or the call refused).
+  // Name-gated like `read_artifact` above so every other tool's context keeps
+  // its reference identity.
+  if (coreTool && isTopologyAiToolName(toolName)) {
+    const gate = await authorizeTopologyAiToolCall(effectiveInput, auth, opts?.topologyBinding);
+    if (!gate.ok) return JSON.stringify({ error: gate.error, code: gate.code });
+    handlerContext = { ...handlerContext, topologyRequest: gate.ctx, topologyAliasScope: topologyAiAliasScope(gate.sessionId) };
+  }
 
   // Only CORE handlers receive the execution context. Extension handlers are
   // third-party code and are called with exactly two arguments — not merely
@@ -658,7 +723,7 @@ export async function executeTool(
     ? null
     : captureContextFrom(auth, opts, toolName);
   try {
-    return await captureLargeToolResult(rawResult, captureCtx);
+    return await inDispatchContext(() => captureLargeToolResult(rawResult, captureCtx));
   } catch (err) {
     captureException(err);
     console.error(`[aiTools] artifact capture failed for ${toolName}; returning the raw result`, err);

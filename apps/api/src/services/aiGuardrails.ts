@@ -25,6 +25,17 @@ import { envFlag } from '../config/env';
 import { resolveActOperation } from './aiAgents/actManifest';
 import { warrantyHpCmslRequested } from '@breeze/shared/validators';
 import { getCachedAiKillStateSnapshot } from './aiKillState';
+import { AGENT_HUMAN_ONLY_TOOLS, AGENT_DENIED_READ_TOOLS } from './aiToolExposure';
+import { LIVE_READ_INPUT_FLAGS, requestsLiveDeviceRead } from './aiLiveDeviceReads';
+
+// Re-exported so every existing importer of AGENT_HUMAN_ONLY_TOOLS keeps
+// working unchanged after the move to aiToolExposure.ts (W01 quorum
+// amendment WQ4, #6755): the two agent-denial registries now live in one
+// data-only file, enforced here.
+export { AGENT_HUMAN_ONLY_TOOLS, AGENT_DENIED_READ_TOOLS };
+// Re-exported for the tier-parity contract tests, which read every tier table
+// from this module.
+export { LIVE_READ_INPUT_FLAGS, requestsLiveDeviceRead };
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -81,6 +92,16 @@ export const TIER2_ACTIONS: Record<string, string[]> = {
   // Ticking a step is not a tool action at all (see aiToolsTicketing.ts).
   manage_ticket_checklist: ['add_item', 'update_item', 'delete_item', 'reorder', 'apply_template'],
   manage_services: ['list'],
+  // Live device inspection: listing processes / scheduled tasks runs a live
+  // command on the device (devices:execute, like GET /system-tools/...). Tier 2
+  // read-only, like file_operations:list and manage_services:list: no prompt,
+  // but an audit row, and an MCP key needs ai:write.
+  manage_processes: ['list'],
+  manage_scheduled_tasks: ['list'],
+  // Asking the device for its OS-native cleaner catalog is a live command
+  // (POST /devices/:id/filesystem/system-cleanup/list needs devices:execute).
+  // `status` reads the stored run and stays Tier 1 (TIER1_READ_ACTIONS).
+  system_cleanup: ['list'],
   // SR5-01 partial relaxation (2026-07-20): directory LISTING is recon-only —
   // filenames leak far less than contents — so it auto-executes with audit.
   // file READ stays Tier 3 below: the agent runs as root/LocalSystem and an
@@ -88,7 +109,7 @@ export const TIER2_ACTIONS: Record<string, string[]> = {
   file_operations: ['list'],
   // #3088 approval-fatigue fix (2026-08-04): read-only execute_command
   // commandTypes are non-mutating device reads and auto-execute with audit,
-  // consistent with their sibling tools (manage_processes list is Tier 1,
+  // consistent with their sibling tools (manage_processes list,
   // manage_services list and file_operations list are Tier 2). This is an
   // explicit conservative allowlist keyed on commandType (the agent-side
   // handler discriminator — see TOOL_ACTION_INPUT_KEYS above); anything not
@@ -132,7 +153,7 @@ export const TIER2_ACTIONS: Record<string, string[]> = {
   manage_groups: ['add_devices', 'remove_devices'],
   // manage_maintenance_windows mutations disabled — managed via configuration policies
   manage_automations: ['enable', 'disable'],
-  // manage_alert_rules mutations disabled — managed via configuration policies
+  // manage_alert_rules is read-only; author conditions via manage_monitor_definitions
   // manage_service_monitors mutations disabled — managed via configuration policies
   generate_report: ['create', 'update', 'delete', 'generate'],
   // Policy prerequisite tools — Tier 2 create/update actions.
@@ -168,7 +189,10 @@ export const TIER2_READONLY_ACTIONS: Record<string, string[]> = {
   manage_policy_feature_link: ['describe'],
   execute_command: ['event_logs_list', 'file_list', 'list_processes'],
   file_operations: ['list'],
+  manage_processes: ['list'],
+  manage_scheduled_tasks: ['list'],
   manage_services: ['list'],
+  system_cleanup: ['list'],
 };
 
 // #3130 companion for whole tools: base-Tier-2 tools whose EVERY operation is
@@ -214,6 +238,59 @@ export const TIER1_ACTIONS: Record<string, string[]> = {
   manage_tags: ['list'],
 };
 
+/**
+ * Spec 2026-09-23 W01-D3: the explicit read allowlist for registry-tier-1
+ * multiplexers. A tier-1 tool with an `action`/discriminator enum resolves
+ * to tier 1 (read-only to headless agents, via `isReadOnlyResolution`) for
+ * ANY action not otherwise escalated — so an unclassified new enum member
+ * would silently default to "read" rather than failing closed. Every action
+ * of such a tool must appear here, in TIER2_ACTIONS, or in TIER3_ACTIONS
+ * (enforced by aiGuardrails.tier1WriteActions.contract.test.ts). Exported for
+ * contract tests only — see the note on TIER2_ACTIONS.
+ */
+export const TIER1_READ_ACTIONS: Record<string, readonly string[]> = {
+  configuration_policy_compliance: ['summary', 'status'],
+  // disk_cleanup:preview reads the latest filesystem-cleanup snapshot and
+  // writes a device_filesystem_cleanup_runs bookkeeping row
+  // (aiToolsFilesystem.ts:391-410) — it does NOT dispatch a scan, and it
+  // changes no device state. Reclassifying it is W04's call (spec W01-D3).
+  disk_cleanup: ['preview'],
+  generate_report: ['list', 'data', 'history', 'download'],
+  get_dns_security: ['allowed', 'blocked', 'redirected'],
+  get_service_monitoring_status: ['status', 'summary', 'results', 'known_services'],
+  manage_alert_rules: ['list_rules', 'get_rule', 'test_rule', 'list_channels', 'alert_summary'],
+  manage_alerts: ['list', 'get'],
+  manage_automations: ['list', 'get', 'history'],
+  manage_backup_configs: ['list', 'get'],
+  manage_backup_profiles: ['list', 'get'],
+  manage_delivery: ['resolve', 'list_routing', 'list_escalation'],
+  manage_deployments: ['list', 'get', 'device_status'],
+  manage_groups: ['list', 'get', 'preview', 'membership_log'],
+  manage_maintenance_windows: ['list', 'get', 'active_now'],
+  // create/update/delete are retired: they return guidance before any DB
+  // access and map to devices:read in TOOL_PERMISSIONS, so they classify as
+  // reads here.
+  manage_monitors: ['get', 'create', 'update', 'delete'],
+  manage_notification_channels: ['list'],
+  manage_patches: ['list', 'compliance', 'device_history'],
+  manage_peripheral_policies: ['list', 'get'],
+  // manage_processes:list and manage_scheduled_tasks:list are NOT here: they
+  // run a live command on the device, so they sit in TIER2_ACTIONS (+ the
+  // read-only allowlist) with file_operations:list / manage_services:list.
+  manage_saved_filters: ['list', 'get'],
+  manage_service_monitors: ['list'],
+  manage_software_policies: ['list', 'get'],
+  manage_ticket_checklist: ['list', 'list_templates', 'get_template'],
+  manage_tickets: ['list', 'get', 'list_work_types'],
+  manage_update_rings: ['list', 'get'],
+  query_agent_versions: ['list_versions', 'check_upgrades'],
+  query_analytics: ['sla_compliance', 'capacity_predictions', 'sla_definitions'],
+  query_backups: ['list_configs', 'list_jobs', 'list_policies'],
+  query_custom_fields: ['list_definitions', 'get_device_values'],
+  // system_cleanup:list is NOT here: it asks the device live (TIER2_ACTIONS).
+  system_cleanup: ['status'],
+};
+
 // Mutations that require approval (Tier 3) even if the tool is registered as Tier 1
 // Exported for contract tests only — see the note on TIER2_ACTIONS.
 export const TIER3_ACTIONS: Record<string, string[]> = {
@@ -248,10 +325,19 @@ export const TIER3_ACTIONS: Record<string, string[]> = {
   // it is here so re-enabling the handler cannot silently reopen the hole.
   manage_patches: ['install', 'rollback', 'setup_auto_approval'],
   manage_groups: ['create', 'update', 'delete'],
-  manage_automations: ['run'],
+  // create/update/delete added W01-D3 (#6755): handler-disabled today
+  // (aiToolsFleet.ts:2041, managed via configuration policies), same pattern
+  // as manage_patches.setup_auto_approval above — escalated so re-enabling
+  // the handler cannot silently reopen an unallowlisted agent write.
+  manage_automations: ['run', 'create', 'update', 'delete'],
   manage_processes: ['kill'],
   manage_policy_feature_link: ['remove'],
   registry_operations: ['set_value', 'create_key', 'delete_key'],
+  // create/update/delete added W01-D3 (#6755): handler-disabled today
+  // (aiToolsFleet.ts:2742, managed via configuration policies) — escalated so
+  // re-enabling the handler cannot silently reopen an unallowlisted agent
+  // write.
+  manage_maintenance_windows: ['create', 'update', 'delete'],
   // Policy prerequisite tools (#3552) — the standalone feature policies that
   // manage_configuration_policy links via featurePolicyId. These were Tier 2
   // (auto-execute + audit, no approval) while the configuration policy that
@@ -300,7 +386,6 @@ export const TIER3_ACTIONS: Record<string, string[]> = {
   manage_dr_plan: ['delete_group'],
   manage_hyperv_checkpoints: ['delete', 'apply'],
   // Monitoring tools — Tier 3 actions (require user approval)
-  manage_monitors: ['create', 'update', 'delete'],
   manage_delivery: ['create_routing','update_routing','delete_routing','set_default','create_escalation','update_escalation','delete_escalation'],
   // Ticketing — move_org is a tenant-shape mutation and requires approval.
   // log_time_entry/start_timer/stop_timer downgraded to Tier 2 (2026-07-20).
@@ -452,41 +537,9 @@ export const TIER3_FOUR_EYES_TOOLS = new Set<string>([
   'request_elevation',
 ]);
 
-/**
- * Tools the `ai_agent` principal may NEVER call, whatever its allowlist says.
- *
- * A third unconditional denial class alongside BLOCKED_TOOLS (tier 4) and
- * `isSecretBearingTool` — and, like those, enforced in `checkAgentGuardrails`
- * ABOVE the allowlist and the multiplexed-action resolution, so the deny
- * cannot depend on a parseable `action` or on the snapshot omitting the name.
- *
- * `manage_ai_agents` (P2-5, #4192) grants an agent a pre-authorized action
- * key: an agent able to call it could grant ITSELF new unattended authority,
- * which is the one escalation no approval scope can contain (the grant
- * outlives the run). Membership here is a registry, not a hard-coded string,
- * so aiGuardrails.agentPrincipal.contract.test.ts can treat the class as
- * unconditionally denied instead of duplicating the literal.
- */
-export const AGENT_HUMAN_ONLY_TOOLS = new Set<string>([
-  'manage_ai_agents',
-  // Execution plane (spec §5.5). FULLY DEREGISTERED as of #6086 — chat-to-agent
-  // delegation is withdrawn until caller authorization can be preserved for the
-  // length of a run, so no tier, schema, handler or MCP declaration remains.
-  // Kept here anyway, and pinned by workspaceLaunchTool.registration.test.ts:
-  // an agent that could launch analysis runs could launch runs that launch
-  // runs, so if the name is ever re-wired this deny (unconditional, above the
-  // allowlist in `checkAgentGuardrails`) must already be in place rather than
-  // being something the re-wiring has to remember. A HUMAN asks for analysis.
-  //
-  // This entry is ALSO load-bearing for the workspace_stage/run/collect/cancel
-  // permission mapping (2026-09-17 ROLE audit §2.7): those four are flat
-  // `ai_agents:read`, which is only defensible while no chat caller can obtain
-  // a run-bearing principal. Re-wiring launch without first raising them to an
-  // execute-class permission hands arbitrary code execution to every
-  // `ai_agents:read` holder. See the LANDMINE note at their TOOL_PERMISSIONS
-  // entries, and aiGuardrails.workspaceToolSurface.contract.test.ts.
-  'workspace_launch_analysis',
-]);
+// AGENT_HUMAN_ONLY_TOOLS and AGENT_DENIED_READ_TOOLS moved to
+// aiToolExposure.ts (W01 quorum amendment WQ4, #6755) and are re-exported
+// near the top of this file so every existing importer keeps working.
 
 export const TIER3_SUPERVISED_ACTIONS: Record<string, string[]> = {
   // complement of TIER3_FOUR_EYES_ACTIONS within TIER3_ACTIONS.
@@ -517,10 +570,17 @@ export const TIER3_SUPERVISED_ACTIONS: Record<string, string[]> = {
   manage_deployments: ['create', 'start', 'cancel'],
   manage_patches: ['install', 'setup_auto_approval'],
   manage_groups: ['create', 'update', 'delete'],
-  manage_automations: ['run'],
+  // create/update/delete added W01-D3 (#6755): handler-disabled today, same
+  // supervised (not four_eyes) class as the sibling fleet tools above —
+  // nothing here is externally binding or financial.
+  manage_automations: ['run', 'create', 'update', 'delete'],
   manage_processes: ['kill'],
   manage_policy_feature_link: ['remove'],
   registry_operations: ['set_value', 'create_key', 'delete_key'],
+  // create/update/delete added W01-D3 (#6755): handler-disabled today,
+  // supervised (not four_eyes) — nothing here is externally binding or
+  // financial.
+  manage_maintenance_windows: ['create', 'update', 'delete'],
   // #3552 policy-prerequisite escalations. `supervised`, matching the
   // configuration policy they link into (manage_configuration_policy
   // create/update/delete above), the Tier-3 singular siblings in
@@ -532,7 +592,6 @@ export const TIER3_SUPERVISED_ACTIONS: Record<string, string[]> = {
   manage_software_policies: ['create', 'update'],
   manage_peripheral_policies: ['create', 'update'],
   manage_dr_plan: ['delete_group'],
-  manage_monitors: ['create', 'update', 'delete'],
   manage_delivery: ['create_routing','update_routing','delete_routing','set_default','create_escalation','update_escalation','delete_escalation'],
   manage_contracts: ['pause', 'resume'],
   // create_site adds a location within an existing org, not a new tenant —
@@ -580,6 +639,19 @@ export const TIER3_SUPERVISED_TOOLS = new Set<string>([
   // ("backup triggers, ... agent upgrades").
   'trigger_backup', 'trigger_hyperv_backup', 'trigger_mssql_backup',
   'trigger_agent_upgrade', 'trigger_agent_restart',
+  // Topology M4 Task 4 (#6000), same class as network_discovery: every
+  // accepted recipe is ONE bounded, same-site OBSERVATIONAL check from the
+  // fixed M1/M3 set (gateway/DNS/internet/configured target/routed trace) —
+  // no arbitrary shell, configuration, identity, destination or destructive
+  // operation exists in its input. Supervised removes nothing: it still needs
+  // an explicit approval with a FRESH second factor (freshApproverFactor.ts),
+  // a mandatory pinned effect digest and live re-authorization at release. It
+  // is not policy-decidable and has no unattended grant.
+  'diagnose_connectivity',
+  // Real outbound POST to a human-configured
+  // URL, and its route requires MFA — see the registry-tier comment beside
+  // aiToolsIntegrations.ts's test_webhook registration.
+  'test_webhook',
 ]);
 
 /**
@@ -592,6 +664,13 @@ export const TIER3_SUPERVISED_TOOLS = new Set<string>([
  */
 export const TIER3_INPUT_AWARE_ACTIONS: ReadonlySet<string> = new Set<string>([
   'manage_organizations:update_org',
+  // A customer-visible ticket reply is a different class of act from an
+  // internal note — the note stays at the tool's base Tier 2 (auto-execute
+  // + audit), but an AI-composed comment that will be shown to the ticket
+  // requester needs a human to have actually looked at it first. Only the
+  // INPUT (`isPublic`) says which one a given call is, so it cannot be
+  // classified by (tool, action) alone in the static tables.
+  'manage_tickets:comment',
   // RMM-QA-176 D9: a 'maintenance' feature link is the canonical
   // monitoring-suppression source, so authoring one is a different class of
   // act from authoring any other link — but only the INPUT says which it is,
@@ -636,6 +715,12 @@ export function isInputAwareTier3(
   action: string | undefined,
   input: Record<string, unknown>,
 ): boolean {
+  if (toolName === 'manage_tickets' && action === 'comment') {
+    // Mirrors the handler's own default (aiToolsTicketing.ts): only an
+    // EXPLICIT `isPublic: true` requests a customer-visible reply. Absent or
+    // `false` stays an internal note at the tool's base Tier 2.
+    return input.isPublic === true;
+  }
   if (toolName !== 'manage_policy_feature_link') return false;
   if (action !== 'add' && action !== 'update') return false;
   return (
@@ -658,6 +743,19 @@ export const TIER3_INPUT_AWARE_TOOLS: ReadonlySet<string> = new Set<string>([
 ]);
 
 /**
+ * Why a proposal-backed `run_script` was refused a tier, when the input named
+ * a `proposalId` but `loadProposalGuardrailContext` could not hand back a
+ * reviewed risk tier for it (#7129). Deliberately collapses "no such id" and
+ * "exists in a different org" into the SAME `proposal_not_found` value — the
+ * caller must never be able to tell a cross-tenant id apart from a
+ * nonexistent one.
+ */
+export type ProposalContextDenyReason =
+  | 'proposal_not_found'
+  | 'proposal_review_pending'
+  | 'proposal_review_failed';
+
+/**
  * Optional, DB-FREE context a caller may hand to the guardrail so an
  * input-aware decision can read persisted state without this module importing
  * the schema (aiGuardrails.imports.contract.test.ts).
@@ -668,6 +766,13 @@ export const TIER3_INPUT_AWARE_TOOLS: ReadonlySet<string> = new Set<string>([
  */
 export interface GuardrailContext {
   proposal?: { riskTier: RiskTier; strictHits: string[] };
+  /**
+   * Set only when `proposal` is undefined AND the loader actually resolved a
+   * specific reason (vs. no context being supplied at all) — lets the tier-4
+   * deny below give the caller a model-actionable reason instead of the
+   * generic `proposal_context_missing` catch-all.
+   */
+  proposalDenyReason?: ProposalContextDenyReason;
 }
 
 /** A `run_script` call that names a proposal instead of a library script. */
@@ -740,6 +845,8 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   query_devices: { resource: 'devices', action: 'read' },
   get_device_details: { resource: 'devices', action: 'read' },
   get_device_hardware_health: { resource: 'devices', action: 'read' },
+  get_device_time_status: { resource: 'devices', action: 'read' },
+  list_time_sync_issues: { resource: 'devices', action: 'read' },
   get_vulnerability_report: { resource: 'devices', action: 'read' },
   get_device_vulnerabilities: { resource: 'devices', action: 'read' },
   // routes/patches/operations.ts:29 (/scan) and :171 (/:id/rollback) both
@@ -838,7 +945,9 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   manage_catalog: {
     create_item: { resource: 'catalog', action: 'write' },
     update_item: { resource: 'catalog', action: 'write' },
-    archive_item: { resource: 'catalog', action: 'write' },
+    // Matches POST /catalog/items/:id/archive
+    // (routes/catalog/catalog.ts:24,75 — `deletePerm`, i.e. catalog:delete).
+    archive_item: { resource: 'catalog', action: 'delete' },
     set_org_price: { resource: 'catalog', action: 'write' },
     remove_org_price: { resource: 'catalog', action: 'write' },
     set_bundle_components: { resource: 'catalog', action: 'write' },
@@ -906,12 +1015,24 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
     move_line: { resource: 'quotes', action: 'write' },
     reorder_lines: { resource: 'quotes', action: 'write' },
     send: { resource: 'quotes', action: 'send' },
-    decline: { resource: 'quotes', action: 'write' },
-    create_pay_link: { resource: 'quotes', action: 'write' },
+    // Recording the customer's decision (however it
+    // came in) is the same authority whichever way they answered: matches
+    // accept-on-behalf and the route's own gate (routes/quotes/lifecycle.ts:
+    // 30, 253-254 — decline-on-behalf is `acceptPerm`, i.e. quotes:accept).
+    decline: { resource: 'quotes', action: 'accept' },
+    // No staff REST twin for THIS action; the matching
+    // staff authority is POST /invoices/:id/pay-link (routes/invoices/stripe.ts:
+    // 19,26), gated on invoices:send. A Stripe checkout session is created on
+    // the partner's connected account, same as that route. `quotes:read` extra
+    // below because the handler still has to read the quote to resolve it.
+    create_pay_link: { resource: 'invoices', action: 'send' },
   },
   // GET orgContacts.ts /organizations/:id/contacts: PERMISSIONS.ORGS_READ.
   // GET remediationSuggestions.ts /: PERMISSIONS.DEVICES_READ.
   list_remediation_suggestions: { resource: 'devices', action: 'read' },
+  // GET remediationSuggestions.ts /: PERMISSIONS.DEVICES_READ — proven fixes are
+  // the same class of read as the suggestions list they feed.
+  find_proven_fixes: { resource: 'devices', action: 'read' },
   list_incidents: { resource: 'alerts', action: 'read' },
   list_ai_agents: { resource: 'ai_agents', action: 'read' },
   list_ai_agent_runs: { resource: 'ai_agents', action: 'read' },
@@ -932,7 +1053,10 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   },
   manage_services: { resource: 'devices', action: 'execute' },
   manage_processes: {
-    list: { resource: 'devices', action: 'read' },
+    // Live inspection: list dispatches list_processes to the agent, the same
+    // command GET /system-tools/devices/:id/processes sends, and that router
+    // requires DEVICES_EXECUTE on every method (routes/systemTools/index.ts).
+    list: { resource: 'devices', action: 'execute' },
     kill: { resource: 'devices', action: 'execute' },
   },
   security_scan: {
@@ -943,13 +1067,18 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
     restore: { resource: 'devices', action: 'execute' },
     vulnerabilities: { resource: 'devices', action: 'read' },
   },
+  // Stored snapshot read. `refresh: true` scans the device live and requires
+  // devices:execute instead (LIVE_READ_INPUT_FLAGS; POST
+  // /devices/:id/filesystem/scan).
   analyze_disk_usage: { resource: 'devices', action: 'read' },
   disk_cleanup: {
     preview: { resource: 'devices', action: 'read' },
     execute: { resource: 'devices', action: 'execute' },
   },
   system_cleanup: {
-    list: { resource: 'devices', action: 'read' },
+    // Live: asks the device for its cleaner catalog, like POST
+    // /devices/:id/filesystem/system-cleanup/list (DEVICES_EXECUTE).
+    list: { resource: 'devices', action: 'execute' },
     run: { resource: 'devices', action: 'execute' },
     status: { resource: 'devices', action: 'read' },
   },
@@ -966,10 +1095,15 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   query_audit_log: { resource: 'audit', action: 'read' },
   query_change_log: { resource: 'devices', action: 'read' },
   network_discovery: { resource: 'devices', action: 'execute' },
+  // Stored boot history. `triggerCollection: true` collects live from the
+  // device and requires devices:execute instead (LIVE_READ_INPUT_FLAGS; POST
+  // /devices/:id/collect-boot-metrics).
   analyze_boot_performance: { resource: 'devices', action: 'read' },
   manage_startup_items: { resource: 'devices', action: 'execute' },
   manage_scheduled_tasks: {
-    list: { resource: 'devices', action: 'read' },
+    // Live inspection: list dispatches tasks_list to the agent, like GET
+    // /system-tools/devices/:id/tasks (DEVICES_EXECUTE router-wide).
+    list: { resource: 'devices', action: 'execute' },
     run: { resource: 'devices', action: 'execute' },
     disable: { resource: 'devices', action: 'execute' },
     enable: { resource: 'devices', action: 'execute' },
@@ -1061,7 +1195,6 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
     run: { resource: 'automations', action: 'write' },
   },
   manage_alert_rules: {
-    list_templates: { resource: 'alerts', action: 'read' },
     list_rules: { resource: 'alerts', action: 'read' },
     get_rule: { resource: 'alerts', action: 'read' },
     create_rule: { resource: 'alerts', action: 'write' },
@@ -1252,7 +1385,15 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   // surfaces on `organizations:*` and `backup:*` rather than the device grants
   // the data's shape suggests (2026-09-17 audit §2.5 — one decision, nine
   // tools). Route evidence is cited per line.
-  query_backups: { resource: 'organizations', action: 'read' },   // routes/backup/jobs.ts:61
+  // Per-action map: list_configs mirrors routes/backup/configs.ts:232
+  // (backup:read), list_jobs mirrors routes/backup/jobs.ts:61 (organizations:read),
+  // list_policies mirrors routes/configurationPolicies/crud.ts's GET / (devices:read).
+  // Bound in aiGuardrails.routeBinding.contract.test.ts.
+  query_backups: {
+    list_configs: { resource: 'backup', action: 'read' },
+    list_jobs: { resource: 'organizations', action: 'read' },
+    list_policies: { resource: 'devices', action: 'read' },
+  },
   get_backup_status: { resource: 'organizations', action: 'read' },   // routes/backup/jobs.ts:147
   browse_snapshots: { resource: 'backup', action: 'read' },   // routes/backup/snapshots.ts:200, 273
   trigger_backup: { resource: 'devices', action: 'execute' },
@@ -1293,24 +1434,39 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   get_sla_breaches: { resource: 'organizations', action: 'read' },
   get_sla_compliance_report: { resource: 'organizations', action: 'read' },
   configure_backup_sla: { resource: 'organizations', action: 'write' },
-  query_dr_plans: { resource: 'organizations', action: 'read' },
-  get_dr_plan_details: { resource: 'organizations', action: 'read' },
-  get_dr_execution_status: { resource: 'organizations', action: 'read' },
+  // Route requires devices:read (routes/dr.ts:34-37, requireDrRead); the
+  // tool matches it (aiGuardrails.routeBinding.contract.test.ts).
+  query_dr_plans: { resource: 'devices', action: 'read' },
+  get_dr_plan_details: { resource: 'devices', action: 'read' },
+  get_dr_execution_status: { resource: 'devices', action: 'read' },
   execute_dr_plan: { resource: 'devices', action: 'execute' },
-  manage_dr_plan: { resource: 'organizations', action: 'write' },
+  // Mirrors routes/dr.ts:38 (requireDrWrite = devices:write) on every plan and
+  // group write.
+  manage_dr_plan: { resource: 'devices', action: 'write' },
   // Monitoring tools — RBAC mappings
   query_monitors: { resource: 'devices', action: 'read' },
   manage_monitors: {
     get: { resource: 'devices', action: 'read' },
-    create: { resource: 'devices', action: 'write' },
-    update: { resource: 'devices', action: 'write' },
-    delete: { resource: 'devices', action: 'write' },
+    // Retired mutations return a refusal before DB access, so they need no write permission.
+    create: { resource: 'devices', action: 'read' },
+    update: { resource: 'devices', action: 'read' },
+    delete: { resource: 'devices', action: 'read' },
   },
   get_service_monitoring_status: { resource: 'devices', action: 'read' },
   // Integration & webhook tools
+  // query_webhooks keeps devices:read though REST GET /webhooks (routes/
+  // webhooks.ts) carries no requirePermission of its own (requireScope only)
+  // — the tool requires more than the route; see the routeBinding UNBOUND entry.
   query_webhooks: { resource: 'devices', action: 'read' },
-  query_psa_status: { resource: 'devices', action: 'read' },
-  test_webhook: { resource: 'devices', action: 'write' },
+  // Route requires organizations:read (routes/psa.ts:435); the tool matches
+  // it (aiGuardrails.routeBinding.contract.test.ts).
+  query_psa_status: { resource: 'organizations', action: 'read' },
+  // Matches POST /webhooks/:id/test
+  // (routes/webhooks.ts:683-684 — organizations:write, plus requireMfa();
+  // see the MFA note beside TOOL_EXTRA_PERMISSIONS). The tool is tier 3
+  // supervised (TIER3_SUPERVISED_TOOLS) because the route mutates and
+  // requires MFA.
+  test_webhook: { resource: 'organizations', action: 'write' },
   // Agent version & remote session tools
   query_agent_versions: { resource: 'devices', action: 'read' },
   trigger_agent_upgrade: { resource: 'devices', action: 'execute' },
@@ -1411,10 +1567,11 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   // Registration-debt payoff: RBAC entries for tools that were registered in
   // aiTools but had no TOOL_PERMISSIONS entry (legacyPermissionGaps in
   // aiToolsRegistryParity.test.ts). See that file's history for context.
-  // Incidents (analogy: manage_dr_plan/sync_huntress_data org-write; get_dr_plan_details org-read)
   create_incident: { resource: 'organizations', action: 'write' },
-  get_incident_timeline: { resource: 'organizations', action: 'read' },
-  generate_incident_report: { resource: 'organizations', action: 'read' },
+  // Route requires alerts:read (routes/incidents.ts:37, requireIncidentRead),
+  // matching list_incidents above (aiGuardrails.routeBinding.contract.test.ts).
+  get_incident_timeline: { resource: 'alerts', action: 'read' },
+  generate_incident_report: { resource: 'alerts', action: 'read' },
   // Device-execute (analogy: s1_isolate_device, execute_command; collect_evidence includes
   // screenshot => privileged extraction like take_screenshot)
   execute_containment: { resource: 'devices', action: 'execute' },
@@ -1509,6 +1666,22 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   list_network_assets: { resource: 'devices', action: 'read' },
   get_network_asset: { resource: 'devices', action: 'read' },
   get_network_asset_reachability: { resource: 'devices', action: 'read' },
+  // Topology reads (M3 Task 6): the devices:read floor is enforced by requireTopologySiteAccess.
+  get_interface_history: { resource: 'topology', action: 'read' },
+  get_link_health: { resource: 'topology', action: 'read' },
+  get_topology_impact: { resource: 'topology', action: 'read' },
+  get_recent_network_changes: { resource: 'topology', action: 'read' },
+  // M3-D12: the devices:read floor comes from requireTopologySiteAccess('read').
+  get_topology_monitoring_status: { resource: 'topology', action: 'read' },
+  // M4 Task 1 (#6000): same floor, applied by the M4-D1 site-pinned gate.
+  get_topology: { resource: 'topology', action: 'read' },
+  get_link_evidence: { resource: 'topology', action: 'read' },
+  get_diagnostic_run: { resource: 'topology', action: 'read' },
+  // M4 Task 4: devices:execute here (one pair per tool, catalog-backed, the
+  // network_discovery precedent); the full floor — topology:execute +
+  // devices:execute + both reads, org/site ceilings — is
+  // requireTopologySiteAccess('execute'), applied at proposal AND at release.
+  diagnose_connectivity: { resource: 'devices', action: 'execute' },
   acknowledge_network_device: { resource: 'alerts', action: 'acknowledge' },
   configure_network_baseline: { resource: 'devices', action: 'write' },
 };
@@ -1595,6 +1768,13 @@ export const TOOL_ACTION_EXTRA_PERMISSIONS: Record<
     // rewrites tenant ownership of the ticket and every child row, so the
     // organizations grant is the real authority being exercised.
     move_org: [{ resource: 'organizations', action: 'write' }],
+  },
+  manage_quotes: {
+    // create_pay_link's primary grant is invoices:send
+    // (the Stripe-session authority, matching POST /invoices/:id/pay-link);
+    // the handler also reads the quote by id to resolve the converted invoice
+    // (createQuotePayLink → quotePay.ts), so quotes:read is required too.
+    create_pay_link: [{ resource: 'quotes', action: 'read' }],
   },
   manage_invoices: {
     // SEC-145 — materializing a contract line reads the contract, so the
@@ -1709,6 +1889,34 @@ export function resolveActionForTool(toolName: string, input: Record<string, unk
 }
 
 /**
+ * The model-actionable `run_script { proposalId }` deny message (#7129). Three
+ * distinct, model-actionable outcomes instead of one catch-all:
+ * - `proposal_not_found` — no such id in the caller's org. Deliberately the
+ *   SAME message for "doesn't exist" and "exists in a different org" (see
+ *   `ProposalContextDenyReason`) — never leak cross-tenant existence.
+ * - `proposal_review_pending` — the review hasn't finished; tells the model to
+ *   poll `get_script_proposal` and retry instead of giving up.
+ * - `proposal_review_failed` — the review ended negatively (static-scan
+ *   rejection or a technical review failure); a new proposal is required.
+ * `undefined` (no context supplied at all, e.g. a caller that never loaded
+ * one) falls back to the original generic `proposal_context_missing`.
+ */
+function buildProposalDenyReason(denyReason: ProposalContextDenyReason | undefined): string {
+  switch (denyReason) {
+    case 'proposal_not_found':
+      return 'proposal_not_found: no reviewed proposal with that id exists in the caller\'s organization';
+    case 'proposal_review_pending':
+      return 'proposal_review_pending: the proposal\'s review has not completed yet — call get_script_proposal '
+        + 'to check its status, then retry run_script once the review is no longer pending';
+    case 'proposal_review_failed':
+      return 'proposal_review_failed: the proposal\'s review ended negatively (scan rejection or a technical '
+        + 'review failure) — call get_script_proposal for details; submit a new proposal to retry';
+    default:
+      return 'proposal_context_missing: run_script with a proposalId requires a reviewed proposal in the caller\'s organization';
+  }
+}
+
+/**
  * Check guardrails for a tool invocation.
  * Returns the effective tier and whether approval is needed.
  */
@@ -1746,7 +1954,7 @@ export function checkGuardrails(
       tier: 4,
       allowed: false,
       requiresApproval: false,
-      reason: 'proposal_context_missing: run_script with a proposalId requires a reviewed proposal in the caller\'s organization',
+      reason: buildProposalDenyReason(context?.proposalDenyReason),
     };
   }
 
@@ -1794,6 +2002,20 @@ export function checkGuardrails(
       allowed: true,
       requiresApproval: false,
       ...(TIER2_READONLY_ACTIONS[toolName]?.includes(action) ? { readOnly: true } : {}),
+      description: buildApprovalDescription(toolName, action, input)
+    };
+  }
+
+  // A stored-data read whose input asks the device for fresh data
+  // (LIVE_READ_INPUT_FLAGS). Tier 2 read-only, like file_operations:list and
+  // manage_services:list: no prompt, but an audit row, and an MCP key needs
+  // ai:write. Without the flag the tool keeps its base tier.
+  if (requestsLiveDeviceRead(toolName, input)) {
+    return {
+      tier: 2,
+      allowed: true,
+      requiresApproval: false,
+      readOnly: true,
       description: buildApprovalDescription(toolName, action, input)
     };
   }
@@ -2167,6 +2389,40 @@ function siteScopeDenial(
 }
 
 /**
+ * A single predicate for "is this NAME (not this call, not this policy) ever
+ * reachable by a headless `ai_agent` principal" (W01 quorum amendment WQ4,
+ * #6755). Both `checkAgentGuardrails` (below) and
+ * `agentToolCatalog.ts`'s `listAgentReachableTools` used to hand-duplicate
+ * this same four-way check; this is the one place it is written now.
+ * Deliberately excludes session-only (M365/Google) exposure: that is a
+ * reachability gate on missing ActiveSession state, not an identity-based
+ * deny, and stays local to `listAgentReachableTools`.
+ */
+export function isNeverAgentTool(toolName: string): boolean {
+  return BLOCKED_TOOLS.has(toolName)
+    || isSecretBearingTool(toolName)
+    || AGENT_HUMAN_ONLY_TOOLS.has(toolName)
+    || AGENT_DENIED_READ_TOOLS.has(toolName);
+}
+
+/** Reason text for `isNeverAgentTool`'s deny — kept out of the predicate so the predicate stays a pure boolean the two call sites can share. */
+function neverAgentToolDenyReason(toolName: string): string {
+  if (isSecretBearingTool(toolName)) {
+    return `Tool "${toolName}" is secret-bearing and never available to agents`;
+  }
+  if (AGENT_HUMAN_ONLY_TOOLS.has(toolName)) {
+    return `Tool "${toolName}" is human-only and is never available to agents`;
+  }
+  if (AGENT_DENIED_READ_TOOLS.has(toolName)) {
+    return `Tool "${toolName}" reads data never available to agents`;
+  }
+  // BLOCKED_TOOLS — already denied above via base.tier === 4 (checkGuardrails
+  // sets tier 4 exactly and only for BLOCKED_TOOLS); kept so isNeverAgentTool
+  // stays total.
+  return `Tool "${toolName}" is not available to agents`;
+}
+
+/**
  * Structural guardrails for the ai_agent principal. This path intentionally
  * never consults user RBAC: an agent has no user role to authorize against.
  */
@@ -2200,14 +2456,16 @@ export function checkAgentGuardrails(
   if (!isAgentGuardrailPolicy(policy)) {
     return deny('AI agent run policy snapshot is missing or invalid');
   }
-  if (!base.allowed || base.tier === 4 || BLOCKED_TOOLS.has(toolName)) {
+  if (!base.allowed || base.tier === 4) {
     return deny(base.reason ?? `Tool "${toolName}" is not available to agents`);
   }
-  if (isSecretBearingTool(toolName)) {
-    return deny(`Tool "${toolName}" is secret-bearing and never available to agents`);
-  }
-  if (AGENT_HUMAN_ONLY_TOOLS.has(toolName)) {
-    return deny(`Tool "${toolName}" is human-only and is never available to agents`);
+  // Unconditional deny, above the allowlist and the multiplexed-action
+  // resolution below: BLOCKED_TOOLS, secret-bearing, AGENT_HUMAN_ONLY_TOOLS
+  // and AGENT_DENIED_READ_TOOLS (W01-D5 / WQ1 / WQ2) all sit here so none of
+  // them can depend on a parseable `action` or on the snapshot omitting the
+  // name.
+  if (isNeverAgentTool(toolName)) {
+    return deny(neverAgentToolDenyReason(toolName));
   }
 
   const siteDenial = siteScopeDenial(input, policy.deviceSiteId);
@@ -2393,6 +2651,9 @@ export async function checkPermissionRequirements(
 
 type ToolPermissionRequirement = { resource: string; action: string };
 
+/** What a LIVE_READ_INPUT_FLAGS request requires in place of the tool's stored-read mapping. */
+const LIVE_DEVICE_READ_PERMISSION: ToolPermissionRequirement = { resource: 'devices', action: 'execute' };
+
 type ToolPermissionResolution =
   | { ok: true; requirements: ToolPermissionRequirement[] }
   | { ok: false; denial: string };
@@ -2410,7 +2671,11 @@ function resolveToolPermissionRequirements(
   let required: ToolPermissionRequirement;
   const action = input.action as string | undefined;
 
-  if ('resource' in permDef && 'action' in permDef) {
+  if (requestsLiveDeviceRead(toolName, input)) {
+    // Live device read (LIVE_READ_INPUT_FLAGS): execute-level, like the REST
+    // route that sends the same command. The base mapping is the stored read.
+    required = LIVE_DEVICE_READ_PERMISSION;
+  } else if ('resource' in permDef && 'action' in permDef) {
     required = permDef as ToolPermissionRequirement;
   } else if (action && (permDef as Record<string, ToolPermissionRequirement>)[action]) {
     required = (permDef as Record<string, ToolPermissionRequirement>)[action]!;
@@ -2559,6 +2824,36 @@ function nonEmptyText(value: unknown): string | null {
  */
 function serviceNameFromPayload(payload: Record<string, unknown>): string | null {
   return nonEmptyText(payload.name !== undefined ? payload.name : payload.serviceName);
+}
+
+/** `alice@acme.example` -> `acme.example`. Null for a value with no `@`-domain. */
+function emailDomain(value: string): string | null {
+  const at = value.lastIndexOf('@');
+  return at === -1 || at === value.length - 1 ? null : value.slice(at + 1).toLowerCase();
+}
+
+/**
+ * Flags a destination address whose domain differs from the workspace
+ * mailbox the Google tool call is acting on. `sourceEmail` (the tool's
+ * `userEmail`/`ownerEmail` argument) is used as a stand-in for the connected
+ * Google workspace's verified/primary domain: `buildApprovalDescription` and
+ * `checkGuardrails` are synchronous and run without any org/connection
+ * context (one caller, `mcpServer.ts`'s pre-execution tier check, has no
+ * loaded session at all), so this cannot look up the real, DB-stored
+ * `google_workspace_connections.customer_domain` for the org without turning
+ * this call chain async — out of scope for a display-string fix. Both sides
+ * of the comparison are therefore caller-suppliable tool arguments, not a
+ * server-verified domain, so the label below is worded as a heuristic rather
+ * than a confirmed-external flag. Display-only: does not block or alter the
+ * call. Domain-locking these tools outright using verified connection data
+ * is a possible future hardening.
+ */
+function externalDestinationFlag(sourceEmail: string | null, destEmail: string | null): string {
+  if (!sourceEmail || !destEmail) return '';
+  const sourceDomain = emailDomain(sourceEmail);
+  const destDomain = emailDomain(destEmail);
+  if (!sourceDomain || !destDomain || sourceDomain === destDomain) return '';
+  return ' (different domain from source mailbox)';
 }
 
 /**
@@ -2714,6 +3009,11 @@ function buildApprovalDescription(
 
     case 'file_operations':
       parts.push(`File ${action}: ${input.path}`);
+      break;
+
+    case 'diagnose_connectivity':
+      parts.push(`Topology ${typeof input.recipe_id === 'string' ? input.recipe_id.replace(/_/g, ' ') : 'connectivity'} diagnostic`);
+      if (typeof input.site_id === 'string') parts.push(`at site ${input.site_id.slice(0, 8)}...`);
       break;
 
     case 'network_discovery':
@@ -2881,29 +3181,78 @@ function buildApprovalDescription(
         parts.push(
           `Add contact "${acHeadline}"${acOthers.length ? ` (${acOthers.join(', ')})` : ''} to organization ${(input.orgId as string)?.slice(0, 8) ?? '(own org)'}...`
         );
-        // Review finding (fix round 2): `siteId` and `isPrimary` are the only
-        // two add_contact inputs whose effect reaches beyond inserting a row,
-        // and neither was shown. `isPrimary: true` DEMOTES whoever currently
-        // holds the scope's primary slot and REPLACES the legacy projection —
-        // organizations.billing_contact, or sites.contact when a site is
-        // pinned, which is a public partner-API DTO. Without these the
-        // approver cannot tell "file a new contact" (routine, hence
-        // supervised) apart from "overwrite this customer's billing contact".
+        // Review finding (fix round 2): `siteId`, `isPrimary` and an
+        // org-level `billing` role are the add_contact inputs whose effect
+        // reaches beyond inserting a row, and none was shown. `isPrimary: true`
+        // DEMOTES whoever holds the scope's primary slot (and, pinned to a
+        // site, REPLACES sites.contact, a public partner-API DTO). An
+        // org-level `billing` role can make the new contact THE billing
+        // contact — organizations.billing_contact, the invoice/quote recipient.
+        // Without these the approver cannot tell "file a new contact"
+        // (routine, hence supervised) apart from "re-point this customer's
+        // invoices".
         const acSiteId = typeof input.siteId === 'string' ? input.siteId : undefined;
         if (acSiteId) parts.push(`on site ${acSiteId.slice(0, 8)}...`);
         if (input.isPrimary === true) {
           parts.push(
-            `as PRIMARY contact (replaces the ${acSiteId ? "site's current contact" : 'current billing contact'})`
+            `as PRIMARY contact (replaces the ${acSiteId ? "site's current contact" : "organization's current primary contact"})`
           );
+        }
+        if (!acSiteId && Array.isArray(input.roles) && input.roles.includes('billing')) {
+          parts.push("with the Billing role (can become the organization's default invoice recipient)");
         }
       } else parts.push(`Organizations: ${action}`);
       break;
 
-    case 'manage_monitors':
-      if (action === 'create') parts.push(`Create monitor "${input.name}" (${input.monitorType})`);
-      else if (action === 'delete') parts.push(`Delete monitor ${(input.monitorId as string)?.slice(0, 8)}...`);
-      else parts.push(`Monitor ${action}: ${(input.monitorId as string)?.slice(0, 8) ?? input.name ?? ''}...`);
+    // These four tools grant mail
+    // forwarding/delegation or calendar visibility to an arbitrary external
+    // address. Previously they had no case here, so the always-visible web
+    // headline AND the mobile takeover/push title (buildActionLabel reads
+    // this `description` as its `reason`) both fell through to the bare
+    // tool name with zero destination information. The exact destination
+    // now appears in the headline on every surface, flagged distinctly when
+    // its domain differs from the mailbox being acted on.
+    case 'google_set_forwarding': {
+      const userEmail = nonEmptyText(input.userEmail);
+      const forwardTo = nonEmptyText(input.forwardTo);
+      parts.push(
+        `Forward mail from ${userEmail ?? 'unknown mailbox'} to ${forwardTo ?? 'unknown address'}` +
+        externalDestinationFlag(userEmail, forwardTo)
+      );
       break;
+    }
+
+    case 'google_disable_forwarding': {
+      const userEmail = nonEmptyText(input.userEmail);
+      parts.push(`Disable mail forwarding for ${userEmail ?? 'unknown mailbox'}`);
+      if (input.removeAddress === true) {
+        const forwardTo = nonEmptyText(input.forwardTo);
+        if (forwardTo) {
+          parts.push(`and remove forwarding address ${forwardTo}${externalDestinationFlag(userEmail, forwardTo)}`);
+        }
+      }
+      break;
+    }
+
+    case 'google_add_mail_delegate': {
+      const userEmail = nonEmptyText(input.userEmail);
+      const delegateEmail = nonEmptyText(input.delegateEmail);
+      parts.push(
+        `Grant ${delegateEmail ?? 'unknown address'} delegate access to ${userEmail ?? 'unknown mailbox'}'s mailbox` +
+        externalDestinationFlag(userEmail, delegateEmail)
+      );
+      break;
+    }
+
+    case 'google_share_calendar': {
+      const ownerEmail = nonEmptyText(input.ownerEmail);
+      const shareWithEmail = nonEmptyText(input.shareWithEmail);
+      parts.push(
+        `Share ${ownerEmail ?? 'unknown'}'s calendar with ${shareWithEmail ?? 'unknown address'}` +
+        externalDestinationFlag(ownerEmail, shareWithEmail)
+      );
+      break;
+    }
 
     default:
       parts.push(`${toolName}${action ? `: ${action}` : ''}`);

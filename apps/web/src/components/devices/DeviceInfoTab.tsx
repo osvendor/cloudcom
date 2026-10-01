@@ -29,6 +29,7 @@ import { fetchWithAuth } from "../../stores/auth";
 import { formatUptime } from "../../lib/utils";
 import { runAction, ActionError } from "../../lib/runAction";
 import { formatDateTime } from "@/lib/dateTimeFormat";
+import { isAgentUpdateStuck, isDeviceLogSilent } from "@breeze/shared";
 import {
   DEVICE_ROLES,
   getDeviceRoleLabel,
@@ -39,6 +40,7 @@ import {
 import DeviceFunctionField from "./DeviceFunctionField";
 import { asList } from '@/lib/asList';
 import { formatDeviceDetailOsVersion } from "./osDisplay";
+import DeviceTimeSection from "./time/DeviceTimeSection";
 import { formatNumber } from "@/lib/i18n/format";
 import { useTranslation } from "react-i18next";
 import "../../lib/i18n";
@@ -74,10 +76,17 @@ type DeviceInfo = {
   agentVersion?: string | null;
   updateOfferWithheldReason?: string | null;
   updateOfferWithheldSince?: string | null;
+  updateAttemptTargetVersion?: string | null;
+  updateAttemptStartedAt?: string | null;
+  updateAttemptLastAt?: string | null;
+  updateAttemptCount?: number | null;
   watchdogVersion?: string | null;
   helperVersion?: string | null;
+  helperInstallIssue?: string | null;
+  helperInstallIssueSince?: string | null;
   status?: string | null;
   lastSeenAt?: string | null;
+  lastLogAt?: string | null;
   enrolledAt?: string | null;
   lastUser?: string | null;
   uptimeSeconds?: number | null;
@@ -197,8 +206,6 @@ function formatDesktopAccessReason(
       return "Helper Not Connected";
     case "virtual_display_unavailable":
       return "Virtual Display Unavailable";
-    case "unsupported_os":
-      return "Unsupported macOS Version";
     case "manual_install":
       return "Manual Install";
     case "no_display_session":
@@ -349,7 +356,8 @@ const statusColors: Record<string, string> = {
 };
 
 export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
-  const { t } = useTranslation("devices");
+  // `remote` is loaded for the desktop-access copy shared with ConnectDesktopButton.
+  const { t } = useTranslation(["devices", "remote"]);
   const [info, setInfo] = useState<DeviceInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
@@ -888,6 +896,11 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
         />
       </Section>
 
+      <DeviceTimeSection
+        deviceId={deviceId}
+        deviceName={info?.displayName ?? info?.hostname ?? deviceId}
+      />
+
       <Section
         title={t("deviceInfoTab.hardwareSummary")}
         icon={<Cpu className="h-4 w-4 text-muted-foreground" />}
@@ -1068,6 +1081,43 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
           label={t("deviceInfoTab.agentVersion")}
           value={info?.agentVersion ?? "—"}
         />
+        {info &&
+        isAgentUpdateStuck({
+          targetVersion: info.updateAttemptTargetVersion,
+          startedAt: info.updateAttemptStartedAt,
+          lastAttemptAt: info.updateAttemptLastAt,
+        }) ? (
+          <div
+            data-testid="update-stuck"
+            role="status"
+            className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-foreground"
+          >
+            {t("deviceInfoTab.updateStuck", {
+              target: info.updateAttemptTargetVersion,
+              // #7214 (paper cut #22): use the same shared date style as the
+              // Last Seen / Enrolled rows below, instead of the locale-default
+              // format (which can include seconds and a different order).
+              since: formatDate(info.updateAttemptStartedAt),
+              attempts: info.updateAttemptCount ?? 1,
+            })}
+          </div>
+        ) : null}
+        {info &&
+        isDeviceLogSilent({
+          status: info.status,
+          lastLogAt: info.lastLogAt,
+          enrolledAt: info.enrolledAt,
+        }) ? (
+          <div
+            data-testid="logs-silent"
+            role="status"
+            className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-foreground"
+          >
+            {info.lastLogAt
+              ? t("deviceInfoTab.logsSilent", { since: formatDate(info.lastLogAt) })
+              : t("deviceInfoTab.logsSilentNeverShipped")}
+          </div>
+        ) : null}
         {info?.updateOfferWithheldReason ? (
           <div
             data-testid="update-offer-withheld"
@@ -1089,6 +1139,28 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
           label={t("deviceInfoTab.helperVersion")}
           value={info?.helperVersion?.trim() || "—"}
         />
+        {/* #6925: Assist enabled but not installed — the agent reports why. */}
+        {info?.helperInstallIssue ? (
+          <div
+            data-testid="helper-install-issue"
+            role="status"
+            className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-foreground"
+          >
+            {(() => {
+              const since = info.helperInstallIssueSince
+                ? new Date(info.helperInstallIssueSince).toLocaleDateString()
+                : "—";
+              switch (info.helperInstallIssue) {
+                case "awaiting_server_offer":
+                  return t("deviceInfoTab.helperInstallIssue.awaitingServerOffer", { since });
+                case "install_abandoned":
+                  return t("deviceInfoTab.helperInstallIssue.installAbandoned", { since });
+                default:
+                  return t("deviceInfoTab.helperInstallIssue.unknown", { since });
+              }
+            })()}
+          </div>
+        ) : null}
         <div className="flex justify-between py-2">
           <dt className="text-sm text-muted-foreground">
             {t("deviceInfoTab.status")}
@@ -1156,7 +1228,11 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
           />
           <InfoRow
             label={t("deviceInfoTab.reason")}
-            value={formatDesktopAccessReason(info.desktopAccess.reason)}
+            value={
+              info.desktopAccess.reason === "unsupported_os"
+                ? t("deviceInfoTab.reasonLoginWindow")
+                : formatDesktopAccessReason(info.desktopAccess.reason)
+            }
           />
           <InfoRow
             label={t("deviceInfoTab.lastChecked")}
@@ -1168,7 +1244,7 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
                 <p className="text-sm text-amber-700 dark:text-amber-400">
                   {info.desktopAccess.reason === "unsupported_os"
-                    ? t("deviceInfoTab.thisMacIsBelowTheMacos")
+                    ? t("remote:connectDesktopButton.unavailable.unsupportedOs")
                     : info.desktopAccess.reason === "manual_install"
                       ? t(
                           "deviceInfoTab.loginWindowReachabilityIsOnlyAdvertised",

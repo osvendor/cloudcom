@@ -19,7 +19,8 @@ const authenticatorMock = vi.hoisted(() => ({
   getBatchApprovalAssertion: vi.fn(),
 }));
 
-vi.mock('../../stores/auth', () => ({ fetchWithAuth: vi.fn() }));
+// registerOrgIdProvider: orgStore (read by the approver-device notice) registers itself on import.
+vi.mock('../../stores/auth', () => ({ fetchWithAuth: vi.fn(), registerOrgIdProvider: vi.fn() }));
 // Resolved relative to THIS file (components/approvals/), the same module
 // runAction.ts reaches via '../components/shared/Toast' — matches the
 // established pattern (AiAgentGraduationPanel.test.tsx) for intercepting
@@ -144,6 +145,39 @@ afterEach(() => {
 });
 
 describe('ApprovalsInbox', () => {
+  it('shows the platform-default approver-device notice to a partner without an explicit choice', async () => {
+    fetchMock.mockImplementation((async (url: string) => {
+      if (String(url).includes('/authenticator/policy')) {
+        return response({
+          policy: { floorOverrides: {}, requireEnrollment: null, enforceFrom: null },
+          effective: {
+            source: 'platform_default',
+            mode: 'grace',
+            requireEnrollment: true,
+            enforceFrom: '2026-11-05T00:00:00.000Z',
+            enforcedTiers: ['high', 'critical'],
+            defaultNotice: 'upcoming',
+          },
+          platformDefault: { enforceFrom: '2026-11-05T00:00:00.000Z', enforcedTiers: ['high', 'critical'] },
+        });
+      }
+      return response({ approvals: [pendingApproval], nextCursor: null });
+    }) as unknown as typeof fetchWithAuth);
+    render(<ApprovalsInbox />);
+    const notice = await screen.findByTestId('approver-assurance-default-notice');
+    expect(notice).toHaveAttribute('data-state', 'upcoming');
+  });
+
+  it('shows no approver-device notice when the policy cannot be read', async () => {
+    fetchMock.mockImplementation((async (url: string) => {
+      if (String(url).includes('/authenticator/policy')) return response({ error: 'Forbidden' }, false, 403);
+      return response({ approvals: [pendingApproval], nextCursor: null });
+    }) as unknown as typeof fetchWithAuth);
+    render(<ApprovalsInbox />);
+    await screen.findByTestId('approval-row-approval-1');
+    expect(screen.queryByTestId('approver-assurance-default-notice')).toBeNull();
+  });
+
   it('renders pending approval details', async () => {
     render(<ApprovalsInbox />);
 
@@ -262,6 +296,8 @@ describe('ApprovalsInbox', () => {
       expect(intentApprovalsMock.decide).toHaveBeenCalledWith(
         'approval-1',
         'approve',
+        undefined,
+        'four_eyes',
       ),
     );
   });
@@ -443,8 +479,12 @@ describe('ApprovalsInbox', () => {
     // — see loadApprovals' `withCount`. The org display name now rides on
     // each row's own server-resolved `orgName` field, so there is no
     // separate org-names lookup to count here.
+    // The approver-device notice reads /authenticator/policy once on mount;
+    // it is not part of the approvals poll, so count approvals calls only.
+    const approvalsCalls = () =>
+      fetchMock.mock.calls.filter(([url]) => !String(url).includes('/authenticator/policy')).length;
     await act(async () => {});
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(approvalsCalls()).toBe(2);
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(30_000);
@@ -452,7 +492,7 @@ describe('ApprovalsInbox', () => {
     // The poll is silent and intentionally skips the count refresh (see
     // `withCount` in loadApprovals), so it adds exactly ONE more call — the
     // list itself.
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(approvalsCalls()).toBe(3);
   });
 
   it('refreshes silently: no loading spinner while re-fetching an already-loaded list', async () => {
@@ -1080,7 +1120,9 @@ describe('ApprovalsInbox — "Approve and always allow"', () => {
     fireEvent.click(await screen.findByTestId('approval-always-allow-confirm-ap-a'));
 
     await waitFor(() => expect(promoteCalls()).toHaveLength(1));
-    expect(intentApprovalsMock.decide).toHaveBeenCalledWith('ap-a', 'approve');
+    // The row's scope rides along: a supervised card must not be pushed onto
+    // the four-eyes passkey path by the always-allow flow.
+    expect(intentApprovalsMock.decide).toHaveBeenCalledWith('ap-a', 'approve', undefined, 'supervised');
 
     const decideOrder = intentApprovalsMock.decide.mock.invocationCallOrder[0];
     const promoteCallIndex = fetchMock.mock.calls.findIndex(([url]) =>
@@ -1159,6 +1201,27 @@ describe('ApprovalsInbox — "Approve and always allow"', () => {
     expect(promoteCalls()).toHaveLength(0);
     expect(showToastMock).not.toHaveBeenCalled();
     expect(screen.getByTestId('approval-row-ap-a')).toBeInTheDocument();
+  });
+
+  it('never promotes when decideIntentApproval returns refused — the approve did not take effect', async () => {
+    const removedOnApprove = new Set<string>();
+    routeGraduationAndBatch([agentCard('ap-a')], graduationDto([graduationRow('manage_patches:install')]), {
+      removedOnApprove,
+    });
+    intentApprovalsMock.decide.mockImplementation(async (id: string) => {
+      removedOnApprove.add(id);
+      return 'refused';
+    });
+    render(<ApprovalsInbox />);
+
+    fireEvent.click(await screen.findByTestId('approval-always-allow-ap-a'));
+    fireEvent.click(await screen.findByTestId('approval-always-allow-confirm-ap-a'));
+
+    // The request was decided (denied), so the card leaves the list …
+    await waitFor(() => expect(screen.queryByTestId('approval-row-ap-a')).not.toBeInTheDocument());
+    // … but nothing was approved, so there is nothing to always allow.
+    expect(promoteCalls()).toHaveLength(0);
+    expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
   });
 
   it('hides the button and stays silent when the graduation fetch fails, without blocking Approve', async () => {
@@ -1391,6 +1454,25 @@ describe('ApprovalsInbox — organization identity, live expiry, paging, and cop
         }),
       ),
     );
+  });
+
+  // The server can refuse an approve (the linked elevation's target could not
+  // be verified) and deny the request instead. decideIntentApproval has
+  // already shown that as an error with the reason; the inbox must not
+  // follow it with "Approved …".
+  it('never reports a refused approve as approved, and refreshes the list', async () => {
+    routeFull({ page1: [{ ...pendingApproval, orgName: 'Acme Dental' }] });
+    intentApprovalsMock.decide.mockResolvedValue('refused');
+    render(<ApprovalsInbox />);
+    await screen.findByTestId('approval-row-approval-1');
+    const listFetchesBefore = fetchMock.mock.calls.length;
+
+    fireEvent.click(screen.getByTestId('approval-approve-approval-1'));
+
+    await waitFor(() => expect(intentApprovalsMock.decide).toHaveBeenCalled());
+    // The decision is final (the request is denied), so the list reloads.
+    await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(listFetchesBefore));
+    expect(showToastMock).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
   });
 
   it('renders "Expires in under a minute" instead of a misleading unit below 60s', async () => {

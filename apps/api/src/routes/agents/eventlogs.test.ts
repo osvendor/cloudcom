@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   select: vi.fn(),
   insert: vi.fn(),
   rateLimiter: vi.fn(),
+  checkAndConsumeIngestQuota: vi.fn(),
   getDeviceEventLogSettings: vi.fn(),
   enqueueLogForwarding: vi.fn(),
   getOrgForwardingConfig: vi.fn(),
@@ -58,6 +59,10 @@ vi.mock('../../services/rate-limit', () => ({
   rateLimiter: mocks.rateLimiter,
 }));
 
+vi.mock('../../services/ingestQuota', () => ({
+  checkAndConsumeIngestQuota: mocks.checkAndConsumeIngestQuota,
+}));
+
 vi.mock('../../services/auditEvents', () => ({
   writeAuditEvent: mocks.writeAuditEvent,
 }));
@@ -73,6 +78,9 @@ vi.mock('../../services/logForwarding', () => ({
 vi.mock('../../services/sentry', () => ({
   captureException: vi.fn(),
 }));
+
+const recordAgentIngestSubmission = vi.hoisted(() => vi.fn());
+vi.mock('../metrics', () => ({ recordAgentIngestSubmission }));
 
 vi.mock('./helpers', () => {
   const sanitizeTimestamp = (value: unknown): Date | null => {
@@ -175,6 +183,7 @@ describe('agent event log routes', () => {
       resetAt: new Date('2026-05-02T13:00:00.000Z'),
     });
     mocks.getOrgForwardingConfig.mockResolvedValue({ endpoint: 'https://logs.example.com' });
+    mocks.checkAndConsumeIngestQuota.mockResolvedValue({ allowed: true, rowsUsed: 1, bytesUsed: 100 });
   });
 
   afterEach(() => {
@@ -229,6 +238,42 @@ describe('agent event log routes', () => {
     // The removed `rawData` field must not resurface in the forward payload.
     const forwarded = mocks.enqueueLogForwarding.mock.calls[0]?.[0];
     expect(forwarded.events[0]).not.toHaveProperty('rawData');
+  });
+
+  it('drops the batch with 429 once the per-device daily byte budget is exceeded', async () => {
+    mockDeviceLookup();
+    const values = mockInsertSuccess();
+    mocks.checkAndConsumeIngestQuota.mockResolvedValueOnce({
+      allowed: false,
+      rowsUsed: 1,
+      bytesUsed: 3 * 1024 * 1024 * 1024,
+    });
+
+    const res = await app.request(`/agents/${AGENT_ID}/eventlogs`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ events: [makeEvent()] }),
+    });
+
+    expect(res.status).toBe(429);
+    expect(values).not.toHaveBeenCalled();
+  });
+
+  it('drops the batch with 429 once the per-org daily row/byte budget is exceeded', async () => {
+    mockDeviceLookup();
+    const values = mockInsertSuccess();
+    mocks.checkAndConsumeIngestQuota
+      .mockResolvedValueOnce({ allowed: true, rowsUsed: 1, bytesUsed: 100 }) // device check
+      .mockResolvedValueOnce({ allowed: false, rowsUsed: 2_000_100, bytesUsed: 100 }); // org check
+
+    const res = await app.request(`/agents/${AGENT_ID}/eventlogs`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ events: [makeEvent()] }),
+    });
+
+    expect(res.status).toBe(429);
+    expect(values).not.toHaveBeenCalled();
   });
 
   it('runs the rate limiter and the forwarding enqueue with NO DB context open (#6097 / #1105)', async () => {
@@ -316,6 +361,101 @@ describe('agent event log routes', () => {
     const body = await res.json();
     expect(body.count).toBe(0); // nothing actually inserted
     expect(mocks.enqueueLogForwarding).not.toHaveBeenCalled();
+  });
+});
+
+// #4340 — routine event-log submits are counted, not audited. Only an insert
+// failure or a clamped timestamp (an anomaly worth a chained record) is audited.
+describe('eventlogs ingest audit (#4340)', () => {
+  let app: Hono;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-02T12:00:00.000Z'));
+    contextDepth = 0;
+    dbContextCalls.length = 0;
+    app = new Hono();
+    app.use('*', async (c, next) => {
+      c.set('agent', { deviceId: 'dev-1', agentId: 'agent-1', orgId: ORG_ID, partnerId: 'partner-1', siteId: 'site-1', role: 'agent' } as never);
+      return next();
+    });
+    app.route('/agents', eventLogsRoutes);
+    mocks.getDeviceEventLogSettings.mockResolvedValue({ minimumLevel: 'info', rateLimitPerHour: 1000 });
+    mocks.rateLimiter.mockResolvedValue({ allowed: true, remaining: 999, resetAt: new Date('2026-05-02T13:00:00.000Z') });
+    mocks.getOrgForwardingConfig.mockResolvedValue(null);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const submit = (events: unknown[]) => app.request(`/agents/${AGENT_ID}/eventlogs`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ events }),
+  });
+
+  it('does NOT audit a clean submit — counts it in the ingest metric', async () => {
+    mockDeviceLookup();
+    mockInsertSuccess();
+
+    const res = await submit([makeEvent(), makeEvent({ eventId: '4624' })]);
+
+    expect(res.status).toBe(200);
+    expect(mocks.writeAuditEvent).not.toHaveBeenCalled();
+    expect(recordAgentIngestSubmission).toHaveBeenCalledTimes(1);
+    expect(recordAgentIngestSubmission).toHaveBeenCalledWith('eventlogs', 'success');
+  });
+
+  it('does NOT audit a submit whose rows were all absorbed as duplicates', async () => {
+    mockDeviceLookup();
+    mockInsertAllConflicts();
+
+    const res = await submit([makeEvent()]);
+
+    expect(res.status).toBe(200);
+    expect(mocks.writeAuditEvent).not.toHaveBeenCalled();
+    expect(recordAgentIngestSubmission).toHaveBeenCalledWith('eventlogs', 'success');
+  });
+
+  it('audits a submit with a clamped future timestamp', async () => {
+    mockDeviceLookup();
+    mockInsertSuccess();
+
+    const res = await submit([makeEvent({ timestamp: '2026-05-02T13:00:00.000Z' }), makeEvent({ eventId: '4624' })]);
+
+    expect(res.status).toBe(200);
+    expect(mocks.writeAuditEvent).toHaveBeenCalledTimes(1);
+    expect(mocks.writeAuditEvent.mock.calls[0]![1]).toMatchObject({
+      orgId: ORG_ID,
+      actorType: 'agent',
+      action: 'agent.eventlogs.submit',
+      resourceType: 'device',
+      resourceId: DEVICE_ID,
+      result: 'success',
+      details: { submittedCount: 2, insertedCount: 2, filteredCount: 0, timestampClampedCount: 1 },
+    });
+    expect(recordAgentIngestSubmission).toHaveBeenCalledWith('eventlogs', 'success');
+  });
+
+  it('audits an insert failure as a failure result', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mockDeviceLookup();
+    const returning = vi.fn().mockRejectedValue(new Error('insert failed'));
+    mocks.insert.mockReturnValue({ values: vi.fn().mockReturnValue({ onConflictDoNothing: vi.fn().mockReturnValue({ returning }) }) });
+
+    const res = await submit([makeEvent()]);
+
+    expect(res.status).toBe(500);
+    expect(mocks.writeAuditEvent).toHaveBeenCalledTimes(1);
+    expect(mocks.writeAuditEvent.mock.calls[0]![1]).toMatchObject({
+      action: 'agent.eventlogs.submit',
+      result: 'failure',
+      details: { submittedCount: 1, insertedCount: 0, filteredCount: 0 },
+    });
+    expect(recordAgentIngestSubmission).toHaveBeenCalledWith('eventlogs', 'failed');
+    consoleError.mockRestore();
   });
 });
 

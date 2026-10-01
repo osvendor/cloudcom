@@ -925,7 +925,7 @@
         "subtotal": "Total parcial",
         "tax": "Impuesto",
         "taxRate": "Tasa impositiva",
-        "taxRateHelp": "Aplica a líneas marcadas como sujetas a impuestos. Establecido en la configuración fiscal de la organización.",
+        "taxRateHelp": "Aplica a líneas marcadas como sujetas a impuestos. Esta tasa se estableció al crear la cotización; para cambiarla en cotizaciones futuras, actualiza la configuración fiscal de la organización.",
         "title": "Totales en vivo",
         "total": "Total"
       },
@@ -1043,7 +1043,8 @@
         "readOnlyHint": "Quita y vuelve a agregar esta sección para cambiar la plantilla, la versión o las variables.",
         "updateToVersion": "Actualizar a v{{version}}",
         "saveVariables": "Guardar variables",
-        "unresolvedWarning": "Variables sin resolver (bloquearán el envío): {{names}}"
+        "unresolvedWarning": "Variables sin resolver (bloquearán el envío): {{names}}",
+        "placementHint": "Los clientes lo ven después de los totales, contraído hasta que lo abren. En el PDF aparece después del precio."
       },
       "coverPage": {
         "title": "Portada",
@@ -1209,7 +1210,7 @@
         "signerEmailLabel": "Su correo electrónico (opcional)",
         "consequenceInvoice": "Se emitirá y numerará ahora una factura por {{amount}}.",
         "consequenceContracts": "Las líneas recurrentes se convierten en contratos en borrador que activas después.",
-        "consequenceEmail": "La factura se enviará por correo electrónico al cliente.",
+        "consequenceEmail": "La factura se enviará por correo electrónico a {{recipients}}.",
         "consequenceDraft": "Esta propuesta nunca se envió. Lo primero que el cliente verá de ella será la factura.",
         "submit": "Aceptar y emitir factura",
         "success": "Propuesta aceptada. Factura {{number}} emitida.",
@@ -1222,7 +1223,9 @@
         "evidenceHelp": "PDF, PNG o JPEG, hasta 10 MB — por ejemplo, la orden de compra firmada o el documento.",
         "evidenceTooLarge": "Este archivo supera los 10 MB. Elige un archivo más pequeño.",
         "evidenceAttached": "Evidencia adjuntada.",
-        "evidenceError": "La aceptación quedó registrada, pero no se pudo adjuntar el archivo de evidencia. Adjúntalo desde la página de la propuesta."
+        "evidenceError": "La aceptación quedó registrada, pero no se pudo adjuntar el archivo de evidencia. Adjúntalo desde la página de la propuesta.",
+        "consequenceEmailNoRecipient": "Esta cotización no tiene destinatarios registrados, por lo que es posible que la factura no se envíe por correo. Envíasela al cliente tú mismo si es necesario.",
+        "successNoRecipient": "Cotización aceptada. Factura {{number}} emitida. Es posible que no se haya enviado por correo: esta cotización no tiene destinatarios registrados."
       },
       "declineOnBehalf": {
         "button": "Rechazar en nombre del cliente",
@@ -1446,6 +1449,18 @@
         "unavailable": "Archivo del acuerdo no disponible",
         "versionFooter": "{{name}} — versión {{version}}"
       },
+      "agreements": {
+        "heading": "Acuerdos",
+        "termsTitle": "Términos y condiciones",
+        "read": "Leer",
+        "hide": "Ocultar",
+        "readTime": "~{{minutes}} min de lectura",
+        "sectionsReadTime_one": "{{count}} sección · ~{{minutes}} min de lectura",
+        "sectionsReadTime_other": "{{count}} secciones · ~{{minutes}} min de lectura",
+        "pdfDocument": "Documento PDF",
+        "unavailable": "No disponible",
+        "untitled": "Acuerdo"
+      },
       "draft": "Borrador",
       "empty": "Esta propuesta aún no tiene ningún contenido.",
       "imageUnavailable": "Imagen no disponible",
@@ -1473,7 +1488,6 @@
         "tax": "Impuesto",
         "unitPrice": "Precio unitario"
       },
-      "terms": "Términos",
       "totals": {
         "annualRecurring": "Recurrente anual",
         "depositDue": "Depósito adeudado",
@@ -1930,19 +1944,18 @@
       },
       "reverseError": "No se pudo revertir el pago.",
       "reverseSuccess": "Pago revertido",
-      "reverseInQuickbooksToo": "Revierte este pago también en QuickBooks",
       "sendLink": "Enviar enlace de pago",
       "setUp": "Configuración",
       "shareLinkPrompt": "Comparta este enlace de pago con su cliente:",
       "stripeNudge": "Conecte Stripe para aceptar pagos con tarjeta en línea.",
       "title": "Pagos",
       "viaStripe": "vía Stripe",
-      "quickbooks": "QuickBooks",
-      "viaQuickbooks": "vía QuickBooks",
-      "inQuickbooks": "En QuickBooks",
-      "syncingToQuickbooks": "Sincronizando…",
-      "quickbooksSyncFailed": "Error de sincronización con QuickBooks",
-      "currencyUnknown": "La moneda de liquidación de tu cuenta de Stripe aún no está en caché, así que no se pudo comparar con esta factura en {{documentCurrency}}. Actualiza los datos de tu cuenta de Stripe en Configuración → Integraciones para habilitar la verificación."
+      "currencyUnknown": "La moneda de liquidación de tu cuenta de Stripe aún no está en caché, así que no se pudo comparar con esta factura en {{documentCurrency}}. Actualiza los datos de tu cuenta de Stripe en Configuración → Integraciones para habilitar la verificación.",
+      "inProvider": "En {{provider}}",
+      "syncingToProvider": "Sincronizando…",
+      "providerSyncFailed": "Error de sincronización con {{provider}}",
+      "reverseInProviderToo": "Revierte este pago también en {{provider}}",
+      "overpayment": "El monto supera el saldo pendiente ({{balance}})."
     },
     "requestPayment": {
       "invoiceSent": "factura enviada",
@@ -1982,22 +1995,22 @@
       "error": "No se pudo restablecer el enlace"
     },
     "accountingSync": {
-      "title": "Sincronización con QuickBooks",
+      "title": "Sincronización con {{provider}}",
       "status": {
         "pending": "Aún no enviada",
         "synced": "Sincronizada",
         "error": "Error de sincronización",
         "synced_with_tax_variance": "Sincronizada con diferencia de impuestos"
       },
-      "taxVarianceHint": "QuickBooks calculó un total de impuestos diferente. Compara ambos registros antes de cerrar el período.",
-      "docNumber": "Documento de QuickBooks {{docNumber}}",
+      "taxVarianceHint": "{{provider}} calculó un total de impuestos diferente. Compara ambos registros antes de cerrar el período.",
+      "docNumber": "Documento de {{provider}} {{docNumber}}",
       "lastSynced": "Última sincronización: {{when}}",
       "syncing": "Sincronizando…",
-      "push": "Enviar a QuickBooks",
-      "pushed": "Factura enviada a QuickBooks.",
-      "pushFailed": "No se pudo enviar la factura a QuickBooks.",
-      "voidedHint": "Esta factura está anulada — no hay nada que enviar a QuickBooks.",
-      "remoteDeletedHint": "Esta factura fue eliminada en QuickBooks. Enviarla de nuevo crearía un duplicado — resuélvelo primero en QuickBooks."
+      "push": "Enviar a {{provider}}",
+      "pushed": "Factura enviada a {{provider}}.",
+      "pushFailed": "No se pudo enviar la factura a {{provider}}.",
+      "voidedHint": "Esta factura está anulada — no hay nada que enviar a {{provider}}.",
+      "remoteDeletedHint": "Esta factura fue eliminada en {{provider}}. Enviarla de nuevo crearía un duplicado — resuélvelo primero en {{provider}}."
     }
   },
   "invoiceDocument": {
@@ -2060,11 +2073,11 @@
       "success": "{{succeeded}} {{verb}}",
       "void": "Anular",
       "voidedVerb": "anulado",
-      "quickbooks": "Enviar a QuickBooks",
-      "quickbooksQueued": "{{enqueued}} en cola para QuickBooks",
-      "quickbooksQueuedPartial": "{{enqueued}} en cola para QuickBooks, {{skipped}} omitidas",
-      "quickbooksQueuedFailed": "{{enqueued}} en cola para QuickBooks, {{skipped}} omitidas, {{failed}} no se pudieron poner en cola",
-      "quickbooksFailed": "No se pudo poner en cola el envío a QuickBooks. Reintenta."
+      "pushToProvider": "Enviar a {{provider}}",
+      "providerQueued": "{{enqueued}} en cola para {{provider}}",
+      "providerQueuedPartial": "{{enqueued}} en cola para {{provider}}, {{skipped}} omitidas",
+      "providerQueuedFailed": "{{enqueued}} en cola para {{provider}}, {{skipped}} omitidas, {{failed}} no se pudieron poner en cola",
+      "providerFailed": "No se pudo poner en cola el envío a {{provider}}. Reintenta."
     },
     "bulkDelete": {
       "message": "¿Eliminar las facturas seleccionadas {{count}}? Sólo se eliminarán las facturas DRAFT; esto no se puede deshacer.",
@@ -2159,11 +2172,11 @@
       "title": "Dirección de Envio"
     },
     "contact": {
-      "description": "Las cotizaciones y facturas se envían por correo electrónico a esta dirección. Sin él, enviar una propuesta se marca como Enviada pero no se envía nada por correo electrónico.",
-      "email": "Correo electrónico de contacto",
-      "emailInvalid": "Introduzca una dirección de correo electrónico válida",
-      "emailPlaceholder": "billing@customer.example",
-      "name": "Nombre de contacto",
+      "description": "Las cotizaciones y facturas se envían por correo electrónico al contacto de facturación de la organización de forma predeterminada: el contacto a nivel de organización con el rol de Facturación. Aún puede cambiar los destinatarios cada vez que envíe.",
+      "manage": "Administrar contactos",
+      "noEmail": "{{name}} tiene el rol de Facturación pero no tiene dirección de correo electrónico, así que no se pueden enviar cotizaciones ni facturas por correo hasta que se agregue una.",
+      "none": "Ningún contacto tiene el rol de Facturación. Hasta que alguno lo tenga, enviar una propuesta la marca como Enviada pero no se envía nada por correo electrónico.",
+      "recipientLabel": "Destinatario predeterminado:",
       "title": "contacto de facturación"
     },
     "currency": {
@@ -2277,7 +2290,8 @@
     "loading": "Cargando configuración de facturación...",
     "saveButton": "Guardar configuración de facturación",
     "saveError": "No se pudo guardar la configuración de facturación.",
-    "saveSuccess": "Configuración de facturación guardada"
+    "saveSuccess": "Configuración de facturación guardada",
+    "readOnlyNotice": "Tienes acceso de solo lectura a la configuración de facturación. Pide a un administrador que la cambie."
   },
   "shared": {
     "documentWorkspace": {
@@ -2302,7 +2316,7 @@
   "billingConnectionsTab": {
     "accounting": {
       "title": "Contabilidad",
-      "description": "Stripe y QuickBooks se conectan en Integraciones — adminístralos allí.",
+      "description": "Stripe, QuickBooks y Xero se conectan en Integraciones — adminístralos allí.",
       "cta": "Administrar conexiones contables →"
     },
     "catalog": {

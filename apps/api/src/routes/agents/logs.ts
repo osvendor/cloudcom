@@ -2,14 +2,39 @@ import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
 import { bodyLimitOnError, reportBodyLimitRejection } from '../../middleware/bodyLimitGate';
 import { z } from 'zod';
-import { eq } from 'drizzle-orm';
-import { gunzipSync } from 'node:zlib';
+import { and, eq, isNull, lt, or } from 'drizzle-orm';
+import { gunzip } from 'node:zlib';
+import { promisify } from 'node:util';
+
+// Async gunzip: a synchronous inflate blocks the event loop for every OTHER
+// agent's request for the duration of the decompression, which is worst
+// exactly when a request is large (the case this is meant to bound).
+const gunzipAsync = promisify(gunzip);
 import { db } from '../../db';
 import { devices, agentLogs } from '../../db/schema';
 import { redactAgentLogFields, redactAgentLogMessage } from '../../services/logRedaction';
 import { writeAuditEvent } from '../../services/auditEvents';
+import { getRedis } from '../../services/redis';
+import { checkAndConsumeIngestQuota } from '../../services/ingestQuota';
+import { envInt } from '../../utils/envInt';
+import { recordAgentIngestSubmission } from '../metrics';
+import { captureException } from '../../services/sentry';
 
 export const logsRoutes = new Hono();
+
+/**
+ * Daily per-device / per-org row+byte ingest budgets (issue: no quota beyond
+ * the 200-rows-per-request cap and the per-minute request-count limiters, so
+ * an admitted device can still sustain tens of millions of rows and tens of
+ * GB/day against shared Postgres disk/WAL/backups). Sized well above a
+ * legitimate agent's built-in shipper ceiling (500 entries/60s, i.e. at most
+ * ~720k rows/day if it somehow ran flat-out forever) and well below what the
+ * per-request/per-minute limiters would otherwise admit.
+ */
+const AGENT_LOG_MAX_ROWS_PER_DEVICE_PER_DAY = envInt('AGENT_LOG_MAX_ROWS_PER_DEVICE_PER_DAY', 2_000_000);
+const AGENT_LOG_MAX_BYTES_PER_DEVICE_PER_DAY = envInt('AGENT_LOG_MAX_BYTES_PER_DEVICE_PER_DAY', 500 * 1024 * 1024);
+const AGENT_LOG_MAX_ROWS_PER_ORG_PER_DAY = envInt('AGENT_LOG_MAX_ROWS_PER_ORG_PER_DAY', 20_000_000);
+const AGENT_LOG_MAX_BYTES_PER_ORG_PER_DAY = envInt('AGENT_LOG_MAX_BYTES_PER_ORG_PER_DAY', 5 * 1024 * 1024 * 1024);
 
 // Agent Diagnostic Log Shipping
 //
@@ -28,6 +53,15 @@ const LOG_BATCH_TOO_LARGE = 'Log batch too large (max 256KB gzipped)';
 // event evidence, but an agent must not place records arbitrarily far into the
 // future. Receipt time remains the authoritative lifecycle/recency clock.
 const MAX_AGENT_LOG_FUTURE_SKEW_MS = 10 * 60 * 1000;
+
+/**
+ * #7067 — `devices.last_log_at` throttle. This route is the hottest ingest
+ * path per device (up to once a minute), so it must not cost a write on every
+ * batch just to record "still shipping". Only move the column when it has
+ * drifted by at least this much — a conditional UPDATE, not a read-then-write,
+ * so it stays race-safe under concurrent requests for the same device.
+ */
+const DEVICE_LAST_LOG_AT_THROTTLE_MS = 5 * 60 * 1000;
 
 /**
  * Remove the two server-authored clamp-provenance keys from redacted agent
@@ -79,7 +113,7 @@ logsRoutes.post(
     const raw = Buffer.from(await c.req.arrayBuffer());
     const encoding = c.req.header('content-encoding')?.toLowerCase() ?? '';
     const decoded = encoding.includes('gzip')
-      ? gunzipSync(raw, { maxOutputLength: 10 * 1024 * 1024 }) // 10MB decompressed cap (defense-in-depth)
+      ? await gunzipAsync(raw, { maxOutputLength: 10 * 1024 * 1024 }) // 10MB decompressed cap (defense-in-depth)
       : raw;
     body = JSON.parse(decoded.toString('utf-8'));
   } catch (err) {
@@ -159,6 +193,43 @@ logsRoutes.post(
     };
   });
 
+  // Daily row/byte ingest budget, checked before the batch is written. Bytes
+  // are the stored (redacted) row shape, not the wire payload — what actually
+  // lands on disk is what the budget is protecting.
+  const batchBytes = Buffer.byteLength(JSON.stringify(rows), 'utf-8');
+  const redis = getRedis();
+  const [deviceQuota, orgQuota] = await Promise.all([
+    checkAndConsumeIngestQuota({
+      redis,
+      prefix: 'agent_logs',
+      scope: 'device',
+      id: device.id,
+      rows: rows.length,
+      bytes: batchBytes,
+      maxRows: AGENT_LOG_MAX_ROWS_PER_DEVICE_PER_DAY,
+      maxBytes: AGENT_LOG_MAX_BYTES_PER_DEVICE_PER_DAY,
+    }),
+    checkAndConsumeIngestQuota({
+      redis,
+      prefix: 'agent_logs',
+      scope: 'org',
+      id: device.orgId,
+      rows: rows.length,
+      bytes: batchBytes,
+      maxRows: AGENT_LOG_MAX_ROWS_PER_ORG_PER_DAY,
+      maxBytes: AGENT_LOG_MAX_BYTES_PER_ORG_PER_DAY,
+    }),
+  ]);
+
+  if (!deviceQuota.allowed || !orgQuota.allowed) {
+    console.warn(
+      `[AgentLogs] Daily ingest budget exceeded for device ${device.id} org ${device.orgId} `
+      + `(device rows=${deviceQuota.rowsUsed} bytes=${deviceQuota.bytesUsed}, `
+      + `org rows=${orgQuota.rowsUsed} bytes=${orgQuota.bytesUsed}) — dropping ${rows.length} row(s)`,
+    );
+    return c.json({ error: 'Daily log ingest budget exceeded', received: 0, dropped: rows.length }, 429);
+  }
+
   let inserted = 0;
   try {
     for (let i = 0; i < rows.length; i += 100) {
@@ -170,26 +241,68 @@ logsRoutes.post(
     console.error(`[AgentLogs] Error batch inserting logs for device ${device.id}:`, err);
   }
 
-  // Content-free ingest audit (counts only, NO log message contents) so the
-  // arrival of diagnostic evidence is itself auditable — mirrors the sibling
-  // eventlogs.ts `agent.eventlogs.submit` event. Fires on success and partial/
-  // total failure alike, so a swallowed insert error still leaves a trail.
+  // #7067 — stamp the device's latest log-ingest time so "heartbeating but no
+  // logs" becomes a queryable condition (isDeviceLogSilent, @breeze/shared)
+  // instead of an absence. Throttled: skip the write entirely when the column
+  // already moved within the last DEVICE_LAST_LOG_AT_THROTTLE_MS, so a
+  // healthy device shipping every ~60s doesn't cost a write per batch.
+  if (inserted > 0) {
+    try {
+      await db
+        .update(devices)
+        .set({ lastLogAt: receivedAt })
+        .where(and(
+          eq(devices.id, device.id),
+          or(
+            isNull(devices.lastLogAt),
+            lt(devices.lastLogAt, new Date(receivedAt.getTime() - DEVICE_LAST_LOG_AT_THROTTLE_MS)),
+          ),
+        ));
+    } catch (err) {
+      // Deliberately does not fail the request — the logs themselves already
+      // landed. But an invisible failure here is worse than the neighboring
+      // insert-failure path: the whole point of last_log_at is to be a
+      // trustworthy stand-in for "logs are flowing", so a silently-stuck
+      // column would make a healthy device read as log-silent with no signal
+      // that the column, not the device, is the thing that's broken.
+      console.error(`[AgentLogs] Failed to update last_log_at for device ${device.id}:`, err);
+      captureException(err instanceof Error ? err : new Error(String(err)), c, {
+        route: 'agents.logs.lastLogAtUpdate',
+        deviceId: device.id,
+      });
+    }
+  }
+
+  // Content-free ingest audit (counts only, NO log message contents), written
+  // ONLY for an anomalous batch: an insert shortfall (a swallowed insert error
+  // still leaves a trail) or server-clamped future timestamps. Finding #9
+  // (#2359) originally audited every batch; at one batch per device per minute
+  // that receipt was ~57% of audit_logs (#4340), and the batch itself is
+  // already durable evidence in agent_logs. Routine volume is counted in
+  // breeze_agent_ingest_submissions_total instead.
   const agent = c.get('agent') as { orgId?: string; agentId?: string } | undefined;
   const partialFailure = rows.length - inserted;
-  writeAuditEvent(c, {
-    orgId: agent?.orgId ?? device.orgId,
-    actorType: 'agent',
-    actorId: agent?.agentId ?? agentId,
-    action: 'agent.logs.submit',
-    resourceType: 'device',
-    resourceId: device.id,
-    details: {
-      submittedCount: data.logs.length,
-      insertedCount: inserted,
-      ...(timestampClampedCount > 0 ? { timestampClampedCount } : {}),
-      ...(partialFailure > 0 ? { partialFailure } : {}),
-    },
-  });
+  recordAgentIngestSubmission(
+    'logs',
+    partialFailure === 0 ? 'success' : inserted === 0 ? 'failed' : 'partial',
+  );
+  if (partialFailure > 0 || timestampClampedCount > 0) {
+    writeAuditEvent(c, {
+      orgId: agent?.orgId ?? device.orgId,
+      actorType: 'agent',
+      actorId: agent?.agentId ?? agentId,
+      action: 'agent.logs.submit',
+      resourceType: 'device',
+      resourceId: device.id,
+      result: partialFailure > 0 ? 'failure' : 'success',
+      details: {
+        submittedCount: data.logs.length,
+        insertedCount: inserted,
+        ...(timestampClampedCount > 0 ? { timestampClampedCount } : {}),
+        ...(partialFailure > 0 ? { partialFailure } : {}),
+      },
+    });
+  }
 
   if (inserted === 0 && rows.length > 0) {
     return c.json({ error: 'Failed to insert logs', received: 0 }, 500);

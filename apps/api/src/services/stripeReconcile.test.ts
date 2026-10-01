@@ -3,8 +3,8 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 // Controllable Drizzle chain mock (same pattern as invoiceService.test.ts): every
 // builder method returns the same chain; an awaited query resolves to the next
 // queued result. Tests queue the rows each db call should resolve to, in order.
-const results: unknown[][] = [];
-function queueResult(rows: unknown[]) { results.push(rows); }
+const results: Array<unknown[] | Error> = [];
+function queueResult(rows: unknown[] | Error) { results.push(rows); }
 
 // Captures every `.set({ amount })` value written so the currency-aware partial
 // refund assertion can inspect the major-unit string actually persisted.
@@ -71,8 +71,10 @@ vi.mock('../db', () => {
       stmts.list.push({ kind: 'delete', table: arg });
       return chain;
     });
-    (chain as { then: unknown }).then = (resolve: (v: unknown) => unknown) => {
+    (chain as { then: unknown }).then = (resolve: (v: unknown) => unknown, reject?: (e: unknown) => unknown) => {
       const rows = results.shift() ?? [];
+      // A queued Error makes that statement REJECT (a failed query).
+      if (rows instanceof Error) return Promise.reject(rows).then(resolve, reject);
       return Promise.resolve(rows).then(resolve);
     };
     return chain;
@@ -121,6 +123,19 @@ vi.mock('./accounting/accountingPaymentPush', async (importOriginal) => ({
   requestPaymentDelete,
 }));
 
+// Xero W01 (Task 6): the partial-refund divergence flag is scoped to the
+// partner's ACTIVE accounting connection, via the non-decrypting id+provider
+// lookup (Task 9: the provider labels the divergence text) (fix round 1 — the plain resolveActiveConnection would eagerly decrypt
+// realm/token columns inside this money transaction). Defaults to a
+// connected partner so every pre-existing test in this file keeps its prior
+// behaviour; the two tests owned by Task 6 override this per-case.
+const { resolveActiveConnectionRefMock } = vi.hoisted(() => ({
+  resolveActiveConnectionRefMock: vi.fn(),
+}));
+vi.mock('./accounting/accountingConnectionService', () => ({
+  resolveActiveConnectionRef: resolveActiveConnectionRefMock,
+}));
+
 const { enqueuePaymentPush, enqueuePaymentDelete } = vi.hoisted(() => ({
   enqueuePaymentPush: vi.fn().mockResolvedValue(true),
   enqueuePaymentDelete: vi.fn().mockResolvedValue(true),
@@ -152,6 +167,8 @@ beforeEach(() => {
   enqueuePaymentPush.mockReset(); enqueuePaymentPush.mockResolvedValue(true);
   enqueuePaymentDelete.mockReset(); enqueuePaymentDelete.mockResolvedValue(true);
   processPendingReversals.mockReset(); processPendingReversals.mockResolvedValue(0);
+  resolveActiveConnectionRefMock.mockReset();
+  resolveActiveConnectionRefMock.mockResolvedValue({ id: 'conn-1', provider: 'quickbooks' });
 });
 
 describe('recordStripePayment', () => {
@@ -348,14 +365,15 @@ describe('recordStripePayment', () => {
 
 describe('reflectStripeRefund', () => {
   it('full refund voids the linked payment (delete, NOT update) and recomputes', async () => {
-    // db call order: select mapping → select payment (pre-delete audit snapshot) →
-    // delete payment → update mapping → (recompute, mocked) →
-    // invoicePartnerId: select invoice → (emit, mocked)
+    // db call order: select mapping → invoicePartnerId select (Xero W01: hoisted
+    // above the partial-refund branch, so it runs before either arm) → select
+    // payment (pre-delete audit snapshot) → delete payment → update mapping →
+    // (recompute, mocked) → (emit, mocked)
     queueResult([{ id: 'm1', invoiceId: 'inv1', orgId: 'org1', invoicePaymentId: 'pay1', stripeAccountId: 'acct_1' }]); // mapping
+    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
     queueResult([{ id: 'pay1', invoiceId: 'inv1', orgId: 'org1', amount: '100.00', method: 'card', recordedBy: null }]); // payment snapshot
     queueResult([]); // delete payment
     queueResult([]); // update mapping → refunded
-    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
 
     await reflectStripeRefund({ stripePaymentIntentId: 'pi_1', amountRefundedCents: 10000, chargeAmountCents: 10000, currency: 'USD', stripeAccountId: 'acct_1' });
 
@@ -373,10 +391,10 @@ describe('reflectStripeRefund', () => {
     // entry must be written from a snapshot read BEFORE the delete (mirrors the
     // manual void route's pre-destroy capture, R2). System-scope writer (no req ctx).
     queueResult([{ id: 'm1', invoiceId: 'inv1', orgId: 'org1', invoicePaymentId: 'pay1', stripeAccountId: 'acct_1' }]); // mapping
+    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
     queueResult([{ id: 'pay1', invoiceId: 'inv1', orgId: 'org1', amount: '100.00', method: 'card', recordedBy: 'usr1' }]); // payment snapshot
     queueResult([]); // delete payment
     queueResult([]); // update mapping → refunded
-    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
 
     await reflectStripeRefund({ stripePaymentIntentId: 'pi_1', amountRefundedCents: 10000, chargeAmountCents: 10000, currency: 'USD', stripeAccountId: 'acct_1' });
 
@@ -401,10 +419,10 @@ describe('reflectStripeRefund', () => {
 
   it('partial refund does NOT write a void audit event (the row survives, only reduced)', async () => {
     queueResult([{ id: 'm1', invoiceId: 'inv1', orgId: 'org1', invoicePaymentId: 'pay1', stripeAccountId: 'acct_1' }]); // mapping
+    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
     queueResult([]); // update payment amount
     queueResult([]); // update mapping → partially_refunded
     queueResult([]); // accounting_entity_mappings divergence flag (Phase D2)
-    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
 
     await reflectStripeRefund({ stripePaymentIntentId: 'pi_1', amountRefundedCents: 4000, chargeAmountCents: 10000, currency: 'USD', stripeAccountId: 'acct_1' });
 
@@ -413,10 +431,10 @@ describe('reflectStripeRefund', () => {
 
   it('partial refund reduces the payment amount (update, NOT delete) and recomputes', async () => {
     queueResult([{ id: 'm1', invoiceId: 'inv1', orgId: 'org1', invoicePaymentId: 'pay1', stripeAccountId: 'acct_1' }]); // mapping
+    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
     queueResult([]); // update payment amount
     queueResult([]); // update mapping → partially_refunded
     queueResult([]); // accounting_entity_mappings divergence flag (Phase D2)
-    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
 
     await reflectStripeRefund({ stripePaymentIntentId: 'pi_1', amountRefundedCents: 4000, chargeAmountCents: 10000, currency: 'USD', stripeAccountId: 'acct_1' });
 
@@ -431,10 +449,10 @@ describe('reflectStripeRefund', () => {
   it('partial refund is currency-aware for zero-decimal currencies (no /100)', async () => {
     // JPY: remaining = 10000 - 4000 = 6000 minor units → "6000.00" major (NOT "60.00").
     queueResult([{ id: 'm1', invoiceId: 'inv1', orgId: 'org1', invoicePaymentId: 'pay1', stripeAccountId: 'acct_1' }]); // mapping
+    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
     queueResult([]); // update payment amount
     queueResult([]); // update mapping → partially_refunded
     queueResult([]); // accounting_entity_mappings divergence flag (Phase D2)
-    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
 
     await reflectStripeRefund({ stripePaymentIntentId: 'pi_1', amountRefundedCents: 4000, chargeAmountCents: 10000, currency: 'JPY', stripeAccountId: 'acct_1' });
 
@@ -483,19 +501,20 @@ describe('Phase D2 — QuickBooks payment push/delete hooks', () => {
   /** The reads reflectStripeRefund issues on the FULL-refund arm. */
   function queueFullRefund() {
     queueResult([{ id: 'm1', invoiceId: 'inv1', orgId: 'org1', invoicePaymentId: 'pay1', stripeAccountId: 'acct_1' }]); // mapping
+    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
     queueResult([{ id: 'pay1', invoiceId: 'inv1', orgId: 'org1', amount: '107.00', method: 'card', recordedBy: null }]); // snapshot
     queueResult([]); // delete payment
     queueResult([]); // update stripe mapping -> refunded
-    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
   }
 
-  /** The reads reflectStripeRefund issues on the PARTIAL-refund arm. */
+  /** The reads reflectStripeRefund issues on the PARTIAL-refund arm. `resolveActiveConnectionRef`
+   *  is mocked (Xero W01, Task 6) and does not consume from this queue. */
   function queuePartialRefund(mappingRows: unknown[] = [{ id: 'map-1' }]) {
     queueResult([{ id: 'm1', invoiceId: 'inv1', orgId: 'org1', invoicePaymentId: 'pay1', stripeAccountId: 'acct_1' }]); // mapping
+    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
     queueResult([]); // update payment amount
     queueResult([]); // update stripe mapping -> partially_refunded
     queueResult(mappingRows); // accounting_entity_mappings divergence flag RETURNING
-    queueResult([{ partnerId: 'p1' }]); // invoicePartnerId select
   }
 
   const refundInput = () => ({
@@ -574,7 +593,7 @@ describe('Phase D2 — QuickBooks payment push/delete hooks', () => {
     const patch = lastStmtOn(accountingEntityMappings, 'update')!.set as Record<string, unknown>;
     expect(patch).toMatchObject({
       syncStatus: 'error',
-      lastError: partialRefundDivergenceMessage('67.00'),
+      lastError: partialRefundDivergenceMessage('67.00', 'QuickBooks'),
     });
     expect(patch.lastError).toBe('Refunded in Stripe, total 67.00; record the refund in QuickBooks (this QuickBooks payment still shows the full amount)');
     // pending_op and claimed_at are deliberately UNTOUCHED: an owed push or a
@@ -606,7 +625,7 @@ describe('Phase D2 — QuickBooks payment push/delete hooks', () => {
     });
 
     const patch = lastStmtOn(accountingEntityMappings, 'update')!.set as Record<string, unknown>;
-    expect(patch.lastError).toBe(partialRefundDivergenceMessage('6700.00'));
+    expect(patch.lastError).toBe(partialRefundDivergenceMessage('6700.00', 'QuickBooks'));
   });
 
   it('only flags a payment that Breeze actually pushed: breeze_origin AND a remote id', async () => {
@@ -628,6 +647,30 @@ describe('Phase D2 — QuickBooks payment push/delete hooks', () => {
     expect(params).toContain('pay1');
     expect(params).toContain('payment');
     expect(params).toContain(true);
+  });
+
+  it('flags only the payment mapping under the partner\'s active connection (integration_id filter, Xero W01)', async () => {
+    resolveActiveConnectionRefMock.mockResolvedValue({ id: 'conn-1', provider: 'quickbooks' });
+    queuePartialRefund();
+
+    await reflectStripeRefund({ ...refundInput(), amountRefundedCents: 6700, chargeAmountCents: 10700 });
+
+    expect(resolveActiveConnectionRefMock).toHaveBeenCalledWith(db, 'p1');
+    const where = lastStmtOn(accountingEntityMappings, 'update')!.where;
+    const { sql, params } = dialect.sqlToQuery(where as SQL);
+    expect(sql).toContain('"accounting_entity_mappings"."integration_id" = $');
+    expect(sql).toContain('"accounting_entity_mappings"."partner_id" = $');
+    expect(params).toContain('conn-1');
+    expect(params).toContain('p1');
+  });
+
+  it('skips the divergence flag, without throwing, when the partner has no accounting connection', async () => {
+    resolveActiveConnectionRefMock.mockResolvedValue(null);
+    queuePartialRefund();
+
+    await expect(reflectStripeRefund({ ...refundInput(), amountRefundedCents: 6700, chargeAmountCents: 10700 }))
+      .resolves.toBeUndefined();
+    expect(lastStmtOn(accountingEntityMappings, 'update')).toBeUndefined();
   });
 
   it('never 500s the webhook on a committed capture because Redis is down', async () => {
@@ -652,6 +695,56 @@ describe('Phase D2 — QuickBooks payment push/delete hooks', () => {
     expect(capture).toHaveBeenCalledWith(expect.any(Error), undefined, expect.objectContaining({
       stripe_reconcile_stage: 'settle-pending-reversals',
     }));
+  });
+
+  // #7069 — everything after the capture's transaction commits is a best-effort
+  // side effect. A throw there made recordStripePayment reject, so the settle
+  // route answered { settled:false } and the sweep counted a failure for a
+  // payment row and invoice status that were ALREADY committed.
+  describe('post-commit side effects never change the committed outcome (#7069)', () => {
+    it.each(['payment.recorded', 'invoice.paid'])('resolves when emitting %s throws after the capture committed', async (type) => {
+      emit.mockImplementation(async (e: { type: string }) => { if (e.type === type) throw new Error(`emit ${type} exploded`); });
+      queueCapture();
+
+      await expect(recordStripePayment(captureInput())).resolves.toEqual({ invoiceId: 'inv1' });
+      expect(insertValues.calls.some((v) => (v as { method?: string }).method === 'card')).toBe(true);
+      expect(capture).toHaveBeenCalledWith(expect.any(Error), undefined, expect.objectContaining({
+        partner_id: 'p1', stripe_reconcile_stage: `settle-emit-${type}`,
+      }));
+    });
+
+    it('still emits invoice.paid when the payment.recorded emit throws', async () => {
+      emit.mockImplementation(async (e: { type: string }) => { if (e.type === 'payment.recorded') throw new Error('boom'); });
+      queueCapture();
+
+      await recordStripePayment(captureInput());
+      expect(emit).toHaveBeenCalledWith(expect.objectContaining({ type: 'invoice.paid' }));
+    });
+
+    it('resolves when emitting payment.failed throws after a terminal decision committed', async () => {
+      emit.mockRejectedValue(new Error('emit exploded'));
+      queueResult([{ id: 'm1', invoiceId: 'inv1', invoicePaymentId: null, stripeAccountId: 'acct_1' }]); // discovery
+      queueResult([{ id: 'inv1', orgId: 'org1', partnerId: 'p1', status: 'void', balance: '107.00', currencyCode: 'USD', stripeAccountId: 'acct_1' }]); // invoice (locked) — void => terminal
+      queueResult([{ id: 'm1', invoiceId: 'inv1', invoicePaymentId: null, stripeAccountId: 'acct_1' }]); // re-read under lock
+
+      await expect(recordStripePayment(captureInput())).resolves.toEqual({ invoiceId: 'inv1' });
+      expect(capture).toHaveBeenCalledWith(expect.any(Error), undefined, expect.objectContaining({
+        stripe_reconcile_stage: 'settle-emit-payment.failed',
+      }));
+    });
+
+    it('resolves, and does NOT announce invoice.paid, when the post-reversal status re-read fails', async () => {
+      processPendingReversals.mockResolvedValue(1);
+      queueCapture();
+      queueResult(new Error('connection terminated')); // post-reversal invoice status re-read
+
+      await expect(recordStripePayment(captureInput())).resolves.toEqual({ invoiceId: 'inv1' });
+      // The reversal may have un-paid the invoice; unconfirmed => stay silent.
+      expect(emit).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'invoice.paid' }));
+      expect(capture).toHaveBeenCalledWith(expect.any(Error), undefined, expect.objectContaining({
+        partner_id: 'p1', stripe_reconcile_stage: 'settle-post-reversal-status',
+      }));
+    });
   });
 
   it('never 500s the webhook on a committed refund because Redis is down', async () => {

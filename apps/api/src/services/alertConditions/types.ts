@@ -64,7 +64,7 @@ export interface BandwidthHighCondition {
   type: 'bandwidth_high';
   direction: 'in' | 'out' | 'total';
   operator: ComparisonOperator;
-  value: number; // Mbps (converted to bps internally)
+  value: number; // megaBITS/sec; agent samples are bytes/sec, handler converts (x8)
   durationMinutes?: number;
 }
 
@@ -73,7 +73,7 @@ export interface DiskIoHighCondition {
   type: 'disk_io_high';
   direction: 'read' | 'write' | 'total';
   operator: ComparisonOperator;
-  value: number; // MB/s (converted to Bps internally)
+  value: number; // MB/s (10^6 bytes/sec); agent samples are bytes/sec
   durationMinutes?: number;
 }
 
@@ -126,7 +126,7 @@ export interface SoftwarePresenceCondition {
 // SLA worker's own state, which runs on its own cadence).
 export interface BackupContinuityCondition {
   type: 'backup_continuity';
-  check: 'no_successful_backup' | 'consecutive_failures';
+  check: 'no_successful_backup' | 'consecutive_failures' | 'completed_with_errors';
   maxAgeHours?: number;
   failureCount?: number;
 }
@@ -148,13 +148,17 @@ export interface NetworkCheckCondition {
   type: 'network_check';
   monitorId: string;
   consecutiveFailures?: number;
+  /** A degraded result counts as a failure (legacy degraded rule). */
+  degradedIsFailure?: boolean;
+  /** A response slower than this counts as a failure (legacy response_time_gt). */
+  maxResponseMs?: number;
 }
 
 // --- W03 (hardware & RAID monitoring) -------------------------------------
 
 // `HardwareComponentType` from `@breeze/shared` minus 'bmc' — BMC health is a
 // separate, future, out-of-band spec (see the design doc).
-import type { HardwareComponentType } from '@breeze/shared';
+import type { HardwareComponentType, TimeSyncFindingCode } from '@breeze/shared';
 export type HardwareHealthComponentFilter = Exclude<HardwareComponentType, 'bmc'>;
 
 // Per-subject (per-component) evidence a leaf handler can report, alongside
@@ -180,6 +184,12 @@ export interface HardwareHealthCondition {
   consecutiveSnapshots: number;
 }
 
+export interface TimeSyncCondition {
+  type: 'time_sync';
+  findings: TimeSyncFindingCode[];
+  consecutiveSnapshots: number;
+}
+
 // Union of all condition types
 export type AlertCondition =
   | ThresholdCondition
@@ -198,7 +208,8 @@ export type AlertCondition =
   | BackupContinuityCondition
   | ScriptMonitorCondition
   | NetworkCheckCondition
-  | HardwareHealthCondition;
+  | HardwareHealthCondition
+  | TimeSyncCondition;
 
 // Compound condition with AND/OR logic
 export interface ConditionGroup {

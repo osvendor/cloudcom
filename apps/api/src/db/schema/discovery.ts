@@ -13,6 +13,7 @@ import {
   real,
   doublePrecision,
   uniqueIndex,
+  check,
   index
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
@@ -137,9 +138,18 @@ export const discoveryJobs = pgTable('discovery_jobs', {
   hostsDiscovered: integer('hosts_discovered'),
   newAssets: integer('new_assets'),
   errors: jsonb('errors'),
+  // M2 D7 dispatch authorization snapshot (secret-free, bounded; see
+  // services/topology/discoveryDispatch.ts). All three set together or none.
+  topologyDispatch: jsonb('topology_dispatch').$type<Record<string, unknown>>(),
+  topologyDeadlineAt: timestamp('topology_deadline_at', { withTimezone: true }),
+  topologyConfigGeneration: varchar('topology_config_generation', { length: 64 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
-});
+}, (table) => [
+  check('discovery_jobs_topology_dispatch_chk', sql`num_nonnulls(topology_dispatch, topology_deadline_at, topology_config_generation) IN (0, 3)
+  AND (topology_dispatch IS NULL OR (jsonb_typeof(topology_dispatch) = 'object' AND octet_length(topology_dispatch::text) <= 65536))
+  AND (topology_config_generation IS NULL OR topology_config_generation ~ '^[0-9a-f]{64}$')`),
+]);
 
 export const discoveredAssets = pgTable('discovered_assets', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -192,7 +202,7 @@ export const discoveredAssets = pgTable('discovered_assets', {
   lastProbeStatus: varchar('last_probe_status', { length: 12 }).$type<'pending' | 'ok' | 'failed'>(),
   lastProbeResponseMs: integer('last_probe_response_ms'),
   lastProbeRef: varchar('last_probe_ref', { length: 80 }),
-  lastJobId: uuid('last_job_id').references(() => discoveryJobs.id),
+  lastJobId: uuid('last_job_id').references(() => discoveryJobs.id, { onDelete: 'set null' }),
   discoveryMethods: discoveryMethodEnum('discovery_methods').array().default([]),
   notes: text('notes'),
   tags: text('tags').array().default([]),
@@ -208,6 +218,7 @@ export const discoveredAssets = pgTable('discovered_assets', {
   // PARTIAL as of #5213 — many IP-less manual rows may coexist in one org, but a
   // non-NULL IP is still unique per org. Every upsert onto this index must
   // repeat the predicate via `targetWhere`, or Postgres cannot infer it (42P10).
+  idOrgUnique: uniqueIndex('discovered_assets_id_org_id_uniq').on(table.id, table.orgId),
   idOrgSiteUnique: uniqueIndex('discovered_assets_id_org_id_site_id_uniq').on(table.id, table.orgId, table.siteId),
   orgIpUnique: uniqueIndex('discovered_assets_org_ip_unique')
     .on(table.orgId, table.ipAddress)
@@ -255,7 +266,7 @@ export const networkBaselines = pgTable('network_baselines', {
   siteId: uuid('site_id').notNull().references(() => sites.id),
   subnet: varchar('subnet', { length: 50 }).notNull(),
   lastScanAt: timestamp('last_scan_at'),
-  lastScanJobId: uuid('last_scan_job_id').references(() => discoveryJobs.id),
+  lastScanJobId: uuid('last_scan_job_id').references(() => discoveryJobs.id, { onDelete: 'set null' }),
   knownDevices: jsonb('known_devices').$type<KnownNetworkDevice[]>().notNull().default([]),
   scanSchedule: jsonb('scan_schedule').$type<NetworkBaselineScanSchedule>(),
   alertSettings: jsonb('alert_settings').$type<NetworkBaselineAlertSettings>().notNull().default({
@@ -309,7 +320,7 @@ export const networkChangeEvents = pgTable('network_change_events', {
   orgId: uuid('org_id').notNull().references(() => organizations.id),
   siteId: uuid('site_id').notNull().references(() => sites.id),
   baselineId: uuid('baseline_id').notNull().references(() => networkBaselines.id),
-  profileId: uuid('profile_id').references(() => discoveryProfiles.id),
+  profileId: uuid('profile_id').references(() => discoveryProfiles.id, { onDelete: 'set null' }),
   eventType: networkEventTypeEnum('event_type').notNull(),
   ipAddress: inet('ip_address').notNull(),
   macAddress: varchar('mac_address', { length: 17 }),

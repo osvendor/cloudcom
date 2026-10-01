@@ -35,7 +35,8 @@ import {
   TIER3_FOUR_EYES_ACTIONS, TIER3_FOUR_EYES_TOOLS,
   TIER3_INPUT_AWARE_ACTIONS, TIER3_INPUT_AWARE_TOOLS,
 } from '../aiGuardrails';
-import { effectDigestResolverKey } from './effectDigest';
+import { effectDigestResolverKey, requiresPinnedEffectDigest } from './effectDigest';
+import { TIER3_SUPERVISED_TOOLS } from '../aiGuardrails';
 
 /** Expands one shared reason across a family of surfaces that are unpinnable
  * for identical structural reasons (the 20 Google Workspace tools, the
@@ -73,6 +74,8 @@ const DELIBERATELY_UNPINNED: Record<string, string> = {
     'NEW-OBJECT: inserts an `elevation_requests` row. Takes no PAM policy/rule id — `pam_rules` are matched implicitly by the device org/site at evaluation time, so there is no addressable policy row the approver signed off on.',
   'manage_patches:rollback':
     'NEW-OBJECT: writes a `patch_rollbacks` row. The addressed `patches` row is a GLOBAL vendor catalog entry re-synced on a schedule, so its `updated_at` churns independently of anything the approver saw — pinning it would fail closed on routine syncs.',
+  'manage_tickets:comment':
+    'NEW-OBJECT: inserts a `ticket_comments` row, and only a customer-visible (`isPublic: true`) comment reaches four_eyes. The full comment body travels in the intent input the approver reviews. `ticketId` addresses the PARENT ticket, which is not the thing being created, and whose `updated_at` churns with every ticket event — pinning it would fail closed on routine activity.',
   'manage_policy_feature_link:add':
     'NEW-OBJECT: inserts a `config_policy_feature_links` row (RMM-QA-176 D9). `configPolicyId` addresses the PARENT policy, which is not the thing being created — there is no pre-existing link row whose content the approver signed off on. The sibling `update`, which DOES address an existing link, is pinned by an EFFECT_DIGEST_RESOLVERS entry rather than exempted here.',
 
@@ -197,5 +200,15 @@ describe('effect-digest coverage: every four_eyes surface is pinned or explicitl
     for (const action of ['issue', 'void', 'record_payment', 'void_payment']) {
       expect(resolverFor(`manage_invoices:${action}`)).toBe(`manage_invoices:${action}`);
     }
+  });
+
+  // Topology M4-D3 (#6000): diagnose_connectivity is SUPERVISED, so the
+  // four_eyes enumeration above never visits it. Its pin is not optional — the
+  // release fails closed without one — so membership is asserted explicitly.
+  it('pins diagnose_connectivity (supervised) and requires the pin', () => {
+    expect(TIER3_SUPERVISED_TOOLS.has('diagnose_connectivity')).toBe(true);
+    expect(effectDigestResolverKey('diagnose_connectivity')).toBe('diagnose_connectivity');
+    expect(requiresPinnedEffectDigest('diagnose_connectivity')).toBe(true);
+    expect(requiresPinnedEffectDigest('run_script')).toBe(false);
   });
 });

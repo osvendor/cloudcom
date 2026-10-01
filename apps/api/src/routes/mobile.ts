@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { zValidator } from '../lib/validation';
 import { z } from 'zod';
 import { scriptParametersSchema } from '@breeze/shared';
@@ -18,9 +18,9 @@ import {
   sites,
   tickets
 } from '../db/schema';
-import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import { authMiddleware, requireMfa, requirePermission, requireScope, withAuthDbAccessContext, type AuthContext } from '../middleware/auth';
 import { userRateLimit } from '../middleware/userRateLimit';
-import { setCooldown, markConfigPolicyRuleCooldown } from '../services/alertCooldown';
+import { setCooldown } from '../services/alertCooldown';
 import {
   ALERT_ACKNOWLEDGE_CAS_LOST_MESSAGE,
   ALERT_CAS_LOST_MESSAGE,
@@ -45,13 +45,20 @@ import {
   assertDeviceExecuteAllowed,
   TrustDeniedError,
 } from '../services/partnerTrust.commands';
+import {
+  assertCommandDeliverable,
+  ParkedDeviceCommandRefusedError,
+} from '../services/unassignedPool/deliveryEligibility';
 import { trustDenyBody } from '../services/partnerTrust';
 // Shared with the web device routes rather than re-declared locally. This file
 // used to carry a byte-identical private copy, which is precisely why the #2968
 // uuid guard — added to the shared helper — silently did not apply to
 // POST /mobile/devices/:id/actions. One definition, one guard.
 import { getDeviceWithOrgCheck } from './devices/helpers';
+import { alertSiteScopeByDeviceIds, alertTopologySiteGate } from './alerts/helpers';
+import { topologySessionAccessCondition } from '../services/topology/aiSessionAccess';
 
+import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 export const mobileRoutes = new Hono();
 const requireMobileAlertRead = requirePermission(PERMISSIONS.ALERTS_READ.resource, PERMISSIONS.ALERTS_READ.action);
 const requireMobileAlertAcknowledge = requirePermission(PERMISSIONS.ALERTS_ACKNOWLEDGE.resource, PERMISSIONS.ALERTS_ACKNOWLEDGE.action);
@@ -122,7 +129,7 @@ function compareLanCandidates(a: LanIpCandidate, b: LanIpCandidate): number {
  * those into the same `0` would render a false "Open alerts · 0" for a
  * device that may have several unresolved critical alerts.
  */
-async function loadDeviceDetailsV1Fields(deviceIds: string[]): Promise<{
+async function loadDeviceDetailsV1Fields(deviceIds: string[], allowedSiteIds?: string[]): Promise<{
   lanIpByDevice: Map<string, string>;
   openAlertCountByDevice: Map<string, number> | null;
   openTicketCountByDevice: Map<string, number> | null;
@@ -168,7 +175,9 @@ async function loadDeviceDetailsV1Fields(deviceIds: string[]): Promise<{
     const alertCountRows = await db
       .select({ deviceId: alerts.deviceId, count: sql<number>`count(*)::int` })
       .from(alerts)
-      .where(and(inArray(alerts.deviceId, deviceIds), inArray(alerts.status, OPEN_ALERT_STATUSES)))
+      // A site-owned topology alert counts on its origin device only when its
+      // OWNING topology site is in the caller's scope (M3-D6).
+      .where(and(inArray(alerts.deviceId, deviceIds), inArray(alerts.status, OPEN_ALERT_STATUSES), alertTopologySiteGate(allowedSiteIds)))
       .groupBy(alerts.deviceId);
     for (const row of alertCountRows) {
       openAlertCountByDevice.set(row.deviceId, Number(row.count));
@@ -403,6 +412,11 @@ async function getAlertWithOrgCheck(
   }
 
   // Site-axis gate. Only restricted callers (allowedSiteIds set) are narrowed.
+  // A topology policy alert is owned by its TOPOLOGY site (M3-D6): its origin
+  // device is provenance only, so its current site is never the gate.
+  if (perms?.allowedSiteIds && alert.topologySiteId) {
+    return canAccessSite(perms, alert.topologySiteId) ? alert : null;
+  }
   // Deviceless alerts are org-wide and not site-bound, so they pass.
   if (perms?.allowedSiteIds && alert.deviceId) {
     const [device] = await db
@@ -424,7 +438,7 @@ async function resolveSiteAllowedDeviceIds(orgId: string, perms: UserPermissions
   // org, which deliberately stays inside accessibleOrgIds — exclude them here so
   // they never enter a site-allowed device set. (Applies to every mobile
   // enumeration below; by-id lookups are left alone.)
-  const orgDevices = await db.select({ id: devices.id, siteId: devices.siteId }).from(devices).where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false)));
+  const orgDevices = await db.select({ id: devices.id, siteId: devices.siteId }).from(devices).where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition()));
   return orgDevices.filter((d) => typeof d.siteId === 'string' && canAccessSite(perms, d.siteId)).map((d) => d.id);
 }
 
@@ -995,11 +1009,13 @@ mobileRoutes.get(
 
     const perms = c.get('permissions') as UserPermissions | undefined;
     if (perms?.allowedSiteIds && auth.orgId) {
-      const allowedDeviceIds = await resolveSiteAllowedDeviceIds(auth.orgId, perms);
-      if (!allowedDeviceIds || allowedDeviceIds.length === 0) {
+      if (perms.allowedSiteIds.length === 0) {
         return c.json({ data: [], pagination: { page, limit, total: 0, nextCursor: null } });
       }
-      conditions.push(inArray(alerts.deviceId, allowedDeviceIds));
+      // Device alerts by in-scope device; site-owned topology alerts by their
+      // owning topology site (M3-D6), whatever the origin device's site.
+      const allowedDeviceIds = await resolveSiteAllowedDeviceIds(auth.orgId, perms);
+      conditions.push(alertSiteScopeByDeviceIds({ allowedSiteIds: perms.allowedSiteIds, allowedDeviceIds: allowedDeviceIds ?? [] }) as ReturnType<typeof eq>);
     }
 
     if (query.status) {
@@ -1049,7 +1065,11 @@ mobileRoutes.get(
         // The category one hop away on the rule's template is the closest
         // thing mobile has to a meaningful alert "type" (#4535). Nullable:
         // alerts can be created without a rule.
-        category: alertTemplates.category
+        category: alertTemplates.category,
+        // The emitter's own tag (e.g. 'maintenance-reboot-sweep'), so mobile
+        // can offer an action that fits the alert rather than guessing from
+        // the title. Only this one scalar leaves `context`.
+        source: sql<string | null>`${alerts.context}->>'source'`
       })
       .from(alerts)
       .leftJoin(devices, eq(alerts.deviceId, devices.id))
@@ -1079,6 +1099,7 @@ mobileRoutes.get(
       acknowledgedAt: alert.acknowledgedAt,
       resolvedAt: alert.resolvedAt,
       category: alert.category ?? null,
+      source: alert.source ?? null,
       device: alert.deviceId ? {
         id: alert.deviceId,
         hostname: alert.deviceHostname,
@@ -1248,10 +1269,6 @@ mobileRoutes.post(
             template?.cooldownMinutes ?? 15;
           await setCooldown(alert.ruleId, alert.deviceId, cooldownMinutes, alert.subjectKey ?? undefined);
         }
-      } else if (alert.configPolicyId) {
-        const ctx = alert.context as Record<string, unknown> | null;
-        const cooldownMinutes = typeof ctx?.cooldownMinutes === 'number' ? ctx.cooldownMinutes : 5;
-        await markConfigPolicyRuleCooldown(alert.configPolicyId, alert.deviceId, cooldownMinutes);
       }
     } catch (error) {
       console.error('[MobileRoutes] Failed to set alert cooldown on resolve:', error);
@@ -1343,7 +1360,7 @@ mobileRoutes.get(
       return c.json({ error: orgCheck.error.message }, orgCheck.error.status as 400 | 403 | 404);
     }
 
-    const conditions: ReturnType<typeof eq>[] = [eq(devices.isEphemeral, false)];
+    const conditions: ReturnType<typeof eq>[] = [eq(devices.isEphemeral, false), notParkedDeviceCondition()];
     if (orgCheck.orgIds !== null) {
       if (orgCheck.orgIds.length === 0) {
         return c.json({ data: [], pagination: { page, limit, total: 0, nextCursor: null } });
@@ -1440,7 +1457,7 @@ mobileRoutes.get(
     // Device Details v1 fields (#5140): batched once for this page, not
     // per-row — see loadDeviceDetailsV1Fields for why this can't fan out.
     const { lanIpByDevice, openAlertCountByDevice, openTicketCountByDevice } =
-      await loadDeviceDetailsV1Fields(items.map((d) => d.id));
+      await loadDeviceDetailsV1Fields(items.map((d) => d.id), perms?.allowedSiteIds);
 
     const data = items.map((d) => {
       const { lastSeenIp, ...rest } = d;
@@ -1475,137 +1492,67 @@ mobileRoutes.post(
     const auth = c.get('auth');
     const deviceId = c.req.param('id')!;
     const data = c.req.valid('json');
-
-    const device = await getDeviceWithOrgCheck(deviceId, auth);
-    if (!device) {
-      return c.json({ error: 'Device not found' }, 404);
-    }
     const permissions = c.get('permissions') as UserPermissions | undefined;
-    if (permissions?.allowedSiteIds && (typeof device.siteId !== 'string' || !canAccessSite(permissions, device.siteId))) {
-      return c.json({ error: 'Access to this site denied' }, 403);
-    }
 
-    if (device.status === 'decommissioned') {
-      return c.json({ error: 'Device is decommissioned' }, 400);
-    }
-
-    if (data.action === 'run_script') {
-      const result = await executeScriptOnDevices({
-        scriptId: data.scriptId as string,
-        deviceIds: [device.id],
-        parameters: data.parameters as Record<string, unknown> | undefined,
-        triggerType: 'manual',
-        auth,
-        permissions,
+    // #7109 — this route is registered in middleware/selfManagedDbContextRoutes.ts,
+    // so no request transaction is held here and every DB touch below must run
+    // inside a context this handler opens.
+    //
+    // The non-script actions run their WHOLE body in one context, which keeps
+    // the single-transaction behaviour they had under the request tx.
+    const { action } = data;
+    if (action !== 'run_script') {
+      return withAuthDbAccessContext(auth, async () => {
+        const target = await resolveQuickActionTarget(deviceId, auth, permissions);
+        if (!target.ok) {
+          return c.json({ error: target.error }, target.status);
+        }
+        return runNonScriptQuickAction(c, auth, target.device, action);
       });
+    }
 
-      if (!result.ok) {
-        return c.json({ error: result.error }, result.status);
-      }
+    // run_script: the target read commits on its own, then the service creates
+    // the execution rows through the runner below (a context that COMMITS when
+    // it returns) and sends the command only after that commit. Under the old
+    // request tx the command went out while its rows were still uncommitted,
+    // so a fast agent's result found no device_commands row and was dropped as
+    // an orphan. No context is held across the service call: it opens its own,
+    // and holding one here would take a second pooled connection (#6671).
+    const target = await withAuthDbAccessContext(auth, () =>
+      resolveQuickActionTarget(deviceId, auth, permissions),
+    );
+    if (!target.ok) {
+      return c.json({ error: target.error }, target.status);
+    }
+    const { device } = target;
 
-      const admission = result.admission.targets.find(
-        (target) => target.requestedDeviceId === device.id,
-      );
-      if (!admission || admission.admission !== 'admitted' || !admission.executionId || !admission.commandId) {
-        const status = admission?.reasonCode === 'maintenance_suppressed' ? 409 : 422;
-        return c.json(
-          {
-            admission: admission?.admission ?? 'denied',
-            reasonCode: admission?.reasonCode ?? 'not_found_or_inaccessible',
-          },
-          status,
-        );
-      }
-      writeRouteAudit(c, {
-        orgId: device.orgId,
-        action: 'mobile.device.action',
-        resourceType: 'device',
-        resourceId: device.id,
-        resourceName: device.hostname,
-        details: {
-          action: data.action,
-          requestId: result.admission.requestId,
-          scriptId: result.script.id,
-          executionId: admission.executionId,
-          commandId: admission.commandId,
-          // #3409 PR3 §2.2 — bound parameter keys whose caller-supplied value
-          // was dropped in favour of the binding. KEYS ONLY, never values.
-          // Named distinctly rather than folded into an existing key: audit
-          // `details` is an untyped shared bag and overloading a generic name
-          // there has already caused one cross-meaning collision (`deviceId`).
-          ignoredParameterKeys: result.ignoredParameters,
+    const result = await executeScriptOnDevices({
+      scriptId: data.scriptId as string,
+      deviceIds: [device.id],
+      parameters: data.parameters as Record<string, unknown> | undefined,
+      triggerType: 'manual',
+      auth,
+      permissions,
+      runInDbContext: (fn) => withAuthDbAccessContext(auth, fn),
+    });
+
+    if (!result.ok) {
+      return c.json({ error: result.error }, result.status);
+    }
+
+    const admission = result.admission.targets.find(
+      (entry) => entry.requestedDeviceId === device.id,
+    );
+    if (!admission || admission.admission !== 'admitted' || !admission.executionId || !admission.commandId) {
+      const status = admission?.reasonCode === 'maintenance_suppressed' ? 409 : 422;
+      return c.json(
+        {
+          admission: admission?.admission ?? 'denied',
+          reasonCode: admission?.reasonCode ?? 'not_found_or_inaccessible',
         },
-      });
-
-      return c.json({
-        action: data.action,
-        executionId: admission.executionId,
-        commandId: admission.commandId,
-        // This endpoint accepts `parameters`, so the mobile client is just as
-        // able to supply a value for a bound key as the web one — the warning
-        // is surfaced here for the same reason and in the same shape as
-        // POST /scripts/:id/execute (omitted when empty, so the clean-run
-        // response shape mobile already parses is unchanged). The single-
-        // device shape needs no aggregation: the fan-out is one device.
-        ignoredParameters: result.ignoredParameters.length > 0 ? result.ignoredParameters : undefined,
-      }, 201);
+        status,
+      );
     }
-
-    // Wake-on-LAN: dispatch via the relay-aware service. Audit row is written
-    // by the service against the target device; no route-level audit here to
-    // avoid duplication.
-    if (data.action === 'wake') {
-      const wake = await dispatchWake(device.id, auth.user.id, {
-        ipAddress: getTrustedClientIpOrUndefined(c),
-        userAgent: c.req.header('user-agent'),
-      });
-      if (!wake.ok) {
-        return c.json({ error: wake.message, code: wake.code }, 412);
-      }
-      return c.json({
-        action: 'wake',
-        commandId: wake.commandId,
-        wakeAttemptId: wake.wakeAttemptId,
-        relay: { deviceId: wake.relayDeviceId, hostname: wake.relayHostname },
-        network: wake.network,
-        broadcast: wake.broadcast,
-        macs: wake.macs,
-      }, 202);
-    }
-
-    let cmdResult;
-    try {
-      await assertDeviceExecuteAllowed(device.id, data.action, auth.user.id);
-      cmdResult = await db
-        .insert(deviceCommands)
-        .values({
-          deviceId: device.id,
-          type: data.action,
-          payload: { source: 'mobile' },
-          status: 'pending',
-          createdBy: auth.user.id
-        })
-        .returning();
-    } catch (e) {
-      if (e instanceof TrustDeniedError) {
-        return c.json(
-          trustDenyBody({
-            allow: false,
-            code: e.code,
-            capability: 'device_execute',
-            reason: e.reason,
-          }, false),
-          403,
-        );
-      }
-      throw e;
-    }
-    const cmd = cmdResult[0];
-
-    if (!cmd) {
-      return c.json({ error: 'Failed to create command' }, 500);
-    }
-
     writeRouteAudit(c, {
       orgId: device.orgId,
       action: 'mobile.device.action',
@@ -1614,16 +1561,150 @@ mobileRoutes.post(
       resourceName: device.hostname,
       details: {
         action: data.action,
-        commandId: cmd.id
-      }
+        requestId: result.admission.requestId,
+        scriptId: result.script.id,
+        executionId: admission.executionId,
+        commandId: admission.commandId,
+        // #3409 PR3 §2.2 — bound parameter keys whose caller-supplied value
+        // was dropped in favour of the binding. KEYS ONLY, never values.
+        // Named distinctly rather than folded into an existing key: audit
+        // `details` is an untyped shared bag and overloading a generic name
+        // there has already caused one cross-meaning collision (`deviceId`).
+        ignoredParameterKeys: result.ignoredParameters,
+      },
     });
 
     return c.json({
       action: data.action,
-      commandId: cmd.id
+      executionId: admission.executionId,
+      commandId: admission.commandId,
+      // This endpoint accepts `parameters`, so the mobile client is just as
+      // able to supply a value for a bound key as the web one — the warning
+      // is surfaced here for the same reason and in the same shape as
+      // POST /scripts/:id/execute (omitted when empty, so the clean-run
+      // response shape mobile already parses is unchanged). The single-
+      // device shape needs no aggregation: the fan-out is one device.
+      ignoredParameters: result.ignoredParameters.length > 0 ? result.ignoredParameters : undefined,
     }, 201);
   }
 );
+
+type QuickActionDevice = NonNullable<Awaited<ReturnType<typeof getDeviceWithOrgCheck>>>;
+
+type QuickActionTarget =
+  | { ok: true; device: QuickActionDevice }
+  | { ok: false; error: string; status: 400 | 403 | 404 };
+
+/**
+ * The device checks every quick action shares. Must run inside a DB access
+ * context — POST /devices/:id/actions is self-managed (#7109).
+ */
+async function resolveQuickActionTarget(
+  deviceId: string,
+  auth: AuthContext,
+  permissions: UserPermissions | undefined,
+): Promise<QuickActionTarget> {
+  const device = await getDeviceWithOrgCheck(deviceId, auth);
+  if (!device) {
+    return { ok: false, error: 'Device not found', status: 404 };
+  }
+  if (permissions?.allowedSiteIds && (typeof device.siteId !== 'string' || !canAccessSite(permissions, device.siteId))) {
+    return { ok: false, error: 'Access to this site denied', status: 403 };
+  }
+  if (device.status === 'decommissioned') {
+    return { ok: false, error: 'Device is decommissioned', status: 400 };
+  }
+  return { ok: true, device };
+}
+
+/**
+ * Wake and the plain device commands (reboot). Runs inside the single
+ * withAuthDbAccessContext the route opens for them, so a throw rolls back
+ * exactly what the request transaction used to.
+ */
+async function runNonScriptQuickAction(
+  c: Context,
+  auth: AuthContext,
+  device: QuickActionDevice,
+  action: Exclude<z.infer<typeof deviceActionSchema>['action'], 'run_script'>,
+) {
+  // Wake-on-LAN: dispatch via the relay-aware service. Audit row is written
+  // by the service against the target device; no route-level audit here to
+  // avoid duplication.
+  if (action === 'wake') {
+    const wake = await dispatchWake(device.id, auth.user.id, {
+      ipAddress: getTrustedClientIpOrUndefined(c),
+      userAgent: c.req.header('user-agent'),
+    });
+    if (!wake.ok) {
+      return c.json({ error: wake.message, code: wake.code }, 412);
+    }
+    return c.json({
+      action: 'wake',
+      commandId: wake.commandId,
+      wakeAttemptId: wake.wakeAttemptId,
+      relay: { deviceId: wake.relayDeviceId, hostname: wake.relayHostname },
+      network: wake.network,
+      broadcast: wake.broadcast,
+      macs: wake.macs,
+    }, 202);
+  }
+
+  let cmdResult;
+  try {
+    // A device parked in a holding org receives lifecycle removal only.
+    await assertCommandDeliverable(db, { deviceId: device.id, commandType: action });
+    await assertDeviceExecuteAllowed(device.id, action, auth.user.id);
+    cmdResult = await db
+      .insert(deviceCommands)
+      .values({
+        deviceId: device.id,
+        type: action,
+        payload: { source: 'mobile' },
+        status: 'pending',
+        createdBy: auth.user.id
+      })
+      .returning();
+  } catch (e) {
+    if (e instanceof ParkedDeviceCommandRefusedError) {
+      return c.json({ error: e.message, code: e.code }, 409);
+    }
+    if (e instanceof TrustDeniedError) {
+      return c.json(
+        trustDenyBody({
+          allow: false,
+          code: e.code,
+          capability: 'device_execute',
+          reason: e.reason,
+        }, false),
+        403,
+      );
+    }
+    throw e;
+  }
+  const cmd = cmdResult[0];
+
+  if (!cmd) {
+    return c.json({ error: 'Failed to create command' }, 500);
+  }
+
+  writeRouteAudit(c, {
+    orgId: device.orgId,
+    action: 'mobile.device.action',
+    resourceType: 'device',
+    resourceId: device.id,
+    resourceName: device.hostname,
+    details: {
+      action: action,
+      commandId: cmd.id
+    }
+  });
+
+  return c.json({
+    action: action,
+    commandId: cmd.id
+  }, 201);
+}
 
 // GET /summary - Get dashboard summary
 mobileRoutes.get(
@@ -1641,7 +1722,7 @@ mobileRoutes.get(
       return c.json({ error: orgCheck.error.message }, orgCheck.error.status as 400 | 403 | 404);
     }
 
-    const deviceConditions: ReturnType<typeof eq>[] = [eq(devices.isEphemeral, false)];
+    const deviceConditions: ReturnType<typeof eq>[] = [eq(devices.isEphemeral, false), notParkedDeviceCondition()];
     if (orgCheck.orgIds !== null) {
       if (orgCheck.orgIds.length === 0) {
         return c.json({
@@ -1689,20 +1770,11 @@ mobileRoutes.get(
     // Alert site-axis: use resolveSiteAllowedDeviceIds (mirrors /alerts/inbox).
     // Only restrict when we have an org context (partner/system spans multiple orgs).
     if (perms?.allowedSiteIds && auth.orgId) {
+      // (An empty site allowlist already returned above.) Device alerts by
+      // in-scope device; site-owned topology alerts by their OWNING topology
+      // site (M3-D6) — which can hold alerts even with no devices in it.
       const allowedDeviceIds = await resolveSiteAllowedDeviceIds(auth.orgId, perms);
-      if (!allowedDeviceIds || allowedDeviceIds.length === 0) {
-        return c.json({
-          devices: {
-            total: Number(deviceStats[0]?.total ?? 0),
-            online: Number(deviceStats[0]?.online ?? 0),
-            offline: Number(deviceStats[0]?.offline ?? 0),
-            maintenance: Number(deviceStats[0]?.maintenance ?? 0),
-            decommissioned: Number(deviceStats[0]?.decommissioned ?? 0)
-          },
-          alerts: { total: 0, active: 0, acknowledged: 0, resolved: 0, critical: 0 }
-        });
-      }
-      alertConditions.push(inArray(alerts.deviceId, allowedDeviceIds));
+      alertConditions.push(alertSiteScopeByDeviceIds({ allowedSiteIds: perms.allowedSiteIds, allowedDeviceIds: allowedDeviceIds ?? [] }) as ReturnType<typeof eq>);
     }
     const alertWhere = alertConditions.length > 0 ? and(...alertConditions) : undefined;
 
@@ -1823,7 +1895,7 @@ mobileRoutes.get(
 
     const deviceWhere = and(
       orgCheck.orgIds === null ? sql`true` : inArray(devices.orgId, orgCheck.orgIds),
-      eq(devices.isEphemeral, false),
+      eq(devices.isEphemeral, false), notParkedDeviceCondition(),
       perms?.allowedSiteIds ? inArray(devices.siteId, perms.allowedSiteIds) : sql`true`,
       or(
         ilike(devices.hostname, term),
@@ -1835,7 +1907,9 @@ mobileRoutes.get(
 
     const alertWhere = and(
       orgCheck.orgIds === null ? sql`true` : inArray(alerts.orgId, orgCheck.orgIds),
-      allowedDeviceIds === null ? sql`true` : inArray(alerts.deviceId, allowedDeviceIds),
+      allowedDeviceIds === null
+        ? sql`true`
+        : alertSiteScopeByDeviceIds({ allowedSiteIds: perms?.allowedSiteIds, allowedDeviceIds }),
       gte(alerts.triggeredAt, thirtyDaysAgo),
       or(ilike(alerts.title, term), ilike(alerts.message, term))
     );
@@ -1843,7 +1917,9 @@ mobileRoutes.get(
     const sessionWhere = and(
       orgCheck.orgIds === null ? sql`true` : inArray(aiSessions.orgId, orgCheck.orgIds),
       gte(aiSessions.lastActivityAt, thirtyDaysAgo),
-      ilike(aiSessions.title, term)
+      ilike(aiSessions.title, term),
+      // Topology M4-D2: a session pinned to an unreadable site never matches.
+      await topologySessionAccessCondition(auth)
     );
 
     // Suppress the unused-import lint when orgCheck.orgIds is null.
@@ -1878,7 +1954,10 @@ mobileRoutes.get(
           triggeredAt: alerts.triggeredAt,
           deviceId: alerts.deviceId,
           deviceHostname: devices.hostname,
-          deviceDisplayName: devices.displayName
+          deviceDisplayName: devices.displayName,
+          // Same emitter tag as /alerts/inbox, so an alert opened from search
+          // gets the same detail-screen actions as one opened from the inbox.
+          source: sql<string | null>`${alerts.context}->>'source'`
         })
         .from(alerts)
         .leftJoin(devices, eq(alerts.deviceId, devices.id))
@@ -1949,7 +2028,8 @@ mobileRoutes.get(
           deviceId: row.deviceId ?? null,
           deviceName,
           message: row.message ?? null,
-          triggeredAt: row.triggeredAt ? new Date(row.triggeredAt).toISOString() : null
+          triggeredAt: row.triggeredAt ? new Date(row.triggeredAt).toISOString() : null,
+          source: row.source ?? null
         }
       };
     });

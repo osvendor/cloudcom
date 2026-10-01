@@ -1,3 +1,4 @@
+import { deleteSiteTopologyAiSessions } from '../services/topology/siteTopologySessions';
 import { ensureDefaultProfile } from '../services/billingProfileService';
 import { lockMfaPolicySettings, countMfaPolicyLockouts, mfaPolicyLockoutResponse } from '../services/mfaPolicyActivation';
 import { MFA_ENROLLMENT_GRACE_DAYS_MAX } from '../services/mfaEnrollmentGrace';
@@ -10,6 +11,7 @@ import { z } from 'zod';
 import { and, eq, ilike, inArray, isNull, ne, not, notInArray, or, sql } from 'drizzle-orm';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { resolveAuditOrgIdForPartner } from '../services/auditOrgResolver';
+import { deleteSiteOwnedTopologyAlerts, lockSiteForDelete } from '../services/siteOwnedAlerts';
 import { partners, organizations, sites, devices, agentVersions, partnerUsers } from '../db/schema';
 // Imported from the CONCRETE schema module, not the '../db/schema' barrel:
 // several suites mock that barrel with a non-partial factory, and a plain
@@ -54,6 +56,16 @@ import { resolvePartnerOrgReach } from '../services/partnerOrgSelection';
 import { stripOrgLifecycleInternalSettings } from '../services/orgSettingsInternalKeys';
 import { captureException } from '../services/sentry';
 import { encryptColumnValueForWrite } from '../services/encryptedColumnRegistry';
+import {
+  LOG_FORWARDING_ORIGIN_CHANGE_MESSAGE,
+  LOG_FORWARDING_SECRET_DESTINATIONS,
+  SettingsSecretInputError,
+  maskSettingsSecrets,
+  restoreMaskedSettingsSecrets,
+  withMaskedSettings,
+} from '../services/settingsSecretMasking';
+import { settingsSecretWouldFollowNewOrigin } from '../services/credentialOriginBinding';
+import { isMaskedIntegrationSecret } from '../services/notificationChannelSecrets';
 import { syncBillingContactRow, syncSiteContactRow } from '../services/contacts/compat';
 import { escapeLike } from '../utils/sql';
 import { PG_UUID_REGEX } from '../utils/uuid';
@@ -88,7 +100,11 @@ import { registerOrgBillingProfileRoutes } from './orgBillingProfile';
 import { registerOrgAuditRetentionSettingsRoutes } from './orgAuditRetentionSettings';
 import { TOPOLOGY_FLAG_KEYS } from '../services/topology/flags';
 import { toolRateLimitMultiplierSchema } from '../services/aiToolRateLimits';
+import { isHoldingOrg } from '../services/unassignedPool/protectedOrg';
+import { PROTECTED_ORG_ERROR } from '../services/unassignedPool/orgType';
 
+import { notHiddenOrgType, notInHiddenOrgCondition } from '../services/unassignedPool/visibility';
+import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 /**
  * Fold the legacy `security.allowedMfaMethods` input alias into the canonical
  * `security.allowedMethods` and drop the alias key so it is never persisted.
@@ -417,6 +433,28 @@ async function ensureOrgAccess(
 }
 
 
+/**
+ * Resolve an incoming `settings` value (organization, partner or site) against
+ * the stored one before it is sealed and written: masked markers and omitted
+ * secret keys keep the stored secret, and a log-forwarding destination may not
+ * move to a new origin while a stored credential is kept rather than
+ * re-entered. `stored` is undefined on create, where there is nothing to keep.
+ */
+function resolveIncomingSettingsSecrets(
+  incoming: unknown,
+  stored: unknown,
+): { ok: true; settings: unknown } | { ok: false; error: string } {
+  if (settingsSecretWouldFollowNewOrigin(incoming, stored, LOG_FORWARDING_SECRET_DESTINATIONS, isMaskedIntegrationSecret)) {
+    return { ok: false, error: LOG_FORWARDING_ORIGIN_CHANGE_MESSAGE };
+  }
+  try {
+    return { ok: true, settings: restoreMaskedSettingsSecrets(incoming, stored) };
+  } catch (err) {
+    if (err instanceof SettingsSecretInputError) return { ok: false, error: err.message };
+    throw err;
+  }
+}
+
 orgRoutes.use('*', authMiddleware);
 
 // GET / - List organizations accessible to the current user
@@ -425,7 +463,7 @@ orgRoutes.get('/', requireScope('organization', 'partner', 'system'), requireOrg
 
   // The per-partner 'quick_support' org stays inside accessibleOrgIds so RLS
   // lets a tech reach their own support session — it must never be enumerated.
-  const conditions = [isNull(organizations.deletedAt), ne(organizations.type, 'quick_support')];
+  const conditions = [isNull(organizations.deletedAt), notHiddenOrgType()];
 
   if (auth.scope === 'organization' && auth.orgId) {
     conditions.push(eq(organizations.id, auth.orgId));
@@ -444,7 +482,7 @@ orgRoutes.get('/', requireScope('organization', 'partner', 'system'), requireOrg
     .where(and(...conditions))
     .orderBy(organizations.name);
 
-  return c.json({ data });
+  return c.json({ data: data.map(withMaskedSettings) });
 });
 
 // --- Partners (system admins) ---
@@ -529,7 +567,7 @@ orgRoutes.get('/partners', requireScope('system'), requireOrgRead, zValidator('q
     .orderBy(partners.createdAt, partners.id);
 
   return c.json({
-    data,
+    data: data.map(withMaskedSettings),
     pagination: { page, limit, total: Number(count) }
   });
 });
@@ -547,6 +585,10 @@ orgRoutes.post('/partners', requireScope('system'), requireOrgWrite, requireMfa(
   // otherwise it mints `{}`-settings partners that the inbound readers' legacy
   // absent-means-enabled fallback treats as opted IN (the #3608 regression).
   data.settings = applyNewPartnerDefaultSettings(data.settings);
+  const createSecrets = resolveIncomingSettingsSecrets(data.settings, undefined);
+  if (!createSecrets.ok) {
+    return c.json({ error: createSecrets.error }, 400);
+  }
 
   const clash = await db
     .select({ id: partners.id })
@@ -568,7 +610,7 @@ orgRoutes.post('/partners', requireScope('system'), requireOrgWrite, requireMfa(
         slug: data.slug,
         type: data.type,
         maxOrganizations: data.maxOrganizations,
-        settings: data.settings,
+        settings: encryptColumnValueForWrite('partners', 'settings', createSecrets.settings),
         billingEmail: data.billingEmail
       })
       .returning(partnerPublicColumns());
@@ -597,7 +639,7 @@ orgRoutes.post('/partners', requireScope('system'), requireOrgWrite, requireMfa(
     }
   });
 
-  return c.json(partner, 201);
+  return c.json(withMaskedSettings(partner), 201);
 });
 
 // --- Partner Self-Service (partner-scoped users) ---
@@ -638,6 +680,19 @@ const supportedLocales = SUPPORTED_LOCALES;
  * The helpers used to live here; they moved to the shared package (#3430) so
  * the web form and the billing-settings schema enforce the identical rule.
  */
+
+/**
+ * The partner settings editor echoes a saved notification destination back as
+ * the masked marker ("keep the stored value" — settingsSecretMasking.ts; a
+ * list entry carries a key naming the stored entry, `********:<key>`), which
+ * the URL validator would otherwise reject. Accept the marker alongside a
+ * valid URL; a typed replacement is still validated.
+ */
+const maskedSettingsSecretMarker = z.string().regex(/^\*+(?::[0-9a-f]+)?$/);
+
+function keptSecretOrHttpUrl(label: string) {
+  return z.union([maskedSettingsSecretMarker, httpUrlValue(label)]);
+}
 
 export const mlSettingsSchema = z.object({
   anomalies: z.object({
@@ -719,9 +774,12 @@ const partnerSettingsSchema = z.object({
     smtpUsername: z.string().optional(),
     smtpEncryption: z.enum(['tls', 'ssl', 'none']).optional(),
     // Server dials this outbound; `file://`/internal targets are SSRF.
-    slackWebhookUrl: httpUrlField('Slack webhook URL'),
+    // Stored sealed and returned masked; the marker keeps the stored value.
+    slackWebhookUrl: keptSecretOrHttpUrl('Slack webhook URL').optional(),
     slackChannel: z.string().optional(),
-    webhooks: z.array(httpUrlValue('Webhook URL')).optional(),
+    // Each saved entry comes back as a keyed marker; sending it keeps that
+    // entry, leaving it out removes it, and a typed URL is added.
+    webhooks: z.array(keptSecretOrHttpUrl('Webhook URL')).optional(),
     preferences: z.record(z.string(), z.record(z.string(), z.boolean())).optional(),
     pushoverAppToken: z.string().max(30).optional(),
     pushoverDefaultUser: z.string().max(30).optional(),
@@ -933,7 +991,7 @@ orgRoutes.get('/partners/me', requireScope('partner'), requirePartner, requireOr
     return c.json({ error: 'Partner not found' }, 404);
   }
 
-  return c.json(partner);
+  return c.json(withMaskedSettings(partner));
 });
 
 orgRoutes.get('/partners/me/ip-allowlist/status', requireScope('partner'), requirePartner, requireOrgRead, async (c) => {
@@ -1001,6 +1059,13 @@ orgRoutes.patch(
 
   // Merge settings (top-level shallow merge, except `security` and `ticketing` below)
   const currentSettings = (current.settings as Record<string, unknown>) || {};
+  if (body.settings) {
+    const resolvedSecrets = resolveIncomingSettingsSecrets(body.settings, currentSettings);
+    if (!resolvedSecrets.ok) {
+      return c.json({ error: resolvedSecrets.error }, 400);
+    }
+    body.settings = resolvedSecrets.settings as typeof body.settings;
+  }
   const newSettings: Record<string, unknown> = body.settings
     ? { ...currentSettings, ...body.settings }
     : { ...currentSettings };
@@ -1254,9 +1319,9 @@ orgRoutes.patch(
   });
 
   if (emailTemplateWarnings.length > 0) {
-    return c.json({ ...partner, warnings: emailTemplateWarnings });
+    return c.json({ ...withMaskedSettings(partner), warnings: emailTemplateWarnings });
   }
-  return c.json(partner);
+  return c.json(withMaskedSettings(partner));
 });
 
 // --- Individual partner management (system-scoped) ---
@@ -1274,7 +1339,7 @@ orgRoutes.get('/partners/:id', requireScope('system'), requireOrgRead, async (c)
     return c.json({ error: 'Partner not found' }, 404);
   }
 
-  return c.json(partner);
+  return c.json(withMaskedSettings(partner));
 });
 
 orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requireMfa(), zValidator('json', updatePartnerSchema), async (c) => {
@@ -1322,6 +1387,11 @@ orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requir
         .from(partners)
         .where(and(eq(partners.id, id), isNull(partners.deletedAt)))
         .limit(1);
+      const resolvedSecrets = resolveIncomingSettingsSecrets(updates.settings, currentPartner?.settings);
+      if (!resolvedSecrets.ok) {
+        return c.json({ error: resolvedSecrets.error }, 400);
+      }
+      updates.settings = resolvedSecrets.settings;
       if (currentPartner) {
         updates.settings = preserveIpAllowlistOnOmit(
           currentPartner.settings,
@@ -1431,7 +1501,7 @@ orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requir
     }
   });
 
-  return c.json(partner);
+  return c.json(withMaskedSettings(partner));
 });
 
 orgRoutes.delete('/partners/:id', requireScope('system'), requireOrgWrite, requireMfa(), async (c) => {
@@ -1602,7 +1672,7 @@ orgRoutes.get('/organizations', requireScope('organization', 'partner', 'system'
   // The hidden 'quick_support' org is inside accessibleOrgIds by design (RLS),
   // so it has to be excluded from the paginated list — one shared `conditions`
   // covers both the count and the row query below.
-  const notQuickSupport = ne(organizations.type, 'quick_support');
+  const notQuickSupport = notHiddenOrgType();
   let conditions;
   // A partner whose only orgs are archived reaches zero accessible ids. That
   // used to short-circuit the whole handler, which would have made
@@ -1754,7 +1824,7 @@ orgRoutes.get('/organizations', requireScope('organization', 'partner', 'system'
     : null;
 
   return c.json({
-    data: [...liveRows, ...(archived?.orgs ?? [])],
+    data: [...liveRows, ...(archived?.orgs ?? [])].map(withMaskedSettings),
     pagination: { page, limit, total: Number(count) },
     // Present only on the page that actually carries the archived block, so it
     // is never a claim about a page that didn't look. Archived orgs are capped
@@ -1849,11 +1919,38 @@ orgRoutes.patch(
   },
 );
 
+/** Thrown inside the create-organization transaction to roll back an insert
+ *  that a concurrent create pushed past `partner.maxOrganizations` — mirrors
+ *  the identically-named class in `routes/partnerApi/provisioning.ts`. */
+class OrgQuotaExceededError extends Error {
+  constructor(readonly cap: number) {
+    super('partner organization quota exceeded');
+    this.name = 'OrgQuotaExceededError';
+  }
+}
+
+/** Same tally `routes/partnerApi/provisioning.ts` uses for the same cap. */
+async function countPartnerOrganizations(partnerId: string): Promise<number> {
+  const [tally] = await db
+    .select({ value: sql<number>`count(*)::int` })
+    .from(organizations)
+    .where(and(
+      eq(organizations.partnerId, partnerId),
+      isNull(organizations.deletedAt),
+      notHiddenOrgType(),
+    ));
+  return tally?.value ?? 0;
+}
+
 orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWrite, requireMfa(), zValidator('json', createOrganizationSchema), async (c) => {
   const auth = c.get('auth');
   const data = c.req.valid('json');
   // M8: canonicalize the MFA allowed-methods alias on CREATE (see /partners).
   data.settings = foldAllowedMfaMethodsAlias(data.settings);
+  const createSecrets = resolveIncomingSettingsSecrets(data.settings, undefined);
+  if (!createSecrets.ok) {
+    return c.json({ error: createSecrets.error }, 400);
+  }
 
   let targetPartnerId: string | null = null;
 
@@ -1873,12 +1970,27 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
   }
 
   const [partnerRow] = await db
-    .select({ currencyCode: partners.currencyCode })
+    .select({ currencyCode: partners.currencyCode, maxOrganizations: partners.maxOrganizations })
     .from(partners)
     .where(and(eq(partners.id, targetPartnerId), isNull(partners.deletedAt)))
     .limit(1);
   if (!partnerRow) {
     return c.json({ error: 'Partner not found' }, 404);
+  }
+
+  // Same cap `POST /partner-api/organizations` already enforces
+  // (partners.maxOrganizations, NULL = unlimited) — this human-facing route
+  // had no quota at all, so a partner (or an org member with org-access-all
+  // creating orgs) had no ceiling on how many orgs — and therefore how many
+  // event-WS Redis subscriptions and how much other per-org fan-out — a
+  // single partner could accumulate. Fast-path pre-check only; racy by
+  // construction like the slug check just below, and backed the same way —
+  // see the post-insert recount inside `insertOrganization()`.
+  if (partnerRow.maxOrganizations != null) {
+    const orgCount = await countPartnerOrganizations(targetPartnerId);
+    if (orgCount >= partnerRow.maxOrganizations) {
+      return c.json({ error: 'Organization quota reached for this partner' }, 409);
+    }
   }
 
   // #3967 — refuse a duplicate slug with a 409 before inserting. Backed by the
@@ -1897,7 +2009,11 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
     status: data.status,
     // The lifecycle engine owns some keys in this blob (prior status, purge
     // warning markers, the purge-retry counter). Never let a client seed them.
-    settings: stripOrgLifecycleInternalSettings(data.settings),
+    settings: encryptColumnValueForWrite(
+      'organizations',
+      'settings',
+      stripOrgLifecycleInternalSettings(createSecrets.settings)
+    ),
     contractStart: data.contractStart ? new Date(data.contractStart) : null,
     contractEnd: data.contractEnd ? new Date(data.contractEnd) : null,
     billingContact: data.billingContact
@@ -1918,10 +2034,24 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
       // for the same reason the insert above needs one: the new org's id is not
       // in the caller's accessible_org_ids yet, so breeze_has_org_access(org_id)
       // would reject the contacts INSERT exactly as it rejects the organizations
-      // one. The blob itself is already persisted by the insert, so this only
-      // mirrors the row.
+      // one. The insert wrote the request's blob; the sync files it as the
+      // org's billing contact and re-projects the column from that contact,
+      // and the response carries what was actually stored.
       if (created[0] && data.billingContact) {
-        await syncBillingContactRow(db, created[0].id, data.billingContact, auth.user?.id ?? null);
+        created[0].billingContact = await syncBillingContactRow(db, created[0].id, data.billingContact, auth.user?.id ?? null);
+      }
+      // Race-free quota enforcement, same trick `POST /partner-api/organizations`
+      // uses: the insert's own AFTER trigger takes the partner discovery lock
+      // EXCLUSIVE, so a concurrent same-partner org insert serializes on it
+      // until COMMIT — by the time a second transaction's insert returns, the
+      // first one's row is already visible to this READ COMMITTED recount.
+      // Over the cap after the real insert -> throw, which rolls this whole
+      // transaction (including the insert we just made) back.
+      if (created[0] && partnerRow.maxOrganizations != null) {
+        const recount = await countPartnerOrganizations(insertValues.partnerId);
+        if (recount > partnerRow.maxOrganizations) {
+          throw new OrgQuotaExceededError(partnerRow.maxOrganizations);
+        }
       }
       return created;
     })
@@ -1934,6 +2064,10 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
   try {
     [organization] = await insertOrganization();
   } catch (error) {
+    if (error instanceof OrgQuotaExceededError) {
+      // The transaction (including the over-cap insert) has already rolled back.
+      return c.json({ error: 'Organization quota reached for this partner' }, 409);
+    }
     if (isPgUniqueViolation(error, ORG_SLUG_UNIQUE_INDEX)) {
       // Only reachable when a concurrent write claimed the slug between the
       // pre-check and this statement. Logged because a spike here means the
@@ -1954,7 +2088,7 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
     details: { partnerId: organization?.partnerId, status: organization?.status, type: organization?.type }
   });
 
-  return c.json(organization, 201);
+  return c.json(withMaskedSettings(organization), 201);
 });
 
 // --- Bulk org/site import (#3242) ---
@@ -2054,7 +2188,7 @@ orgRoutes.get('/organizations/:id', requireScope('partner', 'system'), requireOr
     const archived = archivedScope
       ? await loadArchivedOrg({ orgId: id, scope: archivedScope })
       : null;
-    if (archived) return c.json(archived);
+    if (archived) return c.json(withMaskedSettings(archived));
     return c.json({ error: 'Organization not found' }, 404);
   }
 
@@ -2092,10 +2226,10 @@ orgRoutes.get('/organizations/:id', requireScope('partner', 'system'), requireOr
   const partnerDefaultInvoiceTermsDays = partnerRow?.invoiceTermsDays ?? null;
 
   if (isArchiveLifecycleRow(organization)) {
-    return c.json({ ...organization, archived: true as const, partnerDefaultTaxRate, partnerDefaultInvoiceTermsDays });
+    return c.json({ ...withMaskedSettings(organization), archived: true as const, partnerDefaultTaxRate, partnerDefaultInvoiceTermsDays });
   }
 
-  return c.json({ ...organization, partnerDefaultTaxRate, partnerDefaultInvoiceTermsDays });
+  return c.json({ ...withMaskedSettings(organization), partnerDefaultTaxRate, partnerDefaultInvoiceTermsDays });
 });
 
 orgRoutes.get('/organizations/:id/effective-settings',
@@ -2119,7 +2253,7 @@ orgRoutes.get('/organizations/:id/effective-settings',
     // { minutes, source, inheritedMinutes, inheritedSource } for the org UI's
     // "Inherit (…)" label.
     const aiApprovalTimeout = await getAiApprovalTimeout(id);
-    return c.json({ ...result, aiApprovalTimeout });
+    return c.json({ ...result, effective: maskSettingsSecrets(result.effective), aiApprovalTimeout });
   }
 );
 
@@ -2289,6 +2423,11 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
     }
   }
 
+  // The unassigned-device holding org is managed by Breeze.
+  if (await isHoldingOrg(id)) {
+    return c.json(PROTECTED_ORG_ERROR, 409);
+  }
+
   if (data.settings !== undefined) {
     await lockMfaPolicySettings({ kind: 'organization', id });
   }
@@ -2436,28 +2575,46 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
     const count = await countMfaPolicyLockouts({ kind: 'organization', id }, data.settings);
     if (count) return c.json(mfaPolicyLockoutResponse(count), 409);
 
-    // This write replaces `settings` WHOLESALE, so a client payload naming a
-    // lifecycle-internal key would become that key's stored value. Strip them
-    // first: a preseeded `purgingRecoveryAttempts` would neuter the purge-retry
-    // ceiling, and a preseeded `archivePriorStatus`/`mergePriorStatus` would
-    // choose what a later restore/unfence reactivates the tenant AS.
+    // This write replaces `settings` WHOLESALE, and the settings editor
+    // re-posts the whole blob as it was read — secrets included, as the
+    // masked marker. Resolve those against the stored settings so the write
+    // keeps them, and refuse a log-forwarding destination moved to a new
+    // origin while a stored credential would follow it instead of being
+    // re-entered (same contract as credentialOriginBinding.ts).
+    const [currentOrg] = await db
+      .select({ settings: organizations.settings })
+      .from(organizations)
+      .where(eq(organizations.id, id))
+      .limit(1);
+    const resolvedSecrets = resolveIncomingSettingsSecrets(data.settings, currentOrg?.settings);
+    if (!resolvedSecrets.ok) {
+      return c.json({ error: resolvedSecrets.error }, 400);
+    }
+
+    // A client payload naming a lifecycle-internal key would become that
+    // key's stored value. Strip them first: a preseeded
+    // `purgingRecoveryAttempts` would neuter the purge-retry ceiling, and a
+    // preseeded `archivePriorStatus`/`mergePriorStatus` would choose what a
+    // later restore/unfence reactivates the tenant AS.
     // Encrypt secret-bearing fields (e.g. logForwarding.elasticsearchApiKey)
     // before writing organizations.settings. See encryptedColumnRegistry.
     updates.settings = encryptColumnValueForWrite(
       'organizations',
       'settings',
-      stripOrgLifecycleInternalSettings(data.settings)
+      stripOrgLifecycleInternalSettings(resolvedSecrets.settings)
     );
   }
-  // The blob write stays in THIS update rather than going through
-  // replaceBillingContact: the #2879 override path below re-asserts
-  // partner-ownership and suspended-status in the UPDATE's own WHERE, and the
-  // compat writer targets a bare eq(id, orgId), which would let a billing
-  // contact land on an org that stopped qualifying between check and write.
-  // The `contacts` row is mirrored by syncBillingContactRow once the guarded
-  // update has succeeded — exactly the "caller already wrote the blob" case
-  // that entry point exists for.
-  if (data.billingContact !== undefined) updates.billingContact = data.billingContact;
+  // `billingContact` is deliberately NOT in this UPDATE. It is written by
+  // syncBillingContactRow in runUpdate below, only after this guarded UPDATE
+  // (the #2879 override path re-asserts partner-ownership and suspended-status
+  // in its own WHERE) has matched and so holds the org row lock. The sync edits
+  // the BILLING contact — the org-level contact holding the `billing` role,
+  // never the primary — and re-projects the column from it. Writing the
+  // request's value here first would also break that contact's selection:
+  // with several billing contacts, the "current recipient" tiebreak reads this
+  // column, and would compare against the new address instead of the old one.
+  // `updates` always carries `updatedAt`, so a billingContact-only PATCH still
+  // runs (and locks) the guarded UPDATE.
   if (data.contractStart !== undefined) {
     updates.contractStart = data.contractStart ? new Date(data.contractStart) : null;
   }
@@ -2504,7 +2661,8 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
     // cannot see a suspended org — and `contacts` is policed by
     // breeze_has_org_access(org_id), so it could not see the row either.
     if (rows[0] && data.billingContact !== undefined) {
-      await syncBillingContactRow(db, rows[0].id, data.billingContact, auth.user?.id ?? null);
+      // Answer with the re-projected column, not the pre-sync RETURNING row.
+      rows[0].billingContact = await syncBillingContactRow(db, rows[0].id, data.billingContact, auth.user?.id ?? null);
     }
     return rows;
   };
@@ -2621,7 +2779,7 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
     }
   });
 
-  return c.json(organization);
+  return c.json(withMaskedSettings(organization));
 }] as const;
 
 orgRoutes.patch('/organizations/:id', ...updateOrgHandler);
@@ -2645,6 +2803,11 @@ orgRoutes.delete('/organizations/:id', requireScope('partner', 'system'), requir
 
   if (auth.scope === 'partner' && !auth.canAccessOrg(id)) {
     return c.json({ error: 'Organization not found' }, 404);
+  }
+
+  // The unassigned-device holding org is managed by Breeze.
+  if (await isHoldingOrg(id)) {
+    return c.json(PROTECTED_ORG_ERROR, 409);
   }
 
   const conditions = and(eq(organizations.id, id), isNull(organizations.deletedAt));
@@ -2746,10 +2909,7 @@ orgRoutes.get('/sites', requireScope('organization', 'partner', 'system'), requi
   // picker. Written as raw SQL rather than `notInArray(sites.orgId, db.select(…))`
   // deliberately: the builder form issues a second `db.select()` chain, which
   // the route tests' queue-based db mock would consume as if it were a real query.
-  const notQuickSupportSite = sql`NOT EXISTS (
-    SELECT 1 FROM ${organizations} qs_org
-    WHERE qs_org.id = ${sites.orgId} AND qs_org.type = 'quick_support'
-  )`;
+  const notQuickSupportSite = notInHiddenOrgCondition(sites.orgId);
   const whereCondition = allowedSiteIds
     ? and(baseCondition, notQuickSupportSite, inArray(sites.id, allowedSiteIds))
     : and(baseCondition, notQuickSupportSite);
@@ -2787,7 +2947,7 @@ orgRoutes.get('/sites', requireScope('organization', 'partner', 'system'), requi
       // them here made the Sites table disagree with the tab beside it.
       .where(and(
         inArray(devices.siteId, siteIds),
-        eq(devices.isEphemeral, false),
+        eq(devices.isEphemeral, false), notParkedDeviceCondition(),
         ne(devices.status, 'decommissioned'),
       ))
       .groupBy(devices.siteId);
@@ -2797,7 +2957,7 @@ orgRoutes.get('/sites', requireScope('organization', 'partner', 'system'), requi
   }
 
   const dataWithCounts = data.map((site) => ({
-    ...site,
+    ...withMaskedSettings(site),
     deviceCount: deviceCountBySite.get(site.id) ?? 0
   }));
 
@@ -2863,6 +3023,16 @@ orgRoutes.post('/sites', requireScope('organization', 'partner', 'system'), requ
     return c.json({ error: 'Access to this organization denied' }, 403);
   }
 
+  // The unassigned-device holding org is managed by Breeze.
+  if (await isHoldingOrg(data.orgId)) {
+    return c.json(PROTECTED_ORG_ERROR, 409);
+  }
+
+  const createSecrets = resolveIncomingSettingsSecrets(data.settings, undefined);
+  if (!createSecrets.ok) {
+    return c.json({ error: createSecrets.error }, 400);
+  }
+
   const [site] = await db
     .insert(sites)
     .values({
@@ -2871,7 +3041,7 @@ orgRoutes.post('/sites', requireScope('organization', 'partner', 'system'), requ
       address: data.address,
       timezone: data.timezone,
       contact: data.contact,
-      settings: data.settings
+      settings: encryptColumnValueForWrite('sites', 'settings', createSecrets.settings)
     })
     .returning();
 
@@ -2890,7 +3060,7 @@ orgRoutes.post('/sites', requireScope('organization', 'partner', 'system'), requ
     resourceName: site?.name
   });
 
-  return c.json(site, 201);
+  return c.json(withMaskedSettings(site), 201);
 });
 
 orgRoutes.get('/sites/:id', requireScope('organization', 'partner', 'system'), requireSiteRead, async (c) => {
@@ -2917,7 +3087,7 @@ orgRoutes.get('/sites/:id', requireScope('organization', 'partner', 'system'), r
     return c.json({ error: 'Access to this site denied' }, 403);
   }
 
-  return c.json(site);
+  return c.json(withMaskedSettings(site));
 });
 
 orgRoutes.patch('/sites/:id', requireScope('organization', 'partner', 'system'), requireSiteWrite, requireMfa(), zValidator('json', updateSiteSchema), async (c) => {
@@ -2944,6 +3114,11 @@ orgRoutes.patch('/sites/:id', requireScope('organization', 'partner', 'system'),
     return c.json({ error: 'Access to this site denied' }, 403);
   }
 
+  // The unassigned-device holding org is managed by Breeze.
+  if (await isHoldingOrg(site.orgId)) {
+    return c.json(PROTECTED_ORG_ERROR, 409);
+  }
+
   const permissions = c.get('permissions') as UserPermissions | undefined;
   if (permissions?.allowedSiteIds && !canAccessSite(permissions, site.id)) {
     return c.json({ error: 'Access to this site denied' }, 403);
@@ -2953,7 +3128,11 @@ orgRoutes.patch('/sites/:id', requireScope('organization', 'partner', 'system'),
   // matches the registry walker so UI edits don't regress to plaintext.
   const writeData: Record<string, unknown> = { ...data, updatedAt: new Date() };
   if (writeData.settings !== undefined) {
-    writeData.settings = encryptColumnValueForWrite('sites', 'settings', writeData.settings);
+    const resolvedSecrets = resolveIncomingSettingsSecrets(writeData.settings, site.settings);
+    if (!resolvedSecrets.ok) {
+      return c.json({ error: resolvedSecrets.error }, 400);
+    }
+    writeData.settings = encryptColumnValueForWrite('sites', 'settings', resolvedSecrets.settings);
   }
 
   const [updated] = await db
@@ -2986,7 +3165,7 @@ orgRoutes.patch('/sites/:id', requireScope('organization', 'partner', 'system'),
     details: { changedFields: Object.keys(data) }
   });
 
-  return c.json(updated);
+  return c.json(withMaskedSettings(updated));
 });
 
 orgRoutes.delete('/sites/:id', requireScope('organization', 'partner', 'system'), requireSiteWrite, requireMfa(), async (c) => {
@@ -3008,19 +3187,47 @@ orgRoutes.delete('/sites/:id', requireScope('organization', 'partner', 'system')
     return c.json({ error: 'Access to this site denied' }, 403);
   }
 
+  // The unassigned-device holding org is managed by Breeze.
+  if (await isHoldingOrg(site.orgId)) {
+    return c.json(PROTECTED_ORG_ERROR, 409);
+  }
+
   const permissions = c.get('permissions') as UserPermissions | undefined;
   if (permissions?.allowedSiteIds && !canAccessSite(permissions, site.id)) {
     return c.json({ error: 'Access to this site denied' }, 403);
   }
 
-  await db.delete(sites).where(eq(sites.id, id));
+  // The site's topology domain cascades with it, but two kinds of row point at
+  // it through NO ACTION FKs and must go first, under the site row lock, in ONE
+  // transaction — otherwise the delete aborts with 23503:
+  //  - the topology policy alerts it OWNS (M3-D6, PR #7117 T3) and their
+  //    NO ACTION children;
+  //  - its topology investigation sessions (M4-D2, #6000), pinned to it by
+  //    ai_sessions.topology_site_id, children first.
+  // Both counts land on the audit row.
+  const removed = await db.transaction(async (tx) => {
+    if (!(await lockSiteForDelete(tx, site.id))) return null;
+    const removedTopologyAlerts = await deleteSiteOwnedTopologyAlerts(tx, site.orgId, site.id);
+    const topologyAiSessions = await deleteSiteTopologyAiSessions(tx, { orgId: site.orgId, siteId: site.id });
+    await tx.delete(sites).where(eq(sites.id, id));
+    return { removedTopologyAlerts, topologyAiSessions };
+  });
+  if (removed === null) {
+    return c.json({ error: 'Site not found' }, 404);
+  }
+  const { removedTopologyAlerts, topologyAiSessions } = removed;
+  const siteDeleteDetails = {
+    ...(removedTopologyAlerts > 0 ? { removedTopologyAlerts } : {}),
+    ...(topologyAiSessions.investigations > 0 ? { topologyInvestigationsDeleted: topologyAiSessions } : {}),
+  };
 
   writeRouteAudit(c, {
     orgId: site.orgId,
     action: 'site.delete',
     resourceType: 'site',
     resourceId: site.id,
-    resourceName: site.name
+    resourceName: site.name,
+    ...(Object.keys(siteDeleteDetails).length > 0 ? { details: siteDeleteDetails } : {}),
   });
 
   return c.json({ success: true });

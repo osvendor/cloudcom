@@ -84,6 +84,7 @@ export type BulkPurgeSkipCode =
   | 'UNINSTALL_PENDING'
   | 'SITE_ACCESS_DENIED'
   | 'STATE_CHANGED'
+  | 'BACKUP_PROTECTED'
   | 'AUTHORIZATION_CONTEXT_INVALID'
   | 'ORG_CHANGED'
   | 'ERROR';
@@ -146,6 +147,8 @@ interface PurgeOneOutcome {
   /** From `PurgeResult` — read under the lock. Null when nothing was purged. */
   linkGroupId: string | null;
   linkGroupDissolved: boolean;
+  /** From `PurgeResult`; 0 when nothing was purged. */
+  removedTopologyAlerts?: number;
 }
 
 /**
@@ -188,6 +191,7 @@ async function purgeOne(
             code: null,
             linkGroupId: purged.linkGroupId,
             linkGroupDissolved: purged.linkGroupDissolved,
+            removedTopologyAlerts: purged.removedTopologyAlerts,
           };
         });
       } catch (err) {
@@ -275,6 +279,7 @@ export async function processDeviceBulkPurgeJob(
                   linkGroupDissolved: outcome.linkGroupDissolved,
                 }
               : {}),
+            ...(outcome.removedTopologyAlerts ? { removedTopologyAlerts: outcome.removedTopologyAlerts } : {}),
           },
           result: 'success',
         });

@@ -28,6 +28,7 @@
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import type { FleetDesignDrift, FleetDesignOutcome, FleetDesignReportSummary } from '@breeze/shared';
 import { db } from '../../db';
+import { dateFromSqlValue } from '../portal/sqlTimestamp';
 import { deviceGroupMemberships, fleetDesignAppliedItems, reportRuns } from '../../db/schema';
 
 export interface ApprovedDesignWatch { watchType: string; name: string; enabled: boolean }
@@ -93,7 +94,7 @@ export function uuidArray(ids: readonly string[]) {
 const RETIRED_REF = /^retired:(\d+)$/;
 
 function iso(value: Date | string): string {
-  return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
+  return value instanceof Date ? value.toISOString() : dateFromSqlValue(value).toISOString();
 }
 
 /**
@@ -238,19 +239,8 @@ export async function loadDriftLiveState(orgId: string, approved: ApprovedDesign
   const policyRows = [...policies];
   const policyIds = policyRows.map((p) => p.id);
 
-  const watches = policyIds.length === 0 ? [] : [...await db.execute<LiveWatchRow>(sql`
-    SELECT fl.config_policy_id AS policy_id, w.name, w.watch_type::text AS watch_type, w.enabled
-    FROM config_policy_monitoring_watches w
-    JOIN config_policy_monitoring_settings ms ON ms.id = w.settings_id
-    JOIN config_policy_feature_links fl ON fl.id = ms.feature_link_id AND fl.config_policy_id = ANY(${uuidArray(policyIds)})
-    WHERE w.retired_at IS NULL
-  `)];
-  const rules = policyIds.length === 0 ? [] : [...await db.execute<LiveRuleRow>(sql`
-    SELECT fl.config_policy_id AS policy_id, r.name, r.severity::text AS severity, r.cooldown_minutes
-    FROM config_policy_alert_rules r
-    JOIN config_policy_feature_links fl ON fl.id = r.feature_link_id AND fl.config_policy_id = ANY(${uuidArray(policyIds)})
-    WHERE r.retired_at IS NULL
-  `)];
+  const watches: LiveWatchRow[] = [];
+  const rules: LiveRuleRow[] = [];
   // W05c2 (#6371): Fleet Design now applies watches and rules as monitor
   // attachments. Classify each attached definition by the LEDGER item kind
   // that created it (a service definition can come from a rule proposal);

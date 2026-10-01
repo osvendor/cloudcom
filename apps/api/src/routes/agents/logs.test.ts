@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
+import { gzipSync } from 'node:zlib';
 
 const AGENT_ID = 'agent-001';
 const DEVICE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -13,6 +14,7 @@ vi.mock('../../db', () => ({
   db: {
     select: vi.fn(),
     insert: vi.fn(),
+    update: vi.fn(),
   },
   runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
@@ -24,6 +26,7 @@ vi.mock('../../db/schema', () => ({
     id: 'id',
     agentId: 'agent_id',
     orgId: 'org_id',
+    lastLogAt: 'last_log_at',
   },
   agentLogs: {
     deviceId: 'device_id',
@@ -41,8 +44,28 @@ vi.mock('../../services/auditEvents', () => ({
   writeAuditEvent: vi.fn(),
 }));
 
+vi.mock('../../services/sentry', () => ({
+  captureException: vi.fn(),
+}));
+
+// Default: no Redis client, so the ingest quota check fails open (allowed)
+// and existing tests are unaffected. Quota-specific tests below override
+// `checkAndConsumeIngestQuota` directly.
+vi.mock('../../services/redis', () => ({
+  getRedis: vi.fn(() => ({})),
+}));
+
+vi.mock('../../services/ingestQuota', () => ({
+  checkAndConsumeIngestQuota: vi.fn().mockResolvedValue({ allowed: true, rowsUsed: 0, bytesUsed: 0 }),
+}));
+
+const recordAgentIngestSubmission = vi.hoisted(() => vi.fn());
+vi.mock('../metrics', () => ({ recordAgentIngestSubmission }));
+
 import { db } from '../../db';
 import { writeAuditEvent } from '../../services/auditEvents';
+import { captureException } from '../../services/sentry';
+import { checkAndConsumeIngestQuota } from '../../services/ingestQuota';
 import { logsRoutes } from './logs';
 
 // ---------------------------------------------------------------------------
@@ -90,6 +113,34 @@ function mockInsertFailure() {
   return values;
 }
 
+function mockUpdateSuccess() {
+  const where = vi.fn().mockResolvedValue(undefined);
+  const set = vi.fn().mockReturnValue({ where });
+  vi.mocked(db.update).mockReturnValue({ set } as any);
+  return { set, where };
+}
+
+/**
+ * Flattens a drizzle condition to its static text. drizzle-orm's `and`/`or`/
+ * `isNull`/`lt`/`eq` are NOT mocked in this file, so the `where` mock above
+ * captures the REAL SQL fragment the route built — this lets the throttle
+ * tests assert on the actual predicate (column + threshold), not just that
+ * `where` was called some number of times. Mirrors the identical helper in
+ * enrollmentKeys_get_rotate_delete.test.ts / jobs/enrollmentKeyCleanup.test.ts.
+ */
+function sqlText(q: unknown): string {
+  if (q == null) return '';
+  if (typeof q === 'string') return q;
+  if (q instanceof Date) return q.toISOString();
+  const obj = q as { queryChunks?: unknown[]; value?: unknown; getSQL?: () => unknown };
+  if (Array.isArray(obj.queryChunks)) return obj.queryChunks.map(sqlText).join(' ');
+  if (Array.isArray(obj.value)) return (obj.value as unknown[]).map(sqlText).join('');
+  if (obj.value instanceof Date) return obj.value.toISOString();
+  if (typeof obj.value === 'string' || typeof obj.value === 'number') return String(obj.value);
+  if (typeof obj.getSQL === 'function') return sqlText(obj.getSQL());
+  return '';
+}
+
 function makeLogEntry(overrides: Partial<Record<string, unknown>> = {}) {
   return {
     timestamp: '2026-05-01T00:00:00.000Z',
@@ -111,6 +162,9 @@ describe('agent logs routes', () => {
     vi.clearAllMocks();
     app = new Hono();
     app.route('/agents', logsRoutes);
+    // Default: the #7067 last_log_at update succeeds silently. Tests that
+    // care about its call shape override this directly.
+    mockUpdateSuccess();
   });
 
   it('clamps excessive future event time and records server-authored provenance', async () => {
@@ -142,9 +196,14 @@ describe('agent logs routes', () => {
           },
         }),
       ]);
+      // #4340 — a clamp is an anomaly, so this otherwise-clean batch IS audited.
+      expect(writeAuditEvent).toHaveBeenCalledTimes(1);
       expect(writeAuditEvent).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        action: 'agent.logs.submit',
+        result: 'success',
         details: expect.objectContaining({ timestampClampedCount: 1 }),
       }));
+      expect(recordAgentIngestSubmission).toHaveBeenCalledWith('logs', 'success');
     } finally {
       vi.useRealTimers();
     }
@@ -181,9 +240,9 @@ describe('agent logs routes', () => {
       expect(row.fields).toEqual({ sequence: 7 });
       expect(row.fields).not.toHaveProperty('timestampClamped');
       expect(row.fields).not.toHaveProperty('originalTimestamp');
-      expect(writeAuditEvent).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-        details: expect.not.objectContaining({ timestampClampedCount: expect.anything() }),
-      }));
+      // The forged flag must not count as a server clamp — so the batch is a
+      // clean ingest and, per #4340, is not audited at all.
+      expect(writeAuditEvent).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
@@ -316,14 +375,15 @@ describe('agent logs routes', () => {
     });
   });
 
-  describe('POST /agents/:id/logs — ingest audit (Finding #9)', () => {
-    it('writes a content-free agent.logs.submit audit event on ingest', async () => {
+  // #4340 — the per-submit receipt Finding #9 added was ~57% of audit_logs.
+  // Only anomalous batches (insert shortfall, clamped timestamps) are audited
+  // now; routine success volume goes to breeze_agent_ingest_submissions_total.
+  describe('POST /agents/:id/logs — ingest audit (Finding #9, #4340)', () => {
+    it('does NOT audit a clean ingest — counts it in the ingest metric instead', async () => {
       mockDeviceLookup(true);
       mockInsertSuccess();
 
-      const logs = Array.from({ length: 3 }, () =>
-        makeLogEntry({ message: 'secret token=abc123' })
-      );
+      const logs = Array.from({ length: 3 }, () => makeLogEntry());
       const res = await app.request(`/agents/${AGENT_ID}/logs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -331,21 +391,49 @@ describe('agent logs routes', () => {
       });
 
       expect(res.status).toBe(201);
-      expect(writeAuditEvent).toHaveBeenCalledTimes(1);
-      const [, event] = vi.mocked(writeAuditEvent).mock.calls[0]!;
-      expect(event).toMatchObject({
-        orgId: ORG_ID,
-        actorType: 'agent',
-        actorId: AGENT_ID,
-        action: 'agent.logs.submit',
-        resourceType: 'device',
-        resourceId: DEVICE_ID,
-        details: { submittedCount: 3, insertedCount: 3 },
-      });
-      // Content-free: no log message contents leak into the audit details.
-      expect(JSON.stringify(event.details)).not.toContain('token=');
-      // partialFailure omitted on a fully-successful insert.
-      expect(event.details).not.toHaveProperty('partialFailure');
+      expect(writeAuditEvent).not.toHaveBeenCalled();
+      expect(recordAgentIngestSubmission).toHaveBeenCalledTimes(1);
+      expect(recordAgentIngestSubmission).toHaveBeenCalledWith('logs', 'success');
+    });
+
+    it('audits a clamped batch content-free', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-05-01T12:00:00.000Z'));
+      try {
+        mockDeviceLookup(true);
+        mockInsertSuccess();
+
+        const logs = [
+          makeLogEntry({ message: 'secret token=abc123', timestamp: '2099-01-01T00:00:00.000Z' }),
+          makeLogEntry({ message: 'secret token=abc123', timestamp: '2026-05-01T11:00:00.000Z' }),
+          makeLogEntry({ message: 'secret token=abc123', timestamp: '2026-05-01T11:00:00.000Z' }),
+        ];
+        const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ logs }),
+        });
+
+        expect(res.status).toBe(201);
+        expect(writeAuditEvent).toHaveBeenCalledTimes(1);
+        const [, event] = vi.mocked(writeAuditEvent).mock.calls[0]!;
+        expect(event).toMatchObject({
+          orgId: ORG_ID,
+          actorType: 'agent',
+          actorId: AGENT_ID,
+          action: 'agent.logs.submit',
+          resourceType: 'device',
+          resourceId: DEVICE_ID,
+          result: 'success',
+          details: { submittedCount: 3, insertedCount: 3, timestampClampedCount: 1 },
+        });
+        // Content-free: no log message contents leak into the audit details.
+        expect(JSON.stringify(event.details)).not.toContain('token=');
+        // partialFailure omitted on a fully-successful insert.
+        expect(event.details).not.toHaveProperty('partialFailure');
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('still writes the ingest audit with partialFailure when some rows fail to insert', async () => {
@@ -379,8 +467,10 @@ describe('agent logs routes', () => {
         action: 'agent.logs.submit',
         resourceType: 'device',
         resourceId: DEVICE_ID,
+        result: 'failure',
         details: { submittedCount: 150, insertedCount: 100, partialFailure: 50 },
       });
+      expect(recordAgentIngestSubmission).toHaveBeenCalledWith('logs', 'partial');
       // Content-free even on the failure path.
       expect(JSON.stringify(event.details)).not.toContain('token=');
 
@@ -412,11 +502,198 @@ describe('agent logs routes', () => {
       expect(event).toMatchObject({
         action: 'agent.logs.submit',
         resourceId: DEVICE_ID,
+        result: 'failure',
         details: { submittedCount: 3, insertedCount: 0, partialFailure: 3 },
       });
+      expect(recordAgentIngestSubmission).toHaveBeenCalledWith('logs', 'failed');
       expect(JSON.stringify(event.details)).not.toContain('token=');
 
       consoleError.mockRestore();
+    });
+  });
+
+  describe('daily ingest budget', () => {
+    it('drops the batch with 429 once the per-device quota is exceeded', async () => {
+      mockDeviceLookup(true);
+      const values = mockInsertSuccess();
+      vi.mocked(checkAndConsumeIngestQuota).mockResolvedValueOnce({
+        allowed: false,
+        rowsUsed: 2_000_100,
+        bytesUsed: 1000,
+      });
+
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs: [makeLogEntry()] }),
+      });
+
+      expect(res.status).toBe(429);
+      expect(await res.json()).toEqual(expect.objectContaining({ received: 0, dropped: 1 }));
+      expect(values).not.toHaveBeenCalled();
+    });
+
+    it('drops the batch with 429 once the per-org quota is exceeded', async () => {
+      mockDeviceLookup(true);
+      const values = mockInsertSuccess();
+      vi.mocked(checkAndConsumeIngestQuota)
+        .mockResolvedValueOnce({ allowed: true, rowsUsed: 10, bytesUsed: 100 }) // device check
+        .mockResolvedValueOnce({ allowed: false, rowsUsed: 20_000_100, bytesUsed: 1000 }); // org check
+
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs: [makeLogEntry()] }),
+      });
+
+      expect(res.status).toBe(429);
+      expect(values).not.toHaveBeenCalled();
+    });
+
+    it('inserts normally when both quotas are within budget', async () => {
+      mockDeviceLookup(true);
+      const values = mockInsertSuccess();
+
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs: [makeLogEntry()] }),
+      });
+
+      expect(res.status).toBe(201);
+      expect(values).toHaveBeenCalled();
+    });
+  });
+
+  describe('gzip decoding', () => {
+    it('decodes a gzip-encoded body (async gunzip)', async () => {
+      mockDeviceLookup(true);
+      const values = mockInsertSuccess();
+      const payload = JSON.stringify({ logs: [makeLogEntry()] });
+      const compressed = gzipSync(Buffer.from(payload));
+
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' },
+        body: compressed,
+      });
+
+      expect(res.status).toBe(201);
+      expect(values).toHaveBeenCalled();
+    });
+
+    it('rejects a gzip body that decompresses past the output cap', async () => {
+      mockDeviceLookup(true);
+      const values = mockInsertSuccess();
+      // A highly compressible payload whose decompressed size blows the 10MB cap.
+      const oversizedPayload = JSON.stringify({
+        logs: [makeLogEntry({ message: 'a'.repeat(15 * 1024 * 1024) })],
+      });
+      const compressed = gzipSync(Buffer.from(oversizedPayload));
+
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' },
+        body: compressed,
+      });
+
+      expect(res.status).toBe(400);
+      expect(values).not.toHaveBeenCalled();
+    });
+  });
+
+  // #7067 — devices.last_log_at throttled conditional update.
+  describe('last_log_at update', () => {
+    it('stamps last_log_at on a successful insert', async () => {
+      mockDeviceLookup(true);
+      mockInsertSuccess();
+      const { set, where } = mockUpdateSuccess();
+
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs: [makeLogEntry()] }),
+      });
+
+      expect(res.status).toBe(201);
+      expect(db.update).toHaveBeenCalledWith(expect.anything());
+      expect(set).toHaveBeenCalledWith({ lastLogAt: expect.any(Date) });
+      expect(where).toHaveBeenCalledTimes(1);
+
+      // Race-safety claim: this must be a single conditional UPDATE (scoped
+      // to this device, gated on the throttle), never a read-then-write. If
+      // the `isNull`/`lt`/`eq(id, ...)` branches were dropped, this would
+      // still pass a "where was called once" assertion, so assert the actual
+      // predicate text.
+      const condition = sqlText(where.mock.calls[0]?.[0]);
+      expect(condition).toContain('id');
+      expect(condition).toContain('last_log_at');
+    });
+
+    it('embeds the throttle threshold as exactly receivedAt minus 5 minutes', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-05-01T12:00:00.000Z'));
+      try {
+        mockDeviceLookup(true);
+        mockInsertSuccess();
+        const { set, where } = mockUpdateSuccess();
+
+        await app.request(`/agents/${AGENT_ID}/logs`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ logs: [makeLogEntry()] }),
+        });
+
+        expect(set).toHaveBeenCalledWith({ lastLogAt: new Date('2026-05-01T12:00:00.000Z') });
+        const condition = sqlText(where.mock.calls[0]?.[0]);
+        // The throttle window is 5 minutes: a device whose last_log_at is
+        // exactly 5 minutes old (or older) is due for a fresh write.
+        expect(condition).toContain(new Date('2026-05-01T11:55:00.000Z').toISOString());
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not stamp last_log_at when nothing was inserted', async () => {
+      mockDeviceLookup(true);
+      mockInsertFailure();
+      const { set } = mockUpdateSuccess();
+
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs: [makeLogEntry()] }),
+      });
+
+      expect(res.status).toBe(500);
+      expect(set).not.toHaveBeenCalled();
+    });
+
+    it('swallows a last_log_at update failure without failing the request, but reports it', async () => {
+      mockDeviceLookup(true);
+      const values = mockInsertSuccess();
+      vi.mocked(db.update).mockReturnValue({
+        set: vi.fn().mockReturnValue({
+          where: vi.fn().mockRejectedValue(new Error('update failed')),
+        }),
+      } as any);
+
+      const res = await app.request(`/agents/${AGENT_ID}/logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ logs: [makeLogEntry()] }),
+      });
+
+      expect(res.status).toBe(201);
+      expect(values).toHaveBeenCalled();
+      // A silently-stuck last_log_at would defeat the whole point of this
+      // column (a trustworthy "logs are flowing" signal), so the failure
+      // must be visible somewhere even though the request itself succeeds.
+      expect(captureException).toHaveBeenCalledWith(
+        expect.any(Error),
+        expect.anything(),
+        expect.objectContaining({ route: 'agents.logs.lastLogAtUpdate', deviceId: DEVICE_ID }),
+      );
     });
   });
 });

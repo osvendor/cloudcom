@@ -275,6 +275,17 @@ type Config struct {
 	// daemon, systemd service, etc.). Desktop commands route through IPC when set.
 	IsHeadless bool `mapstructure:"-"`
 
+	// IsInstalledAgent is a runtime flag set when this process is the host's
+	// installed Breeze agent: started by the OS service manager (Windows SCM,
+	// macOS LaunchDaemon, Linux systemd as root), running from the canonical
+	// agent.yaml under ConfigDir(), and not a Quick Support client. Only that
+	// process owns machine-wide artifacts shared with other Breeze processes on
+	// the host (the Breeze Assist package, its autostart entry and its
+	// per-session state). A foreground `run`, a second build pointed at another
+	// config file, or a Quick Support client must leave those alone.
+	// Runtime-only, never read from disk.
+	IsInstalledAgent bool `mapstructure:"-"`
+
 	// SupportMode marks this process as an ephemeral Quick Support client:
 	// enrolled into a throwaway temp workspace, serving one remote-desktop
 	// session, then self-destructing. It gates off everything a disposable
@@ -709,16 +720,139 @@ func Save(cfg *Config) error {
 	return SaveTo(cfg, "")
 }
 
+// SaveTo writes cfg to agent.yaml and its non-credential secrets to
+// secrets.yaml.
+//
+// Issue #2773 — SaveTo does NOT write credential state from cfg. The agent,
+// watchdog and helper tokens and the staged pending_* set are owned by
+// StagePendingCredentials / PromotePendingCredentials / ClearPendingCredentials,
+// which update secrets.yaml directly and never touch the caller's *Config, so
+// cfg is a snapshot that can be arbitrarily stale relative to them: Load copies
+// pending_* into the struct once at startup and nothing refreshes it, and the
+// mTLS renewal paths capture the bearer token before taking any lock. Letting
+// that snapshot win wrote credentials the server no longer accepts over the
+// ones it does. So whatever is on disk is preserved verbatim; cfg only fills a
+// credential the disk does not have yet (the first save of a fresh install).
+// Enrollment, the one caller whose in-memory credentials ARE authoritative,
+// uses SaveEnrollment.
 func SaveTo(cfg *Config, cfgFile string) error {
 	persistMu.Lock()
 	defer persistMu.Unlock()
-	return saveToLocked(cfg, cfgFile)
+	return saveToLocked(cfg, cfgFile, credentialsFromDisk)
+}
+
+// SaveEnrollment is SaveTo for a freshly enrolled identity: cfg's agent,
+// watchdog and helper tokens replace whatever is on disk, and any staged
+// pending_* set is dropped — it belonged to the previous identity and can
+// never be promoted against the new one.
+func SaveEnrollment(cfg *Config, cfgFile string) error {
+	persistMu.Lock()
+	defer persistMu.Unlock()
+	return saveToLocked(cfg, cfgFile, credentialsFromConfig)
+}
+
+// credentialSource selects who is authoritative for credential keys in a
+// saveToLocked call. See SaveTo and SaveEnrollment.
+type credentialSource int
+
+const (
+	credentialsFromDisk credentialSource = iota
+	credentialsFromConfig
+)
+
+// resolveCredentialsForSave decides the credential values a saveToLocked call
+// writes. Callers must hold persistMu, which is what makes this read and the
+// rewrite that follows atomic against the credential writers.
+func resolveCredentialsForSave(cfg *Config, cfgPath string, source credentialSource) (PersistedCredentials, error) {
+	onDisk, readErr := readPersistedCredentialsAt(cfgPath)
+	if readErr != nil {
+		if !errors.Is(readErr, os.ErrNotExist) {
+			if source == credentialsFromDisk {
+				// Fail closed. The file exists but could not be parsed, and the
+				// write that follows replaces it wholesale: proceeding would drop
+				// every credential cfg lacks — including a staged set the server
+				// may already have promoted, i.e. the agent's only copy of its
+				// current credential.
+				return PersistedCredentials{}, fmt.Errorf("reading existing credentials before rewriting the secrets file: %w", readErr)
+			}
+			log.Warn("could not read existing credentials while saving an enrollment; replacing them",
+				"error", readErr.Error())
+		}
+		onDisk = &PersistedCredentials{}
+	}
+
+	pick := func(primary, fallback string) string {
+		if primary != "" {
+			return primary
+		}
+		return fallback
+	}
+	if source == credentialsFromConfig {
+		return PersistedCredentials{
+			AuthToken:         pick(cfg.AuthToken, onDisk.AuthToken),
+			WatchdogAuthToken: pick(cfg.WatchdogAuthToken, onDisk.WatchdogAuthToken),
+			HelperAuthToken:   pick(cfg.HelperAuthToken, onDisk.HelperAuthToken),
+		}, nil
+	}
+	return PersistedCredentials{
+		AuthToken:         pick(onDisk.AuthToken, cfg.AuthToken),
+		WatchdogAuthToken: pick(onDisk.WatchdogAuthToken, cfg.WatchdogAuthToken),
+		HelperAuthToken:   pick(onDisk.HelperAuthToken, cfg.HelperAuthToken),
+		// Never from cfg: its Pending* fields are the startup snapshot, so they
+		// either resurrect a set that was since cleared or replace a newer one.
+		PendingAuthToken:         onDisk.PendingAuthToken,
+		PendingWatchdogAuthToken: onDisk.PendingWatchdogAuthToken,
+		PendingHelperAuthToken:   onDisk.PendingHelperAuthToken,
+	}, nil
+}
+
+// ResolveSavePath returns the agent.yaml path SaveTo and SaveEnrollment write
+// for cfgFile: cfgFile itself, or the default agent.yaml in ConfigDir when the
+// --config flag was left empty. Use it wherever a message names the config
+// file, so an empty flag never prints as an empty path (#7394).
+func ResolveSavePath(cfgFile string) string {
+	if cfgFile != "" {
+		return cfgFile
+	}
+	return filepath.Join(configDir(), "agent.yaml")
+}
+
+// PrepareSaveDir creates and secures the directory SaveEnrollment will write
+// cfgFile's agent.yaml into, exactly as the save itself does first, without
+// writing any file. Enrollment calls it before the enroll request so that a
+// directory the agent cannot secure fails the enrollment before the server
+// creates a device, instead of after (#7394).
+func PrepareSaveDir(cfgFile string) error {
+	return prepareSaveDir(ResolveSavePath(cfgFile))
+}
+
+func prepareSaveDir(cfgPath string) error {
+	dir := filepath.Dir(cfgPath)
+	if dir == "." {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	return enforceConfigDirPermissions(dir)
 }
 
 // saveToLocked is SaveTo's body; callers must hold persistMu. Paired with
 // loadLocked so a read-modify-write of the config file is atomic against every
 // other viper user.
-func saveToLocked(cfg *Config, cfgFile string) error {
+func saveToLocked(cfg *Config, cfgFile string, source credentialSource) error {
+	cfgPath := ResolveSavePath(cfgFile)
+	if err := prepareSaveDir(cfgPath); err != nil {
+		return err
+	}
+
+	// Resolved BEFORE anything is written, so an unreadable secrets file aborts
+	// the save without touching agent.yaml either.
+	creds, err := resolveCredentialsForSave(cfg, cfgPath, source)
+	if err != nil {
+		return err
+	}
+
 	viper.Set("agent_id", cfg.AgentID)
 	viper.Set("server_url", cfg.ServerURL)
 	viper.Set("backup_server_url", cfg.BackupServerURL)
@@ -741,32 +875,11 @@ func saveToLocked(cfg *Config, cfgFile string) error {
 	viper.Set("require_manifest_signing_key_id", cfg.RequireManifestSigningKeyID)
 	viper.Set("hp_warranty_collection_enabled", cfg.HPWarrantyCollectionEnabled)
 	viper.Set("manifest_delegation_epoch", cfg.ManifestDelegationEpoch)
-	// Write only the helper-scoped token to agent.yaml. Full agent and watchdog
-	// bearer tokens are persisted below in root-only secrets.yaml.
-	if cfg.HelperAuthToken != "" {
-		viper.Set("helper_auth_token", cfg.HelperAuthToken)
-	}
-
-	var cfgPath string
-	if cfgFile != "" {
-		cfgPath = cfgFile
-		dir := filepath.Dir(cfgPath)
-		if dir != "." {
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return err
-			}
-			if err := enforceConfigDirPermissions(dir); err != nil {
-				return err
-			}
-		}
-	} else {
-		cfgPath = filepath.Join(configDir(), "agent.yaml")
-		if err := os.MkdirAll(configDir(), 0755); err != nil {
-			return err
-		}
-		if err := enforceConfigDirPermissions(configDir()); err != nil {
-			return err
-		}
+	// Windows only: the helper-scoped token still goes into agent.yaml (see
+	// secretKeyAllowedInAgentYAML). On Unix it is written below to its own
+	// group-scoped file instead, via writeHelperTokenFile.
+	if runtime.GOOS == "windows" && creds.HelperAuthToken != "" {
+		viper.Set("helper_auth_token", creds.HelperAuthToken)
 	}
 
 	// Serialize via viper (same encoder as WriteConfigAs), strip secrets, then
@@ -803,52 +916,27 @@ func saveToLocked(cfg *Config, cfgFile string) error {
 	sv := viper.New()
 
 	// Issue #2621 — SaveTo rebuilds the secrets file from scratch, so every
-	// credential it does not re-write is DROPPED. Two ways that bites:
-	//
-	//   - Staged rotation credentials on disk are invisible to an unrelated
-	//     caller (the mTLS renewal path calls config.Save mid-flight), so a cert
-	//     renewal during a rotation would delete the staged set the server may
-	//     already have promoted.
-	//   - The in-memory config clears tokens for security (AuthToken is zeroed
-	//     after startup) and applyRotatedCredentials updates the credential file
-	//     directly rather than the struct, so cfg's watchdog/helper tokens can be
-	//     stale or empty relative to disk.
-	//
-	// So for every credential: prefer a non-empty in-memory value, otherwise
-	// preserve exactly what is on disk. Never write an empty token over a real
-	// one. A read failure is logged rather than swallowed — silently proceeding
-	// would delete credentials this fallback exists to protect.
-	credsOnDisk, readErr := readPersistedCredentialsAt(cfgPath)
-	// A missing secrets file is the normal first-save/enrollment case, not a
-	// problem — there is simply nothing to preserve. Anything else means the file
-	// exists but could not be parsed, and we are about to overwrite it, so say so.
-	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
-		log.Warn("could not read existing credentials while saving config; on-disk credential preservation is degraded",
-			"error", readErr.Error())
-	}
-	setCredential := func(key, fromCfg string, fromDisk func(*PersistedCredentials) string) {
-		if fromCfg != "" {
-			sv.Set(key, fromCfg)
-			return
-		}
-		if credsOnDisk != nil {
-			if v := fromDisk(credsOnDisk); v != "" {
-				sv.Set(key, v)
-			}
+	// credential it does not re-write is DROPPED. creds (resolved above under
+	// persistMu — see resolveCredentialsForSave for who wins) carries each one
+	// forward. An empty value is not written; it never blanks a real token.
+	setCredential := func(key, value string) {
+		if value != "" {
+			sv.Set(key, value)
 		}
 	}
-	setCredential(secretKeyAuthToken, cfg.AuthToken,
-		func(p *PersistedCredentials) string { return p.AuthToken })
-	setCredential(secretKeyWatchdogAuthToken, cfg.WatchdogAuthToken,
-		func(p *PersistedCredentials) string { return p.WatchdogAuthToken })
-	setCredential(secretKeyHelperAuthToken, cfg.HelperAuthToken,
-		func(p *PersistedCredentials) string { return p.HelperAuthToken })
-	setCredential(secretKeyPendingAuthToken, cfg.PendingAuthToken,
-		func(p *PersistedCredentials) string { return p.PendingAuthToken })
-	setCredential(secretKeyPendingWatchdogAuthToken, cfg.PendingWatchdogAuthToken,
-		func(p *PersistedCredentials) string { return p.PendingWatchdogAuthToken })
-	setCredential(secretKeyPendingHelperAuthToken, cfg.PendingHelperAuthToken,
-		func(p *PersistedCredentials) string { return p.PendingHelperAuthToken })
+	setCredential(secretKeyAuthToken, creds.AuthToken)
+	setCredential(secretKeyWatchdogAuthToken, creds.WatchdogAuthToken)
+	setCredential(secretKeyHelperAuthToken, creds.HelperAuthToken)
+
+	// Unix only (no-op on Windows): also persist the helper token to its own
+	// group-scoped file, from the same resolved value so the copies agree.
+	if err := writeHelperTokenFileFor(cfgPath, creds.HelperAuthToken); err != nil {
+		return fmt.Errorf("writing helper token file: %w", err)
+	}
+
+	setCredential(secretKeyPendingAuthToken, creds.PendingAuthToken)
+	setCredential(secretKeyPendingWatchdogAuthToken, creds.PendingWatchdogAuthToken)
+	setCredential(secretKeyPendingHelperAuthToken, creds.PendingHelperAuthToken)
 
 	sv.Set("mtls_cert_pem", cfg.MtlsCertPEM)
 	sv.Set("mtls_key_pem", cfg.MtlsKeyPEM)
@@ -1038,10 +1126,21 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 }
 
 // secretKeyAllowedInAgentYAML lists keys that look secret by suffix rules but
-// must remain in agent.yaml. The Breeze Helper ("Breeze Assist") runs as the
-// logged-in user and reads agent.yaml directly; it needs helper_auth_token.
-var secretKeyAllowedInAgentYAML = map[string]bool{
-	"helper_auth_token": true,
+// must remain in agent.yaml.
+//
+// helper_auth_token is allowed here ONLY on Windows, where the Breeze Helper
+// ("Breeze Assist") runs as the logged-in user and reads agent.yaml directly
+// because no narrower delivery exists there yet. On Unix it is delivered via
+// a separate, breeze-group-scoped helper_token.yaml instead (see
+// helpertoken_unix.go) and must NOT also land in the world-readable
+// agent.yaml, so it is intentionally excluded from this map on that
+// platform — see isSecretYAMLKey.
+var secretKeyAllowedInAgentYAML = map[string]bool{}
+
+func init() {
+	if runtime.GOOS == "windows" {
+		secretKeyAllowedInAgentYAML["helper_auth_token"] = true
+	}
 }
 
 // isSecretYAMLKey reports whether key should be kept out of agent.yaml (i.e.
@@ -1097,12 +1196,7 @@ func FixConfigPermissions() {
 	}
 	cfgPath := filepath.Join(dir, "agent.yaml")
 	if _, err := os.Stat(cfgPath); err == nil {
-		if err := migrateInlineSecretsToSecretFile(cfgPath); err != nil {
-			log.Warn("Failed to migrate inline config secrets", "path", cfgPath, "error", err.Error())
-		}
-		if err := enforceConfigFilePermissions(cfgPath); err != nil {
-			log.Warn("Failed to fix config file permissions", "path", cfgPath, "error", err.Error())
-		}
+		fixAgentYAMLPermissions(cfgPath)
 	}
 	// Secrets file must remain root-only.
 	sPath := secretsFilePath()
@@ -1110,6 +1204,84 @@ func FixConfigPermissions() {
 		if err := enforceSecretFilePermissions(sPath); err != nil {
 			log.Warn("Failed to fix secrets file permissions", "path", sPath, "error", err.Error())
 		}
+	}
+	seedHelperTokenFileFromSecretsIfMissing(cfgPath)
+	reapplyHelperTokenFilePermissionsFor(cfgPath)
+}
+
+// fixAgentYAMLPermissions is the path-parameterized core of
+// FixConfigPermissions' agent.yaml handling (split out so it can be tested
+// against a temp directory instead of the real, OS-specific config
+// directory). migrateInlineSecretsToSecretFile can fail partway through —
+// e.g. a Windows rename blocked by a concurrent open of agent.yaml — and
+// previously that error was only logged, after which the caller
+// unconditionally loosened agent.yaml to the Helper-readable mode (0644 /
+// BU:FR) regardless of whether inline secret material was still in it. This
+// re-checks the file on disk after the migration attempt (success or not)
+// and only loosens permissions when it is verifiably clear of secret keys;
+// otherwise it locks the file down to the same restrictive mode as
+// secrets.yaml until a later, successful migration can loosen it.
+func fixAgentYAMLPermissions(cfgPath string) {
+	if err := migrateInlineSecretsToSecretFile(cfgPath); err != nil {
+		log.Warn("Failed to migrate inline config secrets", "path", cfgPath, "error", err.Error())
+	}
+	hasInline, err := agentYAMLHasInlineSecrets(cfgPath)
+	if err != nil {
+		log.Warn("Failed to verify agent.yaml is clear of inline secrets; leaving it locked down", "path", cfgPath, "error", err.Error())
+		hasInline = true
+	}
+	if hasInline {
+		log.Warn("agent.yaml still contains inline secret material after migration; leaving it locked down instead of widening its permissions", "path", cfgPath)
+		if err := enforceSecretFilePermissions(cfgPath); err != nil {
+			log.Warn("Failed to lock down config file permissions", "path", cfgPath, "error", err.Error())
+		}
+		return
+	}
+	if err := enforceConfigFilePermissions(cfgPath); err != nil {
+		log.Warn("Failed to fix config file permissions", "path", cfgPath, "error", err.Error())
+	}
+}
+
+// agentYAMLHasInlineSecrets reports whether cfgPath still contains any key
+// that migrateInlineSecretsToSecretFile is meant to have moved out (see
+// isSecretYAMLKey). A read or parse error is reported as "has secrets" (the
+// caller fails closed) rather than silently treated as clean.
+func agentYAMLHasInlineSecrets(cfgPath string) (bool, error) {
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return false, err
+	}
+	var cfgValues map[string]any
+	if err := yaml.Unmarshal(data, &cfgValues); err != nil {
+		return false, err
+	}
+	for key, value := range cfgValues {
+		if isSecretYAMLKey(key) && !isEmptyYAMLValue(value) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// seedHelperTokenFileFromSecretsIfMissing handles the upgrade case: an
+// existing install's helper_auth_token was inline in agent.yaml, and the
+// migration above (isSecretYAMLKey-driven, shared with every other secret
+// key) has just moved it into secrets.yaml — the correct destination for
+// every other secret, but not the group-readable one the Helper needs. If
+// the dedicated helper token file doesn't exist yet, seed it from whatever
+// secrets.yaml now holds. No-op on Windows (writeHelperTokenFile there is a
+// no-op) and on a fresh install (SaveTo already writes the file directly, so
+// it already exists by the time this runs).
+func seedHelperTokenFileFromSecretsIfMissing(cfgPath string) {
+	if _, err := os.Stat(helperTokenFilePathFor(cfgPath)); err == nil {
+		return // already present — nothing to seed
+	}
+	creds, err := readPersistedCredentialsAt(cfgPath)
+	if err != nil || creds == nil || creds.HelperAuthToken == "" {
+		return
+	}
+	if err := writeHelperTokenFileFor(cfgPath, creds.HelperAuthToken); err != nil {
+		log.Warn("failed to seed helper token file from secrets", "error", err.Error())
 	}
 }
 

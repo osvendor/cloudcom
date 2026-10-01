@@ -21,6 +21,7 @@ import { usePermissions } from '@/lib/permissions';
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
 import { useStableT } from '@/lib/i18n/useStableT';
+import { usePageItemName } from '../layout/usePageItemName';
 
 type ScriptExecutionsPageProps = {
   scriptId: string;
@@ -238,6 +239,8 @@ export default function ScriptExecutionsPage({ scriptId }: ScriptExecutionsPageP
     return admission;
   };
 
+  usePageItemName(script?.name);
+
   if (loading && !script) {
     return (
       <div className="flex items-center justify-center py-12">
@@ -287,6 +290,7 @@ export default function ScriptExecutionsPage({ scriptId }: ScriptExecutionsPageP
           <a
             href={`/scripts/${scriptId}`}
             className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+            aria-label={t('scriptExecutionsPage.actions.backToScript')}
           >
             <ArrowLeft className="h-5 w-5" />
           </a>

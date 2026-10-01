@@ -111,7 +111,7 @@ export const NETWORK_DIAGNOSTIC_TIMEOUT_MS = 150 * 1000;
  *
  * Why a ceiling and not a stall clock. `backup_jobs` can use a 15-minute stall
  * window because the agent streams `backup_progress` continuously into
- * `last_progress_at`. Nothing equivalent exists here: `device_commands` has no
+ * `last_keepalive_at`. Nothing equivalent exists here: `device_commands` has no
  * progress column, four of these six types report nothing at all mid-flight,
  * and the BMR pair's only mid-flight signal is a PHASE transition posted to
  * `/bmr/recover/progress` — the whole 3-hour restore sits inside a single
@@ -143,6 +143,28 @@ const RESTORE_TIMEOUT_TYPES = new Set<string>([
   CommandTypes.MSSQL_RESTORE,
   CommandTypes.HYPERV_RESTORE,
 ]);
+
+/**
+ * #7105 — the last-resort ceiling for a `backup_jobs` row, and the command
+ * timeout for `backup_run`.
+ *
+ * The stale backup reaper (`reapStaleBackupJobs`) owns a file backup's
+ * lifetime: liveness, offline grace, and a no-transfer window that can itself
+ * run to 24 h for a large remainder. This is its absolute cap for a job that
+ * never reported anything, and it is exported so that reaper reads it from
+ * here — one number, not two that can drift.
+ *
+ * `backup_run` gets the same value as its command timeout rather than the
+ * 2-hour LONG tier its mssql/hyperv siblings use: a device_commands row for a
+ * file backup must never time out before the job it drives could, or the
+ * timeout (now propagated to the job, see `propagateTimedOutDeviceCommand`)
+ * would fail a healthy multi-hour upload — the #6415 shape. Today no path
+ * writes a device_commands row for `backup_run` (`jobs/backupWorker.ts` sends
+ * it straight over the socket, keyed by the backup_jobs id); before this it
+ * fell through to the 30-minute default with an "Unknown command type"
+ * warning, which is the trap this closes.
+ */
+export const BACKUP_JOB_ABSOLUTE_TIMEOUT_MS = TWENTY_FOUR_HOURS;
 
 const LONG_TIMEOUT_TYPES = new Set<string>([
   CommandTypes.AGENT_ROLLBACK_V1,
@@ -182,6 +204,12 @@ export function getCommandTimeoutMs(
   commandType: string,
   payload?: Record<string, unknown> | null,
 ): number {
+  if (
+    commandType === CommandTypes.TIME_RESYNC ||
+    commandType === CommandTypes.TIME_SET_TIMEZONE ||
+    commandType === CommandTypes.TIME_APPLY_POLICY
+  )
+    return 60_000;
   if (commandType === CommandTypes.SCRIPT) {
     const timeoutSeconds =
       typeof payload?.timeoutSeconds === 'number'
@@ -197,6 +225,7 @@ export function getCommandTimeoutMs(
   if (SHORT_TIMEOUT_TYPES.has(commandType)) return FIVE_MINUTES;
   if (MEDIUM_TIMEOUT_TYPES.has(commandType)) return THIRTY_MINUTES;
   if (RESTORE_TIMEOUT_TYPES.has(commandType)) return WHOLE_MACHINE_RESTORE_TIMEOUT_MS;
+  if (commandType === CommandTypes.BACKUP_RUN) return BACKUP_JOB_ABSOLUTE_TIMEOUT_MS;
   // Disk Cleanup v2: a native run's real budget is per-selection and lives on
   // the row; this is the ceiling that keeps the reaper from terminalising a
   // command whose run is still inside it.

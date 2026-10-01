@@ -12,11 +12,13 @@ import {
   numeric,
   uniqueIndex,
   check,
-  customType
+  customType,
+  foreignKey
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { NOTIFICATION_CHANNEL_TYPES } from '@breeze/shared';
-import { organizations, partners } from './orgs';
+import type { AlertResolutionReason } from '@breeze/shared';
+import { organizations, partners, sites } from './orgs';
 import { devices } from './devices';
 import { users } from './users';
 
@@ -138,6 +140,12 @@ export const alerts = pgTable('alerts', {
   // `alerts_open_rule_device_subject_uidx` enforces open-alert identity below.
   subjectKey: text('subject_key'),
   orgId: uuid('org_id').notNull().references(() => organizations.id),
+  // Topology M3 (M3-D6, migration 2026-11-06-210400): a recurring topology
+  // check alert is OWNED by the topology site (immutable), not by the origin
+  // device (`device_id`, provenance only). Set together at insert, or both
+  // NULL for every other alert; site authorization follows this column.
+  topologySiteId: uuid('topology_site_id'),
+  topologySourceKey: text('topology_source_key'),
   configPolicyId: uuid('config_policy_id'),
   configItemName: varchar('config_item_name', { length: 200 }),
   status: alertStatusEnum('status').notNull().default('active'),
@@ -151,6 +159,7 @@ export const alerts = pgTable('alerts', {
   resolvedAt: timestamp('resolved_at'),
   resolvedBy: uuid('resolved_by').references(() => users.id),
   resolutionNote: text('resolution_note'),
+  resolutionReason: varchar('resolution_reason', { length: 40 }).$type<AlertResolutionReason>(),
   suppressedUntil: timestamp('suppressed_until'),
   dismissedAt: timestamp('dismissed_at'),
   dismissedBy: uuid('dismissed_by').references(() => users.id),
@@ -184,7 +193,13 @@ export const alerts = pgTable('alerts', {
     .on(table.ruleId, table.deviceId, sql`COALESCE(${table.subjectKey}, '')`)
     .where(sql`${table.ruleId} IS NOT NULL AND ${table.status} IN ('active', 'acknowledged', 'suppressed')`),
   // Partner alerts feed keyset (2026-10-30-130100, built CONCURRENTLY).
-  partnerFeedXidIdx: index('idx_alerts_partner_feed_xid').on(table.partnerFeedXid, table.id)
+  partnerFeedXidIdx: index('idx_alerts_partner_feed_xid').on(table.partnerFeedXid, table.id),
+  topologyOwnerChk: check('alerts_topology_owner_chk', sql`(topology_site_id IS NULL) = (topology_source_key IS NULL) AND (topology_source_key IS NULL OR topology_source_key ~ '^topology:[a-f0-9]{64}$')`),
+  topologySiteFk: foreignKey({ name: 'alerts_topology_site_fk', columns: [table.topologySiteId, table.orgId], foreignColumns: [sites.id, sites.orgId] }),
+  topologyOpenSourceUidx: uniqueIndex('alerts_topology_open_source_uidx')
+    .on(table.orgId, table.topologySiteId, table.topologySourceKey)
+    .where(sql`topology_source_key IS NOT NULL AND status IN ('active', 'acknowledged', 'suppressed')`),
+  topologySiteIdx: index('alerts_topology_site_idx').on(table.topologySiteId).where(sql`topology_site_id IS NOT NULL`)
 }));
 
 export const alertCorrelations = pgTable('alert_correlations', {
@@ -248,7 +263,12 @@ export const notificationChannels = pgTable('notification_channels', {
   partnerId: uuid('partner_id').references(() => partners.id),
   name: varchar('name', { length: 255 }).notNull(),
   type: notificationChannelTypeEnum('type').notNull(),
-  config: jsonb('config').notNull(),
+  // `config` (destination + secrets) lives in notificationChannelConfigs
+  // below, NOT on this row (#6379): an org session can read a partner-wide
+  // channel row through the SELECT-only partner-wide branch, and RLS cannot hide
+  // a column. The legacy `config` column was kept for one release as a
+  // write-only rollback mirror and then dropped (#7028,
+  // 2026-11-06-100100-drop-notification-channels-config.sql).
   templates: jsonb('templates').default({}),
   enabled: boolean('enabled').notNull().default(true),
   lastTestedAt: timestamp('last_tested_at', { withTimezone: true }),
@@ -267,6 +287,32 @@ export const notificationChannels = pgTable('notification_channels', {
 }, (table) => ({
   partnerIdIdx: index('notification_channels_partner_id_idx').on(table.partnerId),
 }));
+
+/**
+ * A channel's destination/secret config (#6379), one row per channel.
+ *
+ * Split off `notification_channels` so config confidentiality is enforced by
+ * the database, not only by API redaction. The RLS policy
+ * (2026-11-02-100600-notification-channel-configs.sql) is parent OWNERSHIP —
+ * system, OR org access to the parent's org_id, OR partner access to the
+ * parent's partner_id — and deliberately does NOT mirror the parent's
+ * SELECT-only partner-wide branch. So an org session sees an inherited
+ * partner-wide channel's name/type, but never its config.
+ *
+ * Secret fields inside `config` stay sealed under the AAD tag
+ * `notification_channels.config` (the column's historical home), see
+ * notificationChannelSecrets.ts and encryptedColumnRegistry.ts.
+ *
+ * Every channel is written with its config row in the same transaction
+ * (services/notificationChannelConfig.ts). No org_id: it reaches its tenant
+ * through the parent and is removed by the parent's ON DELETE CASCADE.
+ */
+export const notificationChannelConfigs = pgTable('notification_channel_configs', {
+  channelId: uuid('channel_id')
+    .primaryKey()
+    .references(() => notificationChannels.id, { onDelete: 'cascade' }),
+  config: jsonb('config').notNull(),
+});
 
 /** Evaluated by services/delivery/resolveDelivery.ts. Unknown keys are ignored. */
 export interface RoutingRuleConditions {

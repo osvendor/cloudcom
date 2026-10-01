@@ -10,16 +10,26 @@ import { deviceCommands, devices, auditLogs, users } from '../db/schema';
 import { sendCommandToAgent, isAgentConnected } from '../routes/agentWs';
 import { captureException, captureMessage } from './sentry';
 import { recordBackupCommandTimeout, recordRestoreTimeout } from './backupMetrics';
+import { randomUUID } from 'node:crypto';
 import {
   claimPendingCommandForDelivery,
   releaseClaimedCommandDelivery,
 } from './commandDispatch';
+import { refreshClaimedPayloadForPush } from './commandDelivery';
+import { BACKUP_WRITE_CREDENTIAL_COMMAND_TYPES } from './backupCommandCredentials';
 import { commandAuditDetails } from './commandAudit';
 import {
   AGENT_BINARY_UPDATE_COMMAND_TYPES,
   agentBinaryUpdateDispatchRefusal,
 } from './agentEditionCompat';
 import { assertDeviceExecuteAllowed, TrustDeniedError } from './partnerTrust.commands';
+import { backupReadHelperRefusal } from './backupReadHelperGate';
+import {
+  assertCommandDeliverable,
+  isParkedDeliverableCommandType,
+  isParkedDevice,
+  PARKED_DEVICE_COMMAND_REFUSAL_MESSAGE,
+} from './unassignedPool/deliveryEligibility';
 import { recordCommandDispatch } from './anomalyMetrics';
 // #5128. `dispatchDeviceCommand` imports back from this module; both uses are
 // function-level (neither evaluates the other's exports at module load), so the
@@ -28,6 +38,8 @@ import { dispatchDeviceCommand, dispatchDeviceCommandWithSystemPrecheck } from '
 import { deliverByFor, type OfflinePolicy } from './commandOfflinePolicy';
 import {
   decryptCommandForDelivery,
+  needsStorageDestinationSeal,
+  sealStorageCredentialsForPersistence,
   terminalPayloadErasureSet,
   toAgentCommandFrame,
 } from './sensitiveCommandPayload';
@@ -62,6 +74,7 @@ import { CommandTypes, type CommandType } from './commandTypes';
 import type { AiOriginRef } from '@breeze/shared';
 import { aiOriginColumns } from './aiOriginColumns';
 import { createAuditLogAsync } from './auditService';
+import { markRequestAuditWritten } from './auditRequestTracking';
 
 export interface CommandPayload {
   [key: string]: unknown;
@@ -553,6 +566,29 @@ export async function resolveCommandCreatedBy(
 }
 
 /**
+ * The payload as it may be written to `device_commands`, plus the command id
+ * to insert with. Only a payload carrying an inline storage destination is
+ * changed (sealed — see `sealStorageCredentialsForPersistence`), and only then
+ * is an id reserved; everything else keeps the column default exactly as
+ * before.
+ */
+function persistableCommandPayload(
+  deviceId: string,
+  type: string,
+  payload: CommandPayload,
+  reservedCommandId: string | undefined,
+): { commandId: string | undefined; payload: CommandPayload } {
+  if (!needsStorageDestinationSeal(type, payload)) {
+    return { commandId: reservedCommandId, payload };
+  }
+  const commandId = reservedCommandId ?? randomUUID();
+  return {
+    commandId,
+    payload: sealStorageCredentialsForPersistence(type, payload, { commandId, deviceId }),
+  };
+}
+
+/**
  * Queue a command for execution on a device
  */
 export async function queueCommand(
@@ -606,28 +642,38 @@ export async function queueCommand(
   // `users` row, which would fail the created_by FK with 23503 (#3978).
   const safeUserId = await resolveCommandCreatedBy(deviceId, userId, options.aiOrigin);
 
+  // An inline storage destination is never persisted in plaintext: it is
+  // sealed under an AAD bound to this command's id, so the id is reserved
+  // here when the caller did not reserve one.
+  const persisted = persistableCommandPayload(deviceId, type, payload, options.commandId);
+
   // Insert under a system context (device_commands has no RLS, but a bare-pool
   // write with no access context trips the #1375 contextless-write guard, which
   // CI runs in strict mode). BullMQ workers and other background callers reach
   // here with no request context; when a caller context IS open this is a no-op
   // and the insert stays on the caller's transaction, exactly as before. Matches
   // executeCommand's insert site, which was already wrapped for this reason.
-  const [command] = await withSystemDbAccessContext(() =>
-    db
+  //
+  // A device parked in a holding org receives lifecycle removal only. Checked
+  // on the same context as the insert, so a background caller with no context
+  // of its own reads the device under system scope rather than seeing nothing.
+  const [command] = await withSystemDbAccessContext(async () => {
+    await assertCommandDeliverable(db, { deviceId, commandType: type });
+    return db
       .insert(deviceCommands)
       .values({
-        ...(options.commandId ? { id: options.commandId } : {}),
+        ...(persisted.commandId ? { id: persisted.commandId } : {}),
         deviceId,
         type,
-        payload,
+        payload: persisted.payload,
         status: 'pending',
         createdBy: safeUserId,
         ...(options.deliverBy ? { deliverBy: options.deliverBy } : {}),
         ...(options.submittedOrgId ? { submittedOrgId: options.submittedOrgId } : {}),
         ...aiOriginColumns(options.aiOrigin),
       })
-      .returning(),
-  );
+      .returning();
+  });
 
   // Audit log for mutating commands — fire-and-forget under a system-scope
   // connection outside any caller tx, matching `services/auditService.ts`.
@@ -698,6 +744,9 @@ export async function queueCommand(
 
   if (command && AUDITED_COMMANDS.has(type)) {
     const commandId = command.id;
+    // Claimed up front, like createAuditLogAsync: the write below is
+    // fire-and-forget and may land after the request has returned.
+    markRequestAuditWritten();
     runOutsideDbContext(() =>
       withSystemDbAccessContext(async () => {
         const [device] = await db
@@ -721,7 +770,7 @@ export async function queueCommand(
           resourceType: 'device',
           resourceId: deviceId,
           resourceName: device.hostname,
-          details: commandAuditDetails(commandId, type, payload),
+          details: commandAuditDetails(commandId, type, persisted.payload),
           // Dispatch-time row: the agent hasn't reported back yet, so this
           // cannot claim 'success' (#4225). A completion-time audit event
           // DOES exist (action: 'agent.command.result.submit', written in
@@ -794,7 +843,13 @@ export async function waitForCommandResult(
         completedAt,
         result: {
           status: 'timeout',
-          error: `Command timed out after ${timeoutMs}ms`
+          error: `Command timed out after ${timeoutMs}ms`,
+          // Required by commandAcceptsAgentResultCondition to distinguish
+          // this server-written marker from an agent-reported `status:
+          // 'timeout'` (buildStoredCommandResult never copies this key from
+          // the agent's payload). Matches the other two server-side timeout
+          // writers (staleCommandReaper.ts, verificationScheduled.ts).
+          timedOutBy: 'server',
         },
         ...terminalPayloadErasureSet(),
       })
@@ -1104,6 +1159,7 @@ function shouldCaptureCrossTenantRefusal(expectedOrgId: string): boolean {
 async function precheckCommandExecution(
   deviceId: string,
   type: CommandType | string,
+  payload: CommandPayload,
   options: ExecuteCommandOptions,
 ): Promise<CommandPrecheckOutcome> {
   const { userId } = options;
@@ -1126,6 +1182,7 @@ async function precheckCommandExecution(
       agentEdition: devices.agentEdition,
       agentVersion: devices.agentVersion,
       watchdogVersion: devices.watchdogVersion,
+      backupReadProtocolVersion: devices.backupReadProtocolVersion,
     })
     .from(devices)
     .where(eq(devices.id, deviceId))
@@ -1169,6 +1226,16 @@ async function precheckCommandExecution(
     return { ok: false, result: { status: 'failed', error: 'Device not found' } };
   }
 
+  // A device parked in a holding org receives lifecycle removal only. After
+  // the tenancy gate (a wrong-tenant device answers not-found first) and
+  // before trust, so nothing about the device's trust state is revealed.
+  if (!isParkedDeliverableCommandType(type) && (await isParkedDevice(db, deviceId))) {
+    return {
+      ok: false,
+      result: { status: 'failed', error: PARKED_DEVICE_COMMAND_REFUSAL_MESSAGE },
+    };
+  }
+
   try {
     await assertDeviceExecuteAllowed(deviceId, type, userId);
   } catch (e) {
@@ -1201,6 +1268,13 @@ async function precheckCommandExecution(
       `[commandQueue] ${type} dispatch refused for device ${deviceId} (#4093): ${editionRefusal}`,
     );
     return { ok: false, result: { status: 'failed', error: editionRefusal } };
+  }
+
+  // Same rule as the queue lane (dispatchDeviceCommand.ts): a storage read to
+  // a helper that cannot use a storage session is refused before a row exists.
+  const helperRefusal = backupReadHelperRefusal(type, payload, device.backupReadProtocolVersion);
+  if (helperRefusal) {
+    return { ok: false, result: { status: 'failed', error: helperRefusal } };
   }
 
   if (targetRole === 'watchdog') {
@@ -1315,6 +1389,8 @@ async function dispatchPreparedCommand(
       ? { ...(payload as Record<string, unknown>), timeoutSeconds: Math.ceil(timeoutMs / 1000) }
       : payload;
 
+    const persisted = persistableCommandPayload(deviceId, type, payloadWithBudget, options.commandId);
+
     // Insert command (device_commands — no RLS, but establish a system context
     // so it isn't a contextless bare-pool write under runOutsideDbContext, #1375).
     const [command] = await withSystemDbAccessContext(() =>
@@ -1323,8 +1399,8 @@ async function dispatchPreparedCommand(
         .values({
           deviceId,
           type,
-          payload: payloadWithBudget,
-          ...(options.commandId ? { id: options.commandId } : {}),
+          payload: persisted.payload,
+          ...(persisted.commandId ? { id: persisted.commandId } : {}),
           status: 'pending',
           createdBy: safeUserId,
           targetRole,
@@ -1368,6 +1444,8 @@ async function dispatchPreparedCommand(
     // Audit log for mutating commands (fire-and-forget).
     // Uses device info fetched in step 1 to avoid an RLS-gated query.
     if (AUDITED_COMMANDS.has(type)) {
+      // Claimed up front, like createAuditLogAsync (fire-and-forget write).
+      markRequestAuditWritten();
       withDbAccessContext(
         { scope: 'organization', orgId: device.orgId, accessibleOrgIds: [device.orgId] },
         () =>
@@ -1381,7 +1459,7 @@ async function dispatchPreparedCommand(
               resourceType: 'device',
               resourceId: deviceId,
               resourceName: device.hostname,
-              details: commandAuditDetails(command.id, type, payload),
+              details: commandAuditDetails(command.id, type, persisted.payload),
               // Dispatch-time row: the agent hasn't reported back yet, so
               // this cannot claim 'success' (#4225).
               result: 'dispatched',
@@ -1409,9 +1487,29 @@ async function dispatchPreparedCommand(
     if (device.agentId && dispatchViaWs) {
       const claimed = await claimPendingCommandForDelivery(command.id);
       if (claimed) {
-        // Decrypt once up-front; null means the payload can't be decrypted, so
-        // there's nothing deliverable to retry — skip the send loop and release.
-        const delivered = decryptCommandForDelivery({ id: command.id, type, deviceId, payload });
+        // Same late-binding preparation as the heartbeat claim and the
+        // enqueue-time push: the registered refresher runs FIRST (it resolves
+        // anything the row stores only by reference, e.g. a storage
+        // destination), then decryption. The refresher sees the stored
+        // payload — the reference, never an inline credential.
+        const refreshed = await refreshClaimedPayloadForPush(
+          type,
+          payload && typeof payload === 'object' && !Array.isArray(payload)
+            ? (payload as Record<string, unknown>)
+            : {},
+          { commandId: command.id, deviceId, type, claimedAt: claimed.executedAt },
+        );
+        if (!refreshed.ok && refreshed.refusal !== null) {
+          // Refused: the row is already expired (the reaper reports it), and
+          // no retry can succeed — fail now instead of burning `timeoutMs`.
+          return { status: 'failed' as const, error: refreshed.refusal, commandId: command.id };
+        }
+        // Decrypt once up-front; null means the payload can't be refreshed or
+        // decrypted, so there's nothing deliverable to retry — skip the send
+        // loop and release.
+        const delivered = refreshed.ok
+          ? decryptCommandForDelivery({ id: command.id, type, deviceId, payload: refreshed.payload })
+          : null;
         let sent = false;
         for (let attempt = 0; delivered && attempt < SEND_RETRY_ATTEMPTS; attempt++) {
           sent = sendCommandToAgent(device.agentId, toAgentCommandFrame(delivered));
@@ -1475,6 +1573,28 @@ async function dispatchPreparedCommand(
 }
 
 /**
+ * A backup write (MSSQL / Hyper-V) carries only a reference to its storage
+ * destination; what the helper receives is decided at delivery, on the
+ * delivery path's own connection. A helper that reports brokered writes is
+ * given a write session scoped to the command's backup job — but only when
+ * that connection can see the job. Dispatched from inside a held context, the
+ * job the caller just created is still uncommitted, so delivery cannot see it
+ * and falls back to sending the storage destination itself. That is decided by
+ * dispatch timing, not by the helper, so it is refused here rather than left
+ * to each caller to remember: create the job in a context that commits, then
+ * dispatch at depth 0 (`executeCommandWithSystemPrecheck`).
+ */
+function assertBackupWriteDispatchedAfterCommit(type: CommandType | string): void {
+  if (!BACKUP_WRITE_CREDENTIAL_COMMAND_TYPES.includes(type)) return;
+  if (!getCurrentDbAccessContext()) return;
+  throw new Error(
+    `${type} must be dispatched after the transaction that created its backup job has committed, `
+      + 'with no DB access context held — create the job in its own context, then dispatch with '
+      + 'executeCommandWithSystemPrecheck.',
+  );
+}
+
+/**
  * Execute a command and wait for result (convenience wrapper).
  *
  * When called from routes protected by authMiddleware, the entire request
@@ -1501,7 +1621,8 @@ export async function executeCommand(
   payload: CommandPayload = {},
   options: ExecuteCommandOptions = {}
 ): Promise<CommandResult> {
-  const precheck = await precheckCommandExecution(deviceId, type, options);
+  assertBackupWriteDispatchedAfterCommit(type);
+  const precheck = await precheckCommandExecution(deviceId, type, payload, options);
   if (!precheck.ok) return precheck.result;
   return dispatchPreparedCommand(precheck.device, deviceId, type, payload, options);
 }
@@ -1592,6 +1713,7 @@ export async function executeCommandWithSystemPrecheck(
   payload: CommandPayload = {},
   options: SystemPrecheckCommandOptions,
 ): Promise<CommandResult> {
+  assertBackupWriteDispatchedAfterCommit(type);
   const ambient = getCurrentDbAccessContext();
   if (ambient) {
     reportHeldContextDispatch(ambient.scope, deviceId, type);
@@ -1614,10 +1736,10 @@ export async function executeCommandWithSystemPrecheck(
   // guard above says so out loud. It must not also widen what the caller can
   // reach while it is being wrong.
   const precheck = ambient
-    ? await precheckCommandExecution(deviceId, type, options)
+    ? await precheckCommandExecution(deviceId, type, payload, options)
     : await runOutsideDbContextSafe(() =>
       withSystemDbAccessContext(
-        () => precheckCommandExecution(deviceId, type, options),
+        () => precheckCommandExecution(deviceId, type, payload, options),
         'commandQueue.executeCommandWithSystemPrecheck',
       ));
 

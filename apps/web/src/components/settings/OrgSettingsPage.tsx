@@ -51,6 +51,7 @@ import { isArchiveLifecycleOrg } from '@/lib/archiveLifecycle';
 import Pax8OrgTab from '../organizations/Pax8OrgTab';
 import ExtensionSlotHost from '../extensions/ExtensionSlotHost';
 import { useStableT } from '@/lib/i18n/useStableT';
+import { usePageItemName } from '../layout/usePageItemName';
 
 type TabKey =
   | 'general' | 'contacts' | 'branding' | 'portal' | 'notifications' | 'security'
@@ -289,6 +290,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
     return () => window.removeEventListener('beforeunload', warn);
   }, [saveState.hasUnsavedChanges]);
   const [orgDetails, setOrgDetails] = useState<OrgDetails | null>(null);
+  usePageItemName(orgDetails?.name);
   const [locked, setLocked] = useState<string[]>([]);
   // Issue #2124: registered versions for the pin selectors + the partner's
   // effective pins (shown when `defaults.agentVersionPins` is partner-locked).
@@ -351,14 +353,19 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
     }
   }, [activeTab, effectiveOrgId]);
 
-  const fetchOrgDetails = useCallback(async () => {
+  // `silent`: refresh after a tab saved through its OWN route (mTLS, log
+  // forwarding) — the page's copy of `settings` must pick that write up, since
+  // every section save re-posts the whole blob and the org PATCH replaces it
+  // wholesale. Silent skips the loading screen, so the open tab stays mounted
+  // with its drafts, and leaves the name/type drafts alone.
+  const fetchOrgDetails = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
     if (!effectiveOrgId) {
       setLoading(false);
       return;
     }
 
     try {
-      setLoading(true);
+      if (!silent) setLoading(true);
       setError(undefined);
       const response = await fetchWithAuth(`/orgs/organizations/${effectiveOrgId}`);
       if (!response.ok) {
@@ -370,8 +377,10 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
       }
       const data = await response.json();
       setOrgDetails(data);
-      setNameDraft(data.name ?? '');
-      setTypeDraft(data.type ?? 'customer');
+      if (!silent) {
+        setNameDraft(data.name ?? '');
+        setTypeDraft(data.type ?? 'customer');
+      }
 
       // Fetch effective settings to determine partner-locked fields
       const effRes = await fetchWithAuth(`/orgs/organizations/${effectiveOrgId}/effective-settings`);
@@ -593,7 +602,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
         <p className="text-sm text-destructive">{error}</p>
         <button
           type="button"
-          onClick={fetchOrgDetails}
+          onClick={() => void fetchOrgDetails()}
           className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
         >
           {t('orgSettingsPage.actions.tryAgain')}
@@ -639,10 +648,12 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
         return (
           <>
             <OrgSecuritySettings
+              orgId={effectiveOrgId}
               security={orgDetails?.settings?.security}
               mtls={orgDetails?.settings?.mtls}
               onDirty={handleDirty}
               onSave={(data) => handleSave('security', data)}
+              onMtlsSaved={() => void fetchOrgDetails({ silent: true })}
               locked={locked}
             />
             {/* Execution plane W05 (#5716, spec §8, §11). Lives under Security
@@ -692,7 +703,9 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
       case 'event-logs':
         return (
           <OrgEventLogSettings
+            orgId={effectiveOrgId}
             onDirty={handleDirty}
+            onSaved={() => void fetchOrgDetails({ silent: true })}
             locked={locked}
           />
         );
@@ -776,7 +789,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
                         }
                       }}
                       disabled={isArchived}
-                      className="flex-1 rounded-md border bg-background px-3 py-1.5 text-base font-semibold focus:outline-hidden focus:ring-2 focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
+                      className="min-w-0 flex-1 rounded-md border bg-background px-3 py-1.5 text-base font-semibold focus:outline-hidden focus:ring-2 focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
                       placeholder={t('orgSettingsPage.overview.organizationName')}
                       aria-label={t('orgSettingsPage.overview.organizationName')}
                     />
@@ -809,7 +822,7 @@ export default function OrgSettingsPage({ orgId: propOrgId }: OrgSettingsPagePro
                       value={typeDraft}
                       onChange={(e) => setTypeDraft(e.target.value)}
                       disabled={isArchived}
-                      className="flex-1 rounded-md border bg-background px-3 py-1.5 text-base font-semibold focus:outline-hidden focus:ring-2 focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
+                      className="min-w-0 flex-1 rounded-md border bg-background px-3 py-1.5 text-base font-semibold focus:outline-hidden focus:ring-2 focus:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
                       aria-label={t('orgSettingsPage.overview.organizationType')}
                     >
                       <option value="customer">{t('orgSettingsPage.overview.types.customer')}</option>

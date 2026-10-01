@@ -86,6 +86,7 @@
     },
     "filters": {
       "allDevices": "Todos os dispositivos ({{count}})",
+      "statusFilterLabel": "Filtrar por status de conformidade",
       "pendingPatches": "Patches pendentes ({{count}})",
       "critical": "Críticos ({{count}})",
       "pendingReboot": "Reinicialização pendente ({{count}})",
@@ -264,7 +265,11 @@
       "moreFilters": "Mais filtros",
       "lessFilters": "Menos filtros",
       "allSources": "Todas as fontes",
-      "allOs": "Todos os SOs"
+      "allOs": "Todos os SOs",
+      "severityLabel": "Gravidade",
+      "statusLabel": "Status de aprovação",
+      "sourceLabel": "Origem",
+      "osLabel": "Sistema operacional"
     },
     "actions": {
       "deploy": "Implantar",
@@ -299,6 +304,12 @@
     "pagination": {
       "rowsPerPage": "Linhas por página",
       "pageStatus": "Página {{current}} de {{total}}"
+    },
+    "installFailure": {
+      "badgeDevices_one": "Falha na instalação em {{count}} dispositivo",
+      "badgeDevices_other": "Falha na instalação em {{count}} dispositivos",
+      "noReason": "Nenhum motivo informado pelo agente",
+      "failedAt": "Última tentativa de instalação falhou: {{when}}"
     }
   },
   "patchesPage": {
@@ -309,6 +320,7 @@
     "tabs": {
       "compliance": "Conformidade",
       "patches": "Patches",
+      "jobs": "Trabalhos",
       "updateRings": "Anéis de atualização"
     },
     "actions": {
@@ -326,6 +338,7 @@
     "errors": {
       "fetchRings": "Falha ao buscar anéis de atualização",
       "fetchPatches": "Falha ao buscar patches",
+      "fetchJobs": "Falha ao buscar trabalhos de patch",
       "partnerLevel": "As aprovações de patches são gerenciadas no nível do parceiro",
       "approvePatches": "Falha ao aprovar patches",
       "approveCountOne": "Falha ao aprovar {{count}} patch",
@@ -368,6 +381,68 @@
     },
     "truncatedNotice": "Exibindo {{shown}} de {{total}} patches. Os filtros aqui apenas restringem o que já foi carregado, então o restante não pode ser alcançado nesta visualização — use a API de patches para percorrer o catálogo completo.",
     "shiftedNotice": "Exibindo {{shown}} de {{total}} patches — o catálogo mudou enquanto carregava. Recarregue para ver o restante."
+  },
+  "patchJobsList": {
+    "empty": "Ainda não há trabalhos de patch. Trabalhos criados por políticas, anéis de atualização ou pelo assistente de IA aparecerão aqui.",
+    "loading": "Carregando trabalhos de patch...",
+    "columns": {
+      "name": "Trabalho",
+      "status": "Status",
+      "devices": "Dispositivos",
+      "createdBy": "Criado por",
+      "scheduled": "Agendado",
+      "started": "Iniciado",
+      "completed": "Concluído"
+    },
+    "status": {
+      "scheduled": "Agendado",
+      "running": "Em execução",
+      "completed": "Concluído",
+      "failed": "Falhou",
+      "cancelled": "Cancelado"
+    },
+    "devicesSummary": "{{completed}}/{{total}} concluídos",
+    "devicesSummaryWithFailed": "{{completed}}/{{total}} concluídos, {{failed}} falharam",
+    "createdBySystem": "Sistema",
+    "notScheduled": "—",
+    "actions": {
+      "tryAgain": "Tentar novamente",
+      "previousPage": "Anterior",
+      "nextPage": "Próximo"
+    },
+    "pagination": "Página {{page}} de {{totalPages}}",
+    "filters": {
+      "allStatuses": "Todos os status"
+    }
+  },
+  "patchJobDetail": {
+    "title": "Trabalho de patch",
+    "loading": "Carregando detalhes do trabalho...",
+    "notFound": "Este trabalho de patch não foi encontrado.",
+    "summary": {
+      "status": "Status",
+      "source": "Origem",
+      "scheduled": "Agendado",
+      "started": "Iniciado",
+      "completed": "Concluído",
+      "createdBy": "Criado por"
+    },
+    "resultsTitle": "Resultados por dispositivo ({{count}})",
+    "resultsEmpty": "Ainda não há resultados por dispositivo.",
+    "columns": {
+      "device": "Dispositivo",
+      "patch": "Patch",
+      "status": "Status",
+      "started": "Iniciado",
+      "completed": "Concluído",
+      "reboot": "Reinicialização"
+    },
+    "rebootRequired": "Necessária",
+    "rebootDone": "Concluída",
+    "rebootNotRequired": "—",
+    "errors": {
+      "load": "Falha ao carregar o trabalho de patch"
+    }
   },
   "ringSelector": {
     "label": "Anel de atualização:",

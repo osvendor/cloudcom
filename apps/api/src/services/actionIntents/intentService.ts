@@ -60,7 +60,9 @@ import {
   type IntentTargetScope,
   type ResolveIntentApproversDiagnostics,
 } from './intentApprovers';
+import { isSoleOperatorSelfApprovalForbidden } from './selfApprovalPolicy';
 import { computeEffectDigestOutcome, EffectDigestUnresolvableError, type EffectDigestOutcome } from './effectDigest';
+import { DIAGNOSE_CONNECTIVITY_TOOL_NAME, requiresPinnedEffectDigest } from './pinnedEffectPolicy';
 import {
   assertArgsMatchScope,
   assertArgsMatchTicketScope,
@@ -425,6 +427,15 @@ function nonEmptyString(value: unknown): string | null {
  * fallback below.
  */
 const IMPACT_SUMMARY_BUILDERS: Record<string, (input: Record<string, unknown>) => string | null> = {
+  // Topology M4 Task 4: the materialized proposal names its pinned origin,
+  // context, family and expiry; nothing on the device changes.
+  diagnose_connectivity: (input) => {
+    const recipe = nonEmptyString(input.recipe_id);
+    const origin = nonEmptyString(input.origin_device_id);
+    const expires = nonEmptyString(input.proposal_expires_at);
+    if (!recipe || !origin || !expires) return null;
+    return `Runs one bounded ${recipe.replace(/_/g, ' ')} check from device ${origin.slice(0, 8)}... (context ${nonEmptyString(input.context_key) ?? 'default'}, ${nonEmptyString(input.family) ?? 'ipv4'}); observational only, nothing is changed. Not startable after ${expires}.`;
+  },
   manage_services: (input) => {
     const action = nonEmptyString(input.action);
     const serviceName = nonEmptyString(input.serviceName);
@@ -952,10 +963,12 @@ async function runHumanFanout(args: HumanFanoutArgs): Promise<HumanFanoutResult>
       .returning({ id: approvalRequests.id });
     approvalRequestIds = rows.map((r) => r.id);
     fanOutUserIds = eligibleApprovers;
-  } else if (requesterEligible) {
+  } else if (requesterEligible && !isSoleOperatorSelfApprovalForbidden(toolName)) {
     // Sole-operator branch: the only eligible approver is the requester.
     // Create one row carrying the digest; the assurance-level >= 3 gate is
     // enforced later, in the decide handler (Task 5), not here.
+    // PAM elevation intents never take this branch —
+    // they fall through to the no_eligible_approvers cancellation below.
     ({ approvalRequestIds, requesterApprovalRequestId, fanOutUserIds } =
       await insertSingleApproverRow(requesterId));
   }
@@ -1297,6 +1310,36 @@ export async function createActionIntent(
     throw new ActionIntentError(SITE_CEILING_WRITE_DENIED_MESSAGE, 'site_ceiling');
   }
 
+  // Topology M4 Task 4 (#6000), amendments M4-D1/M4-D3: a diagnose_connectivity
+  // proposal is admitted only from a human's site-pinned topology session, and
+  // is MATERIALIZED here — the origin the planner would use (auto-selected or
+  // confirmed), its context/family and an immutable proposal expiry become the
+  // intent's (immutable) arguments, and the origin is written into the approval
+  // text — so what the approver reads is exactly what the effect digest below
+  // pins. Every intent path funnels through this function, so agent runs, API
+  // keys and scripts are refused here too. Refusals leave no row behind.
+  if (input.toolName === DIAGNOSE_CONNECTIVITY_TOOL_NAME && !externalTool) {
+    // Loaded on demand: the topology graph is irrelevant to every other intent.
+    const { prepareTopologyDiagnosticProposal, TopologyDiagnosticProposalError } = await import('../topology/aiDiagnosticApproval');
+    let prepared: Awaited<ReturnType<typeof prepareTopologyDiagnosticProposal>>;
+    try {
+      prepared = await prepareTopologyDiagnosticProposal(auth, input.input);
+    } catch (err) {
+      if (err instanceof TopologyDiagnosticProposalError) throw new ActionIntentError(err.message, err.code);
+      throw err;
+    }
+    if (input.orgId && input.orgId !== prepared.orgId) {
+      throw new ActionIntentError('The proposal belongs to a different organization', 'topology_site_mismatch');
+    }
+    input = {
+      ...input,
+      input: prepared.arguments as unknown as Record<string, unknown>,
+      orgId: prepared.orgId,
+      reason: prepared.label,
+      actionLabel: prepared.label,
+    };
+  }
+
   const { check: guardrail, context: guardrailContext } = externalTool
     ? {
         check: {
@@ -1400,6 +1443,10 @@ export async function createActionIntent(
   // W04 (#5612): the run's immutable start-of-run policy snapshot, handed to
   // the script lane's agent-authority gate (invariant 13).
   let agentRunPolicySnapshot: AiAgentPolicySnapshot | null = null;
+  // The run's actual admission-time mode, handed to the
+  // script lane's agent-authority gate alongside the snapshot above — see
+  // its use in scriptReviewerAutonomy.ts's `checkAgentAuthority`.
+  let agentRunModeAtStart: string | null = null;
   // #5106: the scoped device's human-readable name, threaded through to
   // buildActionLabel below so the approval headline reads "on <hostname>"
   // instead of the raw "on device <id>..." stub. Stays null for every
@@ -1426,6 +1473,12 @@ export async function createActionIntent(
             policySnapshot: aiAgentRuns.policySnapshot,
             taskId: aiAgentRuns.taskId,
             taskStepKey: aiAgentRuns.taskStepKey,
+            // The run's actual admission-time mode, as
+            // forced by runService.ts's ticket/anomaly downgrade — distinct
+            // from policySnapshot.effective.mode, which stores the resolved
+            // policy's mode regardless of that downgrade. The decidability
+            // gate below must key on this, not on the snapshot's mode.
+            modeAtStart: aiAgentRuns.modeAtStart,
           })
           .from(aiAgentRuns)
           .where(eq(aiAgentRuns.id, principal.runId))
@@ -1498,6 +1551,7 @@ export async function createActionIntent(
     agentRun = loaded.run;
     agentRow = loaded.agent;
     agentRunPolicySnapshot = loaded.run.policySnapshot ?? null;
+    agentRunModeAtStart = loaded.run.modeAtStart ?? null;
 
     // #5205 W04 (#5209), Codex quorum D1b (adopted): the caller ASSERTING a
     // task id proves nothing. `ai_agent_runs.task_id` / `task_step_key` are
@@ -1574,7 +1628,14 @@ export async function createActionIntent(
     // at all: checkAgentGuardrails denies every mutating call whose
     // policy.deviceId is null ("the run is not device-bound").
     const effective = loaded.run.policySnapshot?.effective;
-    agentRunMode = effective?.mode;
+    // The decidability gate must key on the run's actual
+    // admission-time mode (`modeAtStart`), not on `effective.mode`. An
+    // anomaly- or ticket-triggered run is admitted with `modeAtStart:
+    // 'shadow'` even when the resolved policy's own mode is 'act'
+    // (runService.ts's forced-shadow downgrade) — `policySnapshot.effective`
+    // still records that resolved 'act' mode unchanged, so reading it here
+    // silently un-does the downgrade for the policy-decide gate.
+    agentRunMode = loaded.run.modeAtStart;
     // Through the SAME resolver every release/decide-time reader uses, rather
     // than an inline `scope ?? run` — creation and release must not be able to
     // drift on what "the intent's target device" means. A freshly-minted
@@ -1862,6 +1923,15 @@ export async function createActionIntent(
       // check", not a failure. The `unresolved` cases are audited after
       // commit — they are intents that SHOULD have been pinned and weren't.
       const effectDigestOutcome = await computeEffectDigestOutcome(input.toolName, input.input, db);
+      // A tool whose pin is MANDATORY (effectDigest.ts's
+      // requiresPinnedEffectDigest) never stores a NULL digest: refuse the
+      // proposal instead of inheriting the legacy "nothing to check" fallback.
+      if (effectDigestOutcome.kind !== 'pinned' && requiresPinnedEffectDigest(input.toolName)) {
+        throw new EffectDigestUnresolvableError(
+          input.toolName,
+          effectDigestOutcome.kind === 'unresolved' ? effectDigestOutcome.reason : 'no resolver',
+        );
+      }
       const effectDigest = effectDigestOutcome.kind === 'pinned' ? effectDigestOutcome.digest : null;
 
       // Wave 5 Part A (#3827): resolved BEFORE the insert so it can be
@@ -1941,7 +2011,12 @@ export async function createActionIntent(
               orgId,
               approvalScope,
               agentRun: agentRun
-                ? { id: agentRun.id, agentId: agentRun.agentId, policySnapshot: agentRunPolicySnapshot }
+                ? {
+                  id: agentRun.id,
+                  agentId: agentRun.agentId,
+                  policySnapshot: agentRunPolicySnapshot,
+                  modeAtStart: agentRunModeAtStart,
+                }
                 : null,
               arguments: input.input,
             },

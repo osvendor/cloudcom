@@ -94,6 +94,10 @@ export const backupProcessResultSchema = z.object({
   // the TOP-LEVEL key has to be declared right here or the job dead-letters.
   vssMetadata: z.unknown().optional(),
   snapshot: backupSnapshotSummarySchema.optional(),
+  // Snapshot attestation envelope, forwarded verbatim; validated where it is
+  // recorded (services/backupAttestation.ts). Same `z.unknown()` reasoning as
+  // vssMetadata above.
+  attestation: z.unknown().optional(),
   error: z.string().min(1).optional(),
 }).strict();
 
@@ -121,6 +125,11 @@ export const backupQueueJobDataSchema = z.discriminatedUnion('type', [
     // field existed (legacy job payloads never re-hydrate this field, so the
     // dispatch precheck treats undefined as "skip the comparison").
     configGeneration: z.number().int().optional(),
+    // Set only on a dispatch queued again because the device had not reported
+    // its backup helper yet (backupWorker holdForHelperReport): the number of
+    // that re-queue and when the wait began (ISO 8601), which bounds it.
+    capabilityWaitAttempt: z.number().int().positive().optional(),
+    capabilityWaitSince: z.string().datetime().optional(),
     meta: queueActorMetaSchema.optional(),
   }).strict(),
   z.object({
@@ -129,6 +138,10 @@ export const backupQueueJobDataSchema = z.discriminatedUnion('type', [
     orgId: z.string().min(1),
     deviceId: z.string().min(1),
     result: backupProcessResultSchema,
+    // Set by the result handler only after it consumed this job's dispatch
+    // expectation. A queue item without it (enqueued by an older API) never
+    // records a snapshot attestation.
+    dispatchExpectationVerified: z.literal(true).optional(),
     meta: queueActorMetaSchema.optional(),
   }).strict(),
 ]);
@@ -334,6 +347,10 @@ export const automationQueueJobDataSchema = z.discriminatedUnion('type', [
     configPolicyId: z.string().min(1).optional(),
     targetDeviceIds: z.array(z.string().min(1)),
     triggeredBy: z.string().min(1),
+    // #3189 — the trigger occurrence this run is for, so a replayed job resumes
+    // the run the first attempt admitted instead of admitting a second one.
+    // Optional: jobs enqueued before this field existed simply are not deduped.
+    occurrenceKey: z.string().min(1).max(255).optional(),
   }).strict(),
 ]);
 

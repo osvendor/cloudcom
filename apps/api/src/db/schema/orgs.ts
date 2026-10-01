@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, text, timestamp, jsonb, pgEnum, integer, boolean, numeric, char, uniqueIndex, index } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, timestamp, jsonb, pgEnum, integer, boolean, numeric, char, uniqueIndex, index, type AnyPgColumn } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import type { ImpactWeightOverrides } from '@breeze/shared';
 
@@ -18,7 +18,13 @@ export const planTypeEnum = pgEnum('plan_type', ['free', 'starter', 'community',
 // (organizations_partner_quick_support_uniq). It must stay inside
 // accessibleOrgIds so RLS lets techs reach their own support sessions, but it
 // is excluded from every user-facing org enumeration and device/billing count.
-export const orgTypeEnum = pgEnum('org_type', ['customer', 'internal', 'quick_support']);
+//
+// 'unassigned_pool' is the hidden per-partner holding org for devices enrolled
+// with a partner deploy key. Exactly one per
+// partner (organizations_partner_unassigned_pool_uniq). Unlike quick_support it
+// is NEVER inside a human caller's accessibleOrgIds, is execution-denied, and
+// is protected by triggers (see services/unassignedPool/orgType.ts).
+export const orgTypeEnum = pgEnum('org_type', ['customer', 'internal', 'quick_support', 'unassigned_pool']);
 export const orgStatusEnum = pgEnum('org_status', ['active', 'suspended', 'trial', 'churned', 'offboarding', 'merging', 'archived', 'purging']);
 
 export const partners = pgTable('partners', {
@@ -49,6 +55,12 @@ export const partners = pgTable('partners', {
   // acceptance ON THEIR BEHALF. DEFAULT OFF — a new outbound customer email
   // must not start firing on upgrade. Same dedicated-column reasoning as above.
   notifyCustomerOnBehalfAcceptance: boolean('notify_customer_on_behalf_acceptance').notNull().default(false),
+  // Per-partner switch (and kill switch) for deploy-key enrollment into the
+  // partner's holding area. Effective only while the platform flag
+  // PRE_ASSIGNMENT_ENROLLMENT_ENABLED is also on
+  // (services/unassignedPool/switches.ts). Default OFF. Dedicated column, same
+  // reasoning as above.
+  deployKeyEnrollmentEnabled: boolean('deploy_key_enrollment_enabled').notNull().default(false),
   // P2-6 (#4193). PARTIAL overrides of DEFAULT_IMPACT_WEIGHTS (@breeze/shared);
   // NULL means "defaults". Dedicated column, not a partners.settings
   // sub-object — settings cards replace sub-objects wholesale (#3597) and
@@ -286,6 +298,25 @@ export const enrollmentKeys = pgTable('enrollment_keys', {
   // Plain uuid — the FK lives in SQL to avoid a circular import with
   // supportSessions.ts (which imports organizations from this file).
   supportSessionId: uuid('support_session_id'),
+  // Parent-lineage for a child key minted by redeeming a public /s/:code
+  // short-link (routes/enrollmentKeys.ts publicShortLinkRoutes). Distinct
+  // from bootstrapTokenId above, which links a child to the
+  // installer_bootstrap_tokens row that minted it (the MCP bootstrap /
+  // authenticated-installer path) — a /s/:code redemption mints its child
+  // directly against the parent link row, with no bootstrap-token row in
+  // between, so it carries no bootstrapTokenId at all. Nullable: only set
+  // for that one redemption path. Self-referencing FK, so it needs the lazy
+  // `(): AnyPgColumn =>` form (a plain `() =>` reference can't resolve a
+  // table to itself at module-eval time).
+  sourceLinkKeyId: uuid('source_link_key_id').references((): AnyPgColumn => enrollmentKeys.id, { onDelete: 'set null' }),
+  // Snapshot of the parent's credentialGeneration at the moment this child
+  // was minted. Rotating the parent bumps its own credentialGeneration;
+  // comparing this snapshot against the parent's CURRENT value at rotation
+  // time is what lets rotation find and revoke children minted from the
+  // superseded credential, the same pattern installerBootstrapTokens.
+  // parentCredentialGeneration already uses for bootstrap-token-derived
+  // children.
+  sourceLinkKeyGeneration: integer('source_link_key_generation'),
 });
 
 // Durable "loser merged into survivor" record (spec 2026-08-26). loser_org_id

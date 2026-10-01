@@ -28,7 +28,7 @@
     "vulnerabilities": "Vulnerabilidades",
     "oneDrive": "OneDrive",
     "aiForOffice": "IA para Office",
-    "networkMonitor": "Monitoramento de Rede",
+    "networkMonitor": "Rede",
     "jobs": "Jobs",
     "monitoring": "Monitoramento",
     "networkDiscovery": "Descoberta de Rede",
@@ -47,6 +47,7 @@
     "timesheets": "Folhas de Horas",
     "productCatalog": "Catálogo de Produtos",
     "deviceGroups": "Grupos de dispositivos",
+    "unassignedDevices": "Dispositivos não atribuídos",
     "configPolicies": "Políticas de Configuração",
     "integrations": "Integrações",
     "cloudBackup": "Backup em Nuvem",
@@ -92,6 +93,8 @@
     "fleetOrchestration": "Orquestração de Frota",
     "aiAssistant": "Assistente de IA",
     "software": "Software",
+    "softwareInventory": "Inventário de software",
+    "softwarePolicies": "Políticas de software",
     "securityOverview": "Visão Geral",
     "aiRisk": "Risco de IA",
     "deviceBackup": "Backup de Dispositivos",
@@ -101,7 +104,8 @@
     "deliverableTemplates": "Modelos de entregáveis",
     "securityScans": "Varreduras de IOC",
     "system": "Sistema",
-    "monitorConversion": "Conversão de monitores"
+    "monitorConversion": "Conversão de monitores",
+    "timeSync": "Sincronização de horário"
   },
   "documentTitles": {
     "dashboard": "Painel",
@@ -747,7 +751,8 @@
         "alertRulesDescription": "Gerenciar alertas nas Políticas de configuração",
         "keyboardShortcuts": "Atalhos de teclado",
         "keyboardShortcutsDescription": "Todas as teclas e sequências em um só cartão"
-      }
+      },
+      "numberHint": "{{mod}}1–9 para abrir"
     },
     "notifications": {
       "title": "Notificações",
@@ -813,7 +818,17 @@
       "help": "Abrir o painel de ajuda",
       "showThis": "Mostrar este cartão",
       "close": "Fechar uma caixa de diálogo ou menu",
-      "typingNote": "Atalhos de uma tecla ficam pausados enquanto você digita em um campo."
+      "typingNote": "Atalhos de uma tecla ficam pausados enquanto você digita em um campo.",
+      "create": "Criar",
+      "createHint": "Pressione c, solte e depois a tecla.",
+      "paletteNumber": "Abrir um resultado da busca pelo número",
+      "newItems": {
+        "ticket": "Novo chamado",
+        "quote": "Novo orçamento",
+        "invoice": "Nova fatura",
+        "contract": "Novo contrato",
+        "script": "Novo script"
+      }
     }
   },
   "migrationBanner": {
@@ -874,97 +889,18 @@
       }
     },
     "monitors": {
-      "CreateMonitorForm": {
-        "actions": {
-          "createMonitor": "Criar monitor",
-          "creating": "Criando..."
-        },
-        "errors": {
-          "createMonitor": "Falha ao criar monitor",
-          "generic": "Ocorreu um erro",
-          "nameRequired": "Nome é obrigatório",
-          "targetRequired": "Destino é obrigatório"
-        },
-        "fields": {
-          "expectedBanner": "Banner esperado (opcional)",
-          "expectedBody": "Conteúdo esperado do corpo (opcional)",
-          "expectedStatus": "Status esperado",
-          "expectedValue": "Valor esperado (opcional)",
-          "followRedirects": "Seguir redirecionamentos",
-          "hostname": "Nome do host a resolver",
-          "method": "Método",
-          "monitorType": "Tipo de monitor",
-          "nameserver": "Servidor de nomes personalizado (opcional)",
-          "pingCount": "Contagem de ping",
-          "pollingInterval": "Intervalo de consulta (segundos)",
-          "port": "Porta",
-          "recordType": "Tipo de registro",
-          "target": "Destino (IP/Nome do host)",
-          "timeout": "Tempo limite (segundos)",
-          "url": "URL",
-          "verifySsl": "Verificar SSL"
-        },
-        "monitorTypes": {
-          "dnsCheck": {
-            "description": "Verificar se os registros DNS resolvem corretamente",
-            "label": "Verificação de DNS"
-          },
-          "httpCheck": {
-            "description": "Monitorar endpoints HTTP/HTTPS",
-            "label": "Verificação HTTP"
-          },
-          "icmpPing": {
-            "description": "Verificar se um host está acessível via ping",
-            "label": "Ping ICMP"
-          },
-          "tcpPort": {
-            "description": "Verificar se uma porta TCP está aberta e respondendo",
-            "label": "Porta TCP"
-          }
-        },
-        "placeholders": {
-          "expectedBanner": "ex.: SSH-",
-          "expectedBody": "ex.: \"status\":\"ok\"",
-          "expectedValue": "ex.: 93.184.216.34",
-          "hostname": "example.com",
-          "name": "ex.: Servidor Web de Produção",
-          "nameserver": "8.8.8.8",
-          "target": "192.168.1.1 ou server.example.com",
-          "url": "https://example.com/health"
-        },
-        "subtitle": "Configure uma nova verificação de monitoramento para um destino de rede.",
-        "title": "Criar monitor de rede"
-      },
       "MonitorDetailModal": {
         "actions": {
-          "cancelEdit": "Cancelar edição",
-          "checkNow": "Verificar agora",
-          "deleteMonitor": "Excluir monitor",
-          "deleting": "Excluindo...",
-          "yesDelete": "Sim, excluir"
-        },
-        "alertRules": {
-          "disabled": "(desativado)",
-          "title": "Regras de alerta"
+          "checkNow": "Verificar agora"
         },
         "consecutiveFailures": "{{count}} falha consecutiva",
         "consecutiveFailures_plural": "{{count}} falhas consecutivas",
-        "delete": {
-          "confirmShort": "Tem certeza?"
-        },
         "errors": {
-          "deleteMonitor": "Falha ao excluir monitor",
           "generic": "Ocorreu um erro",
           "loadDetails": "Falha ao carregar detalhes do monitor",
-          "triggerCheck": "Falha ao acionar verificação",
-          "updateMonitor": "Falha ao atualizar monitor"
+          "triggerCheck": "Falha ao acionar verificação"
         },
         "fallbackTitle": "Monitor",
-        "fields": {
-          "interval": "Intervalo (s)",
-          "timeout": "Tempo limite (s)",
-          "target": "URL de destino"
-        },
         "labels": {
           "lastChecked": "Última verificação: {{time}}",
           "response": "Resposta: {{response}}",
@@ -992,8 +928,6 @@
           "icmpPing": "Ping ICMP",
           "tcpPort": "Porta TCP"
         },
-        "targetResetNote": "Alterar a URL redefine a observação TLS.",
-        "saved": "Monitor atualizado",
         "certificate": {
           "title": "Certificado",
           "issuer": "Emissor",
@@ -1005,27 +939,22 @@
             "handshakeFailed": "Falha na negociação TLS",
             "notTls": "Sem TLS"
           }
-        }
+        },
+        "openMonitor": "Abrir o monitor desta verificação",
+        "notConverted": "Revise a conversão em Resultados."
       },
       "NetworkMonitorList": {
         "actions": {
-          "addMonitor": "Adicionar monitor",
-          "deleteMonitor": "Excluir monitor",
           "runCheckNow": "Executar verificação agora",
-          "viewDetails": "Ver detalhes"
+          "viewDetails": "Ver detalhes",
+          "newCheck": "Nova verificação"
         },
         "assetFilter": "Filtrando monitores para o ativo selecionado.",
-        "delete": {
-          "confirmLabel": "Excluir monitor",
-          "message": "Tem certeza de que deseja excluir este monitor? Isso também removerá todos os resultados e regras de alerta. Esta ação não pode ser desfeita.",
-          "title": "Excluir monitor de rede"
-        },
         "empty": {
-          "action": "Crie um agora.",
-          "prefix": "Nenhum monitor de rede configurado."
+          "action": "Criar um monitor.",
+          "prefix": "Nenhuma verificação de rede."
         },
         "errors": {
-          "deleteMonitor": "Falha ao excluir monitor",
           "fetchMonitors": "Falha ao buscar monitores",
           "generic": "Ocorreu um erro",
           "triggerCheck": "Falha ao acionar verificação"
@@ -1038,11 +967,13 @@
           "interval": "Intervalo",
           "lastChecked": "Última verificação",
           "response": "Resposta",
-          "target": "Destino"
+          "target": "Destino",
+          "monitor": "Monitor",
+          "openMonitor": "Abrir monitor"
         },
         "loading": "Carregando monitores...",
         "messages": {
-          "monitorDeleted": "Monitor excluído"
+          "checkQueued": "Verificação de rede na fila"
         },
         "status": {
           "degraded": "Degradado"
@@ -1059,6 +990,21 @@
           "httpCheck": "Verificação HTTP",
           "icmpPing": "Ping ICMP",
           "tcpPort": "Porta TCP"
+        },
+        "notConverted": "Não convertido"
+      },
+      "NetworkCheckConversionBanner": {
+        "pending_one": "{{count}} verificação de rede precisa de revisão.",
+        "pending_other": "{{count}} verificações de rede precisam de revisão.",
+        "review": "Revisar conversão",
+        "title": "Conversão de verificações de rede",
+        "convert": "Converter {{count}}",
+        "converted_one": "{{count}} verificação de rede convertida",
+        "converted_other": "{{count}} verificações de rede convertidas",
+        "failed": "Não foi possível converter as verificações de rede",
+        "outcome": {
+          "convertible": "Conversível",
+          "unconvertible": "Não é possível converter"
         }
       }
     },
@@ -1205,7 +1151,8 @@
           "title": "Nenhuma conexão PSA configurada"
         },
         "filters": {
-          "allStatuses": "Todos os status"
+          "allStatuses": "Todos os status",
+          "statusFilterLabel": "Status da conexão"
         },
         "headers": {
           "connection": "Conexão",
@@ -1274,7 +1221,8 @@
           "title": "Nenhum ticket PSA sincronizado"
         },
         "filters": {
-          "allStatuses": "Todos os status"
+          "allStatuses": "Todos os status",
+          "statusFilterLabel": "Status do chamado"
         },
         "headers": {
           "linkedAlert": "Alerta vinculado",
@@ -1410,7 +1358,8 @@
         "empty": "Nenhum webhook encontrado.",
         "failedCount": "{{count}} falhou",
         "filters": {
-          "allStatuses": "Todos os status"
+          "allStatuses": "Todos os status",
+          "statusFilterLabel": "Status do webhook"
         },
         "headers": {
           "events": "Eventos",
@@ -1847,7 +1796,7 @@
         "configureMonitoring": "Configurar Monitoramento",
         "pauseSnmpPolling": "Pausar polling SNMP",
         "resumeSnmpPolling": "Retomar polling SNMP",
-        "disableAllActiveMonitoring": "Desativar todo monitoramento ativo deste ativo",
+        "disableSnmpMonitoring": "Desativar monitoramento SNMP",
         "needsOrgSelection": "Os ativos de monitoramento de rede pertencem a uma única organização.",
         "loadingAssets": "Carregando ativos de monitoramento...",
         "showingAllDiscoveredAssets": "Mostrando todos os ativos descobertos",
@@ -1943,11 +1892,12 @@
       "MonitoringPage": {
         "tabs": {
           "assets": "Ativos",
-          "checks": "Verificações de Rede",
-          "templates": "Modelos SNMP"
+          "templates": "Modelos SNMP",
+          "results": "Resultados"
         },
-        "title": "Monitoramento",
-        "description": "Polling SNMP e verificações de rede. A descoberta pode alimentar o monitoramento, mas o monitoramento é gerenciado aqui."
+        "title": "Rede",
+        "description": "Ativos, modelos SNMP e resultados das verificações de rede. As verificações são criadas como monitores em Alertas.",
+        "newCheck": "Nova verificação"
       }
     },
     "fleet": {
@@ -2187,7 +2137,8 @@
         "description": "Incidentes acompanhados e achados de EDR em todas as suas organizações.",
         "filters": {
           "tracked": "Acompanhados",
-          "findings": "Achados"
+          "findings": "Achados",
+          "kindLabel": "Tipo"
         },
         "emptyTitle": "Nenhum incidente encontrado",
         "emptyFiltered": "Nenhum incidente corresponde aos filtros atuais.",
@@ -2410,7 +2361,9 @@
           "unknown": "Desconhecido"
         },
         "lastSeen": "Visto por último",
-        "noDeviceInventory": "Nenhum inventário de dispositivos disponível dos clientes ainda."
+        "noDeviceInventory": "Nenhum inventário de dispositivos disponível dos clientes ainda.",
+        "healthFilterLabel": "Saúde",
+        "sortFilterLabel": "Ordenar por"
       }
     },
     "remediation": {
@@ -2497,7 +2450,36 @@
         "requesting": "Solicitando...",
         "requestApproval": "Solicitar aprovação",
         "waitingApprovalTitle": "Aguardando aprovação PAM",
-        "approvalPending": "Aprovação pendente"
+        "approvalPending": "Aprovação pendente",
+        "proven": {
+          "badge": "Correção comprovada",
+          "trackAllClients": "Funcionou {{verified}} de {{attempts}} vezes nos seus clientes",
+          "trackThisClient": "Funcionou {{verified}} de {{attempts}} vezes neste cliente"
+        },
+        "feedback": {
+          "worked": "Funcionou",
+          "didNotWork": "Não funcionou",
+          "recorded": "Feedback registrado",
+          "failed": "Não foi possível registrar o feedback"
+        },
+        "done": {
+          "button": "Concluído",
+          "recorded": "Marcado como concluído — acompanhando a recuperação",
+          "failed": "Não foi possível marcar como concluído"
+        },
+        "outcome": {
+          "label": "Resultado: {{state}}",
+          "state": {
+            "pending": "em execução",
+            "awaitingRecovery": "acompanhando a recuperação",
+            "holding": "recuperado — confirmando que se mantém",
+            "verified": "correção verificada",
+            "failed": "não corrigiu o problema",
+            "recurred": "voltou a ocorrer",
+            "inconclusive": "inconclusivo",
+            "cancelled": "cancelado"
+          }
+        }
       }
     },
     "support": {

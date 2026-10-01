@@ -20,6 +20,7 @@ import {
   resolveSiteAllowedDeviceIds,
   runFrozenDeviceIds,
 } from './aiToolsSiteScope';
+import { notInHoldingOrgCondition, notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 
 type VaultHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
 
@@ -95,6 +96,11 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
       // Site axis: a site-restricted caller may only see vaults for devices in
       // their allowed sites (RLS does NOT enforce site). Narrow to that set.
       const orgId = getOrgId(auth);
+      // Fail closed: a site-restricted caller whose org never
+      // resolves must not fall through to an unfiltered query.
+      if (auth.allowedSiteIds && !orgId) {
+        return JSON.stringify({ vaults: [], showing: 0 });
+      }
       if (auth.allowedSiteIds && orgId) {
         const allowed = await resolveSiteAllowedDeviceIds(orgId, auth);
         if (!allowed || allowed.length === 0) {
@@ -168,7 +174,7 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
       const deviceId = input.deviceId as string;
       if (!deviceId) return JSON.stringify({ error: 'deviceId is required' });
 
-      const deviceConditions: SQL[] = [eq(devices.id, deviceId)];
+      const deviceConditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
       const dc = orgWhere(auth, devices.orgId);
       if (dc) deviceConditions.push(dc);
       const [device] = await db
@@ -259,7 +265,7 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
       const vaultId = input.vaultId as string;
       if (!vaultId) return JSON.stringify({ error: 'vaultId is required' });
 
-      const vaultConditions: SQL[] = [eq(localVaults.id, vaultId)];
+      const vaultConditions: SQL[] = [eq(localVaults.id, vaultId), notInHoldingOrgCondition(localVaults.orgId)];
       const vc = orgWhere(auth, localVaults.orgId);
       if (vc) vaultConditions.push(vc);
       const [vault] = await db
@@ -378,7 +384,7 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ error: 'deviceId and vaultPath are required for create' });
         }
 
-        const deviceConditions: SQL[] = [eq(devices.id, deviceId)];
+        const deviceConditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
         const dc = orgWhere(auth, devices.orgId);
         if (dc) deviceConditions.push(dc);
         const [device] = await db
@@ -419,7 +425,7 @@ export function registerVaultTools(aiTools: Map<string, AiTool>): void {
         const vaultId = input.vaultId as string;
         if (!vaultId) return JSON.stringify({ error: 'vaultId is required for update' });
 
-        const vaultConditions: SQL[] = [eq(localVaults.id, vaultId)];
+        const vaultConditions: SQL[] = [eq(localVaults.id, vaultId), notInHoldingOrgCondition(localVaults.orgId)];
         const vc = orgWhere(auth, localVaults.orgId);
         if (vc) vaultConditions.push(vc);
         const [existing] = await db

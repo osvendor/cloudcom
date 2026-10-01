@@ -157,6 +157,7 @@ import { isViewerJtiRevoked, isViewerSessionRevoked } from '../services/viewerTo
 import { sendCommandToAgent } from './agentWs';
 import { checkRemoteAccess, resolveDesktopSessionPolicy } from '../services/remoteAccessPolicy';
 import { createDesktopWsRoutes } from './desktopWs';
+import { RemoteSessionPromptPolicyError } from './remote/consentGate';
 
 // -------------------------------------------------------------------
 // Helpers
@@ -202,11 +203,12 @@ function mockViewerSelect(row: unknown) {
     authorizeLiveRemoteSessionAccessMock.mockImplementation(async (_subject, accessMode = 'live') => {
       const session = live.session as typeof ACTIVE_SESSION & { errorMessage?: string | null };
       const readingFailure = accessMode === 'failure-diagnostics' &&
-        (session.status === 'failed' || (session.status === 'disconnected' && !!session.errorMessage));
+        (session.status === 'failed'
+          || ((session.status === 'disconnected' || session.status === 'denied') && !!session.errorMessage));
       const reason = live.user.status !== 'active' ? 'user_inactive'
         : live.session.userId !== USER_ID ? 'session_not_owned'
           : live.session.type !== 'desktop' ? 'session_missing'
-            : ['disconnected', 'failed'].includes(live.session.status) && !readingFailure ? 'session_inactive' : null;
+            : ['disconnected', 'failed', 'denied'].includes(live.session.status) && !readingFailure ? 'session_inactive' : null;
       if (reason) return { ok: false, status: reason === 'session_missing' ? 404 : 403, reason };
       const policy = await checkRemoteAccess(live.device.id, 'webrtcDesktop');
       return policy.allowed ? { ok: true, ...live } : { ok: false, status: 403, reason: 'policy_denied' };
@@ -511,6 +513,7 @@ describe('validateViewerSessionAccess (via /:id/viewer/offer)', () => {
     { mode: 'notify', behavior: 'proceed', bound: null },
   ] as const)('binds consentUnavailableBehavior=$bound for a $mode/$behavior prompt', async ({ mode, behavior, bound }) => {
     primeHappyPath();
+    mockViewerSelect({ session: ACTIVE_SESSION, device: { ...DEVICE, consentPromptProtocolVersion: 1 }, user: USER });
     const { buildRemoteSessionPromptPayload } = await import('./remote/helpers');
     vi.mocked(buildRemoteSessionPromptPayload).mockResolvedValueOnce({
       mode,
@@ -531,6 +534,49 @@ describe('validateViewerSessionAccess (via /:id/viewer/offer)', () => {
       desktopPromptMode: mode,
       desktopConsentUnavailableBehavior: bound,
     }));
+  });
+
+  it.each([0, 2, undefined])('refuses a consent-mode start before dispatch when the agent reports consent prompt protocol %s', async (version) => {
+    primeHappyPath();
+    mockViewerSelect({ session: ACTIVE_SESSION, device: { ...DEVICE, consentPromptProtocolVersion: version }, user: USER });
+    const { buildRemoteSessionPromptPayload } = await import('./remote/helpers');
+    const { prepareRevocationLeaseForStart } = await import('../services/remoteRevocationLease');
+    vi.mocked(buildRemoteSessionPromptPayload).mockResolvedValueOnce({
+      mode: 'consent',
+      technicianName: null,
+      technicianEmail: null,
+      orgName: null,
+      consentUnavailableBehavior: 'block',
+      consentTimeoutMs: 30000,
+      notifyOnEnd: true,
+      showIndicator: true,
+    } as never);
+
+    const res = await offerRequest();
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.code).toBe('CONSENT_UPGRADE_REQUIRED');
+    expect(body.error).toMatch(/update the agent/i);
+    // Refused before the lease, the start intent and any dispatch.
+    expect(prepareRevocationLeaseForStart).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  it('refuses the start when the prompt policy cannot be resolved', async () => {
+    primeHappyPath();
+    const { buildRemoteSessionPromptPayload } = await import('./remote/helpers');
+    vi.mocked(buildRemoteSessionPromptPayload).mockRejectedValueOnce(
+      new RemoteSessionPromptPolicyError(DEVICE_ID, 'statement timeout'),
+    );
+
+    const res = await offerRequest();
+
+    expect(res.status).toBe(503);
+    expect((await res.json()).code).toBe('REMOTE_PROMPT_POLICY_UNAVAILABLE');
+    expect(db.update).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
   });
 
   it('on valid + active + allowed: submits offer and sends start_desktop with the policy payload', async () => {
@@ -587,7 +633,7 @@ describe('GET /:id/viewer/session failure diagnostics', () => {
   // below): a 'disconnected' session WITH a recorded errorMessage is now the
   // mid-session counterpart to 'failed' and must return the diagnosis too —
   // only a 'disconnected' session with NO recorded reason still rejects.
-  it.each(['pending', 'connecting', 'active', 'denied'])('still rejects a revoked %s session', async (status) => {
+  it.each(['pending', 'connecting', 'active'])('still rejects a revoked %s session', async (status) => {
     mockViewerSelect({ session: { ...failedSession, status }, device: DEVICE, user: USER });
     const res = await request();
     expect(res.status).toBe(401);
@@ -640,6 +686,54 @@ describe('GET /:id/viewer/session failure diagnostics', () => {
     expect(await res.json()).toMatchObject({ status: 'active', webrtcAnswer: 'v=0 stale-answer' });
     expect(db.update).not.toHaveBeenCalled();
     expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  // #6818: a consent refusal commits status 'denied' with the reason in
+  // errorMessage and revokes the viewer token. The answer poll must be able to
+  // read that reason once, so the technician sees "declined" / "did not
+  // respond" instead of a generic "session ended".
+  it('returns the consent reason for a revoked denied session', async () => {
+    const reason = 'The user on the remote device declined the connection.';
+    mockViewerSelect({
+      session: { ...failedSession, status: 'denied', terminationPhase: 'confirmed', errorMessage: reason, desktopPromptMode: 'consent' },
+      device: DEVICE,
+      user: USER,
+    });
+    const res = await request();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ status: 'denied', errorMessage: reason, webrtcAnswer: null });
+    expect(db.update).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+  });
+
+  it('still rejects a revoked denied session with no recorded reason', async () => {
+    mockViewerSelect({
+      session: { ...failedSession, status: 'denied', errorMessage: null },
+      device: DEVICE,
+      user: USER,
+    });
+    const res = await request();
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: 'Session closed' });
+  });
+
+  // #6818: the agent holds its answer until the end user answers the consent
+  // dialog, so the viewer needs the start's prompt mode and answer budget.
+  it.each([
+    ['consent', 77_000],
+    ['notify', 45_000],
+    ['off', 15_000],
+    [null, 15_000],
+  ])('reports promptMode=%s with an answer budget of %i ms', async (promptMode, answerTimeoutMs) => {
+    vi.mocked(isViewerSessionRevoked).mockResolvedValue(false);
+    mockViewerSelect({
+      session: { ...failedSession, status: 'connecting', errorMessage: null, webrtcAnswer: null, desktopPromptMode: promptMode },
+      device: DEVICE,
+      user: USER,
+    });
+    const res = await request();
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ status: 'connecting', promptMode: promptMode ?? 'off', answerTimeoutMs });
   });
 
   it('still rejects a revoked disconnected session with no recorded reason', async () => {

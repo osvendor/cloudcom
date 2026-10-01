@@ -71,8 +71,10 @@ function formatDuration(seconds: number | null | undefined): string {
 function formatBytes(bytes: number | null | undefined): string {
   if (bytes == null) return '-';
   if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${formatNumber(bytes / 1024, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} KB`;
-  return `${formatNumber(bytes / (1024 * 1024), { minimumFractionDigits: 1, maximumFractionDigits: 1 })} MB`;
+  // Auto-scale units (B → TB) like the rest of the backup screens (#7213).
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${formatNumber(bytes / 1024 ** i, { maximumFractionDigits: 1 })} ${units[i]}`;
 }
 
 function readinessColor(score: number): string {
@@ -226,17 +228,19 @@ export default function BackupVerificationTab({
             </div>
             <div>
               {readiness.riskFactors.length > 0 ? (
-                <div className="flex flex-wrap gap-1">
+                // The API's `message` is the human sentence ("No restore test
+                // has run in the last 30 days."); the code is only a fallback
+                // for a row that somehow arrives without one.
+                <ul className="space-y-1">
                   {readiness.riskFactors.map((rf) => (
-                    <span
+                    <li
                       key={rf.code}
-                      className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${severityColors[rf.severity] || ''}`}
-                      title={rf.message}
+                      className={`rounded-md border px-2 py-1 text-xs font-medium ${severityColors[rf.severity] || ''}`}
                     >
-                      {rf.code.replace(/_/g, ' ')}
-                    </span>
+                      {rf.message?.trim() || rf.code.replace(/_/g, ' ')}
+                    </li>
                   ))}
-                </div>
+                </ul>
               ) : (
                 <span className="text-xs text-success">{t('backupVerificationTab.noRiskFactors')}</span>
               )}

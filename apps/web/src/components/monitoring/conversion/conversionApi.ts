@@ -39,7 +39,12 @@ export type PartnerConversionPreview = {
 };
 export const readPartnerPreview = (body: unknown): PartnerConversionPreview => unwrap(body);
 export const readRetireResult = (body: unknown): { conversionId: string } => unwrap(body);
-export type PendingCounts = { policies: number; rows: number; pendingPolicies?: Array<{ id: string; name: string }> };
+export type PendingCounts = {
+  policies: number; rows: number; pendingPolicies?: Array<{ id: string; name: string }>;
+  unconvertible: Array<{ sourceTable: ConversionSourceTable; sourceId: string; name: string;
+    reason: string; policyId: string | null; policyName: string | null; retiredAt: string }>;
+  sweep: { sweptAt: string; converted: number; retired: number } | null;
+};
 export type ConvertResult = { conversionIds: string[]; retired: number; monitorsCreated: number };
 export type PartnerConvertResult = { policies: number; converted: number; unconvertible: number };
 
@@ -51,7 +56,7 @@ export const conversionPaths = {
   revert: (conversionId: string) => `${CONVERSION_BASE}/${encodeURIComponent(conversionId)}/revert`,
   retire: () => `${CONVERSION_BASE}/retire`,
   partnerPreview: () => `${CONVERSION_BASE}/partner/preview`,
-  ledger: (filters: { orgId?: string; policyId?: string; cursor?: string; limit?: number } = {}) => {
+  ledger: (filters: { orgId?: string; policyId?: string; sourceTable?: ConversionSourceTable; cursor?: string; limit?: number } = {}) => {
     const query = new URLSearchParams();
     for (const [key, value] of Object.entries(filters)) if (value != null) query.set(key, String(value));
     return `${CONVERSION_BASE}/ledger?${query}`;
@@ -85,7 +90,8 @@ const TOKEN_SHAPE = /^[A-Za-z]+(?:_[A-Za-z0-9]+)+$/;
  */
 export function conversionErrorMessage(body: unknown): string | undefined {
   if (!body || typeof body !== 'object') return undefined;
-  const { error, message } = body as { error?: unknown; message?: unknown };
+  const { error: rawError, message } = body as { error?: unknown; message?: unknown };
+  const error = rawError === 'stale_preview' ? 'preview_stale' : rawError;
   if (typeof error === 'string' && (CONVERSION_ERROR_CODES as readonly string[]).includes(error)) {
     return i18n.t(/* i18n-dynamic */ `monitoring:conversion.errorCodes.${error}`);
   }
@@ -139,7 +145,7 @@ export async function fetchPolicyPreview(policyId: string, options: PreviewOptio
  * The API wraps every conversion response in `{ data }`; going through
  * readJson/unwrap is what keeps `items` from arriving undefined.
  */
-export async function fetchLedgerPage(filters: { orgId?: string; policyId?: string; cursor?: string; limit?: number }): Promise<LedgerPage> {
+export async function fetchLedgerPage(filters: { orgId?: string; policyId?: string; sourceTable?: ConversionSourceTable; cursor?: string; limit?: number }): Promise<LedgerPage> {
   return readJson<LedgerPage>(await fetchWithAuth(conversionPaths.ledger(filters)), 'Failed to load the conversion history');
 }
 
@@ -154,3 +160,15 @@ export const retireBody = (sourceTable: ConversionSourceTable, sourceId: string,
 
 export const readConvertResult = (body: unknown): ConvertResult => unwrap<ConvertResult>(body);
 export const readPartnerConvertResult = (body: unknown): PartnerConvertResult => unwrap<PartnerConvertResult>(body);
+
+/**
+ * i18next key(s) for an `unconvertible:<code>` reason, resolving against the
+ * complete `conversion.retirement.reasons` map (never the shorter, stale
+ * `conversion.reasons` map) with a readable, code-free fallback. Pass the
+ * result straight to `t()` — i18next falls through the array to whichever
+ * key exists first.
+ */
+export function unconvertibleReasonKeys(reason?: string): [string, string] {
+  const code = (reason ?? '').replace(/^unconvertible:/, '') || 'unknown';
+  return [`monitoring:conversion.retirement.reasons.${code}`, 'monitoring:conversion.retirement.reasons.unknown'];
+}

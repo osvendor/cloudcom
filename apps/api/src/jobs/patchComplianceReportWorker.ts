@@ -7,6 +7,7 @@ import { Job, Queue, Worker } from 'bullmq';
 import * as dbModule from '../db';
 import { devicePatches, devices, patchComplianceReports, patches, patchSourceEnum, patchSeverityEnum } from '../db/schema';
 import { getBullMQConnection, isRedisAvailable } from '../services/redis';
+import { EFFECTIVE_PATCH_SEVERITY_SQL } from '../services/patchSeverityOverlay';
 import { csvRow } from '../services/spreadsheetExport';
 import {
   decodeSiteScope,
@@ -17,6 +18,7 @@ import {
 } from '../services/siteScope';
 import { attachWorkerObservability } from './workerObservability';
 
+import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
   const withSystem = dbModule.withSystemDbAccessContext;
@@ -98,7 +100,7 @@ function buildSummaryFromRows(rows: Array<{ status: string; count: number }>): C
   };
 }
 
-async function generateComplianceSummary(
+export async function generateComplianceSummary(
   orgId: string,
   scope: LiveSiteScopeV1,
   source?: PatchSource | null,
@@ -112,7 +114,7 @@ async function generateComplianceSummary(
   const complianceConditions = [
     eq(devicePatches.orgId, orgId),
     eq(devices.orgId, orgId),
-    eq(devices.isEphemeral, false),
+    eq(devices.isEphemeral, false), notParkedDeviceCondition(),
   ];
   if (scope.kind === 'restricted') {
     complianceConditions.push(inArray(devices.siteId, scope.siteIds));
@@ -121,7 +123,15 @@ async function generateComplianceSummary(
     complianceConditions.push(eq(patches.source, source));
   }
   if (severity) {
-    complianceConditions.push(eq(patches.severity, severity));
+    // Effective per-device value (see patchSeverityOverlay.ts): the trusted
+    // shared classification when known, else this device's own reported
+    // severity. `patches.severity` alone stays 'unknown' forever for
+    // microsoft/apple/linux/custom sources, which used to make a severity
+    // filter silently exclude the majority of a Windows-heavy fleet's patch
+    // volume from this report. Computed per device_patches row (this query's
+    // join is already pinned to devicePatches.orgId = orgId, devices.orgId =
+    // orgId), so nothing here ever compares across orgs.
+    complianceConditions.push(sql`${EFFECTIVE_PATCH_SEVERITY_SQL} = ${severity}`);
   }
 
   const statusCounts = await db

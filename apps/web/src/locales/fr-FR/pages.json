@@ -31,7 +31,6 @@
     "alertsDetail": "Détails de l'alerte",
     "alertsMonitors": "Alertes – Moniteurs",
     "alertsMonitorDetail": "Alertes – Moniteur",
-    "alertsRules": "Alertes – Règles héritées",
     "alerts": "Alertes",
     "analytics": "Analytique",
     "approvals": "Approbations",
@@ -61,6 +60,7 @@
     "contractsNew": "Nouveau contrat",
     "devicesCompare": "Comparaison des appareils",
     "devicesGroups": "Groupes d'appareils",
+    "devicesUnassigned": "Appareils non attribués",
     "devicesDetail": "Détails de l'appareil",
     "devices": "Dispositifs et actifs",
     "devicesNetworkDetail": "Détails de l'appareil réseau",
@@ -79,7 +79,7 @@
     "integrationsWebhooks": "Webhooks",
     "login": "Se connecter",
     "logs": "Journaux",
-    "monitoring": "Surveillance",
+    "monitoring": "Réseau",
     "oauthConsent": "Autoriser l'accès",
     "onedrive": "OneDrive",
     "organizations": "Organisations",
@@ -108,6 +108,7 @@
     "reportsDetailEdit": "Modifier le rapport",
     "reports": "Rapports",
     "reportsNew": "Créer un rapport",
+    "reportsSeriesEdit": "Modifier le rapport multi-organisation",
     "reportsTemplates": "Modèles de rapports",
     "resetPassword": "Réinitialiser le mot de passe",
     "scriptsDetail": "Modifier le script",
@@ -169,7 +170,8 @@
     "agreementTemplateNew": "Nouveau modèle de convention",
     "signedAgreements": "Conventions signées",
     "settingsTicketing": "Paramètres de tickets",
-    "securityScans": "Analyses IOC"
+    "securityScans": "Analyses IOC",
+    "devicesTime": "Synchronisation de l’heure"
   },
   "layout": {
     "metaDescription": "Breeze RMM - Supervision et gestion à distance",

@@ -10,8 +10,8 @@ import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
 import { streamSSE } from 'hono/streaming';
-import { eq, and, desc, sql, asc } from 'drizzle-orm';
-import { db, withSystemDbAccessContext } from '../../db';
+import { eq, and, desc, sql, asc, isNull } from 'drizzle-orm';
+import { db, runOutsideDbContext, withDbAccessContext, withSystemDbAccessContext } from '../../db';
 import { aiSessions, aiMessages, devices } from '../../db/schema';
 import { streamingSessionManager } from '../../services/streamingSessionManager';
 import { buildHelperSystemPrompt } from '../../services/helperAiAgent';
@@ -26,18 +26,21 @@ import {
   CLIENT_DECLARED_MCP_SERVER_NAME,
   type ClientToolDeclaration,
 } from '../../services/clientSessionTools';
-import { getHelperAllowedMcpToolNames, type HelperPermissionLevel } from '../../services/helperToolFilter';
+import { getHelperAllowedMcpToolNames, getHelperAllowedTools, type HelperPermissionLevel } from '../../services/helperToolFilter';
+import { createBreezeMcpServer } from '../../services/aiAgentSdkTools';
 import { resolveHelperPermissionLevelForDevice } from '../../services/helperPermissions';
 import { sanitizeUserMessage } from '../../services/aiInputSanitizer';
-import { storeScreenshot } from '../../services/screenshotStorage';
-import { checkBudget } from '../../services/aiCostTracker';
+import { storeScreenshot, ScreenshotQuotaExceededError, ScreenshotTooLargeError } from '../../services/screenshotStorage';
+import { envInt } from '../../utils/envInt';
+import { checkBudget, checkSystemAiRateLimit } from '../../services/aiCostTracker';
 import { getEffectiveAiBudget } from '../../services/effectiveSettings';
 import { getRedis, rateLimiter } from '../../services';
 import { createSessionPreToolUse, createSessionPostToolUse, settleBlockedTurnForNewMessage } from '../../services/aiAgentSdk';
-import { helperAuth, type HelperDevice } from '../../middleware/helperAuth';
+import { helperAuth, helperDbAccessContext, type HelperDevice } from '../../middleware/helperAuth';
 import type { ActiveSession } from '../../services/streamingSessionManager';
 import { LlmUnavailableError, resolveLlmConfig, type UsableLlmConfig } from '../../services/llm/llmConfigResolver';
 import { captureException } from '../../services/sentry';
+import { persistAutoSessionTitle } from '../../services/aiSessionTitle';
 import {
   isAiBudgetLockTimeout,
   releaseUnusedAiBudgetReservation,
@@ -48,6 +51,13 @@ const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const HELPER_RATE_LIMIT = 30;
 const HELPER_RATE_WINDOW_SECONDS = 60;
 const DEFAULT_PERMISSION_LEVEL: HelperPermissionLevel = 'basic';
+// `/api/v1/helper/` is skipped by the global rate limiter (helper tokens have
+// their own auth path), so screenshot upload needs its own per-device budget:
+// without one, one device can post requests fast enough to exhaust the shared
+// screenshot storage before the per-device byte/count quota below ever gets a
+// chance to reject it.
+const HELPER_SCREENSHOT_RATE_LIMIT = envInt('HELPER_SCREENSHOT_RATE_LIMIT', 12);
+const HELPER_SCREENSHOT_RATE_WINDOW_SECONDS = envInt('HELPER_SCREENSHOT_RATE_WINDOW_SECONDS', 60);
 
 export const helperRoutes = new Hono();
 
@@ -66,20 +76,63 @@ function clientToolsFromSession(session: typeof aiSessions.$inferSelect): Client
   return Array.isArray(raw) ? (raw as ClientToolDeclaration[]) : [];
 }
 
+/**
+ * Ownership predicate every helper session route must apply in addition to
+ * `deviceId = <this device>`: `ai_sessions` is org-axis scoped only, so a
+ * device-id match alone still reaches a technician's device-bound session (or
+ * an agent run) for the SAME device — those have a `userId`/`agentId` set and
+ * never carry `contextSnapshot.source = 'helper'`. Sessions this route itself
+ * creates always set `userId: null` and `contextSnapshot.source: 'helper'`
+ * (see the POST /chat/sessions handler below), so this predicate limits every
+ * helper-token read/write to sessions the helper itself created. Portal-client
+ * and AI-agent sessions keep `userId` null (single-principal check), so their
+ * principal columns are excluded explicitly rather than trusting the stamp.
+ */
+function helperOwnedSessionConditions() {
+  return [
+    isNull(aiSessions.userId),
+    isNull(aiSessions.clientUserId),
+    isNull(aiSessions.agentId),
+    sql`${aiSessions.contextSnapshot}->>'source' = 'helper'`,
+  ];
+}
+
+
+/**
+ * A-W04 (#6151): the device-scoped Breeze server for a session without client
+ * tools. Only the permission level's tools are REGISTERED (not merely
+ * allow-listed), so the other ~190 definitions never ride along on the
+ * model's input. No tenant tools: none are in Helper's allowlist. Helper
+ * recreates its SDK session every turn, so a level change applies on the next
+ * message.
+ */
+function helperMcpServerFactory(level: HelperPermissionLevel) {
+  const onlyTools = new Set(getHelperAllowedTools(level));
+  return (
+    getAuth: Parameters<typeof createBreezeMcpServer>[0],
+    onPreToolUse: Parameters<typeof createBreezeMcpServer>[1],
+    onPostToolUse: Parameters<typeof createBreezeMcpServer>[2],
+    getSession: Parameters<typeof createBreezeMcpServer>[3],
+  ) => ({
+    server: createBreezeMcpServer(getAuth, onPreToolUse, onPostToolUse, getSession, [], { onlyTools }),
+    name: 'breeze',
+  });
+}
+
 async function runHelperPreFlight(
   sessionId: string,
   content: string,
   device: HelperDevice,
   partnerId: string | null,
 ): Promise<
-  | { ok: true; session: typeof aiSessions.$inferSelect; sanitizedContent: string; systemPrompt: string; maxBudgetUsd: number | undefined; allowedTools: string[]; clientTools: ClientToolDeclaration[]; resolved: UsableLlmConfig }
+  | { ok: true; session: typeof aiSessions.$inferSelect; sanitizedContent: string; systemPrompt: string; maxBudgetUsd: number | undefined; allowedTools: string[]; permissionLevel: HelperPermissionLevel; clientTools: ClientToolDeclaration[]; resolved: UsableLlmConfig }
   | { ok: false; error: string; status: number }
 > {
   // Fetch session
   const [session] = await db
     .select()
     .from(aiSessions)
-    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()))
     .limit(1);
 
   if (!session) {
@@ -125,6 +178,20 @@ async function runHelperPreFlight(
     }
   }
 
+  // Org-axis AI rate limiter — the same ceiling technician chat enforces via
+  // checkAiRateLimit (services/aiCostTracker.ts). Helper sessions are
+  // device-scoped with no acting user id, so this uses the org-only variant
+  // (checkSystemAiRateLimit) rather than the per-user+per-org pair; the
+  // per-device 30/min limiter above bounds a single runaway device, this
+  // bounds the whole org regardless of how many devices are spraying turns.
+  try {
+    const orgRateError = await checkSystemAiRateLimit(device.orgId);
+    if (orgRateError) return { ok: false, error: orgRateError, status: 429 };
+  } catch (err) {
+    console.error('[Helper] Org rate limit check failed:', err);
+    return { ok: false, error: 'Unable to verify rate limit.', status: 500 };
+  }
+
   // Budget check
   try {
     const budgetError = await checkBudget(
@@ -166,7 +233,7 @@ async function runHelperPreFlight(
     ? clientDeclaredToolMcpNames(clientTools)
     : getHelperAllowedMcpToolNames(permissionLevel);
 
-  return { ok: true, session, sanitizedContent, systemPrompt, maxBudgetUsd: undefined, allowedTools, clientTools, resolved };
+  return { ok: true, session, sanitizedContent, systemPrompt, maxBudgetUsd: undefined, allowedTools, permissionLevel, clientTools, resolved };
 }
 
 // ============================================
@@ -276,18 +343,30 @@ helperRoutes.post(
     const sessionId = c.req.param('id');
     const { content } = c.req.valid('json');
 
+    // #3127: this route is registered in selfManagedDbContextRoutes, so
+    // helperAuth holds no request transaction across the handler. Each DB phase
+    // re-enters the exact helper context in a short transaction of its own, and
+    // the settle wait and the budget reservation (which opens its own system
+    // transaction) run between them with no connection checked out.
+    const helperDbContext = helperDbAccessContext({
+      orgId: device.orgId,
+      partnerId: auth.helperDevicePartnerId,
+    });
+    const inRequestDb = <T>(fn: () => Promise<T>): Promise<T> =>
+      runOutsideDbContext(() => withDbAccessContext(helperDbContext, fn));
+
     // Pre-flight checks
-    const preflight = await runHelperPreFlight(
+    const preflight = await inRequestDb(() => runHelperPreFlight(
       sessionId,
       content,
       device,
       auth.helperDevicePartnerId ?? null,
-    );
+    ));
     if (!preflight.ok) {
       return c.json({ error: preflight.error }, preflight.status as 400);
     }
 
-    const { session: dbSession, sanitizedContent, systemPrompt, allowedTools, clientTools, resolved } = preflight;
+    const { session: dbSession, sanitizedContent, systemPrompt, allowedTools, permissionLevel, clientTools, resolved } = preflight;
 
     // When the session declared client tools, build the generic client-declared
     // MCP server: each model tool call publishes `client_tool_request` and parks
@@ -307,10 +386,11 @@ helperRoutes.post(
           }),
           name: CLIENT_DECLARED_MCP_SERVER_NAME,
         })
-      : undefined;
+      : helperMcpServerFactory(permissionLevel);
 
     const priorSession = streamingSessionManager.get(sessionId);
     if (priorSession?.state === 'processing') {
+      // #3127: runs with no DB context held (see inRequestDb above).
       const settle = await settleBlockedTurnForNewMessage(priorSession);
       if (settle !== 'concluded') {
         return c.json({
@@ -354,72 +434,84 @@ helperRoutes.post(
     // resolves the WIRE model inside the manager, so a catalog revision with no
     // verified mapping for THIS session's model fails closed only here. Same
     // catch shape as ai.ts — otherwise it reaches `app.onError` as a 500.
-    let activeSession;
-    try {
-      activeSession = await streamingSessionManager.getOrCreate(
-        sessionId,
-        {
-          orgId: dbSession.orgId,
-          sdkSessionId: dbSession.sdkSessionId,
-          model: dbSession.model,
-          maxTurns: dbSession.maxTurns,
-          turnCount: dbSession.turnCount,
-          systemPrompt: dbSession.systemPrompt,
-        },
-        auth,
-        c,
-        systemPrompt,
-        reservedMaxBudgetUsd,
-        resolved,
-        allowedTools,
-        mcpServerFactory as Parameters<typeof streamingSessionManager.getOrCreate>[8],
-        { budgetReservationId },
-      );
-    } catch (err) {
-      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
-      if (err instanceof LlmUnavailableError) return c.json({ error: 'ai_unavailable' }, 503);
-      throw err;
-    }
-
-    // Concurrent message guard. If the turn is blocked only on pending
-    // approval waits (PAM-gated helper tools), settle them so the assistant
-    // can conclude and answer this message (#3089 — shared helper, see ai.ts).
-    if (!streamingSessionManager.tryTransitionToProcessing(activeSession, budgetReservationId)) {
-      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
-      return c.json({ error: 'A message is already being processed for this session' }, 409);
-    }
-
-    // Save user message
-    try {
-      await db.insert(aiMessages).values({
-        sessionId,
-        role: 'user',
-        content: sanitizedContent,
-      });
-    } catch (err) {
-      console.error('[Helper] Failed to save user message:', err);
-      activeSession.state = 'idle';
-      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
-      return c.json({ error: 'Failed to save message' }, 500);
-    }
-
-    // Auto-generate title from first message
-    if (!dbSession.title) {
-      const title = generateSessionTitle(sanitizedContent);
+    const dispatch = await inRequestDb(async (): Promise<
+      | { kind: 'dispatched'; activeSession: ActiveSession }
+      | { kind: 'refused'; response: Response }
+      | { kind: 'failed'; error: unknown }
+    > => {
+      let activeSession: ActiveSession;
       try {
-        await db
-          .update(aiSessions)
-          .set({ title })
-          .where(eq(aiSessions.id, sessionId));
-        activeSession.eventBus.publish({ type: 'title_updated', title });
+        activeSession = await streamingSessionManager.getOrCreate(
+          sessionId,
+          {
+            orgId: dbSession.orgId,
+            sdkSessionId: dbSession.sdkSessionId,
+            model: dbSession.model,
+            maxTurns: dbSession.maxTurns,
+            turnCount: dbSession.turnCount,
+            systemPrompt: dbSession.systemPrompt,
+          },
+          auth,
+          c,
+          systemPrompt,
+          reservedMaxBudgetUsd,
+          resolved,
+          allowedTools,
+          mcpServerFactory as Parameters<typeof streamingSessionManager.getOrCreate>[8],
+          { budgetReservationId },
+        );
       } catch (err) {
-        console.error('[Helper] Failed to auto-set session title:', err);
+        if (err instanceof LlmUnavailableError) {
+          return { kind: 'refused', response: c.json({ error: 'ai_unavailable' }, 503) };
+        }
+        return { kind: 'failed', error: err };
       }
-    }
 
-    // Push message and start timeout
-    activeSession.inputController.pushMessage(sanitizedContent);
-    streamingSessionManager.startTurnTimeout(activeSession);
+      // Concurrent message guard. If the turn is blocked only on pending
+      // approval waits (PAM-gated helper tools), settle them so the assistant
+      // can conclude and answer this message (#3089 — shared helper, see ai.ts).
+      if (!streamingSessionManager.tryTransitionToProcessing(activeSession, budgetReservationId)) {
+        return { kind: 'refused', response: c.json({ error: 'A message is already being processed for this session' }, 409) };
+      }
+
+      // Save user message
+      try {
+        await db.insert(aiMessages).values({
+          sessionId,
+          role: 'user',
+          content: sanitizedContent,
+        });
+      } catch (err) {
+        console.error('[Helper] Failed to save user message:', err);
+        activeSession.state = 'idle';
+        return { kind: 'refused', response: c.json({ error: 'Failed to save message' }, 500) };
+      }
+
+      // Auto-generate title from first message
+      if (!dbSession.title) {
+        const title = generateSessionTitle(sanitizedContent);
+        try {
+          await persistAutoSessionTitle(sessionId, title);
+          activeSession.eventBus.publish({ type: 'title_updated', title });
+        } catch (err) {
+          captureException(err, c, { service: 'helperRoutes', orgId: dbSession.orgId });
+          console.error('[Helper] Failed to auto-set session title:', err);
+        }
+      }
+
+      // Push message and start timeout
+      activeSession.inputController.pushMessage(sanitizedContent);
+      streamingSessionManager.startTurnTimeout(activeSession);
+      return { kind: 'dispatched', activeSession };
+    });
+    if (dispatch.kind !== 'dispatched') {
+      // Released only after the dispatch context has closed, so the release's
+      // own system transaction never runs beside a held request connection.
+      await releaseUnusedAiBudgetReservation({ orgId: dbSession.orgId, reservationId: budgetReservationId });
+      if (dispatch.kind === 'failed') throw dispatch.error;
+      return dispatch.response;
+    }
+    const { activeSession } = dispatch;
 
     const subscriptionId = crypto.randomUUID();
 
@@ -472,7 +564,7 @@ helperRoutes.post(
     const [session] = await db
       .select({ id: aiSessions.id })
       .from(aiSessions)
-      .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+      .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()))
       .limit(1);
 
     if (!session) {
@@ -582,24 +674,61 @@ helperRoutes.post(
     const device = c.get('helperDevice');
     const { imageBase64, width, height, sessionId, reason } = c.req.valid('json');
 
-    const stored = await storeScreenshot({
-      deviceId: device.id,
-      orgId: device.orgId,
-      sessionId,
-      imageBase64,
-      width,
-      height,
-      capturedBy: 'helper',
-      reason,
-      retentionHours: 24,
-    });
+    const redis = getRedis();
+    if (redis) {
+      const rateKey = `helper_screenshot_rate:${device.id}`;
+      const rateCheck = await rateLimiter(
+        redis,
+        rateKey,
+        HELPER_SCREENSHOT_RATE_LIMIT,
+        HELPER_SCREENSHOT_RATE_WINDOW_SECONDS,
+      );
+      if (!rateCheck.allowed) {
+        return c.json({ error: 'Rate limit exceeded. Please wait before uploading another screenshot.' }, 429);
+      }
+    }
 
-    return c.json({
-      id: stored.id,
-      storageKey: stored.storageKey,
-      sizeBytes: stored.sizeBytes,
-      expiresAt: stored.expiresAt,
-    });
+    // An attached sessionId must be one the helper created; otherwise a local
+    // user could plant images on a technician's device-bound session.
+    if (sessionId) {
+      const [session] = await db
+        .select({ id: aiSessions.id })
+        .from(aiSessions)
+        .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()))
+        .limit(1);
+      if (!session) {
+        return c.json({ error: 'Session not found' }, 404);
+      }
+    }
+
+    try {
+      const stored = await storeScreenshot({
+        deviceId: device.id,
+        orgId: device.orgId,
+        sessionId,
+        imageBase64,
+        width,
+        height,
+        capturedBy: 'helper',
+        reason,
+        retentionHours: 24,
+      });
+
+      return c.json({
+        id: stored.id,
+        storageKey: stored.storageKey,
+        sizeBytes: stored.sizeBytes,
+        expiresAt: stored.expiresAt,
+      });
+    } catch (err) {
+      if (err instanceof ScreenshotTooLargeError) {
+        return c.json({ error: 'Screenshot exceeds the maximum allowed size.' }, 413);
+      }
+      if (err instanceof ScreenshotQuotaExceededError) {
+        return c.json({ error: 'Device screenshot storage quota exceeded. Wait for older screenshots to expire.' }, 429);
+      }
+      throw err;
+    }
   },
 );
 
@@ -611,7 +740,7 @@ helperRoutes.get('/chat/sessions', async (c) => {
   const device = c.get('helperDevice');
   const helperUser = c.req.query('helperUser');
 
-  const conditions = [eq(aiSessions.deviceId, device.id)];
+  const conditions = [eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()];
 
   if (helperUser) {
     conditions.push(
@@ -659,7 +788,7 @@ helperRoutes.get('/chat/sessions/:id/messages', async (c) => {
   const [session] = await db
     .select({ id: aiSessions.id })
     .from(aiSessions)
-    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()))
     .limit(1);
 
   if (!session) {
@@ -693,7 +822,7 @@ helperRoutes.delete('/chat/sessions/:id', async (c) => {
   const [session] = await db
     .select()
     .from(aiSessions)
-    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+    .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()))
     .limit(1);
 
   if (!session) {
@@ -727,7 +856,7 @@ helperRoutes.post(
     const [session] = await db
       .select({ id: aiSessions.id })
       .from(aiSessions)
-      .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id)))
+      .where(and(eq(aiSessions.id, sessionId), eq(aiSessions.deviceId, device.id), ...helperOwnedSessionConditions()))
       .limit(1);
 
     if (!session) {

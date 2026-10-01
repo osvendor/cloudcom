@@ -6,6 +6,7 @@ import {
 } from './aiToolsConfigPolicy';
 import { INLINE_SETTINGS_EXAMPLES } from './aiToolsConfigPolicyExamples';
 import { __evaluateRulesForDevice } from './policyEvaluationService';
+import { severityForEnforcement } from './configComplianceAlertBridge';
 
 // #6669 — the `describe` reference is the only shape documentation the model
 // gets for inlineSettings. When it drifted from the evaluator (compliance
@@ -29,8 +30,8 @@ function collectKeys(value: unknown, out = new Set<string>()): Set<string> {
 describe('inline settings reference round-trip', () => {
   const validatedTypes = Object.keys(VALIDATED_INLINE_SETTINGS) as Array<keyof typeof POLICY_FEATURE_INLINE_SETTINGS_REFERENCE>;
 
-  it('validates compliance and alert_rule inline settings', () => {
-    expect(validatedTypes).toEqual(expect.arrayContaining(['compliance', 'alert_rule']));
+  it('validates compliance inline settings', () => {
+    expect(validatedTypes).toContain('compliance');
   });
 
   it.each(validatedTypes)('%s: the example passes the write validator', (featureType) => {
@@ -85,9 +86,18 @@ describe('inline settings reference round-trip', () => {
     expect(result.details[0]?.message).toContain('is not installed');
   });
 
-  it('alert_rule: the reference states what the Windows agent actually collects and points app-presence at compliance', () => {
-    const reference = POLICY_FEATURE_INLINE_SETTINGS_REFERENCE.alert_rule;
-    expect(reference).toMatch(/Information-level events can never match/);
-    expect(reference).toContain('required_software');
+  // #6669 — compliance violations now alert (configComplianceAlertBridge.ts).
+  // The reference must say which enforcement levels alert, and agree with the
+  // bridge, so the assistant neither promises an alert for a report-only rule
+  // nor tells a tech that compliance cannot alert.
+  it('compliance: the reference states which enforcement levels alert, matching the bridge', () => {
+    const reference = POLICY_FEATURE_INLINE_SETTINGS_REFERENCE.compliance;
+    expect(reference).not.toMatch(/does not currently create an alert/);
+    expect(severityForEnforcement('monitor')).toBeNull();
+    expect(severityForEnforcement('warn')).toBe('medium');
+    expect(severityForEnforcement('enforce')).toBe('high');
+    expect(reference).toContain('"warn" and "enforce" also raise an alert');
+    expect(reference).toContain('"monitor" only reports');
+    expect(reference).toContain('software_presence');
   });
 });

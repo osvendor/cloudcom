@@ -54,6 +54,7 @@ export default defineConfig({
       // imports `__tests__/integration/setup` (real postgres pool + autoMigrate).
       // Belongs to vitest.integration.config.ts.
       'src/services/hardwareHealth/**/*.integration.test.ts',
+      'src/services/timeSync/**/*.integration.test.ts',
       // Hardware & RAID monitoring (W05 BMC in-band): use real PostgreSQL and
       // the integration setup.
       'src/services/discovery/agentReportedBmcLink.integration.test.ts',
@@ -207,6 +208,7 @@ export default defineConfig({
       // fail it on connect. Belongs to vitest.integration.config.ts.
       'src/routes/enrollmentKeysExpiredFilter.integration.test.ts',
       'src/routes/enrollmentKeysSiteScope.integration.test.ts',
+      'src/routes/enrollmentKeysFailureCleanup.integration.test.ts',
       // Real-DB suites owned by vitest.integration.config.ts (#3778).
       'src/services/invoiceService.issue.integration.test.ts',
       'src/services/invoicePdf.integration.test.ts',

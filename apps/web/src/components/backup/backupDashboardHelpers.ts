@@ -55,6 +55,11 @@ export type StorageProvider = {
   used?: string | number;
   total?: string | number;
   percent?: number;
+  // What /backup/dashboard sends (#2562): raw usage, no capacity — object
+  // storage has no meaningful total, so the panel shows usage alone.
+  usedBytes?: number;
+  snapshots?: number;
+  configs?: number;
 };
 
 export type AttentionItem = {
@@ -99,6 +104,15 @@ export const statusConfig = {
   partial: {
     icon: AlertTriangle,
     label: 'Partial',
+    className: 'text-warning bg-warning/10'
+  },
+  // completed_with_errors (#5396) is a milder, distinct degraded outcome from
+  // `partial`: a restorable snapshot with some (under-threshold) file
+  // failures. Warning severity, never green, and never the same label as
+  // `partial` or the generic `warning` bucket.
+  completed_with_errors: {
+    icon: AlertTriangle,
+    label: 'Completed with errors',
     className: 'text-warning bg-warning/10'
   },
   warning: {
@@ -280,3 +294,10 @@ export function buildLinePath(values: number[], maxValue: number): string {
     .join(' ');
 }
 import { formatDateTime } from '@/lib/dateTimeFormat';
+
+const ISO_TIMESTAMP_RE = /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b/g;
+
+/** Attention-item text is composed server-side with raw ISO timestamps; show them in the user's format (#7213). */
+export function localizeIsoTimestamps(text: string): string {
+  return text.replace(ISO_TIMESTAMP_RE, (iso) => formatDateTime(iso, { fallback: iso }));
+}

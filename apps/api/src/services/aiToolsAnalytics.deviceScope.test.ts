@@ -191,4 +191,23 @@ describe('get_executive_summary — org-wide aggregate is denied to device-scope
     expect(parsed.error).toBeUndefined();
     expect(parsed.summary.id).toBe('s1');
   });
+
+  // The stored summary carries no per-site provenance, so ANY defined site
+  // list — including an empty one — must refuse rather than return it.
+  it.each([
+    ['selected sites', ['site-1']],
+    ['no sites', []],
+  ])('refuses for a site-restricted caller (%s), without reading the summary', async (_label, allowedSiteIds) => {
+    let summaryRead = false;
+    mockDb.select.mockImplementation(() => {
+      summaryRead = true;
+      return { from: () => ({ where: () => ({ orderBy: () => ({ limit: () => Promise.resolve([{ id: 's1' }]) }) }) }) };
+    });
+
+    const r = await handlerFor('get_executive_summary')({}, makeAuth({ allowedSiteIds }));
+    const parsed = JSON.parse(r);
+    expect(parsed.summary).toBeUndefined();
+    expect(String(parsed.error)).toMatch(/org/i);
+    expect(summaryRead).toBe(false);
+  });
 });

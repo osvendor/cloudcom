@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -61,9 +62,46 @@ var (
 
 var checksumHexPattern = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
 
+// In-flight stages reported through a ProgressReporter (#3578). The server
+// records the latest one on the command row so a long install stops reading as
+// an opaque "Pending". Must match COMMAND_PROGRESS_STAGES in
+// apps/api/src/services/commandProgress.ts, which only ever advances a command
+// along that list — report stages in this order.
+const (
+	ProgressStageDownloading = "downloading"
+	ProgressStageInstalling  = "installing"
+)
+
+// ProgressReporter receives a stage the moment it BEGINS. It must not block:
+// progress is advisory, and a slow or lost report must never delay or fail the
+// install. A nil reporter is valid and reports nothing.
+type ProgressReporter func(stage string)
+
+func (r ProgressReporter) report(stage string) {
+	if r != nil {
+		r(stage)
+	}
+}
+
+// Download and installer seams. Vars (not direct calls) solely so tests can
+// observe stage ordering without a network or a real installer.
+var (
+	downloadFileFn     = downloadFile
+	executeInstallerFn = executeInstaller
+)
+
 // InstallSoftware downloads a package from a presigned URL, verifies its checksum,
 // and executes it with the provided silent install arguments.
-func InstallSoftware(payload map[string]any) (result CommandResult) {
+func InstallSoftware(payload map[string]any) CommandResult {
+	return InstallSoftwareWithProgress(payload, nil)
+}
+
+// InstallSoftwareWithProgress is InstallSoftware plus in-flight stage reports:
+// ProgressStageDownloading just before the package download starts and
+// ProgressStageInstalling just before the installer runs (package-manager
+// installs report only ProgressStageInstalling — winget/brew download
+// internally). A payload refused before either stage reports nothing.
+func InstallSoftwareWithProgress(payload map[string]any, progress ProgressReporter) (result CommandResult) {
 	startTime := time.Now()
 	// Stamp StartedAt on every return path so the server can record the
 	// real start instead of reconstructing it from durationMs.
@@ -72,6 +110,7 @@ func InstallSoftware(payload map[string]any) (result CommandResult) {
 	}()
 
 	if _, ok := payload["installMethod"].(map[string]any); ok {
+		progress.report(ProgressStageInstalling)
 		return installViaManager(payload, defaultManagerDeps())
 	}
 
@@ -86,6 +125,14 @@ func InstallSoftware(payload map[string]any) (result CommandResult) {
 	softwareName := GetPayloadString(payload, "softwareName", "")
 	version := GetPayloadString(payload, "version", "")
 	fileName, fileType, checksum, silentInstallArgs, softwareName, version, err := validateInstallInputs(fileName, fileType, checksum, silentInstallArgs, softwareName, version)
+	if err != nil {
+		return NewErrorResult(err, time.Since(startTime).Milliseconds())
+	}
+
+	// Vendor-documented success exit codes (#7038) — e.g. Veeam's 1000/1101.
+	// Parsed before anything is downloaded so a malformed declaration fails
+	// loudly instead of turning every such install into an unexplained failure.
+	successExitCodes, err := parseSuccessExitCodes(payload)
 	if err != nil {
 		return NewErrorResult(err, time.Since(startTime).Milliseconds())
 	}
@@ -138,8 +185,9 @@ func InstallSoftware(payload map[string]any) (result CommandResult) {
 		)
 	}
 
-	// Download to temp directory
-	tempDir, err := os.MkdirTemp("", "breeze-sw-install-*")
+	// Download to a private per-download staging directory (hardened DACL on
+	// Windows — see createPrivateInstallDir).
+	tempDir, err := createPrivateInstallDir()
 	if err != nil {
 		return NewErrorResult(fmt.Errorf("failed to create temp dir: %w", err), time.Since(startTime).Milliseconds())
 	}
@@ -147,7 +195,8 @@ func InstallSoftware(payload map[string]any) (result CommandResult) {
 
 	localPath := filepath.Join(tempDir, filepath.Base(fileName))
 
-	if err := downloadFile(client, downloadUrl, localPath); err != nil {
+	progress.report(ProgressStageDownloading)
+	if err := downloadFileFn(client, downloadUrl, localPath); err != nil {
 		// safeDownloadError, never %w: net/http wraps every transport failure
 		// in *url.Error, whose message repeats the full request URL — and a
 		// managed software URL is typically presigned, carrying a capability
@@ -173,7 +222,8 @@ func InstallSoftware(payload map[string]any) (result CommandResult) {
 	}
 
 	// Execute installer
-	exitCode, output, descendantsPending, err := executeInstaller(localPath, fileType, silentInstallArgs)
+	progress.report(ProgressStageInstalling)
+	exitCode, output, descendantsPending, err := executeInstallerFn(localPath, fileType, silentInstallArgs, successExitCodes)
 	output, outputTruncated := sanitizeInstallerOutput(output)
 	if err != nil {
 		errMsg := err.Error()
@@ -589,7 +639,10 @@ func computeSHA256(filePath string) (string, error) {
 // executeInstaller runs the installer for fileType. The third return reports
 // that the installer's descendants outlived it (see runInstallerCommand), which
 // post-install detection needs in order to wait for the real install to land.
-func executeInstaller(localPath, fileType, silentInstallArgs string) (int, string, bool, error) {
+// successExitCodes are the version's declared vendor success codes (#7038);
+// they apply to the installer itself (for a DMG, its embedded .pkg), never to
+// the DMG path's hdiutil/cp helpers, whose own contract is zero-only.
+func executeInstaller(localPath, fileType, silentInstallArgs string, successExitCodes []uint32) (int, string, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), installTimeout)
 	defer cancel()
 
@@ -616,13 +669,13 @@ func executeInstaller(localPath, fileType, silentInstallArgs string) (int, strin
 
 	case fileType == "dmg" && runtime.GOOS == "darwin":
 		// Mount, find .app or .pkg, install, unmount
-		return installDMG(ctx, localPath)
+		return installDMG(ctx, localPath, successExitCodes)
 
 	default:
 		return 1, "", false, fmt.Errorf("unsupported file type %q on %s", fileType, runtime.GOOS)
 	}
 
-	return runInstallerCommand(ctx, cmd, fileType)
+	return runInstallerCommand(ctx, cmd, fileType, successExitCodes)
 }
 
 // lockedBuffer collects an installer's merged stdout+stderr. CombinedOutput's
@@ -649,7 +702,9 @@ func (b *lockedBuffer) Bytes() []byte {
 // installer's descendants were still holding the output pipes when the wrapper
 // exited — i.e. the real setup is probably still running, which post-install
 // detection must account for before declaring the rule unsatisfied.
-func runInstallerCommand(ctx context.Context, cmd *exec.Cmd, fileType string) (int, string, bool, error) {
+// successExitCodes extends the built-in success codes for this one command
+// (see installerExitIndicatesSuccess); nil means the defaults only.
+func runInstallerCommand(ctx context.Context, cmd *exec.Cmd, fileType string, successExitCodes []uint32) (int, string, bool, error) {
 	cmd.Env = procoutput.ApplyEnv(os.Environ())
 	// EXE installers are typically wrappers: they spawn the real setup (which
 	// inherits the output handles) and exit. Without WaitDelay, Wait blocks on
@@ -701,7 +756,7 @@ func runInstallerCommand(ctx context.Context, cmd *exec.Cmd, fileType string) (i
 	// success code — otherwise a good install inside the last installerWaitDelay
 	// of the window is reported as a 30-minute hang.
 	if ctx.Err() == context.DeadlineExceeded &&
-		(cmd.ProcessState == nil || !cmd.ProcessState.Exited() || !installerExitIndicatesSuccess(fileType, exitCode)) {
+		(cmd.ProcessState == nil || !cmd.ProcessState.Exited() || !installerExitIndicatesSuccess(fileType, exitCode, successExitCodes)) {
 		// Only here: the deadline fired on an installer that never finished, so
 		// its descendants are part of a hang, not of a legitimate install still
 		// landing. Every other path leaves the tree alone.
@@ -710,7 +765,7 @@ func runInstallerCommand(ctx context.Context, cmd *exec.Cmd, fileType string) (i
 			fmt.Errorf("installer timed out after %s and was terminated", installTimeout)
 	}
 
-	if installerExitIndicatesSuccess(fileType, exitCode) {
+	if installerExitIndicatesSuccess(fileType, exitCode, successExitCodes) {
 		return exitCode, procoutput.BytesToUTF8(output), descendantsPending, nil
 	}
 
@@ -723,16 +778,69 @@ func runInstallerCommand(ctx context.Context, cmd *exec.Cmd, fileType string) (i
 // reboot is pending/underway" codes returned by both MSI and many EXE installers.
 // Previously only MSI 3010 was honored, so a reboot-pending EXE install — and any
 // MSI returning 1641 — was wrongly reported as failed (#2022).
-func installerExitIndicatesSuccess(fileType string, exitCode int) bool {
+//
+// declared are the package version's vendor-documented success codes (#7038,
+// winget's InstallerSuccessCodes analog). They ADD to the defaults above and
+// never replace them. They are compared by uint32 bit pattern: a Windows exit
+// code is a DWORD that Go widens to a non-negative int, and parseSuccessExitCodes
+// has already folded a signed (HRESULT-style) declaration onto the same bits. A
+// negative exitCode is Go's "did not exit normally" sentinel, never a real exit
+// status, so it can never match a declaration (it must not alias 0xFFFFFFFF).
+func installerExitIndicatesSuccess(fileType string, exitCode int, declared []uint32) bool {
 	if exitCode == 0 {
 		return true
 	}
 	switch strings.ToLower(strings.TrimSpace(fileType)) {
 	case "exe", "msi":
-		return exitCode == 3010 || exitCode == 1641
-	default:
+		if exitCode == 3010 || exitCode == 1641 {
+			return true
+		}
+	}
+	if exitCode < 0 || int64(exitCode) > math.MaxUint32 {
 		return false
 	}
+	for _, code := range declared {
+		if uint32(exitCode) == code {
+			return true
+		}
+	}
+	return false
+}
+
+// maxSuccessExitCodes mirrors the server-side bound on
+// software_versions.success_exit_codes.
+const maxSuccessExitCodes = 32
+
+// parseSuccessExitCodes reads the optional successExitCodes payload field (#7038).
+// Each entry must be an integer in [-2147483648, 4294967295] — the union of the
+// signed and unsigned spellings of a 32-bit Windows exit code, the same range
+// winget accepts — and is normalized to its uint32 bit pattern. A malformed
+// list is an error rather than being dropped: ignoring it would silently report
+// every install that relies on it as failed.
+func parseSuccessExitCodes(payload map[string]any) ([]uint32, error) {
+	raw, ok := payload["successExitCodes"]
+	if !ok || raw == nil {
+		return nil, nil
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("successExitCodes must be an array of integers")
+	}
+	if len(items) > maxSuccessExitCodes {
+		return nil, fmt.Errorf("successExitCodes exceeds maximum of %d entries", maxSuccessExitCodes)
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	codes := make([]uint32, 0, len(items))
+	for _, item := range items {
+		f, ok := item.(float64)
+		if !ok || f != math.Trunc(f) || f < math.MinInt32 || f > math.MaxUint32 {
+			return nil, fmt.Errorf("successExitCodes entries must be integers between %d and %d", math.MinInt32, uint64(math.MaxUint32))
+		}
+		codes = append(codes, uint32(int64(f)))
+	}
+	return codes, nil
 }
 
 func buildMSIExecArgs(localPath, silentInstallArgs string) []string {
@@ -767,7 +875,10 @@ func buildMSIExecArgs(localPath, silentInstallArgs string) []string {
 // real disk image; production behavior is unchanged.
 var dmgCommandContext = exec.CommandContext
 
-func installDMG(ctx context.Context, dmgPath string) (int, string, bool, error) {
+// successExitCodes are the version's declared vendor success codes (#7038). They
+// apply to the embedded .pkg — the version's real installer — and never to the
+// hdiutil/cp helpers.
+func installDMG(ctx context.Context, dmgPath string, successExitCodes []uint32) (int, string, bool, error) {
 	// Mount
 	mountPoint := filepath.Join(os.TempDir(), "breeze-dmg-mount")
 	os.MkdirAll(mountPoint, 0700)
@@ -781,7 +892,7 @@ func installDMG(ctx context.Context, dmgPath string) (int, string, bool, error) 
 	// Their descendantsPending is likewise dropped rather than propagated —
 	// nothing hdiutil or cp leaves behind is an install still landing on disk.
 	mountCmd := dmgCommandContext(ctx, "hdiutil", "attach", dmgPath, "-mountpoint", mountPoint, "-nobrowse", "-quiet")
-	if _, out, _, err := runInstallerCommand(ctx, mountCmd, ""); err != nil {
+	if _, out, _, err := runInstallerCommand(ctx, mountCmd, "", nil); err != nil {
 		return 1, out, false, fmt.Errorf("failed to mount DMG: %w", err)
 	}
 	// Best-effort unmount: the install result is already decided by the time this
@@ -799,7 +910,7 @@ func installDMG(ctx context.Context, dmgPath string) (int, string, bool, error) 
 			// A .pkg postinstall script routinely spawns a lingering child, so
 			// this is the DMG case that needs both the WaitDelay escape and the
 			// descendantsPending signal that makes detection settle.
-			return runInstallerCommand(ctx, dmgCommandContext(ctx, "installer", "-pkg", pkgPath, "-target", "/"), "pkg")
+			return runInstallerCommand(ctx, dmgCommandContext(ctx, "installer", "-pkg", pkgPath, "-target", "/"), "pkg", successExitCodes)
 		}
 	}
 
@@ -808,7 +919,7 @@ func installDMG(ctx context.Context, dmgPath string) (int, string, bool, error) 
 		if strings.HasSuffix(entry.Name(), ".app") {
 			src := filepath.Join(mountPoint, entry.Name())
 			dst := filepath.Join("/Applications", entry.Name())
-			exitCode, out, _, err := runInstallerCommand(ctx, dmgCommandContext(ctx, "cp", "-R", src, dst), "")
+			exitCode, out, _, err := runInstallerCommand(ctx, dmgCommandContext(ctx, "cp", "-R", src, dst), "", nil)
 			if err != nil {
 				return exitCode, out, false, fmt.Errorf("failed to copy app: %w", err)
 			}

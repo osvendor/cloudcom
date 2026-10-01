@@ -660,13 +660,14 @@ function buildVerdictTaskPrompt(ctx: AgentRunPromptContext): string {
   );
 
   lines.push('');
+  // Same sanitizer as the default task turn below — see its comment.
   if (ctx.alert) {
-    lines.push(`Alert severity: ${ctx.alert.severity}`);
-    lines.push(`Alert: ${ctx.alert.title}`);
-    if (ctx.alert.message) lines.push(`Alert detail: ${ctx.alert.message}`);
+    lines.push(`Alert severity: ${sanitizeSweepText(ctx.alert.severity, 16)}`);
+    lines.push(`Alert: ${sanitizeSweepText(ctx.alert.title, 160) || 'untitled'}`);
+    if (ctx.alert.message) lines.push(`Alert detail: ${sanitizeSweepText(ctx.alert.message, 500)}`);
   }
   if (ctx.device) {
-    lines.push(`Target device: ${ctx.device.hostname} (${ctx.device.osType}, id ${ctx.device.id})`);
+    lines.push(`Target device: ${sanitizeSweepText(ctx.device.hostname, 255)} (${ctx.device.osType}, id ${ctx.device.id})`);
   }
   if (group) {
     lines.push(
@@ -1002,12 +1003,47 @@ export function buildNarrativeTaskPrompt(ctx: AgentRunPromptContext): string {
   lines.push('## Backups');
   lines.push(narrativeLine('backup jobs succeeded', backups?.ok ?? null, backupsMeasured));
   lines.push(narrativeLine('backup jobs failed', backups?.failed ?? null, backupsMeasured));
+  lines.push(narrativeLine('backup jobs completed with file errors', backups?.withErrors ?? null, backupsMeasured));
   lines.push(narrativeLine('backup jobs partial', backups?.partial ?? null, backupsMeasured));
   lines.push(narrativeLine('backup jobs that reached an outcome', backups?.terminal ?? null, backupsMeasured));
   // `null`, never 0, when nothing reached a terminal state — a rate over an
   // empty denominator is not 0%, it is unknown.
   lines.push(narrativeLine('backup success rate (%)', backups?.successRatePct ?? null, backupsMeasured));
   lines.push(narrativeLine('devices with a failed backup', backups?.devicesFailed ?? null, backupsMeasured));
+
+  // Third-party backup (Cove et al., #6012): CURRENT device health observed
+  // from the vendor, never job counts — kept visibly separate from the job
+  // lines above so a "critical" device is not read as a "failed" job.
+  const providers = c?.backupProviders;
+  const providersMeasured = Boolean(providers?.available);
+  lines.push('third-party backup (current device health, not job counts):');
+  if (providersMeasured && providers!.devices === 0) {
+    lines.push('third-party backup devices: 0 (none reporting for this organization)');
+  } else {
+    lines.push(narrativeLine('third-party backup devices', providers?.devices ?? null, providersMeasured));
+    lines.push(...narrativeHistogram(
+      'third-party backup devices',
+      providers?.devicesByHealth ?? { healthy: 0, warning: 0, critical: 0, unknown: 0 },
+      providersMeasured,
+    ));
+    if (providersMeasured && providers!.criticalDevices.length > 0) {
+      lines.push('critical third-party backup devices:');
+      for (const device of providers!.criticalDevices) lines.push(sanitizeSweepText(device.name));
+      if (providers!.criticalDevicesTruncated) {
+        lines.push('(more critical third-party backup devices were left out to keep this bounded)');
+      }
+    }
+    lines.push(narrativeLine(
+      'third-party backup devices not matched to a managed device',
+      providers?.unlinkedDevices ?? null,
+      providersMeasured,
+    ));
+    lines.push(narrativeLine(
+      'minutes since the oldest third-party backup sync',
+      providers?.lastSyncAgeMinutes ?? null,
+      providersMeasured,
+    ));
+  }
 
   const fleet = c?.fleet;
   const fleetMeasured = Boolean(fleet?.available);
@@ -1171,8 +1207,8 @@ const FLEET_DESIGN_SECTION_GUIDANCE: Readonly<Record<(typeof FLEET_DESIGN_SECTIO
     + 'Every device id must come from the device table above. A device belongs to one function.',
   monitoring: 'per function, the watches (service/process) and alert rules with thresholds, cooldown, '
     + 'action and paging. Rationale is required on every watch and rule — say why THIS fleet needs it.',
-  retired: 'watches and rules in the current configuration that the design does not carry forward, each '
-    + 'with a reason. Empty is valid.',
+  retired: 'always return an empty array. Legacy watch and rule retirement is no longer an apply action. '
+    + 'Report any monitoring concerns under unsure instead.',
   automation: 'per function, built-in playbooks by name or a custom playbook described in prose, and '
     + 'scripts you propose (full content).',
   legacy: 'one entry per script listed above as legacy (empty when there are none). bucket obsolete | covered | needed. '
@@ -1183,11 +1219,6 @@ const FLEET_DESIGN_SECTION_GUIDANCE: Readonly<Record<(typeof FLEET_DESIGN_SECTIO
   unsure: 'functions below the threshold, unreachable devices, findings that need a human, and any '
     + 'coarse-role correction (billing-relevant).',
 };
-
-/** W05 (#5655): replaces the `retired` guidance when an approved design exists. */
-const FLEET_DESIGN_RETIRED_DRIFT_GUIDANCE =
-  'drift: rules and watches live today that the approved design does not carry, and approved ones that '
-  + 'are missing or changed by hand. Each with a reason. Empty is valid.';
 
 /**
  * Fleet Designer W01 (#5651) — the task turn for a `design`-profile run.
@@ -1368,7 +1399,7 @@ export function buildFleetDesignTaskPrompt(ctx: AgentRunPromptContext): string {
 
   lines.push('## Write these eight sections, in this order');
   for (const key of FLEET_DESIGN_SECTION_KEYS) {
-    const guidance = key === 'retired' && e.approvedDesign ? FLEET_DESIGN_RETIRED_DRIFT_GUIDANCE : FLEET_DESIGN_SECTION_GUIDANCE[key];
+    const guidance = FLEET_DESIGN_SECTION_GUIDANCE[key];
     lines.push(`${key}: ${guidance}`);
   }
   lines.push('');
@@ -1606,14 +1637,18 @@ export function buildAgentRunTaskPrompt(ctx: AgentRunPromptContext): string {
 
   lines.push(`Trigger: ${ctx.run.triggerKind}`);
 
+  // Same sanitizer the sweep/narrative/patch profiles already use for this
+  // exact data (alert title, device hostname): tenant-authored/endpoint-
+  // reported text, rendered single-line so it cannot add an extra line of
+  // task prompt (see `sanitizeSweepText`'s doc comment above).
   if (ctx.alert) {
-    lines.push(`Alert severity: ${ctx.alert.severity}`);
-    lines.push(`Alert: ${ctx.alert.title}`);
-    if (ctx.alert.message) lines.push(`Alert detail: ${ctx.alert.message}`);
+    lines.push(`Alert severity: ${sanitizeSweepText(ctx.alert.severity, 16)}`);
+    lines.push(`Alert: ${sanitizeSweepText(ctx.alert.title, 160) || 'untitled'}`);
+    if (ctx.alert.message) lines.push(`Alert detail: ${sanitizeSweepText(ctx.alert.message, 500)}`);
   }
 
   if (ctx.device) {
-    lines.push(`Target device: ${ctx.device.hostname} (${ctx.device.osType}, id ${ctx.device.id})`);
+    lines.push(`Target device: ${sanitizeSweepText(ctx.device.hostname, 255)} (${ctx.device.osType}, id ${ctx.device.id})`);
   } else if (!ctx.ticket) {
     // A ticket run is device-less by design (v1 has no device axis for
     // tickets — see runService.ts) and gets its own closing instruction

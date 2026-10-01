@@ -8,14 +8,16 @@ loadDotenv({ quiet: true });
 import './config/normalizeNodeEnv';
 import { serve } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
+import { installPerRouteMaxPayload } from './services/wsMaxPayload';
 import { Hono } from 'hono';
-import type { Context } from 'hono';
+import type { MiddlewareHandler } from 'hono';
 import { cors } from 'hono/cors';
 import { HTTPException } from 'hono/http-exception';
 import { prettyJSON } from 'hono/pretty-json';
 import { secureHeaders } from 'hono/secure-headers';
 
 import { securityMiddleware } from './middleware/security';
+import { exceptPathPrefix } from './middleware/pathExemption';
 import { requestPathLogger } from './middleware/requestPathLogger';
 import { createGlobalBodyLimitMiddleware } from './middleware/bodyLimitGate';
 import { globalRateLimit } from './middleware/globalRateLimit';
@@ -25,6 +27,7 @@ import { configRoutes } from './routes/config';
 import { externalServicesRoutes } from './routes/externalServices';
 import { agentRoutes } from './routes/agents';
 import { deviceRoutes } from './routes/devices';
+import { timeStatusRoutes } from './routes/timeStatus';
 import { pamRoutes } from './routes/pam';
 import { scriptRoutes } from './routes/scripts';
 import { scriptLibraryRoutes } from './routes/scriptLibrary';
@@ -44,6 +47,7 @@ import { invoicesPublicRoutes } from './routes/invoicesPublic';
 import { stripeConnectRoutes } from './routes/stripeConnect';
 import { stripeWebhookRoutes } from './routes/webhooks/stripe';
 import { quickbooksWebhookRoutes } from './routes/webhooks/quickbooks';
+import { xeroWebhookRoutes } from './routes/webhooks/xero';
 import { resendWebhookRoutes } from './routes/webhooks/emailProvider';
 import { invoiceAssemblyRoutes } from './routes/invoices/assembly';
 import { invoiceSettingsRoutes } from './routes/invoices/settings';
@@ -88,6 +92,7 @@ import { installerRoutes } from './routes/installer';
 import { supportPublicRoutes } from './routes/supportPublic';
 import { ssoRoutes } from './routes/sso';
 import { partnerLoginBrandingRoutes } from './routes/partnerLoginBranding';
+import { preAssignmentRoutes } from './routes/preAssignment';
 import { docsRoutes } from './routes/docs';
 import { accessReviewRoutes } from './routes/accessReviews';
 import { webhookRoutes } from './routes/webhooks';
@@ -172,7 +177,9 @@ import { playbookRoutes } from './routes/playbooks';
 import { remediationSuggestionRoutes } from './routes/remediationSuggestions';
 import { seedBuiltInPlaybooks } from './services/builtInPlaybooks';
 import { ensureSystemLibraryScripts } from './services/systemScriptLibrary';
+import { runLegacyAlertingRetirement, LEGACY_ALERTING_RETRY_DELAYS_MS } from './services/monitors/conversion/retirementSweep';
 import { ensureBuiltInMonitorsForAllPartners } from './services/monitors/builtInMonitors';
+import { sealUnsealedSettingsSecrets } from './services/settingsSecretBackfill';
 import { seedDefaultAuditBaselines } from './services/auditBaselineService';
 import { changesRoutes } from './routes/changes';
 import { dnsSecurityRoutes } from './routes/dnsSecurity';
@@ -229,8 +236,9 @@ import {
 import { getWedgedBackendMinAgeMs } from './db/wedgedBackends';
 import { startRedisMemoryMonitor, stopRedisMemoryMonitor } from './services/redisMemoryMonitor';
 import { isBenignRejection, isRecoverablePostgresConnectionTeardown } from './services/rejectionSuppressions';
-import { partnerGuard, isPartnerGuardExemptPath } from './middleware/partnerGuard';
-import { API_VERSION } from './version';
+import { partnerGuardWithExemptions } from './middleware/partnerGuard';
+import { buildHealthPayload } from './services/versionInfo';
+import { warnOnVersionMismatch } from './services/versionMismatch';
 import {
   setWorkerReadinessTransitionHandler,
   workerReadinessRegistry,
@@ -253,11 +261,16 @@ import {
 // event-dispatch/relay consumers, which have their own role gating distinct
 // from the registry's placement filter.
 import { getWebhookWorker } from './workers/webhookDelivery';
-import { startRegisteredWorkers, buildWorkerShutdownTasks } from './services/workerRegistry';
+import {
+  startRegisteredWorkers,
+  startRedisIndependentWorkers,
+  buildWorkerShutdownTasks,
+} from './services/workerRegistry';
 import { registerAiAgentEnqueuer } from './jobs/aiAgentEnqueuer';
 import { backfillC2cConnectionSecrets } from './services/c2cSecrets';
 import { backfillDefaultPatchSchedules } from './jobs/patchScheduleBackfill';
 import { registerAllEventSubscribers } from './services/eventSubscribers';
+import { registerTopologyPhysicalAuthorities } from './services/topology/physicalAuthorities';
 import { initializeDeviceEventHandlers } from './events/deviceEvents';
 import { buildWebhookFanoutDeps } from './services/webhookFanoutDeps';
 import { closeRedis, getRedis, isRedisAvailable } from './services/redis';
@@ -293,9 +306,11 @@ import {
   extensionRootsSnapshot,
 } from './extensions/faultAttribution';
 import { syncBinaries } from './services/binarySync';
+import { startRegularMsiCacheWarmer } from './services/installerBuilder';
 import * as dbModule from './db';
-import { deviceGroups, devices, securityThreats, webhookDeliveries } from './db/schema';
-import { eq, ne, sql } from 'drizzle-orm';
+import { webhookDeliveries } from './db/schema';
+import { resolveFallbackOrgId } from './services/auditFallbackOrg';
+import { ne, sql } from 'drizzle-orm';
 import { envInt } from './utils/envInt';
 import {
   createReadinessEvaluator,
@@ -399,7 +414,12 @@ const readiness = createReadinessEvaluator({
 setWorkerReadinessTransitionHandler(() => readiness.invalidate());
 
 // Create WebSocket helpers (must be done before routes are registered)
-const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
+const { injectWebSocket, upgradeWebSocket, wss } = createNodeWebSocket({ app });
+// One WebSocketServer instance serves every upgrade route below (terminal,
+// desktop signaling, tunnel relay, event stream, agent ingest) with no
+// per-route hook for `maxPayload`, so the `ws` library default of 100 MiB
+// would otherwise apply everywhere. Size it per route instead.
+installPerRouteMaxPayload(wss);
 const resolveCorsOrigin = createCorsOriginResolver({
   configuredOriginsRaw: process.env.CORS_ALLOWED_ORIGINS,
   nodeEnv: process.env.NODE_ENV
@@ -414,19 +434,41 @@ const resolveCorsOrigin = createCorsOriginResolver({
 // but was never mounted, so neither series appeared in a production scrape.
 app.use('*', metricsMiddleware);
 app.use('*', requestPathLogger());
+
+// The tunnel-http proxy route (routes/tunnelHttp.ts) sets its own response
+// headers on every request — a restrictive sandboxed CSP that intentionally
+// allows same-origin framing so the app's own iframe can embed the proxied
+// device UI, plus its own cross-site request admission — and does so
+// specifically BECAUSE some of the app-wide headers below (CSP
+// `frame-ancestors 'none'`, X-Frame-Options: DENY, credentialed CORS) are
+// wrong for that one route: applied on top, they silently won the merge over
+// the route's own response and broke iframe embedding entirely (the route's
+// sandbox CSP never reached the browser). Skip only the conflicting header
+// output for that path prefix; every other route keeps it unchanged.
+//
+// `securityMiddleware()` also enforces FORCE_HTTPS redirect and
+// canonical-Host rejection, which have nothing to do with the CSP conflict
+// above and must keep running for this prefix too — so it is exempted via
+// its own `skipHeadersPathPrefix` option (headers only), not via
+// `exceptTunnelHttp`, which would drop that transport enforcement as well.
+const TUNNEL_HTTP_PATH_PREFIX = '/api/v1/tunnel-http/';
+const exceptTunnelHttp = (mw: MiddlewareHandler) => exceptPathPrefix(TUNNEL_HTTP_PATH_PREFIX, mw);
+
 app.use(
   '*',
-  secureHeaders({
-    // Override defaults to match Breeze security policy:
-    // - HSTS: 1 year (secureHeaders default is 180 days / 15552000s)
-    strictTransportSecurity: 'max-age=31536000; includeSubDomains; preload',
-    // - X-Frame-Options: DENY (default is SAMEORIGIN)
-    xFrameOptions: 'DENY',
-    // - Referrer-Policy: strict-origin-when-cross-origin (default is no-referrer)
-    referrerPolicy: 'strict-origin-when-cross-origin',
-  })
+  exceptTunnelHttp(
+    secureHeaders({
+      // Override defaults to match Breeze security policy:
+      // - HSTS: 1 year (secureHeaders default is 180 days / 15552000s)
+      strictTransportSecurity: 'max-age=31536000; includeSubDomains; preload',
+      // - X-Frame-Options: DENY (default is SAMEORIGIN)
+      xFrameOptions: 'DENY',
+      // - Referrer-Policy: strict-origin-when-cross-origin (default is no-referrer)
+      referrerPolicy: 'strict-origin-when-cross-origin',
+    })
+  )
 );
-app.use('*', securityMiddleware());
+app.use('*', securityMiddleware({ skipHeadersPathPrefix: TUNNEL_HTTP_PATH_PREFIX }));
 app.use(
   '*',
   createGlobalBodyLimitMiddleware({
@@ -438,14 +480,16 @@ app.use('*', globalRateLimit());
 app.use('*', prettyJSON());
 app.use(
   '*',
-  cors({
-    origin: (origin) => resolveCorsOrigin(origin),
-    credentials: true,
-    allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-API-Key', 'X-Breeze-CSRF'],
-    allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    exposeHeaders: ['Content-Length', 'X-Request-Id'],
-    maxAge: 86400
-  })
+  exceptTunnelHttp(
+    cors({
+      origin: (origin) => resolveCorsOrigin(origin),
+      credentials: true,
+      allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-API-Key', 'X-Breeze-CSRF'],
+      allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+      exposeHeaders: ['Content-Length', 'X-Request-Id'],
+      maxAge: 86400
+    })
+  )
 );
 
 const startedAt = Date.now();
@@ -456,12 +500,9 @@ const startedAt = Date.now();
 // instead — see routes/agents/download.ts #1470 — so this payload is no longer
 // coupled to the installer.)
 app.get('/health', (c) => {
-  const uptimeSeconds = Math.floor((Date.now() - startedAt) / 1000);
-  return c.json({
-    status: 'ok',
-    version: API_VERSION,
-    uptime: uptimeSeconds
-  });
+  // binariesVersion differs from version only on a server-only release image
+  // (see services/binarySource.ts getPairedBinariesVersion).
+  return c.json(buildHealthPayload(startedAt));
 });
 
 // Kubernetes liveness probe — minimal 200 OK
@@ -573,10 +614,6 @@ function sanitizeActionSegment(segment: string): string {
   return segment;
 }
 
-function isLikelyUuid(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
-}
-
 function buildFallbackAction(method: string, apiPath: string): string {
   const cleaned = apiPath.replace(/^\/api\/v1\//, '/');
   const segments = cleaned
@@ -608,152 +645,12 @@ function fallbackAuditEligible(path: string): boolean {
   return path.startsWith('/api/v1/');
 }
 
-async function resolveFallbackOrgId(c: Context, path: string): Promise<string | null> {
-  const auth = c.get('auth') as { orgId?: string | null; accessibleOrgIds?: string[] } | undefined;
-  if (auth?.orgId) {
-    return auth.orgId;
-  }
-
-  if (auth?.accessibleOrgIds && auth.accessibleOrgIds.length === 1) {
-    return auth.accessibleOrgIds[0] ?? null;
-  }
-
-  if (path.startsWith('/api/v1/agents/')) {
-    const segments = path.split('/').filter(Boolean);
-    const agentId = segments[3];
-    if (!agentId || agentId === 'enroll') {
-      return null;
-    }
-
-    try {
-      const [device] = await db
-        .select({ orgId: devices.orgId })
-        .from(devices)
-        .where(eq(devices.agentId, agentId))
-        .limit(1);
-      return device?.orgId ?? null;
-    } catch (err) {
-      console.error('[audit] Failed to resolve orgId from path:', err);
-      return null;
-    }
-  }
-
-  if (path.startsWith('/api/v1/devices/')) {
-    const segments = path.split('/').filter(Boolean);
-    const entity = segments[3];
-    if (!entity) {
-      return null;
-    }
-
-    if (entity === 'groups') {
-      const groupId = segments[4];
-      if (!groupId || !isLikelyUuid(groupId)) {
-        return null;
-      }
-
-      try {
-        const [group] = await db
-          .select({ orgId: deviceGroups.orgId })
-          .from(deviceGroups)
-          .where(eq(deviceGroups.id, groupId))
-          .limit(1);
-        return group?.orgId ?? null;
-      } catch (err) {
-        console.error('[audit] Failed to resolve orgId from device group:', err);
-        return null;
-      }
-    }
-
-    if (!isLikelyUuid(entity)) {
-      return null;
-    }
-
-    try {
-      const [device] = await db
-        .select({ orgId: devices.orgId })
-        .from(devices)
-        .where(eq(devices.id, entity))
-        .limit(1);
-      return device?.orgId ?? null;
-    } catch (err) {
-      console.error('[audit] Failed to resolve orgId from path:', err);
-      return null;
-    }
-  }
-
-  if (path.startsWith('/api/v1/security/scan/')) {
-    const segments = path.split('/').filter(Boolean);
-    const deviceId = segments[4];
-    if (!deviceId || !isLikelyUuid(deviceId)) {
-      return null;
-    }
-
-    try {
-      const [device] = await db
-        .select({ orgId: devices.orgId })
-        .from(devices)
-        .where(eq(devices.id, deviceId))
-        .limit(1);
-      return device?.orgId ?? null;
-    } catch (err) {
-      console.error('[audit] Failed to resolve orgId from path:', err);
-      return null;
-    }
-  }
-
-  if (path.startsWith('/api/v1/security/threats/')) {
-    const segments = path.split('/').filter(Boolean);
-    const threatId = segments[4];
-    if (!threatId || !isLikelyUuid(threatId)) {
-      return null;
-    }
-
-    try {
-      const [threat] = await db
-        .select({ orgId: devices.orgId })
-        .from(securityThreats)
-        .innerJoin(devices, eq(securityThreats.deviceId, devices.id))
-        .where(eq(securityThreats.id, threatId))
-        .limit(1);
-      return threat?.orgId ?? null;
-    } catch (err) {
-      console.error('[audit] Failed to resolve orgId from path:', err);
-      return null;
-    }
-  }
-
-  if (path.startsWith('/api/v1/system-tools/devices/')) {
-    const segments = path.split('/').filter(Boolean);
-    const deviceId = segments[4];
-    if (!deviceId || !isLikelyUuid(deviceId)) {
-      return null;
-    }
-
-    try {
-      const [device] = await db
-        .select({ orgId: devices.orgId })
-        .from(devices)
-        .where(eq(devices.id, deviceId))
-        .limit(1);
-      return device?.orgId ?? null;
-    } catch (err) {
-      console.error('[audit] Failed to resolve orgId from path:', err);
-      return null;
-    }
-  }
-
-  return null;
-}
-
 // Generic partner status guard — blocks non-active partners.
 // IMPORTANT: every branch MUST `return` the next()/partnerGuard() promise so
 // any Response (403 PARTNER_INACTIVE, 403 PARTNER_NOT_FOUND, 503 PARTNER_LOOKUP_UNAVAILABLE)
 // propagates back through Hono's compose chain. Discarding the return causes
 // Hono to throw "Context is not finalized" and the request collapses to 500.
-api.use('*', async (c, next) => {
-  if (isPartnerGuardExemptPath(c.req.path)) return next();
-  return partnerGuard(c, next);
-});
+api.use('*', partnerGuardWithExemptions);
 
 api.use('*', async (c, next) => {
   const auditWritten = await runWithAuditRequestTracking(next);
@@ -818,6 +715,7 @@ api.route('/agents', agentRoutes);
 api.route('/native-target', nativeTargetRoutes);
 api.route('/staff-native', staffNativeRoutes);
 api.route('/devices', deviceRoutes);
+api.route('/time-status', timeStatusRoutes);
 api.route('/pam', pamRoutes);
 api.route('/scripts', scriptRoutes);
 api.route('/script-library', scriptLibraryRoutes);
@@ -915,6 +813,9 @@ api.route('/sso', ssoRoutes);
 // legacy singular /partner router) — final URL /api/v1/partners/me/login-branding
 // per Task 11's consumed contract (#2183).
 api.route('/partners', partnerLoginBrandingRoutes);
+// Parked-device holding area: full partner admins list and assign devices
+// waiting in their partner's holding org.
+api.route('/pre-assignment', preAssignmentRoutes);
 api.route('/docs', docsRoutes);
 api.route('/access-reviews', accessReviewRoutes);
 api.route('/webhooks', webhookRoutes);
@@ -926,11 +827,19 @@ api.route('/webhooks/tickets', emailWebhookRoutes);
 // via c.req.text(), so no body-consuming middleware sits in front of it.
 api.route('/webhooks', stripeWebhookRoutes);
 // Intuit QuickBooks webhook — no session auth, HMAC-gated with the app-level
-// verifier token. partnerGuard passes through (no Authorization header); the
-// route reads the raw body itself via c.req.text(), so no body-consuming
+// verifier token. partnerGuard skips this exact path (isPartnerGuardExemptPath),
+// so even a request carrying a bearer token does no partner read before the
+// HMAC check (#7296); the route reads the raw body itself via c.req.text(), so no body-consuming
 // middleware may sit in front of it. NOT in SELF_MANAGED_DB_CONTEXT_ROUTES:
 // there is no ambient auth transaction to opt out of on an unauthenticated route.
 api.route('/webhooks', quickbooksWebhookRoutes);
+// Xero webhook (W05) — no session auth, HMAC-gated with XERO_WEBHOOK_KEY.
+// partnerGuard skips this exact path (isPartnerGuardExemptPath), so even a
+// request carrying a bearer token does no partner read before the HMAC check.
+// The route reads the raw body itself via c.req.text(), so no body-consuming
+// middleware may sit in front of it. NOT in SELF_MANAGED_DB_CONTEXT_ROUTES:
+// there is no ambient auth transaction to opt out of on an unauthenticated route.
+api.route('/webhooks', xeroWebhookRoutes);
 // Resend delivery webhook for partner sending domains (W06) — no session auth,
 // Svix-signature-verified, and inert with a 404 when EMAIL_DOMAINS_WEBHOOK_SECRET
 // is unset. partnerGuard passes through (no Authorization header); the route
@@ -1215,6 +1124,16 @@ async function initializeWorkers(): Promise<void> {
     console.warn('[WARN] Redis not available - background workers disabled');
     workerInitPhase = 'skipped-no-redis';
     readiness.invalidate();
+    // #7105: the few entries that need only Postgres (the stale command
+    // reaper) keep running on their Redis-less fallback. Readiness is
+    // unchanged — this process still consumes no queues.
+    await startRedisIndependentWorkers(breezeRole(), {
+      onResult: (name, ok, error) => {
+        if (ok) return;
+        console.error(`[CRITICAL] Failed to start ${name} without Redis:`, error);
+        captureException(error instanceof Error ? error : new Error(String(error)));
+      },
+    });
     return;
   }
 
@@ -1579,6 +1498,8 @@ async function bootstrap(): Promise<void> {
   }
 
   console.log(`Breeze API starting on port ${port}...`);
+  // #7024: BREEZE_VERSION edited without new image digests — say so at boot.
+  warnOnVersionMismatch();
 
   // Initialize error reporting first so failures during the rest of startup
   // (migrations, seeds, self-tests) and the global onError/unhandledRejection
@@ -1842,6 +1763,17 @@ async function bootstrap(): Promise<void> {
     console.error('[startup] Binary sync failed (non-fatal in github mode):', err);
   }
 
+  // Keeps the regular-MSI download cache (installerBuilder.ts) warm from a
+  // background timer instead of the request path: the installer routes that
+  // consume it all run inside an ambient DB transaction opened by auth
+  // middleware before their handlers run, so there is no place inside those
+  // handlers to fetch before "entering" that transaction. Deliberately not
+  // awaited — its own first fetch runs in the background and must not add
+  // GitHub network latency to boot; a request that lands before the first
+  // warm completes still gets its own bounded fetch via fetchRegularMsi's
+  // existing cache-miss fallback.
+  startRegularMsiCacheWarmer();
+
   // Boot-time self-test for every deployment that signs its own update
   // manifests: round-trip a synthetic manifest through sign + validate. If this
   // fails, agent updates would silently 409 at runtime (#625). Fail fast so
@@ -1870,6 +1802,10 @@ async function bootstrap(): Promise<void> {
     }
   }
 
+  // M2 D1: physical topology producer authorities (discovery target, UniFi
+  // controller site). Default-deny when absent, so install before serving.
+  registerTopologyPhysicalAuthorities();
+
   server = serve({
     fetch: app.fetch,
     port
@@ -1895,6 +1831,44 @@ async function bootstrap(): Promise<void> {
     })
     .catch((err) => {
       console.error('[startup] Failed to provision built-in monitors:', err);
+    });
+
+  // Notification-channel secrets in partner/org/site settings are sealed on
+  // write; this seals values stored before that. Detached after serve() like
+  // the built-ins above: readers open both forms, so nothing waits on it.
+  // Idempotent — once every value is sealed it finds nothing to do.
+  void sealUnsealedSettingsSecrets()
+    .then((result) => {
+      const touched = Object.entries(result).filter(([, stats]) => stats.scanned > 0);
+      if (touched.length > 0) {
+        console.log(
+          `[startup] Settings secrets sealed: ${touched
+            .map(([table, s]) => `${table} ${s.sealed}/${s.scanned} row(s) (${s.contended} changed concurrently, ${s.failed} failed)`)
+            .join('; ')}`,
+        );
+      }
+    })
+    .catch((err) => {
+      console.error('[startup] Sealing stored settings secrets failed:', err);
+      captureException(err, undefined, { area: 'settings_secret_backfill' });
+    });
+
+  // W05d — convert whatever legacy alerting the W05c release left unconverted,
+  // retire what cannot convert (listed in the Monitors banner), then count what
+  // is still unretired. Detached after serve() for the same reason as the
+  // built-ins above; chained so the count runs AFTER the sweep and cannot fire
+  // spuriously on the first boot after upgrade. Never refuses boot.
+  void runLegacyAlertingRetirement({ retryDelaysMs: LEGACY_ALERTING_RETRY_DELAYS_MS })
+    .then((r) => {
+      console.log(
+        `[startup] Legacy alerting retirement: ${r.partners} partner(s) swept, ${r.converted} converted, ` +
+        `${r.retired} retired, ${r.failed} failed; unretired rules=${r.remaining.configPolicyAlertRules} ` +
+        `watches=${r.remaining.configPolicyMonitoringWatches}`,
+      );
+    })
+    .catch((err) => {
+      console.error('[startup] Legacy alerting retirement failed:', err);
+      captureException(err, undefined, { area: 'legacy_alerting_sweep' });
     });
 
   // Explicit registration (wave 3.5d-b, #4086): the lazy worker registry only

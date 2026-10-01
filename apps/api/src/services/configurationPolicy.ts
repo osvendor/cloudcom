@@ -13,6 +13,7 @@ import {
   configPolicyMaintenanceSettings,
   configPolicyEventLogSettings,
   configPolicyHardwareMonitoringSettings,
+  configPolicyTimeSyncSettings,
   configPolicySensitiveDataSettings,
   configPolicyMonitoringSettings,
   configPolicyMonitoringWatches,
@@ -27,7 +28,6 @@ import {
   deviceGroupMemberships,
   sites,
   patchPolicies,
-  alertRules,
   backupConfigs,
   backupProfiles,
   securityPolicies,
@@ -37,7 +37,7 @@ import {
   sensitiveDataPolicies,
   peripheralPolicies,
 } from '../db/schema';
-import { and, eq, desc, or, isNull, isNotNull, sql, inArray, asc, getTableColumns, SQL } from 'drizzle-orm';
+import { and, eq, desc, or, isNull, isNotNull, sql, inArray, notInArray, asc, getTableColumns, SQL } from 'drizzle-orm';
 import { canManagePartnerWidePolicies, PartnerWideWriteDeniedError } from './partnerWideAccess';
 import { buildRoleOsFilterConditions } from './featureConfigResolver';
 import {
@@ -49,18 +49,20 @@ import { pgErrorCode, pgErrorConstraint } from '../utils/pgErrors';
 import { captureException } from './sentry';
 import { z } from 'zod';
 import {
-  alertRuleInlineSettingsSchema,
   backupExcludePatternsSchema,
+  complianceItemName,
   configFeatureInlineSettingsSchema,
+  duplicateComplianceItemNameMessage,
+  duplicateComplianceItemNames,
   deviceLifecycleInlineSettingsSchema,
   eventLogInlineSettingsSchema,
   hardwareMonitoringInlineSettingsSchema,
   maintenanceInlineSettingsSchema,
-  monitoringInlineSettingsSchema,
   monitorsInlineSettingsSchema,
   monitorsInheritanceSchema,
   onedriveHelperInlineSettingsSchema,
   remoteAccessInlineSettingsSchema as remoteAccessCapabilitySettingsSchema,
+  timeSyncInlineSettingsSchema,
   warrantyInlineSettingsSchema,
   warrantyHpCmslCollectionEffective,
   readRecordedWarrantyHpCmslConsent,
@@ -72,6 +74,7 @@ import { normalizePatchInlineSettings, tryNormalizePatchInlineSettings } from '.
 import { resolvePartnerIdForOrg } from '../routes/patches/helpers';
 import { getPolicyBaselineDefaults } from './policyBaselineDefaults';
 import type { AutomationAction } from './automationRuntime';
+import { scheduleComplianceAlertReconcile } from './complianceAlertReconcileTrigger';
 
 // ============================================
 // Inline settings schemas
@@ -151,7 +154,9 @@ export const vulnerabilityInlineSettingsSchema = z
 // configurationPolicy ⇄ policyBaselineDefaults import cycle (and to keep route/
 // helper test suites from transitively crash-loading this service). Re-exported
 // here so existing importers that read them from configurationPolicy still work.
-import { CONFIG_FEATURE_TYPES, type ConfigFeatureType } from './configFeatureTypes';
+import { CONFIG_FEATURE_TYPES, RETIRED_CONFIG_FEATURE_TYPES, isRetiredConfigFeatureType, type ConfigFeatureType, isExecutionGatedFeatureType } from './configFeatureTypes';
+import { resolveExecutionSafeGroupIds, auditRefusedExecutionGroups } from './executionTargetGating';
+import { isUnassignedPoolOrgType } from './unassignedPool/orgType';
 export { CONFIG_FEATURE_TYPES };
 export type { ConfigFeatureType };
 export type ConfigAssignmentLevel = 'partner' | 'organization' | 'site' | 'device_group' | 'device';
@@ -636,7 +641,10 @@ export async function listConfigPolicies(
           featureType: configPolicyFeatureLinks.featureType,
         })
         .from(configPolicyFeatureLinks)
-        .where(inArray(configPolicyFeatureLinks.configPolicyId, policyIds))
+        .where(and(
+          inArray(configPolicyFeatureLinks.configPolicyId, policyIds),
+          notInArray(configPolicyFeatureLinks.featureType, [...RETIRED_CONFIG_FEATURE_TYPES]),
+        ))
         .orderBy(asc(configPolicyFeatureLinks.featureType))
     : [];
 
@@ -689,6 +697,11 @@ export async function updateConfigPolicy(
     .returning();
 
   if (!updated) return null;
+  // Only an active policy's rules are evaluated; alerts raised by a policy that
+  // is no longer active close through the reconcile.
+  if (data.status !== undefined && data.status !== existing.status) {
+    scheduleComplianceAlertReconcile({ configPolicyId: id }, 'policy-status');
+  }
   return updated;
 }
 
@@ -700,7 +713,7 @@ export async function deleteConfigPolicy(id: string, auth: AuthContext) {
   // Pre-fetch to apply the partner-wide administration gate (see
   // updateConfigPolicy) before the destructive statement.
   const [existing] = await db
-    .select({ orgId: configurationPolicies.orgId })
+    .select({ orgId: configurationPolicies.orgId, partnerId: configurationPolicies.partnerId })
     .from(configurationPolicies)
     .where(and(...conditions))
     .limit(1);
@@ -723,6 +736,11 @@ export async function deleteConfigPolicy(id: string, auth: AuthContext) {
       .delete(configurationPolicies)
       .where(and(...conditions))
       .returning();
+    // Scoped by the owner: the policy row is gone by the time the reconcile runs.
+    const owner = existing.orgId !== null
+      ? { orgId: existing.orgId }
+      : existing.partnerId ? { partnerId: existing.partnerId } : null;
+    if (deleted && owner) scheduleComplianceAlertReconcile(owner, 'policy-delete');
     return deleted ?? null;
   } catch (err) {
     // Lost the race: a child was created after the check above. The FK is the
@@ -757,30 +775,6 @@ async function decomposeInlineSettings(
   const s = settings as Record<string, unknown>;
 
   switch (featureType) {
-    case 'alert_rule': {
-      const parsed = alertRuleInlineSettingsSchema.parse(s);
-      if (parsed.items.length > 0) {
-        await tx.insert(configPolicyAlertRules).values(
-          parsed.items.map((item, idx) => ({
-            featureLinkId: linkId,
-            name: item.name,
-            severity: item.severity,
-            conditions: item.conditions,
-            cooldownMinutes: item.cooldownMinutes,
-            autoResolve: item.autoResolve,
-            autoResolveConditions: item.autoResolveConditions ?? null,
-            titleTemplate: item.titleTemplate ?? '{{ruleName}} triggered on {{deviceName}}',
-            messageTemplate: item.messageTemplate ?? '{{ruleName}} condition met',
-            escalationPolicyId: item.escalationPolicyId ?? null,
-            notificationChannelIds: item.notificationChannelIds ?? null,
-            sortOrder: item.sortOrder ?? idx,
-            rationale: item.rationale ?? null,
-          }))
-        );
-      }
-      break;
-    }
-
     case 'automation': {
       const items = Array.isArray(s.items) ? s.items : [];
       if (items.length > 0) {
@@ -826,7 +820,7 @@ async function decomposeInlineSettings(
             }
             return {
               featureLinkId: linkId,
-              name: String(item.name ?? `Compliance Rule ${idx + 1}`),
+              name: complianceItemName(item, idx),
               rules: item.rules ?? {},
               enforcementLevel: (VALID_ENFORCEMENT.includes(item.enforcementLevel as Enforcement) ? item.enforcementLevel : 'monitor') as Enforcement,
               checkIntervalMinutes: typeof item.checkIntervalMinutes === 'number' ? item.checkIntervalMinutes : 60,
@@ -892,6 +886,20 @@ async function decomposeInlineSettings(
       break;
     }
 
+    case 'time_sync': {
+      const parsed = timeSyncInlineSettingsSchema.parse(s);
+      await tx.insert(configPolicyTimeSyncSettings).values({
+        featureLinkId: linkId,
+        enforceNtp: parsed.enforceNtp,
+        ntpServers: parsed.ntpServers,
+        pollIntervalMinutes: parsed.pollIntervalMinutes,
+        timezoneExpected: parsed.timezone.expected,
+        pinnedTimezone: parsed.timezone.pinnedTimezone,
+        timezoneAutoFix: parsed.timezone.autoFix,
+      });
+      break;
+    }
+
     case 'sensitive_data': {
       await tx.insert(configPolicySensitiveDataSettings).values({
         featureLinkId: linkId,
@@ -908,43 +916,6 @@ async function decomposeInlineSettings(
         cron: typeof s.cron === 'string' ? s.cron : null,
         timezone: typeof s.timezone === 'string' ? s.timezone : 'UTC',
       });
-      break;
-    }
-
-    case 'monitoring': {
-      const parsed = monitoringInlineSettingsSchema.parse(s);
-      const [settingsRow] = await tx.insert(configPolicyMonitoringSettings).values({
-        featureLinkId: linkId,
-        checkIntervalSeconds: parsed.checkIntervalSeconds,
-      }).onConflictDoUpdate({
-        target: configPolicyMonitoringSettings.featureLinkId,
-        set: { checkIntervalSeconds: parsed.checkIntervalSeconds, updatedAt: new Date() },
-      }).returning();
-      if (settingsRow && parsed.watches.length > 0) {
-        const VALID_SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'] as const;
-        type AlertSeverity = (typeof VALID_SEVERITIES)[number];
-        await tx.insert(configPolicyMonitoringWatches).values(
-          parsed.watches.map((w, idx) => ({
-            settingsId: settingsRow.id,
-            watchType: w.watchType as 'service' | 'process',
-            name: w.name,
-            displayName: w.displayName ?? null,
-            enabled: w.enabled,
-            alertOnStop: w.alertOnStop,
-            alertAfterConsecutiveFailures: w.alertAfterConsecutiveFailures,
-            alertSeverity: (VALID_SEVERITIES.includes(w.alertSeverity as AlertSeverity) ? w.alertSeverity : 'high') as AlertSeverity,
-            cpuThresholdPercent: w.cpuThresholdPercent ?? null,
-            memoryThresholdMb: w.memoryThresholdMb ?? null,
-            thresholdDurationSeconds: w.thresholdDurationSeconds,
-            autoRestart: w.autoRestart,
-            maxRestartAttempts: w.maxRestartAttempts,
-            restartCooldownSeconds: w.restartCooldownSeconds,
-            sortOrder: idx,
-            rationale: w.rationale ?? null,
-          }))
-        );
-      }
-
       break;
     }
 
@@ -1137,6 +1108,18 @@ async function decomposeInlineSettings(
           }))
         );
       }
+      // Upsert preserves the settings id and its retired watch history after
+      // 2026-10-31-110000-legacy-alerting-retirement-sweep.sql re-keys ownership.
+      // Attachment edits must neither create an interval override nor reset an
+      // existing (including migration-re-keyed) interval.
+      if (parsed.checkIntervalSeconds !== undefined) {
+        await tx.insert(configPolicyMonitoringSettings)
+          .values({ featureLinkId: linkId, checkIntervalSeconds: parsed.checkIntervalSeconds })
+          .onConflictDoUpdate({
+            target: configPolicyMonitoringSettings.featureLinkId,
+            set: { checkIntervalSeconds: parsed.checkIntervalSeconds, updatedAt: new Date() },
+          });
+      }
       break;
     }
 
@@ -1166,26 +1149,25 @@ async function decomposeInlineSettings(
  * plain ZodError before any row is touched.
  *
  * Mirrors exactly the `case` arms of decomposeInlineSettings that call `.parse`
- * — the others build their rows defensively from `unknown` and cannot throw.
+ * — the others build their rows defensively from `unknown` and cannot throw —
+ * plus one rule decompose cannot enforce by itself: compliance rule set names
+ * are unique within the link (DuplicateComplianceItemNameError).
  */
 function assertDecomposableInlineSettings(featureType: ConfigFeatureType, settings: unknown): void {
   // Same early-out as decomposeInlineSettings: nothing to decompose, nothing to check.
   if (!settings || typeof settings !== 'object') return;
   switch (featureType) {
-    case 'alert_rule':
-      alertRuleInlineSettingsSchema.parse(settings);
-      break;
     case 'event_log':
       eventLogInlineSettingsSchema.parse(settings);
       break;
     case 'hardware_monitoring':
       hardwareMonitoringInlineSettingsSchema.parse(settings);
       break;
+    case 'time_sync':
+      timeSyncInlineSettingsSchema.parse(settings);
+      break;
     case 'maintenance':
       maintenanceInlineSettingsSchema.parse(settings);
-      break;
-    case 'monitoring':
-      monitoringInlineSettingsSchema.parse(settings);
       break;
     case 'remote_access':
       remoteAccessConsentSettingsSchema.parse(settings);
@@ -1195,6 +1177,9 @@ function assertDecomposableInlineSettings(featureType: ConfigFeatureType, settin
       break;
     case 'monitors':
       monitorsInlineSettingsSchema.parse(settings);
+      break;
+    case 'compliance':
+      assertUniqueComplianceItemNames(settings);
       break;
     default:
       break;
@@ -1211,9 +1196,6 @@ async function deleteNormalizedRows(
   tx: Parameters<Parameters<typeof db.transaction>[0]>[0]
 ): Promise<void> {
   switch (featureType) {
-    case 'alert_rule':
-      await tx.delete(configPolicyAlertRules).where(and(eq(configPolicyAlertRules.featureLinkId, linkId), isNull(configPolicyAlertRules.retiredAt)));
-      break;
     case 'automation':
       await tx.delete(configPolicyAutomations).where(and(eq(configPolicyAutomations.featureLinkId, linkId), isNull(configPolicyAutomations.retiredAt)));
       break;
@@ -1232,33 +1214,12 @@ async function deleteNormalizedRows(
     case 'hardware_monitoring':
       await tx.delete(configPolicyHardwareMonitoringSettings).where(eq(configPolicyHardwareMonitoringSettings.featureLinkId, linkId));
       break;
+    case 'time_sync':
+      await tx.delete(configPolicyTimeSyncSettings).where(eq(configPolicyTimeSyncSettings.featureLinkId, linkId));
+      break;
     case 'sensitive_data':
       await tx.delete(configPolicySensitiveDataSettings).where(eq(configPolicySensitiveDataSettings.featureLinkId, linkId));
       break;
-    case 'monitoring': {
-      // Keep the settings row stable: deleting it would cascade to retired
-      // watches and destroy their conversion history. Decompose upserts it.
-      //
-      // Deliberately does NOT touch config_policy_alert_rules. The monitoring
-      // decompose path used to write alert rules keyed by the MONITORING link
-      // and this delete was its replace-half; as of the 2026-07-30 consolidation
-      // the insert half is gone and the alert_rule link is the sole owner. If
-      // 2026-07-30-alert-rule-ownership-consolidation.sql has not run (or a row
-      // slipped past it), a delete here would silently destroy legacy rules on
-      // the next save of an unrelated Monitoring setting, with nothing to
-      // re-create them. Leaving the rows in place keeps them recoverable by a
-      // replay of the migration.
-      await tx.delete(configPolicyMonitoringWatches).where(and(
-        inArray(
-          configPolicyMonitoringWatches.settingsId,
-          tx.select({ id: configPolicyMonitoringSettings.id })
-            .from(configPolicyMonitoringSettings)
-            .where(eq(configPolicyMonitoringSettings.featureLinkId, linkId)),
-        ),
-        isNull(configPolicyMonitoringWatches.retiredAt),
-      ));
-      break;
-    }
     case 'backup':
       await tx.delete(configPolicyBackupSettings).where(eq(configPolicyBackupSettings.featureLinkId, linkId));
       break;
@@ -1271,6 +1232,7 @@ async function deleteNormalizedRows(
       break;
     }
     case 'monitors':
+      // Replace attachments only; decompose upserts settings, preserving retired watches.
       await tx.delete(configPolicyMonitors).where(eq(configPolicyMonitors.featureLinkId, linkId));
       break;
     case 'warranty':
@@ -1301,39 +1263,6 @@ async function assembleInlineSettings(
   executor: DbExecutor
 ): Promise<unknown | null> {
   switch (featureType) {
-    case 'alert_rule': {
-      const rows = await executor
-        .select()
-        .from(configPolicyAlertRules)
-        .where(and(eq(configPolicyAlertRules.featureLinkId, linkId), isNull(configPolicyAlertRules.retiredAt)))
-        .orderBy(asc(configPolicyAlertRules.sortOrder));
-      if (rows.length === 0) {
-        const [retired] = await executor.select({ id: configPolicyAlertRules.id })
-          .from(configPolicyAlertRules)
-          .where(and(eq(configPolicyAlertRules.featureLinkId, linkId), isNotNull(configPolicyAlertRules.retiredAt)))
-          .limit(1);
-        // Retired history makes an empty live set authoritative; links awaiting
-        // normalization must still fall back to their pre-backfill JSON mirror.
-        return retired ? { items: [] } : null;
-      }
-      return {
-        items: rows.map((r) => ({
-          name: r.name,
-          severity: r.severity,
-          conditions: r.conditions,
-          cooldownMinutes: r.cooldownMinutes,
-          autoResolve: r.autoResolve,
-          autoResolveConditions: r.autoResolveConditions,
-          titleTemplate: r.titleTemplate,
-          messageTemplate: r.messageTemplate,
-          escalationPolicyId: r.escalationPolicyId,
-          notificationChannelIds: r.notificationChannelIds,
-          sortOrder: r.sortOrder,
-          rationale: r.rationale,
-        })),
-      };
-    }
-
     case 'automation': {
       const rows = await executor
         .select()
@@ -1468,6 +1397,26 @@ async function assembleInlineSettings(
         : null;
     }
 
+    case 'time_sync': {
+      const [row] = await executor
+        .select()
+        .from(configPolicyTimeSyncSettings)
+        .where(eq(configPolicyTimeSyncSettings.featureLinkId, linkId))
+        .limit(1);
+      return row
+        ? timeSyncInlineSettingsSchema.parse({
+            enforceNtp: row.enforceNtp,
+            ntpServers: row.ntpServers,
+            pollIntervalMinutes: row.pollIntervalMinutes,
+            timezone: {
+              expected: row.timezoneExpected,
+              pinnedTimezone: row.pinnedTimezone,
+              autoFix: row.timezoneAutoFix,
+            },
+          })
+        : null;
+    }
+
     case 'sensitive_data': {
       const [row] = await executor
         .select()
@@ -1488,40 +1437,6 @@ async function assembleInlineSettings(
         intervalMinutes: row.intervalMinutes,
         cron: row.cron,
         timezone: row.timezone,
-      };
-    }
-
-    case 'monitoring': {
-      const [settingsRow] = await executor
-        .select()
-        .from(configPolicyMonitoringSettings)
-        .where(eq(configPolicyMonitoringSettings.featureLinkId, linkId))
-        .limit(1);
-      if (!settingsRow) return null;
-      const watches = await executor
-        .select()
-        .from(configPolicyMonitoringWatches)
-        .where(and(eq(configPolicyMonitoringWatches.settingsId, settingsRow.id), isNull(configPolicyMonitoringWatches.retiredAt)))
-        .orderBy(asc(configPolicyMonitoringWatches.sortOrder));
-
-      return {
-        checkIntervalSeconds: settingsRow.checkIntervalSeconds,
-        watches: watches.map((w) => ({
-          watchType: w.watchType,
-          name: w.name,
-          displayName: w.displayName,
-          enabled: w.enabled,
-          alertOnStop: w.alertOnStop,
-          alertAfterConsecutiveFailures: w.alertAfterConsecutiveFailures,
-          alertSeverity: w.alertSeverity,
-          cpuThresholdPercent: w.cpuThresholdPercent,
-          memoryThresholdMb: w.memoryThresholdMb,
-          thresholdDurationSeconds: w.thresholdDurationSeconds,
-          autoRestart: w.autoRestart,
-          maxRestartAttempts: w.maxRestartAttempts,
-          restartCooldownSeconds: w.restartCooldownSeconds,
-          rationale: w.rationale,
-        })),
       };
     }
 
@@ -1576,6 +1491,11 @@ async function assembleInlineSettings(
       const inheritance = monitorsInheritanceSchema.catch('cumulative').parse(
         (link?.inlineSettings as { inheritance?: unknown } | null)?.inheritance,
       );
+      const [settingsRow] = await executor
+        .select({ checkIntervalSeconds: configPolicyMonitoringSettings.checkIntervalSeconds })
+        .from(configPolicyMonitoringSettings)
+        .where(eq(configPolicyMonitoringSettings.featureLinkId, linkId))
+        .limit(1);
       // Deliberately never falls back to `link.inlineSettings` here, even when
       // `rows` is empty: config_policy_monitors is the sole source of truth for
       // attachments (see addFeatureLink's "runtime must read normalized
@@ -1597,6 +1517,7 @@ async function assembleInlineSettings(
           sortOrder: r.sortOrder,
         })),
         inheritance,
+        ...(settingsRow ? { checkIntervalSeconds: settingsRow.checkIntervalSeconds } : {}),
       };
     }
 
@@ -1676,6 +1597,34 @@ export class WarrantyConsentError extends Error {
 }
 
 /**
+ * Two compliance rule sets in one feature link with the same name. A rule set
+ * is identified by (feature link, name) across saves — the evaluator's
+ * automation_policy_compliance row, the due check and the compliance alert all
+ * key on it — so two of them would share one state row and one alert and
+ * overwrite each other's result. The HTTP routes refuse this up front with a
+ * 400 (DUPLICATE_COMPLIANCE_RULE_SET_NAME); this is the backstop for every
+ * other caller.
+ */
+export class DuplicateComplianceItemNameError extends Error {
+  readonly code = 'DUPLICATE_COMPLIANCE_RULE_SET_NAME' as const;
+
+  constructor(readonly names: string[]) {
+    super(duplicateComplianceItemNameMessage(names[0] ?? ''));
+    this.name = 'DuplicateComplianceItemNameError';
+  }
+}
+
+function assertUniqueComplianceItemNames(settings: unknown): void {
+  if (!settings || typeof settings !== 'object') return;
+  const items = (settings as { items?: unknown }).items;
+  if (!Array.isArray(items)) return;
+  const names = duplicateComplianceItemNames(
+    items.filter((item): item is { name?: unknown } => !!item && typeof item === 'object'),
+  );
+  if (names.length > 0) throw new DuplicateComplianceItemNameError(names);
+}
+
+/**
  * The authenticated user on whose behalf a warranty consent may be stamped.
  * Supplied OUT OF BAND by the HTTP routes — never read from the payload, and
  * never available to `manage_policy_feature_link`, which is why an assistant
@@ -1740,6 +1689,27 @@ export function resolveWarrantyInlineSettingsForWrite(
   };
 }
 
+/** Keep the compatibility mirror and mutation response faithful to the interval row. */
+async function reloadMonitorsInterval(
+  link: typeof configPolicyFeatureLinks.$inferSelect,
+  executor: DbExecutor,
+) {
+  const [settings] = await executor
+    .select({ checkIntervalSeconds: configPolicyMonitoringSettings.checkIntervalSeconds })
+    .from(configPolicyMonitoringSettings)
+    .where(eq(configPolicyMonitoringSettings.featureLinkId, link.id))
+    .limit(1);
+  const inlineSettings = { ...(link.inlineSettings as Record<string, unknown> | null ?? {}) };
+  const previousInterval = inlineSettings.checkIntervalSeconds;
+  delete inlineSettings.checkIntervalSeconds;
+  if (settings) inlineSettings.checkIntervalSeconds = settings.checkIntervalSeconds;
+  if (previousInterval !== inlineSettings.checkIntervalSeconds) {
+    await executor.update(configPolicyFeatureLinks).set({ inlineSettings })
+      .where(eq(configPolicyFeatureLinks.id, link.id));
+  }
+  return { ...link, inlineSettings };
+}
+
 export async function addFeatureLink(
   configPolicyId: string,
   featureType: ConfigFeatureType,
@@ -1782,12 +1752,14 @@ export async function addFeatureLink(
     inlineSettings = remoteAccessInlineSettingsSchema.parse(inlineSettings);
   }
 
+  if (featureType === 'compliance') assertUniqueComplianceItemNames(inlineSettings);
+
   const normalizedAutomation = featureType === 'automation'
     ? await normalizeConfigPolicyAutomationSettings(inlineSettings)
     : null;
   if (normalizedAutomation) inlineSettings = normalizedAutomation.settings;
 
-  return executor.transaction(async (tx) => {
+  const added = await executor.transaction(async (tx) => {
     const effectiveInlineSettings =
       featureType === 'patch'
         ? normalizePatchInlineSettings(inlineSettings)
@@ -1833,8 +1805,27 @@ export async function addFeatureLink(
       );
     }
 
-    return link;
+    return featureType === 'monitors' ? reloadMonitorsInterval(link, tx) : link;
   });
+  // A policy that gains compliance can take precedence over the policy whose
+  // rules a device followed until now; alerts those rules raised close.
+  if (added && featureType === 'compliance') {
+    scheduleComplianceAlertReconcile({ configPolicyId }, 'feature-link-add');
+  }
+  return added;
+}
+
+/** Internal mutation lookup; caller must first authorize access to the policy. */
+export async function getRetiredFeatureLink(configPolicyId: string, linkId: string) {
+  const [link] = await db.select({ id: configPolicyFeatureLinks.id, featureType: configPolicyFeatureLinks.featureType })
+    .from(configPolicyFeatureLinks)
+    .where(and(
+      eq(configPolicyFeatureLinks.configPolicyId, configPolicyId),
+      eq(configPolicyFeatureLinks.id, linkId),
+      inArray(configPolicyFeatureLinks.featureType, [...RETIRED_CONFIG_FEATURE_TYPES]),
+    ))
+    .limit(1);
+  return link ?? null;
 }
 
 export async function updateFeatureLink(
@@ -1848,7 +1839,8 @@ export async function updateFeatureLink(
     updates.inlineSettings = configFeatureInlineSettingsSchema.parse(updates.inlineSettings);
   }
 
-  return executor.transaction(async (tx) => {
+  let updatedComplianceOf: string | null = null;
+  const result = await executor.transaction(async (tx) => {
     // Fetch current link to get featureType, scoped to configPolicyId when provided
     const conditions = [eq(configPolicyFeatureLinks.id, linkId)];
     if (configPolicyId) {
@@ -1860,6 +1852,9 @@ export async function updateFeatureLink(
       .where(and(...conditions))
       .limit(1);
     if (!existing) return null;
+    if (isRetiredConfigFeatureType(existing.featureType)) {
+      throw new Error(`Feature link ${linkId} is retired (${existing.featureType}); it cannot be edited`);
+    }
 
     if (existing.featureType === 'pam' && updates.inlineSettings !== undefined && updates.inlineSettings !== null) {
       pamInlineSettingsSchema.parse(updates.inlineSettings);
@@ -1969,8 +1964,16 @@ export async function updateFeatureLink(
       }
     }
 
-    return updated ?? null;
+    if (!updated) return null;
+    if (existing.featureType === 'compliance') updatedComplianceOf = existing.configPolicyId;
+    return existing.featureType === 'monitors' ? reloadMonitorsInterval(updated, tx) : updated;
   });
+  // A renamed or removed rule set never gets another compliance event, so its
+  // open alerts close through the reconcile.
+  if (updatedComplianceOf) {
+    scheduleComplianceAlertReconcile({ configPolicyId: updatedComplianceOf }, 'feature-link-update');
+  }
+  return result;
 }
 
 /** A feature link is the permanent owner of converted source history. */
@@ -1994,10 +1997,38 @@ async function featureLinkHasRetiredHistory(linkId: string, executor: DbExecutor
 }
 
 export async function removeFeatureLink(linkId: string, configPolicyId: string) {
+  const removed = await removeFeatureLinkInTransaction(linkId, configPolicyId);
+  // Emptied or deleted, a compliance link's rules stop applying; the alerts
+  // they raised close through the reconcile.
+  if (removed?.featureType === 'compliance') {
+    scheduleComplianceAlertReconcile({ configPolicyId }, 'feature-link-remove');
+  }
+  return removed;
+}
+
+async function removeFeatureLinkInTransaction(linkId: string, configPolicyId: string) {
   return db.transaction(async (tx) => {
     const predicate = and(eq(configPolicyFeatureLinks.id, linkId), eq(configPolicyFeatureLinks.configPolicyId, configPolicyId));
     const [existing] = await tx.select().from(configPolicyFeatureLinks).where(predicate).for('update');
     if (!existing) return null;
+
+    const [settings] = await tx.select().from(configPolicyMonitoringSettings)
+      .where(eq(configPolicyMonitoringSettings.featureLinkId, linkId)).limit(1);
+    const inline = (existing.inlineSettings ?? {}) as Record<string, unknown>;
+    if (settings || (existing.featureType === 'monitors' && inline.inheritance === 'replace')) {
+      const reason = settings ? 'monitoring_settings' as const : 'replace_inheritance' as const;
+      // Legacy monitoring links may still own duplicate settings and history.
+      if (existing.featureType !== 'monitors') return { ...existing, kept: true as const, reason };
+      await tx.delete(configPolicyMonitors).where(eq(configPolicyMonitors.featureLinkId, linkId));
+      const inlineSettings: Record<string, unknown> = { ...inline, items: [] };
+      delete inlineSettings.checkIntervalSeconds;
+      if (settings) inlineSettings.checkIntervalSeconds = settings.checkIntervalSeconds;
+      const [updated] = await tx.update(configPolicyFeatureLinks).set({
+        inlineSettings,
+        updatedAt: new Date(),
+      }).where(predicate).returning();
+      return updated ? { ...updated, kept: true as const, reason } : null;
+    }
 
     // D11/D29: deleting the owner would cascade away retired source rows and
     // leave conversion provenance dangling. Keep it as an empty live feature.
@@ -2018,7 +2049,11 @@ export async function listFeatureLinks(configPolicyId: string, executor: DbExecu
   const links = await executor
     .select()
     .from(configPolicyFeatureLinks)
-    .where(eq(configPolicyFeatureLinks.configPolicyId, configPolicyId));
+    .where(and(
+      eq(configPolicyFeatureLinks.configPolicyId, configPolicyId),
+      // Preserve retired rows for history without exposing them as active links.
+      notInArray(configPolicyFeatureLinks.featureType, [...RETIRED_CONFIG_FEATURE_TYPES]),
+    ));
 
   // Assemble inlineSettings from normalized tables for each link
   const enriched = await Promise.all(
@@ -2107,6 +2142,9 @@ export async function assignPolicy(
     })
     .onConflictDoNothing()
     .returning();
+  // A new assignment can take precedence over the one a device followed until
+  // now; alerts raised by rules the device no longer follows close.
+  if (assignment) scheduleComplianceAlertReconcile({ configPolicyId }, 'assignment-add');
   return assignment ?? null;
 }
 
@@ -2387,6 +2425,7 @@ export async function unassignPolicy(assignmentId: string, configPolicyId: strin
       )
     )
     .returning();
+  if (deleted) scheduleComplianceAlertReconcile({ configPolicyId }, 'assignment-remove');
   return deleted ?? null;
 }
 
@@ -2436,20 +2475,53 @@ async function resolveEffectiveConfigWithExecutor(
   if (!device) return null;
 
   // 2. Load org for partnerId
-  const [org] = await executor
-    .select({ partnerId: organizations.partnerId })
+  const [orgRow] = await executor
+    .select({ partnerId: organizations.partnerId, type: organizations.type })
     .from(organizations)
     .where(eq(organizations.id, device.orgId))
     .limit(1);
+  // A device parked in its partner's holding org resolves no partner-level or
+  // partner-wide configuration: it is not managed until it is assigned.
+  const org = orgRow && isUnassignedPoolOrgType(orgRow.type)
+    ? { partnerId: null as string | null }
+    : orgRow;
 
   // 3. Load device group memberships
   const groupRows = await executor
     .select({ groupId: deviceGroupMemberships.groupId })
     .from(deviceGroupMemberships)
     .where(eq(deviceGroupMemberships.deviceId, deviceId));
-  const groupIds = groupRows.map((r) => r.groupId);
+  const rawGroupIds = groupRows.map((r) => r.groupId);
 
-  // 4. Build target match conditions
+  // Field-provenance tiering — a device_group-level
+  // config-policy assignment can name a dynamic group whose rules key on an
+  // execution-refused agent-reported field (hostname, tags, deviceRole,
+  // custom.*, ...). Membership itself is left alone (this device really is a
+  // member per the materialized device_group_memberships row).
+  //
+  // What is gated by field provenance is NOT "any assignment from this
+  // group" — it is only assignments for EXECUTION_GATED feature types
+  // (installs/deploys software, runs automations/scripts, elevates
+  // privilege, grants remote access, delivers a credential). A PROTECTIVE
+  // feature type (hardening, DNS/firewall posture, peripheral control,
+  // monitoring, compliance/vulnerability/sensitive-data scanning, ...) only
+  // restricts or detects on the device it applies to, so dropping it because
+  // the group's rules happen to reference an agent-reported field would
+  // silently turn a real protection OFF for a device that never asked to be
+  // excluded — an unsafe-by-default "not enforced" failure mode. Both
+  // classifications therefore still query the full raw membership set below;
+  // only the execution-gated rows sourced from a refused group are dropped,
+  // after the query, once each row's own featureType is known (see the
+  // filter after `sorted` is computed).
+  const { refusedGroups } = await resolveExecutionSafeGroupIds(rawGroupIds);
+  const refusedGroupFieldsById = new Map(refusedGroups.map((g) => [g.id, g.refusedFields]));
+  if (refusedGroups.length > 0) {
+    auditRefusedExecutionGroups(device.orgId, 'config_policy.execution_target_refused_agent_reported_fields', refusedGroups);
+  }
+
+  // 4. Build target match conditions. Every group the device is really a
+  // member of is included here — see the field-provenance tiering note above for why the
+  // protective/execution-gated split cannot be applied at this stage.
   const targetConditions: SQL[] = [];
   targetConditions.push(
     and(
@@ -2457,11 +2529,11 @@ async function resolveEffectiveConfigWithExecutor(
       eq(configPolicyAssignments.targetId, deviceId)
     )!
   );
-  if (groupIds.length > 0) {
+  if (rawGroupIds.length > 0) {
     targetConditions.push(
       and(
         eq(configPolicyAssignments.level, 'device_group'),
-        inArray(configPolicyAssignments.targetId, groupIds)
+        inArray(configPolicyAssignments.targetId, rawGroupIds)
       )!
     );
   }
@@ -2549,6 +2621,7 @@ async function resolveEffectiveConfigWithExecutor(
     )
     .where(and(
       sql`(${sql.join(targetConditions, sql` OR `)})`,
+      notInArray(configPolicyEffectiveFeatureLinks.featureType, [...RETIRED_CONFIG_FEATURE_TYPES]),
       // Apply the optional role/os device-type filter (#1724). A NULL filter
       // matches all; a set filter gates the assignment to matching devices.
       ...buildRoleOsFilterConditions(device),
@@ -2583,8 +2656,21 @@ async function resolveEffectiveConfigWithExecutor(
     },
   );
 
+  // 5b. Drop only the EXECUTION_GATED rows sourced from a refused device_group
+  // — see the field-provenance tiering note above the target-condition build. A row's own
+  // featureType is only known once the assignment/feature-link join has come
+  // back, which is why this happens here rather than by excluding the group
+  // from `targetConditions` entirely.
+  const gatedRows = refusedGroupFieldsById.size === 0
+    ? rows
+    : rows.filter((row) => {
+        if (row.assignmentLevel !== 'device_group') return true;
+        if (!refusedGroupFieldsById.has(row.assignmentTargetId)) return true;
+        return !isExecutionGatedFeatureType(row.featureType as ConfigFeatureType);
+      });
+
   // 6. Sort by level priority (device=5 first), then priority ASC, then createdAt ASC
-  const sorted = rows.sort((a, b) => {
+  const sorted = gatedRows.sort((a, b) => {
     const levelDiff = (LEVEL_PRIORITY[b.assignmentLevel as ConfigAssignmentLevel] ?? 0) -
                       (LEVEL_PRIORITY[a.assignmentLevel as ConfigAssignmentLevel] ?? 0);
     if (levelDiff !== 0) return levelDiff;
@@ -2767,7 +2853,6 @@ export const PARTNER_LINKABLE_FEATURE_TYPES: ReadonlySet<ConfigFeatureType> = ne
   'patch',
   'software_policy',
   'security',
-  'alert_rule',
   'compliance',
   'sensitive_data',
   'peripheral_control',
@@ -2917,7 +3002,6 @@ export async function validateFeaturePolicyExists(
   if (
     featureType === 'software_policy' ||
     featureType === 'security' ||
-    featureType === 'alert_rule' ||
     featureType === 'compliance' ||
     featureType === 'sensitive_data' ||
     featureType === 'peripheral_control' ||
@@ -2927,7 +3011,7 @@ export async function validateFeaturePolicyExists(
       return { valid: true };
     }
 
-    // Software (#2126), security (#2127), alert-rule (#2128), compliance
+    // Software (#2126), security (#2127), compliance
     // (#2129, automation_policies), sensitive-data, and peripheral-control
     // (#2131) policies are dual-ownership. A config policy may link:
     //  - an org-owned policy belonging to the config policy's own org
@@ -2939,15 +3023,13 @@ export async function validateFeaturePolicyExists(
       ? { table: softwarePolicies, label: 'Software policy' }
       : featureType === 'security'
         ? { table: securityPolicies, label: 'Security policy' }
-        : featureType === 'alert_rule'
-          ? { table: alertRules, label: 'Alert rule' }
-          : featureType === 'compliance'
-            ? { table: automationPolicies, label: 'Compliance policy' }
-            : featureType === 'sensitive_data'
-              ? { table: sensitiveDataPolicies, label: 'Sensitive data policy' }
-              : featureType === 'peripheral_control'
-                ? { table: peripheralPolicies, label: 'Peripheral policy' }
-                : { table: maintenanceWindows, label: 'Maintenance window' };
+        : featureType === 'compliance'
+          ? { table: automationPolicies, label: 'Compliance policy' }
+          : featureType === 'sensitive_data'
+            ? { table: sensitiveDataPolicies, label: 'Sensitive data policy' }
+            : featureType === 'peripheral_control'
+              ? { table: peripheralPolicies, label: 'Peripheral policy' }
+              : { table: maintenanceWindows, label: 'Maintenance window' };
     const partnerId =
       owner.partnerId ?? (owner.orgId ? await resolvePartnerIdForOrg(owner.orgId) : null);
 
@@ -3003,9 +3085,9 @@ export async function validateFeaturePolicyExists(
   }
 
   if (
-    featureType === 'monitoring' ||
     featureType === 'event_log' ||
     featureType === 'hardware_monitoring' ||
+    featureType === 'time_sync' ||
     featureType === 'onedrive_helper' ||
     featureType === 'vulnerability' ||
     featureType === 'device_lifecycle' ||

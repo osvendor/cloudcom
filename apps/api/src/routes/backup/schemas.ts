@@ -6,6 +6,8 @@ import {
   backupScheduleSchema as sharedBackupScheduleSchema,
 } from '@breeze/shared/validators';
 import { drRestoreConfigSchema } from '../../services/drBareMetalRebuildStep';
+// Pool-free leaf (imports only zod) — this module must stay pool-free at load.
+import { hypervOptionsSchema, isAbsoluteRebuildPath } from '../../services/bareMetalRebuildSchemas';
 import { BACKUP_HEALTH_MAX_LIMIT } from '../../services/backupHealthCursor';
 
 const queryBoolean = z.preprocess((value) => {
@@ -167,7 +169,7 @@ export const jobListSchema = z.object({
   // passing one through to a pgEnum comparison makes Postgres raise
   // `invalid input value for enum backup_status` (a 500, not an empty list).
   status: z.enum([
-    'pending', 'running', 'completed', 'failed', 'cancelled', 'partial',
+    'pending', 'running', 'completed', 'completed_with_errors', 'failed', 'cancelled', 'partial',
     'queued', 'canceled',
   ]).optional(),
   device: z.string().optional(),
@@ -347,6 +349,17 @@ export const bmrRecoveryDownloadSchema = z.object({
   path: z.string().min(1).max(4096),
 });
 
+// Recovery-token-authenticated (not session-authenticated): the shipped
+// run-recovery.sh/.ps1 launch script only ever holds the plaintext recovery
+// token, the same credential /bmr/recover/authenticate already accepts —
+// there is no user session to gate this behind requirePermission the way
+// /bmr/signing-key and /bmr/media/:id/signature are.
+export const bmrRecoveryBinarySignatureSchema = z.object({
+  token: z.string().min(1),
+  platform: z.enum(['linux', 'windows']),
+  architecture: z.string().min(1).max(20),
+});
+
 // ── Bare-metal recovery schemas (W04a) ──────────────────────────────
 
 export const bmrRecoveryCreateSchema = z.object({
@@ -457,8 +470,9 @@ export const bmrMediaListSchema = z.object({
 });
 
 // Restore-as-VM (W05a): two engines behind one route. `hyperv` is the
-// existing Hyper-V path (fields verbatim); `rebuild` drives the Linux rebuild
-// engine on a helper host and produces a VHDX. The rebuild variant is strict
+// existing Hyper-V path (fields verbatim); `rebuild` drives the rebuild
+// engine on a helper host of the snapshot's platform (Linux or Windows) and
+// produces a VHDX. The rebuild variant is strict
 // and carries NO `identity` field — the server always creates the recovery
 // with `identity: 'new'` (spec §9: a rehearsal image can never resume the
 // production identity), so a client cannot even ask.
@@ -482,7 +496,10 @@ export const rebuildVhdxOutputPathSchema = z
   .string()
   .min(1)
   .max(1024)
-  .refine((p) => p.startsWith('/') && p.endsWith('.vhdx'), 'absolute .vhdx path required');
+  .refine(
+    (p) => isAbsoluteRebuildPath(p) && p.toLowerCase().endsWith('.vhdx'),
+    'absolute .vhdx path required (POSIX or a Windows drive letter, no UNC)',
+  );
 
 const bmrVmRestoreRebuildSchema = z
   .object({
@@ -491,6 +508,9 @@ const bmrVmRestoreRebuildSchema = z
     rebuildHostDeviceId: z.string().guid(),
     outputPath: rebuildVhdxOutputPathSchema,
     imageSizeGb: z.number().int().min(1).optional(),
+    // W06d: create a Hyper-V VM after the rebuild — Windows rebuild hosts only
+    // (400 hyperv_requires_windows_host otherwise, checked where the host is known).
+    hyperv: hypervOptionsSchema,
   })
   .strict();
 

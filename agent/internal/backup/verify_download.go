@@ -116,6 +116,49 @@ func downloadWithDeadline(ctx context.Context, provider providers.BackupProvider
 	return err
 }
 
+// downloadClockInterface abstracts wall time for downloadWithStallTimeout so
+// its tests can drive the passage of time explicitly instead of racing real
+// scheduling (#7255): the provider's chunk pacing and the watchdog's
+// no-progress window are two independently-scheduled real-time waits, and on
+// a loaded CI runner the gap between them could shrink enough to trip a false
+// stall even though nothing was actually stalled. Production always uses
+// realDownloadClock; this is a seam, not a behaviour change.
+type downloadClockInterface interface {
+	Now() time.Time
+	NewTimer(d time.Duration) downloadTimerInterface
+}
+
+// downloadTimerInterface is the subset of *time.Timer that
+// downloadWithStallTimeout uses.
+type downloadTimerInterface interface {
+	C() <-chan time.Time
+	Reset(d time.Duration) bool
+	Stop() bool
+}
+
+type realDownloadClock struct{}
+
+func (realDownloadClock) Now() time.Time { return time.Now() }
+func (realDownloadClock) NewTimer(d time.Duration) downloadTimerInterface {
+	return realDownloadTimer{time.NewTimer(d)}
+}
+
+type realDownloadTimer struct{ t *time.Timer }
+
+func (r realDownloadTimer) C() <-chan time.Time        { return r.t.C }
+func (r realDownloadTimer) Reset(d time.Duration) bool { return r.t.Reset(d) }
+func (r realDownloadTimer) Stop() bool                 { return r.t.Stop() }
+
+var downloadClock downloadClockInterface = realDownloadClock{}
+
+// setDownloadClockForTest overrides downloadClock. Call the returned func
+// (typically via defer) to restore it.
+func setDownloadClockForTest(c downloadClockInterface) (restore func()) {
+	old := downloadClock
+	downloadClock = c
+	return func() { downloadClock = old }
+}
+
 // errDownloadStalled is matched (errors.Is) by a downloadStallError.
 var errDownloadStalled = errors.New("download stalled")
 
@@ -152,9 +195,17 @@ func downloadStallWindow() time.Duration { return downloadTimeoutFloor }
 // production provider reports it), backed up by localPath growing past the
 // largest size seen so far, so a
 // provider that writes the destination without reporting is still seen as
-// progressing. File growth is sampled only when the window is about to
-// expire, so a transfer seen only that way fails at most two windows after
-// its last byte. A provider without providers.ContextDownloader (test fakes)
+// progressing. Once the provider has reported any progress through the
+// callback, the callback is authoritative (WithDownloadProgress requires it
+// to report every chunk) and file growth is ignored: the callback stamped
+// those bytes when they arrived, and re-crediting them when the growth was
+// sampled, a window later, made a stall take about two windows to detect
+// (#6952). Destination size is not a byte count anyway: a ranged parallel
+// writer (Azure) can extend it past what has arrived. A provider that never
+// reports is seen through growth alone, sampled only when the window is
+// about to expire and credited at the sample time, so it fails at most two
+// windows after its last byte and is never cut off early.
+// A provider without providers.ContextDownloader (test fakes)
 // gets the plain, uncancellable Download, as in downloadWithDeadline.
 //
 // A stall is returned as a *downloadStallError (errors.Is errDownloadStalled).
@@ -169,13 +220,13 @@ func downloadWithStallTimeout(ctx context.Context, provider providers.BackupProv
 
 	var received atomic.Int64
 	var lastProgress atomic.Int64 // UnixNano of the last observed progress
-	lastProgress.Store(time.Now().UnixNano())
+	lastProgress.Store(downloadClock.Now().UnixNano())
 
 	fileCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	fileCtx = providers.WithDownloadProgress(fileCtx, func(n int64) {
 		received.Add(n)
-		lastProgress.Store(time.Now().UnixNano())
+		advanceProgress(&lastProgress, downloadClock.Now().UnixNano())
 	})
 
 	done := make(chan struct{})
@@ -186,7 +237,7 @@ func downloadWithStallTimeout(ctx context.Context, provider providers.BackupProv
 		// shrinks (re-created by a retry or by FallbackProvider's next
 		// candidate) and regrows to an old size delivered no new data.
 		maxSize := max(localFileSize(localPath), 0)
-		timer := time.NewTimer(window)
+		timer := downloadClock.NewTimer(window)
 		defer timer.Stop()
 		for {
 			select {
@@ -194,12 +245,22 @@ func downloadWithStallTimeout(ctx context.Context, provider providers.BackupProv
 				return
 			case <-fileCtx.Done():
 				return
-			case <-timer.C:
+			case <-timer.C():
 			}
-			now := time.Now()
+			now := downloadClock.Now()
 			if size := localFileSize(localPath); size > maxSize {
 				maxSize = size
-				lastProgress.Store(now.UnixNano())
+				// A reporting provider's bytes were stamped by the callback
+				// when they landed; crediting growth again now would extend
+				// the deadline by up to a window past the last byte (#6952).
+				// received never resets within a download. That relies on
+				// every provider reporting its whole body to the progress
+				// callback (DownloadProgressWriter, or Azure's SDK progress
+				// hook), so once one byte is reported, later bytes (including
+				// a fallback candidate's) are reported too.
+				if received.Load() == 0 {
+					advanceProgress(&lastProgress, now.UnixNano())
+				}
 			}
 			idle := now.Sub(time.Unix(0, lastProgress.Load()))
 			if idle >= window {
@@ -221,6 +282,19 @@ func downloadWithStallTimeout(ctx context.Context, provider providers.BackupProv
 		return &downloadStallError{window: window, received: got, err: err}
 	}
 	return err
+}
+
+// advanceProgress moves *last forward to at, never backward. The progress
+// callback (possibly from several goroutines) and the file-growth sampler
+// both record progress, and a writer descheduled between reading the clock
+// and storing must not overwrite a later timestamp with its older one.
+func advanceProgress(last *atomic.Int64, at int64) {
+	for {
+		cur := last.Load()
+		if at <= cur || last.CompareAndSwap(cur, at) {
+			return
+		}
+	}
 }
 
 // localFileSize returns the size of path, or -1 when it cannot be stat'ed.

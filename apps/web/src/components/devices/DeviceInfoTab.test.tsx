@@ -15,6 +15,7 @@ vi.mock('../shared/Toast', () => ({
   showToast: vi.fn(),
 }));
 
+vi.mock('./time/DeviceTimeSection', () => ({ default: () => null }));
 const fetchWithAuthMock = vi.mocked(fetchWithAuth);
 const showToastMock = vi.mocked(showToast);
 
@@ -116,6 +117,35 @@ describe('DeviceInfoTab — OS version display', () => {
   });
 });
 
+describe('DeviceInfoTab — desktop access unsupported_os copy (#7331)', () => {
+  it('describes the login window, not an outdated macOS version', async () => {
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === `/devices/${deviceId}`) {
+        return makeJsonResponse({
+          ...baseDeviceInfoPayload,
+          osType: 'macos',
+          desktopAccess: {
+            mode: 'unavailable',
+            reason: 'unsupported_os',
+            remoteDesktopPermission: null,
+            checkedAt: '2026-09-28T00:00:00Z',
+          },
+        });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<DeviceInfoTab deviceId={deviceId} />);
+
+    await screen.findByText(/at the login window/i);
+    expect(screen.getByText('Login Window (macOS)')).toBeInTheDocument();
+    expect(screen.queryByText(/Unsupported macOS Version/i)).toBeNull();
+    expect(screen.queryByText(/below the macOS 14/i)).toBeNull();
+  });
+});
+
 describe('DeviceInfoTab — update offers withheld (#6449)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -147,6 +177,120 @@ describe('DeviceInfoTab — update offers withheld (#6449)', () => {
     render(<DeviceInfoTab deviceId={deviceId} />);
     await screen.findByText('Operating System');
     expect(screen.queryByTestId('update-offer-withheld')).toBeNull();
+  });
+});
+
+describe('DeviceInfoTab — stuck agent update (#4073)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function load(extra: Record<string, unknown>) {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({ ...baseDeviceInfoPayload, agentVersion: '0.106.0', ...extra });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+  }
+
+  it('shows the stuck-update notice with target and attempt count', async () => {
+    load({
+      updateAttemptTargetVersion: '0.110.0',
+      updateAttemptStartedAt: new Date(Date.now() - 3 * 60 * 60_000).toISOString(),
+      updateAttemptLastAt: new Date(Date.now() - 60_000).toISOString(),
+      updateAttemptCount: 180,
+    });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    const notice = await screen.findByTestId('update-stuck');
+    expect(notice.textContent).toContain('0.110.0');
+    expect(notice.textContent).toContain('180');
+  });
+
+  it('formats the "since" date the same way as Last Seen / Enrolled (#7214, paper cut #22)', async () => {
+    load({
+      updateAttemptTargetVersion: '0.110.0',
+      updateAttemptStartedAt: '2026-09-27T09:54:11.000Z',
+      updateAttemptLastAt: new Date(Date.now() - 60_000).toISOString(),
+      updateAttemptCount: 14,
+    });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    const notice = await screen.findByTestId('update-stuck');
+    // The shared formatter (used by Last Seen / Enrolled below) renders
+    // "Sep 27, 2026, ..." — short month, no seconds. The banner previously
+    // called formatDateTime with no options (locale-default, often including
+    // seconds / a different order) instead of that shared style.
+    expect(notice.textContent).toMatch(/Sep 27, 2026, \d{1,2}:\d{2}/);
+    expect(notice.textContent).not.toMatch(/:\d{2}:\d{2}\s*(AM|PM)?$/);
+  });
+
+  it('shows no notice while a fresh update is in progress', async () => {
+    load({
+      updateAttemptTargetVersion: '0.110.0',
+      updateAttemptStartedAt: new Date(Date.now() - 60_000).toISOString(),
+      updateAttemptLastAt: new Date().toISOString(),
+      updateAttemptCount: 1,
+    });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    await screen.findByText('Operating System');
+    expect(screen.queryByTestId('update-stuck')).toBeNull();
+  });
+});
+
+describe('DeviceInfoTab — logs silent (#7067)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function load(extra: Record<string, unknown>) {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({ ...baseDeviceInfoPayload, ...extra });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+  }
+
+  it('shows the logs-silent notice for an online device quiet past the threshold', async () => {
+    load({ lastLogAt: new Date(Date.now() - 7 * 60 * 60_000).toISOString() });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    expect(await screen.findByTestId('logs-silent')).toBeInTheDocument();
+  });
+
+  it('formats the logs-silent date without seconds, like the stuck-update notice', async () => {
+    const d = new Date(Date.now() - 7 * 60 * 60_000);
+    d.setSeconds(37, 0);
+    load({ lastLogAt: d.toISOString() });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    const notice = await screen.findByTestId('logs-silent');
+    expect(notice.textContent).not.toMatch(/\d:\d\d:37/);
+    expect(notice.textContent).toMatch(/\d:\d\d/);
+  });
+
+  it('shows the never-shipped variant when the device has no last_log_at but has been enrolled long enough', async () => {
+    load({ lastLogAt: null, enrolledAt: new Date(Date.now() - 7 * 60 * 60_000).toISOString() });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    expect(await screen.findByTestId('logs-silent')).toBeInTheDocument();
+  });
+
+  it('shows no notice for an online device with recent logs', async () => {
+    load({ lastLogAt: new Date(Date.now() - 60_000).toISOString() });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    await screen.findByText('Operating System');
+    expect(screen.queryByTestId('logs-silent')).toBeNull();
+  });
+
+  it('shows no notice for an offline device with a stale last_log_at', async () => {
+    load({ status: 'offline', lastLogAt: new Date(Date.now() - 7 * 60 * 60_000).toISOString() });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    await screen.findByText('Operating System');
+    expect(screen.queryByTestId('logs-silent')).toBeNull();
   });
 });
 
@@ -509,5 +653,49 @@ describe('DeviceInfoTab — role + custom-field mutations also use runAction', (
         expect.objectContaining({ type: 'success', message: 'Device role saved' }),
       );
     });
+  });
+});
+
+describe('DeviceInfoTab — Breeze Assist install issue (#6925)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function load(extra: Record<string, unknown>) {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === `/devices/${deviceId}` && method === 'GET') {
+        return makeJsonResponse({ ...baseDeviceInfoPayload, ...extra });
+      }
+      if (url === '/custom-fields') return makeJsonResponse({ data: [] });
+      return makeJsonResponse({}, false, 404);
+    });
+  }
+
+  it('explains a missing helper offer, with the since-date', async () => {
+    load({
+      helperInstallIssue: 'awaiting_server_offer',
+      helperInstallIssueSince: '2026-10-01T00:00:00.000Z',
+    });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    const notice = await screen.findByTestId('helper-install-issue');
+    expect(notice.textContent).toMatch(/not installed/i);
+    expect(notice.textContent).toMatch(/has not offered/i);
+    expect(notice.textContent).toContain(new Date('2026-10-01T00:00:00.000Z').toLocaleDateString());
+  });
+
+  it('explains an abandoned install differently', async () => {
+    load({ helperInstallIssue: 'install_abandoned', helperInstallIssueSince: '2026-10-01T00:00:00.000Z' });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    const notice = await screen.findByTestId('helper-install-issue');
+    expect(notice.textContent).toMatch(/failed repeatedly/i);
+  });
+
+  it('shows no notice for a healthy device', async () => {
+    load({ helperInstallIssue: null, helperInstallIssueSince: null });
+    render(<DeviceInfoTab deviceId={deviceId} />);
+    await screen.findByText('Operating System');
+    expect(screen.queryByTestId('helper-install-issue')).toBeNull();
   });
 });

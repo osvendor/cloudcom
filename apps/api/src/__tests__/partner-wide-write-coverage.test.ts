@@ -66,18 +66,22 @@ const ALLOWED_WITHOUT_CAPABILITY_CHECK: Record<string, string> = {
   // A partner-wide `network_monitors` row is ALWAYS a compiled artefact of a
   // `network_check` monitor definition — the compiler is its only writer, and
   // every caller-facing create/update/delete path below refuses one outright
-  // rather than gating it. So none of these four can reach a partner-owned row
+  // rather than gating it. So none of these paths can reach a partner-owned row
   // at all, which is a stronger property than passing the capability gate.
-  'routes/monitors.ts': 'legacy network-monitor CRUD is org-axis only: requireMonitorAccess refuses an org_id NULL row as 404, and a managed row as 409',
-  'routes/monitoring.ts': 'every write is scoped `networkMonitors.orgId = <org>`, which can never match a partner-wide (org_id NULL) row',
   'routes/discovery.ts': 'asset-unlink delete is scoped `networkMonitors.orgId = <asset org>`, which can never match a partner-wide (org_id NULL) row',
   'services/discoveredAssetSiteMove.ts': 'site-move re-attach is scoped `networkMonitors.orgId = <asset org>` (the monitors were captured under the same predicate), which can never match a partner-wide (org_id NULL) row',
-  'services/aiToolsMonitoring.ts': 'assertMonitorSiteAccess fails closed on org_id NULL, and a managed row is refused, so the AI tool cannot mutate a partner-owned row',
+  // --- fix_memory (AI Suggested Fixes W1) -----------------------------------
+  // Derived aggregate recomputed from fix_outcomes by background system-context
+  // jobs (outcome watcher, sweeper, tenant-erasure rebuild). No caller chooses
+  // an owner axis: owner is resolved from the fix's own current ownership.
+  'services/fixMemory/store.ts': 'derived aggregate written only by background system-context recompute/rebuild from fix_outcomes; no caller-facing write and no caller-chosen owner axis',
   // #5289 — the compiler's only write to monitor_definitions stamps the
   // compiled_* ids and hash back onto a definition its CALLER already loaded
   // and authorised. Every caller-facing write path (create/update/delete) runs
   // the gate in services/monitors/monitorService.ts before compiling, and the
   // compiler never takes an owner axis from a request.
+  'services/monitors/conversion/networkChecks.ts': 'Network adoption is org-axis only: caller-visible pending org sources, org access and full governance checks precede ledger writes; partnerId is always null and compiler adoption verifies the definition org',
+  'services/monitors/conversion/networkHistory.ts': 'network retirement and reversal require a visible org-owned source, reject site/device ceilings, and scope ledger and definition writes to that organization',
   'services/monitors/monitorCompiler.ts': 'stamps compiled_* provenance on a definition the caller already gated via monitorService',
   // Built-in default monitors: provisions each partner's OWN three monitors
   // once (no policy, no assignment), from createPartner()/the system-scope partner route/API boot —
@@ -127,7 +131,6 @@ const ALLOWED_WITHOUT_CAPABILITY_CHECK: Record<string, string> = {
   'routes/oauthInteraction.ts': 'records the end-user\'s own OAuth consent grant, not partner configuration',
 
   // --- known gaps, tracked; listed so the count cannot silently grow ---------
-  'routes/alertTemplates/rules.ts': 'alert RULES are org-owned in practice; partner-wide rule ownership is not exposed by this route',
   'routes/softwareInstallMethods.ts': 'software_catalog rows here are catalog metadata, gated by the software permission set',
   // Corrected 2026-09 (site-ceiling gate review): this entry previously read
   // "read-oriented inventory surface; its policy writes delegate to
@@ -171,6 +174,7 @@ const ALLOWED_WITHOUT_CAPABILITY_CHECK: Record<string, string> = {
   'services/platformAdminBootstrap.ts': 'startup-only platform-admin bootstrap (index.ts boot path); no tenant route calls it',
   'services/patchAlerts.ts': 'patch-job finalizer / reboot sweep creating derived alert artifacts (global built-in templates, org-owned rules) in system context — no tenant caller, same class as policyAlertBridge',
   'services/policyAlertBridge.ts': 'startup event subscriber creating derived alert artifacts in system context',
+  'services/configComplianceAlertBridge.ts': 'policy.violation/policy.compliant event subscriber (routed from policyAlertBridge, #6669) creating derived alert artifacts in system context: the one global built-in template (org_id AND partner_id NULL, never partner-owned) and org-owned alert_rules rows stamped with the DEVICE event org_id — no tenant caller, no request-supplied owner axis, same class as policyAlertBridge/patchAlerts',
   'services/stripeConnectService.ts': 'Stripe-signed webhook records provider-side disconnect status; no tenant caller',
   'services/stripeFinancialEventPoller.ts': 'system reconciliation worker persists provider cursor/error state; no tenant caller',
   'services/stripeReversalState.ts': 'system poller and verified Stripe webhook own the provider-authoritative reversal inbox',
@@ -228,6 +232,12 @@ const ALLOWED_WITHOUT_CAPABILITY_CHECK: Record<string, string> = {
   // mean only a partner admin could dismiss their own suggestion, which is the
   // opposite of the intent. Same class as timeEntryService.ts above.
   'services/timeSuggestionService.ts': 'per-technician suggestion decisions keyed on user_id (partner_id is only the RLS axis); never partner-wide config',
+  // Same class as quickSupportOrg.ts above: provisions the partner's hidden
+  // unassigned-device holding org (an org-axis container). It writes no
+  // partner-owned config row, and its callers (deploy-key minting) are
+  // full-partner-admin surfaces gated at the route.
+  'services/unassignedPool/parkedExpiry.ts': 'expired/purged holding-area ledger rows, written by the scheduled expiry and purge jobs (system) and by the expire-by-key incident action, whose route resolves the partner through canManagePartnerWidePolicies',
+  'services/unassignedPool/poolOrg.ts': 'holding-org provisioning creates an org-axis container (same class as quickSupportOrg.ts)',
 
   // --- caller-facing, gated at the route layer (verify the gate when editing
   //     these services or adding ANY new route caller) -----------------------
@@ -308,6 +318,7 @@ const ALLOWED_WITHOUT_CAPABILITY_CHECK: Record<string, string> = {
   // --- catalog/accounting data on their own permission sets (precedent:
   //     routes/softwareInstallMethods.ts + routes/accounting/index.ts above) --
   'services/accounting/accountingConnectionService.ts': 'QBO/Xero connection lifecycle, gated by its own admin permission set (recorded exemption)',
+  'services/accounting/accountingTenantSelectionStore.ts': 'Xero W02 tenant selection: claims/deletes the partner\'s OWN pending_tenant accounting_connections row. Every caller route passes requireScope(partner,system) + requireAccountingPartnerAuthority (which calls canManagePartnerWidePolicies) + accounting:manage + MFA; the reaper runs in system context. Same recorded exemption as accountingConnectionService.ts',
   'services/accounting/accountingMappingService.ts': 'accounting_entity_mappings is integration external-ref data, not a partner-wide policy table; every write route in routes/accounting/index.ts passes requireScope(partner,system) + requireMfa() + requireMappingWrite (per-entity-type admin permission), and workers/erasure run under system context',
   'services/accounting/accountingInvoicePush.ts': 'same accounting_entity_mappings rows as accountingMappingService above, for the invoice entity type; the manual/bulk push routes pass requireScope(partner,system) + requireMfa() + INVOICES_WRITE, and the accounting-sync worker runs under system context',
   'services/accounting/accountingPaymentPull.ts': 'QBO-signed webhook / system-context CDC backstop writes payment mapping rows and invoice_payments; there is no tenant caller to gate — the connection is resolved by id or realm fingerprint and every write carries that connection\'s (integration_id, partner_id), enforced by the composite FK (mirrors the Stripe webhook precedent)',
@@ -333,6 +344,7 @@ const ALLOWED_WITHOUT_CAPABILITY_CHECK: Record<string, string> = {
   'services/aiAgents/fleetDesignReport.ts': 'system-authored Fleet Design: inserts with org_id = run.org_id and updates WHERE org_id = run.org_id — never a partner-owned row, no caller-facing surface',
   'services/managedEvidenceDefinitions.ts': 'provisions the org\'s managed evidence definition with a concrete org_id (#5784); never partner-owned',
   'services/portal/reportsSelfService.ts': 'customer-portal self-service: inserts portal definitions with the portal org_id and updates a definition it loaded by org_id + portal_self_service; partner-owned rows are never portal-visible (spec 3.5)',
+  'services/reportSeries/reconcile.ts': 'the multi-org report reconciler writes only ORG-owned series children: inserts carry a concrete org_id from the eligible target set, updates key on id + org_id + series_id, and reports_series_child_shape_chk forbids a partner-owned child. Its callers are services/reportSeries/store.ts (every entry point gated by canManagePartnerWidePolicies through requireSeriesPartner) and the schedule worker gate / repair sweep (system context, no caller)',
   'services/emailDomains/domainSync.ts': 'the sending-domain state machine runs only inside the sending-domains BullMQ worker, under system DB scope, with no caller and no auth context: it takes a domain id from a job payload, advances that ONE row between provider-observed statuses, and creates no partner-owned configuration. Every caller-facing create/update/delete of partner_sending_domains goes through routes/partnerSendingDomains.ts, which carries the canManagePartnerWidePolicies gate',
 };
 
@@ -453,7 +465,16 @@ describe('partner-wide write coverage (security review 2026-08-16 §1.1)', () =>
     expect(undocumented).toEqual([]);
   });
 
-  it('the six sites from the 2026-08-16 review carry the gate', () => {
+  it.each(['routes/alertTemplates/templates.ts', 'routes/alertTemplates/rules.ts'])(
+    '%s cannot mutate partner-axis tables after retirement',
+    (rel) => {
+      const source = readFileSync(join(API_SRC, rel), 'utf8');
+      expect(mutatedTables(source, tableNames)).toEqual([]);
+      expect(source).toContain('legacyAlertingGone');
+    },
+  );
+
+  it('the surviving write sites from the 2026-08-16 review carry the gate', () => {
     // Named explicitly so a regression on any ONE of them is a clearly-labelled
     // failure rather than an anonymous line in the sweep above.
     const fixed = [
@@ -462,7 +483,7 @@ describe('partner-wide write coverage (security review 2026-08-16 §1.1)', () =>
       'routes/updateRings.ts',
       'services/aiToolsPolicyPrereqs.ts',
       'routes/clientAi/adminTemplates.ts',
-      'routes/alertTemplates/templates.ts',
+      // Alert-template writes were retired; their absence is checked above.
       'routes/partnerServicePrincipals.ts',
     ];
 

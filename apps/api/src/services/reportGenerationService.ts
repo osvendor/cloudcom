@@ -37,6 +37,7 @@ import { isManagedEvidenceType, type ManagedEvidenceType } from './managedEviden
 import { reportTypeDef } from './reportRegistry';
 import { endpointManagementConfigSchema } from './reportConfigSchemas';
 import { organizationScope, reportOwnerOfScope, type ReportScope } from './reportScope';
+import { alertSiteScopeByDeviceIds } from '../routes/alerts/helpers';
 // #3198 W02: shared with the business generators, which refuse a restricted
 // authority with a non-empty site list themselves (the zero-safe branch below
 // only sees the empty-list case).
@@ -47,6 +48,7 @@ import {
   UnsupportedReportScopeError,
 } from './reportErrors';
 
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 export {
   StoredArtifactOnlyReportError,
   UnexecutableReportScopeError,
@@ -405,7 +407,7 @@ export async function readDeviceInventoryRows(orgId: string, conditions: SQL[]) 
     })
     .from(devices)
     .leftJoin(deviceHardware, eq(devices.id, deviceHardware.deviceId))
-    .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), ...conditions))
+    .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition(), ...conditions))
     .orderBy(devices.hostname);
 }
 
@@ -426,7 +428,7 @@ export async function generateDeviceInventoryReport(
   // devices live in the partner's hidden 'quick_support' org, which deliberately
   // stays inside accessibleOrgIds so RLS lets a tech reach their own session.
   // Nothing filters them out for us — reports must exclude them explicitly.
-  const conditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false)];
+  const conditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition()];
 
   const filters = config.filters as Record<string, unknown> | undefined;
   if (filters?.deviceIds && Array.isArray(filters.deviceIds) && filters.deviceIds.length > 0) {
@@ -525,7 +527,7 @@ export async function readSoftwareInventoryRows(orgId: string, conditions: SQL[]
     })
     .from(deviceSoftware)
     .innerJoin(devices, eq(deviceSoftware.deviceId, devices.id))
-    .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), ...conditions))
+    .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition(), ...conditions))
     .orderBy(deviceSoftware.name, devices.hostname);
 }
 
@@ -535,7 +537,7 @@ export async function generateSoftwareInventoryReport(
   authority: OrgReportExecutionAuthority,
 ) {
   assertReportExecutionPreflight(orgId, config, authority, 'software_inventory');
-  const conditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false)];
+  const conditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition()];
 
   const filters = config.filters as Record<string, unknown> | undefined;
   if (filters?.deviceIds && Array.isArray(filters.deviceIds) && filters.deviceIds.length > 0) {
@@ -573,11 +575,13 @@ export async function generateAlertSummaryReport(
   }
 
   const allowedDeviceIds = await resolveSiteAllowedDeviceIds(orgId, authority);
-  if (allowedDeviceIds) {
-    if (allowedDeviceIds.length === 0) {
+  if (allowedDeviceIds && authority.scope.kind === 'restricted') {
+    if (authority.scope.siteIds.length === 0) {
       return { rows: [], rowCount: 0, summary: {} };
     }
-    conditions.push(inArray(alerts.deviceId, allowedDeviceIds));
+    // Device alerts by in-scope device; site-owned topology alerts by their
+    // owning topology site (M3-D6), never the origin device's site.
+    conditions.push(alertSiteScopeByDeviceIds({ allowedSiteIds: authority.scope.siteIds, allowedDeviceIds })!);
   }
 
   const whereCondition = and(...conditions);
@@ -622,7 +626,7 @@ export async function generateComplianceReport(
   authority: OrgReportExecutionAuthority,
 ) {
   assertReportExecutionPreflight(orgId, config, authority, 'compliance');
-  const conditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false)];
+  const conditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition()];
 
   const filters = config.filters as Record<string, unknown> | undefined;
   if (filters?.siteIds && Array.isArray(filters.siteIds) && filters.siteIds.length > 0) {
@@ -693,7 +697,7 @@ export async function generatePerformanceReport(
   authority: OrgReportExecutionAuthority,
 ) {
   assertReportExecutionPreflight(orgId, config, authority, 'performance');
-  const deviceConditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false)];
+  const deviceConditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition()];
   if (addAllowedSiteCondition(deviceConditions, authority)) {
     return emptyRowsReport();
   }
@@ -768,7 +772,7 @@ export async function generateExecutiveSummaryReport(
     .limit(1);
 
   const dateRange = config.dateRange as Record<string, string> | undefined;
-  const deviceConditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false)];
+  const deviceConditions: SQL[] = [eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition()];
   const emptyDeviceScope = addAllowedSiteCondition(deviceConditions, authority);
   const deviceWhereCondition = and(...deviceConditions);
 
@@ -794,11 +798,13 @@ export async function generateExecutiveSummaryReport(
   }
 
   const allowedDeviceIds = await resolveSiteAllowedDeviceIds(orgId, authority);
-  if (allowedDeviceIds) {
-    alertConditions.push(inArray(alerts.deviceId, allowedDeviceIds));
+  const restrictedSiteIds = allowedDeviceIds && authority.scope.kind === 'restricted' ? authority.scope.siteIds : null;
+  if (allowedDeviceIds && restrictedSiteIds) {
+    // Site-owned topology alerts follow their owning topology site (M3-D6).
+    alertConditions.push(alertSiteScopeByDeviceIds({ allowedSiteIds: restrictedSiteIds, allowedDeviceIds })!);
   }
 
-  const alertStats = allowedDeviceIds?.length === 0
+  const alertStats = restrictedSiteIds?.length === 0
     ? [{ total: 0, critical: 0, high: 0, resolved: 0 }]
     : await db
       .select({
@@ -1025,6 +1031,7 @@ function zeroSafeReport(type: ReportType, orgId: string): ReportResult {
     case 'performance':
     case 'security_compliance_posture':
     case 'hardware_lifecycle':
+    case 'backup_status':
     // #5784 W02 — NOT stored-artifact-only: a restricted authority with zero
     // sites gets an empty-but-shaped result rather than a throw.
     case 'threat_detection_review':

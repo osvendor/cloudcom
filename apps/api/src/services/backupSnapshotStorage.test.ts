@@ -270,6 +270,66 @@ describe('backup snapshot storage', () => {
     expect(deletedKeys).toEqual(['snapshots/provider-snap-1/manifest.json']);
   });
 
+  // #6398: the agent never applies the destination `prefix` — snapshot
+  // objects live at `snapshots/<id>/...`. Immutability and deletion must target
+  // that physical layout, not `<prefix>/snapshots/<id>`.
+  it('applies retention under the agent layout, ignoring the configured destination prefix (#6398)', async () => {
+    sendMock
+      .mockImplementationOnce(async (command) => {
+        expect(command).toBeInstanceOf(ListObjectsV2Command);
+        expect(command.input.Prefix).toBe('snapshots/provider-snap-1');
+        return { Contents: [{ Key: 'snapshots/provider-snap-1/manifest.json' }], IsTruncated: false };
+      })
+      .mockImplementationOnce(async () => ({}));
+
+    const result = await applyBackupSnapshotImmutability({
+      provider: 's3',
+      providerConfig: {
+        bucket: 'backups',
+        region: 'us-east-1',
+        accessKey: 'key',
+        secretKey: 'secret',
+        prefix: 'w05',
+      },
+      snapshotId: 'provider-snap-1',
+      metadata: {},
+      retainUntil: new Date('2026-04-30T00:00:00.000Z'),
+    });
+
+    expect(result.objectCount).toBe(1);
+  });
+
+  it('deletes under the agent layout, ignoring the configured destination prefix (#6398)', async () => {
+    const deletedKeys: string[] = [];
+    sendMock
+      .mockImplementationOnce(async (command) => {
+        expect(command).toBeInstanceOf(ListObjectsV2Command);
+        expect(command.input.Prefix).toBe('snapshots/provider-snap-1');
+        return { Contents: [{ Key: 'snapshots/provider-snap-1/manifest.json' }], IsTruncated: false };
+      })
+      .mockImplementationOnce(async (command) => {
+        deletedKeys.push(
+          ...(command.input.Delete?.Objects ?? []).map((object: { Key?: string }) => object.Key ?? '')
+        );
+        return {};
+      });
+
+    await deleteBackupSnapshotArtifacts({
+      provider: 's3',
+      providerConfig: {
+        bucket: 'backups',
+        region: 'us-east-1',
+        accessKey: 'key',
+        secretKey: 'secret',
+        prefix: 'w05',
+      },
+      snapshotId: 'provider-snap-1',
+      metadata: {},
+    });
+
+    expect(deletedKeys).toEqual(['snapshots/provider-snap-1/manifest.json']);
+  });
+
   it('fails when no objects are found for provider immutability', async () => {
     sendMock.mockImplementationOnce(async () => ({
       Contents: [],
@@ -485,6 +545,92 @@ describe('backup snapshot storage', () => {
         fetchBackupObjectBytes({ provider: 'unknown', providerConfig: {}, key: 'x' }),
       ).rejects.toThrow(/does not support object fetch/);
     });
+
+    it('rejects an S3 object whose declared ContentLength exceeds maxBytes, without reading the body', async () => {
+      const transformToByteArray = vi.fn();
+      sendMock.mockResolvedValueOnce({ ContentLength: 1000, Body: { transformToByteArray } });
+
+      await expect(
+        fetchBackupObjectBytes({
+          provider: 's3',
+          providerConfig: { bucket: 'backups', region: 'us-east-1' },
+          key: 'snapshots/a/manifest.json',
+          maxBytes: 500,
+        }),
+      ).rejects.toMatchObject({ name: 'BackupObjectTooLargeError', sizeBytes: 1000, maxBytes: 500 });
+      expect(transformToByteArray).not.toHaveBeenCalled();
+    });
+
+    it('rejects an S3 object whose actual bytes exceed maxBytes when ContentLength was not reported', async () => {
+      const bytes = new Uint8Array(1000);
+      sendMock.mockResolvedValueOnce({ Body: { transformToByteArray: async () => bytes } });
+
+      await expect(
+        fetchBackupObjectBytes({
+          provider: 's3',
+          providerConfig: { bucket: 'backups', region: 'us-east-1' },
+          key: 'snapshots/a/manifest.json',
+          maxBytes: 500,
+        }),
+      ).rejects.toMatchObject({ name: 'BackupObjectTooLargeError' });
+    });
+
+    it('allows an S3 object at or under maxBytes', async () => {
+      const bytes = new Uint8Array(500);
+      sendMock.mockResolvedValueOnce({ ContentLength: 500, Body: { transformToByteArray: async () => bytes } });
+
+      const result = await fetchBackupObjectBytes({
+        provider: 's3',
+        providerConfig: { bucket: 'backups', region: 'us-east-1' },
+        key: 'snapshots/a/manifest.json',
+        maxBytes: 500,
+      });
+      expect(result).toEqual(bytes);
+    });
+  });
+
+  describe('fetchBackupObjectText maxBytes cap', () => {
+    it('rejects an S3 object whose declared ContentLength exceeds maxBytes, without reading the body', async () => {
+      const transformToString = vi.fn();
+      sendMock.mockResolvedValueOnce({ ContentLength: 1000, Body: { transformToString } });
+
+      await expect(
+        fetchBackupObjectText({
+          provider: 's3',
+          providerConfig: { bucket: 'backups', region: 'us-east-1' },
+          key: 'snapshots/a/manifest.json',
+          maxBytes: 500,
+        }),
+      ).rejects.toMatchObject({ name: 'BackupObjectTooLargeError', sizeBytes: 1000, maxBytes: 500 });
+      expect(transformToString).not.toHaveBeenCalled();
+    });
+
+    it('rejects an S3 object whose actual decoded bytes exceed maxBytes when ContentLength was not reported', async () => {
+      const text = 'x'.repeat(1000);
+      sendMock.mockResolvedValueOnce({ Body: { transformToString: async () => text } });
+
+      await expect(
+        fetchBackupObjectText({
+          provider: 's3',
+          providerConfig: { bucket: 'backups', region: 'us-east-1' },
+          key: 'snapshots/a/manifest.json',
+          maxBytes: 500,
+        }),
+      ).rejects.toMatchObject({ name: 'BackupObjectTooLargeError' });
+    });
+
+    it('allows an S3 text object at or under maxBytes', async () => {
+      const text = '{"files":[]}';
+      sendMock.mockResolvedValueOnce({ ContentLength: text.length, Body: { transformToString: async () => text } });
+
+      const result = await fetchBackupObjectText({
+        provider: 's3',
+        providerConfig: { bucket: 'backups', region: 'us-east-1' },
+        key: 'snapshots/a/manifest.json',
+        maxBytes: text.length,
+      });
+      expect(result).toBe(text);
+    });
   });
 });
 
@@ -507,6 +653,18 @@ describe('local-provider GC I/O (real filesystem)', () => {
 
   afterEach(async () => {
     await rm(root, { recursive: true, force: true });
+  });
+
+  it('deletes a local snapshot under the agent layout, ignoring the configured destination prefix (#6398)', async () => {
+    await deleteBackupSnapshotArtifacts({
+      provider: 'local',
+      providerConfig: { path: root, prefix: 'w05' },
+      snapshotId: 'snapA',
+      metadata: {},
+    });
+
+    expect(await readdir(join(root, 'snapshots'))).toEqual([]);
+    expect(await readdir(join(root, 'other'))).toEqual(['unrelated.dat']);
   });
 
   it('walks the snapshot root and reports every file key with a real mtime', async () => {
@@ -584,6 +742,48 @@ describe('local-provider GC I/O (real filesystem)', () => {
       key: 'snapshots/snapA/manifest.json',
     });
     expect(Buffer.from(result).toString('utf8')).toBe('{"files":[]}');
+  });
+
+  it('rejects a local object over maxBytes via a stat check, without reading its content', async () => {
+    await expect(
+      fetchBackupObjectBytes({
+        provider: 'local',
+        providerConfig: { path: root },
+        key: 'snapshots/snapA/manifest.json',
+        maxBytes: 1,
+      }),
+    ).rejects.toMatchObject({ name: 'BackupObjectTooLargeError' });
+  });
+
+  it('allows a local object at or under maxBytes', async () => {
+    const result = await fetchBackupObjectBytes({
+      provider: 'local',
+      providerConfig: { path: root },
+      key: 'snapshots/snapA/manifest.json',
+      maxBytes: '{"files":[]}'.length,
+    });
+    expect(Buffer.from(result).toString('utf8')).toBe('{"files":[]}');
+  });
+
+  it('rejects a local text object over maxBytes via a stat check, without reading its content', async () => {
+    await expect(
+      fetchBackupObjectText({
+        provider: 'local',
+        providerConfig: { path: root },
+        key: 'snapshots/snapA/manifest.json',
+        maxBytes: 1,
+      }),
+    ).rejects.toMatchObject({ name: 'BackupObjectTooLargeError' });
+  });
+
+  it('allows a local text object at or under maxBytes', async () => {
+    const result = await fetchBackupObjectText({
+      provider: 'local',
+      providerConfig: { path: root },
+      key: 'snapshots/snapA/manifest.json',
+      maxBytes: '{"files":[]}'.length,
+    });
+    expect(result).toBe('{"files":[]}');
   });
 
   it('deletes only the intended keys, leaving siblings intact', async () => {

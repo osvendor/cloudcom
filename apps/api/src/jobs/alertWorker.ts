@@ -7,14 +7,12 @@
 
 import { Queue, Worker, Job } from 'bullmq';
 import * as dbModule from '../db';
-import { devices, deviceMetrics, organizations, alerts } from '../db/schema';
-import { eq, ne, and, gte, gt, desc, asc, inArray, isNotNull } from 'drizzle-orm';
+import { devices, deviceMetrics, organizations } from '../db/schema';
+import { eq, ne, and, gte, gt, desc, asc, inArray } from 'drizzle-orm';
 import { getBullMQConnection } from '../services/redis';
 import {
   evaluateDeviceAlerts,
   checkAllAutoResolve,
-  evaluateDeviceAlertsFromPolicy,
-  checkAutoResolveFromConfigPolicy,
 } from '../services/alertService';
 import { isReusableState } from '../services/bullmqUtils';
 import { createInstrumentedQueue } from '../services/bullmqQueue';
@@ -26,22 +24,13 @@ import {
   selectNetworkCheckOrgIds,
 } from '../services/monitors/networkCheckAlertSweep';
 import { drainSubjectAlertOutbox } from '../services/subjectAlertOutbox';
+import { notHoldingOrgCondition, notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
   const withSystem = dbModule.withSystemDbAccessContext;
   return typeof withSystem === 'function' ? withSystem(fn) : fn();
 };
-
-/** Check if a Drizzle/Postgres error is "relation does not exist" (42P01). */
-function isRelationNotFoundError(error: unknown): boolean {
-  if (!error || typeof error !== 'object') return false;
-  const cause = (error as { cause?: { code?: string } }).cause;
-  // eslint-disable-next-line breeze/no-direct-sqlstate -- Existing guard explicitly reads the Drizzle driver cause.
-  return cause?.code === '42P01';
-}
-
-let _configPolicyTableWarningLogged = false;
 
 // Queue name
 const ALERT_QUEUE = 'alert-evaluation';
@@ -207,7 +196,9 @@ export async function processEvaluateAll(data: EvaluateAllJobData): Promise<{
       .from(organizations)
       .where(and(
         eq(organizations.status, 'active'),
-        ne(organizations.type, 'quick_support')
+        ne(organizations.type, 'quick_support'),
+        // Nor the holding org: parked devices raise no alerts.
+        notHoldingOrgCondition()
       ))
   );
 
@@ -239,6 +230,7 @@ export async function processEvaluateAll(data: EvaluateAllJobData): Promise<{
     const conditions = [
       inArray(devices.orgId, orgIds),
       eq(devices.isEphemeral, false),
+      notParkedDeviceCondition(),
       eq(devices.status, 'online'),
       gte(devices.lastSeenAt, recentThreshold)
     ];
@@ -374,26 +366,10 @@ async function processEvaluateDevice(data: EvaluateDeviceJobData): Promise<{
   const startTime = Date.now();
 
   try {
-    const legacyAlertIds = await evaluateDeviceAlerts(data.deviceId);
-
-    let configPolicyAlertIds: string[] = [];
-    try {
-      configPolicyAlertIds = await evaluateDeviceAlertsFromPolicy(data.deviceId);
-    } catch (cpError: unknown) {
-      if (isRelationNotFoundError(cpError)) {
-        if (!_configPolicyTableWarningLogged) {
-          _configPolicyTableWarningLogged = true;
-          console.warn('[AlertWorker] Config policy tables not found — run "pnpm db:migrate" to create them. Skipping config policy alert evaluation.');
-        }
-      } else {
-        throw cpError;
-      }
-    }
-
-    const alertIds = [...legacyAlertIds, ...configPolicyAlertIds];
+    const alertIds = await evaluateDeviceAlerts(data.deviceId);
 
     if (alertIds.length > 0) {
-      console.log(`[AlertWorker] Created ${alertIds.length} alerts for device ${data.deviceId} (legacy=${legacyAlertIds.length}, configPolicy=${configPolicyAlertIds.length})`);
+      console.log(`[AlertWorker] Created ${alertIds.length} alerts for device ${data.deviceId}`);
     }
 
     return {
@@ -418,42 +394,10 @@ async function processAutoResolve(data: AutoResolveJobData): Promise<{
   const startTime = Date.now();
 
   try {
-    // Legacy auto-resolve: checks per-alert against standalone alert rules
-    const legacyResolvedCount = await checkAllAutoResolve(data.orgId);
-
-    // Config policy auto-resolve: checks per-device against config policy alert rules
-    let configPolicyResolvedCount = 0;
-    try {
-      const orgConditions = [
-        eq(alerts.status, 'active'),
-        isNotNull(alerts.configPolicyId)
-      ];
-      if (data.orgId) {
-        orgConditions.push(eq(alerts.orgId, data.orgId));
-      }
-
-      const configPolicyAlerts = await db
-        .select({ deviceId: alerts.deviceId })
-        .from(alerts)
-        .where(and(...orgConditions));
-
-      const uniqueDeviceIds = [...new Set(configPolicyAlerts.map(a => a.deviceId))];
-
-      for (const deviceId of uniqueDeviceIds) {
-        try {
-          configPolicyResolvedCount += await checkAutoResolveFromConfigPolicy(deviceId);
-        } catch (error) {
-          console.error(`[AlertWorker] Error in config policy auto-resolve for device ${deviceId}:`, error);
-        }
-      }
-    } catch (error) {
-      console.error('[AlertWorker] Error querying config policy alerts for auto-resolve:', error);
-    }
-
-    const resolvedCount = legacyResolvedCount + configPolicyResolvedCount;
+    const resolvedCount = await checkAllAutoResolve(data.orgId);
 
     if (resolvedCount > 0) {
-      console.log(`[AlertWorker] Auto-resolved ${resolvedCount} alerts (legacy=${legacyResolvedCount}, configPolicy=${configPolicyResolvedCount})`);
+      console.log(`[AlertWorker] Auto-resolved ${resolvedCount} alerts`);
     }
 
     return {

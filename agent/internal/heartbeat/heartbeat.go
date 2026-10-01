@@ -111,14 +111,33 @@ type HeartbeatPayload struct {
 	// pointer so an old-agent omission (nil) is distinguishable from a
 	// genuine "physical" report (false) — the server only overwrites the
 	// stored value when the agent actually sends one.
-	IsVirtual                 *bool                          `json:"isVirtual,omitempty"`
-	VirtualizationPlatform    string                         `json:"virtualizationPlatform,omitempty"`
-	HealthStatus              *health.AgentHealthObservation `json:"healthStatus,omitempty"`
-	DroppedLogs               int64                          `json:"droppedLogs,omitempty"`
-	HelperVersion             string                         `json:"helperVersion,omitempty"`
-	WatchdogVersion           string                         `json:"watchdogVersion,omitempty"`
-	BackupVersion             string                         `json:"backupVersion,omitempty"`
-	RollbackComponentVersions map[string]string              `json:"rollbackComponentVersions,omitempty"`
+	IsVirtual              *bool                          `json:"isVirtual,omitempty"`
+	VirtualizationPlatform string                         `json:"virtualizationPlatform,omitempty"`
+	HealthStatus           *health.AgentHealthObservation `json:"healthStatus,omitempty"`
+	DroppedLogs            int64                          `json:"droppedLogs,omitempty"`
+	HelperVersion          string                         `json:"helperVersion,omitempty"`
+	// HelperInstallIssue is a Breeze Assist install problem the agent is stuck
+	// on (helper.InstallIssue* codes, #6925), e.g. enabled but not installed
+	// with no helper version offered. Omitted when there is none, so older
+	// servers (which strip unknown keys) and healthy devices send nothing.
+	HelperInstallIssue        string            `json:"helperInstallIssue,omitempty"`
+	WatchdogVersion           string            `json:"watchdogVersion,omitempty"`
+	BackupVersion             string            `json:"backupVersion,omitempty"`
+	RollbackComponentVersions map[string]string `json:"rollbackComponentVersions,omitempty"`
+	// BackupReadProtocolVersion is the brokered storage-read protocol the
+	// INSTALLED backup helper reports (breeze-backup --protocol-info), never
+	// inferred from this agent's own version. Omitted when the helper is
+	// absent, predates the flag, or reports 0. The server treats omission as
+	// 0 on every heartbeat (non-sticky), so a helper downgrade is reflected
+	// on the next beat.
+	BackupReadProtocolVersion int `json:"backupReadProtocolVersion,omitempty"`
+	// BackupIntegrityProtocolVersion and BackupWriteProtocolVersion are the
+	// snapshot integrity and brokered storage-write protocols the same
+	// installed helper reports, under the same rules: never inferred,
+	// omitted at 0, and read by the server as 0 on every heartbeat that
+	// omits them.
+	BackupIntegrityProtocolVersion int `json:"backupIntegrityProtocolVersion,omitempty"`
+	BackupWriteProtocolVersion     int `json:"backupWriteProtocolVersion,omitempty"`
 	// ServerURL is the control-plane base URL this heartbeat is POSTed to
 	// (#2288). Set per-attempt in postHeartbeat, so a backup probe reports
 	// the backup URL and the device row shows real fleet position.
@@ -233,8 +252,17 @@ type SecurityCapabilities struct {
 	// already seen, and refuses all starts after a terminal. Behind
 	// REMOTE_DESKTOP_FENCE_REQUIRED the API refuses to start a desktop session
 	// against an agent reporting 0, same shape as the revocation-lease gate.
-	DesktopFenceProtocolVersion int                      `json:"desktopFenceProtocolVersion,omitempty"`
-	PamReconciliation           *PamReconciliationStatus `json:"pamReconciliation,omitempty"`
+	DesktopFenceProtocolVersion int `json:"desktopFenceProtocolVersion,omitempty"`
+	// ConsentPromptProtocolVersion declares that this build parses the
+	// `prompt` block on a desktop-stream-start command (parseDesktopPrompt,
+	// handlers_desktop.go) and gates capture on it: a consent dialog or
+	// on-screen notice per the resolved policy. An agent that predates this
+	// silently drops an unfamiliar `prompt` key (JSON unmarshal into a known
+	// struct ignores unrecognized fields) and streams unconditionally, so the
+	// API refuses to start a session that requires consent or notification
+	// against an agent reporting 0.
+	ConsentPromptProtocolVersion int                      `json:"consentPromptProtocolVersion,omitempty"`
+	PamReconciliation            *PamReconciliationStatus `json:"pamReconciliation,omitempty"`
 }
 
 type PamReconciliationStatus struct {
@@ -347,6 +375,7 @@ type Heartbeat struct {
 	topologyDiagnosticJournal *networkdiagnostic.Journal
 	topologyDiagnosticActive  map[string]activeTopologyDiagnostic
 	networkContextMu          sync.Mutex
+	adjacencyStatePath        string // test override; default is the data dir
 	networkContext            *networkContextManager
 	config                    *config.Config
 	secureToken               *secmem.SecureString
@@ -360,6 +389,12 @@ type Heartbeat struct {
 	inventoryCol              *collectors.InventoryCollector
 	vpnCol                    *collectors.VPNCollector
 	changeTrackerCol          *collectors.ChangeTrackerCollector
+	// hardwareCollectFn / memoryCollectFn override the hardware-send path's
+	// collectors in tests; nil uses hardwareCol.CollectHardware and
+	// collectors.CollectMemoryModules. memoryCollectTimeout 0 = default.
+	hardwareCollectFn    func() (*collectors.HardwareInfo, error)
+	memoryCollectFn      func() (*collectors.MemoryInfo, error)
+	memoryCollectTimeout time.Duration
 	// changeTrackerMu serializes the change tracker's collect → send → commit
 	// cycle. sendInventory is dispatched both on the 15-minute tick and by the
 	// "Refresh Inventory" command (handlers.go), so two cycles can genuinely
@@ -419,6 +454,7 @@ type Heartbeat struct {
 	hwStopping         bool
 	hwDisabledQueued   bool
 	hwDisabledSnapshot *hwhealth.Snapshot
+	timeSync           *timeSyncRuntime
 	// #2728 — a patch submission that fails (e.g. a fleet-wide 429 from the
 	// per-org rate limiter) used to leave posture stale for a full scan
 	// interval, because lastPatchUpdate was stamped at dispatch time whether or
@@ -821,6 +857,15 @@ type Heartbeat struct {
 	backupVersionRead          bool
 	backupVersionReadWarned    bool
 
+	// backupProtocolReader is a test seam for the --protocol-info probe
+	// (readInstalledBackupProtocols); nil in production. The cache fields
+	// below are guarded by backupVersionMu and cleared by
+	// invalidateBackupVersionCache, exactly like the version cache.
+	backupProtocolReader   func() (backupipc.ProtocolInfo, backupProbeOutcome)
+	backupProtocolValue    backupipc.ProtocolInfo
+	backupProtocolRead     bool
+	backupProtocolFailedAt time.Time
+
 	// backupHelperDownloader is an optional test seam: when non-nil,
 	// prefetchBackupHelper / reconcileBackupHelper call this instead of
 	// constructing a real updater.Updater (Component: "backup") and invoking
@@ -959,6 +1004,7 @@ func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureStri
 		hwConfig:                       hwhealth.Config{Enabled: true, PollInterval: 10 * time.Minute, DiskHealthInterval: time.Hour},
 	}
 	h.hwContext, h.hwCancel = context.WithCancel(context.Background())
+	h.initTimeSync()
 	h.accepting.Store(true)
 	h.isService = cfg.IsService
 	h.isHeadless = cfg.IsHeadless
@@ -1017,6 +1063,13 @@ func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureStri
 			helper.WithManifestKeys(h.pinnedManifestPubKeys),
 			helper.WithRequireManifestSigningKeyID(h.requireManifestSigningKeyID),
 			helper.WithBackupServerURL(h.BackupServerURL),
+			// Only the installed agent may install, update, spawn or remove
+			// the host's machine-wide Assist; see config.IsInstalledAgent.
+			helper.WithMachineInstallOwner(cfg.IsInstalledAgent && !cfg.SupportMode),
+			// Re-hash the broker's allowlist when a new helper binary lands, or
+			// the broker rejects it until the agent restarts (#7043). Reads
+			// h.sessionBroker at call time: the broker is built further down.
+			helper.WithOnInstalled(h.onHelperInstalled),
 			helper.WithSpawnFunc(func(sessionKey, binaryPath string, args ...string) (int, error) {
 				// Try launching via connected user-role helper first (runs as
 				// the logged-in user, so the Tauri app inherits user identity).
@@ -1053,6 +1106,13 @@ func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureStri
 			helper.WithManifestKeys(h.pinnedManifestPubKeys),
 			helper.WithRequireManifestSigningKeyID(h.requireManifestSigningKeyID),
 			helper.WithBackupServerURL(h.BackupServerURL),
+			// Only the installed agent may install, update, spawn or remove
+			// the host's machine-wide Assist; see config.IsInstalledAgent.
+			helper.WithMachineInstallOwner(cfg.IsInstalledAgent && !cfg.SupportMode),
+			// Re-hash the broker's allowlist when a new helper binary lands, or
+			// the broker rejects it until the agent restarts (#7043). Reads
+			// h.sessionBroker at call time: the broker is built further down.
+			helper.WithOnInstalled(h.onHelperInstalled),
 		)
 	}
 
@@ -1787,6 +1847,7 @@ func bootstrapThenListenWithRetry(ctx context.Context, bootstrap func() error, l
 func (h *Heartbeat) Start() {
 	go h.reconcileNativeRustDeskTarget()
 	h.startHardwareHealth()
+	h.startTimeSync()
 	h.startPamReconciliationRetryLoop()
 
 	// Issue #2621 — before the first heartbeat, finish any credential rotation
@@ -1947,9 +2008,7 @@ func (h *Heartbeat) Start() {
 			// a `renewCert` signal that can only arrive in a heartbeat
 			// response the server is refusing to send is a deadlock.
 			go h.maybeSelfInitiateCertRenewal()
-			if h.authMon != nil && h.authMon.ShouldSkip() {
-				log.Debug("skipping heartbeat tick, auth-dead",
-					"backoff", h.authMon.BackoffDuration())
+			if h.skipTickIfAuthDead() {
 				// continue here re-arms the ticker without running
 				// sendHeartbeatWithWatchdog or any inventory/posture/security
 				// scheduling — all of that work requires a valid auth token.
@@ -1996,6 +2055,7 @@ func (h *Heartbeat) Start() {
 			patchInterval := time.Duration(patchIntervalHours) * time.Hour
 			shouldSendPatch := h.claimPatchScanLocked(now, patchInterval)
 			hwTiers := h.hardwareTiersLocked(now, false)
+			h.timeSyncTickLocked(now)
 			h.mu.Unlock()
 
 			// Check for recent boot every few minutes (not every heartbeat tick).
@@ -2098,6 +2158,7 @@ func (h *Heartbeat) StopAcceptingCommands() {
 // respecting the context deadline.
 func (h *Heartbeat) DrainAndWait(ctx context.Context) {
 	h.stopHardwareHealth()
+	h.stopTimeSync()
 	log.Info("draining in-flight commands and inventory goroutines")
 	h.pool.Drain(ctx)
 	h.wg.Wait()
@@ -2119,6 +2180,7 @@ func (h *Heartbeat) DrainAndWait(ctx context.Context) {
 func (h *Heartbeat) Stop() {
 	h.stopOnce.Do(func() {
 		h.stopHardwareHealth()
+		h.stopTimeSync()
 		shutdownTimeout := h.shutdownTimeout
 		if shutdownTimeout <= 0 {
 			shutdownTimeout = 5 * time.Second
@@ -2288,6 +2350,11 @@ func (h *Heartbeat) sendInventoryData(endpoint string, payload any, label string
 	if endpoint == "hardware-health" && h.hwContext != nil {
 		parent = h.hwContext
 	}
+	if endpoint == "time-status" {
+		if upload, ok := payload.(timeSyncUpload); ok && upload.ctx != nil {
+			parent = upload.ctx
+		}
+	}
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
 
@@ -2299,6 +2366,11 @@ func (h *Heartbeat) sendInventoryData(endpoint string, payload any, label string
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		if endpoint == "time-status" {
+			if err := validateTimeSyncResponse(resp.Body); err != nil {
+				return err
+			}
+		}
 		log.Debug("inventory sent", "label", label)
 		return nil
 	} else {
@@ -2306,6 +2378,9 @@ func (h *Heartbeat) sendInventoryData(endpoint string, payload any, label string
 	}
 	if endpoint == "hardware-health" {
 		return &hardwareSubmissionError{status: resp.StatusCode}
+	}
+	if endpoint == "time-status" {
+		return &timeSyncSubmissionError{status: resp.StatusCode}
 	}
 	return fmt.Errorf("inventory send failed for %s: status %d", label, resp.StatusCode)
 }
@@ -2520,12 +2595,80 @@ func (h *Heartbeat) sendHardwareInventory() {
 	// Launched as a bare goroutine; without this a panic takes down the process.
 	defer observability.Recoverer("heartbeat.hardwareInventory")
 
-	hw, err := collectors.Guard("hardware", h.hardwareCol.CollectHardware)
+	collectHW := h.hardwareCollectFn
+	if collectHW == nil {
+		collectHW = h.hardwareCol.CollectHardware
+	}
+	hw, err := collectors.Guard("hardware", collectHW)
 	if err != nil {
 		log.Error("failed to collect hardware info", "error", err.Error())
 		return
 	}
-	h.sendInventoryData("hardware", hw, "hardware")
+
+	// Per-slot memory rides on this send only (startup, 24 h, manual
+	// refresh) — deliberately not inside CollectHardware(), which also runs
+	// on the 15-minute change-tracker tick and at enrollment. It is collected
+	// independently: on any failure the `memory` key is omitted (the API then
+	// keeps what it stored) and base hardware still goes out.
+	payload := hardwareInventoryPayload{HardwareInfo: hw, Memory: h.collectMemoryModules()}
+	label := "hardware"
+	if payload.Memory != nil {
+		label = fmt.Sprintf("hardware (%d memory slots)", len(payload.Memory.Modules))
+	}
+	_ = h.sendInventoryData("hardware", payload, label)
+}
+
+// hardwareInventoryPayload is the PUT /agents/:id/hardware body: the base
+// hardware fields flattened at the top level plus the optional `memory`
+// block. Older APIs strip the unknown key.
+type hardwareInventoryPayload struct {
+	*collectors.HardwareInfo
+	Memory *collectors.MemoryInfo `json:"memory,omitempty"`
+}
+
+const defaultMemoryCollectTimeout = 45 * time.Second
+
+// collectMemoryModules runs the memory collector with panic recovery and a
+// hard deadline, returning nil (omit the key) on any failure.
+func (h *Heartbeat) collectMemoryModules() *collectors.MemoryInfo {
+	collect := h.memoryCollectFn
+	if collect == nil {
+		collect = collectors.CollectMemoryModules
+	}
+	timeout := h.memoryCollectTimeout
+	if timeout <= 0 {
+		timeout = defaultMemoryCollectTimeout
+	}
+
+	type result struct {
+		info *collectors.MemoryInfo
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		defer observability.Recoverer("heartbeat.memoryModules")
+		info, err := collectors.Guard("memory-modules", collect)
+		done <- result{info, err}
+	}()
+
+	select {
+	case r := <-done:
+		switch {
+		case errors.Is(r.err, collectors.ErrMemoryUnsupported):
+			log.Debug("memory module inventory unsupported on this platform")
+			return nil
+		case r.err != nil:
+			log.Warn("failed to collect memory modules; sending hardware without them", "error", r.err.Error())
+			return nil
+		case r.info == nil || len(r.info.Modules) == 0:
+			log.Warn("memory module collector returned no modules; sending hardware without them")
+			return nil
+		}
+		return r.info
+	case <-time.After(timeout):
+		log.Warn("memory module collection timed out; sending hardware without them", "timeout", timeout.String())
+		return nil
+	}
 }
 
 func (h *Heartbeat) sendAppleWarrantyInfo() {
@@ -3067,6 +3210,16 @@ func (h *Heartbeat) applyConfigUpdate(update map[string]any) {
 	}
 	if hasWar {
 		h.applyWarrantyConfig(warRaw)
+	}
+
+	// Apply time_sync_settings (#7452 W03b). Same rule as warranty above: this
+	// must stay above the policy-probe early return or it never runs.
+	tsRaw, hasTS := update["time_sync_settings"]
+	if !hasTS {
+		tsRaw, hasTS = update["timeSyncSettings"]
+	}
+	if hasTS {
+		h.applyTimeSyncSettings(tsRaw)
 	}
 
 	registryRaw, hasRegistry := update["policy_registry_state_probes"]
@@ -4497,6 +4650,10 @@ func (h *Heartbeat) sendHeartbeat() {
 	virtComputed := h.cachedVirtComputed
 	h.mu.Unlock()
 
+	if runtime.GOOS == "darwin" {
+		updateRelocationFDAHealth(h.healthMon, defaultRelocationFDAProbe())
+	}
+
 	healthSnapshot := h.healthMon.Snapshot(health.SnapshotMetadata{
 		DeviceID:         h.config.DeviceID,
 		AgentVersion:     h.agentVersion,
@@ -4504,20 +4661,28 @@ func (h *Heartbeat) sendHeartbeat() {
 		ObservedAt:       time.Now().UTC(),
 	})
 	payload := HeartbeatPayload{
-		Status:          status,
-		AgentVersion:    h.agentVersion,
-		HelperVersion:   h.helperMgr.InstalledVersion(),
-		WatchdogVersion: h.installedWatchdogVersion(),
-		BackupVersion:   h.installedBackupVersion(),
-		HealthStatus:    &healthSnapshot,
-		DeviceRole:      deviceRole,
-		IsHeadless:      h.currentHeadless(),
+		Status:        status,
+		AgentVersion:  h.agentVersion,
+		HelperVersion: h.helperMgr.InstalledVersion(),
+		// Observed by the previous heartbeat's Apply (#6925).
+		HelperInstallIssue: h.helperMgr.InstallIssue(),
+		WatchdogVersion:    h.installedWatchdogVersion(),
+		BackupVersion:      h.installedBackupVersion(),
+		HealthStatus:       &healthSnapshot,
+		DeviceRole:         deviceRole,
+		IsHeadless:         h.currentHeadless(),
 		// Wave 6 Task 4 — this build enforces internal/netpolicy (Tasks 1-3),
 		// so it always declares version 1. Unconditional (not gated on any
 		// runtime check): the enforcement is compiled in, not a runtime
 		// toggle.
 		SecurityCapabilities: compiledSecurityCapabilities(),
 	}
+	// Read from the installed helper at startup and again after any helper
+	// install (invalidateBackupVersionCache).
+	backupProtocols := h.backupProtocols()
+	payload.BackupReadProtocolVersion = backupProtocols.BackupReadProtocolVersion
+	payload.BackupIntegrityProtocolVersion = backupProtocols.BackupIntegrityProtocolVersion
+	payload.BackupWriteProtocolVersion = backupProtocols.BackupWriteProtocolVersion
 	payload.SecurityCapabilities.PamLifetimeProtocolVersion = h.pamLifetimeProtocolVersion()
 	pamReconciliation := h.pamReconciliationStatus()
 	payload.SecurityCapabilities.PamReconciliation = &pamReconciliation
@@ -4695,7 +4860,15 @@ func (h *Heartbeat) doHeartbeatPost(baseURL string, payload *HeartbeatPayload) (
 		if h.authMon != nil {
 			h.authMon.RecordAuthFailure()
 		}
+		h.noteAuthRejectedLiveness()
 		return nil, false
+	}
+
+	if resp.StatusCode == http.StatusForbidden {
+		// Decommissioned / quarantined / tenant-inactive. Not counted by the
+		// auth monitor (unchanged), but it is still "running, rejected by the
+		// server", which a watchdog restart cannot fix (#2796).
+		h.noteAuthRejectedLiveness()
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -5910,7 +6083,21 @@ func (h *Heartbeat) confirmTokenRotation(newAuthToken string) (confirmed bool, t
 	confirmClient := api.NewClient(h.serverURL(), newAuthToken, h.config.AgentID)
 	resp, err := confirmClient.ConfirmTokenRotation()
 	if err != nil {
-		if api.IsRotationTerminal(err) {
+		discard := api.IsRotationTerminal(err)
+		if !discard && errors.Is(err, api.ErrStagedTokenRejected) {
+			// Issue #2773 — a bare 401 does not by itself say the staged set is
+			// dead (see api.ErrStagedTokenRejected). Discard only once the
+			// current credential is proven to be the server's current one;
+			// otherwise the staged copy may be the only credential the server
+			// will accept once this device or its tenant is reinstated.
+			if !h.currentCredentialProvenCurrent(newAuthToken) {
+				log.Warn("staged token was rejected but the current credential could not be proven current; keeping the staged set and retrying",
+					"reason", err.Error())
+				return false, false
+			}
+			discard = true
+		}
+		if discard {
 			// The staged set can never be promoted now — it expired, or the server
 			// told us (#2894) that it is neither the staged nor the current
 			// credential. Drop it so the per-tick retry and startup reconciliation
@@ -5936,6 +6123,44 @@ func (h *Heartbeat) confirmTokenRotation(newAuthToken string) (confirmed bool, t
 	}
 
 	return resp.Confirmed, false
+}
+
+// currentCredentialProvenCurrent reports whether the agent's in-memory current
+// token is provably the server's CURRENT agent credential — the precondition
+// for discarding a staged set the confirm route answered with a bare 401
+// (#2773).
+//
+// It asks the confirm route itself, authenticated with the current token. That
+// route mutates nothing for a token that is already current, and its answers
+// are precise:
+//   - 200 (`alreadyCurrent`, or the token was the live staged hash and has
+//     just been promoted) — current.
+//   - 409 `pending_token_required` — current, with some other set staged.
+//   - anything else — NOT proven: a 401 (suspended device, inactive tenant,
+//     or a token that is no longer accepted at all), `rotation_unresolvable`
+//     (it authenticates only as the superseded previous credential, so the
+//     server's current one is something else — possibly the staged token), or
+//     a transport/5xx failure.
+func (h *Heartbeat) currentCredentialProvenCurrent(stagedToken string) bool {
+	if h.secureToken == nil || h.secureToken.IsZeroed() {
+		return false
+	}
+	current := h.secureToken.Reveal()
+	// After a confirmed promotion whose local write failed, memory already runs
+	// on the staged token. Probing with the token that was just rejected would
+	// prove nothing.
+	if current == "" || current == stagedToken {
+		return false
+	}
+	_, err := api.NewClient(h.serverURL(), current, h.config.AgentID).ConfirmTokenRotation()
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, api.ErrPendingTokenRequired) {
+		return true
+	}
+	log.Warn("could not prove the current credential is the server's current one", "reason", err.Error())
+	return false
 }
 
 // applyRotatedCredentials collapses a confirmed rotation into the agent's
@@ -6048,6 +6273,56 @@ func (h *Heartbeat) reconcilePendingRotation() {
 		persisted.PendingHelperAuthToken,
 	)
 	log.Info("resumed credential rotation confirmed and promoted")
+}
+
+// skipTickIfAuthDead reports whether this heartbeat tick should be skipped
+// because the auth monitor is in an auth-dead backoff window. A skipped tick
+// still refreshes the auth-rejected liveness marker: the loop is alive, it is
+// just not allowed to talk to the server yet (#2796).
+func (h *Heartbeat) skipTickIfAuthDead() bool {
+	if h.authMon == nil || !h.authMon.ShouldSkip() {
+		return false
+	}
+	log.Debug("skipping heartbeat tick, auth-dead",
+		"backoff", h.authMon.BackoffDuration())
+	h.noteAuthRejectedLiveness()
+	return true
+}
+
+// noteAuthRejectedLiveness tells the watchdog that this agent is running its
+// heartbeat loop but the server is rejecting its credentials (#2796).
+// LastHeartbeat only advances on HTTP 200, so without this a live agent that
+// is correctly backing off reads as wedged: the watchdog restarts it every
+// ~10 minutes, each restart resets its in-memory backoff, and once the
+// restart budget is gone the watchdog parks in FAILOVER and polls the server
+// itself. Written to agent.state AND sent over IPC — the file alone is not
+// reliable on AV/EDR-locked hosts (#2763).
+func (h *Heartbeat) noteAuthRejectedLiveness() {
+	now := time.Now()
+	if h.statePath != "" {
+		if err := state.UpdateAuthRejected(h.statePath, now); err != nil {
+			log.Warn("failed to update state file auth-rejected marker", "error", err.Error())
+		}
+	}
+	if h.sessionBroker == nil {
+		return
+	}
+	sess := h.sessionBroker.PreferredSessionWithScope("watchdog")
+	if sess == nil {
+		return
+	}
+	// LastHeartbeat stays empty: this must never read as a successful
+	// heartbeat, to this watchdog or to one that predates AuthRejectedAt.
+	if err := sess.SendNotify("", ipc.TypeStateSync, ipc.StateSync{
+		AgentVersion:     h.agentVersion,
+		Connected:        false,
+		AuthRejectedAt:   now.Format(time.RFC3339),
+		ActiveBackupRuns: h.sessionBroker.ActiveBackupRunCount(),
+	}); err != nil {
+		// On an AV/EDR-locked host this IPC send is the only liveness
+		// channel left, so a failure here must leave a trace.
+		log.Warn("failed to send auth-rejected state_sync to watchdog", "error", err.Error())
+	}
 }
 
 // sendWatchdogStateSync sends a state_sync IPC message to the watchdog
@@ -7651,5 +7926,6 @@ func compiledSecurityCapabilities() SecurityCapabilities {
 		RollbackProtocolVersion:         1,
 		RevocationLeaseProtocolVersion:  1,
 		DesktopFenceProtocolVersion:     1,
+		ConsentPromptProtocolVersion:    1,
 	}
 }

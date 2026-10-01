@@ -88,6 +88,15 @@ describe('AutomationList managed automations', () => {
   });
 });
 
+describe('AutomationList filter selects accessible name (#7156)', () => {
+  it('gives the trigger and status filter selects a real accessible name', () => {
+    render(<AutomationList automations={[baseAutomation]} />);
+
+    expect(screen.getByRole('combobox', { name: 'Trigger' })).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Status' })).toBeInTheDocument();
+  });
+});
+
 describe('AutomationList controlled trigger filter (#5288)', () => {
   it('honours a controlled triggerFilter prop and reports select changes', () => {
     const onChange = vi.fn();
@@ -155,5 +164,23 @@ describe('AutomationList elevated actions', () => {
     render(<AutomationList automations={[automation]} />);
 
     expect(screen.queryByTestId('automation-elevated-badge')).toBeNull();
+  });
+});
+
+describe('AutomationList empty state (#7155)', () => {
+  it('renders the empty state outside the table so it is not centered across a table wider than the screen', () => {
+    render(
+      <AutomationList
+        automations={[]}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onRun={vi.fn()}
+        onToggle={vi.fn()}
+        onViewHistory={vi.fn()}
+      />
+    );
+
+    const emptyMessage = screen.getByText('No automations found. Try adjusting your search or filters.');
+    expect(emptyMessage.closest('table')).toBeNull();
   });
 });

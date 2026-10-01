@@ -1,4 +1,223 @@
 {
+  "timeSync": {
+    "title": "Hora",
+    "loading": "Carregando o status de hora…",
+    "error": "Não foi possível carregar o status de hora.",
+    "retry": "Tentar novamente",
+    "unknown": "Desconhecido",
+    "yes": "Sim",
+    "no": "Não",
+    "site": "Local",
+    "policy": "Política",
+    "states": {
+      "not_reported": "Ainda não há dados de hora — é necessária uma atualização do agente que inclua sincronização de hora",
+      "unsupported_os": "Ainda não há suporte neste sistema operacional"
+    },
+    "health": {
+      "healthy": "Saudável",
+      "warning": "Aviso",
+      "critical": "Crítico",
+      "unknown": "Desconhecido"
+    },
+    "severity": {
+      "critical": "Crítico",
+      "warning": "Aviso",
+      "info": "Informações"
+    },
+    "received": "Recebido: {{at}}",
+    "collected": "Coletado: {{at}}",
+    "stale": "Desatualizado — o último relatório de hora foi recebido há mais de 90 minutos.",
+    "expected": "Esperado: {{windows}} ({{iana}}), de {{source}}: {{name}}",
+    "expectedPolicy": "Esperado: {{windows}} ({{iana}}), da política {{name}} — substitui o fuso horário do local",
+    "managedBadge": "Gerenciado pela Política de Grupo",
+    "unset": {
+      "site_utc_default": "Nenhum fuso horário esperado (o local usa UTC como padrão)",
+      "no_site": "Nenhum fuso horário esperado (nenhum local atribuído)",
+      "unmapped": "Nenhum fuso horário esperado (o fuso horário do local não tem correspondência no Windows)"
+    },
+    "noFindings": "Nenhuma ocorrência relacionada à hora neste relatório.",
+    "events": "Eventos de hora recentes ({{count}})",
+    "noEvents": "Nenhum evento de hora recente.",
+    "eventHeading": "Evento {{id}} · Nível {{level}}",
+    "noMessage": "Nenhuma mensagem do evento.",
+    "fields": {
+      "source": "Fonte de hora",
+      "sourceKind": "Tipo de fonte",
+      "lastSync": "Última sincronização bem-sucedida",
+      "method": "Método de coleta",
+      "lastError": "Último erro de sincronização",
+      "stratum": "Nível NTP",
+      "poll": "Intervalo de consulta efetivo (segundos)",
+      "syncType": "Tipo de sincronização",
+      "ntpServer": "Configuração do servidor NTP",
+      "hosts": "Hosts NTP identificados",
+      "specialPoll": "Intervalo de consulta especial (segundos)",
+      "serviceState": "Serviço de Hora do Windows",
+      "serviceStartType": "Inicialização do serviço",
+      "policyManaged": "Gerenciado pela Política de Grupo",
+      "policyManagedValues": "Valores da Política de Grupo",
+      "hostProvider": "Provedor de hora do host da VM habilitado",
+      "joinType": "Tipo de ingresso",
+      "role": "Função no domínio",
+      "domain": "Domínio",
+      "forest": "Floresta",
+      "pdc": "PDC",
+      "windowsId": "Fuso horário atual do Windows",
+      "bias": "Desvio (minutos)",
+      "autoUpdate": "Fuso horário automático"
+    },
+    "values": {
+      "NT5DS": "Hierarquia do domínio (NT5DS)",
+      "NTP": "Pares NTP",
+      "NoSync": "Sem sincronização",
+      "AllSync": "Todas as fontes",
+      "ntp_peer": "Par NTP",
+      "domain_peer": "Par do domínio",
+      "local_clock": "Relógio local",
+      "free_running": "Relógio independente",
+      "vm_host": "Host da VM",
+      "unknown": "Desconhecido",
+      "provider_api": "API do provedor do Windows",
+      "w32tm_tokens": "Tokens de status de hora do Windows",
+      "events": "Eventos do Time-Service",
+      "unavailable": "Indisponível",
+      "none": "Sem ingresso",
+      "workplace": "Registrado no local de trabalho",
+      "azure_ad": "Ingressado no Microsoft Entra",
+      "on_prem_ad": "Ingressado no Active Directory",
+      "hybrid_azure_ad": "Ingresso híbrido no Entra",
+      "workgroup": "Grupo de trabalho",
+      "entra_only": "Somente Entra",
+      "member": "Membro do domínio",
+      "dc": "Controlador de domínio",
+      "pdc_emulator": "Emulador de PDC",
+      "forest_root_pdc_emulator": "Emulador de PDC da raiz da floresta",
+      "running": "Em execução",
+      "stopped": "Parado",
+      "start_pending": "Iniciando",
+      "stop_pending": "Parando",
+      "paused": "Pausado",
+      "not_installed": "Não instalado",
+      "auto": "Automático",
+      "delayed_auto": "Automático (atrasado)",
+      "manual": "Modo manual",
+      "trigger_manual": "Manual (início por gatilho)",
+      "disabled": "Desabilitado",
+      "on": "Ativado",
+      "off": "Desativado"
+    },
+    "findings": {
+      "pdc_no_external_source": {
+        "label": "O PDC raiz da floresta não tem fonte externa",
+        "hint": "Configure servidores NTP em {device} — ele é o PDC raiz da floresta e todos os membros do domínio o seguem."
+      },
+      "source_local_clock": {
+        "label": "Usando o relógio local",
+        "hint": "Está sincronizando com o próprio relógio. Configure uma fonte NTP (ou, se ingressado em um domínio, verifique o controlador de domínio)."
+      },
+      "dc_vm_host_sync": {
+        "label": "O controlador de domínio está sincronizando com o host da VM",
+        "hint": "Desabilite o provedor de hora do host da VM neste controlador de domínio."
+      },
+      "ntp_server_unresolvable": {
+        "label": "O nome do servidor NTP é inválido ou não pode ser resolvido",
+        "hint": "O servidor NTP {host} não pode ser resolvido ou o nome é inválido — corrija o nome ou o DNS."
+      },
+      "ntp_peer_unreachable": {
+        "label": "O par NTP está inacessível",
+        "hint": "Nenhuma resposta de {source} — verifique o tráfego UDP de saída na porta 123."
+      },
+      "domain_source_unavailable": {
+        "label": "Fonte de hora do domínio indisponível",
+        "hint": "Não foi possível encontrar uma fonte de hora do domínio — verifique a conectividade com o controlador de domínio."
+      },
+      "member_not_on_hierarchy": {
+        "label": "Não está usando a hierarquia do domínio",
+        "hint": "Ingressado no domínio, mas não está usando a hierarquia do domínio."
+      },
+      "sync_disabled": {
+        "label": "A sincronização de hora está desabilitada",
+        "hint": "O serviço de Hora do Windows está desabilitado."
+      },
+      "sync_stale": {
+        "label": "Nenhuma sincronização bem-sucedida recente",
+        "hint": "Nenhuma sincronização bem-sucedida desde {lastSuccessfulSyncAt}."
+      },
+      "correction_refused": {
+        "label": "A correção de hora foi recusada",
+        "hint": "O desvio do relógio é grande demais para o Windows corrigir automaticamente; sincronize novamente ou corrija manualmente."
+      },
+      "timezone_mismatch": {
+        "label": "O fuso horário é diferente do esperado",
+        "hint": "O fuso horário é {actual}; o esperado é {expected} (de {site or policy})."
+      },
+      "policy_not_applied": {
+        "label": "A política de hora não foi aplicada",
+        "hint": "Não foi possível aplicar a política de hora: {error}."
+      },
+      "policy_conflict_gpo": {
+        "label": "A Política de Grupo controla as configurações de hora",
+        "hint": "O W32Time é gerenciado pela Política de Grupo; o Breeze não altera suas configurações."
+      }
+    },
+    "management": {
+      "title": "Sincronização de horário",
+      "description": "Política de horário do Windows baseada no domínio e configurações de fuso horário",
+      "domainRule": "Grupos de trabalho, dispositivos que usam apenas o Entra e o PDC do domínio raiz da floresta usam os servidores NTP configurados. Membros do domínio, controladores de domínio e outros emuladores PDC usam a hierarquia do domínio. Funções desconhecidas são ignoradas.",
+      "gpoWins": "A Política de Grupo tem precedência. O Breeze não altera as configurações do W32Time gerenciadas pela Política de Grupo.",
+      "enforceNtp": "Exigir a sincronização de horário",
+      "ntpServers": "Servidores NTP — um nome de host ou endereço IP por linha, até 5",
+      "pollInterval": "Intervalo de consulta (minutos, 15–1440)",
+      "expectedTimezone": "Fuso horário esperado",
+      "site": "Usar o fuso horário do local",
+      "pinned": "Fixar um fuso horário",
+      "pinnedZone": "Fuso horário fixado",
+      "pinOverrides": "O fuso horário fixado tem precedência sobre o fuso horário do local.",
+      "autoFix": "Corrigir automaticamente o fuso horário",
+      "invalidServers": "Use no máximo 5 hosts NTP válidos, sem opções ou portas. Para exigir a sincronização, é necessário pelo menos um host.",
+      "invalidInterval": "Insira um número inteiro de 15 a 1440.",
+      "invalidZone": "Escolha um fuso horário com correspondência no Windows.",
+      "policySource": "Da política {{name}} — tem precedência sobre o fuso horário do local",
+      "unnamedPolicy": "Política sem nome"
+    },
+    "actions": {
+      "resync": "Sincronizar novamente",
+      "setTimezone": "Definir o fuso horário esperado",
+      "applyPolicy": "Aplicar a política de horário agora",
+      "bulkResync": "Sincronizar novamente os dispositivos selecionados",
+      "bulkSetTimezone": "Definir o fuso horário esperado em cada dispositivo selecionado",
+      "queued": "Comando de horário colocado na fila",
+      "failed": "Não foi possível colocar o comando de horário na fila",
+      "awaiting": "Na fila — aguardando execução",
+      "offline": "Na fila sem conexão — expira após 1 hora",
+      "delivered": "Entregue — aguardando execução",
+      "noExpected": "Ignorado — nenhum fuso horário esperado",
+      "select": "Selecionar dispositivo",
+      "outcomes": "Resultados dos comandos",
+      "checking": "Verificando o fuso horário esperado atual"
+    },
+    "enforcement": {
+      "title": "Último resultado da política de horário",
+      "none": "Nenhum resultado de aplicação informado ainda",
+      "ntp": "Sincronização de horário",
+      "timezone": "Fuso horário",
+      "ok": "Aplicada ou já em conformidade",
+      "failed": "Falhou",
+      "skipped": "Ignorada",
+      "before": "Antes",
+      "after": "Depois",
+      "reportedAt": "Informado em",
+      "applied": "Aplicada",
+      "already_compliant": "Já em conformidade",
+      "role_unknown": "Ignorada porque a função no domínio é desconhecida",
+      "conflict_gpo": "Ignorada porque a Política de Grupo tem precedência",
+      "readback_mismatch": "A leitura de verificação não correspondeu à política solicitada",
+      "exec_failed": "O comando do Windows falhou",
+      "invalid_settings": "As configurações eram inválidas",
+      "auto_timezone_on": "O fuso horário automático do Windows está habilitado",
+      "no_expected_timezone": "Nenhum fuso horário esperado está configurado"
+    }
+  },
   "aiActivity": {
     "title": "Atividade de IA",
     "count": "{{count}} ações despachadas nos últimos {{days}} dias",
@@ -99,6 +318,9 @@
     "generatingToken": "Gerando token...",
     "multiFactorAuthenticationIsRequiredTo3": "A autenticação multifator é obrigatória para gerar tokens de instalação.",
     "generateNewToken": "Gerar novo token",
+    "generateToken": "Gerar token",
+    "cliTokenNotGenerated": "Ainda não há token. Escolha o site, o número de dispositivos e a expiração e, em seguida, gere um token. Cada token é uma chave de registro ativa.",
+    "cliTokenSite": "Os dispositivos registrados com este token entram em {{site}}.",
     "singleUseValidForOneDevice": "Uso único — válido para um dispositivo. Gere um novo token para cada máquina adicional.",
     "linux": "linux",
     "windows2": "Windows",
@@ -603,7 +825,8 @@
       "generated": "Gerado em",
       "noSoftwareData": "Sem dados de software",
       "configuration": "Configuração"
-    }
+    },
+    "timeRangeSelectLabel": "Intervalo de tempo"
   },
   "deviceComplianceTab": {
     "failedToLoadComplianceStatus": "Falha ao carregar o status de conformidade",
@@ -1002,6 +1225,12 @@
     "quotedByQuotes": "Este grupo é precificado por {{count}} orçamento(s) aberto(s): {{names}}. Remova primeiro essas linhas de orçamento.",
     "quotedByQuotesCount": "Este grupo é precificado por {{count}} orçamento(s) aberto(s). Remova primeiro essas linhas de orçamento.",
     "failedToRunScriptOnGroups": "Falha ao executar o script nos grupos",
+    "bulkScriptMembershipFailed": "Não foi possível carregar os dispositivos do grupo {{group}}",
+    "bulkScriptNoDevices": "Os grupos selecionados não têm dispositivos nos quais você possa executar um script.",
+    "bulkScriptTooManyDevices": "Os grupos selecionados contêm {{count}} dispositivos; um script pode ser executado em no máximo {{max}} de uma vez. Selecione menos grupos.",
+    "bulkScriptNoneQueued": "O script não foi enfileirado em nenhum dispositivo ({{reasons}}).",
+    "bulkScriptPartiallyQueued": "{{admitted}} de {{total}} dispositivos enfileirados; {{refused}} não admitidos ({{reasons}}).",
+    "bulkScriptQueued": "{{script}} enfileirado em {{count}} dispositivo(s).",
     "failedToApplyPolicyToGroups": "Falha ao aplicar a política aos grupos",
     "failedToMoveDevice": "Falha ao mover o dispositivo",
     "loadingGroupMembership": "Carregando os membros do grupo...",
@@ -1021,6 +1250,7 @@
     "noDeviceGroupsYetCreateOne": "Ainda não há grupos de dispositivos. Crie um para começar a organizar dispositivos.",
     "createYourFirstGroup": "Criar seu primeiro grupo",
     "selectAllGroups": "Selecionar todos os grupos",
+    "selectGroup": "Selecionar grupo {{name}}",
     "dynamic": "Dinâmico",
     "static": "Estático",
     "device": "dispositivo",
@@ -1093,10 +1323,36 @@
     "primary": "Principal",
     "ipAddress": "Endereço IP",
     "macAddress": "Endereço MAC",
-    "linkSpeed": "Velocidade do link"
+    "linkSpeed": "Velocidade do link",
+    "memorySlotsUsed": "{{used}} de {{total}} slots em uso",
+    "memorySpeedConfigured": "{{speed}} (configurada)",
+    "memorySpeedRated": "{{speed}} (nominal)",
+    "onPackageMemory": "Memória integrada ao encapsulamento do processador",
+    "memoryModules": "Módulos de memória",
+    "memoryNotReported": "Ainda não informado — requer atualização do agente",
+    "noMemoryModulesReported": "Nenhum módulo de memória informado.",
+    "memoryModulesOnPackage": "A memória é integrada ao chip (soldada) — não há slots removíveis para informar.",
+    "memoryMaxCapacity": "Capacidade máxima suportada: {{capacity}}",
+    "slot": "Soquete",
+    "capacity": "Capacidade",
+    "memoryType": "Tipo",
+    "speed": "Velocidade",
+    "manufacturer": "Fabricante",
+    "partNumber": "Número da peça",
+    "serialNumber": "Nº de série",
+    "emptySlot": "Vazio",
+    "ratedSpeed": "nominal {{speed}}"
   },
   "deviceInfoTab": {
+    "logsSilent": "Este dispositivo está online, mas não envia logs desde {{since}}. O envio de logs pode estar desativado, falhando ou não chegando ao servidor — verifique a configuração de envio de logs do agente no dispositivo.",
+    "logsSilentNeverShipped": "Este dispositivo está online, mas nunca enviou um log. O envio de logs pode estar desativado, falhando ou não chegando ao servidor — verifique a configuração de envio de logs do agente no dispositivo.",
+    "updateStuck": "A atualização do agente para {{target}} parece travada: {{attempts}} tentativas desde {{since}} e o dispositivo continua na versão antiga. O atualizador tenta novamente a cada heartbeat; verifique os logs do agente, ou o próprio dispositivo se ele não enviar nenhum.",
     "updateOfferWithheld": "As ofertas de atualização estão retidas para este dispositivo (desde {{since}}): não é possível confirmar que a build do agente aceita a edição servida por este servidor, então ele permanece na versão atual. Recupere-o com um instalador da edição servida ou uma versão do agente que informe sua edição.",
+    "helperInstallIssue": {
+      "awaitingServerOffer": "O Breeze Assist está ativado, mas não instalado (desde {{since}}): o servidor não ofereceu uma versão do Breeze Assist para instalar neste dispositivo, então ele continua sem instalação. Verifique se há uma build do Breeze Assist publicada para a plataforma deste dispositivo.",
+      "installAbandoned": "O Breeze Assist está ativado, mas não instalado (desde {{since}}): a instalação da versão oferecida falhou repetidamente, então o agente pausou as novas tentativas. Ele tentará de novo em algumas horas ou quando uma versão mais recente for oferecida; o log do agente contém o erro de instalação.",
+      "unknown": "O Breeze Assist está ativado, mas não instalado (desde {{since}})."
+    },
     "gpu": "GPU",
     "text": "—",
     "failedToFetchDeviceDetails": "Falha ao buscar os detalhes do dispositivo",
@@ -1189,7 +1445,7 @@
     "missing": "Ausente",
     "reason": "Motivo",
     "lastChecked": "Última verificação",
-    "thisMacIsBelowTheMacos": "Este Mac não atende ao requisito mínimo do macOS 14+ para o acesso nativo à área de trabalho pela janela de login.",
+    "reasonLoginWindow": "Janela de login (macOS)",
     "loginWindowReachabilityIsOnlyAdvertised": "A acessibilidade da janela de login só é informada em instalações gerenciadas que tenham o auxiliar de área de trabalho implantado.",
     "theNativeLoginWindowDesktopPath": "O acesso nativo à área de trabalho pela janela de login depende da aprovação do direito de acesso pela Apple.",
     "theNativeLoginWindowDesktopPath2": "O acesso nativo à área de trabalho pela janela de login ainda não está pronto neste dispositivo.",
@@ -1438,7 +1694,17 @@
       "manual": "Manual"
     },
     "updateWithheld": "Atualizações retidas",
+    "logsSilent": "Logs silenciosos",
+    "logsSilentTooltip": "Este dispositivo está online, mas não envia logs há mais de 6 horas. O envio de logs pode estar desativado, falhando ou não chegando ao servidor.",
+    "updateStuck": "Atualização travada",
+    "updateStuckTooltip": "Este dispositivo está há mais de uma hora tentando atualizar o agente para {{target}} sem concluir.",
     "updateWithheldTooltip": "O servidor não está oferecendo atualizações a este dispositivo porque não é possível confirmar que a build do agente aceita a edição servida. Ele permanece na versão atual até ser recuperado.",
+    "helperNotInstalled": "Não instalado",
+    "helperInstallIssueTooltip": {
+      "awaitingServerOffer": "O Breeze Assist está ativado, mas não instalado: o servidor não ofereceu nenhuma versão do Breeze Assist para instalar neste dispositivo.",
+      "installAbandoned": "O Breeze Assist está ativado, mas não instalado: a instalação da versão oferecida falhou repetidamente e as novas tentativas estão pausadas.",
+      "unknown": "O Breeze Assist está ativado, mas não instalado."
+    },
     "agentVersionRelation": {
       "equalTooltip": "Corresponde à versão efetiva {{version}}",
       "aheadTooltip": "À frente do pin {{version}}",
@@ -1642,7 +1908,12 @@
       "source": "Origem"
     },
     "thirdParty": "Terceiros",
-    "uncategorized": "Sem categoria"
+    "uncategorized": "Sem categoria",
+    "installFailure": {
+      "badge": "Falha na instalação",
+      "noReason": "Nenhum motivo informado pelo agente",
+      "failedAt": "Última tentativa de instalação falhou: {{when}}"
+    }
   },
   "devicePerformanceGraphs": {
     "description": "Uso de CPU, RAM e disco e largura de banda da rede ao longo do tempo",
@@ -2251,7 +2522,8 @@
         "cpuCores": "Núcleos da CPU",
         "ramTotalMb": "RAM (MB)",
         "diskTotalGb": "Tamanho do disco (GB)",
-        "gpuModel": "Modelo da GPU"
+        "gpuModel": "Modelo da GPU",
+        "health": "Saúde do hardware"
       },
       "network": {
         "ipAddress": "Endereço IP",
@@ -2319,7 +2591,8 @@
         "cpuCores": "Núcleos da CPU",
         "ramTotalMb": "RAM (MB)",
         "diskTotalGb": "Tamanho do disco (GB)",
-        "gpuModel": "Modelo da GPU"
+        "gpuModel": "Modelo da GPU",
+        "health": "Saúde do hardware"
       },
       "network": {
         "ipAddress": "Endereço IP",
@@ -2404,7 +2677,8 @@
         "cpuCores": "Núcleos da CPU",
         "ramTotalMb": "RAM (MB)",
         "diskTotalGb": "Tamanho do disco (GB)",
-        "gpuModel": "Modelo da GPU"
+        "gpuModel": "Modelo da GPU",
+        "health": "Saúde do hardware"
       },
       "network": {
         "ipAddress": "Endereço IP",
@@ -2727,15 +3001,12 @@
         "invalidPort": "A porta deve ser um número inteiro entre 1 e 65535.",
         "pause": "Pausar consultas",
         "resume": "Retomar consultas",
-        "disable": "Desabilitar todo o monitoramento",
-        "disableTitle": "Desabilitar todo o monitoramento?",
-        "disableMessage": "As consultas SNMP e as verificações de rede deste ativo serão desabilitadas.",
+        "disable": "Desativar monitoramento SNMP",
+        "disableTitle": "Desativar o monitoramento SNMP?",
+        "disableMessage": "Interromper as consultas SNMP deste ativo? As verificações de rede continuam sendo gerenciadas em Monitores.",
         "checksTitle": "Verificações de rede",
         "noChecks": "Nenhuma verificação de rede configurada.",
         "addCheck": "Adicionar verificação",
-        "removeCheck": "Remover verificação",
-        "removeCheckTitle": "Remover verificação de rede?",
-        "removeCheckMessage": "Remover a verificação de rede “{{name}}”? Esta ação não pode ser desfeita.",
         "never": "nunca",
         "leaveBlankToKeep": "Armazenado — deixe em branco para manter o valor atual",
         "snmpVersion": "Versão SNMP",
@@ -2778,7 +3049,8 @@
           "tcp_port": "porta TCP",
           "http_check": "verificação HTTP",
           "dns_check": "verificação DNS"
-        }
+        },
+        "addCheckHint": "Adicionar verificação abre o monitor com este ativo selecionado."
       },
       "link": {
         "description": "Vincule este ativo descoberto ao dispositivo gerenciado que corresponde à mesma máquina.",
@@ -2821,12 +3093,8 @@
         "snmpSaveFailed": "Não foi possível salvar as configurações SNMP",
         "pollingPaused": "Consultas SNMP pausadas",
         "pollingResumed": "Consultas SNMP retomadas",
-        "monitoringDisabled": "Monitoramento desabilitado para este ativo",
-        "monitoringDisableFailed": "Não foi possível desabilitar o monitoramento",
-        "checkCreated": "Verificação de rede adicionada",
-        "checkCreateFailed": "Não foi possível adicionar a verificação de rede",
-        "checkRemoved": "Verificação de rede removida",
-        "checkRemoveFailed": "Não foi possível remover a verificação de rede",
+        "monitoringDisabled": "Monitoramento SNMP desativado",
+        "monitoringDisableFailed": "Não foi possível desativar o monitoramento SNMP",
         "siteChanged": "Movido para {{site}}.",
         "siteChangeFailed": "Não foi possível mover o ativo para o novo site",
         "siteChangedUnlinked": "O vínculo com o dispositivo com agente foi removido porque esse dispositivo está em outro site.",
@@ -3459,7 +3727,6 @@
     "events": "Eventos de hardware",
     "noEvents": "Nenhum evento de hardware registrado.",
     "noComponents": "Nenhum componente informado. Verifique as fontes.",
-    "all": "Todos os estados de hardware",
     "managementController": "Controlador de gerenciamento",
     "bmcVendor": "Fabricante",
     "bmcFirmware": "Versão do firmware",
@@ -3471,5 +3738,135 @@
     "bmcAgentReport": "— informado pelo agente do host",
     "bmcAssociation": "Este controlador de gerenciamento está associado ao host e continua sendo um dispositivo de rede separado.",
     "bmcConfirmUnlink": "Remover a associação do controlador de gerenciamento? A vinculação automática permanece desativada para este ativo até que você o vincule novamente."
+  },
+  "unassignedDevices": {
+    "title": "Dispositivos não atribuídos",
+    "description": "Dispositivos registrados com uma chave de implantação do parceiro aguardam aqui até você atribuí-los a uma organização cliente.",
+    "refresh": "Atualizar",
+    "bulkAssign": "Atribuir selecionados ({{count}})",
+    "reportedCaption": "Nome do host, sistema operacional, número de série, endereço MAC e modelo são informados por cada dispositivo e não são verificados.",
+    "loading": "Carregando dispositivos…",
+    "loadFailed": "Não foi possível carregar os dispositivos não atribuídos.",
+    "empty": "Nenhum dispositivo aguardando atribuição.",
+    "selectAll": "Selecionar todos os dispositivos",
+    "selectRow": "Selecionar {{hostname}}",
+    "never": "Nunca",
+    "assign": "Atribuir",
+    "columns": {
+      "hostname": "Nome do host",
+      "os": "Sistema operacional",
+      "serial": "Número de série",
+      "mac": "Endereço MAC",
+      "deployKey": "Chave de implantação",
+      "parkedAt": "Aguardando desde",
+      "lastSeen": "Visto por último"
+    },
+    "selectionCap": "No máximo {{max}} dispositivos podem ser atribuídos em um lote."
+  },
+  "assignParkedDialog": {
+    "titleSingle": "Atribuir {{hostname}}",
+    "titleBulk": "Atribuir {{count}} dispositivos",
+    "description": "O dispositivo passa a fazer parte da organização e do local escolhidos e começa a receber a configuração.",
+    "identityCaption": "Informado pelo dispositivo — não verificado",
+    "hostnameLabel": "Nome do host",
+    "osLabel": "Sistema operacional",
+    "serialLabel": "Número de série",
+    "macLabel": "Endereço MAC",
+    "modelLabel": "Modelo",
+    "targetOrgLabel": "Organização",
+    "targetOrgPlaceholder": "Escolha uma organização",
+    "targetSiteLabel": "Local",
+    "targetSitePlaceholder": "Escolha um local",
+    "loadingSites": "Carregando locais…",
+    "noSites": "Esta organização não tem locais.",
+    "noOrgs": "Nenhuma organização pode receber dispositivos.",
+    "possession": "Confirmei por outro canal que esta máquina pertence a este cliente",
+    "collisionHeading": "Já existe um dispositivo com este nome de host nesse local.",
+    "collisionAccept": "Atribuir mesmo assim e gerar um alerta de conflito de identidade",
+    "stepUpHeading": "Confirme sua identidade",
+    "stepUpIntro": "Confirme com seu segundo fator para atribuir.",
+    "stepUpCodeLabel": "Código de autenticação",
+    "stepUpPasskeyNote": "Sua chave de acesso será solicitada ao continuar.",
+    "stepUpRetry": "Essa confirmação não foi aceita. Tente novamente.",
+    "noStepUpFactor": "Configure um aplicativo autenticador ou uma chave de acesso para atribuir dispositivos.",
+    "cancel": "Cancelar",
+    "close": "Fechar",
+    "submit": "Atribuir",
+    "submitStepUp": "Confirmar e atribuir",
+    "submitting": "Atribuindo…",
+    "genericError": "Não foi possível atribuir o dispositivo.",
+    "successSingle": "{{hostname}} atribuído a {{orgName}}",
+    "bulkSummary": "{{ok}} de {{total}} dispositivos atribuídos",
+    "resultOk": "Atribuído",
+    "resultCodes": {
+      "DEVICE_NOT_FOUND": "Não encontrado",
+      "DEVICE_NOT_PARKED": "Já atribuído",
+      "DEVICE_NOT_ASSIGNABLE": "Em remoção",
+      "DEVICE_PARKING_EXPIRED": "Expirado",
+      "TARGET_ORG_INVALID": "A organização não pode receber dispositivos",
+      "TARGET_SITE_INVALID": "Local indisponível",
+      "DEVICE_IDENTITY_COLLISION": "Nome de host já existe no local",
+      "PARTNER_DEVICE_LIMIT_REACHED": "Limite de dispositivos atingido",
+      "STEP_UP_REQUIRED": "Confirmação necessária",
+      "ASSIGNMENT_FAILED": "Falhou"
+    }
+  },
+  "timeFleet": {
+    "title": "Sincronização de horário",
+    "subtitle": "Configuração de horário do Windows e problemas de sincronização observados.",
+    "view": "Visualização",
+    "list": "Dispositivos",
+    "byDomain": "Por domínio do AD",
+    "health": "Integridade",
+    "finding": "Problema",
+    "findings": "Problemas",
+    "role": "Função",
+    "organization": "Organização",
+    "site": "Local",
+    "all": "Todos",
+    "refresh": "Atualizar",
+    "device": "Dispositivo",
+    "source": "Fonte de horário",
+    "received": "Último recebimento",
+    "stale": "Desatualizado",
+    "noData": "Ainda não há dados de horário",
+    "unknown": "Desconhecido",
+    "never": "Nunca",
+    "none": "Nenhum",
+    "noDomain": "Nenhum domínio do AD informado",
+    "pdcContext": "O PDC é fixado como referência e pode estar fora dos filtros ou da página selecionados.",
+    "pdcMissing": "O PDC não está cadastrado no inventário acessível. Ele pode estar fora do seu escopo de acesso.",
+    "exportCurrent": "Exportar CSV atual",
+    "exportHistory": "Exportar CSV diário",
+    "from": "De (UTC)",
+    "to": "Até (UTC)",
+    "evidence": "Sincronização observada e informada pelo agente Breeze; os dias sem relatório são indicados como lacunas. Exporte até 400 dias UTC. Os filtros selecionam o conjunto atual de dispositivos.",
+    "rangeError": "Escolha um intervalo de 1 a 400 dias UTC.",
+    "exportError": "A exportação de evidências falhou. Tente novamente.",
+    "siteError": "Não foi possível carregar os locais. Atualize para tentar novamente.",
+    "loading": "Carregando dados de sincronização de horário…",
+    "loadError": "Não foi possível carregar os dados de sincronização de horário.",
+    "retry": "Tentar novamente",
+    "empty": "Nenhum dispositivo Windows acessível corresponde a estes filtros.",
+    "count": "{{count}} dispositivo correspondente",
+    "count_other": "{{count}} dispositivos correspondentes",
+    "previous": "Anterior",
+    "next": "Próxima",
+    "page": "Página {{page}}",
+    "healthLabels": {
+      "healthy": "Íntegro",
+      "warning": "Aviso",
+      "critical": "Crítico",
+      "unknown": "Desconhecido"
+    },
+    "roles": {
+      "workgroup": "Grupo de trabalho",
+      "entra_only": "Somente Entra",
+      "member": "Membro do domínio",
+      "dc": "Controlador de domínio",
+      "pdc_emulator": "Emulador de PDC do domínio",
+      "forest_root_pdc_emulator": "Emulador de PDC da raiz da floresta",
+      "unknown": "Desconhecido"
+    }
   }
 }

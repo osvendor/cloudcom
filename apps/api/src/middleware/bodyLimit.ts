@@ -34,6 +34,9 @@ export type BodyLimitRule =
   | 'contract-template'
   | 'agent-ingest'
   | 'agent-hardware-health'
+  | 'agent-time-status'
+  | 'agent-topology-adjacency'
+  | 'agent-unifi-telemetry'
   | 'ticket-attachment'
   | 'org-document'
   | 'quote-acceptance-evidence'
@@ -196,7 +199,34 @@ export function bodyLimitForPath(path: string): BodyLimitPolicy {
   // broader agent-ingest branch below so it gets its own distinct rule label
   // and its own (smaller) size, not the 5MB agent-ingest allowance.
   if (path.match(/^\/api\/v1\/agents\/[^/]+\/hardware-health$/)) {
-    return { rule: 'agent-hardware-health', maxSize: 2 * 1024 * 1024, error: 'Request body too large' };
+    return {
+      rule: 'agent-hardware-health',
+      maxSize: 2 * 1024 * 1024,
+      error: 'Request body too large',
+    };
+  }
+  if (path.match(/^\/api\/v1\/agents\/[^/]+\/time-status$/)) {
+    return {
+      rule: 'agent-time-status',
+      maxSize: 512 * 1024,
+      error: 'Request body too large',
+    };
+  }
+  // Discovery adjacency (M2 #5998 D14): one per-target AdjacencyV2 report of at
+  // most 4 MiB (ADJACENCY_V2_MAX_BYTES, which the route's schema re-checks) plus
+  // the `{parentJobId, report}` envelope. The agent bounds the report before
+  // posting, so this is a transport ceiling, not a normal operating size.
+  if (path.match(/^\/api\/v1\/agents\/[^/]+\/topology\/adjacency$/)) {
+    return { rule: 'agent-topology-adjacency', maxSize: 4 * 1024 * 1024 + 64 * 1024, error: 'Adjacency report too large (max 4 MiB)' };
+  }
+  // UniFi telemetry (M2 #5998 Task 5): the legacy poll body plus the optional
+  // typed `topologyV1` companion, which the shared wire guard bounds at 8 MiB
+  // (UNIFI_TOPOLOGY_V1_MAX_BYTES; the Go collector drops a larger companion
+  // before posting). The legacy half keeps its historical 1 MiB default, so
+  // the gate is the sum. Without this every companion-bearing poll above 1 MiB
+  // 413s here and the LEGACY telemetry of that poll is lost with it.
+  if (path.match(/^\/api\/v1\/agents\/[^/]+\/unifi-telemetry$/)) {
+    return { rule: 'agent-unifi-telemetry', maxSize: 9 * 1024 * 1024, error: 'UniFi telemetry too large (max 8 MiB topology + 1 MiB telemetry)' };
   }
   if (path.match(/^\/api\/v1\/agents\/[^/]+\/(hardware|software|disks|network|connections|heartbeat)$/)) {
     return { rule: 'agent-ingest', maxSize: 5 * 1024 * 1024, error: 'Request body too large' };

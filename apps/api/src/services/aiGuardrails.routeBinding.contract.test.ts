@@ -200,6 +200,11 @@ export function routeRegistrationPermissions(
 interface Binding {
   tool: string;
   action?: string;
+  /**
+   * Extra tool input for a tool whose permission follows a non-`action` input
+   * (a boolean that asks for fresh data from the device). Merged with `action`.
+   */
+  input?: Record<string, unknown>;
   /** Relative to `src/routes/`. */
   routeFile: string;
   method: Method;
@@ -238,6 +243,10 @@ const BINDINGS: readonly Binding[] = [
     tool: 'list_remediation_suggestions', routeFile: 'remediationSuggestions.ts', method: 'get', path: '/',
     toolOnly: { extra: [], reason: 'Explicit orgId requires organization access; exact-device scope also narrows device rows; empty site access returns no rows, including device-less suggestions.' },
   },
+  {
+    tool: 'find_proven_fixes', routeFile: 'remediationSuggestions.ts', method: 'get', path: '/',
+    toolOnly: { extra: [], reason: 'Source alert/episode is resolved through the caller org condition, exact-device scope and site scope before any memory read; memory output is counts only.' },
+  },
   // Exact-device scope additionally limits these reads to linked assets.
   { tool: 'list_network_assets', routeFile: 'discovery.ts', method: 'get', path: '/assets', toolOnly: { extra: [], reason: 'Exact-device callers only see assets linked to allowed devices.' } },
   { tool: 'get_network_asset', routeFile: 'discovery.ts', method: 'get', path: '/assets/:id', toolOnly: { extra: [], reason: 'Exact-device callers only see assets linked to allowed devices.' } },
@@ -271,10 +280,26 @@ const BINDINGS: readonly Binding[] = [
   { tool: 'get_vault_status', routeFile: 'backup/vault.ts', method: 'get', path: '/:id/status' },
   { tool: 'configure_vault', routeFile: 'backup/vault.ts', method: 'post', path: '/' },
 
-  // §2.5 — backup / Hyper-V / MSSQL reads.
-  { tool: 'query_backups', routeFile: 'backup/jobs.ts', method: 'get', path: '/jobs' },
+  // Restore tools and DR plan management/execution.
+  { tool: 'restore_snapshot', routeFile: 'backup/restore.ts', method: 'post', path: '/restore' },
+  { tool: 'restore_as_vm', routeFile: 'backup/vmrestore.ts', method: 'post', path: '/restore/as-vm' },
+  { tool: 'instant_boot_vm', routeFile: 'backup/vmrestore.ts', method: 'post', path: '/restore/instant-boot' },
+  { tool: 'restore_hyperv_vm', routeFile: 'backup/hyperv.ts', method: 'post', path: '/restore' },
+  { tool: 'restore_mssql_database', routeFile: 'backup/mssql.ts', method: 'post', path: '/mssql/restore' },
+  { tool: 'manage_dr_plan', action: 'create_plan', routeFile: 'dr.ts', method: 'post', path: '/plans' },
+  { tool: 'manage_dr_plan', action: 'update_plan', routeFile: 'dr.ts', method: 'patch', path: '/plans/:id' },
+  { tool: 'manage_dr_plan', action: 'add_group', routeFile: 'dr.ts', method: 'post', path: '/plans/:id/groups' },
+  { tool: 'manage_dr_plan', action: 'update_group', routeFile: 'dr.ts', method: 'patch', path: '/plans/:id/groups/:gid' },
+  { tool: 'manage_dr_plan', action: 'delete_group', routeFile: 'dr.ts', method: 'delete', path: '/plans/:id/groups/:gid' },
+  // backup:write for plans with a BARE_METAL_REBUILD group is data-dependent;
+  // the handler enforces it (aiToolsDR.ts execute_dr_plan).
+  { tool: 'execute_dr_plan', routeFile: 'dr.ts', method: 'post', path: '/plans/:id/execute' },
+
+  // §2.5 — backup / Hyper-V / MSSQL reads. query_backups' own binding moved to
+  // the per-action rows below (its base tier-1 map is per-action, so a
+  // bare-tool binding here can no longer resolve).
   { tool: 'browse_snapshots', routeFile: 'backup/snapshots.ts', method: 'get', path: '/snapshots/:id/browse' },
-  { tool: 'get_vm_restore_estimate', routeFile: 'backup/vmrestore.ts', method: 'get', path: '/backup/restore/as-vm/estimate/:snapshotId' },
+  { tool: 'get_vm_restore_estimate', routeFile: 'backup/vmrestore.ts', method: 'get', path: '/restore/as-vm/estimate/:snapshotId' },
   { tool: 'query_hyperv_vms', routeFile: 'backup/hyperv.ts', method: 'get', path: '/vms' },
   { tool: 'query_mssql_instances', routeFile: 'backup/mssql.ts', method: 'get', path: '/mssql/instances' },
 
@@ -308,6 +333,24 @@ const BINDINGS: readonly Binding[] = [
   // §2.4 — a registry read is an agent EXECUTION (SR5-01 precedent).
   { tool: 'registry_operations', action: 'read_key', routeFile: 'devices/commands.ts', method: 'post', path: '/:id/commands' },
 
+  // Live device inspection: every /system-tools route dispatches to the agent,
+  // and the router (systemTools/index.ts) gates every method on devices:execute.
+  { tool: 'manage_processes', action: 'list', routeFile: 'systemTools/processes.ts', method: 'get', path: '/devices/:deviceId/processes', parents: ['systemTools/index.ts'] },
+  { tool: 'manage_scheduled_tasks', action: 'list', routeFile: 'systemTools/scheduledTasks.ts', method: 'get', path: '/devices/:deviceId/tasks', parents: ['systemTools/index.ts'] },
+  { tool: 'manage_services', action: 'list', routeFile: 'systemTools/services.ts', method: 'get', path: '/devices/:deviceId/services', parents: ['systemTools/index.ts'] },
+  { tool: 'file_operations', action: 'list', routeFile: 'systemTools/fileBrowser.ts', method: 'get', path: '/devices/:deviceId/files', parents: ['systemTools/index.ts'] },
+  { tool: 'registry_operations', action: 'get_value', routeFile: 'systemTools/registry.ts', method: 'get', path: '/devices/:deviceId/registry/value', parents: ['systemTools/index.ts'] },
+  // Live device reads outside /system-tools. The live request is bound to the
+  // route that sends the same command; the stored-data read to the route that
+  // reads the stored result.
+  { tool: 'system_cleanup', action: 'list', routeFile: 'devices/filesystemSystemCleanup.ts', method: 'post', path: '/:id/filesystem/system-cleanup/list' },
+  { tool: 'system_cleanup', action: 'run', routeFile: 'devices/filesystemSystemCleanup.ts', method: 'post', path: '/:id/filesystem/system-cleanup/run' },
+  { tool: 'system_cleanup', action: 'status', routeFile: 'devices/filesystemSystemCleanup.ts', method: 'get', path: '/:id/filesystem/system-cleanup/run/:cleanupRunId' },
+  { tool: 'analyze_disk_usage', input: { refresh: true }, routeFile: 'devices/filesystem.ts', method: 'post', path: '/:id/filesystem/scan' },
+  { tool: 'analyze_disk_usage', routeFile: 'devices/filesystem.ts', method: 'get', path: '/:id/filesystem' },
+  { tool: 'analyze_boot_performance', input: { triggerCollection: true }, routeFile: 'devices/bootMetrics.ts', method: 'post', path: '/:id/collect-boot-metrics' },
+  { tool: 'analyze_boot_performance', routeFile: 'devices/bootMetrics.ts', method: 'get', path: '/:id/boot-metrics' },
+
   // §2.6 — the ten resources that did not exist in the canonical catalog.
   { tool: 'manage_deployments', action: 'get', routeFile: 'deployments.ts', method: 'get', path: '/:id' },
   { tool: 'manage_deployments', action: 'create', routeFile: 'deployments.ts', method: 'post', path: '/' },
@@ -334,6 +377,65 @@ const BINDINGS: readonly Binding[] = [
 
   { tool: 'manage_update_rings', action: 'list', routeFile: 'updateRings.ts', method: 'get', path: '/' },
   { tool: 'manage_update_rings', action: 'create', routeFile: 'updateRings.ts', method: 'post', path: '/' },
+
+  // These tools require the same permission as the route they mirror
+  // (aiGuardrails.ts TOOL_PERMISSIONS / TOOL_ACTION_EXTRA_PERMISSIONS). Bound
+  // here so a later change to the route's permission is reflected here too.
+  { tool: 'manage_quotes', action: 'decline', routeFile: 'quotes/lifecycle.ts', method: 'post', path: '/:id/decline-on-behalf' },
+  {
+    tool: 'manage_quotes', action: 'create_pay_link', routeFile: 'invoices/stripe.ts', method: 'post', path: '/:id/pay-link',
+    toolOnly: {
+      extra: ['quotes:read'],
+      reason: 'the handler resolves the pay link from the CONVERTED QUOTE by id before delegating to the invoice route\'s own logic (createQuotePayLink → quotePay.ts), so it needs quotes:read on top of the route\'s invoices:send.',
+    },
+  },
+  { tool: 'manage_catalog', action: 'archive_item', routeFile: 'catalog/catalog.ts', method: 'post', path: '/:id/archive' },
+  { tool: 'test_webhook', routeFile: 'webhooks.ts', method: 'post', path: '/:id/test' },
+  // Read-only tools: each requires the same permission as its route.
+  { tool: 'query_backups', action: 'list_configs', routeFile: 'backup/configs.ts', method: 'get', path: '/configs' },
+  { tool: 'query_backups', action: 'list_jobs', routeFile: 'backup/jobs.ts', method: 'get', path: '/jobs' },
+  { tool: 'query_backups', action: 'list_policies', routeFile: 'configurationPolicies/crud.ts', method: 'get', path: '/' },
+  { tool: 'get_backup_status', routeFile: 'backup/dashboard.ts', method: 'get', path: '/status/:deviceId' },
+  { tool: 'query_backup_sla', routeFile: 'backup/sla.ts', method: 'get', path: '/configs' },
+  { tool: 'get_sla_breaches', routeFile: 'backup/sla.ts', method: 'get', path: '/events' },
+  { tool: 'get_sla_compliance_report', routeFile: 'backup/sla.ts', method: 'get', path: '/dashboard' },
+  { tool: 'query_dr_plans', routeFile: 'dr.ts', method: 'get', path: '/plans' },
+  { tool: 'get_dr_plan_details', routeFile: 'dr.ts', method: 'get', path: '/plans/:id' },
+  { tool: 'get_dr_execution_status', routeFile: 'dr.ts', method: 'get', path: '/executions/:id' },
+  { tool: 'query_c2c_connections', routeFile: 'c2c/connections.ts', method: 'get', path: '/connections' },
+  { tool: 'query_c2c_jobs', routeFile: 'c2c/jobs.ts', method: 'get', path: '/jobs' },
+  { tool: 'search_c2c_items', routeFile: 'c2c/items.ts', method: 'get', path: '/items' },
+  { tool: 'get_browser_security', routeFile: 'browserSecurity.ts', method: 'get', path: '/extensions' },
+  { tool: 'get_software_compliance', routeFile: 'softwarePolicies.ts', method: 'get', path: '/violations' },
+  { tool: 'query_compliance_policies', routeFile: 'policyManagement/crud.ts', method: 'get', path: '/' },
+  { tool: 'get_compliance_status', routeFile: 'policyManagement/compliance.ts', method: 'get', path: '/:id/compliance' },
+  { tool: 'get_elevation_history', routeFile: 'pam.ts', method: 'get', path: '/elevation-requests' },
+  { tool: 'get_peripheral_activity', routeFile: 'peripheralControl.ts', method: 'get', path: '/activity' },
+  { tool: 'get_sensitive_data_overview', routeFile: 'sensitiveData.ts', method: 'get', path: '/scans' },
+  { tool: 'get_user_risk_scores', routeFile: 'userRisk.ts', method: 'get', path: '/scores' },
+  { tool: 'get_user_risk_detail', routeFile: 'userRisk.ts', method: 'get', path: '/users/:userId' },
+  { tool: 'get_incident_timeline', routeFile: 'incidents.ts', method: 'get', path: '/:id' },
+  { tool: 'generate_incident_report', routeFile: 'incidents.ts', method: 'get', path: '/:id/report' },
+  { tool: 'query_analytics', action: 'capacity_predictions', routeFile: 'analytics.ts', method: 'get', path: '/capacity' },
+  { tool: 'get_executive_summary', routeFile: 'analytics.ts', method: 'get', path: '/executive-summary' },
+  { tool: 'list_monitors', routeFile: 'monitorDefinitions.ts', method: 'get', path: '/' },
+  { tool: 'get_monitor', routeFile: 'monitorDefinitions.ts', method: 'get', path: '/:id' },
+  { tool: 'get_ip_history', routeFile: 'devices/hardware.ts', method: 'get', path: '/:id/ip-history' },
+  { tool: 'get_network_changes', routeFile: 'networkChanges.ts', method: 'get', path: '/' },
+  {
+    tool: 'list_remote_sessions',
+    routeFile: 'remote/sessions.ts',
+    method: 'get',
+    path: '/sessions',
+    // remote:access comes from the parent router (remote/index.ts), not the session route.
+    parents: ['remote/index.ts'],
+  },
+  { tool: 'query_custom_fields', action: 'list_definitions', routeFile: 'customFields.ts', method: 'get', path: '/' },
+  { tool: 'query_psa_status', routeFile: 'psa.ts', method: 'get', path: '/connections' },
+  { tool: 'search_script_library', routeFile: 'scripts.ts', method: 'get', path: '/' },
+  { tool: 'list_scripts', routeFile: 'scripts.ts', method: 'get', path: '/' },
+  { tool: 'get_script_details', routeFile: 'scripts.ts', method: 'get', path: '/:id' },
+  { tool: 'get_script_execution_history', routeFile: 'scripts.ts', method: 'get', path: '/:id/executions' },
 ];
 
 /**
@@ -352,6 +454,19 @@ const UNBOUND: ReadonlyArray<{ tool: string; action?: string; reason: string }> 
   {
     tool: 'computer_control',
     reason: 'no single HTTP route: it rides an already-established remote session over the signalling channel, so its remote:access extra is inherited from create_remote_session rather than from a route of its own',
+  },
+  {
+    tool: 'query_webhooks',
+    reason: 'GET /webhooks (routes/webhooks.ts) carries no requirePermission at all — requireScope only — so there is no route permission set to bind against; the tool keeps its devices:read gate regardless. Route gap filed as a follow-up (#6755 PR).',
+  },
+  {
+    tool: 'list_script_templates',
+    reason: 'global template table with no matching HTTP route: no endpoint reads script_templates directly',
+  },
+  {
+    tool: 'query_agent_versions',
+    action: 'list_versions',
+    reason: 'reads the global agent_versions table (no tenant data, no matching read route); REST GET /agent-versions/ (agentVersions.ts:1232) is platform-admin only, a different audience than the tool',
   },
 ];
 
@@ -373,7 +488,7 @@ function routePermissionsFor(binding: Binding): string[] {
 function toolPermissionsFor(binding: Binding): string[] {
   const required = requiredPermissionsForTool(
     binding.tool,
-    binding.action ? { action: binding.action } : {},
+    { ...(binding.input ?? {}), ...(binding.action ? { action: binding.action } : {}) },
   );
   if (required === null) {
     throw new Error(`no RBAC mapping for ${binding.tool}${binding.action ? `.${binding.action}` : ''}`);
@@ -381,7 +496,8 @@ function toolPermissionsFor(binding: Binding): string[] {
   return [...new Set(required.map((r) => `${r.resource}:${r.action}`))].sort();
 }
 
-const label = (b: Binding) => `${b.tool}${b.action ? `.${b.action}` : ''}`;
+const label = (b: Binding) =>
+  `${b.tool}${b.action ? `.${b.action}` : ''}${b.input ? ` ${JSON.stringify(b.input)}` : ''}`;
 
 describe('contract: every remapped AI tool requires what its HTTP route requires', () => {
   it('the binder actually resolves a permission for every pair (not vacuously empty)', () => {

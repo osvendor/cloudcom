@@ -5,12 +5,13 @@ import { and, desc, eq, gte, inArray, sql, type SQL } from 'drizzle-orm';
 
 import { db } from '../db';
 import { devices, elevationAudit, elevationRequests, mlFeedbackEvents, remediationSuggestions } from '../db/schema';
-import { authMiddleware, requireMfa, requirePermission, requireScope } from '../middleware/auth';
+import { authMiddleware, requireMfa, requirePermission, requireScope, withAuthDbAccessContext } from '../middleware/auth';
 import { writeRouteAudit } from '../services/auditEvents';
 import { emitRemediationSuggestionFeedback } from '../services/mlFeedbackEmitters';
 import { generateRemediationSuggestions } from '../services/remediationSuggestions';
 import { canAccessSite, PERMISSIONS, type UserPermissions } from '../services/permissions';
 import { executeScriptOnDevices } from '../services/scriptExecution';
+import { createManualStepsOutcome, loadOutcomeSummaries, recordExecutionOutcome, recordOutcomeVote, type OutcomeSummary } from '../services/fixMemory/outcomeRecorder';
 
 export const remediationSuggestionRoutes = new Hono();
 
@@ -56,6 +57,8 @@ const updateBodySchema = z.object({
   playbookExecutionId: z.string().uuid().nullable().optional(),
   failureMessage: z.string().max(5000).nullable().optional(),
 });
+
+const voteBodySchema = z.object({ vote: z.enum(['up', 'down']) });
 
 type UpdateRemediationSuggestionInput = z.infer<typeof updateBodySchema>;
 
@@ -244,7 +247,7 @@ function validateSuggestionLifecycleUpdate(input: UpdateRemediationSuggestionInp
   return null;
 }
 
-function serializeSuggestion(row: typeof remediationSuggestions.$inferSelect) {
+function serializeSuggestion(row: typeof remediationSuggestions.$inferSelect, outcome: OutcomeSummary | null = null) {
   return {
     id: row.id,
     orgId: row.orgId,
@@ -278,6 +281,8 @@ function serializeSuggestion(row: typeof remediationSuggestions.$inferSelect) {
     acceptedAt: row.acceptedAt?.toISOString() ?? null,
     rejectedAt: row.rejectedAt?.toISOString() ?? null,
     executedAt: row.executedAt?.toISOString() ?? null,
+    origin: row.origin,
+    outcome,
   };
 }
 
@@ -439,7 +444,8 @@ remediationSuggestionRoutes.get(
       .limit(query.limit);
 
     const visible = await filterSiteAllowedSuggestions(rows, perms);
-    return c.json({ data: visible.map(serializeSuggestion) });
+    const outcomes = await loadOutcomeSummaries(visible.map((row) => row.id));
+    return c.json({ data: visible.map((row) => serializeSuggestion(row, outcomes.get(row.id) ?? null)) });
   }
 );
 
@@ -667,9 +673,12 @@ remediationSuggestionRoutes.post(
       },
     });
 
+    // Same shape as the list: the panel replaces its list with this response,
+    // so a suggestion that already has an attempt must keep its outcome.
+    const outcomes = await loadOutcomeSummaries(visible.map((row) => row.id));
     return c.json({
       skipped: result.skipped,
-      data: visible.map(serializeSuggestion),
+      data: visible.map((row) => serializeSuggestion(row, outcomes.get(row.id) ?? null)),
     }, result.skipped ? 200 : 201);
   }
 );
@@ -837,49 +846,68 @@ remediationSuggestionRoutes.post(
     const perms = c.get('permissions') as UserPermissions | undefined;
     const id = c.req.param('id') ?? '';
 
-    const conditions: SQL[] = [eq(remediationSuggestions.id, id)];
-    const orgCond = auth.orgCondition(remediationSuggestions.orgId);
-    if (orgCond) conditions.push(orgCond);
+    // #7109 — this route is registered in middleware/selfManagedDbContextRoutes.ts,
+    // so no request transaction is held here. Three phases, none nested:
+    //   1. load + gate the suggestion in a short context;
+    //   2. executeScriptOnDevices creates the execution rows through the runner
+    //      (a context that COMMITS when it returns) and sends the command only
+    //      after that commit — under the old request tx the command went out
+    //      while its rows were uncommitted and a fast agent's result was
+    //      dropped as an orphan;
+    //   3. link the suggestion to the execution in a second short context.
+    // No context is held across phase 2: the service opens its own, and
+    // holding one here would take a second pooled connection (#6671).
+    const gate = await withAuthDbAccessContext(auth, async () => {
+      const conditions: SQL[] = [eq(remediationSuggestions.id, id)];
+      const orgCond = auth.orgCondition(remediationSuggestions.orgId);
+      if (orgCond) conditions.push(orgCond);
 
-    const [existing] = await db
-      .select()
-      .from(remediationSuggestions)
-      .where(and(...conditions))
-      .limit(1);
+      const [existing] = await db
+        .select()
+        .from(remediationSuggestions)
+        .where(and(...conditions))
+        .limit(1);
 
-    if (!existing) {
-      return c.json({ error: 'Suggestion not found' }, 404);
-    }
-    if (!(await siteAllowedForSuggestion(existing, perms))) {
-      return c.json({ error: 'Suggestion not found or access denied' }, 403);
-    }
-    if (existing.status !== 'accepted' && existing.status !== 'edited') {
-      return c.json({ error: 'Suggestion must be accepted or edited before it can be executed' }, 400);
-    }
-    if (existing.scriptExecutionId) {
-      return c.json({ error: 'Suggestion already has a linked script execution' }, 409);
-    }
-    if (existing.targetType !== 'script' || !existing.scriptId) {
-      return c.json({ error: 'Only script remediation suggestions can be executed' }, 400);
-    }
+      if (!existing) {
+        return { ok: false as const, error: 'Suggestion not found', status: 404 as const };
+      }
+      if (!(await siteAllowedForSuggestion(existing, perms))) {
+        return { ok: false as const, error: 'Suggestion not found or access denied', status: 403 as const };
+      }
+      if (existing.status !== 'accepted' && existing.status !== 'edited') {
+        return { ok: false as const, error: 'Suggestion must be accepted or edited before it can be executed', status: 400 as const };
+      }
+      if (existing.scriptExecutionId) {
+        return { ok: false as const, error: 'Suggestion already has a linked script execution', status: 409 as const };
+      }
+      if (existing.targetType !== 'script' || !existing.scriptId) {
+        return { ok: false as const, error: 'Only script remediation suggestions can be executed', status: 400 as const };
+      }
 
-    const deviceId = singleTargetDeviceId(existing);
-    if (!deviceId) {
-      return c.json({ error: 'Remediation script execution requires exactly one target device' }, 400);
-    }
+      const deviceId = singleTargetDeviceId(existing);
+      if (!deviceId) {
+        return { ok: false as const, error: 'Remediation script execution requires exactly one target device', status: 400 as const };
+      }
 
-    const approvalError = await validateRemediationExecutionApproval(existing, deviceId);
-    if (approvalError) {
-      return c.json({ error: approvalError }, 403);
+      const approvalError = await validateRemediationExecutionApproval(existing, deviceId);
+      if (approvalError) {
+        return { ok: false as const, error: approvalError, status: 403 as const };
+      }
+      return { ok: true as const, existing, scriptId: existing.scriptId, deviceId };
+    });
+    if (!gate.ok) {
+      return c.json({ error: gate.error }, gate.status);
     }
+    const { existing, scriptId, deviceId } = gate;
 
     const execution = await executeScriptOnDevices({
-      scriptId: existing.scriptId,
+      scriptId,
       deviceIds: [deviceId],
       parameters: normalizeSuggestionParameters(existing.parameters),
       triggerType: 'manual',
       auth,
       permissions: perms,
+      runInDbContext: (fn) => withAuthDbAccessContext(auth, fn),
     });
 
     if (!execution.ok) {
@@ -897,46 +925,68 @@ remediationSuggestionRoutes.post(
     }
     const scriptExecutionId = admission.executionId;
 
-    const now = new Date();
-    const [updated] = await db
-      .update(remediationSuggestions)
-      .set({
-        status: 'executed',
-        scriptExecutionId,
-        executedBy: auth.user.id,
-        executedAt: now,
-        updatedAt: now,
-      })
-      .where(eq(remediationSuggestions.id, existing.id))
-      .returning();
+    // The execution is committed (and may already be running) by now, so a
+    // failure below leaves it unlinked from the suggestion. That was already
+    // true under the request tx: a rollback there could undo the link but
+    // never the command the agent had been sent.
+    const phase3 = await withAuthDbAccessContext(auth, async () => {
+      const now = new Date();
+      const [row] = await db
+        .update(remediationSuggestions)
+        .set({
+          status: 'executed',
+          scriptExecutionId,
+          executedBy: auth.user.id,
+          executedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(remediationSuggestions.id, existing.id))
+        .returning();
 
-    if (!updated) {
+      if (!row) return undefined;
+
+      await emitRemediationSuggestionFeedback({
+        orgId: row.orgId,
+        suggestionId: row.id,
+        eventType: 'suggestion.executed',
+        dedupeKey: remediationFeedbackDedupeKey({
+          status: 'executed',
+          scriptExecutionId: row.scriptExecutionId,
+          playbookExecutionId: row.playbookExecutionId,
+          toolExecutionId: row.toolExecutionId,
+        }),
+        outcome: 'executed',
+        actorUserId: auth.user.id,
+        metadata: {
+          route: 'remediation_suggestions.execute',
+          sourceType: row.sourceType,
+          sourceId: row.sourceId,
+          targetType: row.targetType,
+          scriptId: row.scriptId,
+          scriptExecutionId: row.scriptExecutionId,
+          elevationRequestId: row.elevationRequestId,
+          riskTier: row.riskTier,
+        },
+      });
+
+      // AI Suggested Fixes W1 — the attempt the outcome watcher follows.
+      // Rides this same context/transaction so it is atomic with the link:
+      // withDbTransaction opens a SAVEPOINT here, so a failed insert rolls
+      // back to the savepoint and this update + feedback emit still commit.
+      // No extra pool checkout, and no window where the link can commit
+      // while the recorder call itself throws as an uncaught 500.
+      const outcome = await recordExecutionOutcome({
+        suggestion: row,
+        deviceId,
+        scriptExecutionId,
+      });
+      return { row, outcome };
+    });
+
+    if (!phase3) {
       return c.json({ error: 'Failed to update suggestion' }, 500);
     }
-
-    await emitRemediationSuggestionFeedback({
-      orgId: updated.orgId,
-      suggestionId: updated.id,
-      eventType: 'suggestion.executed',
-      dedupeKey: remediationFeedbackDedupeKey({
-        status: 'executed',
-        scriptExecutionId: updated.scriptExecutionId,
-        playbookExecutionId: updated.playbookExecutionId,
-        toolExecutionId: updated.toolExecutionId,
-      }),
-      outcome: 'executed',
-      actorUserId: auth.user.id,
-      metadata: {
-        route: 'remediation_suggestions.execute',
-        sourceType: updated.sourceType,
-        sourceId: updated.sourceId,
-        targetType: updated.targetType,
-        scriptId: updated.scriptId,
-        scriptExecutionId: updated.scriptExecutionId,
-        elevationRequestId: updated.elevationRequestId,
-        riskTier: updated.riskTier,
-      },
-    });
+    const { row: updated, outcome } = phase3;
 
     writeRouteAudit(c, {
       orgId: updated.orgId,
@@ -957,9 +1007,79 @@ remediationSuggestionRoutes.post(
     });
 
     return c.json({
-      data: serializeSuggestion(updated),
+      data: serializeSuggestion(updated, outcome),
       execution: execution.admission,
     }, 201);
+  }
+);
+
+remediationSuggestionRoutes.post(
+  '/:id/vote',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.SCRIPTS_EXECUTE.resource, PERMISSIONS.SCRIPTS_EXECUTE.action),
+  zValidator('json', voteBodySchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const id = c.req.param('id') ?? '';
+    const { vote } = c.req.valid('json');
+    const conditions: SQL[] = [eq(remediationSuggestions.id, id)];
+    const orgCond = auth.orgCondition(remediationSuggestions.orgId);
+    if (orgCond) conditions.push(orgCond);
+    const [existing] = await db.select().from(remediationSuggestions).where(and(...conditions)).limit(1);
+    if (!existing) return c.json({ error: 'Suggestion not found' }, 404);
+    if (!(await siteAllowedForSuggestion(existing, perms))) {
+      return c.json({ error: 'Suggestion not found or access denied' }, 403);
+    }
+    const outcome = await recordOutcomeVote({ suggestionId: existing.id, orgId: existing.orgId, vote, userId: auth.user.id });
+    if (!outcome) return c.json({ error: 'No recorded fix attempt for this suggestion' }, 409);
+    writeRouteAudit(c, {
+      orgId: existing.orgId,
+      action: 'ml.remediation_suggestion.vote',
+      resourceType: 'remediation_suggestion',
+      resourceId: existing.id,
+      resourceName: existing.title,
+      details: { vote, outcomeState: outcome.state },
+    });
+    return c.json({ data: { outcome } });
+  }
+);
+
+remediationSuggestionRoutes.post(
+  '/:id/done',
+  requireScope('organization', 'partner', 'system'),
+  requirePermission(PERMISSIONS.SCRIPTS_EXECUTE.resource, PERMISSIONS.SCRIPTS_EXECUTE.action),
+  async (c) => {
+    const auth = c.get('auth');
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const id = c.req.param('id') ?? '';
+    const conditions: SQL[] = [eq(remediationSuggestions.id, id)];
+    const orgCond = auth.orgCondition(remediationSuggestions.orgId);
+    if (orgCond) conditions.push(orgCond);
+    const [existing] = await db.select().from(remediationSuggestions).where(and(...conditions)).limit(1);
+    if (!existing) return c.json({ error: 'Suggestion not found' }, 404);
+    if (!(await siteAllowedForSuggestion(existing, perms))) {
+      return c.json({ error: 'Suggestion not found or access denied' }, 403);
+    }
+    if (existing.targetType !== 'manual_steps') {
+      return c.json({ error: 'Only manual-step suggestions can be marked done' }, 400);
+    }
+    if (existing.status !== 'accepted' && existing.status !== 'edited') {
+      return c.json({ error: 'Suggestion must be accepted or edited before it can be marked done' }, 400);
+    }
+    const deviceId = singleTargetDeviceId(existing);
+    if (!deviceId) return c.json({ error: 'Marking manual steps done requires exactly one target device' }, 400);
+    const outcome = await createManualStepsOutcome({ suggestion: existing, deviceId });
+    if (!outcome) return c.json({ error: 'This suggestion was already marked done' }, 409);
+    writeRouteAudit(c, {
+      orgId: existing.orgId,
+      action: 'ml.remediation_suggestion.done',
+      resourceType: 'remediation_suggestion',
+      resourceId: existing.id,
+      resourceName: existing.title,
+      details: { sourceType: existing.sourceType, sourceId: existing.sourceId },
+    });
+    return c.json({ data: { outcome } }, 201);
   }
 );
 

@@ -6,6 +6,7 @@ import AutomationList, { type Automation } from './AutomationList';
 import AutomationRunHistory, {
   type AutomationRun as RunHistoryRun,
   type DeviceRunResult,
+  type DeviceCommandResult,
   type DeviceScriptResult,
 } from './AutomationRunHistory';
 import { fetchWithAuth, handleSessionExpired, useAuthStore } from '../../stores/auth';
@@ -185,6 +186,32 @@ function toDeviceScriptResults(raw: unknown): DeviceScriptResult[] | undefined {
   return parsed.length > 0 ? parsed : undefined;
 }
 
+/** Parse the per-device execute_command results a run produced (#3188). */
+export function toDeviceCommandResults(raw: unknown): DeviceCommandResult[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const parsed = raw
+    .map((entry): DeviceCommandResult | null => {
+      if (!isPlainRecord(entry)) return null;
+      if (typeof entry.actionIndex !== 'number') return null;
+      return {
+        actionIndex: entry.actionIndex,
+        status: asString(entry.status) ?? 'pending',
+        output: asString(entry.output),
+        outputTruncated: entry.outputTruncated === true,
+        error: asString(entry.error),
+        errorTruncated: entry.errorTruncated === true,
+        message: asString(entry.message),
+      };
+    })
+    .filter((entry): entry is DeviceCommandResult => entry !== null);
+  if (raw.length > 0 && parsed.length === 0) {
+    console.warn(
+      `[AutomationsPage] discarded all ${raw.length} command result(s) for a device — unexpected payload shape`,
+    );
+  }
+  return parsed.length > 0 ? parsed : undefined;
+}
+
 function toDeviceRunResult(raw: unknown): DeviceRunResult | null {
   if (!isPlainRecord(raw)) return null;
   const deviceId = asString(raw.deviceId);
@@ -204,6 +231,7 @@ function toDeviceRunResult(raw: unknown): DeviceRunResult | null {
     output: asString(raw.output),
     error: asString(raw.error),
     scriptResults: toDeviceScriptResults(raw.scriptResults),
+    commandResults: toDeviceCommandResults(raw.commandResults),
   };
 }
 
@@ -431,14 +459,23 @@ export default function AutomationsPage() {
         </a>
       </div>
 
-      <nav className="flex gap-1 border-b" aria-label={t('automationsPage.tabs.ariaLabel')}>
+      {/* #7148: this row overflowed by 33px at 390px, clipping "Event rules"
+          mid-word. It stayed a plain button row (not OverflowTabs) because an
+          existing test contract (AutomationsPage.tabs.test.tsx) — and the
+          AutomationList trigger-select reverse-mapping it drives — depends on
+          `role="button"` + `aria-current="page"` semantics that OverflowTabs'
+          ARIA tabs pattern (`role="tab"` + `aria-selected`) doesn't provide.
+          overflow-x-auto + shrink-0 + whitespace-nowrap fixes the clipping
+          without changing that contract. */}
+      <nav className="flex gap-1 overflow-x-auto border-b" aria-label={t('automationsPage.tabs.ariaLabel')}>
         {JOB_TABS.map((key) => (
           <button
             key={key}
             type="button"
             onClick={() => switchTab(key)}
             aria-current={tab === key ? 'page' : undefined}
-            className={`-mb-px border-b-2 px-3 py-2 text-sm ${tab === key ? 'border-primary font-medium text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
+            data-testid={`automations-tab-${key}`}
+            className={`-mb-px shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm ${tab === key ? 'border-primary font-medium text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'}`}
           >
             {t(/* i18n-dynamic */ `automationsPage.tabs.${key}`)}
           </button>

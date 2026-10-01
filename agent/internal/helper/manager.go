@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/breeze-rmm/agent/internal/config"
 	"github.com/breeze-rmm/agent/internal/logging"
 	"github.com/breeze-rmm/agent/internal/secmem"
 	"github.com/breeze-rmm/agent/internal/updater"
@@ -125,6 +126,18 @@ func WithRequireManifestSigningKeyID(require func() bool) Option {
 	return func(m *Manager) { m.requireManifestSigningKeyID = require }
 }
 
+// WithMachineInstallOwner declares whether this process owns the host's
+// machine-wide Breeze Assist installation (config.Config.IsInstalledAgent).
+// A Manager that is not the owner never installs, updates, uninstalls,
+// spawns, stops or reconfigures Assist and never touches its autostart entry
+// or per-session state: those are shared with the installed agent, and a
+// second agent process (foreground run, lab build, Quick Support client)
+// acting on its own server's policy would otherwise tear down the installed
+// agent's Assist. Omitting the option means "not the owner".
+func WithMachineInstallOwner(owner bool) Option {
+	return func(m *Manager) { m.managesMachineInstall = owner }
+}
+
 // WithBackupServerURL sets a provider for the configured backup control-plane
 // URL, threaded into the verified downloader's netpolicy.Policy so the backup
 // origin (not just serverURL's primary) is reachable for helper downloads
@@ -133,6 +146,24 @@ func WithRequireManifestSigningKeyID(require func() bool) Option {
 // it does not default to serverURL's value.
 func WithBackupServerURL(backupServerURL func() string) Option {
 	return func(m *Manager) { m.backupServerURL = backupServerURL }
+}
+
+// WithOnInstalled sets a callback that runs after a verified install puts a
+// new helper binary on disk, before any session is (re)spawned from it. It
+// runs again when an update whose new build would not start is rolled back,
+// before the previous build is respawned. It receives the binary's path.
+//
+// The agent wires it to the session broker's RefreshAllowedHashes, so the
+// binary's hash is allowlisted before its first IPC connection (#7043).
+// Without it, the broker's startup snapshot rejects a helper installed after
+// the agent started until the agent restarts. The same applies after every
+// helper update.
+//
+// It runs synchronously with the Manager's lock held, so it must not call
+// back into the Manager. It is not called when the download, the package
+// install or the post-install version check fails.
+func WithOnInstalled(fn func(binaryPath string)) Option {
+	return func(m *Manager) { m.onInstalled = fn }
 }
 
 // Manager handles helper binary lifecycle: install/update plus per-session runtime state.
@@ -165,6 +196,11 @@ type Manager struct {
 	// two separate isOurProcess()+stopByPID() opens.
 	stopIfOursFunc func(pid int, binaryPath string) (bool, error)
 
+	// keptBackup is the pre-update backup a failed rollback kept because it
+	// is the only good copy of the helper (#7357); the zero value means none.
+	// Mirrored on disk by keptBackupRecordPath. Guarded by mu.
+	keptBackup helperBackup
+
 	// downloadFunc fetches and INTEGRITY-VERIFIES the helper package for the
 	// given version, returning the path to a verified temp file. In production
 	// this is the updater-backed verified downloader (defaultHelperDownloader)
@@ -188,6 +224,9 @@ type Manager struct {
 
 	requireManifestSigningKeyID func() bool
 
+	// onInstalled runs after a successful, verified install. See WithOnInstalled.
+	onInstalled func(binaryPath string)
+
 	// now is the clock for the abandon cooldown; nil means time.Now (tests inject).
 	now func() time.Time
 
@@ -201,11 +240,22 @@ type Manager struct {
 
 	legacyAutoStartCleaned bool
 
+	// managesMachineInstall: this process owns the machine-wide Assist
+	// installation. See WithMachineInstallOwner. Immutable after New.
+	managesMachineInstall bool
+	// nonOwnerNoticeLogged: the "not the owner, leaving Assist alone" line has
+	// been logged once for this process. Guarded by mu.
+	nonOwnerNoticeLogged bool
+
 	// notInstalledWarned: the "enabled but not installed, waiting for the
 	// server" warning has fired for the current not-installed episode. Reset
 	// when the binary appears or the policy turns off, so the log carries one
 	// line per transition instead of one per heartbeat (#6872).
 	notInstalledWarned bool
+
+	// installIssue: the install-issue code (install_retry.go) the last Apply
+	// observed; "" when none. Reported in the heartbeat (#6925). Guarded by mu.
+	installIssue string
 }
 
 // New creates a new helper Manager. serverURL is a provider (func() string) so
@@ -262,24 +312,22 @@ func defaultBinaryPath() string {
 	}
 }
 
+// ManagesMachineInstall reports whether this Manager owns the machine-wide
+// Assist installation (see WithMachineInstallOwner).
+func (m *Manager) ManagesMachineInstall() bool {
+	return m.managesMachineInstall
+}
+
 // DefaultBinaryPath returns the platform-default Breeze Assist binary path.
 func DefaultBinaryPath() string {
 	return defaultBinaryPath()
 }
 
+// defaultBaseDir is where Assist's per-session state and legacy global config
+// live: the agent's own config dir, resolved by the same function the agent
+// uses for agent.yaml, so the two can never disagree.
 func defaultBaseDir() string {
-	switch runtime.GOOS {
-	case "darwin":
-		return "/Library/Application Support/Breeze"
-	case "windows":
-		pd := os.Getenv("ProgramData")
-		if pd == "" {
-			pd = `C:\ProgramData`
-		}
-		return filepath.Join(pd, "Breeze")
-	default:
-		return "/etc/breeze"
-	}
+	return config.ConfigDir()
 }
 
 func defaultSpawnFunc(sessionKey, binaryPath string, args ...string) (int, error) {
@@ -306,6 +354,20 @@ func (m *Manager) Apply(settings *Settings) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Only the installed agent manages the machine-wide Assist install. Every
+	// step below (legacy-name cleanup, per-session migration, the HKLM Run
+	// sweep, install/update, spawn/stop, uninstall) acts on state shared with
+	// that agent, driven by THIS process's server policy. A second agent
+	// process on the same host must not act on it at all.
+	if !m.managesMachineInstall {
+		if !m.nonOwnerNoticeLogged {
+			log.Info("leaving Breeze Assist to the installed agent: this process is not the installed agent service",
+				"policyEnabled", settings.Enabled)
+			m.nonOwnerNoticeLogged = true
+		}
+		return
+	}
 
 	// Snapshot install state BEFORE migrateFromLegacyName — on Linux (and
 	// old-name darwin/windows) it can delete the binary, and we must still
@@ -351,6 +413,7 @@ func (m *Manager) Apply(settings *Settings) {
 		// abandoned (pending cleared) and we fall through to the waiting branch.
 		m.abandonIfExhaustedLocked()
 		if m.pendingHelperVersion == "" {
+			m.installIssue = m.notInstalledIssueLocked()
 			if !m.notInstalledWarned {
 				log.Warn(m.notInstalledReasonLocked())
 				m.notInstalledWarned = true
@@ -362,6 +425,10 @@ func (m *Manager) Apply(settings *Settings) {
 			}
 			return
 		}
+		// An offered version is being installed: not stuck, whatever happens
+		// next (a failure is retried; exhausting the budget abandons it and a
+		// later tick reports install_abandoned).
+		m.installIssue = ""
 		if err := m.downloadAndInstall(m.pendingHelperVersion); err != nil {
 			m.recordInstallFailureLocked(m.pendingHelperVersion)
 			// downloadAndInstall wraps the verified downloader's error, which for
@@ -379,6 +446,7 @@ func (m *Manager) Apply(settings *Settings) {
 	}
 	if !settings.Enabled || m.isInstalled() {
 		m.notInstalledWarned = false
+		m.installIssue = ""
 	}
 
 	activeSessions := m.sessionEnumerator.ActiveSessions()
@@ -781,7 +849,7 @@ func (m *Manager) downloadAndInstall(version string) error {
 	}
 	defer os.Remove(verifiedPath)
 
-	if err := installPackageFunc(verifiedPath, m.binaryPath); err != nil {
+	if err := installPackageFunc(verifiedPath, m.binaryPath, version); err != nil {
 		return fmt.Errorf("install helper package: %w", err)
 	}
 
@@ -809,7 +877,18 @@ func (m *Manager) downloadAndInstall(version string) error {
 	}
 
 	log.Info("helper installed", "path", m.binaryPath, "version", version)
+	// The binary at an allowlisted path just changed. Let the session broker
+	// re-hash it before any session spawns the new build (#7043).
+	m.notifyInstalledLocked()
 	return nil
+}
+
+// notifyInstalledLocked runs the WithOnInstalled callback, if any. Must be
+// called with m.mu held.
+func (m *Manager) notifyInstalledLocked() {
+	if m.onInstalled != nil {
+		m.onInstalled(m.binaryPath)
+	}
 }
 
 // readBinaryVersion reads the installed helper binary's stamped version.
@@ -908,6 +987,10 @@ func (m *Manager) applyPendingUpdate() {
 		return
 	}
 
+	// A kept backup (#7357) is deliberately not released here: a build that
+	// installed but would not start, with a rollback that could not replace
+	// it, is at the target version too. Releasing would expose the only good
+	// copy to the next update's backup.
 	if installed := m.installedVersionLocked(); installed == m.pendingHelperVersion || helperVersionsMatch(installed, m.pendingHelperVersion) {
 		log.Info("helper already at target version, clearing pending update", "version", installed)
 		m.pendingHelperVersion = ""
@@ -923,6 +1006,12 @@ func (m *Manager) applyPendingUpdate() {
 		log.Debug("helper update deferred, chat active", "targetVersion", m.pendingHelperVersion)
 		return
 	}
+	// The install stops every helper, including ones in sessions the
+	// console-only enumerator does not track (RDP), so the chat gate has to
+	// cover them too (#7113).
+	if m.untrackedChatActiveLocked() {
+		return
+	}
 	lease, acquired := updater.TryBeginProcessMutation("helper-update")
 	if !acquired {
 		log.Debug("helper update deferred, another component mutation is active", "targetVersion", m.pendingHelperVersion)
@@ -933,20 +1022,46 @@ func (m *Manager) applyPendingUpdate() {
 	log.Info("helper is idle, applying update", "targetVersion", m.pendingHelperVersion)
 
 	var stopped []*sessionState
+	tracked := make(map[string]bool, len(m.sessions))
 	for _, state := range m.sessions {
 		state.refreshPID()
 		m.stopSessionWatcher(state)
+		// Listed before the stop so a session whose stop fails gets its
+		// watcher back below.
+		stopped = append(stopped, state)
+		tracked[state.key] = true
 		if err := m.ensureStoppedSession(state); err != nil {
-			log.Error("failed to stop helper session for update", "session", state.key, "error", err.Error())
+			m.abortUpdateBeforeInstallLocked(stopped, fmt.Errorf("stop helper in session %s: %w", state.key, err))
 			return
 		}
-		stopped = append(stopped, state)
+	}
+	// A helper in a session the enumerator does not track (RDP, or one started
+	// outside the agent) still maps breeze-helper.exe. Left running, msiexec
+	// meets a file in use: it fails (1603) or defers the replacement to a
+	// reboot (#7113).
+	if _, busy, err := m.stopHelperInstancesLocked(tracked); err != nil {
+		m.abortUpdateBeforeInstallLocked(stopped, fmt.Errorf("stop helper in untracked session: %w", err))
+		return
+	} else if len(busy) > 0 {
+		// A chat started after the gate above. Not a failed attempt: retry on
+		// a later heartbeat, as the gate would have.
+		log.Info("helper update deferred, chat started in an untracked session", "pids", busy,
+			"targetVersion", m.pendingHelperVersion)
+		m.restartSessionsLocked(stopped)
+		return
 	}
 
-	backupPath := m.binaryPath + ".backup"
-	if err := copyFile(m.binaryPath, backupPath); err != nil {
-		log.Warn("failed to backup helper binary", "error", err.Error())
-	}
+	// The rollback below restores only the file. On Windows, an msiexec that
+	// succeeded has already registered the product at the target, so a
+	// restored exe sits under a newer registration. That is deliberate (a
+	// working old helper beats a new one that will not start), and the next
+	// retry recovers from it: installMSI forces a file reinstall when the
+	// product is registered at the target (#6868).
+	//
+	// After a rollback that kept the backup, the backup is the only good copy
+	// and this attempt restores it on failure instead of backing up the
+	// current (broken) binary (#7357).
+	backup := m.backupForUpdateLocked()
 
 	if err := m.downloadAndInstall(m.pendingHelperVersion); err != nil {
 		m.recordInstallFailureLocked(m.pendingHelperVersion)
@@ -954,32 +1069,37 @@ func (m *Manager) applyPendingUpdate() {
 		key, value := updater.SafeDownloadErrorFields(err)
 		log.Error("failed to install helper update", key, value,
 			"targetVersion", m.pendingHelperVersion, "failures", m.updateFailures)
-		if restoreErr := restoreBackup(backupPath, m.binaryPath); restoreErr != nil {
-			log.Error("failed to rollback helper", "error", restoreErr.Error())
-		}
-		for _, state := range stopped {
-			state.watcherGaveUp = false // intentional stop, not a crash
-			if err := m.ensureRunningSession(state); err != nil {
-				log.Error("failed to restart helper after rollback", "session", state.key, "error", err.Error())
-			} else {
-				m.startSessionWatcher(state)
-			}
-		}
+		m.rollbackBinaryLocked(backup)
+		m.restartSessionsLocked(stopped)
 		return
 	}
 
-	for _, state := range stopped {
+	for i, state := range stopped {
 		state.pid = 0
 		state.watcherGaveUp = false // new binary — give it a fresh chance
 		if err := m.ensureRunningSession(state); err != nil {
-			log.Error("failed to start updated helper", "session", state.key, "error", err.Error())
-			if restoreErr := restoreBackup(backupPath, m.binaryPath); restoreErr != nil {
-				log.Error("failed to rollback helper", "error", restoreErr.Error())
+			// A new build that will not start is a failed attempt, the same as
+			// a failed msiexec, so it counts toward the retry cap (#7049).
+			m.recordInstallFailureLocked(m.pendingHelperVersion)
+			log.Error("failed to start updated helper", "session", state.key, "error", err.Error(),
+				"targetVersion", m.pendingHelperVersion, "failures", m.updateFailures)
+			// The sessions started before this one run the new exe, and Windows
+			// refuses to replace a mapped image ("Access is denied"). Stop them,
+			// and this one in case its spawn half-succeeded, before restoring
+			// (#6869).
+			for _, started := range stopped[:i+1] {
+				m.stopSessionWatcher(started)
+				if err := m.ensureStoppedSession(started); err != nil {
+					log.Warn("failed to stop updated helper before rollback", "session", started.key, "error", err.Error())
+				}
+				started.pid = 0
 			}
-			for _, restartState := range stopped {
-				_ = m.ensureRunningSession(restartState)
-				m.startSessionWatcher(restartState)
-			}
+			m.rollbackBinaryLocked(backup)
+			// The install already told the broker about the new build, and
+			// the rollback just put the previous one back. Refresh again
+			// before respawning it, or the broker rejects it (#7043).
+			m.notifyInstalledLocked()
+			m.restartSessionsLocked(stopped)
 			return
 		}
 		m.startSessionWatcher(state)
@@ -988,7 +1108,22 @@ func (m *Manager) applyPendingUpdate() {
 	log.Info("helper updated successfully", "requestedVersion", m.pendingHelperVersion)
 	m.pendingHelperVersion = ""
 	m.clearInstallFailuresLocked()
-	_ = os.Remove(backupPath)
+	// The new build installed and started: it supersedes any kept copy.
+	_ = os.Remove(m.backupPath())
+	m.releaseKeptBackupLocked()
+}
+
+// abortUpdateBeforeInstallLocked gives up on this update attempt before the
+// installer ran, because a helper holding the binary could not be stopped. It
+// is a failed attempt and counts toward the retry cap (#7113): uncounted, a
+// stop that keeps failing is retried on every heartbeat for good. The sessions
+// already stopped get their helper and watcher back. Must be called with m.mu
+// held.
+func (m *Manager) abortUpdateBeforeInstallLocked(stopped []*sessionState, err error) {
+	m.recordInstallFailureLocked(m.pendingHelperVersion)
+	log.Error("failed to stop breeze assist for update", "error", err.Error(),
+		"targetVersion", m.pendingHelperVersion, "failures", m.updateFailures)
+	m.restartSessionsLocked(stopped)
 }
 
 // Shutdown stops all session watchers gracefully. Unlike the Apply/update
@@ -1055,16 +1190,4 @@ func (m *Manager) stopSessionWatcherBounded(state *sessionState, d time.Duration
 		log.Warn("session watcher shutdown timed out, abandoning", "session", state.key)
 	}
 	m.mu.Lock()
-}
-
-func copyFile(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dst, data, 0755)
-}
-
-func restoreBackup(backupPath, targetPath string) error {
-	return os.Rename(backupPath, targetPath)
 }

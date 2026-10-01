@@ -83,7 +83,7 @@ describe('navSections structure (#1321, #1324)', () => {
     expect(names).toEqual(['Device Backup', 'Cloud Backup', 'Disaster Recovery']);
   });
 
-  it('keeps Network Monitor out of Security (lives under Fleet Management)', () => {
+  it('keeps Network out of Security (lives under Fleet Management)', () => {
     expect(hrefsOf('security')).not.toContain('/monitoring');
     // Security still leads with its own Security item.
     expect(section('security').items[0].href).toBe('/security');
@@ -106,8 +106,12 @@ describe('navSections structure (#1321, #1324)', () => {
     expect(hrefsOf('service-desk')).toEqual(['/tickets', '/timesheet']);
     expect(hrefsOf('fleet-management')).toEqual([
       '/devices/groups',
+      // Parked devices awaiting assignment (full partner admins only).
+      '/devices/unassigned',
       '/configuration-policies',
       '/software',
+      '/software-inventory',
+      '/software-policies',
       '/monitoring',
       '/discovery',
       '/onedrive',
@@ -176,11 +180,11 @@ describe('navSections structure (#1321, #1324)', () => {
     expect(jobs.requiredPermission).toEqual({ resource: 'automations', action: 'read' });
   });
 
-  it('labels /monitoring as Network Monitor again — monitor config moved under Alerts (2026-09-13)', () => {
+  it('labels /monitoring as Network — checks are authored under Alerts → Monitors (W05e)', () => {
     const item = navSections
       .find((s) => s.id === 'fleet-management')!
       .items.find((i) => i.href === '/monitoring')!;
-    expect(item.name).toBe('Network Monitor');
+    expect(item.name).toBe('Network');
     expect(item.labelKey).toBe('nav.networkMonitor');
   });
 
@@ -219,10 +223,11 @@ describe('navSections structure (#1321, #1324)', () => {
 });
 
 describe('go-to keyboard chords (g then key)', () => {
-  it('every chord targets a top-level nav item and reuses its label key', () => {
+  it('every chord targets a sidebar nav item and reuses its label key', () => {
+    const allNav = [...topLevelNav, ...navSections.flatMap((section) => section.items)];
     for (const shortcut of GO_TO_SHORTCUTS) {
-      const item = topLevelNav.find((nav) => nav.href === shortcut.href);
-      expect(item, `no top-level nav item for g ${shortcut.key} → ${shortcut.href}`).toBeDefined();
+      const item = allNav.find((nav) => nav.href === shortcut.href);
+      expect(item, `no sidebar nav item for g ${shortcut.key} → ${shortcut.href}`).toBeDefined();
       expect(shortcut.labelKey).toBe(item!.labelKey);
     }
   });
@@ -346,22 +351,41 @@ describe('sidebar i18n seed', () => {
     await i18n.changeLanguage('pt-BR');
     render(<Sidebar currentPath="/monitoring" />);
 
-    const nestedLink = await screen.findByText('Monitoramento de Rede');
+    const nestedLink = await screen.findByText('Rede');
     expect(nestedLink.closest('a')).toHaveAttribute('href', '/monitoring');
-    expect(screen.queryByText('Network Monitor')).not.toBeInTheDocument();
+    expect(screen.queryByText('Network')).not.toBeInTheDocument();
   });
 
-  it.each(['/software-inventory', '/software-policies'])(
-    'highlights the single Software item for alias path %s',
+  it('exposes Software, Software Inventory and Software Policies as separate nav links (#7123)', async () => {
+    const { container } = render(<Sidebar currentPath="/" />);
+    await waitFor(() => {
+      for (const href of ['/software', '/software-inventory', '/software-policies']) {
+        expect(container.querySelector(`a[href="${href}"]`), href).not.toBeNull();
+      }
+    });
+  });
+
+  it('gates and labels the new software items like Software (devices:read, own i18n keys)', () => {
+    const items = section('fleet-management').items;
+    for (const [href, labelKey] of [
+      ['/software-inventory', 'nav.softwareInventory'],
+      ['/software-policies', 'nav.softwarePolicies'],
+    ]) {
+      const item = items.find((i) => i.href === href);
+      expect(item?.labelKey, href).toBe(labelKey);
+      expect(item?.requiredPermission, href).toEqual({ resource: 'devices', action: 'read' });
+    }
+  });
+
+  it.each(['/software', '/software-inventory', '/software-policies'])(
+    'highlights only the matching Software item for path %s',
     async (path) => {
       const { container } = render(<Sidebar currentPath={path} />);
-      const link = await waitFor(() => {
-        const a = container.querySelector('a[href="/software"]');
-        expect(a).not.toBeNull();
-        return a as HTMLAnchorElement;
+      await waitFor(() => {
+        expect(container.querySelector(`a[href="${path}"]`)).not.toBeNull();
       });
-      expect(link.className).toContain('bg-primary');
-      expect(container.querySelector(`a[href="${path}"]`)).toBeNull();
+      const active = Array.from(container.querySelectorAll('a.bg-primary')).map((a) => a.getAttribute('href'));
+      expect(active).toEqual([path]);
     },
   );
 

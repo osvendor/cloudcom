@@ -10,6 +10,13 @@ import { isPgUniqueViolation } from '../utils/pgErrors';
 import { authMiddleware, requireMfa, requirePermission, requireScope } from '../middleware/auth';
 import { sendCommandToAgent, isAgentConnected } from './agentWs';
 import { checkRemoteAccess } from '../services/remoteAccessPolicy';
+import { checkVncConsentGate } from './remote/vncConsentGate';
+import {
+  CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE_CODE,
+  CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE_MESSAGE,
+  REMOTE_PROMPT_POLICY_UNAVAILABLE_CODE,
+  REMOTE_PROMPT_POLICY_UNAVAILABLE_MESSAGE,
+} from './remote/consentGate';
 import { HTTP_TUNNEL_MAX_SESSION_HOURS } from './tunnelHttp';
 import { createWsTicket, createVncConnectCode, consumeVncConnectCode, getViewerAccessTokenExpirySeconds, HTTP_TICKET_TTL_MS } from '../services/remoteSessionAuth';
 import {
@@ -36,6 +43,7 @@ import {
   toTerminalSessionRow,
   type TerminalSessionRow,
 } from '../services/remoteDesktopTerminalIntent';
+import { markRequestAuditWritten } from '../services/auditRequestTracking';
 
 export const tunnelRoutes = new Hono();
 
@@ -60,6 +68,20 @@ async function authorizeTunnelContinuation(sessionId: string, userId: string) {
 }
 
 function liveAuthorizationResponse(c: Context, denial: { status: 403 | 404 | 429 | 503; reason: string }) {
+  // The live-authority check refuses VNC tunnels on consent-mode devices;
+  // answer with the same technician-facing codes as POST /tunnels.
+  if (denial.reason === 'consent_required') {
+    return c.json({
+      error: CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE_MESSAGE,
+      code: CONSENT_REQUIRED_TRANSPORT_UNAVAILABLE_CODE,
+    }, 409);
+  }
+  if (denial.reason === 'prompt_policy_unavailable') {
+    return c.json({
+      error: REMOTE_PROMPT_POLICY_UNAVAILABLE_MESSAGE,
+      code: REMOTE_PROMPT_POLICY_UNAVAILABLE_CODE,
+    }, 503);
+  }
   return c.json({ error: 'Remote session access denied', reason: denial.reason }, denial.status);
 }
 
@@ -393,6 +415,7 @@ async function logTunnelAudit(
           ipAddress,
           result: 'success',
         });
+        markRequestAuditWritten();
       })
     );
   } catch (error) {
@@ -438,13 +461,19 @@ tunnelRoutes.post(
     if (!policyCheck.allowed) {
       return c.json({
         error: policyCheck.reason,
-        code: 'REMOTE_ACCESS_POLICY_DENIED',
+        // A parked device carries its own code (DEVICE_PENDING_ASSIGNMENT).
+        code: policyCheck.code ?? 'REMOTE_ACCESS_POLICY_DENIED',
         capability: tunnelCapability,
         policyName: policyCheck.policyName,
       }, 403);
     }
 
     const isVNC = body.type === 'vnc';
+    // VNC has no end-user consent prompt: refuse it on a consent-mode device.
+    if (isVNC) {
+      const consentGate = await checkVncConsentGate(device.id);
+      if (!consentGate.ok) return c.json(consentGate.body, consentGate.status);
+    }
     const targetHost = isVNC ? '127.0.0.1' : body.targetHost;
     const targetPort = isVNC ? 5900 : body.targetPort;
 
@@ -579,7 +608,8 @@ tunnelRoutes.post(
     if (!policyCheck.allowed) {
       return c.json({
         error: policyCheck.reason,
-        code: 'REMOTE_ACCESS_POLICY_DENIED',
+        // A parked device carries its own code (DEVICE_PENDING_ASSIGNMENT).
+        code: policyCheck.code ?? 'REMOTE_ACCESS_POLICY_DENIED',
         capability: 'proxy',
         policyName: policyCheck.policyName,
       }, 403);
@@ -1641,7 +1671,10 @@ vncViewerRoutes.post('/upgrade-to-webrtc', async (c) => {
 
   const policyCheck = await checkRemoteAccess(bound.deviceId, 'webrtcDesktop');
   if (!policyCheck.allowed) {
-    return c.json({ error: policyCheck.reason ?? 'WebRTC desktop access is disabled by policy' }, 403);
+    return c.json({
+      error: policyCheck.reason ?? 'WebRTC desktop access is disabled by policy',
+      ...(policyCheck.code ? { code: policyCheck.code } : {}),
+    }, 403);
   }
 
   // Reuse the same pattern as /sessions: terminate stragglers first, insert
@@ -1768,8 +1801,16 @@ vncViewerRoutes.post('/downgrade-to-vnc', async (c) => {
 
   const policyCheck = await checkRemoteAccess(bound.deviceId, 'vncRelay');
   if (!policyCheck.allowed) {
-    return c.json({ error: policyCheck.reason ?? 'VNC relay is disabled by policy' }, 403);
+    return c.json({
+      error: policyCheck.reason ?? 'VNC relay is disabled by policy',
+      ...(policyCheck.code ? { code: policyCheck.code } : {}),
+    }, 403);
   }
+
+  // Falling back from the desktop viewer to VNC would drop the consent prompt:
+  // refuse it on a consent-mode device.
+  const consentGate = await checkVncConsentGate(bound.deviceId);
+  if (!consentGate.ok) return c.json(consentGate.body, consentGate.status);
 
   // Insert the tunnel session row, then kick the agent off.
   const tunnel = await withSystemDbAccessContext(() => createRemoteSession('tunnel', {

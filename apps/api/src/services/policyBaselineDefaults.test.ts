@@ -1,8 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { CONFIG_FEATURE_TYPES } from './configurationPolicy';
+import { CONFIG_FEATURE_TYPES, RETIRED_CONFIG_FEATURE_TYPES } from './configFeatureTypes';
 import { getPolicyBaselineDefaults, getRemoteAccessBaseline, getPamBaseline } from './policyBaselineDefaults';
 import { PAM_DEFAULTS } from '../routes/agents/pamSettings';
 import { configFeatureTypeEnum } from '../db/schema/configurationPolicies';
+import { TIME_SYNC_DEFAULTS } from '@breeze/shared';
 
 describe('policyBaselineDefaults', () => {
   it('has exactly one entry per ConfigFeatureType', () => {
@@ -41,6 +42,21 @@ describe('policyBaselineDefaults', () => {
 
   it('getPamBaseline returns UAC off', () => {
     expect(getPamBaseline()).toEqual({ uacInterceptionEnabled: false });
+  });
+
+  it('shows disabled time management as the baseline without sharing mutable defaults', () => {
+    const first = getPolicyBaselineDefaults().find(
+      (x) => x.featureType === 'time_sync',
+    )!;
+    expect(first).toMatchObject({
+      applied: false,
+      inlineSettings: TIME_SYNC_DEFAULTS,
+    });
+    (first.inlineSettings!.ntpServers as string[]).push('pool.ntp.org');
+    expect(
+      getPolicyBaselineDefaults().find((x) => x.featureType === 'time_sync')!
+        .inlineSettings,
+    ).toEqual(TIME_SYNC_DEFAULTS);
   });
 });
 
@@ -84,8 +100,16 @@ describe('getRemoteAccessBaseline IS_HOSTED clipboard branching', () => {
   });
 });
 
-describe('CONFIG_FEATURE_TYPES parity with DB enum', () => {
-  it('matches configFeatureTypeEnum.enumValues exactly', () => {
-    expect([...CONFIG_FEATURE_TYPES].sort()).toEqual([...configFeatureTypeEnum.enumValues].sort());
+describe('CONFIG_FEATURE_TYPES parity with DB enum (W05d: canonical ∪ retired)', () => {
+  it('canonical plus retired matches configFeatureTypeEnum.enumValues exactly', () => {
+    expect([...CONFIG_FEATURE_TYPES, ...RETIRED_CONFIG_FEATURE_TYPES].sort())
+      .toEqual([...configFeatureTypeEnum.enumValues].sort());
+  });
+  it('the two lists are disjoint and retired types have no baseline entry', () => {
+    const baseline = getPolicyBaselineDefaults().map((e) => e.featureType);
+    for (const t of RETIRED_CONFIG_FEATURE_TYPES) {
+      expect(CONFIG_FEATURE_TYPES as readonly string[]).not.toContain(t);
+      expect(baseline).not.toContain(t);
+    }
   });
 });

@@ -10,6 +10,7 @@ import { keysetEnvelope, keysetParamSchema, keysetWhereCondition, readKeysetArgs
 import { db } from '../db';
 import { canManagePartnerWidePolicies } from './partnerWideAccess';
 import { alerts, devices, notificationChannels } from '../db/schema';
+import { selectNotificationChannelsWithConfig, writeNotificationChannelConfig } from './notificationChannelConfig';
 import { eq, and, desc, sql, inArray, ne, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
@@ -24,7 +25,7 @@ import {
   buildResolveAlertCas,
   buildSuppressAlertCas,
 } from './alertService';
-import { deviceIdSiteDenied, resolveSiteAllowedDeviceIds } from './aiToolsSiteScope';
+import { deviceIdSiteDenied, resolveSiteAllowedDeviceIds, siteAllowlistOf } from './aiToolsSiteScope';
 import { emitAlertStateFeedback } from './mlFeedbackEmitters';
 import {
   encryptNotificationChannelConfig,
@@ -32,7 +33,7 @@ import {
   isMaskedIntegrationSecret,
 } from './notificationChannelSecrets';
 import { webhookOriginChangeWouldRetainAuthorization } from './credentialOriginBinding';
-import { validateNotificationChannelConfig } from '../routes/alerts/helpers';
+import { alertSiteScopeByDeviceIds, validateNotificationChannelConfig } from '../routes/alerts/helpers';
 import { sanitizeThrownToolError } from './aiToolErrors';
 import { resolveWritableToolOrgId } from './aiToolWriteOrg';
 
@@ -85,6 +86,20 @@ export async function findAlertWithAccess(alertId: string, auth: AuthContext) {
   // all, so this check cannot be folded into the site one.
   if (auth.allowedDeviceIds
     && (!alert.deviceId || !auth.allowedDeviceIds.includes(alert.deviceId))) return null;
+  // Helper device axis: a Helper-authenticated caller (routes/helper/*, the
+  // tray app) is pinned to its OWN device the same way an exact-device AI run
+  // is pinned to `allowedDeviceIds` above. The site-axis check below is not
+  // enough on its own — a Helper session carries no `allowedSiteIds`
+  // restriction, so without this it could read (Tier 1 `get`) any org-wide or
+  // sibling-device alert by UUID.
+  if (auth.helperDeviceId
+    && (!alert.deviceId || alert.deviceId !== auth.helperDeviceId)) return null;
+  // A topology policy alert is owned by its topology site (M3-D6): the site
+  // axis follows that site, never the origin device's current one.
+  if (alert.topologySiteId) {
+    const allowedSites = siteAllowlistOf(auth);
+    return allowedSites !== undefined && !allowedSites.includes(alert.topologySiteId) ? null : alert;
+  }
   if (alert.deviceId && (await deviceIdSiteDenied(auth, alert.deviceId))) return null;
   return alert;
 }
@@ -103,6 +118,7 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceId'],
     domain: 'monitoring',
     searchHint: 'alerts: list, get, acknowledge, resolve, suppress',
+    alwaysLoad: true,
     definition: {
       name: 'manage_alerts',
       description: 'Query, view, acknowledge, resolve, or suppress alerts. Use action "list" to search alerts, "get" for details, "acknowledge" to mark as seen, "resolve" to close, or "suppress" to temporarily silence an alert.',
@@ -157,14 +173,22 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
         // `allowedDeviceIds` and no site axis at all (#6096).
         const listOrgId = getOrgId(auth);
         if ((auth.allowedSiteIds || auth.allowedDeviceIds) && listOrgId) {
-          const allowed = await resolveSiteAllowedDeviceIds(listOrgId, auth);
-          if (!allowed || allowed.length === 0) {
+          const allowed = (await resolveSiteAllowedDeviceIds(listOrgId, auth)) ?? [];
+          const allowedSites = siteAllowlistOf(auth);
+          // Empty only when NOTHING is in scope: a site with no devices can
+          // still own topology policy alerts (M3-D6).
+          if (allowed.length === 0 && (auth.allowedDeviceIds || !allowedSites || allowedSites.length === 0)) {
             return emptyKeysetPage();
           }
           if (input.deviceId && !allowed.includes(input.deviceId as string)) {
             return emptyKeysetPage();
           }
-          conditions.push(inArray(alerts.deviceId, allowed));
+          // A topology policy alert follows its owning topology site (M3-D6),
+          // not the origin device's current site; the device axis still binds a
+          // device-bound run.
+          conditions.push(alertSiteScopeByDeviceIds({
+            allowedSiteIds: allowedSites, allowedDeviceIds: allowed, deviceAxis: auth.allowedDeviceIds !== undefined,
+          })!);
         }
 
         // `total` reflects the whole filtered set, so it must be computed
@@ -651,13 +675,18 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
         }
 
         try {
-          const [channel] = await db.insert(notificationChannels).values({
-            orgId,
-            name: input.name as string,
-            type: channelType,
-            config: encryptNotificationChannelConfig(channelType, input.config) as Record<string, unknown>,
-            enabled: input.enabled !== false,
-          }).returning();
+          // Channel row and its config row (#6379) commit together.
+          const channel = await db.transaction(async (tx) => {
+            const [row] = await tx.insert(notificationChannels).values({
+              orgId,
+              name: input.name as string,
+              type: channelType,
+              enabled: input.enabled !== false,
+            }).returning();
+            if (!row) return null;
+            await writeNotificationChannelConfig(row.id, encryptNotificationChannelConfig(channelType, input.config), tx);
+            return row;
+          });
           if (!channel) return JSON.stringify({ error: 'Failed to create notification channel' });
 
           return JSON.stringify({ success: true, channelId: channel.id, name: channel.name, type: channel.type });
@@ -681,7 +710,7 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
           );
         }
 
-        const [existing] = await db.select().from(notificationChannels).where(and(...conditions)).limit(1);
+        const [existing] = await selectNotificationChannelsWithConfig(and(...conditions), { limit: 1 });
         if (!existing) return JSON.stringify({ error: 'Notification channel not found or access denied' });
 
         // Partner-wide channels are administrable only with the partner-wide
@@ -700,8 +729,16 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
         }
 
         const updates: Record<string, unknown> = { updatedAt: new Date() };
+        let nextConfig: unknown;
         if (typeof input.name === 'string') updates.name = input.name;
         if (input.config !== undefined && input.config !== null) {
+          // Merging needs the stored config (masked secrets resolve against
+          // it); a missing notification_channel_configs row (#6379) would
+          // silently drop them.
+          if (existing.config === null || existing.config === undefined) {
+            console.error(`[aiToolsAlerts] Channel ${existing.id} has no config row (notification_channel_configs) — config update refused`);
+            return JSON.stringify({ error: 'Notification channel has no stored configuration' });
+          }
           if (
             existing.type === 'webhook'
             && webhookOriginChangeWouldRetainAuthorization(
@@ -723,11 +760,14 @@ export function registerAlertTools(aiTools: Map<string, AiTool>): void {
           if (configErrors.length > 0) {
             return JSON.stringify({ error: `Invalid ${existing.type} channel configuration`, details: configErrors });
           }
-          updates.config = mergedEncrypted;
+          nextConfig = mergedEncrypted;
         }
         if (typeof input.enabled === 'boolean') updates.enabled = input.enabled;
 
-        await db.update(notificationChannels).set(updates).where(eq(notificationChannels.id, existing.id));
+        await db.transaction(async (tx) => {
+          await tx.update(notificationChannels).set(updates).where(eq(notificationChannels.id, existing.id));
+          if (nextConfig !== undefined) await writeNotificationChannelConfig(existing.id, nextConfig, tx);
+        });
         return JSON.stringify({ success: true, message: `Channel "${existing.name}" updated` });
       }
 

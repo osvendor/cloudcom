@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 import { Readable } from 'node:stream';
-import { bmrRoutes, bmrPublicRoutes } from './bmr';
+import { bmrRoutes, bmrPublicRoutes, enforcePublicRateLimit } from './bmr';
 
 const ORG_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 const DEVICE_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
@@ -1365,6 +1365,37 @@ describe('bmr routes', () => {
       expect.objectContaining({ id: TOKEN_ID }),
       'snapshots/snap-ext-001/manifest.json'
     );
+    expect(res.headers.get('Content-Length')).toBe('2');
+  });
+
+  // #6489: a local-provider `.gz` object is gunzipped server-side, so its
+  // decompressed length isn't known up front — the service returns
+  // `contentLength: null`. The route must omit the header rather than send
+  // a lying/placeholder one (e.g. `Content-Length: null`).
+  it('omits Content-Length for a decompressed local .gz recovery download whose length is not known up front', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: TOKEN_ID,
+      snapshotId: SNAPSHOT_ID,
+      status: 'authenticated',
+      authenticatedAt: new Date('2026-03-31T13:00:00.000Z'),
+      expiresAt: new Date('2026-04-01T00:00:00.000Z'),
+    }]));
+    getAuthenticatedRecoveryDownloadTargetMock.mockResolvedValueOnce({
+      unavailable: false,
+      type: 'stream',
+      contentType: 'application/octet-stream',
+      contentLength: null,
+      stream: Readable.from(Buffer.from('decompressed payload')),
+    });
+
+    const res = await app.request(
+      '/backup/bmr/recover/download?path=snapshots/snap-ext-001/files/payload.dat.gz',
+      { headers: { Authorization: `Bearer ${VALID_RECOVERY_TOKEN}` } },
+    );
+
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('decompressed payload');
+    expect(res.headers.get('Content-Length')).toBeNull();
   });
 
   it('rate limits repeated recovery downloads for the same token', async () => {
@@ -1425,13 +1456,101 @@ describe('bmr routes', () => {
     );
   });
 
+  // Before this fix, `/bmr/recover/download` had no per-IP limiter (unlike
+  // authenticate/complete) and ran a system-wide expired-token UPDATE
+  // unconditionally on every request, before any validation.
+  it('rate limits recovery downloads per source IP', async () => {
+    rateLimiterMock.mockResolvedValueOnce({
+      allowed: false,
+      remaining: 0,
+      resetAt: new Date(Date.now() + 60_000),
+    });
+
+    const res = await app.request(
+      '/backup/bmr/recover/download?path=snapshots/snap-ext-001/manifest.json',
+      { headers: { 'X-Recovery-Token': VALID_RECOVERY_TOKEN } },
+    );
+
+    expect(res.status).toBe(429);
+    expect(rateLimiterMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringMatching(/^bmr:download:/),
+      expect.any(Number),
+      60,
+    );
+    expect(getAuthenticatedRecoveryDownloadTargetMock).not.toHaveBeenCalled();
+  });
+
+  it('bounds the expired-token sweep to at most once per throttle window', async () => {
+    selectMock.mockReturnValue(chainMock([{
+      id: TOKEN_ID,
+      snapshotId: SNAPSHOT_ID,
+      status: 'authenticated',
+      authenticatedAt: new Date('2026-03-31T13:00:00.000Z'),
+      expiresAt: new Date('2026-04-01T00:00:00.000Z'),
+    }]));
+    getAuthenticatedRecoveryDownloadTargetMock.mockResolvedValue({
+      unavailable: false,
+      type: 'stream',
+      contentType: 'application/json',
+      contentLength: 2,
+      stream: Readable.from(Buffer.from('{}')),
+    });
+
+    await app.request(
+      '/backup/bmr/recover/download?path=snapshots/snap-ext-001/manifest.json',
+      { headers: { 'X-Recovery-Token': VALID_RECOVERY_TOKEN } },
+    );
+
+    expect(rateLimiterMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'bmr:expire-sweep',
+      1,
+      expect.any(Number),
+    );
+  });
+
+  it('skips the expiry sweep write when the sweep throttle gate denies', async () => {
+    // First call is the per-IP gate (allowed), second is the sweep throttle
+    // gate (denied) — the route must skip the sweep, not fail the request.
+    rateLimiterMock
+      .mockResolvedValueOnce({ allowed: true, remaining: 9, resetAt: new Date(Date.now() + 60_000) })
+      .mockResolvedValueOnce({ allowed: false, remaining: 0, resetAt: new Date(Date.now() + 60_000) });
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: TOKEN_ID,
+      snapshotId: SNAPSHOT_ID,
+      status: 'authenticated',
+      authenticatedAt: new Date('2026-03-31T13:00:00.000Z'),
+      expiresAt: new Date('2026-04-01T00:00:00.000Z'),
+    }]));
+    getAuthenticatedRecoveryDownloadTargetMock.mockResolvedValueOnce({
+      unavailable: false,
+      type: 'stream',
+      contentType: 'application/json',
+      contentLength: 2,
+      stream: Readable.from(Buffer.from('{}')),
+    });
+
+    const res = await app.request(
+      '/backup/bmr/recover/download?path=snapshots/snap-ext-001/manifest.json',
+      { headers: { 'X-Recovery-Token': VALID_RECOVERY_TOKEN } },
+    );
+
+    // The request itself still succeeds — only the sweep is skipped.
+    expect(res.status).toBe(200);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
   it('rejects recovery download query tokens by default', async () => {
     const res = await app.request(
       `/backup/bmr/recover/download?token=${VALID_RECOVERY_TOKEN}&path=snapshots/snap-ext-001/manifest.json`
     );
 
     expect(res.status).toBe(400);
-    expect(rateLimiterMock).not.toHaveBeenCalled();
+    // The per-IP backstop runs before any token validation (it must — it
+    // exists precisely to bound requests that never reach a valid token),
+    // so it (and the throttled expiry-sweep gate) is expected to fire here.
+    // What must NOT happen is the expensive per-token lookup.
     expect(getAuthenticatedRecoveryDownloadTargetMock).not.toHaveBeenCalled();
   });
 
@@ -1736,6 +1855,38 @@ describe('bmr routes', () => {
     ]);
   });
 
+  // Server-only images pair with an older binaries release: the recovery ISO
+  // catalog must advertise that release's media (version + manifest), never the
+  // server's own version — which has no recovery assets at all.
+  it('server-only image: the catalog follows the paired binaries release', async () => {
+    const saved = { ...process.env };
+    try {
+      process.env.BINARY_SOURCE = 'github';
+      process.env.BREEZE_VERSION = '0.118.2';
+      process.env.BREEZE_BINARIES_VERSION = '0.118.0';
+      delete process.env.BINARY_VERSION;
+      delete process.env.BINARY_GITHUB_REPOSITORY;
+      delete process.env.GITHUB_REPO;
+      lookupReleaseManifestAssetForDisplayMock.mockResolvedValue(null);
+
+      const res = await app.request('/backup/bmr/boot-media', {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(2);
+      for (const entry of body.data) expect(entry.version).toBe('0.118.0');
+      expect(lookupReleaseManifestAssetForDisplayMock).toHaveBeenCalled();
+      for (const [, manifestUrl] of lookupReleaseManifestAssetForDisplayMock.mock.calls) {
+        expect(manifestUrl).toContain('/releases/download/v0.118.0/');
+      }
+    } finally {
+      process.env = saved;
+    }
+  });
+
   it('degrades to null checksums when the release manifest cannot be resolved', async () => {
     lookupReleaseManifestAssetForDisplayMock.mockResolvedValue(null);
 
@@ -1751,6 +1902,151 @@ describe('bmr routes', () => {
       expect(entry.sha256).toBeNull();
       expect(entry.size).toBeNull();
     }
+  });
+
+  describe('POST /bmr/recover/binary-signature (launch-script binary verification)', () => {
+    it('returns the binary signature (never the public key) for a valid, non-terminal token and a signed artifact', async () => {
+      selectMock
+        .mockReturnValueOnce(chainMock([{ id: TOKEN_ID, orgId: ORG_ID, status: 'active' }]))
+        .mockReturnValueOnce(chainMock([{
+          status: 'ready',
+          metadata: {
+            binarySignatureBase64: 'c2lnbmF0dXJlLWJ5dGVz',
+            binarySignatureKeyId: 'key-1',
+            binarySignaturePublicKey: 'RWRUZXN0UHViS2V5MTIzNA==',
+          },
+        }]));
+
+      const res = await app.request('/backup/bmr/recover/binary-signature', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: VALID_RECOVERY_TOKEN, platform: 'linux', architecture: 'amd64' }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // The trust root for this endpoint's caller (run-recovery.sh/.ps1)
+      // is a public key baked into the bundle at build time, never one
+      // this route hands back — see recoveryMediaService.ts's
+      // buildLaunchScript. Serving the key over the same connection the
+      // caller is trying to verify would make verification depend on that
+      // same server, so the key never comes from this route.
+      expect(body).toMatchObject({
+        signature: 'c2lnbmF0dXJlLWJ5dGVz',
+        keyId: 'key-1',
+      });
+      expect(body.publicKey).toBeUndefined();
+    });
+
+    it('fails closed (404) when the artifact has no signature available (legacy_unsigned)', async () => {
+      selectMock
+        .mockReturnValueOnce(chainMock([{ id: TOKEN_ID, orgId: ORG_ID, status: 'active' }]))
+        .mockReturnValueOnce(chainMock([{ status: 'legacy_unsigned', metadata: {} }]));
+
+      const res = await app.request('/backup/bmr/recover/binary-signature', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: VALID_RECOVERY_TOKEN, platform: 'linux', architecture: 'amd64' }),
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('fails closed (404) when no matching artifact exists', async () => {
+      selectMock
+        .mockReturnValueOnce(chainMock([{ id: TOKEN_ID, orgId: ORG_ID, status: 'active' }]))
+        .mockReturnValueOnce(chainMock([]));
+
+      const res = await app.request('/backup/bmr/recover/binary-signature', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: VALID_RECOVERY_TOKEN, platform: 'linux', architecture: 'amd64' }),
+      });
+
+      expect(res.status).toBe(404);
+    });
+
+    it('rejects an invalid token format without any DB lookup', async () => {
+      const res = await app.request('/backup/bmr/recover/binary-signature', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: 'not-a-real-token', platform: 'linux', architecture: 'amd64' }),
+      });
+
+      expect(res.status).toBe(401);
+      expect(selectMock).not.toHaveBeenCalled();
+    });
+
+    it('rejects a revoked token', async () => {
+      selectMock.mockReturnValueOnce(chainMock([{ id: TOKEN_ID, orgId: ORG_ID, status: 'revoked' }]));
+
+      const res = await app.request('/backup/bmr/recover/binary-signature', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: VALID_RECOVERY_TOKEN, platform: 'linux', architecture: 'amd64' }),
+      });
+
+      expect(res.status).toBe(401);
+    });
+  });
+});
+
+// #5409 — when the trusted-proxy config doesn't resolve a client IP,
+// getTrustedClientIp returns the literal 'unknown'. Every recovering machine
+// then shared ONE 10/min bucket. The fallback must be a distinct, roomier
+// bucket (the per-token limit is the real brute-force control) and 429s carry
+// Retry-After.
+describe('enforcePublicRateLimit — unresolved client IP (#5409)', () => {
+  function fakeCtx(remoteAddress?: string) {
+    const headers: Record<string, string> = {};
+    return {
+      req: { header: () => undefined },
+      env: remoteAddress ? { incoming: { socket: { remoteAddress } } } : undefined,
+      header: (k: string, v: string) => { headers[k] = v; },
+      json: (body: unknown, status: number) => ({ body, status, headers }),
+    };
+  }
+
+  beforeEach(() => {
+    rateLimiterMock.mockReset();
+    rateLimiterMock.mockResolvedValue({ allowed: true, remaining: 9, resetAt: new Date(Date.now() + 60_000) });
+  });
+
+  it('does not key on the literal "unknown" bucket and widens the limit', async () => {
+    const result = await enforcePublicRateLimit(fakeCtx(), 'authenticate', 10);
+    expect(result).toBeNull();
+    const [, key, limit, window] = rateLimiterMock.mock.calls[0] as unknown as [unknown, string, number, number];
+    expect(key).toBe('bmr:authenticate:unresolved');
+    expect(limit).toBe(200);
+    expect(window).toBe(60);
+  });
+
+  it('uses only a small multiplier for exchange (no effective per-token bound)', async () => {
+    await enforcePublicRateLimit(fakeCtx(), 'exchange', 10);
+    const [, key, limit] = rateLimiterMock.mock.calls[0] as unknown as [unknown, string, number];
+    expect(key).toBe('bmr:exchange:unresolved');
+    expect(limit).toBe(30);
+  });
+
+  it('keeps the strict per-IP limit when the IP resolves', async () => {
+    const prev = process.env.TRUST_PROXY_HEADERS;
+    process.env.TRUST_PROXY_HEADERS = 'false';
+    try {
+      await enforcePublicRateLimit(fakeCtx('203.0.113.7'), 'authenticate', 10);
+    } finally {
+      if (prev === undefined) delete process.env.TRUST_PROXY_HEADERS;
+      else process.env.TRUST_PROXY_HEADERS = prev;
+    }
+    const [, key, limit] = rateLimiterMock.mock.calls[0] as unknown as [unknown, string, number];
+    expect(key).toBe('bmr:authenticate:203.0.113.7');
+    expect(limit).toBe(10);
+  });
+
+  it('returns 429 with Retry-After from the unresolved bucket', async () => {
+    rateLimiterMock.mockResolvedValueOnce({ allowed: false, remaining: 0, resetAt: new Date(Date.now() + 30_000) });
+    const res: any = await enforcePublicRateLimit(fakeCtx(), 'complete', 5);
+    expect(res.status).toBe(429);
+    expect(Number(res.headers['Retry-After'])).toBeGreaterThanOrEqual(29);
   });
 });
 

@@ -27,6 +27,16 @@ vi.mock('../../stores/auth', () => ({
   handleSessionExpired: vi.fn(),
 }));
 
+// #7217 — "Install agent…" is offered only to a role that can mint enrollment
+// keys (organizations:write). Mutable so a case can drop the grant.
+const permState = vi.hoisted(() => ({ grants: new Set<string>(['organizations:write']) }));
+vi.mock('@/lib/permissions', () => ({
+  usePermissions: () => ({
+    permissions: [],
+    can: (resource: string, action: string) => permState.grants.has(`${resource}:${action}`),
+  }),
+}));
+
 vi.mock('../../lib/devicesFetch', () => ({
   fetchAllDevices: vi.fn(),
   fetchAllNetworkDevices: vi.fn(),
@@ -207,7 +217,7 @@ vi.mock('./DeviceCard', () => ({
 // action over the FULL device array it was given (mirroring the real
 // DeviceList, which hands the unfiltered selection to onBulkAction). Tests use
 // the per-action buttons to drive DevicesPage.handleBulkAction directly.
-type StubDevice = { id: string; deviceClass?: string; hostname?: string; displayName?: string; watchdogVersion?: string | null; status?: string; wanIp?: string | null; lanIp?: string | null; hardwareHealth?: string | null; hardwareHealthSummary?: Record<string, number> | null };
+type StubDevice = { id: string; deviceClass?: string; hostname?: string; displayName?: string; watchdogVersion?: string | null; status?: string; wanIp?: string | null; lanIp?: string | null; lastLogAt?: string | null; hardwareHealth?: string | null; hardwareHealthSummary?: Record<string, number> | null };
 vi.mock('./DeviceList', () => ({
   default: ({ devices, serverFilterIds, onBulkAction, onAction, onSelect, onShowDecommissioned, onHideDecommissioned, includeDecommissioned }: { devices: StubDevice[]; serverFilterIds?: Set<string> | null; onBulkAction?: (action: string, devices: StubDevice[]) => void; onAction?: (action: string, device: StubDevice) => void; onSelect?: (device: StubDevice) => void; onShowDecommissioned?: () => void; onHideDecommissioned?: () => void; includeDecommissioned?: boolean }) => (
     <div
@@ -218,6 +228,7 @@ vi.mock('./DeviceList', () => ({
       data-filter-ids={serverFilterIds ? [...serverFilterIds].sort().join(',') : ''}
       data-hostnames={devices.map(d => d.hostname ?? '').join(',')}
       data-display-names={devices.map(d => d.displayName ?? '').join(',')}
+      data-last-log-ats={devices.map(d => d.lastLogAt ?? '').join(',')}
       data-watchdog-versions={devices.map(d => d.watchdogVersion ?? '').join(',')}
       data-wan-ips={devices.map(d => d.wanIp ?? '').join(',')}
       data-lan-ips={devices.map(d => d.lanIp ?? '').join(',')}
@@ -383,6 +394,18 @@ describe('DevicesPage — advanced filter applies to BOTH views', () => {
     const list = await screen.findByTestId('device-list');
     expect(list.getAttribute('data-hostnames')).toContain('host-alpha');
     expect(list.getAttribute('data-display-names')).toContain('Reception Laptop');
+  });
+
+  it('carries lastLogAt through the row transform so the Logs silent pill uses real log recency', async () => {
+    const lastLogAt = new Date(Date.now() - 60_000).toISOString();
+    vi.mocked(fetchAllDevices).mockResolvedValue({
+      data: [{ ...rawDevice(DEV_1, 'host-alpha'), lastLogAt }],
+    } as never);
+
+    render(<DevicesPage />);
+
+    const list = await screen.findByTestId('device-list');
+    expect(list.getAttribute('data-last-log-ats')).toBe(lastLogAt);
   });
 
   it('grid view renders only the devices matching the advanced filter (not the raw list)', async () => {
@@ -3127,6 +3150,22 @@ describe('DevicesPage — header "Add" split menu (#5213)', () => {
     expect(screen.queryByTestId('devices-page-add-menu')).toBeNull();
   });
 
+  it('does not offer "Install agent…" to a role that cannot mint enrollment keys (#7217)', async () => {
+    permState.grants = new Set();
+    try {
+      render(<DevicesPage />);
+      await screen.findByTestId('device-list');
+
+      fireEvent.click(screen.getByTestId('devices-page-add-menu-trigger'));
+      expect(screen.getByTestId('devices-page-add-menu')).toBeTruthy();
+      expect(screen.queryByTestId('devices-page-add-menu-install-agent')).toBeNull();
+      // The asset entries do not need enrollment keys and stay available.
+      expect(screen.getByTestId('devices-page-add-menu-add-manual-asset')).toBeTruthy();
+    } finally {
+      permState.grants = new Set(['organizations:write']);
+    }
+  });
+
   it('selecting "Install agent…" closes the menu without touching the hash', async () => {
     render(<DevicesPage />);
     await screen.findByTestId('device-list');
@@ -3187,54 +3226,53 @@ describe('DevicesPage — header refresh button', () => {
   });
 });
 
-describe('DevicesPage — hardware health filter (#6854 W04)', () => {
-  it('filters on the server, maps summaries and restores non-agent rows', async () => {
+describe('DevicesPage — hardware health (#6854 W04)', () => {
+  it('maps the rollup and summary, with no standalone hardware dropdown', async () => {
     const { decodeFilterFromHash } = await import('./filterUrl');
     vi.mocked(decodeFilterFromHash).mockReturnValueOnce(null);
     window.history.replaceState(null, '', window.location.pathname);
     vi.mocked(fetchAllDevices).mockResolvedValue({
-      data: [{ ...rawDevice(DEV_1, 'raid-host'), hardwareHealth: 'unknown', hardwareHealthSummary: { counts: { unknown: 2 }, controllerNames: [] } },
-        rawDevice(DEV_2, 'no-snapshot')], total: 2, pagesWalked: 1,
-    } as never);
-    vi.mocked(fetchAllNetworkDevices).mockResolvedValue({
-      data: [{ ...rawDevice(DEV_3, 'switch'), deviceClass: 'network' }], total: 1, pagesWalked: 1,
-    } as never);
-    vi.mocked(fetchAllManualAssets).mockResolvedValue({
-      data: [{ ...rawDevice('44444444-4444-4444-4444-444444444444', 'rack'), deviceClass: 'manual' }],
+      data: [{ ...rawDevice(DEV_1, 'raid-host'), hardwareHealth: 'unknown', hardwareHealthSummary: { counts: { unknown: 2 }, controllerNames: [] } }],
       total: 1, pagesWalked: 1,
     } as never);
-    openOnAllClasses();
     render(<DevicesPage />);
-    await waitFor(() => expect(screen.getByTestId('device-list')).toHaveAttribute('data-device-count', '4'));
-    fireEvent.change(screen.getByTestId('hardware-health-filter'), { target: { value: 'unknown' } });
-    await waitFor(() => expect(fetchAllDevices).toHaveBeenLastCalledWith(expect.objectContaining({ hardwareHealth: 'unknown' })));
     await waitFor(() => expect(screen.getByTestId('device-list')).toHaveAttribute('data-device-count', '1'));
     expect(screen.getByTestId('device-list')).toHaveAttribute('data-hardware-health', 'unknown');
     expect(screen.getByTestId('device-list')).toHaveAttribute('data-hardware-summary', '[{"unknown":2}]');
-    fireEvent.change(screen.getByTestId('hardware-health-filter'), { target: { value: '' } });
-    await waitFor(() => expect(fetchAllDevices).toHaveBeenLastCalledWith(expect.objectContaining({ hardwareHealth: undefined })));
-    await waitFor(() => expect(screen.getByTestId('device-list')).toHaveAttribute('data-device-count', '4'));
-    expect(window.location.search).toBe('');
+    // Hardware health is a field in the shared filter builder (`hardware.health`),
+    // not a second, page-local filter control.
+    expect(screen.queryByTestId('hardware-health-filter')).toBeNull();
+    expect(fetchAllDevices).not.toHaveBeenCalledWith(expect.objectContaining({ hardwareHealth: expect.anything() }));
   });
+});
 
-  it('ignores a late background refresh from before the hardware filter changed', async () => {
+// deviceFetchGeneration guard: the header Refresh carries no abort signal, so
+// it can still be in flight when an org switch starts a newer fetch. The late
+// refresh must not overwrite the newer org's list.
+describe('DevicesPage — stale fetch guard', () => {
+  it('ignores a manual refresh that lands after an org switch', async () => {
     const { decodeFilterFromHash } = await import('./filterUrl');
-    vi.mocked(decodeFilterFromHash).mockReturnValueOnce(null);
+    vi.mocked(decodeFilterFromHash).mockReturnValue(null);
     window.history.replaceState(null, '', window.location.pathname);
-    const all = { data: [rawDevice(DEV_1, 'old-host'), rawDevice(DEV_2, 'no-snapshot')], total: 2, pagesWalked: 1 };
+    const all = { data: [rawDevice(DEV_1, 'old-host'), rawDevice(DEV_2, 'other-host')], total: 2, pagesWalked: 1 };
     let finishOld!: (value: typeof all) => void;
     vi.mocked(fetchAllDevices).mockResolvedValueOnce(all as never)
       .mockReturnValueOnce(new Promise(resolve => { finishOld = resolve; }) as never)
-      .mockResolvedValue({ data: [{ ...rawDevice(DEV_1, 'filtered-host'), hardwareHealth: 'unknown' }], total: 1, pagesWalked: 1 } as never);
-    render(<DevicesPage />);
-    await waitFor(() => expect(screen.getByTestId('device-list')).toHaveAttribute('data-device-count', '2'));
-    fireEvent.click(screen.getByTestId('devices-page-refresh'));
-    await waitFor(() => expect(fetchAllDevices).toHaveBeenCalledTimes(2));
-    fireEvent.change(screen.getByTestId('hardware-health-filter'), { target: { value: 'unknown' } });
-    await waitFor(() => expect(screen.getByTestId('device-list')).toHaveAttribute('data-device-count', '1'));
-    await act(async () => { finishOld(all); });
-    expect(screen.getByTestId('device-list')).toHaveAttribute('data-hostnames', 'filtered-host');
-    expect(screen.getByTestId('device-list')).toHaveAttribute('data-device-count', '1');
-    expect(screen.getByTestId('devices-page-refresh')).toHaveAttribute('aria-busy', 'false');
+      .mockResolvedValue({ data: [rawDevice(DEV_1, 'org-host')], total: 1, pagesWalked: 1 } as never);
+    const saved = { ...orgStoreState };
+    try {
+      const { rerender } = render(<DevicesPage />);
+      await waitFor(() => expect(screen.getByTestId('device-list')).toHaveAttribute('data-device-count', '2'));
+      fireEvent.click(screen.getByTestId('devices-page-refresh'));
+      await waitFor(() => expect(fetchAllDevices).toHaveBeenCalledTimes(2));
+      Object.assign(orgStoreState, { allOrgs: false, currentOrgId: 'org-1', lastOrgId: 'org-1', organizations: [{ id: 'org-1', name: 'Org One' }] });
+      rerender(<DevicesPage />);
+      await waitFor(() => expect(screen.getByTestId('device-list')).toHaveAttribute('data-hostnames', 'org-host'));
+      await act(async () => { finishOld(all); });
+      expect(screen.getByTestId('device-list')).toHaveAttribute('data-hostnames', 'org-host');
+      expect(screen.getByTestId('device-list')).toHaveAttribute('data-device-count', '1');
+    } finally {
+      Object.assign(orgStoreState, saved);
+    }
   });
 });

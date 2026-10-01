@@ -300,8 +300,29 @@ describe('tier-3 approval scope classification', () => {
     });
     expect(check.description).toBe(
       'Add contact "Jane Doe" to organization 11112222... '
-      + 'as PRIMARY contact (replaces the current billing contact)',
+      + "as PRIMARY contact (replaces the organization's current primary contact)",
     );
+  });
+
+  // The org's primary contact is no longer what invoices go to: the billing
+  // contact is the org-level contact holding the `billing` role. So it is the
+  // ROLE, not isPrimary, that can re-point this customer's invoices — and the
+  // approver has to be told.
+  it('add_contact approval description flags an org-level billing role as an invoice-recipient change', () => {
+    const check = checkGuardrails('manage_organizations', {
+      action: 'add_contact', orgId: CONTACT_ORG, name: 'Jane Doe', roles: ['technical', 'billing'],
+    });
+    expect(check.description).toBe(
+      'Add contact "Jane Doe" to organization 11112222... '
+      + "with the Billing role (can become the organization's default invoice recipient)",
+    );
+  });
+
+  it('add_contact approval description does not flag a SITE contact with the billing role', () => {
+    const check = checkGuardrails('manage_organizations', {
+      action: 'add_contact', orgId: CONTACT_ORG, siteId: CONTACT_SITE, name: 'Jane Doe', roles: ['billing'],
+    });
+    expect(check.description).toBe('Add contact "Jane Doe" to organization 11112222... on site 22223333...');
   });
 
   it('add_contact approval description names the SITE and the site-contact takeover together', () => {
@@ -419,6 +440,21 @@ describe('tier-3 approval scope classification', () => {
     expect(thresholds.approvalScope).toBeUndefined();
   });
 
+  // Topology M4 Task 4 (#6000): one fixed-recipe, same-site observational
+  // diagnostic. Supervised (requester decides) but still an explicit approval,
+  // pinned effect and fresh-MFA release — never four_eyes, never unlisted.
+  it('diagnose_connectivity is a whole-tool supervised tier-3 tool', () => {
+    expect(getToolTier('diagnose_connectivity')).toBe(3);
+    expect(TIER3_SUPERVISED_TOOLS.has('diagnose_connectivity')).toBe(true);
+    expect(TIER3_FOUR_EYES_TOOLS.has('diagnose_connectivity')).toBe(false);
+    expect(TIER3_FOUR_EYES_ACTIONS.diagnose_connectivity).toBeUndefined();
+    expect(TIER3_SUPERVISED_ACTIONS.diagnose_connectivity).toBeUndefined();
+    expect(resolveApprovalScope('diagnose_connectivity', undefined, {})).toBe('supervised');
+    expect(checkGuardrails('diagnose_connectivity', {})).toMatchObject({
+      tier: 3, requiresApproval: true, approvalScope: 'supervised',
+    });
+  });
+
   it('checkGuardrails surfaces the scope on tier-3 results', () => {
     const fourEyes = checkGuardrails('manage_invoices', { action: 'issue' });
     expect(fourEyes.tier).toBe(3);
@@ -428,5 +464,36 @@ describe('tier-3 approval scope classification', () => {
     expect(supervised.approvalScope).toBe('supervised');
     const tier2 = checkGuardrails('manage_patches', { action: 'approve' });
     expect(tier2.approvalScope).toBeUndefined();
+  });
+
+  it('manage_tickets comment escalates to tier 3 supervised only when isPublic is explicitly true', () => {
+    const publicComment = checkGuardrails('manage_tickets', { action: 'comment', ticketId: 't1', content: 'hi', isPublic: true });
+    expect(publicComment.tier).toBe(3);
+    expect(publicComment.approvalScope).toBe('supervised');
+
+    const privateComment = checkGuardrails('manage_tickets', { action: 'comment', ticketId: 't1', content: 'hi', isPublic: false });
+    expect(privateComment.tier).toBe(2);
+    expect(privateComment.approvalScope).toBeUndefined();
+
+    const defaultedComment = checkGuardrails('manage_tickets', { action: 'comment', ticketId: 't1', content: 'hi' });
+    expect(defaultedComment.tier).toBe(2);
+    expect(defaultedComment.approvalScope).toBeUndefined();
+  });
+
+  it('manage_tickets:comment is input-aware: exempt from the static per-action tables', () => {
+    expect(TIER3_INPUT_AWARE_ACTIONS.has('manage_tickets:comment')).toBe(true);
+    expect(TIER3_ACTIONS.manage_tickets ?? []).not.toContain('comment');
+  });
+
+  // test_webhook's route (POST /webhooks/:id/test, routes/webhooks.ts:683-684)
+  // carries requireMfa() on top of organizations:write, and it mutates (a real
+  // outbound POST). Per this module's documented MFA rule, a tool mirroring a
+  // mutating requireMfa() route is tier 3. TIER3_SUPERVISED_TOOLS membership
+  // alone is covered by the whole-tool registry-tier assertion above; this
+  // pins the end-to-end resolution explicitly.
+  it('test_webhook is tier 3 and resolves to the supervised approval scope', () => {
+    expect(getToolTier('test_webhook')).toBe(3);
+    expect(resolveApprovalScope('test_webhook', undefined, {})).toBe('supervised');
+    expect(TIER3_SUPERVISED_TOOLS.has('test_webhook')).toBe(true);
   });
 });

@@ -29,6 +29,9 @@ import { eq, and, SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { AGENT_MAX_FILE_WRITE_BYTES } from '../routes/systemTools/schemas';
+import { isAgentConfigPath } from '../routes/systemTools/sensitiveTargets';
+import { aiPathRefusal } from './aiPathRestriction';
+import { requestsLiveDeviceRead } from './aiLiveDeviceReads';
 import {
   buildCleanupPreview,
   getLatestFilesystemSnapshot,
@@ -55,6 +58,7 @@ import { createAuditLogAsync } from './auditService';
 import { captureException } from './sentry';
 import { writeAuditEvent, requestLikeFromSnapshot } from './auditEvents';
 import { CLEANUP_PREVIEW_TTL_HOURS } from '../routes/devices/filesystem';
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -100,7 +104,7 @@ async function verifyDeviceAccess(
   if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
     return { error: 'Device not found or access denied' };
   }
-  const conditions: SQL[] = [eq(devices.id, deviceId)];
+  const conditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
   const orgCond = auth.orgCondition(devices.orgId);
   if (orgCond) conditions.push(orgCond);
   const [device] = await db.select().from(devices).where(and(...conditions)).limit(1);
@@ -167,6 +171,16 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
       const fileCommandType = actionMap[input.action as string];
       if (!fileCommandType) return JSON.stringify({ error: `Unknown action: ${input.action}` });
 
+      // Deny the agent's own config/secrets directory outright, regardless
+      // of the caller's permission — this tool does not go through
+      // routes/systemTools (it calls aiExecuteCommand directly), so it must carry its
+      // own copy of the same check the REST file routes apply.
+      const targetPath = input.path as string;
+      const targetNewPath = input.newPath as string | undefined;
+      if (isAgentConfigPath(targetPath) || (targetNewPath !== undefined && isAgentConfigPath(targetNewPath))) {
+        return JSON.stringify({ error: 'Access to this path is not permitted' });
+      }
+
       // The agent rejects file_write payloads over 4MB decoded, and its WS
       // read limit (16MB) is sized from that cap — an oversized frame kills
       // the agent's connection instead of being rejected (issue #2399).
@@ -192,7 +206,8 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
   });
 
   // ============================================
-  // analyze_disk_usage - Tier 1 (read-only)
+  // analyze_disk_usage - Tier 1 stored snapshot read; `refresh: true` scans
+  // the device live (Tier 2 read-only, devices:execute — aiLiveDeviceReads.ts)
   // ============================================
 
   registerTool({
@@ -202,12 +217,12 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceId'],
     definition: {
       name: 'analyze_disk_usage',
-      description: 'Analyze filesystem usage for a device and explain what is consuming disk space. Can optionally run a fresh scan.',
+      description: 'Analyze filesystem usage for a device and explain what is consuming disk space. Reads the latest stored scan; refresh=true runs a fresh scan on the device (needs execute permission).',
       input_schema: {
         type: 'object' as const,
         properties: {
           deviceId: { type: 'string', description: 'The device UUID' },
-          refresh: { type: 'boolean', description: 'If true, run a fresh filesystem analysis before returning results' },
+          refresh: { type: 'boolean', description: 'If true, run a fresh filesystem analysis on the device first (also needed when no stored scan exists)' },
           path: { type: 'string', description: 'Volume or directory to analyse (e.g. "C:\\\\", "D:\\\\", "/", "/data"). Defaults to the OS root.' },
           maxDepth: { type: 'number', description: 'Max traversal depth (1-64)' },
           topFiles: { type: 'number', description: 'Largest file rows to keep (1-500)' },
@@ -222,7 +237,9 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
     },
     handler: async (input, auth) => {
       const deviceId = input.deviceId as string;
-      const refresh = Boolean(input.refresh);
+      // The same predicate the guardrails classify on: only this input may
+      // reach the device (permission and tier both key on it).
+      const refresh = requestsLiveDeviceRead('analyze_disk_usage', input);
       const maxCandidates = Math.min(Math.max(1, Number(input.maxCandidates) || 50), 200);
 
       const access = await verifyDeviceAccess(deviceId, auth, refresh);
@@ -232,6 +249,10 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
         osType,
         typeof input.path === 'string' && input.path.length > 0 ? input.path : osRootScanPath(osType),
       );
+      // The schema checked the raw input; normalisation can respell it
+      // (`C:Users\x` becomes `C:\Users\x`), so check what is actually scanned.
+      const scanRootRefusal = aiPathRefusal(scanPath);
+      if (scanRootRefusal) return JSON.stringify({ error: scanRootRefusal });
       // Narrower than the route's check on purpose: the tool has no volume
       // list, so only the OS root auto-continues a checkpointed baseline. A
       // second volume's scan simply does not self-resume from the AI lane.
@@ -240,7 +261,9 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
       const snapshot = await getLatestFilesystemSnapshot(deviceId, scanPath);
       let freshPayload: Record<string, unknown> | null = null;
 
-      if (refresh || !snapshot) {
+      // No stored scan is NOT a reason to scan: that would reach the device
+      // on a call classified (and permission-checked) as a stored read.
+      if (refresh) {
         const timeoutMs = Math.max(90_000, ((Number(input.timeoutSeconds) || 300) + 75) * 1000);
         const commandId = randomUUID();
         // Commit registration before the command can be delivered. Escaping the
@@ -300,7 +323,7 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
       }
 
       if (!snapshot && !freshPayload) {
-        return JSON.stringify({ message: 'No filesystem analysis available. Try refresh=true.' });
+        return JSON.stringify({ message: 'No filesystem analysis stored for this volume yet. Call again with refresh=true to scan the device.' });
       }
 
       // The shared command-result handler owns persistence. Render this command's
@@ -674,7 +697,8 @@ export function registerFilesystemTools(aiTools: Map<string, AiTool>): void {
   });
 
   // ============================================
-  // system_cleanup - Tier 1 list, Tier 3 run (spec §9.1)
+  // system_cleanup - Tier 2 list (asks the device live), Tier 1 status,
+  // Tier 3 run (spec §9.1)
   // ============================================
   //
   // THIN on purpose. Every decision — the MIN_AGENT_VERSION gate, action-id

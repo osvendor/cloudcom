@@ -7,6 +7,8 @@
  */
 
 import { z } from 'zod';
+// Pool-free leaf (imports only zod) shared with the route schema.
+import { hypervOptionsSchema, isAbsoluteRebuildPath } from './bareMetalRebuildSchemas';
 
 // Reusable validators (duplicated locally to avoid circular imports)
 const uuid = z.string().guid();
@@ -23,7 +25,7 @@ export const backupToolSchemas: Record<string, z.ZodType> = {
   // Backup & DR tool modules
   query_backups: z.object({
     action: z.enum(['list_configs', 'list_jobs', 'list_policies']),
-    status: z.enum(['pending', 'running', 'completed', 'failed', 'cancelled', 'partial']).optional(),
+    status: z.enum(['pending', 'running', 'completed', 'completed_with_errors', 'failed', 'cancelled', 'partial']).optional(),
     deviceId: uuid.optional(),
     configId: uuid.optional(),
     limit: z.number().int().min(1).max(100).optional(),
@@ -76,10 +78,11 @@ export const backupToolSchemas: Record<string, z.ZodType> = {
         snapshotId: uuid,
         rebuildHostDeviceId: uuid,
         outputPath: z.string().min(1).max(1024).refine(
-          (p) => p.startsWith('/') && p.endsWith('.vhdx') && !p.includes('\0') && !p.includes('..'),
-          { message: 'absolute .vhdx path required' },
+          (p) => isAbsoluteRebuildPath(p) && p.toLowerCase().endsWith('.vhdx') && !p.includes('..'),
+          { message: 'absolute .vhdx path required (POSIX or a Windows drive letter, no UNC)' },
         ),
         imageSizeGb: z.number().int().min(1).optional(),
+        hyperv: hypervOptionsSchema,
       }).strict(),
     ]),
   ),

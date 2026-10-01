@@ -31,7 +31,6 @@
     "alertsDetail": "Alert Details",
     "alertsMonitors": "Alerts – Monitors",
     "alertsMonitorDetail": "Alerts – Monitor",
-    "alertsRules": "Alerts – Legacy rules",
     "alerts": "Alerts",
     "analytics": "Analytics",
     "approvals": "Approvals",
@@ -61,6 +60,7 @@
     "contractsNew": "New contract",
     "devicesCompare": "Device Comparison",
     "devicesGroups": "Device Groups",
+    "devicesUnassigned": "Unassigned Devices",
     "devicesDetail": "Device Details",
     "devices": "Devices & Assets",
     "devicesNetworkDetail": "Network Device Details",
@@ -79,7 +79,7 @@
     "integrationsWebhooks": "Webhooks",
     "login": "Sign In",
     "logs": "Logs",
-    "monitoring": "Monitoring",
+    "monitoring": "Network",
     "oauthConsent": "Authorize access",
     "onedrive": "OneDrive",
     "organizations": "Organizations",
@@ -108,6 +108,7 @@
     "reportsDetailEdit": "Edit Report",
     "reports": "Reports",
     "reportsNew": "Create Report",
+    "reportsSeriesEdit": "Edit Multi-org Report",
     "reportsTemplates": "Report Templates",
     "resetPassword": "Reset Password",
     "scriptsDetail": "Edit Script",
@@ -169,7 +170,8 @@
     "agreementTemplateNew": "New agreement template",
     "signedAgreements": "Signed agreements",
     "settingsTicketing": "Ticketing Settings",
-    "securityScans": "IOC Scans"
+    "securityScans": "IOC Scans",
+    "devicesTime": "Time synchronization"
   },
   "layout": {
     "metaDescription": "Breeze RMM - Remote Monitoring and Management",

@@ -31,7 +31,6 @@
     "alertsDetail": "Uyarı Ayrıntıları",
     "alertsMonitors": "Uyarılar – Monitörler",
     "alertsMonitorDetail": "Uyarılar – Monitör",
-    "alertsRules": "Uyarılar – Eski kurallar",
     "alerts": "Uyarılar",
     "analytics": "Analitik",
     "approvals": "Onaylar",
@@ -61,6 +60,7 @@
     "contractsNew": "Yeni sözleşme",
     "devicesCompare": "Cihaz Karşılaştırması",
     "devicesGroups": "Cihaz Grupları",
+    "devicesUnassigned": "Atanmamış Cihazlar",
     "devicesDetail": "Cihaz Ayrıntıları",
     "devices": "Cihazlar ve Varlıklar",
     "devicesNetworkDetail": "Ağ Cihazı Ayrıntıları",
@@ -79,7 +79,7 @@
     "integrationsWebhooks": "Webhooklar",
     "login": "Giriş Yap",
     "logs": "Günlükler",
-    "monitoring": "İzleme",
+    "monitoring": "Ağ",
     "oauthConsent": "Erişimi yetkilendir",
     "onedrive": "OneDrive",
     "organizations": "Organizasyonlar",
@@ -108,6 +108,7 @@
     "reportsDetailEdit": "Raporu Düzenle",
     "reports": "Raporlar",
     "reportsNew": "Rapor Oluştur",
+    "reportsSeriesEdit": "Çok Kuruluşlu Raporu Düzenle",
     "reportsTemplates": "Rapor Şablonları",
     "resetPassword": "Şifreyi Sıfırla",
     "scriptsDetail": "Komut Dosyasını Düzenle",
@@ -169,7 +170,8 @@
     "agreementTemplateNew": "Yeni anlaşma şablonu",
     "signedAgreements": "İmzalı anlaşmalar",
     "settingsTicketing": "Bilet Ayarları",
-    "securityScans": "IOC Taramaları"
+    "securityScans": "IOC Taramaları",
+    "devicesTime": "Saat eşitleme"
   },
   "layout": {
     "metaDescription": "Breeze RMM - Uzaktan İzleme ve Yönetim",

@@ -1,4 +1,5 @@
 import type { ConfigFeatureType } from '@breeze/shared';
+import { i18n } from '@/lib/i18n';
 
 // Derived from the canonical CONFIG_FEATURE_TYPES (single source of truth in
 // @breeze/shared) so the config-policy editor's feature tabs can't silently
@@ -48,10 +49,8 @@ export type FeatureTabProps = {
   /** Parent policy's feature link for this tab (for inheritance display) */
   parentLink?: FeatureLink | undefined;
   /**
-   * Every feature link on the policy, including this tab's own. Read-only:
-   * a tab that needs to WRITE a sibling link (MonitorsTab's Check interval
-   * writes the `monitoring` link) still goes through useFeatureLink and
-   * reports it with onLinkChanged(link, thatFeatureType). (W05c2)
+   * Every feature link on the policy, including this tab's own. Read-only;
+   * changes go through useFeatureLink and onLinkChanged.
    */
   siblingLinks?: FeatureLink[];
   /**
@@ -69,11 +68,9 @@ export const FEATURE_META: Record<FeatureType, {
   description: string;
 }> = {
   patch:        { label: 'Patches',      fetchUrl: '/update-rings',        description: 'Patch management settings' },
-  alert_rule:   { label: 'Alerts',       fetchUrl: '/alerts/rules',        description: 'Server-evaluated alert rules: CPU/RAM/disk thresholds, offline detection, event log alerts' },
   monitors:     { label: 'Monitors',     fetchUrl: '/monitor-definitions', description: 'Monitors attached to this policy: condition, response, delivery and escalation in one object' },
   backup:       { label: 'Backup',       fetchUrl: '/backup/configs',      description: 'Backup schedule and retention' },
   security:     { label: 'Security',     fetchUrl: '/security/policies',   description: 'Security policy settings' },
-  monitoring:   { label: 'Service & Process Monitoring', fetchUrl: '/monitoring', description: 'Agent-side watches: service/process stop detection, auto-restart, resource limits per process' },
   maintenance:  { label: 'Maintenance',  fetchUrl: '/maintenance/windows', description: 'Maintenance window settings' },
   compliance:   { label: 'Compliance',   fetchUrl: '/policies',            description: 'Compliance rules and enforcement' },
   automation:   { label: 'Automations',  fetchUrl: '/automations',         description: 'Automated tasks and responses' },
@@ -89,4 +86,13 @@ export const FEATURE_META: Record<FeatureType, {
   onedrive_helper: { label: 'OneDrive Helper', fetchUrl: null, description: 'Silently sign in OneDrive, enforce Files On-Demand and Known Folder Move, and auto-mount SharePoint libraries per user.' },
   device_lifecycle: { label: 'Device Lifecycle', fetchUrl: null, description: 'Permanently delete removed devices after a retention window' },
   hardware_monitoring: { label: 'Hardware Monitoring', fetchUrl: null, description: 'RAID and disk health collection intervals' },
+  time_sync: {
+    get label() {
+      return i18n.t('devices:timeSync.management.title');
+    },
+    fetchUrl: null,
+    get description() {
+      return i18n.t('devices:timeSync.management.description');
+    },
+  },
 };

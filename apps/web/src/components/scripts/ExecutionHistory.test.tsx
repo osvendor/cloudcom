@@ -42,12 +42,23 @@ const rows = [
   },
 ] as unknown as ScriptExecution[];
 
-// The data rows carry role="button" (the whole row is clickable), so the
-// implicit "row" ARIA role is gone — query the DOM directly instead.
+// Query the DOM directly rather than by role: the buttons inside each row
+// (Cancel, View details) are the only interactive controls now (#7179 —
+// the row itself used to double as role="button", which nested-interactive
+// controls inside another interactive element, an axe violation).
 function bodyRows(): HTMLElement[] {
   const body = screen.getByRole('table').querySelector('tbody')!;
   return Array.from(body.querySelectorAll('tr'));
 }
+
+describe('ExecutionHistory filter selects accessible name (#7156)', () => {
+  it('gives the status and date-range filter selects a real accessible name', () => {
+    render(<ExecutionHistory executions={rows} />);
+
+    expect(screen.getByRole('combobox', { name: 'Status' })).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Date range' })).toBeInTheDocument();
+  });
+});
 
 describe('ExecutionHistory', () => {
   it('filters on a search term without throwing when scriptName or deviceHostname is missing', () => {
@@ -132,6 +143,19 @@ describe('ExecutionHistory', () => {
     fireEvent.click(screen.getAllByTitle('View details')[0]);
 
     expect(onViewDetails).toHaveBeenCalledWith(expect.objectContaining({ id: 'e1' }));
+  });
+
+  // axe (nested-interactive): the row carried role="button" + tabIndex while
+  // containing real <button> controls (Cancel, View details) — a screen
+  // reader has no way to represent an interactive element nested inside
+  // another interactive element. The buttons are the only controls now.
+  it('does not expose the row itself as an interactive control', () => {
+    render(<ExecutionHistory executions={rows} onViewDetails={vi.fn()} />);
+
+    for (const row of bodyRows()) {
+      expect(row).not.toHaveAttribute('role', 'button');
+      expect(row).not.toHaveAttribute('tabindex');
+    }
   });
 });
 

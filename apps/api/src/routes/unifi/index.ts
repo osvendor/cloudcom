@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
 import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../../middleware/auth';
 import { PERMISSIONS } from '../../services/permissions';
 import { db, runOutsideDbContext } from '../../db';
@@ -12,7 +12,10 @@ import { listControllerSitesForIntegration } from '../../services/unifi/unifiCon
 import { listCollectors, upsertCollector, deleteCollector, upsertSelfHostedController } from '../../services/unifi/unifiCollectorService';
 import { enqueueUnifiSync } from '../../jobs/unifiWorker';
 import { canManagePartnerWidePolicies } from '../../services/partnerWideAccess';
+import { revokeUnifiCollectorDrift, revokeUnifiMappingDrift, snapshotUnifiCollectors, snapshotUnifiMappings } from '../../services/topology/unifiAuthority';
 
+import { isHoldingOrg } from '../../services/unassignedPool/protectedOrg';
+import { PROTECTED_ORG_ERROR } from '../../services/unassignedPool/orgType';
 export const unifiRoutes = new Hono();
 
 type RouteAuth = Pick<AuthContext, 'scope' | 'partnerId' | 'orgId' | 'partnerOrgAccess' | 'canAccessOrg'>;
@@ -173,7 +176,12 @@ unifiRoutes.post('/disconnect', partnerScopes, writePerm, requireMfa(), async (c
   // Idempotent: a 0-row delete means "already disconnected", which is the desired
   // end state — report success so runAction doesn't toast a misleading failure on
   // a double-click or concurrent disconnect.
+  // The integration delete cascades its collectors; revoke their UniFi topology
+  // sources (M2 D1 source lifecycle) in the same request transaction.
+  const conn = await getConnection(db, partner.partnerId);
+  const collectorsBefore = conn ? await snapshotUnifiCollectors(conn.id) : [];
   await deleteConnection(db, partner.partnerId);
+  if (conn) await revokeUnifiCollectorDrift(conn.id, collectorsBefore);
   return c.json({ success: true });
 });
 
@@ -225,13 +233,34 @@ unifiRoutes.put('/mappings', partnerScopes, writePerm, requireMfa(), zValidator(
   // entry hits the 403, so the client sees a failure on a partially-applied batch.
   const resolved: Array<{ m: (typeof mappings)[number]; orgId: string; siteId: string }> = [];
   for (const m of mappings) {
-    const [site] = await db.select({ id: sites.id, orgId: sites.orgId }).from(sites).where(eq(sites.id, m.siteId)).limit(1);
+    const [site] = await db
+      .select({
+        id: sites.id,
+        orgId: sites.orgId,
+        partnerId: sql<string | null>`(SELECT o.partner_id FROM organizations o WHERE o.id = ${sites.orgId})`,
+      })
+      .from(sites)
+      .where(eq(sites.id, m.siteId))
+      .limit(1);
     if (!site) return c.json({ success: false, message: `Unknown Breeze site: ${m.siteId}` }, 400);
     if (!auth.canAccessOrg(site.orgId)) {
       return c.json({ success: false, message: 'Access to target organization denied' }, 403);
     }
+    // The site must belong to the connection's own partner. canAccessOrg is
+    // true for system scope, so without this a platform admin acting for one
+    // partner could map another partner's site.
+    if (site.partnerId !== conn.partnerId) {
+      return c.json({ success: false, message: 'Target site does not belong to this partner' }, 403);
+    }
+    // canAccessOrg is true for system scope: the holding org is never a target.
+    if (await isHoldingOrg(site.orgId)) {
+      return c.json({ success: false, message: PROTECTED_ORG_ERROR.error, code: PROTECTED_ORG_ERROR.code }, 409);
+    }
     resolved.push({ m, orgId: site.orgId, siteId: site.id });
   }
+  // M2 D1: a remapped or deleted controller site revokes the UniFi topology
+  // sources its old mapping authorized (revokeUnifiMappingDrift below).
+  const mappingsBefore = await snapshotUnifiMappings(conn.id);
   for (const { m, orgId, siteId } of resolved) {
     await db.insert(unifiSiteMappings).values({
       integrationId: conn.id,
@@ -292,6 +321,7 @@ unifiRoutes.put('/mappings', partnerScopes, writePerm, requireMfa(), zValidator(
         .where(and(eq(unifiSiteMappings.integrationId, conn.id), inArray(unifiSiteMappings.id, staleIds)));
     }
   }
+  await revokeUnifiMappingDrift(conn.id, mappingsBefore);
   return c.json({ success: true });
 });
 
@@ -347,6 +377,7 @@ unifiRoutes.put('/collectors', partnerScopes, writePerm, requireMfa(), zValidato
   const [dev] = await db.select({ id: devices.id, orgId: devices.orgId }).from(devices).where(eq(devices.id, body.collectorDeviceId)).limit(1);
   if (!dev) return c.json({ success: false, message: 'Unknown collector agent' }, 400);
   if (dev.orgId !== site.orgId) return c.json({ success: false, message: 'Collector agent must belong to the site\'s organization' }, 400);
+  const collectorsBefore = await snapshotUnifiCollectors(conn.id);
   const collector = await upsertCollector(db, {
     integrationId: conn.id,
     orgId: site.orgId,
@@ -358,6 +389,8 @@ unifiRoutes.put('/collectors', partnerScopes, writePerm, requireMfa(), zValidato
     pollIntervalSeconds: body.pollIntervalSeconds,
     createdBy: auth.user.id,
   });
+  // A reassigned collector (device/site/controller) revokes its old topology sources.
+  await revokeUnifiCollectorDrift(conn.id, collectorsBefore);
   return c.json({ success: true, collectorId: collector.id });
 });
 
@@ -386,6 +419,7 @@ unifiRoutes.put('/controllers', partnerScopes, writePerm, requireMfa(), zValidat
   const [dev] = await db.select({ id: devices.id, orgId: devices.orgId }).from(devices).where(eq(devices.id, body.collectorDeviceId)).limit(1);
   if (!dev) return c.json({ success: false, message: 'Unknown collector agent' }, 400);
   if (dev.orgId !== site.orgId) return c.json({ success: false, message: 'Collector agent must belong to the site\'s organization' }, 400);
+  const collectorsBefore = await snapshotUnifiCollectors(conn.id);
   const collector = await upsertSelfHostedController(db, {
     integrationId: conn.id,
     orgId: site.orgId,
@@ -396,6 +430,7 @@ unifiRoutes.put('/controllers', partnerScopes, writePerm, requireMfa(), zValidat
     pollIntervalSeconds: body.pollIntervalSeconds,
     createdBy: auth.user.id,
   });
+  await revokeUnifiCollectorDrift(conn.id, collectorsBefore);
   return c.json({ success: true, collectorId: collector.id });
 });
 
@@ -409,7 +444,9 @@ unifiRoutes.delete('/collectors/:hostId', partnerScopes, writePerm, requireMfa()
   const hostId = c.req.param('hostId');
   if (!hostId) return c.json({ success: false, message: 'hostId is required' }, 400);
   // Idempotent (see /disconnect): already-absent is the desired end state.
+  const collectorsBefore = await snapshotUnifiCollectors(conn.id);
   await deleteCollector(db, conn.id, hostId);
+  await revokeUnifiCollectorDrift(conn.id, collectorsBefore);
   return c.json({ success: true });
 });
 

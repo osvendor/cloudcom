@@ -94,6 +94,7 @@ vi.mock('../middleware/auth', () => ({
   requireScope: vi.fn(() => async (_c: any, next: any) => next()),
   requirePermission: vi.fn(() => async (_c: any, next: any) => next()),
   requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
+  withAuthDbAccessContext: vi.fn(async (_auth: unknown, fn: () => Promise<unknown>) => fn()),
 }));
 
 vi.mock('../services/aiAgent', () => ({
@@ -168,6 +169,7 @@ import { getUsageSummary, updateBudget, getSessionHistory } from '../services/ai
 import { streamingSessionManager } from '../services/streamingSessionManager';
 import { runPreFlightChecks, abortActivePlan } from '../services/aiAgentSdk';
 import { LlmUnavailableError } from '../services/llm/llmConfigResolver';
+import { LlmNotConfiguredError } from '../services/llm/llmAvailability';
 
 const ORG_ID = 'org-111';
 const SESSION_ID = '11111111-1111-1111-1111-111111111111';
@@ -242,6 +244,19 @@ describe('AI routes', () => {
 
       expect(res.status).toBe(503);
       expect(await res.json()).toEqual({ error: 'ai_unavailable' });
+    });
+
+    it('returns ai_not_configured as 503 when no model provider is configured', async () => {
+      vi.mocked(createSession).mockRejectedValueOnce(new LlmNotConfiguredError());
+
+      const res = await app.request('/ai/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ title: 'Test' }),
+      });
+
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: expect.stringMatching(/not configured/i), code: 'ai_not_configured' });
     });
 
     it('returns 500 on unexpected creation error', async () => {
@@ -428,6 +443,20 @@ describe('AI routes', () => {
       expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
     });
 
+    it('returns ai_not_configured as 503 before touching the SDK manager', async () => {
+      vi.mocked(runPreFlightChecks).mockResolvedValueOnce({ ok: false, error: 'ai_not_configured', status: 503 });
+
+      const res = await app.request(`/ai/sessions/${SESSION_ID}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: JSON.stringify({ content: 'hello there' }),
+      });
+
+      expect(res.status).toBe(503);
+      expect(await res.json()).toEqual({ error: expect.stringMatching(/not configured/i), code: 'ai_not_configured' });
+      expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
+    });
+
     it('preserves the structured retryable 503 from resolver preflight failures', async () => {
       vi.mocked(runPreFlightChecks).mockResolvedValueOnce({
         ok: false,
@@ -548,7 +577,7 @@ describe('AI routes', () => {
         expect.objectContaining({ source: 'partner', configId: 'config-1', configVersion: 3 }),
         undefined,
         undefined,
-        expect.objectContaining({ budgetReservationId: expect.any(String) }),
+        expect.objectContaining({ budgetReservationId: expect.any(String), toolSearch: true }),
       );
     });
   });

@@ -86,6 +86,7 @@
     },
     "filters": {
       "allDevices": "All Devices ({{count}})",
+      "statusFilterLabel": "Compliance status filter",
       "pendingPatches": "Pending Patches ({{count}})",
       "critical": "Critical ({{count}})",
       "pendingReboot": "Pending Reboot ({{count}})",
@@ -264,7 +265,11 @@
       "moreFilters": "More filters",
       "lessFilters": "Less filters",
       "allSources": "All Sources",
-      "allOs": "All OS"
+      "allOs": "All OS",
+      "severityLabel": "Severity",
+      "statusLabel": "Approval status",
+      "sourceLabel": "Source",
+      "osLabel": "Operating system"
     },
     "actions": {
       "deploy": "Deploy",
@@ -299,6 +304,12 @@
     "pagination": {
       "rowsPerPage": "Rows per page",
       "pageStatus": "Page {{current}} of {{total}}"
+    },
+    "installFailure": {
+      "badgeDevices_one": "Install failed on {{count}} device",
+      "badgeDevices_other": "Install failed on {{count}} devices",
+      "noReason": "No reason reported by the agent",
+      "failedAt": "Last install attempt failed: {{when}}"
     }
   },
   "patchesPage": {
@@ -309,6 +320,7 @@
     "tabs": {
       "compliance": "Compliance",
       "patches": "Patches",
+      "jobs": "Jobs",
       "updateRings": "Update Rings"
     },
     "actions": {
@@ -326,6 +338,7 @@
     "errors": {
       "fetchRings": "Failed to fetch update rings",
       "fetchPatches": "Failed to fetch patches",
+      "fetchJobs": "Failed to fetch patch jobs",
       "partnerLevel": "Patch approvals are managed at the partner level",
       "approvePatches": "Failed to approve patches",
       "approveCountOne": "Failed to approve {{count}} patch",
@@ -368,6 +381,68 @@
     },
     "truncatedNotice": "Showing {{shown}} of {{total}} patches. The filters here only narrow what's already loaded, so the rest can't be reached from this view — use the patches API to work through the full catalog.",
     "shiftedNotice": "Showing {{shown}} of {{total}} patches — the catalog changed while it was loading. Reload to see the rest."
+  },
+  "patchJobsList": {
+    "empty": "No patch jobs yet. Jobs created by policies, update rings, or the AI assistant will appear here.",
+    "loading": "Loading patch jobs...",
+    "columns": {
+      "name": "Job",
+      "status": "Status",
+      "devices": "Devices",
+      "createdBy": "Created by",
+      "scheduled": "Scheduled",
+      "started": "Started",
+      "completed": "Completed"
+    },
+    "status": {
+      "scheduled": "Scheduled",
+      "running": "Running",
+      "completed": "Completed",
+      "failed": "Failed",
+      "cancelled": "Cancelled"
+    },
+    "devicesSummary": "{{completed}}/{{total}} completed",
+    "devicesSummaryWithFailed": "{{completed}}/{{total}} completed, {{failed}} failed",
+    "createdBySystem": "System",
+    "notScheduled": "—",
+    "actions": {
+      "tryAgain": "Try again",
+      "previousPage": "Previous",
+      "nextPage": "Next"
+    },
+    "pagination": "Page {{page}} of {{totalPages}}",
+    "filters": {
+      "allStatuses": "All statuses"
+    }
+  },
+  "patchJobDetail": {
+    "title": "Patch job",
+    "loading": "Loading job details...",
+    "notFound": "This patch job could not be found.",
+    "summary": {
+      "status": "Status",
+      "source": "Source",
+      "scheduled": "Scheduled",
+      "started": "Started",
+      "completed": "Completed",
+      "createdBy": "Created by"
+    },
+    "resultsTitle": "Device results ({{count}})",
+    "resultsEmpty": "No per-device results yet.",
+    "columns": {
+      "device": "Device",
+      "patch": "Patch",
+      "status": "Status",
+      "started": "Started",
+      "completed": "Completed",
+      "reboot": "Reboot"
+    },
+    "rebootRequired": "Required",
+    "rebootDone": "Completed",
+    "rebootNotRequired": "—",
+    "errors": {
+      "load": "Failed to load patch job"
+    }
   },
   "ringSelector": {
     "label": "Update Ring:",

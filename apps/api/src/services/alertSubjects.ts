@@ -47,7 +47,14 @@ export async function evaluateSubjectAlerts({ rule, template, device, monitor, e
   for (const subject of subjects) {
     if (subject.status !== 'breaching') continue;
     const context = {
-      ...evidence.context, ...subject.context, source: 'hardware_health', subjectKey: subject.subjectKey,
+      ...evidence.context,
+      ...subject.context,
+      source:
+        monitor?.kind ??
+        (typeof subject.context?.source === 'string'
+          ? subject.context.source
+          : 'hardware_health'),
+      subjectKey: subject.subjectKey,
       deviceName: device.displayName || device.hostname, hostname: device.hostname, osType: device.osType,
       osVersion: device.osVersion, ruleName: rule.name, severity, actualValue: subject.actualValue,
       templateId: template.id, cooldownMinutes: (overrides?.cooldownMinutes as number) ?? template.cooldownMinutes,
@@ -70,7 +77,7 @@ export async function evaluateSubjectAlerts({ rule, template, device, monitor, e
     for (const alert of await open()) {
       const subject = byKey.get(alert.subjectKey!);
       if (!alert.requiresHuman && subject?.status === 'recovered') {
-        await resolveAlert(alert.id, `Auto-resolved: ${subject.description}`, undefined, true);
+        await resolveAlert(alert.id, `Auto-resolved: ${subject.description}`, undefined, true, 'condition_cleared');
       }
     }
   }

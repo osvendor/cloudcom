@@ -31,7 +31,6 @@
     "alertsDetail": "Warnmeldungsdetails",
     "alertsMonitors": "Warnungen – Monitore",
     "alertsMonitorDetail": "Warnungen – Monitor",
-    "alertsRules": "Warnungen – Alte Regeln",
     "alerts": "Warnungen",
     "analytics": "Analysen",
     "approvals": "Genehmigungen",
@@ -61,6 +60,7 @@
     "contractsNew": "Neuer Vertrag",
     "devicesCompare": "Gerätevergleich",
     "devicesGroups": "Gerätegruppen",
+    "devicesUnassigned": "Nicht zugewiesene Geräte",
     "devicesDetail": "Gerätedetails",
     "devices": "Geräte & Assets",
     "devicesNetworkDetail": "Netzwerkgerätedetails",
@@ -79,7 +79,7 @@
     "integrationsWebhooks": "Webhooks",
     "login": "Anmelden",
     "logs": "Protokolle",
-    "monitoring": "Überwachung",
+    "monitoring": "Netzwerk",
     "oauthConsent": "Zugriff autorisieren",
     "onedrive": "OneDrive",
     "organizations": "Organisationen",
@@ -108,6 +108,7 @@
     "reportsDetailEdit": "Bericht bearbeiten",
     "reports": "Berichte",
     "reportsNew": "Bericht erstellen",
+    "reportsSeriesEdit": "Multi-Organisations-Bericht bearbeiten",
     "reportsTemplates": "Berichtsvorlagen",
     "resetPassword": "Passwort zurücksetzen",
     "scriptsDetail": "Skript bearbeiten",
@@ -169,7 +170,8 @@
     "agreementTemplateNew": "Neue Vereinbarungsvorlage",
     "signedAgreements": "Unterzeichnete Vereinbarungen",
     "settingsTicketing": "Ticketing-Einstellungen",
-    "securityScans": "IOC-Scans"
+    "securityScans": "IOC-Scans",
+    "devicesTime": "Zeitsynchronisierung"
   },
   "layout": {
     "metaDescription": "Breeze RMM - Remote-Überwachung und -Verwaltung",

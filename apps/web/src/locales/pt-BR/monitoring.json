@@ -97,7 +97,8 @@
       "create": "Criar monitor",
       "test": "Testar em um dispositivo",
       "deploy": "Implantar em…",
-      "delete": "Excluir"
+      "delete": "Excluir",
+      "backToMonitors": "Voltar para monitores"
     },
     "errors": {
       "load": "Falha ao carregar o monitor",
@@ -154,12 +155,20 @@
     },
     "composite": {
       "children": "Condições filhas",
-      "add": "Adicionar condição"
+      "add": "Adicionar condição",
+      "matchLabel": "Correspondência"
     },
     "restart": {
       "label": "Reiniciar serviço no dispositivo",
       "maxAttempts": "Máximo de tentativas de reinício",
       "cooldownSeconds": "Espera entre reinícios (segundos)"
+    },
+    "networkCheckAsset": {
+      "label": "Ativo",
+      "unbound": "Nenhum ativo vinculado",
+      "failed": "Não foi possível carregar os ativos",
+      "orgRequired": "Selecione uma organização proprietária para vincular um ativo.",
+      "pingName": "Ping para {{label}}"
     }
   },
   "kinds": {
@@ -182,7 +191,8 @@
     "backup_continuity": "Continuidade do backup",
     "script": "Verificação de script",
     "network_check": "Verificação de rede",
-    "hardware_health": "Integridade do hardware"
+    "hardware_health": "Integridade do hardware",
+    "time_sync": "Sincronização de horário"
   },
   "fields": {
     "operator": "Comparação",
@@ -223,7 +233,18 @@
     "port": "Porta",
     "expectStatus": "Código de status esperado",
     "pollingIntervalSeconds": "Consultar a cada (segundos)",
-    "match": "Correspondência"
+    "match": "Correspondência",
+    "pingCount": "Solicitações de eco",
+    "expectBanner": "Banner esperado",
+    "httpMethod": "Método HTTP",
+    "expectedBody": "A resposta deve conter",
+    "followRedirects": "Seguir redirecionamentos",
+    "verifySsl": "Verificar certificado TLS",
+    "recordType": "Tipo de registro",
+    "expectedValue": "Valor esperado",
+    "nameserver": "Servidor de nomes",
+    "degradedIsFailure": "Tratar degradado como falha",
+    "maxResponseMs": "Falhar se mais lento que (ms)"
   },
   "operators": {
     "gt": "maior que",
@@ -279,7 +300,8 @@
   },
   "backupChecks": {
     "no_successful_backup": "Nenhum backup bem-sucedido",
-    "consecutive_failures": "Falhas consecutivas"
+    "consecutive_failures": "Falhas consecutivas",
+    "completed_with_errors": "Concluído com erros de arquivos"
   },
   "checkTypes": {
     "icmp_ping": "Ping ICMP",
@@ -348,6 +370,7 @@
     "convert": "Converter em monitor",
     "converted": "Convertida",
     "notConvertible": "As condições desta regra não podem ser expressas como um único monitor.",
+    "systemManaged": "Regra gerenciada pelo sistema. O Breeze gera este alerta por conta própria, então não há nada para converter.",
     "errors": {
       "fetch": "Falha ao carregar as regras de alerta",
       "convert": "Falha ao converter a regra"
@@ -420,9 +443,9 @@
       "review": "Revisar",
       "convertEverything": "Converter tudo…",
       "confirmTitle": "Converter todas as regras legadas, monitoramentos e automações acionadas por alerta em todas as suas políticas?",
-      "confirmBody": "{{rows}} em {{policies}} de todo o parceiro. Linhas convertidas são aposentadas no lugar. As demais ficam para revisão ou aposentadoria manual em W05c; W05d converte as restantes e aposenta as não convertíveis.",
+      "confirmBody": "{{rows}} em {{policies}} de todo o parceiro. Linhas convertidas são aposentadas no lugar. As demais ficam agora para revisão ou aposentadoria manual; uma versão futura converte as restantes e aposenta as não convertíveis.",
       "confirmRun": "Converter tudo",
-      "convertedAll": "{{converted}} linhas convertidas em {{policies}} políticas; {{unconvertible}} não puderam ser convertidas.",
+      "convertedAll": "{{rows}} convertidas em {{policies}}; {{unconvertible}} não puderam ser convertidas.",
       "errors": {
         "convertAll": "Falha ao converter tudo"
       }
@@ -493,7 +516,7 @@
       "empty": "Nenhum histórico de conversão.",
       "system": "Sistema",
       "reverted": "Revertido",
-      "deadline": "Desfazer fica indisponível após W05d remover o avaliador de origem."
+      "deadline": "Desfazer fica indisponível após a aposentadoria de alertas legados remover o avaliador de origem."
     },
     "errorCodes": {
       "preview_stale": "A política mudou desde esta pré-visualização. Gere uma nova pré-visualização antes de converter.",
@@ -509,6 +532,46 @@
       "conversion_revert_unavailable": "Esta conversão não pode mais ser desfeita.",
       "invalid_reason": "Esse motivo de desativação não é válido.",
       "unknown": "A conversão falhou. Tente novamente."
+    },
+    "retirement": {
+      "summary_one": "{{count}} regra legada não pôde ser convertida em monitor — revise.",
+      "summary_other": "{{count}} regras legadas não puderam ser convertidas em monitores — revise.",
+      "review": "Revisar",
+      "dismiss": "Dispensar",
+      "openAlertsNote": "Estas regras não disparam mais. Os alertas abertos permanecem abertos até que alguém os resolva; recrie a condição como monitor se ainda for necessária.",
+      "reasons": {
+        "custom_condition": "condição personalizada",
+        "nested_group": "grupo de condições aninhado",
+        "no_condition": "sem condição avaliável",
+        "equivalence_delta": "a conversão mudaria o que dispara em alguns dispositivos",
+        "escalation_policy_axis": "a política de escalonamento pertence a uma única organização",
+        "parent_unconverted": "a política pai não foi convertida",
+        "policy_inactive": "a política está inativa ou arquivada",
+        "prerequisite_missing": "falta uma correção pré-requisito neste servidor",
+        "metric_without_kind": "a métrica não tem tipo de monitor",
+        "child_kind_not_composable": "condição incompatível com monitor composto",
+        "too_many_conditions": "condições demais",
+        "too_many_responses": "seriam necessárias mais de dez respostas",
+        "auto_resolve_conditions": "não é possível preservar as condições de resolução personalizadas",
+        "target_unconvertible": "o destino da resposta não pode ser convertido",
+        "already_managed": "já é gerenciada por um monitor",
+        "no_org": "a verificação não pertence a nenhuma organização",
+        "asset_missing": "o ativo descoberto vinculado não existe mais",
+        "condition_invalid": "as configurações da verificação não formam uma condição de monitor válida",
+        "no_active_rules": "a verificação não tem nenhuma regra de alerta ativa",
+        "multiple_network_rules": "a verificação tem mais de uma regra de alerta ativa",
+        "network_predicate_unsupported": "a condição de alerta não tem equivalente nos monitores",
+        "network_threshold_out_of_range": "o limite de falhas está fora do intervalo (no máximo 100 falhas consecutivas)",
+        "site_binding_unrepresentable": "a verificação vinculada a um site não está associada a nenhum ativo descoberto",
+        "config_override_unrepresentable": "o destino ou o tempo limite personalizado não pode ser preservado",
+        "built_in": "regra de sistema integrada; continua alertando por conta própria",
+        "no_rules": "o modelo não tem regras para converter",
+        "target_or_owner": "o destino ou o proprietário de uma regra difere do seu modelo",
+        "blocked": "a conversão está bloqueada",
+        "disabled_response_automation": "a automação de resposta está desativada",
+        "alert_workflow_kept": "o fluxo de alertas é mantido como está",
+        "unknown": "conversão recusada; revise a origem"
+      }
     }
   },
   "device": {
@@ -541,7 +604,41 @@
           "warning": "Aviso",
           "critical": "Crítico"
         }
+      },
+      "time_sync": {
+        "findings": "Problemas",
+        "consecutiveSnapshots": "Instantâneos consecutivos",
+        "findingOptions": {
+          "pdc_no_external_source": "O PDC raiz da floresta não tem fonte externa",
+          "source_local_clock": "Usando o relógio local",
+          "dc_vm_host_sync": "O controlador de domínio está sincronizando com o host da VM",
+          "ntp_server_unresolvable": "O nome do servidor NTP é inválido ou não pode ser resolvido",
+          "ntp_peer_unreachable": "O par NTP está inacessível",
+          "domain_source_unavailable": "Fonte de hora do domínio indisponível",
+          "member_not_on_hierarchy": "Não está usando a hierarquia do domínio",
+          "sync_disabled": "A sincronização de hora está desabilitada",
+          "sync_stale": "Nenhuma sincronização bem-sucedida recente",
+          "correction_refused": "A correção de hora foi recusada",
+          "timezone_mismatch": "O fuso horário é diferente do esperado",
+          "policy_not_applied": "A política de hora não foi aplicada",
+          "policy_conflict_gpo": "A Política de Grupo controla as configurações de hora"
+        }
       }
     }
+  },
+  "httpMethods": {
+    "GET": "GET (obter)",
+    "HEAD": "HEAD (somente cabeçalhos)",
+    "POST": "POST (enviar)",
+    "PUT": "PUT (substituir)",
+    "OPTIONS": "OPTIONS (recursos)"
+  },
+  "dnsRecordTypes": {
+    "A": "A (endereço IPv4)",
+    "AAAA": "AAAA (endereço IPv6)",
+    "MX": "MX (servidor de e-mail)",
+    "CNAME": "CNAME (nome alternativo)",
+    "TXT": "TXT (texto)",
+    "NS": "NS (servidor de nomes)"
   }
 }

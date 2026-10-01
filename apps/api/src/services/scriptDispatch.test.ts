@@ -1,6 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { SQL, Param } from 'drizzle-orm';
 
+// Devices parked in a holding org, by id. The helper's query is proven against
+// Postgres in parkedCommandDelivery.integration.test.ts.
+const parkedDeviceIds = vi.hoisted(() => new Set<string>());
+vi.mock('./unassignedPool/deliveryEligibility', async () => ({
+  ...(await vi.importActual<typeof import('./unassignedPool/deliveryEligibility')>(
+    './unassignedPool/deliveryEligibility',
+  )),
+  isParkedDevice: vi.fn(async (_reader: unknown, deviceId: string) => parkedDeviceIds.has(deviceId)),
+}));
+
 vi.mock('../db', () => ({
   db: { select: vi.fn(), insert: vi.fn(), update: vi.fn(), delete: vi.fn() },
   runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
@@ -222,6 +232,21 @@ describe('dispatchScriptToDevice — invariants', () => {
     // Decommission is permanent — checked against the caller's snapshot with
     // no live re-read.
     expect(db.select).not.toHaveBeenCalled();
+  });
+
+  it('refuses a parked device before any row is written or payload sealed', async () => {
+    const parked = device();
+    parkedDeviceIds.add(parked.id);
+    try {
+      const r = await dispatchScriptToDevice({ device: parked, source: { kind: 'saved', script: savedScript() } });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.code).toBe('device_pending_assignment');
+      expect(db.insert).not.toHaveBeenCalled();
+      expect(encryptSensitivePayloadFields).not.toHaveBeenCalled();
+      expect(queueCommand).not.toHaveBeenCalled();
+    } finally {
+      parkedDeviceIds.clear();
+    }
   });
 
   it('rejects offline device under a reject policy (snapshot and live read agree)', async () => {
@@ -751,6 +776,130 @@ describe('dispatchScriptToDevice — delivery', () => {
     }
     expect(consoleWarnSpy).not.toHaveBeenCalled();
     consoleWarnSpy.mockRestore();
+  });
+});
+
+// #3445: a caller that dispatches inside a transaction (the automation
+// runtime's per-device lock) must not put the command on the wire before that
+// transaction commits, or a fast agent's result reaches rows it cannot see.
+describe('dispatchScriptToDevice — deferDelivery (#3445)', () => {
+  function mockRunningUpdate() {
+    const setSpy = vi.fn();
+    vi.mocked(db.update).mockReturnValue({
+      set: (vals: Record<string, unknown>) => {
+        setSpy(vals);
+        return { where: () => Promise.resolve(undefined) };
+      },
+    } as any);
+    return setSpy;
+  }
+
+  it('creates the rows but neither claims nor sends until deliver() is called', async () => {
+    const setSpy = mockRunningUpdate();
+    const executedAt = new Date('2026-09-26T00:00:00Z');
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ executedAt } as any);
+    vi.mocked(sendCommandToAgent).mockReturnValue(true);
+
+    const r = await dispatchScriptToDevice({
+      device: device({ agentId: 'agent-1' }),
+      source: { kind: 'saved', script: savedScript() },
+      deferDelivery: true,
+    });
+
+    expect(queueCommand).toHaveBeenCalledTimes(1);
+    expect(claimPendingCommandForDelivery).not.toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+    expect(setSpy).not.toHaveBeenCalled();
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.delivered).toBe(false);
+    expect(r.deliveryOutcome).toBe('deferred');
+    expect(r.deliver).toBeTypeOf('function');
+
+    const delivered = await r.deliver!();
+    expect(claimPendingCommandForDelivery).toHaveBeenCalledWith('cmd-1');
+    expect(sendCommandToAgent).toHaveBeenCalledWith('agent-1', expect.objectContaining({ id: 'cmd-1', type: 'script' }));
+    expect(setSpy).toHaveBeenCalledWith({ status: 'running', startedAt: executedAt });
+    expect(delivered).toEqual(expect.objectContaining({
+      ok: true,
+      commandId: 'cmd-1',
+      executionId: 'exec-1',
+      delivered: true,
+      deliveryOutcome: 'sent',
+      executedAt,
+    }));
+  });
+
+  it('deliver() writes the running flip in its own system context (it runs with no ambient transaction)', async () => {
+    mockRunningUpdate();
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ executedAt: new Date() } as any);
+    vi.mocked(sendCommandToAgent).mockReturnValue(true);
+    const { withSystemDbAccessContext } = await import('../db');
+
+    const r = await dispatchScriptToDevice({
+      device: device({ agentId: 'agent-1' }),
+      source: { kind: 'saved', script: savedScript() },
+      deferDelivery: true,
+    });
+    if (!r.ok) throw new Error('expected ok');
+    vi.mocked(withSystemDbAccessContext).mockClear();
+    await r.deliver!();
+    expect(withSystemDbAccessContext).toHaveBeenCalled();
+  });
+
+  it('deliver() reports no_agent without claiming when the device has no agent', async () => {
+    const r = await dispatchScriptToDevice({
+      device: device({ agentId: null }),
+      source: { kind: 'saved', script: savedScript() },
+      deferDelivery: true,
+    });
+    if (!r.ok) throw new Error('expected ok');
+    const delivered = await r.deliver!();
+    expect(claimPendingCommandForDelivery).not.toHaveBeenCalled();
+    expect(delivered).toEqual(expect.objectContaining({ ok: true, delivered: false, deliveryOutcome: 'no_agent' }));
+  });
+
+  it('a send that throws after the claim releases the claim back to pending before propagating', async () => {
+    const executedAt = new Date('2026-09-26T00:00:00Z');
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ executedAt } as any);
+    vi.mocked(sendCommandToAgent).mockImplementationOnce(() => { throw new Error('socket-local in worker role'); });
+    const { releaseClaimedCommandDelivery } = await import('./commandDispatch');
+
+    const r = await dispatchScriptToDevice({
+      device: device({ agentId: 'agent-1' }),
+      source: { kind: 'saved', script: savedScript() },
+      deferDelivery: true,
+    });
+    if (!r.ok) throw new Error('expected ok');
+    await expect(r.deliver!()).rejects.toThrow('socket-local in worker role');
+    expect(releaseClaimedCommandDelivery).toHaveBeenCalledWith('cmd-1', executedAt);
+  });
+
+  it('a failed running flip after a successful send still reports delivered (the agent has it)', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.mocked(db.update).mockReturnValue({
+      set: () => ({ where: () => Promise.reject(new Error('connection reset')) }),
+    } as any);
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ executedAt: new Date() } as any);
+    vi.mocked(sendCommandToAgent).mockReturnValue(true);
+
+    const r = await dispatchScriptToDevice({
+      device: device({ agentId: 'agent-1' }),
+      source: { kind: 'saved', script: savedScript() },
+      deferDelivery: true,
+    });
+    if (!r.ok) throw new Error('expected ok');
+    const delivered = await r.deliver!();
+    expect(delivered).toEqual(expect.objectContaining({ ok: true, delivered: true, deliveryOutcome: 'sent' }));
+    expect(captureException).toHaveBeenCalled();
+    consoleErrorSpy.mockRestore();
+  });
+
+  it('without deferDelivery the result carries no deliver() (immediate path unchanged)', async () => {
+    const r = await dispatchScriptToDevice({ device: device({ agentId: null }), source: { kind: 'saved', script: savedScript() } });
+    if (!r.ok) throw new Error('expected ok');
+    expect(r.deliver).toBeUndefined();
+    expect(r.deliveryOutcome).toBe('no_agent');
   });
 });
 
@@ -1464,6 +1613,33 @@ describe('dispatchScriptToDevice — tenantSecret parameters', () => {
       // which decides row ownership, differs.
       expect(r.error).toBe(AGENT_UPGRADE_REQUIRED_MESSAGE);
     }
+  });
+
+  // #3445: a deferred dispatch runs the same gate, later, from deliver() — with
+  // no ambient transaction, so the gate needs its own system context.
+  it('deferred: deliver() runs the claim gate in its own system context and surfaces its refusal', async () => {
+    mockSealOnce();
+    vi.mocked(claimPendingCommandForDelivery).mockResolvedValue({ executedAt: new Date() } as any);
+    vi.mocked(sendCommandToAgent).mockReturnValue(true);
+    vi.mocked(failClaimedSecretCommandsForUnsupportedAgent).mockResolvedValue([]);
+    const { withSystemDbAccessContext } = await import('../db');
+
+    const r = await dispatchSecret({ device: device({ agentId: 'agent-1' }), deferDelivery: true });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(failClaimedSecretCommandsForUnsupportedAgent).not.toHaveBeenCalled();
+
+    vi.mocked(withSystemDbAccessContext).mockClear();
+    const delivered = await r.deliver!();
+
+    expect(failClaimedSecretCommandsForUnsupportedAgent).toHaveBeenCalledTimes(1);
+    expect(withSystemDbAccessContext).toHaveBeenCalled();
+    expect(sendCommandToAgent).not.toHaveBeenCalled();
+    expect(delivered).toEqual({
+      ok: false,
+      code: 'agent_upgrade_required_recorded',
+      error: AGENT_UPGRADE_REQUIRED_MESSAGE,
+    });
   });
 
   // The gate's own try/catch covers only its writes: the capability SELECT

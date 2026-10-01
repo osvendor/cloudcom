@@ -106,8 +106,9 @@ function rigDeviceListRows(
   const limit = vi.fn().mockReturnValue({ offset });
   const orderBy = vi.fn().mockReturnValue({ limit });
   const where = vi.fn().mockReturnValue({ orderBy });
-  // Two chained leftJoins (deviceHardware, then deviceReliability #1720), so
-  // each leftJoin returns a thenable that also exposes the next leftJoin.
+  // Three chained leftJoins (deviceHardware, deviceReliability #1720,
+  // deviceHardwareHealth #6854), so each leftJoin returns an object exposing
+  // the next leftJoin and the terminal where().
   const chain: Record<string, unknown> = {};
   const leftJoin = vi.fn().mockReturnValue(chain);
   chain.leftJoin = leftJoin;
@@ -176,6 +177,12 @@ describe('GET /devices — response shape', () => {
         possibleReplacementOfDeviceId: '55555555-5555-4555-8555-555555555555',
         purchaseDate: '2025-03-01',
         purchaseDateSource: 'vendor',
+        updateOfferWithheldReason: 'edition_unconfirmed',
+        updateAttemptTargetVersion: 'v0.68.0',
+        updateAttemptStartedAt: new Date('2026-05-26T19:20:00.000Z'),
+        updateAttemptLastAt: new Date('2026-05-26T19:24:00.000Z'),
+        helperInstallIssue: 'awaiting_server_offer',
+        lastLogAt: new Date('2026-05-26T19:30:00.000Z'),
       },
       ],
       [{ device_id: '33333333-3333-4333-8333-333333333333', ip_address: '10.20.30.40' }],
@@ -229,6 +236,29 @@ describe('GET /devices — response shape', () => {
     // so the Device Settings modal showed a blank field after save/reload.
     expect(row).toHaveProperty('purchaseDate', '2025-03-01');
     expect(row).toHaveProperty('purchaseDateSource', 'vendor');
+    // #7068/#7023 — stuck-self-update and Assist-install-issue list badges
+    // read these fields off the list row directly (DeviceList.tsx); the
+    // detail route already returns them via projectPublicDevice, but the
+    // list select/mapper in core.ts was never extended to match.
+    expect(row).toHaveProperty('updateOfferWithheldReason', 'edition_unconfirmed');
+    expect(row).toHaveProperty('updateAttemptTargetVersion', 'v0.68.0');
+    expect(row).toHaveProperty(
+      'updateAttemptStartedAt',
+      new Date('2026-05-26T19:20:00.000Z').toISOString(),
+    );
+    expect(row).toHaveProperty(
+      'updateAttemptLastAt',
+      new Date('2026-05-26T19:24:00.000Z').toISOString(),
+    );
+    expect(row).toHaveProperty('helperInstallIssue', 'awaiting_server_offer');
+    // #7067 — the "logs silent" list badge (DeviceList.tsx) reads lastLogAt
+    // off the list row directly; the detail route already returns it via
+    // projectPublicDevice, but the list select/mapper needs the same fix as
+    // #7068/#7023 above or the badge silently never renders on the list.
+    expect(row).toHaveProperty(
+      'lastLogAt',
+      new Date('2026-05-26T19:30:00.000Z').toISOString(),
+    );
   });
 
   it('returns null watchdogStatus / mainAgentSilentSince for healthy rows (still present in shape)', async () => {
@@ -274,6 +304,12 @@ describe('GET /devices — response shape', () => {
         helperLifecycleMode: null,
         purchaseDate: null,
         purchaseDateSource: null,
+        updateOfferWithheldReason: null,
+        updateAttemptTargetVersion: null,
+        updateAttemptStartedAt: null,
+        updateAttemptLastAt: null,
+        helperInstallIssue: null,
+        lastLogAt: null,
       },
     ]);
 
@@ -348,79 +384,53 @@ describe('GET /devices — response shape', () => {
     expect(Object.prototype.hasOwnProperty.call(row, 'purchaseDateSource')).toBe(true);
     expect(row.purchaseDate).toBeNull();
     expect(row.purchaseDateSource).toBeNull();
+
+    // #7068/#7023 — keys present (null) for a healthy device with no stuck
+    // update / withheld offer / Assist install issue.
+    expect(Object.prototype.hasOwnProperty.call(row, 'updateOfferWithheldReason')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'updateAttemptTargetVersion')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'updateAttemptStartedAt')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'updateAttemptLastAt')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(row, 'helperInstallIssue')).toBe(true);
+    expect(row.updateOfferWithheldReason).toBeNull();
+    expect(row.updateAttemptTargetVersion).toBeNull();
+    expect(row.updateAttemptStartedAt).toBeNull();
+    expect(row.updateAttemptLastAt).toBeNull();
+    expect(row.helperInstallIssue).toBeNull();
+
+    // #7067 — key present (null) for a device that has never shipped a log
+    // (or predates this column).
+    expect(Object.prototype.hasOwnProperty.call(row, 'lastLogAt')).toBe(true);
+    expect(row.lastLogAt).toBeNull();
   });
 
-  it.each(['warning', 'critical', 'unknown'] as const)('projects and filters hardware %s for rows and total', async health => {
-    const { where, leftJoin } = rigDeviceListRows([{
+  it.each(['ok', 'warning', 'critical', 'unknown'] as const)('projects the hardware %s rollup on list rows', async health => {
+    const { leftJoin } = rigDeviceListRows([{
       id: '11111111-1111-4111-8111-111111111111', hostname: 'hardware-host',
       hardwareHealth: health, hardwareHealthSummary: { counts: { 'physical_disk:critical': 2 }, controllerNames: ['PERC'] },
     }]);
-    const countWhere = vi.fn().mockResolvedValue([{ count: 1 }]);
-    const countChain: Record<string, unknown> = { where: countWhere };
-    const countJoin = vi.fn().mockReturnValue(countChain);
-    countChain.leftJoin = countJoin;
-    vi.mocked(db.select).mockReturnValueOnce({ from: vi.fn().mockReturnValue(countChain) } as never);
-    const response = await app.request(`/devices?hardwareHealth=${health}&includeTotal=true`);
+    const response = await app.request('/devices');
     expect(response.status).toBe(200);
     const body = await response.json();
     expect(body.data[0]).toMatchObject({ hardwareHealth: health, hardwareHealthSummary: { counts: { 'physical_disk:critical': 2 }, controllerNames: ['PERC'] } });
-    expect(body.pagination.total).toBe(1);
-    expect(vi.mocked(db.select).mock.calls[1]?.[0]).toMatchObject({
+    expect(vi.mocked(db.select).mock.calls[0]?.[0]).toMatchObject({
       hardwareHealth: deviceHardwareHealth.health, hardwareHealthSummary: deviceHardwareHealth.summary,
     });
     expect(leftJoin.mock.calls.some(([table]) => table === deviceHardwareHealth)).toBe(true);
-    expect(countJoin.mock.calls.some(([table]) => table === deviceHardwareHealth)).toBe(true);
-    for (const value of [where.mock.calls[0]?.[0], countWhere.mock.calls[0]?.[0]]) {
-      const query = new PgDialect().sqlToQuery(value as SQL);
-      expect(query.sql).toContain('"device_hardware_health"."health"');
-      expect(query.sql).not.toMatch(/coalesce/i);
-      expect(query.params).toContain(health);
-    }
   });
   it('preserves null projection when no hardware row exists', async () => {
     rigDeviceListRows([{ id: '11111111-1111-4111-8111-111111111111', hardwareHealth: null, hardwareHealthSummary: null }]);
     const response = await app.request('/devices');
     expect((await response.json()).data[0]).toMatchObject({ hardwareHealth: null, hardwareHealthSummary: null });
   });
-  it.each(['ok', 'invalid', ''])('rejects unsupported hardware filter %s', async health => {
-    const response = await app.request(`/devices?hardwareHealth=${health}`);
-    expect(response.status).toBe(400);
-    expect(db.select).not.toHaveBeenCalled();
-  });
-  it('rejects a cross-org hardware filter before querying', async () => {
-    const response = await app.request('/devices?hardwareHealth=critical&orgId=22222222-2222-4222-8222-222222222222');
-    expect(response.status).toBe(403);
-    expect(db.select).not.toHaveBeenCalled();
-  });
-  it('keeps the caller organization predicate with the hardware filter', async () => {
-    const orgId = '11111111-1111-4111-8111-111111111111';
-    vi.mocked(authMiddleware).mockImplementationOnce(async (c, next) => {
-      c.set('auth', { scope: 'organization', orgId, accessibleOrgIds: [orgId],
-        canAccessOrg: (id: string) => id === orgId,
-        orgCondition: (column: typeof devices.orgId) => eq(column, orgId),
-      } as never);
-      await next();
-    });
+  // Filtering on hardware health goes through the shared filter engine
+  // (`hardware.health`), not a bespoke list query param.
+  it('does not filter on a hardwareHealth query param', async () => {
     const { where } = rigDeviceListRows([]);
     const response = await app.request('/devices?hardwareHealth=critical');
     expect(response.status).toBe(200);
     const query = new PgDialect().sqlToQuery(where.mock.calls[0]?.[0] as SQL);
-    expect(query.sql).toContain('"devices"."org_id"');
-    expect(query.sql).toContain('"device_hardware_health"."health"');
-    expect(query.params).toEqual(expect.arrayContaining([orgId, 'critical']));
-  });
-  it('returns an empty filtered list without dropping pagination', async () => {
-    rigDeviceListRows([]);
-    const response = await app.request('/devices?hardwareHealth=warning');
-    expect(await response.json()).toMatchObject({ data: [], pagination: { nextCursor: null } });
-  });
-  it('does not query when authentication rejects the request', async () => {
-    vi.mocked(authMiddleware).mockImplementationOnce(async c => c.json({ error: 'Unauthorized' }, 401));
-    expect((await app.request('/devices?hardwareHealth=critical')).status).toBe(401);
-    expect(db.select).not.toHaveBeenCalled();
-  });
-  it('does not report database failure as empty healthy inventory', async () => {
-    vi.mocked(db.select).mockImplementationOnce(() => { throw new Error('database unavailable'); });
-    expect((await app.request('/devices?hardwareHealth=critical')).status).toBe(500);
+    expect(query.sql).not.toContain('device_hardware_health');
+    expect(query.params).not.toContain('critical');
   });
 });

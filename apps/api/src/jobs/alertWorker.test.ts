@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { beforeEach, describe, expect, it, vi, afterEach } from 'vitest';
 
 const {
@@ -18,6 +19,7 @@ const {
   const ctx = {
     depth: 0,
     orgReadDepths: [] as number[],
+    wheres: [] as unknown[],
     deviceReadDepths: [] as number[],
     addBulkDepths: [] as number[],
     networkCheckReadDepths: [] as number[],
@@ -62,6 +64,11 @@ vi.mock('drizzle-orm', () => ({
   isNotNull: (col: unknown) => ({ op: 'isNotNull', col })
 }));
 
+vi.mock('../services/unassignedPool/selectorPredicate', () => ({
+  notHoldingOrgCondition: () => ({ op: 'notHoldingOrg' }),
+  notParkedDeviceCondition: () => ({ op: 'notParkedDevice' }),
+}));
+
 vi.mock('../db/schema', () => ({
   devices: devicesSchema,
   deviceMetrics: {},
@@ -81,14 +88,16 @@ vi.mock('../db', () => ({
       from: (table: unknown) => {
         if (table === organizationsSchema) {
           return {
-            where: () => {
+            where: (cond: unknown) => {
+              ctx.wheres.push(cond);
               ctx.orgReadDepths.push(ctx.depth);
               return Promise.resolve([{ id: 'org-1' }]);
             }
           };
         }
         return {
-          where: () => ({
+          where: (cond: unknown) => ({
+            ...(ctx.wheres.push(cond), {}),
             orderBy: () => ({
               limit: (limit: number) => {
                 ctx.deviceReadDepths.push(ctx.depth);
@@ -143,8 +152,6 @@ vi.mock('../services/redis', () => ({
 vi.mock('../services/alertService', () => ({
   evaluateDeviceAlerts: vi.fn(),
   checkAllAutoResolve: vi.fn(),
-  evaluateDeviceAlertsFromPolicy: vi.fn(),
-  checkAutoResolveFromConfigPolicy: vi.fn()
 }));
 
 vi.mock('../services/bullmqUtils', () => ({
@@ -177,6 +184,7 @@ import { createAlertWorker, processEvaluateAll, triggerFullEvaluation } from './
 const resetCtx = () => {
   ctx.depth = 0;
   ctx.orgReadDepths.length = 0;
+  ctx.wheres.length = 0;
   ctx.deviceReadDepths.length = 0;
   ctx.addBulkDepths.length = 0;
   ctx.networkCheckReadDepths.length = 0;
@@ -212,6 +220,14 @@ describe('alertWorker.processEvaluateAll cursor fan-out', () => {
     const jobs = firstCall[0];
     expect(jobs).toHaveLength(50);
     expect(jobs[0]!.data.deviceId).toBe('device-000000');
+  });
+
+  it('leaves the holding org and parked devices out of the evaluation sweep', async () => {
+    fleetState.fleet = buildFleet(3);
+    await processEvaluateAll({ type: 'evaluate-all' });
+    const text = JSON.stringify(ctx.wheres);
+    expect(text).toContain('notHoldingOrg');
+    expect(text).toContain('notParkedDevice');
   });
 
   it('paginates through multiple chunks when fleet > chunkSize', async () => {
@@ -344,17 +360,28 @@ describe('alertWorker evaluate-all #1105 DB-context scoping', () => {
     expect(ctx.tripwireViolations).toEqual([]);
   });
 
+  it('evaluate-device runs only the monitor/standalone evaluator', async () => {
+    createAlertWorker();
+    const service = await import('../services/alertService');
+    vi.mocked(service.evaluateDeviceAlerts).mockResolvedValue(['a1']);
+    const result = await workerState.processor!({ data: {
+      type: 'evaluate-device', deviceId: 'device-1', orgId: 'org-1',
+    } });
+    expect(result).toMatchObject({ alertsCreated: 1 });
+    expect(readFileSync(new URL('./alertWorker.ts', import.meta.url), 'utf8'))
+      .not.toMatch(/evaluateDeviceAlertsFromPolicy|checkAutoResolveFromConfigPolicy/);
+  });
+
   it('still wraps per-device evaluation in a system DB context', async () => {
     createAlertWorker();
     expect(workerState.processor).toBeTypeOf('function');
 
     const seenDepths: number[] = [];
-    const { evaluateDeviceAlerts, evaluateDeviceAlertsFromPolicy } = await import('../services/alertService');
+    const { evaluateDeviceAlerts } = await import('../services/alertService');
     vi.mocked(evaluateDeviceAlerts).mockImplementation(async () => {
       seenDepths.push(ctx.depth);
       return [];
     });
-    vi.mocked(evaluateDeviceAlertsFromPolicy).mockImplementation(async () => []);
 
     await workerState.processor!({ data: { type: 'evaluate-device', deviceId: 'device-1', orgId: 'org-1' } });
 
@@ -365,9 +392,8 @@ describe('alertWorker evaluate-all #1105 DB-context scoping', () => {
   it('drains subject events after device commit and outside the fleet context', async () => {
     subjectOutbox.depths.length = 0;
     createAlertWorker();
-    const { evaluateDeviceAlerts, evaluateDeviceAlertsFromPolicy } = await import('../services/alertService');
+    const { evaluateDeviceAlerts } = await import('../services/alertService');
     vi.mocked(evaluateDeviceAlerts).mockResolvedValue([]);
-    vi.mocked(evaluateDeviceAlertsFromPolicy).mockResolvedValue([]);
     await workerState.processor!({ data: { type: 'evaluate-device', deviceId: 'device-1', orgId: 'org-1' } });
     expect(subjectOutbox.depths).toEqual([0]);
     fleetState.fleet = [];

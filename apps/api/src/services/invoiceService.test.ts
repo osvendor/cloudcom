@@ -116,6 +116,14 @@ vi.mock('../jobs/accountingSyncWorker', () => ({
   enqueueAccountingPaymentDelete: vi.fn().mockResolvedValue(true),
 }));
 
+// Xero W01 producer gate: the issue/void hooks only enqueue when the partner
+// has an invoice-push-capable connection, and the job carries its id. Defaults
+// to a connected QuickBooks row so every existing hook test drives the same path.
+vi.mock('./accounting/accountingConnectionService', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./accounting/accountingConnectionService')>()),
+  resolveActiveConnectionFor: vi.fn().mockResolvedValue({ id: 'c1', provider: 'quickbooks' }),
+}));
+
 // The Phase D2 payment push/delete REQUEST helpers recordPayment/voidPayment
 // call inside their own transaction. Mocked so these tests assert the
 // DELEGATION (transaction handle, arguments, ordering against the enqueue),
@@ -125,6 +133,9 @@ vi.mock('./accounting/accountingPaymentPush', () => ({
   requestPaymentDelete: vi.fn().mockResolvedValue(null),
   fanOutOwedPayments: vi.fn().mockResolvedValue([]),
 }));
+
+const { captureExceptionMock } = vi.hoisted(() => ({ captureExceptionMock: vi.fn() }));
+vi.mock('./sentry', () => ({ captureException: captureExceptionMock }));
 
 import { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
@@ -140,6 +151,8 @@ import {
 } from '../jobs/accountingSyncWorker';
 import { requestPaymentPush, requestPaymentDelete, fanOutOwedPayments } from './accounting/accountingPaymentPush';
 import { requestInvoiceSessionRevocation } from './stripeSessionRevocation';
+import { resolveActiveConnectionFor } from './accounting/accountingConnectionService';
+const resolveActiveConnectionForMock = vi.mocked(resolveActiveConnectionFor);
 
 const requestPaymentPushMock = vi.mocked(requestPaymentPush);
 const requestPaymentDeleteMock = vi.mocked(requestPaymentDelete);
@@ -1020,7 +1033,30 @@ describe('issueInvoice document_locale stamp', () => {
   it('enqueues an accounting push for the issued invoice, keyed off the locked row', async () => {
     queueIssuePath(draft(), { id: 'p1', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30, settings: {} });
     await svc.issueInvoice('inv1', actor);
-    expect(enqueueAccountingInvoicePushMock).toHaveBeenCalledWith('inv1', 'p1');
+    expect(enqueueAccountingInvoicePushMock).toHaveBeenCalledWith('inv1', 'p1', 'c1');
+  });
+
+  it('does not enqueue an auto-push when the partner has no invoice-push-capable connection (Xero W01 producer gate)', async () => {
+    queueIssuePath(draft(), { id: 'p1', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30, settings: {} });
+    resolveActiveConnectionForMock.mockResolvedValueOnce(null);
+    await svc.issueInvoice('inv1', actor);
+    expect(resolveActiveConnectionForMock).toHaveBeenCalledWith('p1', 'invoicePush');
+    expect(enqueueAccountingInvoicePushMock).not.toHaveBeenCalled();
+  });
+
+  it('enqueues the auto-push with the active connection id', async () => {
+    queueIssuePath(draft(), { id: 'p1', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30, settings: {} });
+    resolveActiveConnectionForMock.mockResolvedValueOnce({ id: 'c1', provider: 'quickbooks' } as never);
+    await svc.issueInvoice('inv1', actor);
+    expect(enqueueAccountingInvoicePushMock).toHaveBeenCalledWith('inv1', 'p1', 'c1');
+  });
+
+  it('does not let a failed connection read fail the (already-committed) issuance', async () => {
+    queueIssuePath(draft(), { id: 'p1', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30, settings: {} });
+    resolveActiveConnectionForMock.mockRejectedValueOnce(new Error('db blip'));
+    await expect(svc.issueInvoice('inv1', actor)).resolves.toBeDefined();
+    expect(enqueueAccountingInvoicePushMock).not.toHaveBeenCalled();
+    expect(captureExceptionMock).toHaveBeenCalled();
   });
 
   it('does not let a failed accounting-push enqueue fail the (already-committed) issuance', async () => {
@@ -1031,7 +1067,7 @@ describe('issueInvoice document_locale stamp', () => {
 
   /**
    * Settings consolidation W02-API (M11, audit finding 22): the issue-time
-   * `terms` stamp now goes through the SHARED resolveInvoiceFooter, so it
+   * `terms` stamp now goes through the SHARED resolveDocumentFooter, so it
    * considers `portal_branding.footerText` — the fallback the render path has
    * always had. Behaviour note: already-issued invoices are untouched (their
    * `terms` column is written and this path never re-runs); a NEWLY issued
@@ -1059,14 +1095,16 @@ describe('issueInvoice document_locale stamp', () => {
     expect(issueSet().terms).toBe('Partner footer');
   });
 
-  it('stamps a null terms when neither a partner footer nor a portal footer exists', async () => {
+  it("stamps the explicit empty marker '' (not NULL) when neither a partner footer nor a portal footer exists (#7216)", async () => {
+    // NULL means "not frozen — resolve live" to the render path, so a NULL
+    // stamp let a footer added after issue print on the issued invoice.
     queueIssuePath(
       draft(),
       { id: 'p1', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30, settings: {}, invoiceFooter: null },
       [],
     );
     await svc.issueInvoice('inv1', actor);
-    expect(issueSet().terms).toBeNull();
+    expect(issueSet().terms).toBe('');
   });
 });
 
@@ -1835,6 +1873,7 @@ describe('getInvoice — accountingSync (QuickBooks Phase C, Task 5)', () => {
     queueResult([]); // grouped evidence counts
     queueResult([]); // stripe connection (not connected)
     queueResult([{
+      provider: 'quickbooks',
       syncStatus: 'synced',
       lastSyncedAt: new Date('2026-09-01T12:00:00.000Z'),
       lastError: null,
@@ -1860,6 +1899,7 @@ describe('getInvoice — accountingSync (QuickBooks Phase C, Task 5)', () => {
     queueResult([]);
     queueResult([]);
     queueResult([{
+      provider: 'quickbooks',
       syncStatus: 'error',
       lastSyncedAt: null,
       lastError: 'Deleted in QuickBooks',
@@ -2408,7 +2448,7 @@ describe('voidPayment -> QuickBooks delete hook', () => {
     ]);
 
     await expect(svc.voidPayment('pay1', actor)).rejects.toMatchObject({
-      status: 409, code: 'QUICKBOOKS_OWNED_PAYMENT',
+      status: 409, code: 'PROVIDER_OWNED_PAYMENT',
     });
     expect(requestPaymentDeleteMock).not.toHaveBeenCalled();
     expect((db as unknown as { delete: Mock }).delete).not.toHaveBeenCalled();
@@ -2440,7 +2480,7 @@ describe('voidPayment -> QuickBooks delete hook', () => {
     queueVoidPaymentReads(payment(), [{ breezeOrigin: false }], [{ status: 'connected', pullPayments: true }]);
 
     await expect(svc.voidPayment('pay1', actor)).rejects.toMatchObject({
-      status: 409, code: 'QUICKBOOKS_OWNED_PAYMENT',
+      status: 409, code: 'PROVIDER_OWNED_PAYMENT',
     });
     expect(requestPaymentDeleteMock).not.toHaveBeenCalled();
     expect((db as unknown as { delete: Mock }).delete).not.toHaveBeenCalled();
@@ -2457,7 +2497,7 @@ describe('voidPayment -> QuickBooks delete hook', () => {
 
     const res = await svc.voidPayment('pay1', actor);
 
-    expect(res.audit).toMatchObject({ paymentId: 'pay1', quickbooksRecordUntouched: true });
+    expect(res.audit).toMatchObject({ paymentId: 'pay1', providerRecordUntouched: true });
     expect(requestPaymentDeleteMock).toHaveBeenCalled();
     // No QuickBooks write: Breeze never created that Payment.
     expect(enqueuePaymentDeleteMock).not.toHaveBeenCalled();
@@ -2483,6 +2523,20 @@ describe('voidPayment -> QuickBooks delete hook', () => {
     }));
   });
 
+  it('keeps the persisted audit action and names the provider (Xero W05 refinement 21)', async () => {
+    // Reuse the setup of the existing "writes its own durable audit" test for a
+    // remote-origin void with pull off.
+    requestPaymentDeleteMock.mockResolvedValue(null);
+    queueVoidPaymentReads(payment(), [{ breezeOrigin: false }], [{ status: 'connected', pullPayments: false }]);
+
+    await svc.voidPayment('pay1', actor);
+
+    expect(writeAuditEventMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: 'invoice.payment.voided_quickbooks_untouched',
+      details: expect.objectContaining({ provider: 'quickbooks' }),
+    }));
+  });
+
   it('writes no such audit for an ordinary Breeze payment void', async () => {
     requestPaymentDeleteMock.mockResolvedValue('map-1');
     queueVoidPaymentReads(payment(), [{ breezeOrigin: true }]);
@@ -2500,7 +2554,7 @@ describe('voidPayment -> QuickBooks delete hook', () => {
 
     const res = await svc.voidPayment('pay1', actor);
 
-    expect(res.audit).toMatchObject({ quickbooksRecordUntouched: true });
+    expect(res.audit).toMatchObject({ providerRecordUntouched: true });
   });
 
   it('ALLOWS voiding a QuickBooks-origin payment when the connection is gone entirely', async () => {
@@ -2508,7 +2562,7 @@ describe('voidPayment -> QuickBooks delete hook', () => {
     queueVoidPaymentReads(payment(), [{ breezeOrigin: false }], []);
 
     await expect(svc.voidPayment('pay1', actor)).resolves.toMatchObject({
-      audit: { quickbooksRecordUntouched: true },
+      audit: { providerRecordUntouched: true },
     });
   });
 
@@ -2518,7 +2572,39 @@ describe('voidPayment -> QuickBooks delete hook', () => {
 
     const res = await svc.voidPayment('pay1', actor);
 
-    expect(res.audit).not.toHaveProperty('quickbooksRecordUntouched');
+    expect(res.audit).not.toHaveProperty('providerRecordUntouched');
+  });
+
+  // Xero W01: the refusal and the untouched audit name the connection's provider.
+  it('keeps the exact QuickBooks refusal message for a QuickBooks connection', async () => {
+    queueVoidPaymentReads(payment(), [{ breezeOrigin: false }], [{ provider: 'quickbooks', status: 'connected', pullPayments: true }]);
+
+    await expect(svc.voidPayment('pay1', actor)).rejects.toMatchObject({
+      status: 409, code: 'PROVIDER_OWNED_PAYMENT',
+      message: 'This payment came from QuickBooks; reverse it in QuickBooks instead',
+    });
+  });
+
+  it('names the owning provider in the refusal, keeping the PROVIDER_OWNED_PAYMENT code', async () => {
+    queueVoidPaymentReads(payment(), [{ breezeOrigin: false }], [{ provider: 'xero', status: 'connected', pullPayments: true }]);
+
+    await expect(svc.voidPayment('pay1', actor)).rejects.toMatchObject({
+      status: 409, code: 'PROVIDER_OWNED_PAYMENT',
+      message: 'This payment came from Xero; reverse it in Xero instead',
+    });
+  });
+
+  it('the untouched audit carries the connection\'s provider, and the returned audit shape is unchanged', async () => {
+    requestPaymentDeleteMock.mockResolvedValue(null);
+    queueVoidPaymentReads(payment(), [{ breezeOrigin: false }], [{ provider: 'quickbooks', status: 'connected', pullPayments: false }]);
+
+    const res = await svc.voidPayment('pay1', actor);
+
+    expect(writeAuditEventMock).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: 'invoice.payment.voided_quickbooks_untouched',
+      details: { invoiceId: 'i1', amount: '40.00', reason: 'pull_disabled', provider: 'quickbooks' },
+    }));
+    expect(res.audit).not.toHaveProperty('provider');
   });
 });
 
@@ -2540,7 +2626,9 @@ describe('listPayments source tagging + accountingSync', () => {
   }
 
   const mapping = (over: Record<string, unknown> = {}) => ({
-    breezeEntityId: 'pay1', breezeOrigin: true, syncStatus: 'synced', lastError: null, ...over,
+    breezeEntityId: 'pay1', breezeOrigin: true, syncStatus: 'synced', lastError: null,
+    provider: 'quickbooks', // the joined accounting_connections.provider (Xero W01)
+    ...over,
   });
 
   it('classifies a QUICKBOOKS-ORIGIN mapped payment as quickbooks with no sync card', async () => {
@@ -2553,6 +2641,14 @@ describe('listPayments source tagging + accountingSync', () => {
     expect(rows).toEqual([expect.objectContaining({ id: 'pay1', source: 'quickbooks', accountingSync: null })]);
   });
 
+  it('tags a remote-origin payment with the provider of the mapping\'s own connection (Xero W01)', async () => {
+    queueListPayments([{ id: 'pay1', method: 'check' }], [], [mapping({ breezeOrigin: false, provider: 'xero' })]);
+
+    const rows = await svc.listPayments('i1', actor);
+
+    expect(rows[0]).toMatchObject({ source: 'xero', accountingSync: null });
+  });
+
   it('classifies a BREEZE-ORIGIN mapped payment as manual, with its sync state attached', async () => {
     // A payment Breeze PUSHED to QuickBooks stays hand-voidable (the void
     // propagates the deletion) — it only gains a sync badge.
@@ -2561,6 +2657,14 @@ describe('listPayments source tagging + accountingSync', () => {
     const rows = await svc.listPayments('i1', actor);
 
     expect(rows[0]).toMatchObject({ source: 'manual', accountingSync: { status: 'synced', lastError: null } });
+  });
+
+  it("a Breeze-origin payment's sync state names the provider it was pushed to (Xero W04)", async () => {
+    queueListPayments([{ id: 'pay1', method: 'check' }], [], [mapping({ syncStatus: 'synced', provider: 'xero' })]);
+
+    const rows = await svc.listPayments('i1', actor);
+
+    expect(rows[0]!.accountingSync).toEqual({ status: 'synced', lastError: null, provider: 'xero' });
   });
 
   it('surfaces a push failure on a Stripe payment without changing its source', async () => {
@@ -2763,6 +2867,42 @@ describe('voidInvoice refuses an invoice with applied payments (#5180)', () => {
     await svc.voidInvoice('i1', 'duplicate', {}, actor);
 
     expect(setCalls.calls.find((p) => p.status === 'void')).toBeTruthy();
+  });
+
+  // Xero W01 producer gate on the void hook, same contract as the issue hook.
+  function queueUnpaidVoid() {
+    queueResult([sentInvoice()]); // invoice FOR UPDATE
+    queueResult([]); // invoice_payments: none
+    queueResult([]); // invoice_lines FOR UPDATE
+    queueResult([]); // the void update
+    queueResult([{ id: 'i1', orgId: 'org1', partnerId: 'p1', status: 'void', currencyCode: 'USD' }]); // getInvoice re-read
+  }
+
+  it('enqueues the accounting void with the active connection id', async () => {
+    queueUnpaidVoid();
+    await svc.voidInvoice('i1', 'duplicate', {}, actor);
+    expect(resolveActiveConnectionForMock).toHaveBeenCalledWith('p1', 'invoicePush');
+    expect(enqueueAccountingInvoiceVoidMock).toHaveBeenCalledWith('i1', 'p1', 'c1');
+  });
+
+  it('does not enqueue an accounting void when the partner has no invoice-push-capable connection', async () => {
+    queueUnpaidVoid();
+    resolveActiveConnectionForMock.mockResolvedValueOnce(null);
+    await svc.voidInvoice('i1', 'duplicate', {}, actor);
+    expect(enqueueAccountingInvoiceVoidMock).not.toHaveBeenCalled();
+  });
+
+  // Mirrors the issue-hook's "does not let a failed connection read fail the
+  // (already-committed) issuance" test above: the void hook's own try/catch
+  // must swallow a resolveActiveConnectionFor rejection (e.g. a decrypt
+  // failure before the Task 5 minor fix) rather than let it escape and fail
+  // the already-committed void.
+  it('does not let a failed connection read fail the (already-committed) void', async () => {
+    queueUnpaidVoid();
+    resolveActiveConnectionForMock.mockRejectedValueOnce(new Error('db blip'));
+    await expect(svc.voidInvoice('i1', 'duplicate', {}, actor)).resolves.toBeDefined();
+    expect(enqueueAccountingInvoiceVoidMock).not.toHaveBeenCalled();
+    expect(captureExceptionMock).toHaveBeenCalled();
   });
 
   it('refuses a fully-refunded-looking row too: any non-zero applied total blocks it', async () => {

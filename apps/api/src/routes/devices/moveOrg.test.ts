@@ -233,7 +233,7 @@ function setAuth(overrides: Partial<{
 // barrier (#3778): readOrgStampingDefaultsMany locks both orgs ascending by id
 // before anything else in the move transaction, and the currency guard now
 // compares those locked values rather than the pre-transaction read.
-let currentOrgRows: Array<{ id: string; partnerId: string; name?: string; currencyCode?: string }> = [];
+let currentOrgRows: Array<{ id: string; partnerId: string; name?: string; currencyCode?: string; type?: string }> = [];
 /** Org ids that exist in the PRE-transaction read but are gone by the time the
  *  in-transaction SHARE barrier locks them (#3778 finding 7): an org deleted
  *  between the two reads. readOrgStampingDefaultsMany omits such ids from its
@@ -265,7 +265,7 @@ let pinnedOccurrenceRows: Array<{ id: string }> = [];
 const collapseStmt = (s: string) => s.replace(/\s+/g, ' ').trim();
 
 function rigOrgAndSiteSelects(opts: {
-  orgRows: Array<{ id: string; partnerId: string; name?: string; currencyCode?: string }>;
+  orgRows: Array<{ id: string; partnerId: string; name?: string; currencyCode?: string; type?: string }>;
   siteRow: { id: string } | null;
   assigneeRow?: { id: string; partnerId: string; status: string; email: string };
 }) {
@@ -724,7 +724,9 @@ describe('POST /devices/:id/move-org', () => {
         `Expected exactly one ticket_alert_links org_id rewrite.\nStatements:\n${statements.join('\n')}`,
       ).toEqual([
         `UPDATE ticket_alert_links SET org_id = ${TARGET_ORG}::uuid ` +
-          `WHERE alert_id IN (SELECT id FROM alerts WHERE device_id = ${DEVICE_ID}::uuid)`,
+          // A site-owned topology alert (M3-D6) stays with its site's org, so
+          // its link is not re-stamped (PR #7117 T2).
+          `WHERE alert_id IN (SELECT id FROM alerts WHERE device_id = ${DEVICE_ID}::uuid AND topology_site_id IS NULL)`,
       ]);
     });
 
@@ -1212,7 +1214,7 @@ describe('POST /devices/:id/move-org', () => {
       // target org.
       expect(onlyStatement(statements, 'ai_alert_verdicts')).toBe(collapseStmt(`
         UPDATE ai_alert_verdicts SET org_id = ${TARGET_ORG}::uuid
-        WHERE alert_id IN (SELECT id FROM alerts WHERE device_id = ${DEVICE_ID}::uuid)
+        WHERE alert_id IN (SELECT id FROM alerts WHERE device_id = ${DEVICE_ID}::uuid AND topology_site_id IS NULL)
         OR correlation_group_id IN (
         SELECT g.id FROM alert_correlation_groups g
         WHERE g.org_id = ${TARGET_ORG}::uuid
@@ -1786,6 +1788,34 @@ describe('POST /devices/:id/move-org', () => {
       expect(res.status).toBe(500);
       expect(await res.json()).toEqual({ error: 'Source organization not found' });
       expect(guardMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('holding-org one-way guard', () => {
+    it.each([
+      ['into a holding org', { source: 'customer', target: 'unassigned_pool' }, 'POOL_ENTRY_FORBIDDEN'],
+      ['out of a holding org', { source: 'unassigned_pool', target: 'customer' }, 'POOL_EXIT_REQUIRES_ASSIGNMENT'],
+    ] as const)('refuses a move %s with 409 before any transaction', async (_label, types, code) => {
+      setAuth({ scope: 'system' });
+      vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue(SAMPLE_DEVICE as never);
+      rigOrgAndSiteSelects({
+        orgRows: [
+          { id: SOURCE_ORG, partnerId: 'partner-1', type: types.source },
+          { id: TARGET_ORG, partnerId: 'partner-1', type: types.target },
+        ],
+        siteRow: { id: TARGET_SITE },
+      });
+
+      const res = await app.request(`/devices/${DEVICE_ID}/move-org`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer t', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ orgId: TARGET_ORG, siteId: TARGET_SITE, stepUpGrant: GRANT_ID }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ code });
+      expect(db.transaction).not.toHaveBeenCalled();
+      expect(consumeStepUpGrant).not.toHaveBeenCalled();
     });
   });
 

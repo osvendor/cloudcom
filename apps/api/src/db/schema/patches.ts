@@ -214,6 +214,16 @@ export const devicePatches = pgTable('device_patches', {
   // before the user-context winget pass existed; NULL is treated as
   // machine-wide. Constrained by device_patches_scope_chk.
   scope: varchar('scope', { length: 16 }),
+  // This device's own agent-reported severity/category, written unconditionally
+  // by every scan (routes/agents/patches.ts) regardless of trust — unlike
+  // patches.severity/.category, which only a trusted source (a curated
+  // third-party catalog match) may set. Scoped to this device_id/org_id row,
+  // so one tenant's report can never move another tenant's classification.
+  // Effective severity/category for approval rules, UI and reports is
+  // COALESCE(patches.severity/.category, this row's reported_* value) — see
+  // services/patchSeverityOverlay.ts.
+  reportedSeverity: patchSeverityEnum('reported_severity'),
+  reportedCategory: text('reported_category'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 }, (table) => ({
@@ -285,7 +295,11 @@ export const patchJobResults = pgTable('patch_job_results', {
   // is not — the predicate is proven statically instead. See the migration.
   statusCreatedIdx: index('idx_patch_job_results_status_created')
     .on(table.createdAt)
-    .where(sql`status IN ('failed', 'queued')`)
+    .where(sql`status IN ('failed', 'queued')`),
+  // #4223: latest attempt per (device, patch) for the patch list / device
+  // patches install-failure overlay (services/patchInstallFailures.ts).
+  devicePatchCreatedIdx: index('idx_patch_job_results_device_patch_created')
+    .on(table.deviceId, table.patchId, table.createdAt)
 }));
 
 export const patchRollbacks = pgTable('patch_rollbacks', {

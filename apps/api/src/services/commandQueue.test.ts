@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
+
+process.env.APP_ENCRYPTION_KEY = process.env.APP_ENCRYPTION_KEY || 'test-app-encryption-key-for-vitest';
 import {
   queueCommand,
   waitForCommandResult,
@@ -20,7 +22,10 @@ import { sendCommandToAgent, isAgentConnected } from '../routes/agentWs';
 import {
   claimPendingCommandForDelivery,
   releaseClaimedCommandDelivery,
+  expireRefusedClaimedCommandDelivery,
 } from './commandDispatch';
+import { deliveryRefreshers } from './commandDelivery';
+import { decryptCommandForDelivery } from './sensitiveCommandPayload';
 import { TrustDeniedError } from './partnerTrust.commands';
 import { captureException } from './sentry';
 
@@ -38,6 +43,26 @@ vi.mock('./partnerTrust.commands', async () => {
   };
 });
 
+// Devices parked in a holding org, by id. The eligibility helper is mocked at
+// its module seam (its real query is proven against Postgres in
+// parkedCommandDelivery.integration.test.ts); the refusal semantics are kept.
+const parkedDeviceIds = vi.hoisted(() => new Set<string>());
+vi.mock('./unassignedPool/deliveryEligibility', async () => {
+  const actual = await vi.importActual<typeof import('./unassignedPool/deliveryEligibility')>(
+    './unassignedPool/deliveryEligibility',
+  );
+  return {
+    ...actual,
+    isParkedDevice: vi.fn(async (_reader: unknown, deviceId: string) => parkedDeviceIds.has(deviceId)),
+    assertCommandDeliverable: vi.fn(async (_reader: unknown, input: { deviceId: string; commandType: string }) => {
+      if (actual.isParkedDeliverableCommandType(input.commandType)) return;
+      if (parkedDeviceIds.has(input.deviceId)) {
+        throw new actual.ParkedDeviceCommandRefusedError(input.deviceId, input.commandType);
+      }
+    }),
+  };
+});
+
 vi.mock('../db', () => ({
   db: {
     select: vi.fn(),
@@ -47,6 +72,8 @@ vi.mock('../db', () => ({
   runOutsideDbContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  hasDbAccessContext: vi.fn(() => false),
+  withDbTransaction: vi.fn(async (fn: () => Promise<unknown>) => fn()),
 }));
 
 vi.mock('./auditService', () => ({
@@ -61,6 +88,7 @@ vi.mock('../routes/agentWs', () => ({
 vi.mock('./commandDispatch', () => ({
   claimPendingCommandForDelivery: vi.fn(),
   releaseClaimedCommandDelivery: vi.fn(),
+  expireRefusedClaimedCommandDelivery: vi.fn(),
 }));
 
 vi.mock('./sentry', () => ({
@@ -92,6 +120,7 @@ vi.mock('../db/schema', async (importOriginal) => {
 describe('command queue service', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    parkedDeviceIds.clear();
     partnerTrustCommandMocks.assertDeviceExecuteAllowed.mockImplementation(
       async (_deviceId, type) => {
         if (type === 'script') {
@@ -134,6 +163,105 @@ describe('command queue service', () => {
     await expect(
       queueCommand('d1', 'self_uninstall', { removeConfig: true }, 'u1'),
     ).resolves.toBeTruthy();
+  });
+
+  it('queueCommand refuses a parked device before inserting anything', async () => {
+    parkedDeviceIds.add('d-parked');
+    vi.mocked(db.select).mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([{ id: 'u1' }]),
+        }),
+      }),
+    } as any);
+
+    await expect(queueCommand('d-parked', 'refresh_inventory', {}, 'u1')).rejects.toMatchObject({
+      name: 'ParkedDeviceCommandRefusedError',
+      code: 'DEVICE_PENDING_ASSIGNMENT',
+      status: 409,
+    });
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('queueCommand still queues lifecycle removal for a parked device', async () => {
+    parkedDeviceIds.add('d-parked');
+    vi.mocked(db.select).mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([{ id: 'u1' }]),
+        }),
+      }),
+    } as any);
+    vi.mocked(db.insert).mockReturnValue({
+      values: vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([{ id: 'cmd-parked-uninstall' }]),
+      }),
+    } as any);
+
+    await expect(queueCommand('d-parked', 'self_uninstall', {}, 'u1')).resolves.toMatchObject({
+      id: 'cmd-parked-uninstall',
+    });
+  });
+
+  it('executeCommand answers a parked device with a failed result and inserts nothing', async () => {
+    parkedDeviceIds.add('d-parked');
+    vi.mocked(db.select).mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([{ id: 'd-parked', status: 'online', orgId: 'pool-org' }]),
+        }),
+      }),
+    } as any);
+
+    const result = await executeCommand('d-parked', 'list_services', {});
+
+    expect(result).toMatchObject({ status: 'failed', error: expect.stringContaining('waiting to be assigned') });
+    expect(db.insert).not.toHaveBeenCalled();
+    expect(partnerTrustCommandMocks.assertDeviceExecuteAllowed).not.toHaveBeenCalled();
+  });
+
+  it('queueCommand never persists an inline storage destination in plaintext', async () => {
+    vi.mocked(db.select).mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([{ id: 'u1' }]),
+        }),
+      }),
+    } as any);
+    const values = vi.fn().mockReturnValue({
+      returning: vi.fn().mockResolvedValue([{ id: 'cmd-dr' }]),
+    });
+    vi.mocked(db.insert).mockReturnValue({ values } as any);
+
+    await queueCommand(
+      'd1',
+      'mssql_restore',
+      {
+        snapshotId: 'snap-1',
+        provider: 's3',
+        providerConfig: { accessKey: 'AKIA-SYNTHETIC-ACCESS', secretKey: 'synthetic-secret-value' },
+      },
+      'u1',
+    );
+
+    const commandRow = values.mock.calls
+      .map((call) => call[0] as { id?: string; type?: string; payload?: Record<string, unknown> })
+      .find((row) => row.type === 'mssql_restore')!;
+    expect(JSON.stringify(commandRow.payload)).not.toContain('synthetic-secret-value');
+    expect(JSON.stringify(commandRow.payload)).not.toContain('AKIA-SYNTHETIC-ACCESS');
+    expect(commandRow.payload!.providerConfig).toBeUndefined();
+    expect(typeof commandRow.payload!.providerConfigEnvelope).toBe('string');
+    expect(typeof commandRow.id).toBe('string');
+    const delivered = decryptCommandForDelivery({
+      id: commandRow.id!,
+      type: 'mssql_restore',
+      deviceId: 'd1',
+      payload: commandRow.payload,
+    });
+    expect((delivered?.payload as Record<string, unknown>).providerConfig).toEqual({
+      accessKey: 'AKIA-SYNTHETIC-ACCESS',
+      secretKey: 'synthetic-secret-value',
+    });
   });
 
   it('queueCommandForExecution returns a structured trust error instead of throwing', async () => {
@@ -876,6 +1004,9 @@ describe('command queue service', () => {
         agentId: 'agent-1',
         orgId: 'org-1',
         hostname: 'host-1',
+        // A helper that supports storage sessions, so storage reads pass the
+        // enqueue gate and reach the delivery refresher under test.
+        backupReadProtocolVersion: 1,
       };
       const queued = { id: 'cmd-x' };
       const completed = opts.completedResult ?? {
@@ -1205,6 +1336,102 @@ describe('command queue service', () => {
       expect(sendCommandToAgent).toHaveBeenCalled();
     });
 
+    describe('storage destination delivery on the direct push', () => {
+      const saved = { ...deliveryRefreshers };
+      const refPayload = {
+        snapshotId: 'snap-1',
+        provider: 's3',
+        providerConfigRef: {
+          configId: '44444444-4444-4444-8444-444444444444',
+          orgId: '11111111-1111-4111-8111-111111111111',
+        },
+      };
+
+      afterEach(() => {
+        for (const key of Object.keys(deliveryRefreshers)) delete deliveryRefreshers[key];
+        Object.assign(deliveryRefreshers, saved);
+      });
+
+      it('runs the delivery refresher before pushing, so the frame carries the destination resolved at delivery', async () => {
+        setupOnlineDeviceMocks();
+        vi.mocked(isAgentConnected).mockReturnValue(true);
+        vi.mocked(sendCommandToAgent).mockReturnValue(true);
+        const seen: unknown[] = [];
+        deliveryRefreshers.mssql_verify = async (p, ctx) => {
+          seen.push(ctx);
+          const { providerConfigRef: _ref, ...rest } = p;
+          return { ...rest, providerConfig: { bucket: 'b', secretKey: 'resolved-at-delivery' } };
+        };
+
+        const result = await executeCommand('dev-online', CommandTypes.MSSQL_VERIFY, refPayload);
+
+        expect(result.status).toBe('completed');
+        expect(seen).toEqual([
+          expect.objectContaining({ commandId: 'cmd-x', deviceId: 'dev-online', type: 'mssql_verify' }),
+        ]);
+        expect(sendCommandToAgent).toHaveBeenCalledWith('agent-1', {
+          id: 'cmd-x',
+          type: 'mssql_verify',
+          payload: {
+            snapshotId: 'snap-1',
+            provider: 's3',
+            providerConfig: { bucket: 'b', secretKey: 'resolved-at-delivery' },
+          },
+        });
+      });
+
+      it('fails fast and expires the row when delivery is refused, without pushing anything', async () => {
+        const { CommandDeliveryRefusedError } = await import('./commandDeliveryRefusal');
+        setupOnlineDeviceMocks();
+        vi.mocked(isAgentConnected).mockReturnValue(true);
+        vi.mocked(sendCommandToAgent).mockReturnValue(true);
+        deliveryRefreshers.mssql_verify = async () => {
+          throw new CommandDeliveryRefusedError('destination no longer resolves');
+        };
+
+        const result = await executeCommand('dev-online', CommandTypes.MSSQL_VERIFY, refPayload, {
+          timeoutMs: 30000,
+        });
+
+        expect(sendCommandToAgent).not.toHaveBeenCalled();
+        expect(result.status).toBe('failed');
+        expect(result.error).toContain('destination no longer resolves');
+        expect(result.commandId).toBe('cmd-x');
+        expect(expireRefusedClaimedCommandDelivery).toHaveBeenCalledWith(
+          'cmd-x',
+          expect.any(Date),
+          'destination no longer resolves',
+        );
+      });
+
+      it('never persists an inline storage destination in plaintext on the direct path', async () => {
+        setupOnlineDeviceMocks();
+        vi.mocked(isAgentConnected).mockReturnValue(false);
+
+        await executeCommand(
+          'dev-online',
+          CommandTypes.HYPERV_RESTORE,
+          { snapshotId: 'snap-1', provider: 's3', providerConfig: { secretKey: 'synthetic-secret-value' } },
+          { preferHeartbeat: true },
+        );
+
+        const insertResult = vi.mocked(db.insert).mock.results[0]!.value as { values: ReturnType<typeof vi.fn> };
+        const values = insertResult.values.mock.calls[0]![0] as { id?: string; payload: Record<string, unknown> };
+        expect(JSON.stringify(values.payload)).not.toContain('synthetic-secret-value');
+        expect(values.payload.providerConfig).toBeUndefined();
+        expect(typeof values.id).toBe('string');
+        const delivered = decryptCommandForDelivery({
+          id: values.id!,
+          type: 'hyperv_restore',
+          deviceId: 'dev-online',
+          payload: values.payload,
+        });
+        expect((delivered?.payload as Record<string, unknown>).providerConfig).toEqual({
+          secretKey: 'synthetic-secret-value',
+        });
+      });
+    });
+
     it('skips the WS pre-check when preferHeartbeat is true', async () => {
       // Heartbeat-preferred callers (e.g. Tauri helper) intentionally let the
       // command queue and wait for the next agent poll, so the WS pre-check
@@ -1510,6 +1737,60 @@ describe('command queue service', () => {
       await expect(queueCommand('dev-stranded', 'update_watchdog', { version: '0.108.0' }))
         .rejects.toThrow(/executeCommand/i);
       expect(db.insert).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('backup read helper gate on executeCommand', () => {
+    function mockDevice(device: Record<string, unknown>) {
+      let pollCall = 0;
+      vi.mocked(db.select).mockImplementation(() => ({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockImplementation(() => {
+              pollCall += 1;
+              if (pollCall === 1) return Promise.resolve([device]);
+              return Promise.resolve([{ id: 'cmd-v', status: 'completed', result: { status: 'completed' } }]);
+            }),
+          }),
+        }),
+      }) as any);
+      const insertValues = vi.fn().mockReturnValue({
+        returning: vi.fn().mockResolvedValue([{ id: 'cmd-v', type: 'mssql_verify' }]),
+        execute: vi.fn().mockResolvedValue(undefined),
+      });
+      vi.mocked(db.insert).mockReturnValue({ values: insertValues } as any);
+      return insertValues;
+    }
+
+    const device = {
+      id: 'dev-sql',
+      status: 'online',
+      agentId: null,
+      orgId: 'org-1',
+      hostname: 'sql-01',
+      watchdogLastSeen: null,
+      agentEdition: null,
+      agentVersion: '0.118.0',
+      watchdogVersion: null,
+    };
+    const verifyPayload = { snapshotId: 'snap-1', provider: 's3', providerConfigRef: { configId: 'c', orgId: 'org-1' } };
+
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    it('refuses a storage-destination read to a helper below the brokered read protocol, writing no row', async () => {
+      const insertValues = mockDevice({ ...device, backupReadProtocolVersion: 0 });
+      const result = await executeCommand('dev-sql', 'mssql_verify', verifyPayload, { userId: 'user-1' });
+      expect(result.status).toBe('failed');
+      expect(result.error).toMatch(/^Update the Breeze agent on this device/);
+      expect(insertValues).not.toHaveBeenCalled();
+    });
+
+    it('lets the same read through to a helper that supports the protocol', async () => {
+      const insertValues = mockDevice({ ...device, backupReadProtocolVersion: 1 });
+      await executeCommand('dev-sql', 'mssql_verify', verifyPayload, { userId: 'user-1', timeoutMs: 10 });
+      expect(insertValues).toHaveBeenCalledWith(expect.objectContaining({ type: 'mssql_verify' }));
     });
   });
 

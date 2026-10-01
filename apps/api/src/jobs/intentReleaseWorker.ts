@@ -41,10 +41,12 @@ import { checkToolPermission } from '../services/aiGuardrails';
 import { ensureLaneCheckpointBeforeRelease } from '../services/actionIntents/laneCheckpoint';
 import { readAiKillState } from '../services/aiKillState';
 import { computeEffectDigestForRelease, hasPinnedDigest } from '../services/actionIntents/effectDigest';
+import { requiresPinnedEffectDigest } from '../services/actionIntents/pinnedEffectPolicy';
 import type { ToolExecutionContext } from '../services/toolExecutionContext';
 import { executeTool, requiresLiveSession } from '../services/aiTools';
 import { executeTenantToolDetailed } from '../services/toolSources/execute';
 import { withAuthDbAccessContext } from '../middleware/auth';
+import { withTopologyReleasePreconditions } from '../services/topology/aiToolGate';
 import { getToolTimeout, withToolTimeout } from '../services/toolTimeouts';
 import {
   isHeadlessGoogleTool,
@@ -841,6 +843,10 @@ const USER_OWNED_RELEASE_ACTIONS: ReadonlySet<string> = new Set([
   // supervised (manage_browser_policy is a whole-tool TIER3_SUPERVISED_TOOLS
   // member).
   'manage_browser_policy:create',
+  // Same table/guard shape as `:create` above — `apply` stamps
+  // `userId: auth.user.id` into the queued device command
+  // (aiToolsBrowser.ts's `aiDispatchDeviceCommand` call).
+  'manage_browser_policy:apply',
   // cis_remediation_actions.approved_by / .requested_by
   // (db/schema/cisBenchmark.ts) — apply_cis_remediation is a whole-tool
   // TIER3_SUPERVISED_TOOLS member. It has no dispatch multiplexing, but its
@@ -853,6 +859,18 @@ const USER_OWNED_RELEASE_ACTIONS: ReadonlySet<string> = new Set([
   // software_policies.created_by (db/schema/softwarePolicies.ts) —
   // manage_software_policy is a whole-tool TIER3_SUPERVISED_TOOLS member.
   'manage_software_policy:create',
+  // sensitive_data_findings.remediation_metadata.updatedBy (jsonb, not an
+  // actual FK — db/schema/sensitiveData.ts — but the contract's own
+  // name-level over-approximation is intentional; guarded the same way
+  // regardless) — remediate_sensitive_data is a whole-tool
+  // TIER3_SUPERVISED_TOOLS member. `accept_risk`/`false_positive`/
+  // `mark_remediated` share one branch; the empty-string entry is the
+  // encrypt/quarantine/secure_delete queue path, which is not gated behind
+  // an `action === …` check of its own.
+  'remediate_sensitive_data:accept_risk',
+  'remediate_sensitive_data:false_positive',
+  'remediate_sensitive_data:mark_remediated',
+  'remediate_sensitive_data:',
   // elevation_requests.subject_user_id / elevation_audit_entries.actor_user_id
   // (db/schema/elevations.ts) — request_elevation is a whole-tool
   // TIER3_FOUR_EYES_TOOLS member, single-action.
@@ -1214,6 +1232,13 @@ export async function releaseApprovedIntent(intentId: string): Promise<void> {
   // the very window this check just closed (the digest proves the target was
   // unchanged AS OF THE READ; a later read proves nothing).
   let verifiedContext: ToolExecutionContext | undefined;
+  // A tool whose pin is MANDATORY (topology diagnose_connectivity, M4-D3) never
+  // inherits the NULL-means-nothing-to-check fallback below: no pinned digest
+  // is an explicit refusal, before anything executes.
+  if (!hasPinnedDigest(intent) && requiresPinnedEffectDigest(intent.actionName)) {
+    await failIntent(intent, 'digest_required', { details: { actionName: intent.actionName } });
+    return;
+  }
   if (hasPinnedDigest(intent)) {
     // Runs in its own short system-scoped context (same discipline as Step 2
     // above) — this point in the function is between DB contexts (Step 2's
@@ -1425,7 +1450,13 @@ export async function releaseApprovedIntent(intentId: string): Promise<void> {
               },
             });
       rawResult = await withToolTimeout(
-        withAuthDbAccessContext(auth, invoke),
+        // Review R1 (#6671 shape): a topology diagnostic release re-checks
+        // topology AI availability inside its start transaction, under the
+        // org lock. Its partner-axis preconditions are resolved HERE, before
+        // the release context opens, and carried in — never read through a
+        // second pooled connection while that lock is held. A no-op for
+        // every other action.
+        withTopologyReleasePreconditions(intent.actionName, intent.orgId, () => withAuthDbAccessContext(auth, invoke)),
         getToolTimeout(intent.actionName),
         intent.actionName,
       );

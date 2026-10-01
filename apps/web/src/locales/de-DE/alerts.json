@@ -221,7 +221,11 @@
       "resolved": "Gelöst",
       "suppressed": "Unterdrückt",
       "dismissed": "Verworfen"
-    }
+    },
+    "filterStatusLabel": "Statusfilter",
+    "filterSeverityLabel": "Schweregradfilter",
+    "filterDeviceLabel": "Gerätefilter",
+    "filterDateRangeLabel": "Zeitraumfilter"
   },
   "alertRuleEditPage": {
     "loadingAlertRule": "Warnungsregel wird geladen...",
@@ -527,7 +531,6 @@
       "alerts": "Warnungen",
       "correlations": "Korrelationen",
       "monitors": "Monitore",
-      "rules": "Regeln",
       "delivery": "Zustellung"
     }
   },
@@ -869,7 +872,8 @@
       "webhook": "Webhook",
       "sms": "SMS",
       "pushover": "Pushover"
-    }
+    },
+    "typeLabel": "Typ"
   },
   "notificationChannelsPage": {
     "loadingNotificationChannels": "Benachrichtigungskanäle werden geladen...",

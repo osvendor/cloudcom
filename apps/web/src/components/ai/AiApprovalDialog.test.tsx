@@ -316,6 +316,31 @@ describe('intent-backed self-approve (sole operator)', () => {
     expect(onIntentDecided).not.toHaveBeenCalled();
   });
 
+  it('refused → terminal state with the refused copy, never "approved"', async () => {
+    // The server accepted the approve but refused to apply it and denied the
+    // request. decideIntentApproval has already toasted the reason; the card
+    // must settle terminally and must not read as approved.
+    decideIntentApproval.mockResolvedValue('refused');
+    const onIntentDecided = vi.fn();
+    render(
+      <AiApprovalDialog
+        {...selfProps}
+        intentBacked
+        selfApprovalRequestId="ap-1"
+        onIntentDecided={onIntentDecided}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /approve/i }));
+    await waitFor(() => expect(screen.getByRole('alert')).toBeInTheDocument());
+    expect(screen.getByRole('alert')).toHaveTextContent(/approval refused/i);
+    // The decided-approve state renders "Action approved"; a refusal never does.
+    expect(screen.queryByText(/action approved/i)).toBeNull();
+    expect(screen.queryByRole('button', { name: /approve/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /deny/i })).toBeNull();
+    // Decided (denied), so the parent may clear it — same as a 409/410.
+    expect(onIntentDecided).toHaveBeenCalledOnce();
+  });
+
   it('deny → decideIntentApproval(deny) → onIntentDecided', async () => {
     decideIntentApproval.mockResolvedValue('decided');
     const onIntentDecided = vi.fn();
@@ -436,6 +461,41 @@ describe('intent-backed self-approve (sole operator)', () => {
     expect(screen.queryByRole('button', { name: /approve/i })).toBeNull();
     expect(screen.queryByRole('button', { name: /deny/i })).toBeNull();
     expect(screen.getByText(/waiting for an approver/i)).toBeInTheDocument();
+  });
+});
+
+describe('fresh approver factor (topology diagnose_connectivity, M4-D3)', () => {
+  const props = () => ({
+    toolName: 'diagnose_connectivity',
+    description: 'Run gateway reachability from core-sw-1',
+    input: { site_id: 's' } as Record<string, unknown>,
+    onApprove: vi.fn<() => void>(),
+    onReject: vi.fn<() => void>(),
+  });
+
+  it('asks the decide helper for a fresh factor on approve', async () => {
+    decideIntentApproval.mockResolvedValue('decided');
+    const onIntentDecided = vi.fn();
+    render(<AiApprovalDialog {...props()} intentBacked selfApprovalRequestId="ap-1" approvalScope="supervised" onIntentDecided={onIntentDecided} testIdPrefix="topology-proposal" />);
+    fireEvent.click(screen.getByTestId('topology-proposal-approve'));
+    await waitFor(() => expect(onIntentDecided).toHaveBeenCalled());
+    expect(decideIntentApproval).toHaveBeenCalledWith('ap-1', 'approve', undefined, 'supervised', { freshFactor: true });
+  });
+
+  it('fresh_factor_required keeps Approve available for another passkey scan and says why', async () => {
+    decideIntentApproval.mockResolvedValue('fresh_factor_required');
+    render(<AiApprovalDialog {...props()} intentBacked selfApprovalRequestId="ap-1" approvalScope="supervised" onIntentDecided={vi.fn()} testIdPrefix="topology-proposal" />);
+    fireEvent.click(screen.getByTestId('topology-proposal-approve'));
+    await waitFor(() => expect(screen.getByTestId('topology-proposal-error')).toHaveTextContent(/fresh passkey/i));
+    expect(screen.getByTestId('topology-proposal-approve')).not.toBeDisabled();
+    expect(screen.getByTestId('topology-proposal-deny')).toBeInTheDocument();
+  });
+
+  it('deny sends no fresh-factor request', async () => {
+    decideIntentApproval.mockResolvedValue('decided');
+    render(<AiApprovalDialog {...props()} intentBacked selfApprovalRequestId="ap-1" approvalScope="supervised" onIntentDecided={vi.fn()} testIdPrefix="topology-proposal" />);
+    fireEvent.click(screen.getByTestId('topology-proposal-deny'));
+    await waitFor(() => expect(decideIntentApproval).toHaveBeenCalledWith('ap-1', 'deny', undefined, 'supervised'));
   });
 });
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/breeze-rmm/agent/internal/backup/bmr"
 	"github.com/breeze-rmm/agent/internal/backup/providers"
@@ -56,6 +57,12 @@ func newRebuildCommand() *cobra.Command {
 		// SilenceErrors stays false — the error text itself must still print.
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// --drivers stays a known flag so an older script gets this
+			// reason instead of "unknown flag"; driver injection is not
+			// supported yet, so any value is refused before anything runs.
+			if len(driverDirs) > 0 {
+				return errors.New(rebuild.DriverInjectionUnsupportedReason)
+			}
 			if token != "" && providerConfig != "" {
 				return fmt.Errorf("use either --token/--server or --provider-config, not both")
 			}
@@ -167,7 +174,7 @@ func newRebuildCommand() *cobra.Command {
 	cmd.Flags().StringVar(&markerFile, "marker-file", "", "JSON {recoveryId, nonce} for original identity (--provider-config mode only; --token mode gets this from the bootstrap)")
 	cmd.Flags().StringVar(&resultJSON, "result-json", "", "write the result JSON here as well as stdout")
 	cmd.Flags().StringVar(&stateDir, "state-dir", "", "engine state dir (default /var/lib/breeze/rebuild; Windows: %ProgramData%\\Breeze\\rebuild)")
-	cmd.Flags().StringArrayVar(&driverDirs, "drivers", nil, "Windows only: a directory of driver packages for DISM /Add-Driver (repeatable)")
+	cmd.Flags().StringArrayVar(&driverDirs, "drivers", nil, "not supported yet: driver injection is refused; boot the restored machine and install drivers from Windows")
 	cmd.Flags().BoolVar(&forceDisk, "force-disk", false, "Windows only: overwrite a disk target that holds a Windows installation")
 	cmd.Flags().BoolVar(&allowDomainController, "allow-domain-controller", false, "Windows only: allow rebuilding a domain controller source")
 	cmd.Flags().StringVar(&workRoot, "work-root", "", "Windows vhdx: restore scratch dir override (default %ProgramData%\\Breeze\\rebuild\\work\\<snapshotID>)")
@@ -180,6 +187,9 @@ func newRebuildCommand() *cobra.Command {
 	_ = cmd.MarkFlagRequired("target")
 	return cmd
 }
+
+// progressPostTimeout bounds one recovery progress post, retries included.
+const progressPostTimeout = 2 * time.Minute
 
 // buildTokenModeOptions is the server-issued-token half of a rebuild,
 // shared by `breeze-backup rebuild --token` and the bare_metal_rebuild
@@ -213,8 +223,15 @@ func buildTokenModeOptions(ctx context.Context, server, token string, target reb
 	// yet — callers (execBareMetalRebuild, the CLI's RunE) already turn a
 	// buildTokenModeOptions error into a fail/non-zero result without
 	// calling runTokenModeRebuild.
+	// Progress posts outlive a cancelled run: when the rebuild is stopped
+	// (operator cancel, or the bare_metal_rebuild watchdog), the terminal
+	// "failed" post is what tells the console why, so it must not be
+	// cancelled with the run. Each post is bounded on its own instead.
+	reportCtx := context.WithoutCancel(ctx)
 	report := func(u bmr.ProgressUpdate) {
-		if err := bmr.PostRecoveryProgress(ctx, server, token, u); err != nil {
+		postCtx, cancel := context.WithTimeout(reportCtx, progressPostTimeout)
+		defer cancel()
+		if err := bmr.PostRecoveryProgress(postCtx, server, token, u); err != nil {
 			slog.Warn("recovery progress not recorded", "status", u.Status, "error", err.Error())
 			_, _ = fmt.Fprintf(os.Stderr, "progress %s not recorded: %v\n", u.Status, err)
 		}
@@ -296,7 +313,7 @@ func runRebuildAndReport(ctx context.Context, cmd *cobra.Command, opts rebuild.O
 		writeResult(res)
 		return runErr
 	}
-	res, runErr := runTokenModeRebuild(ctx, opts, report, rebuild.Run)
+	res, runErr := runTokenModeRebuild(ctx, opts, report, rebuild.Run, nil)
 	writeResult(res)
 	return runErr
 }
@@ -310,10 +327,20 @@ func runRebuildAndReport(ctx context.Context, cmd *cobra.Command, opts rebuild.O
 // confirmation after the machine restarts (the console posts it), and
 // checked_in only ever comes from the heartbeat marker match (server-side,
 // see routes/agents/heartbeat.ts). runFn is rebuild.Run outside tests.
-func runTokenModeRebuild(ctx context.Context, opts rebuild.Options, report func(bmr.ProgressUpdate), runFn func(context.Context, rebuild.Options) (*rebuild.Result, error)) (*rebuild.Result, error) {
+//
+// afterRun, when non-nil, runs after a successful real run and BEFORE the
+// "validated" post, and may annotate the result (the bare_metal_rebuild
+// command's optional Hyper-V VM step records vmCreated/vmError and leads
+// Warnings with a failure). It must come first: for an identity: new
+// recovery the validated post is what completes the row server-side, after
+// which the server ignores anything the command result adds — so an outcome
+// recorded after that post would never reach it. afterRun never changes the
+// run's status; the CLI passes nil.
+func runTokenModeRebuild(ctx context.Context, opts rebuild.Options, report func(bmr.ProgressUpdate), runFn func(context.Context, rebuild.Options) (*rebuild.Result, error), afterRun func(context.Context, *rebuild.Result)) (*rebuild.Result, error) {
 	dry := opts
 	dry.DryRun = true
 	pre, preErr := runFn(ctx, dry)
+	pre, preErr = annotateBudgetFailure(ctx, pre, preErr)
 	if preErr != nil {
 		if pre != nil && pre.Status == "refused" {
 			report(bmr.ProgressUpdate{Status: "refused", Reason: pre.Refusal, Result: pre})
@@ -337,8 +364,12 @@ func runTokenModeRebuild(ctx context.Context, opts rebuild.Options, report func(
 
 	report(bmr.ProgressUpdate{Status: "restoring"})
 	res, runErr := runFn(ctx, opts)
+	res, runErr = annotateBudgetFailure(ctx, res, runErr)
 	switch {
 	case runErr == nil:
+		if afterRun != nil && res != nil {
+			afterRun(ctx, res)
+		}
 		report(bmr.ProgressUpdate{Status: "validated", Result: res, Warnings: res.Warnings})
 	case res != nil && res.Status == "refused":
 		report(bmr.ProgressUpdate{Status: "refused", Reason: res.Refusal, Result: res})

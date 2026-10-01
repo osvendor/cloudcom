@@ -47,12 +47,17 @@ export const backupStatusEnum = pgEnum('backup_status', [
   'failed',
   'cancelled',
   'partial',
+  // #5396: a run that produced a restorable snapshot but had one or more file
+  // failures under the #3000 partial threshold. `completed` means every file
+  // was read. Added by 2026-11-02-100900-backup-status-completed-with-errors.sql.
+  'completed_with_errors',
 ]);
 
 /**
  * The two non-terminal `backup_status` values. A job in one of these is still
  * in-flight and may legitimately accept a progress update or a terminal result;
- * the other four (completed / failed / cancelled / partial) are terminal.
+ * the others (completed / completed_with_errors / failed / cancelled / partial)
+ * are terminal.
  *
  * Single source of truth for the "terminal vs in-flight" invariant over
  * backupStatusEnum — imported by both services/backupProgress.ts and
@@ -79,7 +84,16 @@ export const IN_FLIGHT_BACKUP_JOB_STATUSES = ['pending', 'running'] as const;
  * (or attentionItems) to express "degraded"; do not express it by pretending
  * no backup exists.
  */
-export const RESTORABLE_BACKUP_JOB_STATUSES = ['completed', 'partial'] as const;
+export const RESTORABLE_BACKUP_JOB_STATUSES = ['completed', 'completed_with_errors', 'partial'] as const;
+
+/**
+ * The terminal `backup_status` values a run lands in when it produced a
+ * snapshot but at least one file failed (#5396): `completed_with_errors` under
+ * the 10% threshold, `partial` over it. Both are restorable (see above) but
+ * neither is a clean `completed`, so every surface that colours a run must
+ * render them as degraded, never green.
+ */
+export const DEGRADED_BACKUP_JOB_STATUSES = ['completed_with_errors', 'partial'] as const;
 
 /**
  * Marker the stale-backup-job reaper (jobs/staleCommandReaper.ts) stamps into a
@@ -261,10 +275,19 @@ export const backupJobs = pgTable(
     snapshotId: varchar('snapshot_id', { length: BACKUP_SNAPSHOT_ID_MAX_LENGTH }),
     vssMetadata: jsonb('vss_metadata'),
     backupType: backupTypeEnum('backup_type').default('file'),
-    // Live-progress columns (stall detection + UI progress/speed). Set on
-    // every backup_progress WS message and on the async started-ack; NULL
-    // means the agent never reported progress (legacy agent).
+    // Live-progress columns (stall detection + UI progress/speed), #2798.
+    // Two clocks, deliberately separate:
+    //  - last_keepalive_at: LIVENESS. Bumped by every backup_progress WS
+    //    message (including the agent's 30s keepalive, which re-sends
+    //    unchanged counters) and by the async started/queued ack. NULL means
+    //    the agent never sent a lifecycle signal (legacy agent). Also the
+    //    "has the helper spoken yet" marker for the queue lifecycle guards.
+    //  - last_progress_at: PROGRESS. Advanced only when transferred_size or
+    //    file_count actually increases. The stale reaper's no-transfer rule
+    //    keys on it; before #2798 it was bumped by the keepalive too, which
+    //    made the stall rule unreachable for a live-but-wedged agent.
     lastProgressAt: timestamp('last_progress_at', { withTimezone: true }),
+    lastKeepaliveAt: timestamp('last_keepalive_at', { withTimezone: true }),
     totalFiles: integer('total_files'),
     // Incremental-backup dedup stats: files/bytes referenced from a prior
     // snapshot instead of re-transferred this run. NULL = agent didn't report
@@ -362,6 +385,10 @@ export const backupSnapshots = pgTable(
     // — the W02 sweep self-heals a NULL row from the storage listing; there
     // is no follow-up NOT NULL migration.
     storageIdentity: text('storage_identity'),
+    // Object-key layout the snapshot was written with. Every writer produces
+    // 'legacy_flat' (snapshots/<snapshotId>/...); readers refuse any other
+    // value (services/backupKeyLayout.ts).
+    keyLayout: text('key_layout').notNull().default('legacy_flat'),
     // Bare-metal recovery (W01): disk layout captured at run time and the
     // guard verdict. NULL verdict = not assessed (file-only run / old agent).
     layoutManifest: jsonb('layout_manifest'),
@@ -375,6 +402,16 @@ export const backupSnapshots = pgTable(
     fileIndexHydratedAt: timestamp('file_index_hydrated_at', { withTimezone: true }),
     fileIndexExternalCount: integer('file_index_external_count'),
     fileIndexError: text('file_index_error'),
+    // Snapshot attestation projection for display and reports (see
+    // schema/backupSnapshotAttestations.ts). Restore decisions read the
+    // attestation row, never this column. 'unattested_legacy' = produced
+    // by a helper that does not report attestations; never backfilled.
+    integrityStatus: text('integrity_status').notNull().default('unattested_legacy'),
+    // How the row came to exist: 'agent_result' (an authenticated result for a
+    // dispatched job), 'reconcile' (adopted from storage) or
+    // 'agent_result_after_reconcile' (a reconciled row whose producing
+    // device's own result arrived later). NULL = created before this column.
+    resultProvenance: text('result_provenance'),
   },
   (table) => ({
     orgIdIdx: index('backup_snapshots_org_id_idx').on(table.orgId),
@@ -386,6 +423,22 @@ export const backupSnapshots = pgTable(
     parentSnapshotIdIdx: index('backup_snapshots_parent_snapshot_id_idx').on(
       table.parentSnapshotId
     ),
+    // SEC follow-up: DB-enforced guarantee that two runs cannot claim the
+    // same snapshot id against the same storage destination, regardless of
+    // which org's RLS context the write runs under. See migration
+    // 2026-11-05-100300-backup-snapshots-storage-identity-snapshot-id-uq.sql
+    // for the scope rationale (storage_identity, not a bare global id) and
+    // the partial-index rationale (storageIdentity is nullable forever).
+    storageIdentitySnapshotIdUq: uniqueIndex(
+      'backup_snapshots_storage_identity_snapshot_id_uq'
+    ).on(table.storageIdentity, table.snapshotId).where(
+      sql`${table.storageIdentity} IS NOT NULL`
+    ),
+    // Storage GC looks up rows with a non-default layout on every run; almost
+    // every row is 'legacy_flat', so the partial index stays tiny.
+    keyLayoutNonDefaultIdx: index('backup_snapshots_key_layout_non_default_idx')
+      .on(table.keyLayout)
+      .where(sql`${table.keyLayout} <> 'legacy_flat'`),
   })
 );
 

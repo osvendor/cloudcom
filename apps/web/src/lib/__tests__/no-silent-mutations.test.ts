@@ -52,6 +52,10 @@ const TARGET_GLOBS = [
   // Network device "Check now" (#5988 W05): the probe reads liveness outside
   // W04's settings writer and must surface every mutation outcome.
   'src/components/devices/networkDevice/useAssetProbe.ts',
+  // Parked-device assignment: single and bulk assign mutations go through
+  // runAction from birth.
+  'src/components/devices/AssignParkedDeviceDialog.tsx',
+  'src/components/devices/UnassignedDevicesPage.tsx',
   'src/components/alerts/delivery/deliveryActions.ts',
   'src/components/alerts/AlertsPage.tsx',
   'src/components/alerts/AlertDetailPage.tsx',
@@ -129,6 +133,10 @@ const TARGET_GLOBS = [
   // Metric anomaly episodes W04: card actions (dismiss/resolve/promote/unsnooze)
   // are the only mutation surface for the rewritten panel.
   'src/components/devices/AnomalyEpisodeCard.tsx',
+  // AI Suggested Fixes W1: Generate/accept/dismiss/execute plus the 👍/👎 vote
+  // and Done feed the fix-memory outcome record — a silent failure here loses
+  // the evidence a proven fix is built from.
+  'src/components/remediation/RemediationSuggestionsPanel.tsx',
   // Fleet Designer W02 (#5652): the Function field's PUT is its own file.
   'src/components/devices/DeviceFunctionField.tsx',
   'src/components/devices/DevicePatchStatusTab.tsx',
@@ -183,11 +191,12 @@ const TARGET_GLOBS = [
   'src/components/billing/quotes/QuoteEditor.tsx',
   'src/components/alerts/CorrelatedAlertGroups.tsx',
   'src/components/integrations/SecurityIntegration.tsx',
-  // QuickBooks entity mapping workbench: confirm/create/unlink/sync decisions
+  // Accounting entity mapping workbench (QuickBooks, and Xero from W02):
+  // confirm/create/unlink/sync decisions
   // and the income-account save all mutate a partner's accounting linkage —
   // a bare fetchWithAuth here would silently fail a mapping the operator
   // believes was saved.
-  'src/components/integrations/QuickbooksMappingWorkbench.tsx',
+  'src/components/integrations/AccountingMappingWorkbench.tsx',
   'src/components/devices/DeviceVulnerabilitiesTab.tsx',
   'src/components/vulnerabilities/VulnerabilityFleetPage.tsx',
   'src/components/vulnerabilities/SoftwareGroupDrawer.tsx',
@@ -255,7 +264,9 @@ const TARGET_GLOBS = [
   'src/components/admin/QuarantinedDevices.tsx',
   'src/components/automations/AutomationsPage.tsx',
   // #5313: create-monitor and site-edit saves confirmed nothing on 2xx.
-  'src/components/monitors/CreateMonitorForm.tsx',
+  'src/components/monitors/NetworkCheckConversionBanner.tsx',
+  'src/components/monitors/NetworkMonitorList.tsx',
+  'src/components/monitors/MonitorDetailModal.tsx',
   'src/components/settings/SiteDetailPage.tsx',
   'src/components/automations/PoliciesPage.tsx',
   // #3531 sweep: the same hidden-failure pattern (destructive action behind an
@@ -320,12 +331,34 @@ const TARGET_GLOBS = [
   // that 403s on the all-organizations access gate must never look identical
   // to one that succeeded.
   'src/components/reports/ReportTemplates.tsx',
-  // QuickBooks connection panel (Phase D): connect/disconnect/push-mode/settings
+  // Multi-org report series W04 (Combine): the combine POST rewrites and
+  // archives existing reports across orgs; a silent failure would read as
+  // "combined" while every duplicate keeps sending.
+  'src/components/reports/series/CombineDialog.tsx',
+  // Multi-org report series (W03): the one client for every series mutation
+  // (create/edit/targets/transfer/delete/detach, per-org run, recipient
+  // overrides). A silent failure here reads as "this org was excluded" or
+  // "this customer will receive it" when neither is true.
+  'src/components/reports/series/seriesApi.ts',
+  // Accounting connection panel (formerly the QuickBooks-only panel, Phase D): connect/disconnect/push-mode/settings
   // -refresh already routed through runAction, but the file was never guarded —
   // so the pull-payments PATCH and the "Sync now" enqueue would have shipped
   // unguarded next to them. A silent failure on either reads as "payment sync
   // is on / a sync is running" while the books and Breeze quietly diverge.
-  'src/components/integrations/QuickbooksIntegration.tsx',
+  'src/components/integrations/AccountingConnectionPanel.tsx',
+  // Accounting customer import: the import POST creates Breeze organizations
+  // from provider customers. It already used runAction but was never listed
+  // (Xero W01 Task 18), so a regression to a bare fetch would have gone unseen.
+  'src/components/integrations/AccountingCustomerImport.tsx',
+  // Xero organisation (tenant) picker: select/cancel both mutate the pending
+  // tenant-selection row. A silent failure here would leave the partner
+  // believing an organisation was connected (or the pending grant cancelled)
+  // when the API never confirmed either.
+  'src/components/integrations/AccountingTenantPicker.tsx',
+  // Xero settings step: the four default-account/tax/bank picker PATCH is a
+  // one-page Save — a silent failure here would leave the operator believing
+  // new defaults are live when the server never saved them.
+  'src/components/integrations/AccountingSettingsStep.tsx',
   // Partner trust action links approve or suspend an entire partner. Keep the
   // TOTP-confirmed mutation inside runAction so this high-impact result cannot
   // fail without operator feedback.
@@ -442,6 +475,14 @@ const TARGET_GLOBS = [
   // from a Breeze device; a silent failure leaves the tech believing the link
   // is gone while alerts keep firing against it.
   'src/components/backup/ExternalBackupCard.tsx',
+  // Topology M2 (#5998 Task 9): hide/restore of a connection in one view. A
+  // silent failure leaves a tech believing a false cable is hidden (or back).
+  'src/components/topology/RelationshipExclusionAction.tsx',
+  // Topology M3 (#5999 Task 11): arming recurring monitoring and port
+  // measurement. A silent failure leaves a tech believing a site is being
+  // measured (or no longer is) when it is not.
+  'src/components/topology/MonitoringPolicyPanel.tsx',
+  'src/components/topology/InterfaceTelemetrySettings.tsx',
 ];
 
 const absoluteFiles: string[] = TARGET_GLOBS.map((rel) => resolve(WEB_ROOT, '..', rel));
@@ -739,10 +780,10 @@ describe('no silent mutations in targeted set', () => {
     // plus SsoProvidersPage.tsx and ReportBuilder.tsx (2026-08-28 pre-release sweep),
     // plus AlertVerdictBadge.tsx (P2-1 Task 15), plus
     // AiAgentSchedulesSection.tsx (P2-2 Task 13, #4189), plus
-    // QuickbooksMappingWorkbench.tsx (QuickBooks entity mapping, Task 6), plus
+    // AccountingMappingWorkbench.tsx (QuickBooks entity mapping, Task 6), plus
     // ImpactPage.tsx (P2-6 Task 10, #4193), plus ImpactWeightsDrawer.tsx
     // (P2-6 Task 11, #4193), plus AccountingSyncCard.tsx (QuickBooks invoice
-    // push, Phase C Task 7), plus QuickbooksIntegration.tsx (QuickBooks payment
+    // push, Phase C Task 7), plus AccountingConnectionPanel.tsx (QuickBooks payment
     // pull-back, Phase D Task 7 — the pull-payments PATCH and the "Sync now"
     // enqueue joined four pre-existing unguarded mutations in that file), plus
     // AiAgentGraduationPanel.tsx (P2-5 Task 20, #4192). ApprovalsInbox.tsx was
@@ -815,7 +856,19 @@ describe('no silent mutations in targeted set', () => {
     // Backup provider integration (W03 #6011) adds three adopters: 185 → 188.
     // 188 -> 189: ExternalBackupCard.tsx (W03 Task 12, #6011) added to TARGET_GLOBS.
     // #5313 adds monitors/CreateMonitorForm.tsx and settings/SiteDetailPage.tsx: 189 → 191.
-    expect(absoluteFiles.length).toBe(191);
+    // Network results replace the deleted create form with three mutation adopters: 191 → 193.
+    // Xero W01 renames the two QuickBooks components and adds the previously
+    // unlisted AccountingCustomerImport.tsx: 193 → 194.
+    // 194 -> 195: topology/RelationshipExclusionAction.tsx (#5998 Task 9).
+    // 195 -> 197: topology/MonitoringPolicyPanel.tsx + InterfaceTelemetrySettings.tsx (#5999 Task 11).
+    // Xero W02 Task 11 adds AccountingTenantPicker.tsx: 197 → 198.
+    // Xero W02 Task 12 adds AccountingSettingsStep.tsx: 198 → 199.
+    // AI Suggested Fixes W1 adds remediation/RemediationSuggestionsPanel.tsx: 199 → 200.
+    // 200 -> 202: devices/AssignParkedDeviceDialog.tsx and
+    // devices/UnassignedDevicesPage.tsx (parked-device assignment).
+    // Multi-org report series W03 adds reports/series/seriesApi.ts: 202 → 203.
+    // Multi-org report series W04 adds reports/series/CombineDialog.tsx: 203 → 204.
+    expect(absoluteFiles.length).toBe(204);
     for (const f of absoluteFiles) {
       expect(() => statSync(f)).not.toThrow();
     }

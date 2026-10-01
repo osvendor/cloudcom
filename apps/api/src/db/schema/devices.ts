@@ -110,6 +110,15 @@ export const devices = pgTable('devices', {
   maintenanceReason: varchar('maintenance_reason', { length: 500 }),
   maintenanceStartedBy: uuid('maintenance_started_by').references(() => users.id, { onDelete: 'set null' }),
   lastSeenAt: timestamp('last_seen_at'),
+  // #7067 — latest agent-logs ingest time for this device. Written by the
+  // logs ingest route (agents/logs.ts), throttled to a conditional UPDATE so
+  // a batch that moved the value < 5 min doesn't cost a write on the hot
+  // ingest path. NULL = never shipped a log (or predates this column).
+  // Combined with `status`, this is what lets the server tell "a heartbeating
+  // device that is quiet by design" from "a heartbeating device whose log
+  // shipping is mute" without depending on the (possibly broken) log channel
+  // itself — see isDeviceLogSilent in @breeze/shared.
+  lastLogAt: timestamp('last_log_at', { withTimezone: true }),
   enrolledAt: timestamp('enrolled_at').defaultNow().notNull(),
   // Bare-metal recovery W04a: stamped by the heartbeat check-in that completes
   // a recovery. recoveredFromSnapshotId is a soft reference to
@@ -246,6 +255,38 @@ export const devices = pgTable('devices', {
   // desktop-start dispatch sites refuse with 503 agent_upgrade_required, same
   // shape as the revocation-lease gate above. Non-sticky: rewritten every beat.
   desktopFenceProtocolVersion: integer('desktop_fence_protocol_version').notNull().default(0),
+  // Consent/notification prompt capability. 1 = this agent build parses the
+  // `prompt` block on a desktop-stream-start command and gates on it
+  // (consent dialog / on-screen notice) before capturing. 0 (default, and
+  // every agent that omits the field) means the agent silently ignores an
+  // unfamiliar `prompt` key and streams unconditionally — so any dispatch
+  // site that resolves a policy requiring consent or notification must
+  // refuse to start rather than send a prompt block a capability-0 agent
+  // will not honor. Non-sticky, same contract as the versions above.
+  consentPromptProtocolVersion: integer('consent_prompt_protocol_version').notNull().default(0),
+  // Brokered storage-read protocol of the INSTALLED backup helper, reported by
+  // the main agent as a top-level heartbeat field. 1 = the helper can restore
+  // through a short-lived storage session instead of reusable storage
+  // credentials; 0 (every agent that omits the field) = no.
+  // Non-sticky: rewritten every beat so a helper downgrade clears the claim.
+  //
+  // NULL = NOT REPORTED YET: a newly enrolled (or re-enrolled) install whose
+  // first heartbeat has not arrived. Unknown is not "old helper": backup and
+  // restore dispatch waits for the report rather than choosing the path an
+  // old helper would get (services/backupHelperProtocols.ts). The heartbeat
+  // always writes a number, so NULL never returns once a report is recorded
+  // except through re-enrollment, which resets all three to NULL.
+  backupReadProtocolVersion: integer('backup_read_protocol_version'),
+  // Snapshot integrity protocol of the INSTALLED backup helper (same report,
+  // same non-sticky contract, same NULL = not reported yet). 1 = the helper
+  // produces snapshot attestations; 2 = it also checks them at every restore.
+  // 0 = neither.
+  backupIntegrityProtocolVersion: integer('backup_integrity_protocol_version'),
+  // Storage write protocol of the INSTALLED backup helper (same report, same
+  // non-sticky contract, same NULL = not reported yet). 1 = the helper writes
+  // through brokered storage sessions; 0 = it writes with the configured
+  // storage destination.
+  backupWriteProtocolVersion: integer('backup_write_protocol_version'),
   rollbackComponentVersions: jsonb('rollback_component_versions').$type<Record<string, string> | null>(),
   // Agent-reported build edition + migration-needed flag (heartbeat telemetry).
   // Non-sensitive; drives the self-hosted migration banner. Written unconditionally
@@ -263,6 +304,23 @@ export const devices = pgTable('devices', {
   // on a state change; `since` is when the current episode began.
   updateOfferWithheldReason: varchar('update_offer_withheld_reason', { length: 50 }),
   updateOfferWithheldSince: timestamp('update_offer_withheld_since', { withTimezone: true }),
+  // #4073 — the agent self-update currently being attempted. Stamped by the
+  // WS `update_status` message the agent sends before EVERY attempt, cleared
+  // by the heartbeat once the reported version reaches the target. An open
+  // record that is old and still retrying is a stuck update
+  // (isAgentUpdateStuck in @breeze/shared) — detectable without logs.
+  updateAttemptTargetVersion: varchar('update_attempt_target_version', { length: 50 }),
+  updateAttemptStartedAt: timestamp('update_attempt_started_at', { withTimezone: true }),
+  updateAttemptLastAt: timestamp('update_attempt_last_at', { withTimezone: true }),
+  updateAttemptCount: integer('update_attempt_count'),
+  // #6925 — agent-reported Breeze Assist install problem. NULL = none reported
+  // (healthy, Assist off, or an agent too old to report). 'awaiting_server_offer'
+  // = enabled but not installed and the server sent no helper version;
+  // 'install_abandoned' = the agent gave up installing the offered version
+  // (#6927). Written by the heartbeat ONLY on a state change; `since` is when
+  // the current episode began.
+  helperInstallIssue: varchar('helper_install_issue', { length: 50 }),
+  helperInstallIssueSince: timestamp('helper_install_issue_since', { withTimezone: true }),
   // Enrollment idempotency (#2764): uninstall intent stamped by the agent's
   // graceful-uninstall notify path (Task 5/6); reaper decommissions once past
   // grace with no re-enrollment heartbeat. possibleReplacementOfDeviceId links
@@ -328,6 +386,13 @@ export const deviceHardware = pgTable('device_hardware', {
   motherboardProduct: varchar('motherboard_product', { length: 255 }),
   motherboardVersion: varchar('motherboard_version', { length: 255 }),
   biosVersion: varchar('bios_version', { length: 100 }),
+  // Memory summary (#5351). All NULL until an agent reports a valid `memory`
+  // block; `memoryObservedAt` is when one was last applied (updatedAt also
+  // advances when memory collection failed). See device_memory_modules.
+  memorySlotsTotal: integer('memory_slots_total'),
+  memoryMaxCapacityMb: integer('memory_max_capacity_mb'),
+  memorySoldered: boolean('memory_soldered'),
+  memoryObservedAt: timestamp('memory_observed_at'),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
   partnerExportUpdatedAt: timestamp('partner_export_updated_at', { precision: 3 }).defaultNow().notNull()
 });
@@ -427,6 +492,41 @@ export const deviceDisks = pgTable('device_disks', {
   health: varchar('health', { length: 50 }).default('healthy'),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 });
+
+// Per-slot memory inventory (#5351). One row per physical slot, populated or
+// empty (populated = false). Synced by slotKey from the agent's hardware
+// report (services/inventoryChildSync.ts syncDeviceMemoryModules), so row ids
+// survive unchanged reports. Migration:
+// 2026-11-01-110000-device-memory-modules.sql, which also declares the
+// composite FK DEFERRABLE INITIALLY IMMEDIATE (drizzle's foreignKey() builder
+// has no deferrable option) and installs the partner-export material triggers.
+export const deviceMemoryModules = pgTable('device_memory_modules', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  deviceId: uuid('device_id').notNull().references(() => devices.id),
+  orgId: uuid('org_id').notNull().references(() => organizations.id),
+  slotKey: varchar('slot_key', { length: 160 }).notNull(),
+  slotIndex: integer('slot_index').notNull(),
+  locator: varchar('locator', { length: 128 }).notNull(),
+  bankLabel: varchar('bank_label', { length: 128 }),
+  populated: boolean('populated').notNull(),
+  capacityMb: integer('capacity_mb'),
+  memoryType: varchar('memory_type', { length: 32 }),
+  formFactor: varchar('form_factor', { length: 32 }),
+  speedMts: integer('speed_mts'),
+  configuredSpeedMts: integer('configured_speed_mts'),
+  manufacturer: varchar('manufacturer', { length: 128 }),
+  partNumber: varchar('part_number', { length: 128 }),
+  serialNumber: varchar('serial_number', { length: 128 }),
+  updatedAt: timestamp('updated_at').defaultNow().notNull()
+}, (table) => ({
+  deviceSlotKeyUnique: uniqueIndex('device_memory_modules_device_slot_key_uniq').on(table.deviceId, table.slotKey),
+  orgIdIdx: index('device_memory_modules_org_id_idx').on(table.orgId),
+  deviceOrgFk: foreignKey({
+    columns: [table.deviceId, table.orgId],
+    foreignColumns: [devices.id, devices.orgId],
+    name: 'device_memory_modules_device_org_fk',
+  }).onUpdate('cascade').onDelete('cascade'),
+}));
 
 export const deviceMetrics = pgTable('device_metrics', {
   deviceId: uuid('device_id').notNull().references(() => devices.id),
@@ -602,6 +702,14 @@ export const deviceCommands = pgTable('device_commands', {
   // clock). NULL = legacy rule (execution timeout measured from created_at).
   // See services/commandOfflinePolicy.ts and jobs/staleCommandReaper.ts.
   deliverBy: timestamp('deliver_by', { withTimezone: true }),
+  // #3578 -- the last in-flight stage the agent reported for this command over
+  // the `command_progress` WS frame (services/commandProgress.ts), and when it
+  // reported it. NULL on every row from an agent that predates the frame, and
+  // until the first report. Advisory only: nothing gates on it -- terminal
+  // state is still owned by `status`. See
+  // 2026-11-08-113300-device-commands-progress-stage.sql.
+  progressStage: varchar('progress_stage', { length: 32 }),
+  progressAt: timestamp('progress_at', { withTimezone: true }),
   // #5128 -- the device's org at enqueue. PROVENANCE, not tenancy: compared at
   // claim time to cancel rows whose device has since moved org. Deliberately
   // NOT named org_id so the RLS/cascade auto-discovery keeps device_commands

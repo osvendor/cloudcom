@@ -1,7 +1,6 @@
 import { eq, sql } from 'drizzle-orm';
 import { getRedis } from './redis';
 import * as dbModule from '../db';
-import { utcMsFromOffsetlessDbTimestamp } from '../utils/offsetlessTimestamp';
 import { refreshTokenFamilies } from '../db/schema/refreshTokenFamilies';
 
 const ACCESS_TOKEN_REVOCATION_TTL_SECONDS = 15 * 60;
@@ -116,6 +115,25 @@ export async function isUserTokenRevoked(userId: string, tokenIssuedAt?: number)
   }
 }
 
+/**
+ * Millisecond-precision variant of `isUserTokenRevoked` for callers whose
+ * "issued at" value is a real Date/timestamp (e.g. a DB row's `createdAt`),
+ * not a JWT `iat`. `isUserTokenRevoked`'s default 1-second grace exists
+ * specifically for JWT `iat`, which is itself second-granular and needs
+ * slack to allow a same-second re-login; applying that same grace to a
+ * millisecond-precision timestamp lets a value created in the same UTC
+ * second as the revocation — even strictly before it — read as "created
+ * after," which is the wrong answer.
+ *
+ * This fails closed at the boundary instead: a timestamp in the same
+ * second as the revocation, or earlier, is treated as revoked. Only a
+ * timestamp in a later whole second is treated as issued after.
+ */
+export async function isTimestampRevoked(userId: string, createdAtMs: number): Promise<boolean> {
+  const boundSeconds = Math.floor(createdAtMs / 1000) - 1;
+  return isUserTokenRevoked(userId, boundSeconds);
+}
+
 export interface RevokeAllUserTokensOptions {
   /**
    * Unix seconds of the moment a REPLACEMENT session was minted for this user
@@ -187,24 +205,17 @@ export async function revokeAllRefreshTokenFamiliesForUser(
   });
 }
 
-// `users.passwordChangedAt` is a `timestamp` (no tz) column
-// (apps/api/src/db/schema/users.ts), so the Date Drizzle hands back carries
-// the UTC wall clock re-read as THIS PROCESS's local time — wrong by exactly
-// the host's UTC offset on any non-UTC host. A caller-supplied string (e.g. an
-// already-serialized `toISOString()` value) is NOT affected: it carries an
-// explicit 'Z' offset, so `new Date(string).getTime()` is already correct and
-// must not be re-corrected. Same defect class as #4018; the correction itself
-// lives in utils/offsetlessTimestamp.ts (canonical writeup there), and
-// testUtils/pgOffsetlessTimestamp.ts is the test-side simulation.
+// `passwordChangedAt` is a Drizzle read of `users.password_changed_at`
+// (`timestamp`, no tz). Drizzle decodes that column as UTC, so the Date is
+// already the stored instant on any host and is compared as is. A string must
+// carry an explicit offset (e.g. an already-serialized `toISOString()` value).
 export function isTokenIssuedBeforePasswordChange(
   tokenIssuedAt: number | undefined,
   passwordChangedAt: Date | string | null | undefined
 ): boolean {
   if (!passwordChangedAt) return false;
 
-  const changedAtMs = passwordChangedAt instanceof Date
-    ? utcMsFromOffsetlessDbTimestamp(passwordChangedAt)
-    : new Date(passwordChangedAt).getTime();
+  const changedAtMs = new Date(passwordChangedAt).getTime();
   if (!Number.isFinite(changedAtMs)) return false;
 
   // A token with no sane iat cannot prove it was minted after the password

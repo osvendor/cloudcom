@@ -4,6 +4,7 @@ import { useOrgStore, type Site } from '../../stores/orgStore';
 import { fallbackInstallerFilename, filenameFromContentDisposition } from '@/lib/downloadFilename';
 import { navigateTo } from '@/lib/navigation';
 import { fetchAllSites } from '@/lib/fetchAllSites';
+import AccessDenied from '../shared/AccessDenied';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { showToast } from '../shared/Toast';
 import { runAction, ActionError } from '../../lib/runAction';
@@ -17,9 +18,18 @@ interface EnrollmentKey {
   id: string;
   orgId: string;
   siteId: string | null;
+  /** Name of the bound site (#7217) — what tells same-named Add Device keys apart. */
+  siteName?: string | null;
   name: string;
   key?: string | null;
+  /**
+   * Redacted (null) by the API for a caller who lacks organizations:write —
+   * shortCode is an enrollment-capable secret, so a read-only role never
+   * receives its value. `hasShortLink` still reports whether the underlying
+   * link exists, so the row can distinguish "hidden" from "never created".
+   */
   shortCode?: string | null;
+  hasShortLink?: boolean;
   usageCount: number;
   maxUsage: number | null;
   expiresAt: string | null;
@@ -84,6 +94,9 @@ export default function EnrollmentKeyManager() {
   const [keys, setKeys] = useState<EnrollmentKey[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
+  // A 403 on the list is a permission state, not a transient failure: render
+  // AccessDenied instead of an error with a Retry that can only 403 again.
+  const [accessDenied, setAccessDenied] = useState(false);
   const [modalMode, setModalMode] = useState<ModalMode>('closed');
   const [selectedKey, setSelectedKey] = useState<EnrollmentKey | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -129,8 +142,13 @@ export default function EnrollmentKeyManager() {
           void navigateTo('/login', { replace: true });
           return;
         }
+        if (response.status === 403) {
+          setAccessDenied(true);
+          return;
+        }
         throw new Error(stableT('enrollmentKeys.fetchFailed'));
       }
+      setAccessDenied(false);
       const data = await response.json();
       setKeys(data.data ?? []);
       const total = data.pagination?.total ?? 0;
@@ -488,6 +506,10 @@ export default function EnrollmentKeyManager() {
     );
   }
 
+  if (accessDenied) {
+    return <AccessDenied testId="enrollment-keys-denied" />;
+  }
+
   if (error && keys.length === 0) {
     return (
       <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-6 text-center">
@@ -606,6 +628,7 @@ export default function EnrollmentKeyManager() {
             <thead className="bg-muted/40">
               <tr className="text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                 <th className="px-4 py-3">{t('common:labels.name')}</th>
+                <th className="px-4 py-3">{t('common:labels.site')}</th>
                 <th className="px-4 py-3">{t('enrollmentKeys.shortCode')}</th>
                 <th className="px-4 py-3">{t('common:labels.status')}</th>
                 <th className="px-4 py-3">{t('enrollmentKeys.usage')}</th>
@@ -617,7 +640,7 @@ export default function EnrollmentKeyManager() {
             <tbody>
               {keys.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">
+                  <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">
                     {t('enrollmentKeys.empty')}
                   </td>
                 </tr>
@@ -627,6 +650,9 @@ export default function EnrollmentKeyManager() {
                   return (
                     <tr key={key.id} className="border-b last:border-b-0 hover:bg-muted/50">
                       <td className="px-4 py-3 font-medium">{key.name}</td>
+                      <td className="px-4 py-3" data-testid={`key-site-${key.id}`}>
+                        {key.siteName ?? '—'}
+                      </td>
                       <td className="px-4 py-3">
                         {key.shortCode ? (
                           <div className="flex items-center gap-2">
@@ -650,6 +676,13 @@ export default function EnrollmentKeyManager() {
                               )}
                             </button>
                           </div>
+                        ) : key.hasShortLink ? (
+                          <span
+                            className="text-xs text-muted-foreground italic"
+                            title={t('enrollmentKeys.shortCodeHidden')}
+                          >
+                            {t('enrollmentKeys.shortCodeHidden')}
+                          </span>
                         ) : (
                           <span className="text-xs text-muted-foreground">—</span>
                         )}

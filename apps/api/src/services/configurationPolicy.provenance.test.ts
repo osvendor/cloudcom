@@ -14,6 +14,12 @@ vi.mock('../db', () => ({
   getCurrentDbAccessContext: vi.fn(() => ({ scope: 'system' as const })),
 }));
 
+// Field-provenance tiering (denylist option) — see configurationPolicy.baseline.test.ts.
+vi.mock('./executionTargetGating', () => ({
+  resolveExecutionSafeGroupIds: vi.fn(async (groupIds: string[]) => ({ allowedGroupIds: groupIds, refusedGroups: [] })),
+  auditRefusedExecutionGroups: vi.fn(),
+}));
+
 import { resolveEffectiveConfig } from './configurationPolicy';
 import { db } from '../db';
 import type { AuthContext } from '../middleware/auth';
@@ -140,15 +146,15 @@ describe('resolveEffectiveConfig inheritance provenance', () => {
         inherited: true,
         linkSourcePolicyId: 'parent-1',
       }),
-      row({ featureType: 'alert_rule', featureLinkId: 'link-child-ar', inherited: false }),
+      row({ featureType: 'patch', featureLinkId: 'link-child-ar', inherited: false }),
     ]);
 
     const r = await resolveEffectiveConfig('dev-1', systemAuth);
     expect(r!.features.event_log!.inheritedFromPolicyId).toBe('parent-1');
-    expect(r!.features.alert_rule!.inheritedFromPolicyId).toBeNull();
+    expect(r!.features.patch!.inheritedFromPolicyId).toBeNull();
     // Both compete at the CHILD's assignment level and priority.
     expect(r!.features.event_log!.sourceLevel).toBe('organization');
-    expect(r!.features.alert_rule!.sourceLevel).toBe('organization');
+    expect(r!.features.patch!.sourceLevel).toBe('organization');
   });
 
   it('a lost row does not leak its provenance onto the winner', async () => {

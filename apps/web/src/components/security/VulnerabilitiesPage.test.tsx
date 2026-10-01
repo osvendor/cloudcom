@@ -1,5 +1,6 @@
+import '@/lib/i18n';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, waitFor } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 
 const { fetchWithAuth } = vi.hoisted(() => ({
   fetchWithAuth: vi.fn()
@@ -33,6 +34,35 @@ beforeEach(() => {
 
 afterEach(() => {
   window.history.replaceState(null, '', window.location.pathname);
+});
+
+describe('VulnerabilitiesPage filter selects accessible name (#7156)', () => {
+  it('gives the severity/status/category filter selects a real accessible name', async () => {
+    render(<VulnerabilitiesPage />);
+    expect(await screen.findByRole('combobox', { name: 'Severity' })).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Status' })).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Category' })).toBeInTheDocument();
+  });
+});
+
+describe('VulnerabilitiesPage checkbox accessible names', () => {
+  it('names the select-all and per-row checkboxes', async () => {
+    fetchWithAuth.mockResolvedValue(ok({
+      ...emptyListPayload,
+      data: [{
+        id: 't1', deviceId: 'd1', deviceName: 'HOST-1', name: 'Evil.Exe', category: 'trojan',
+        severity: 'high', status: 'active', detectedAt: '2026-09-01T00:00:00Z', filePath: 'C:\\evil.exe'
+      }]
+    }));
+    render(<VulnerabilitiesPage />);
+    await screen.findAllByText('Evil.Exe');
+    expect(screen.getAllByRole('checkbox', { name: 'Select all threats' }).length).toBeGreaterThan(0);
+    // Table row + mobile card each expose a named row checkbox.
+    expect(screen.getAllByRole('checkbox', { name: 'Select threat Evil.Exe' }).length).toBeGreaterThan(0);
+    for (const cb of screen.getAllByRole('checkbox')) {
+      expect(cb).toHaveAccessibleName();
+    }
+  });
 });
 
 describe('VulnerabilitiesPage', () => {

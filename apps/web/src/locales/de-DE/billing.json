@@ -925,7 +925,7 @@
         "subtotal": "Zwischensumme",
         "tax": "Steuer",
         "taxRate": "Steuersatz",
-        "taxRateHelp": "Gilt für Positionen, die als steuerpflichtig gekennzeichnet sind. Wird in den Steuereinstellungen der Organisation festgelegt.",
+        "taxRateHelp": "Gilt für Positionen, die als steuerpflichtig gekennzeichnet sind. Dieser Satz wurde bei der Erstellung des Angebots festgelegt; um ihn für künftige Angebote zu ändern, passen Sie die Steuereinstellungen der Organisation an.",
         "title": "Live-Summen",
         "total": "Gesamtsumme"
       },
@@ -1043,7 +1043,8 @@
         "readOnlyHint": "Entfernen Sie diesen Abschnitt und fügen Sie ihn neu hinzu, um Vorlage, Version oder Variablen zu ändern.",
         "updateToVersion": "Auf v{{version}} aktualisieren",
         "saveVariables": "Variablen speichern",
-        "unresolvedWarning": "Nicht aufgelöste Variablen (verhindern das Senden): {{names}}"
+        "unresolvedWarning": "Nicht aufgelöste Variablen (verhindern das Senden): {{names}}",
+        "placementHint": "Kunden sehen dies nach den Summen, eingeklappt, bis sie es öffnen. Im PDF folgt es auf den Preis."
       },
       "coverPage": {
         "title": "Deckblatt",
@@ -1209,7 +1210,7 @@
         "signerEmailLabel": "E-Mail-Adresse (optional)",
         "consequenceInvoice": "Eine Rechnung über {{amount}} wird jetzt erstellt und nummeriert.",
         "consequenceContracts": "Wiederkehrende Positionen werden zu Vertragsentwürfen, die Sie später aktivieren.",
-        "consequenceEmail": "Die Rechnung wird per E-Mail an den Kunden gesendet.",
+        "consequenceEmail": "Die Rechnung wird per E-Mail an {{recipients}} gesendet.",
         "consequenceDraft": "Dieses Angebot wurde nie versendet. Der Kunde sieht es zum ersten Mal als Rechnung.",
         "submit": "Annehmen und Rechnung stellen",
         "success": "Angebot angenommen. Rechnung {{number}} erstellt.",
@@ -1222,7 +1223,9 @@
         "evidenceHelp": "PDF, PNG oder JPEG, bis zu 10 MB — z. B. die unterschriebene Bestellung oder das Dokument.",
         "evidenceTooLarge": "Diese Datei ist größer als 10 MB. Wählen Sie eine kleinere Datei.",
         "evidenceAttached": "Nachweis angehängt.",
-        "evidenceError": "Die Annahme wurde erfasst, aber die Nachweisdatei konnte nicht angehängt werden. Hängen Sie sie von der Angebotsseite aus an."
+        "evidenceError": "Die Annahme wurde erfasst, aber die Nachweisdatei konnte nicht angehängt werden. Hängen Sie sie von der Angebotsseite aus an.",
+        "consequenceEmailNoRecipient": "Für dieses Angebot ist kein Empfänger hinterlegt, daher wird die Rechnung möglicherweise nicht per E-Mail versendet. Senden Sie sie bei Bedarf selbst an den Kunden.",
+        "successNoRecipient": "Angebot angenommen. Rechnung {{number}} ausgestellt. Sie wurde möglicherweise nicht per E-Mail versendet — für dieses Angebot ist kein Empfänger hinterlegt."
       },
       "declineOnBehalf": {
         "button": "Im Auftrag ablehnen",
@@ -1446,6 +1449,18 @@
         "unavailable": "Vereinbarungsdatei nicht verfügbar",
         "versionFooter": "{{name}} — Version {{version}}"
       },
+      "agreements": {
+        "heading": "Vereinbarungen",
+        "termsTitle": "Allgemeine Geschäftsbedingungen",
+        "read": "Lesen",
+        "hide": "Ausblenden",
+        "readTime": "ca. {{minutes}} Min. Lesezeit",
+        "sectionsReadTime_one": "{{count}} Abschnitt · ca. {{minutes}} Min. Lesezeit",
+        "sectionsReadTime_other": "{{count}} Abschnitte · ca. {{minutes}} Min. Lesezeit",
+        "pdfDocument": "PDF-Dokument",
+        "unavailable": "Nicht verfügbar",
+        "untitled": "Vereinbarung"
+      },
       "draft": "Entwurf",
       "empty": "Dieser Vorschlag hat noch keinen Inhalt.",
       "imageUnavailable": "Bild nicht verfügbar",
@@ -1473,7 +1488,6 @@
         "tax": "Steuer",
         "unitPrice": "Stückpreis"
       },
-      "terms": "Bedingungen",
       "totals": {
         "annualRecurring": "Jährlich wiederkehrend",
         "depositDue": "Anzahlung fällig",
@@ -1930,19 +1944,18 @@
       },
       "reverseError": "Die Zahlung konnte nicht rückgängig gemacht werden.",
       "reverseSuccess": "Zahlung storniert",
-      "reverseInQuickbooksToo": "Stornieren Sie diese Zahlung auch in QuickBooks",
       "sendLink": "Zahlungslink senden",
       "setUp": "Einrichten",
       "shareLinkPrompt": "Teilen Sie diesen Zahlungslink mit Ihrem Kunden:",
       "stripeNudge": "Verbinden Sie Stripe, um Online-Kartenzahlungen zu akzeptieren.",
       "title": "Zahlungen",
       "viaStripe": "über Stripe",
-      "quickbooks": "QuickBooks",
-      "viaQuickbooks": "über QuickBooks",
-      "inQuickbooks": "In QuickBooks vorhanden",
-      "syncingToQuickbooks": "Wird synchronisiert…",
-      "quickbooksSyncFailed": "QuickBooks-Synchronisierung fehlgeschlagen",
-      "currencyUnknown": "Die Abrechnungswährung Ihres Stripe-Kontos ist noch nicht zwischengespeichert, daher konnte sie nicht mit dieser Rechnung in {{documentCurrency}} abgeglichen werden. Aktualisieren Sie die Stripe-Kontodaten unter Einstellungen → Integrationen, um die Prüfung zu aktivieren."
+      "currencyUnknown": "Die Abrechnungswährung Ihres Stripe-Kontos ist noch nicht zwischengespeichert, daher konnte sie nicht mit dieser Rechnung in {{documentCurrency}} abgeglichen werden. Aktualisieren Sie die Stripe-Kontodaten unter Einstellungen → Integrationen, um die Prüfung zu aktivieren.",
+      "inProvider": "In {{provider}} vorhanden",
+      "syncingToProvider": "Wird synchronisiert…",
+      "providerSyncFailed": "{{provider}}-Synchronisierung fehlgeschlagen",
+      "reverseInProviderToo": "Stornieren Sie diese Zahlung auch in {{provider}}",
+      "overpayment": "Der Betrag übersteigt den offenen Saldo ({{balance}})."
     },
     "requestPayment": {
       "invoiceSent": "Rechnung verschickt",
@@ -1982,22 +1995,22 @@
       "error": "Link konnte nicht zurückgesetzt werden"
     },
     "accountingSync": {
-      "title": "QuickBooks-Synchronisierung",
+      "title": "{{provider}}-Synchronisierung",
       "status": {
         "pending": "Noch nicht übertragen",
         "synced": "Synchronisiert",
         "error": "Synchronisierung fehlgeschlagen",
         "synced_with_tax_variance": "Synchronisiert mit Steuerabweichung"
       },
-      "taxVarianceHint": "QuickBooks hat eine abweichende Steuersumme berechnet. Vergleichen Sie beide Datensätze, bevor Sie die Periode abschließen.",
-      "docNumber": "QuickBooks-Beleg {{docNumber}}",
+      "taxVarianceHint": "{{provider}} hat eine abweichende Steuersumme berechnet. Vergleichen Sie beide Datensätze, bevor Sie die Periode abschließen.",
+      "docNumber": "{{provider}}-Beleg {{docNumber}}",
       "lastSynced": "Zuletzt synchronisiert am {{when}}",
       "syncing": "Wird übertragen…",
-      "push": "An QuickBooks übertragen",
-      "pushed": "Rechnung an QuickBooks übertragen.",
-      "pushFailed": "Die Rechnung konnte nicht an QuickBooks übertragen werden.",
-      "voidedHint": "Diese Rechnung ist storniert — es gibt nichts an QuickBooks zu übertragen.",
-      "remoteDeletedHint": "Diese Rechnung wurde in QuickBooks gelöscht. Ein erneutes Übertragen würde ein Duplikat erzeugen — lösen Sie dies zuerst in QuickBooks."
+      "push": "An {{provider}} übertragen",
+      "pushed": "Rechnung an {{provider}} übertragen.",
+      "pushFailed": "Die Rechnung konnte nicht an {{provider}} übertragen werden.",
+      "voidedHint": "Diese Rechnung ist storniert — es gibt nichts an {{provider}} zu übertragen.",
+      "remoteDeletedHint": "Diese Rechnung wurde in {{provider}} gelöscht. Ein erneutes Übertragen würde ein Duplikat erzeugen — lösen Sie dies zuerst in {{provider}}."
     }
   },
   "invoiceDocument": {
@@ -2060,11 +2073,11 @@
       "success": "{{succeeded}} {{verb}}",
       "void": "Stornieren",
       "voidedVerb": "storniert",
-      "quickbooks": "An QuickBooks übertragen",
-      "quickbooksQueued": "{{enqueued}} für QuickBooks eingereiht",
-      "quickbooksQueuedPartial": "{{enqueued}} für QuickBooks eingereiht, {{skipped}} übersprungen",
-      "quickbooksQueuedFailed": "{{enqueued}} für QuickBooks eingereiht, {{skipped}} übersprungen, {{failed}} konnten nicht eingereiht werden",
-      "quickbooksFailed": "Die QuickBooks-Übertragung konnte nicht eingereiht werden. Erneut versuchen."
+      "pushToProvider": "An {{provider}} übertragen",
+      "providerQueued": "{{enqueued}} für {{provider}} eingereiht",
+      "providerQueuedPartial": "{{enqueued}} für {{provider}} eingereiht, {{skipped}} übersprungen",
+      "providerQueuedFailed": "{{enqueued}} für {{provider}} eingereiht, {{skipped}} übersprungen, {{failed}} konnten nicht eingereiht werden",
+      "providerFailed": "Die {{provider}}-Übertragung konnte nicht eingereiht werden. Erneut versuchen."
     },
     "bulkDelete": {
       "message": "{{count}} ausgewählte Rechnung(en) löschen? Es werden nur DRAFT-Rechnungen gelöscht; Dies kann nicht rückgängig gemacht werden.",
@@ -2159,11 +2172,11 @@
       "title": "Rechnungsadresse"
     },
     "contact": {
-      "description": "Angebote und Rechnungen werden per E-Mail an diese Adresse gesendet. Ohne diese Angabe wird das Senden eines Angebots als „Gesendet“ gekennzeichnet, es wird jedoch nichts per E-Mail gesendet.",
-      "email": "Kontakt-E-Mail",
-      "emailInvalid": "Geben Sie eine gültige E-Mail-Adresse ein",
-      "emailPlaceholder": "billing@customer.example",
-      "name": "Kontaktname",
+      "description": "Angebote und Rechnungen werden standardmäßig per E-Mail an den Rechnungskontakt der Organisation gesendet – den Kontakt auf Organisationsebene mit der Rolle „Buchhaltung“. Die Empfänger können Sie bei jedem Versand weiterhin ändern.",
+      "manage": "Kontakte verwalten",
+      "noEmail": "{{name}} hat die Rolle „Buchhaltung“, aber keine E-Mail-Adresse. Angebote und Rechnungen können erst per E-Mail gesendet werden, wenn eine hinzugefügt wurde.",
+      "none": "Kein Kontakt hat die Rolle „Buchhaltung“. Bis dahin wird ein gesendetes Angebot als „Gesendet“ markiert, aber nichts per E-Mail verschickt.",
+      "recipientLabel": "Standardempfänger:",
       "title": "Rechnungskontakt"
     },
     "currency": {
@@ -2277,7 +2290,8 @@
     "loading": "Abrechnungseinstellungen werden geladen…",
     "saveButton": "Abrechnungseinstellungen speichern",
     "saveError": "Die Abrechnungseinstellungen konnten nicht gespeichert werden.",
-    "saveSuccess": "Abrechnungseinstellungen gespeichert"
+    "saveSuccess": "Abrechnungseinstellungen gespeichert",
+    "readOnlyNotice": "Sie haben nur Lesezugriff auf die Rechnungseinstellungen. Bitten Sie eine Administratorin oder einen Administrator, sie zu ändern."
   },
   "shared": {
     "documentWorkspace": {
@@ -2302,7 +2316,7 @@
   "billingConnectionsTab": {
     "accounting": {
       "title": "Buchhaltung",
-      "description": "Stripe und QuickBooks werden unter Integrationen verbunden — dort verwalten.",
+      "description": "Stripe, QuickBooks und Xero werden unter Integrationen verbunden — dort verwalten.",
       "cta": "Buchhaltungsverbindungen verwalten →"
     },
     "catalog": {

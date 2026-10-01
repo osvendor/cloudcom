@@ -1,4 +1,4 @@
-export const LAYOUT_VERSION = 'elk-layered-0.12.0-v1';
+export const LAYOUT_VERSION = 'elk-layered-0.12.0-v2';
 export type LayoutPosition = { nodeId: string; x: number; y: number; pinned: boolean };
 export type LayoutBox = { id: string; width: number; height: number; role: string; groupId?: string };
 export type LayoutFence = {
@@ -10,7 +10,8 @@ export type LayoutFence = {
 };
 export type LayoutRequest = LayoutFence & {
   nodes: LayoutBox[];
-  edges: { id: string; source: string; target: string }[];
+  /** Physical edges carry their interface IDs as ports; parallel cables keep distinct IDs (M2). */
+  edges: { id: string; source: string; target: string; sourcePort?: string; targetPort?: string }[];
   positions: LayoutPosition[];
   mode: 'incremental' | 'reflow';
 };

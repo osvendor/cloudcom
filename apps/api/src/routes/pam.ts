@@ -48,6 +48,7 @@ import { writeAuditEvent } from '../services/auditEvents';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
 import { publishEvent, type EventType } from '../services/eventBus';
 import { mirrorElevationDecisionToExecution } from '../services/pamToolActionGovernance';
+import { pamAuditExportRoutes } from './pamAuditExport';
 import { evaluatePamRules, type PamRuleCandidate } from '../services/pamRuleEngine';
 import {
   describePamRuleTierDrift,
@@ -69,6 +70,8 @@ import {
   type PamActuationRef,
 } from '../services/pamActuationLifecycle';
 
+import { isHoldingOrg } from '../services/unassignedPool/protectedOrg';
+import { PROTECTED_ORG_ERROR } from '../services/unassignedPool/orgType';
 /**
  * Thrown inside the respond transaction when an ai_tool_action elevation is
  * decided but its linked ai_tool_executions row is no longer pending (the
@@ -219,6 +222,7 @@ function enforcementResponse(row: {
 export const pamRoutes = new Hono();
 pamRoutes.use('*', authMiddleware);
 pamRoutes.use('*', requireScope('organization', 'partner', 'system'));
+pamRoutes.route('/', pamAuditExportRoutes);
 
 /** Event emission is best-effort post-commit; never fail the request. */
 async function safePublish(
@@ -701,7 +705,8 @@ pamRoutes.post(
           }
         }
 
-        return { kind: 'ok' as const, row, newStatus: updated[0]!.status, actuation };
+        const newStatus = actuation.refusalReason ? 'denied' : updated[0]!.status;
+        return { kind: 'ok' as const, row, newStatus, actuation };
       });
     } catch (err) {
       if (err instanceof StepUpRequiredError) {
@@ -753,6 +758,13 @@ pamRoutes.post(
       );
     }
 
+    // An approve can be refused inside the transaction (createPamDecisionIntent:
+    // the target's identity could not be verified), which leaves the request
+    // denied. The approver still asked to approve, so the action stays
+    // `approve`, but the audit result, the published event and the response
+    // all report the refusal, and none of them reports it as an approval.
+    // Clients must read `enforcementStatus` to tell the approver.
+    const refusalReason = result.actuation.refusalReason;
     writeAuditEvent(c, {
       orgId: result.row.orgId,
       actorType: 'user',
@@ -760,7 +772,10 @@ pamRoutes.post(
       action: approve ? 'pam.elevation_request.approve' : 'pam.elevation_request.deny',
       resourceType: 'elevation_request',
       resourceId: result.row.id,
-      details: { reason: body.reason, duration_minutes: approve ? durationMinutes : undefined },
+      result: refusalReason ? 'denied' : 'success',
+      details: refusalReason
+        ? { reason: body.reason, enforcement_status: 'refused', refusal_reason: refusalReason }
+        : { reason: body.reason, duration_minutes: approve ? durationMinutes : undefined },
     });
 
     // #1254: a uac_intercept elevation may also have been fanned out to the
@@ -792,7 +807,7 @@ pamRoutes.post(
     }
 
     await safePublish(
-      approve ? 'elevation.approved' : 'elevation.denied',
+      approve && !refusalReason ? 'elevation.approved' : 'elevation.denied',
       result.row.orgId,
       {
         elevationRequestId: result.row.id,
@@ -800,6 +815,7 @@ pamRoutes.post(
         flowType: result.row.flowType,
         status: result.newStatus,
         decidedByUserId: auth.user.id,
+        ...(refusalReason ? { enforcementStatus: 'refused', reason: refusalReason } : {}),
       },
     );
 
@@ -810,9 +826,12 @@ pamRoutes.post(
       success: true,
       id: result.row.id,
       status: result.newStatus,
-      enforcementStatus: result.actuation.desiredState === 'active'
-        ? 'pending_dispatch'
-        : 'cleanup_pending',
+      enforcementStatus: refusalReason
+        ? 'refused'
+        : result.actuation.desiredState === 'active'
+          ? 'pending_dispatch'
+          : 'cleanup_pending',
+      ...(refusalReason ? { reason: refusalReason } : {}),
     });
   },
 );
@@ -1179,6 +1198,8 @@ pamRoutes.post('/rules', requirePamManagePolicy, requireMfa(), zValidator('json'
   if (!resolvedOrg.orgId) {
     return c.json({ error: resolvedOrg.error ?? 'Organization resolution failed' }, 400);
   }
+  // canAccessOrg is true for system scope: the holding org is never a target.
+  if (await isHoldingOrg(resolvedOrg.orgId)) return c.json(PROTECTED_ORG_ERROR, 409);
 
   // Site axis is app-layer-only for pam_rules (RLS Shape-1 org-only). A
   // site-restricted tech must not author org-wide (siteId null → '') or
@@ -1610,6 +1631,8 @@ pamRoutes.get('/config', requirePamRead, async (c) => {
   if (!resolvedOrg.orgId) {
     return c.json({ error: resolvedOrg.error ?? 'Organization resolution failed' }, 400);
   }
+  // canAccessOrg is true for system scope: the holding org is never a target.
+  if (await isHoldingOrg(resolvedOrg.orgId)) return c.json(PROTECTED_ORG_ERROR, 409);
   const [cfg] = await db
     .select()
     .from(pamOrgConfig)
@@ -1642,6 +1665,8 @@ pamRoutes.put(
     if (!resolvedOrg.orgId) {
       return c.json({ error: resolvedOrg.error ?? 'Organization resolution failed' }, 400);
     }
+    // canAccessOrg is true for system scope: the holding org is never a target.
+    if (await isHoldingOrg(resolvedOrg.orgId)) return c.json(PROTECTED_ORG_ERROR, 409);
     const [saved] = await db
       .insert(pamOrgConfig)
       .values({
@@ -1770,6 +1795,8 @@ pamRoutes.post(
     if (!resolvedOrg.orgId) {
       return c.json({ error: resolvedOrg.error ?? 'Organization resolution failed' }, 400);
     }
+    // canAccessOrg is true for system scope: the holding org is never a target.
+    if (await isHoldingOrg(resolvedOrg.orgId)) return c.json(PROTECTED_ORG_ERROR, 409);
     const [created] = await db
       .insert(pamSignerGroups)
       .values({

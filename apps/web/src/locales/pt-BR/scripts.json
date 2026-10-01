@@ -25,7 +25,8 @@
     },
     "actions": {
       "create": "Criar automação",
-      "saveChanges": "Salvar alterações"
+      "saveChanges": "Salvar alterações",
+      "backToAutomations": "Voltar para tarefas"
     }
   },
   "automationForm": {
@@ -163,7 +164,8 @@
       "command": "Comando",
       "whenOffline": "Se o dispositivo estiver offline",
       "software": "Software",
-      "failureNotificationChannel": "Canal de notificação de falha"
+      "failureNotificationChannel": "Canal de notificação de falha",
+      "actionType": "Tipo de ação"
     },
     "options": {
       "whenOffline": {
@@ -223,7 +225,9 @@
     "searchPlaceholder": "Pesquisar automações...",
     "filters": {
       "allTriggers": "Todos os gatilhos",
-      "allStatus": "Todos os status"
+      "allStatus": "Todos os status",
+      "triggerLabel": "Gatilho",
+      "statusLabel": "Status de ativação"
     },
     "trigger": {
       "schedule": "Agendamento",
@@ -332,6 +336,14 @@
       "awaiting": "Aguardando a resposta do agente…",
       "truncated": "Saída truncada — consulte o histórico de scripts do dispositivo para ver o texto completo."
     },
+    "commandOutput": {
+      "show_one": "Mostrar saída do comando",
+      "show_other": "Mostrar saída do comando ({{count}})",
+      "hide_one": "Ocultar saída do comando",
+      "hide_other": "Ocultar saída do comando ({{count}})",
+      "label": "Comando (ação {{index}})",
+      "truncated": "Saída truncada — o texto completo não é exibido nesta visualização."
+    },
     "errors": {
       "cancelRun": "Não foi possível cancelar a execução."
     }
@@ -426,6 +438,7 @@
       "generic": "Ocorreu um erro"
     },
     "loading": "Carregando dados de conformidade...",
+    "backToPolicies": "Voltar para políticas",
     "policyTitle": "Conformidade: {{policy}}",
     "policyFallback": "Política",
     "title": "Painel de conformidade",
@@ -483,7 +496,8 @@
     },
     "actions": {
       "create": "Criar política",
-      "saveChanges": "Salvar alterações"
+      "saveChanges": "Salvar alterações",
+      "backToPolicies": "Voltar para políticas"
     }
   },
   "policyForm": {
@@ -542,7 +556,8 @@
     },
     "actions": {
       "savePolicy": "Salvar política",
-      "addRule": "Adicionar regra"
+      "addRule": "Adicionar regra",
+      "removeRule": "Remover regra"
     },
     "fields": {
       "name": "Nome da política",
@@ -560,7 +575,8 @@
       "configFilePath": "Caminho do arquivo de configuração",
       "configKey": "Chave de configuração",
       "remediationScript": "Script de correção",
-      "evaluateEvery": "Avaliar a cada"
+      "evaluateEvery": "Avaliar a cada",
+      "ruleType": "Tipo de regra"
     },
     "placeholders": {
       "name": "Política de baseline de segurança",
@@ -617,7 +633,9 @@
     "searchPlaceholder": "Pesquisar políticas...",
     "filters": {
       "allEnforcement": "Todos os níveis de aplicação",
-      "allStatus": "Todos os status"
+      "allStatus": "Todos os status",
+      "enforcementLabel": "Aplicação",
+      "statusLabel": "Status de ativação"
     },
     "enforcement": {
       "monitor": {
@@ -731,7 +749,9 @@
       "lastHour": "Última hora",
       "lastDay": "Últimas 24 horas",
       "lastWeek": "Últimos 7 dias",
-      "lastMonth": "Últimos 30 dias"
+      "lastMonth": "Últimos 30 dias",
+      "statusLabel": "Status de execução",
+      "dateLabel": "Intervalo de datas"
     },
     "status": {
       "pending": "Pendente",
@@ -973,6 +993,7 @@
     "loading": "Carregando execuções...",
     "actions": {
       "backToScripts": "Voltar para scripts",
+      "backToScript": "Voltar para o script",
       "runScript": "Executar script"
     },
     "breadcrumb": {
@@ -1442,7 +1463,8 @@
       "notStarted": "A execução não foi iniciada (o dispositivo pode estar em manutenção).",
       "pollDeadline": "Ainda sem resultado — verifique o histórico de execuções.",
       "pollFailed": "Não foi possível ler o resultado — a execução pode ter sido excluída ou seu acesso mudou."
-    }
+    },
+    "deviceSelectLabel": "Dispositivo de teste"
   },
   "provenance": {
     "origin": "Origem",

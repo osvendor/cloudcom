@@ -23,7 +23,16 @@ import {
   logSessionAudit,
   buildRemoteSessionPromptPayload,
   createDesktopStartCommandId,
+  isConsentPromptCapable,
 } from './remote/helpers';
+import {
+  CONSENT_UPGRADE_REQUIRED_CODE,
+  CONSENT_UPGRADE_REQUIRED_MESSAGE,
+  REMOTE_PROMPT_POLICY_UNAVAILABLE_CODE,
+  REMOTE_PROMPT_POLICY_UNAVAILABLE_MESSAGE,
+  RemoteSessionPromptPolicyError,
+  requiresConsentCapableAgent,
+} from './remote/consentGate';
 import {
   assertDesktopStartIntentCurrent,
   boundConsentUnavailableBehavior,
@@ -77,6 +86,8 @@ import {
   authorizeLiveRemoteSessionAccess,
   type LiveRemoteSessionAuthorizationResult,
 } from '../services/remoteWsAuthorization';
+import { isViewerFailureDiagnosticRow } from '../services/viewerFailureDiagnostics';
+import { viewerAnswerTimeoutMs } from './remote/consentTiming';
 import {
   assertRemoteWsUpgradeRuntimeReady,
   getRemoteWsUpgradeConnection,
@@ -265,6 +276,7 @@ function connectExchangeAuthorizationDenial(
     case 'session_missing':
     case 'session_not_owned':
     case 'user_inactive':
+    case 'credential_revoked':
       return { status: 401, error: 'Invalid or expired connect code' };
     case 'session_inactive':
       return { status: 400, error: 'Session is not available for connection' };
@@ -323,8 +335,7 @@ async function validateViewerSessionAccess(
     return viewerAuthorizationDenial(live);
   }
   const readingFailure = accessMode === 'failure-diagnostics' &&
-    (live.session.status === 'failed' ||
-      (live.session.status === 'disconnected' && !!live.session.errorMessage));
+    isViewerFailureDiagnosticRow(live.session.status, live.session.errorMessage);
   if (sessionRevoked && !readingFailure) {
     return { valid: false, status: 401, error: 'Session closed' };
   }
@@ -926,6 +937,62 @@ function createDesktopWsHandlers(
           return;
         }
 
+        // Consent/notification prompt config, resolved exactly as the two
+        // WebRTC start paths resolve it (buildRemoteSessionPromptPayload).
+        // This transport previously started streaming with no prompt block
+        // at all, so the agent's consent gate (which every start path relies
+        // on — the viewer is untrusted) had nothing to gate on and streamed
+        // unconditionally regardless of the device's consent/notify policy.
+        let streamPrompt: Awaited<ReturnType<typeof buildRemoteSessionPromptPayload>>;
+        try {
+          streamPrompt = await buildRemoteSessionPromptPayload(device, userId);
+        } catch (error) {
+          if (!(error instanceof RemoteSessionPromptPolicyError)) throw error;
+          // An unreadable prompt policy refuses the start, exactly as the
+          // WebRTC offer routes do.
+          ws.send(JSON.stringify({
+            type: 'error',
+            code: REMOTE_PROMPT_POLICY_UNAVAILABLE_CODE,
+            message: REMOTE_PROMPT_POLICY_UNAVAILABLE_MESSAGE,
+          }));
+          await closeDesktopSessionLifecycle(sessionId, {
+            expectedWs: ws,
+            connection: boundIdentity,
+            reason: 'setup_failed',
+            terminalStatus: 'failed',
+            notifyAgent: true,
+          });
+          ws.close(4003, 'Remote access prompt policy unavailable');
+          return;
+        }
+
+        // Fail closed on capability, not silently on the wire: an agent build
+        // that predates the consent-gate feature parses `cmd.Payload` into a
+        // known struct and simply drops an unfamiliar `prompt` key (Go's JSON
+        // unmarshal semantics), then streams unconditionally — so when the
+        // resolved policy requires a consent dialog or an on-screen notice
+        // (streamPrompt is set; `off` ships no prompt block and needs no
+        // gate), refuse the start outright rather than dispatch a prompt the
+        // agent will not honor. Unattended devices are unaffected.
+        if (streamPrompt && !isConsentPromptCapable(Number(device.consentPromptProtocolVersion ?? 0))) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            code: CONSENT_UPGRADE_REQUIRED_CODE,
+            message: 'This device\'s remote desktop policy requires an on-screen consent or '
+              + 'notification prompt, but its agent build does not yet support it. Update the '
+              + 'agent on this device, then try again.',
+          }));
+          await closeDesktopSessionLifecycle(sessionId, {
+            expectedWs: ws,
+            connection: boundIdentity,
+            reason: 'setup_failed',
+            terminalStatus: 'failed',
+            notifyAgent: true,
+          });
+          ws.close(4003, 'Agent update required for consent prompt');
+          return;
+        }
+
         // Update only a still-open row, under the same row-locked start-intent
         // commit the WebRTC paths use (SEC-038 W02). A prior owner may have made
         // the row terminal after validation but before this exact lease was
@@ -1007,7 +1074,8 @@ function createDesktopWsHandlers(
             quality: 60,
             scaleFactor: 1.0,
             maxFps: 15,
-            revocationLease: streamLease.lease
+            revocationLease: streamLease.lease,
+            ...(streamPrompt ? { prompt: streamPrompt } : {})
           }
         };
 
@@ -1636,10 +1704,31 @@ export function createDesktopWsRoutes(
       // Consent/notification prompt + on-screen session banner config, same as
       // the REST offer route — without it the agent shows no "technician
       // connected" notice or indicator for viewer-token sessions.
-      const prompt = await buildRemoteSessionPromptPayload(
-        access.device,
-        access.session.userId
-      );
+      let prompt: Awaited<ReturnType<typeof buildRemoteSessionPromptPayload>>;
+      try {
+        prompt = await buildRemoteSessionPromptPayload(
+          access.device,
+          access.session.userId
+        );
+      } catch (error) {
+        // Same refusal as the JWT offer route: an unreadable prompt policy
+        // must not start a session that might have required consent.
+        if (error instanceof RemoteSessionPromptPolicyError) {
+          return c.json({
+            error: REMOTE_PROMPT_POLICY_UNAVAILABLE_MESSAGE,
+            code: REMOTE_PROMPT_POLICY_UNAVAILABLE_CODE,
+          }, 503);
+        }
+        throw error;
+      }
+      // Consent-mode starts need a consent-capable agent (same gate as the JWT
+      // offer route), refused before the lease, the start intent or dispatch.
+      if (requiresConsentCapableAgent(prompt, access.device)) {
+        return c.json({
+          error: CONSENT_UPGRADE_REQUIRED_MESSAGE,
+          code: CONSENT_UPGRADE_REQUIRED_CODE,
+        }, 409);
+      }
       // Fail-closed revocation lease (same gate as the JWT offer route).
       const offerLease = await prepareRevocationLeaseForStart(sessionId);
       if (!offerLease.ok) {
@@ -1821,6 +1910,10 @@ export function createDesktopWsRoutes(
         terminationPhase,
         webrtcAnswer: answerWithheld ? null : access.session.webrtcAnswer,
         errorMessage: access.session.errorMessage,
+        // #6818: in consent mode the agent answers only after the end user
+        // does, so the viewer extends its answer poll to this budget.
+        promptMode: access.session.desktopPromptMode ?? 'off',
+        answerTimeoutMs: viewerAnswerTimeoutMs(access.session.desktopPromptMode),
         startedAt: access.session.startedAt,
         endedAt: access.session.endedAt,
       });

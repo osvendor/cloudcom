@@ -160,6 +160,8 @@ export const SENTRY_EVENT_CODES = [
   'accounting_home_currency_cas_lost',
   /** The Intuit webhook route was reached with QBO_WEBHOOK_VERIFIER_TOKEN unset. */
   'accounting_webhook_verifier_token_missing',
+  /** The Xero webhook route was reached with XERO_WEBHOOK_KEY unset. */
+  'accounting_webhook_signing_key_missing',
   /** Inbound mail arrived with no usable provider sender-auth verdict. */
   'inbound_email_sender_auth_unverified',
   /** Inbound mail lost the message-id claim race and duplicated a ticket. */
@@ -171,6 +173,7 @@ export const SENTRY_EVENT_CODES = [
    * the mapping is added.
    */
   'sending_domain_provider_state_unknown',
+  'sending_domain_adoption_refused',
   /** No usable platform LLM key is configured on this deployment. */
   'llm_platform_key_missing',
   /** The LLM egress audit queue shed rows — the audit trail has gaps (#3922). */
@@ -220,6 +223,18 @@ export const SENTRY_EVENT_CODES = [
   'backup_result_org_divergence',
   /** Snapshots are unattributable because two orgs share a destination. */
   'backup_snapshot_ambiguous_destination',
+
+  // --- tenant erasure -----------------------------------------------------
+  /**
+   * An org-erasure attempt was refused because a backup snapshot for that org
+   * still carries an active legal hold — either at the erasure's initial
+   * precondition check or at a later re-check immediately before the
+   * `backup_snapshots` delete step itself. Nothing was deleted; the requester
+   * (or the recovery sweep, for a sweep-driven attempt) has to be told
+   * explicitly, since a BullMQ "skipped" result is not a job failure and
+   * would otherwise raise no alert on its own.
+   */
+  'tenant_erasure_refused_legal_hold',
 
   // --- agent binary serving ---------------------------------------------
   /** No promoted `agent_versions` row, so downloads fall back to the

@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  Bell,
   Boxes,
   ClipboardCheck,
   Cloud,
   FileSearch,
   HardDrive,
+  Clock,
   Layers,
   LifeBuoy,
   PackageCheck,
@@ -15,7 +15,6 @@ import {
   Shield,
   ShieldCheck,
   ShieldAlert,
-  Activity,
   Usb,
   Wrench,
   Trash2,
@@ -29,6 +28,7 @@ import { friendlyFetchError } from "../../lib/utils";
 import { fetchWithAuth } from "../../stores/auth";
 import { useTranslation } from "react-i18next";
 import "../../lib/i18n";
+import { i18n } from "../../lib/i18n";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -117,14 +117,12 @@ type EffectiveConfiguration = {
 // exclusion set stays honest. (#2004)
 const FEATURE_META: Record<FeatureType, { label: string; Icon: LucideIcon }> = {
   patch: { label: "Patch Management", Icon: PackageCheck },
-  alert_rule: { label: "Alert Rules", Icon: Bell },
   monitors: { label: "Monitors", Icon: Radar },
   automation: { label: "Automation", Icon: Zap },
   maintenance: { label: "Maintenance Windows", Icon: Wrench },
   compliance: { label: "Compliance", Icon: ClipboardCheck },
   security: { label: "Security", Icon: Shield },
   backup: { label: "Backup", Icon: HardDrive },
-  monitoring: { label: "Monitoring", Icon: Activity },
   warranty: { label: "Warranty", Icon: ShieldCheck },
   software_policy: { label: "Software Policy", Icon: Boxes },
   sensitive_data: { label: "Data Discovery", Icon: FileSearch },
@@ -135,6 +133,12 @@ const FEATURE_META: Record<FeatureType, { label: string; Icon: LucideIcon }> = {
   vulnerability: { label: "Vulnerability Scanning", Icon: ShieldAlert },
   device_lifecycle: { label: "Device Lifecycle", Icon: Trash2 },
   hardware_monitoring: { label: "Hardware Monitoring", Icon: HardDrive },
+  time_sync: {
+    get label() {
+      return i18n.t("devices:timeSync.management.title");
+    },
+    Icon: Clock,
+  },
 };
 
 // Display order = FEATURE_META insertion order. Derived (not hand-listed) so the
@@ -153,9 +157,13 @@ const LEVEL_LABELS: Record<AssignmentLevel, string> = {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-function summarizeSettings(settings: Record<string, unknown> | null): string[] {
+type SettingsSummaryItem = { label: string; value: string };
+
+function summarizeSettings(
+  settings: Record<string, unknown> | null,
+): SettingsSummaryItem[] {
   if (!settings || Object.keys(settings).length === 0) return [];
-  const items: string[] = [];
+  const items: SettingsSummaryItem[] = [];
   for (const [key, value] of Object.entries(settings)) {
     if (value === null || value === undefined) continue;
     // Format key from camelCase/snake_case to readable
@@ -165,13 +173,17 @@ function summarizeSettings(settings: Record<string, unknown> | null): string[] {
       .replace(/^\s/, "")
       .toLowerCase();
     if (typeof value === "boolean") {
-      items.push(`${label}: ${value ? "yes" : "no"}`);
+      items.push({ label, value: value ? "yes" : "no" });
     } else if (typeof value === "string" || typeof value === "number") {
-      items.push(`${label}: ${value}`);
+      // Values render verbatim — never CSS-title-cased. A raw id/UUID (e.g.
+      // destinationConfigId) must not have its hyphen-delimited segments
+      // mangled by `text-transform: capitalize` (#7214, paper cut #27).
+      items.push({ label, value: String(value) });
     } else if (Array.isArray(value)) {
-      items.push(
-        `${label}: ${value.length} item${value.length !== 1 ? "s" : ""}`,
-      );
+      items.push({
+        label,
+        value: `${value.length} item${value.length !== 1 ? "s" : ""}`,
+      });
     }
     if (items.length >= 4) break; // limit to 4 summary lines
   }
@@ -372,8 +384,10 @@ export default function DeviceEffectiveConfigTab({
                   <div className="mt-3 rounded-md border bg-muted/30 px-3 py-2">
                     <ul className="space-y-0.5 text-xs text-muted-foreground">
                       {settings.map((s) => (
-                        <li key={s} className="capitalize">
-                          {s}
+                        <li key={s.label}>
+                          <span className="capitalize">{s.label}</span>
+                          {": "}
+                          <span>{s.value}</span>
                         </li>
                       ))}
                     </ul>

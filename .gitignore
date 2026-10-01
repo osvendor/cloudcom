@@ -6,6 +6,8 @@ node_modules/
 dist/
 .astro/
 .turbo/
+# tsc --build declaration output (apps/api/tsconfig.src.json, #6270)
+.tsbuild/
 
 # Environment
 .env
@@ -46,6 +48,8 @@ coverage/
 # Go
 agent/breeze-agent
 agent/breeze-backup
+agent/cmd/breeze-backup/breeze-backup
+agent/cmd/breeze-backup/breeze-backup.exe
 agent/breeze-watchdog
 agent/bin/
 viewer/bin/

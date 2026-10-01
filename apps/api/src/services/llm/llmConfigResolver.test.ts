@@ -34,7 +34,7 @@ const {
     updateWheres: [] as unknown[],
   },
   decryptMock: vi.fn(),
-  contextState: { outsideCalls: 0, systemCalls: 0 },
+  contextState: { outsideCalls: 0, systemCalls: 0, ambientScope: undefined as string | undefined },
   getListedProviderByEntryIdMock: vi.fn(),
   buildGuardedLlmFetchMock: vi.fn(),
   guardedFetchOptions: [] as Array<{
@@ -86,6 +86,7 @@ vi.mock('../sentry', () => ({
 }));
 
 vi.mock('../../db', () => ({
+  getCurrentDbAccessContext: () => (contextState.ambientScope ? { scope: contextState.ambientScope } : undefined),
   runOutsideDbContext: (fn: () => unknown) => {
     contextState.outsideCalls += 1;
     return fn();
@@ -141,6 +142,7 @@ import {
   resolveLlmConfig,
   resolveLlmConfigForOrg,
   resolveWireModel,
+  llmUnusableCodeForOrgInSystemContext,
   type UsableLlmConfig,
 } from './llmConfigResolver';
 import { SecretKeyMaterialError } from '../secretCrypto';
@@ -225,6 +227,7 @@ beforeEach(() => {
   dbState.updateWheres.length = 0;
   contextState.outsideCalls = 0;
   contextState.systemCalls = 0;
+  contextState.ambientScope = undefined;
   decryptMock.mockReturnValue('partner-plaintext-key');
   guardedFetchOptions.length = 0;
   buildGuardedLlmFetchMock.mockImplementation((opts: (typeof guardedFetchOptions)[number]) => {
@@ -240,6 +243,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
   if (originalCatalogFlag === undefined) delete process.env.LLM_PROVIDER_CATALOG_ENABLED;
   else process.env.LLM_PROVIDER_CATALOG_ENABLED = originalCatalogFlag;
   if (originalPlatformKey === undefined) delete process.env.ANTHROPIC_API_KEY;
@@ -276,6 +280,57 @@ describe('resolveLlmConfigForOrg', () => {
     expect(decryptMock).not.toHaveBeenCalled();
     expect(contextState.outsideCalls).toBe(1);
     expect(contextState.systemCalls).toBe(1);
+  });
+});
+
+describe('llmUnusableCodeForOrgInSystemContext (topology readiness, review R1)', () => {
+  beforeEach(() => { contextState.ambientScope = 'system'; });
+
+  it('reads on the CALLER\'s system connection — no escape, no second context, no error marking', async () => {
+    dbState.selectResults.push([{ partnerId: PARTNER_ID }], [row()]);
+    await expect(llmUnusableCodeForOrgInSystemContext(ORG_ID)).resolves.toBeNull();
+    expect(contextState.outsideCalls).toBe(0);
+    expect(contextState.systemCalls).toBe(0);
+  });
+
+  it('mirrors the resolver decisions: platform without a partner config; unusable on error status, undecryptable key or a delisted catalog pin', async () => {
+    dbState.selectResults.push([{ partnerId: null }]);
+    await expect(llmUnusableCodeForOrgInSystemContext(ORG_ID)).resolves.toBeNull();
+    dbState.selectResults.push([{ partnerId: PARTNER_ID }], []);
+    await expect(llmUnusableCodeForOrgInSystemContext(ORG_ID)).resolves.toBeNull();
+    dbState.selectResults.push([{ partnerId: PARTNER_ID }], [row({ status: 'error' })]);
+    await expect(llmUnusableCodeForOrgInSystemContext(ORG_ID)).resolves.toBe('ai_unavailable');
+    decryptMock.mockImplementationOnce(() => { throw new Error('bad ciphertext'); });
+    dbState.selectResults.push([{ partnerId: PARTNER_ID }], [row()]);
+    await expect(llmUnusableCodeForOrgInSystemContext(ORG_ID)).resolves.toBe('ai_unavailable');
+    process.env.LLM_PROVIDER_CATALOG_ENABLED = 'true';
+    dbState.selectResults.push([{ partnerId: PARTNER_ID }], [row({ catalogEntryId: CATALOG_ENTRY_ID })]);
+    await expect(llmUnusableCodeForOrgInSystemContext(ORG_ID)).resolves.toBe('ai_unavailable');
+    dbState.selectResults.push([]);
+    await expect(llmUnusableCodeForOrgInSystemContext(ORG_ID)).resolves.toBe('ai_unavailable');
+    expect(dbState.updateSets).toEqual([]);
+  });
+
+  it('is NOT ready on the platform path when the server has no model key at all (with or without a partner row)', async () => {
+    delete process.env.ANTHROPIC_API_KEY;
+    vi.stubEnv('CLAUDE_CODE_OAUTH_TOKEN', '');
+    dbState.selectResults.push([{ partnerId: null }]);
+    await expect(llmUnusableCodeForOrgInSystemContext(ORG_ID)).resolves.toBe('ai_not_configured');
+    dbState.selectResults.push([{ partnerId: PARTNER_ID }], []);
+    await expect(llmUnusableCodeForOrgInSystemContext(ORG_ID)).resolves.toBe('ai_not_configured');
+    // A partner BYO key is a usable provider on its own.
+    dbState.selectResults.push([{ partnerId: PARTNER_ID }], [row()]);
+    await expect(llmUnusableCodeForOrgInSystemContext(ORG_ID)).resolves.toBeNull();
+    // The documented self-host credential (#1412) counts as a platform key.
+    process.env.ANTHROPIC_AUTH_TOKEN = 'gateway-token';
+    dbState.selectResults.push([{ partnerId: null }]);
+    await expect(llmUnusableCodeForOrgInSystemContext(ORG_ID)).resolves.toBeNull();
+  });
+
+  it('refuses to run outside a system context (it would read under the wrong RLS scope)', async () => {
+    contextState.ambientScope = 'organization';
+    await expect(llmUnusableCodeForOrgInSystemContext(ORG_ID)).rejects.toThrow(/system/);
+    expect(dbState.selectFields).toEqual([]);
   });
 });
 

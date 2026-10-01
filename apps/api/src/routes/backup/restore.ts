@@ -9,12 +9,16 @@ import { recordBackupDispatchFailure } from '../../services/backupMetrics';
 import { CommandTypes, queueBackupStopCommand, queueCommandForExecution } from '../../services/commandQueue';
 import { PERMISSIONS } from '../../services/permissions';
 import { resolveBackupProviderConfig, resolveBackupDestinationError } from '../../services/backupProviderConfig';
+import { backupReadCredentialPayload } from '../../services/backupCommandCredentials';
 import { resolveScopedOrgId } from './helpers';
+import { attachDeviceNames, restoreModeFromTargetConfig } from './deviceNames';
 import { restoreListSchema, restoreSchema } from './schemas';
+import { resolveSelectedSnapshotPaths, selectedSnapshotPathError } from '../../services/backupSelectedPaths';
 import {
   authorizeRouteResilienceResources,
   resolveRouteAuthorizedDeviceIds,
 } from './resilienceAuthorization';
+import { isBackupHelperUpdateRequiredError } from '../../services/backupReadHelperGate';
 
 export const restoreRoutes = new Hono();
 
@@ -28,10 +32,13 @@ function runInOrg<T>(orgId: string, fn: () => Promise<T>): Promise<T> {
 }
 
 function mapDispatchErrorStatus(error: string): number {
-  return error.startsWith('Device is ') ? 409 : 502;
+  // Both are states of the target device the operator can act on, not
+  // dispatch failures.
+  return error.startsWith('Device is ') || isBackupHelperUpdateRequiredError(error) ? 409 : 502;
 }
 
 function dispatchFailureReason(error: string): string {
+  if (isBackupHelperUpdateRequiredError(error)) return 'helper_update_required';
   return error.startsWith('Device is ') ? 'device_offline' : 'enqueue_failed';
 }
 
@@ -149,7 +156,7 @@ restoreRoutes.get(
       .orderBy(desc(restoreJobs.createdAt))
       .limit(query.limit);
 
-    return c.json({ data: rows.map(toRestoreResponse) });
+    return c.json({ data: await attachDeviceNames(orgId, rows.map(toRestoreResponse)) });
   }
 );
 
@@ -180,7 +187,8 @@ restoreRoutes.get(
       return c.json({ error: 'Restore job not found' }, 404);
     }
 
-    return c.json({ data: toRestoreResponse(row) });
+    const [withName] = await attachDeviceNames(orgId, [toRestoreResponse(row)]);
+    return c.json({ data: withName });
   }
 );
 
@@ -224,6 +232,7 @@ restoreRoutes.post(
       return c.json({ error: 'Snapshot not found' }, 404);
     }
 
+    let selectedPaths: string[] = [];
     if (payload.restoreType === 'selective') {
       const snapshotFiles = await db
         .select({ id: backupSnapshotFiles.id, sourcePath: backupSnapshotFiles.sourcePath })
@@ -234,11 +243,16 @@ restoreRoutes.post(
         return c.json({ error: 'Selective restore is unavailable for snapshots without indexed files' }, 409);
       }
 
-      const availablePaths = new Set(snapshotFiles.map((row) => row.sourcePath));
-      const invalidPath = payload.selectedPaths?.find((path) => !availablePaths.has(path));
-      if (invalidPath) {
-        return c.json({ error: `Selected path is not available in this snapshot: ${invalidPath}` }, 400);
+      // The browse tree shows forward-slash paths; map each selection back to
+      // the stored original the agent indexed (and matches against).
+      const resolution = resolveSelectedSnapshotPaths(
+        payload.selectedPaths ?? [],
+        snapshotFiles.map((row) => row.sourcePath)
+      );
+      if (!resolution.ok) {
+        return c.json({ error: selectedSnapshotPathError(resolution) }, 400);
       }
+      selectedPaths = resolution.paths;
     }
 
     const now = new Date();
@@ -287,7 +301,7 @@ restoreRoutes.post(
           deviceId: resolvedTargetDeviceId,
           restoreType: payload.restoreType,
           targetPath: payload.targetPath ?? null,
-          selectedPaths: payload.restoreType === 'selective' ? (payload.selectedPaths ?? []) : [],
+          selectedPaths,
           status: 'pending',
           initiatedBy: c.get('auth')?.user?.id ?? null,
           createdAt: now,
@@ -311,9 +325,10 @@ restoreRoutes.post(
             restoreJobId: row.id,
             snapshotId: snapshot.snapshotId,
             targetPath: row.targetPath ?? '',
-            selectedPaths: payload.restoreType === 'selective' ? (payload.selectedPaths ?? []) : [],
-            provider: backupProviderConfig.provider,
-            providerConfig: backupProviderConfig.providerConfig,
+            selectedPaths,
+            // A reference only: the destination is resolved when the command
+            // is delivered, so it is never written to the command row.
+            ...backupReadCredentialPayload(snapshot.configId!, orgId, backupProviderConfig.provider),
           },
           { userId: auth?.user?.id ?? undefined }
         )
@@ -551,6 +566,9 @@ function toRestoreResponse(row: typeof restoreJobs.$inferSelect) {
     snapshotId: row.snapshotId,
     deviceId: row.deviceId,
     restoreType: row.restoreType,
+    // Restore-as-VM / instant boot persist restoreType 'full'; expose the mode so
+    // the UI does not label them "full restore" (#7213).
+    restoreMode: restoreModeFromTargetConfig(row.targetConfig),
     selectedPaths: row.selectedPaths ?? [],
     status: row.status,
     targetPath: row.targetPath ?? null,

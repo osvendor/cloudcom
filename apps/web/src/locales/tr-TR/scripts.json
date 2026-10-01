@@ -25,7 +25,8 @@
     },
     "actions": {
       "create": "Otomasyon Oluşturun",
-      "saveChanges": "Değişiklikleri Kaydet"
+      "saveChanges": "Değişiklikleri Kaydet",
+      "backToAutomations": "İşlere Dön"
     }
   },
   "automationForm": {
@@ -163,7 +164,8 @@
       "command": "Komut",
       "whenOffline": "Cihaz çevrimdışıysa",
       "software": "Yazılım",
-      "failureNotificationChannel": "Arıza Bildirim Kanalı"
+      "failureNotificationChannel": "Arıza Bildirim Kanalı",
+      "actionType": "Eylem türü"
     },
     "options": {
       "whenOffline": {
@@ -223,7 +225,9 @@
     "searchPlaceholder": "Arama otomasyonları...",
     "filters": {
       "allTriggers": "Tüm Tetikleyiciler",
-      "allStatus": "Tüm Durumlar"
+      "allStatus": "Tüm Durumlar",
+      "triggerLabel": "Tetikleyici",
+      "statusLabel": "Durum"
     },
     "trigger": {
       "schedule": "Program",
@@ -332,6 +336,14 @@
       "awaiting": "Temsilcinin rapor vermesi bekleniyor…",
       "truncated": "Çıktı kesildi — tam metin için cihazın komut dosyası geçmişine bakın."
     },
+    "commandOutput": {
+      "show_one": "Komut çıktısını göster",
+      "show_other": "Komut çıktısını göster ({{count}})",
+      "hide_one": "Komut çıktısını gizle",
+      "hide_other": "Komut çıktısını gizle ({{count}})",
+      "label": "Komut (eylem {{index}})",
+      "truncated": "Çıktı kısaltıldı — tam metin bu görünümde gösterilmez."
+    },
     "errors": {
       "cancelRun": "Çalıştırma iptal edilemedi."
     }
@@ -426,6 +438,7 @@
       "generic": "Bir hata oluştu"
     },
     "loading": "Uyumluluk verileri yükleniyor...",
+    "backToPolicies": "Politikalara Dön",
     "policyTitle": "Uyumluluk: {{policy}}",
     "policyFallback": "Politika",
     "title": "Uyumluluk Kontrol Paneli",
@@ -483,7 +496,8 @@
     },
     "actions": {
       "create": "Politika Oluştur",
-      "saveChanges": "Değişiklikleri Kaydet"
+      "saveChanges": "Değişiklikleri Kaydet",
+      "backToPolicies": "Politikalara Dön"
     }
   },
   "policyForm": {
@@ -542,7 +556,8 @@
     },
     "actions": {
       "savePolicy": "Kaydetme politikası",
-      "addRule": "Kural Ekle"
+      "addRule": "Kural Ekle",
+      "removeRule": "Kuralı Kaldır"
     },
     "fields": {
       "name": "Politika adı",
@@ -560,7 +575,8 @@
       "configFilePath": "Yapılandırma Dosyası Yolu",
       "configKey": "Yapılandırma Anahtarı",
       "remediationScript": "Düzeltme Komut Dosyası",
-      "evaluateEvery": "Her Şeyi Değerlendirin"
+      "evaluateEvery": "Her Şeyi Değerlendirin",
+      "ruleType": "Kural türü"
     },
     "placeholders": {
       "name": "Güvenlik temel politikası",
@@ -617,7 +633,9 @@
     "searchPlaceholder": "Arama politikaları...",
     "filters": {
       "allEnforcement": "Tüm Yaptırımlar",
-      "allStatus": "Tüm Durumlar"
+      "allStatus": "Tüm Durumlar",
+      "enforcementLabel": "Uygulama",
+      "statusLabel": "Durum"
     },
     "enforcement": {
       "monitor": {
@@ -731,7 +749,9 @@
       "lastHour": "Son Saat",
       "lastDay": "Son 24 Saat",
       "lastWeek": "Son 7 Gün",
-      "lastMonth": "Son 30 Gün"
+      "lastMonth": "Son 30 Gün",
+      "statusLabel": "Durum",
+      "dateLabel": "Tarih aralığı"
     },
     "status": {
       "pending": "Beklemede",
@@ -973,6 +993,7 @@
     "loading": "Yürütmeler yükleniyor...",
     "actions": {
       "backToScripts": "Komut Dosyalarına Geri Dön",
+      "backToScript": "Komut Dosyasına Geri Dön",
       "runScript": "Komut Dosyasını Çalıştır"
     },
     "breadcrumb": {
@@ -1442,7 +1463,8 @@
       "pollDeadline": "Hâlâ sonuç yok — sonucu görmek için çalıştırma geçmişini kontrol edin.",
       "pollFailed": "Çalıştırma sonucu okunamadı — silinmiş olabilir veya erişiminiz değişmiş olabilir."
     },
-    "devicesLoadFailed": "Cihazlar yüklenemedi"
+    "devicesLoadFailed": "Cihazlar yüklenemedi",
+    "deviceSelectLabel": "Test cihazı"
   },
   "provenance": {
     "origin": "Köken",

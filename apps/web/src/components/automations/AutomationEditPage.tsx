@@ -16,6 +16,7 @@ import Breadcrumbs from '../layout/Breadcrumbs';
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
 import { useStableT } from '@/lib/i18n/useStableT';
+import { usePageItemName } from '../layout/usePageItemName';
 
 type Site = { id: string; name: string };
 type Group = { id: string; name: string };
@@ -167,6 +168,7 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string>();
   const [defaultValues, setDefaultValues] = useState<Partial<AutomationFormValues>>();
+  usePageItemName(isNew ? undefined : defaultValues?.name);
   const [webhookUrl, setWebhookUrl] = useState<string>();
   // #3824: a seeded, agent-owned automation is read-only — render a notice
   // instead of the editor. The API 409s on save anyway.
@@ -373,6 +375,9 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
         // creation, and the server rejects it on non-partner callers.
         Object.assign(payload, {
           enabled: true,
+          // The API reads orgId from the body only (not ?orgId=), and 400s for a
+          // multi-org partner without it. Partner-wide rows have no org.
+          ...(values.ownerScope !== 'partner' && currentOrgId ? { orgId: currentOrgId } : {}),
           ...(isPartnerScope && values.ownerScope ? { ownerScope: values.ownerScope } : {})
         });
       }
@@ -436,6 +441,7 @@ export default function AutomationEditPage({ automationId, isNew = false }: Auto
         <a
           href="/jobs"
           className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+          aria-label={t('automationEditPage.actions.backToAutomations')}
         >
           <ArrowLeft className="h-5 w-5" />
         </a>

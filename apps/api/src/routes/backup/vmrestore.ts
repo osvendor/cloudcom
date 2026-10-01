@@ -113,9 +113,11 @@ async function dispatchVmRestoreCommand(options: VmRestoreDispatchOptions): Prom
 }
 
 // ── POST /backup/restore/as-vm — Trigger VM restore ────────────────
+// (mounted under backupRoutes' own '/backup' prefix in ./index.ts —
+// paths here must NOT repeat that prefix)
 
 vmRestoreRoutes.post(
-  '/backup/restore/as-vm',
+  '/restore/as-vm',
   requireScope('organization', 'partner', 'system'),
   requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action),
   requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
@@ -130,7 +132,8 @@ vmRestoreRoutes.post(
 
     const payload = c.req.valid('json');
 
-    // ── Rebuild engine (W05a): Linux whole-machine snapshot → VHDX on a Linux host ──
+    // ── Rebuild engine (W05a; W06d): whole-machine snapshot → VHDX on a rebuild
+    // host of the same platform, optionally a Hyper-V VM on a Windows host ──
     if (payload.engine === 'rebuild') {
       const authorization = await authorizeRouteResilienceResources(c, orgId, [
         { kind: 'snapshot', id: payload.snapshotId, role: 'source' },
@@ -145,13 +148,18 @@ vmRestoreRoutes.post(
           rebuildHostDeviceId: payload.rebuildHostDeviceId,
           outputPath: payload.outputPath,
           ...(payload.imageSizeGb !== undefined ? { imageSizeGb: payload.imageSizeGb } : {}),
+          ...(payload.hyperv ? { hyperv: payload.hyperv } : {}),
           userId: auth.user?.id ?? null,
           requestUrl: c.req.url,
         })
       );
 
       if (!result.ok) {
-        return c.json({ error: result.error, ...(result.details ? { details: result.details } : {}) }, result.status);
+        return c.json({
+          error: result.error,
+          ...(result.message ? { message: result.message } : {}),
+          ...(result.details ? { details: result.details } : {}),
+        }, result.status);
       }
 
       writeRouteAudit(c, {
@@ -167,6 +175,7 @@ vmRestoreRoutes.post(
           commandId: result.commandId,
           outputPath: payload.outputPath,
           identity: 'new',
+          ...(payload.hyperv ? { hyperv: payload.hyperv } : {}),
         },
       });
 
@@ -316,7 +325,7 @@ vmRestoreRoutes.post(
 // ── POST /backup/restore/instant-boot — Trigger instant boot VM ───────
 
 vmRestoreRoutes.post(
-  '/backup/restore/instant-boot',
+  '/restore/instant-boot',
   requireScope('organization', 'partner', 'system'),
   requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action),
   requirePermission(PERMISSIONS.DEVICES_EXECUTE.resource, PERMISSIONS.DEVICES_EXECUTE.action),
@@ -467,7 +476,7 @@ vmRestoreRoutes.post(
 // ── GET /backup/restore/instant-boot/active — Active instant boots ─────────
 
 vmRestoreRoutes.get(
-  '/backup/restore/instant-boot/active',
+  '/restore/instant-boot/active',
   requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action),
   async (c) => {
     const auth = c.get('auth');
@@ -546,7 +555,7 @@ vmRestoreRoutes.get(
 
 // ── GET /backup/restore/as-vm/estimate/:snapshotId — VM estimate ────
 
-vmRestoreRoutes.get('/backup/restore/as-vm/estimate/:snapshotId', requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action), async (c) => {
+vmRestoreRoutes.get('/restore/as-vm/estimate/:snapshotId', requirePermission(PERMISSIONS.BACKUP_READ.resource, PERMISSIONS.BACKUP_READ.action), async (c) => {
   const auth = c.get('auth');
   const orgId = resolveScopedOrgId(auth, c.req.query('orgId'));
   if (!orgId) {

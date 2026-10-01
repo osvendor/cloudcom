@@ -25,7 +25,8 @@
     },
     "actions": {
       "create": "Create Automation",
-      "saveChanges": "Save Changes"
+      "saveChanges": "Save Changes",
+      "backToAutomations": "Back to Jobs"
     }
   },
   "automationForm": {
@@ -150,6 +151,7 @@
     },
     "fields": {
       "name": "Automation name",
+      "actionType": "Action type",
       "cronExpression": "Cron Expression",
       "eventType": "Event Type",
       "webhookUrl": "Webhook URL",
@@ -223,7 +225,9 @@
     "searchPlaceholder": "Search automations...",
     "filters": {
       "allTriggers": "All Triggers",
-      "allStatus": "All Status"
+      "allStatus": "All Status",
+      "triggerLabel": "Trigger",
+      "statusLabel": "Status"
     },
     "trigger": {
       "schedule": "Schedule",
@@ -334,6 +338,14 @@
       "untitled": "Script",
       "awaiting": "Waiting for the agent to report…",
       "truncated": "Output truncated — see the device's script history for the full text."
+    },
+    "commandOutput": {
+      "show_one": "Show command output",
+      "show_other": "Show command output ({{count}})",
+      "hide_one": "Hide command output",
+      "hide_other": "Hide command output ({{count}})",
+      "label": "Command (action {{index}})",
+      "truncated": "Output truncated — the full text is not kept in this view."
     }
   },
   "automationsPage": {
@@ -426,6 +438,7 @@
       "generic": "An error occurred"
     },
     "loading": "Loading compliance data...",
+    "backToPolicies": "Back to Policies",
     "policyTitle": "Compliance: {{policy}}",
     "policyFallback": "Policy",
     "title": "Compliance Dashboard",
@@ -483,7 +496,8 @@
     },
     "actions": {
       "create": "Create Policy",
-      "saveChanges": "Save Changes"
+      "saveChanges": "Save Changes",
+      "backToPolicies": "Back to Policies"
     }
   },
   "policyForm": {
@@ -542,10 +556,12 @@
     },
     "actions": {
       "savePolicy": "Save policy",
-      "addRule": "Add Rule"
+      "addRule": "Add Rule",
+      "removeRule": "Remove Rule"
     },
     "fields": {
       "name": "Policy name",
+      "ruleType": "Rule type",
       "targetType": "Target Type",
       "softwareName": "Software Name",
       "versionCheck": "Version Check",
@@ -617,7 +633,9 @@
     "searchPlaceholder": "Search policies...",
     "filters": {
       "allEnforcement": "All Enforcement",
-      "allStatus": "All Status"
+      "allStatus": "All Status",
+      "enforcementLabel": "Enforcement",
+      "statusLabel": "Status"
     },
     "enforcement": {
       "monitor": {
@@ -731,7 +749,9 @@
       "lastHour": "Last Hour",
       "lastDay": "Last 24 Hours",
       "lastWeek": "Last 7 Days",
-      "lastMonth": "Last 30 Days"
+      "lastMonth": "Last 30 Days",
+      "statusLabel": "Status",
+      "dateLabel": "Date range"
     },
     "status": {
       "pending": "Pending",
@@ -973,6 +993,7 @@
     "loading": "Loading executions...",
     "actions": {
       "backToScripts": "Back to Scripts",
+      "backToScript": "Back to Script",
       "runScript": "Run Script"
     },
     "breadcrumb": {
@@ -1410,6 +1431,7 @@
   },
   "testRunner": {
     "title": "Test run",
+    "deviceSelectLabel": "Test device",
     "devicePlaceholder": "Select a test device…",
     "noDevices": "No compatible devices",
     "devicesLoadFailed": "Couldn't load devices",

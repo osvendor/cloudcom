@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { bmrCompleteSchema, bmrVmRestoreSchema, canonicalizeS3CredentialFields } from './schemas';
+import { bmrCompleteSchema, bmrVmRestoreSchema, canonicalizeS3CredentialFields, jobListSchema } from './schemas';
 
 // D14: a bare-metal recovery completion report was answering "Request body
 // too large" for a payload carrying ~9,900 unbounded `warnings` strings (the
@@ -105,6 +105,25 @@ describe('bmrVmRestoreSchema — engine discriminated union (W05a)', () => {
     expect(bmrVmRestoreSchema.safeParse({ engine: 'rebuild', snapshotId: SNAP, outputPath: '/srv/out.vhdx' }).success).toBe(false);
   });
 
+  // W06d (Task 20): a Windows rebuild host takes a drive-letter output path and
+  // an optional hyperv block (VM creation after the rebuild).
+  it('accepts a Windows drive-letter output path and an optional hyperv block on the rebuild variant', () => {
+    const parsed = bmrVmRestoreSchema.safeParse({
+      engine: 'rebuild', snapshotId: SNAP, rebuildHostDeviceId: DEV, outputPath: 'D:\\rebuild\\dev-1.VHDX',
+      hyperv: { vmName: 'w06-proof', switchName: 'lab-switch', memoryMb: 4096, cpuCount: 2 },
+    });
+    expect(parsed.success).toBe(true);
+    if (parsed.success && parsed.data.engine === 'rebuild') {
+      expect(parsed.data.hyperv).toEqual({ vmName: 'w06-proof', switchName: 'lab-switch', memoryMb: 4096, cpuCount: 2 });
+    }
+  });
+
+  it('rejects an invalid hyperv block on the rebuild variant', () => {
+    const base = { engine: 'rebuild', snapshotId: SNAP, rebuildHostDeviceId: DEV, outputPath: 'C:\\out\\x.vhdx' };
+    expect(bmrVmRestoreSchema.safeParse({ ...base, hyperv: { vmName: '' } }).success).toBe(false);
+    expect(bmrVmRestoreSchema.safeParse({ ...base, hyperv: { vmName: 'x', diskSizeGb: 40 } }).success).toBe(false);
+  });
+
   it('rejects an unknown engine', () => {
     expect(bmrVmRestoreSchema.safeParse({ engine: 'vmware', snapshotId: SNAP, targetDeviceId: DEV, hypervisor: 'hyperv', vmName: 'VM' }).success).toBe(false);
   });
@@ -148,5 +167,12 @@ describe('canonicalizeS3CredentialFields', () => {
     const details: Record<string, unknown> = { accessKey: 'AK', secretKey: 'SK' };
     canonicalizeS3CredentialFields(details);
     expect(details).toEqual({ accessKey: 'AK', secretKey: 'SK' });
+  });
+});
+
+// #5396: the job list must accept filtering on the new terminal status.
+describe('jobListSchema status (#5396)', () => {
+  it('accepts completed_with_errors', () => {
+    expect(jobListSchema.safeParse({ status: 'completed_with_errors' }).success).toBe(true);
   });
 });

@@ -17,6 +17,7 @@ import {
   resolveSiteAllowedDeviceIds, runFrozenDeviceIds, SITE_SCOPE_EMPTY_NOTE,
 } from './aiToolsSiteScope';
 import { sanitizeThrownToolError } from './aiToolErrors';
+import { canReadSensitiveEventLogCategory } from './eventLogSensitivity';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 
@@ -98,6 +99,7 @@ export function registerEventLogTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceIds'],
     domain: 'monitoring',
     searchHint: 'event logs across devices, full-text search, severity, source, category and time filters',
+    alwaysLoad: true,
     definition: {
       name: 'search_logs',
       description:
@@ -156,9 +158,11 @@ export function registerEventLogTools(aiTools: Map<string, AiTool>): void {
             scopeNote: SITE_SCOPE_EMPTY_NOTE,
           });
         }
+        const canReadSensitiveCategory = await canReadSensitiveEventLogCategory(auth);
         const result = await searchFleetLogs(auth, {
           allowedDeviceIds,
           allowedSiteIds: normalizedAllowedSiteIds(auth),
+          canReadSensitiveCategory,
           query: typeof input.query === 'string' ? input.query : undefined,
           timeRange: typeof input.timeRange === 'object' && input.timeRange !== null
             ? {
@@ -281,9 +285,11 @@ export function registerEventLogTools(aiTools: Map<string, AiTool>): void {
           });
         }
 
+        const canReadSensitiveCategory = await canReadSensitiveEventLogCategory(auth);
         const trends = await getLogTrends(auth, {
           allowedDeviceIds,
           allowedSiteIds: normalizedAllowedSiteIds(auth),
+          canReadSensitiveCategory,
           start: timeRange.start,
           end: timeRange.end,
           minLevel: typeof input.minLevel === 'string'
@@ -300,6 +306,7 @@ export function registerEventLogTools(aiTools: Map<string, AiTool>): void {
           groupingSummary = await getLogAggregation(auth, {
             allowedDeviceIds,
             allowedSiteIds: normalizedAllowedSiteIds(auth),
+            canReadSensitiveCategory,
             start: trends.start,
             end: trends.end,
             bucket: 'hour',

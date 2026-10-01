@@ -25,10 +25,10 @@ import {
   configPolicyAssignments,
   configurationPolicies,
   configPolicyEffectiveFeatureLinks,
+  configPolicyFeatureLinks,
   configPolicyEventLogSettings,
   configPolicyHardwareMonitoringSettings,
   configPolicyMonitoringSettings,
-  configPolicyMonitoringWatches,
   configPolicyOnedriveSettings,
   configPolicyOnedriveLibraries,
   onedriveDeviceState,
@@ -66,8 +66,13 @@ import { resolveEffectiveWarrantyInlineSettings } from '../../services/warrantyP
 import { warrantyHpCmslCollectionEffective } from '@breeze/shared/validators';
 import { policyOwnershipCondition, withDevicePartnerPolicyVisibility } from '../../services/configPolicyOwnership';
 import { HARDWARE_MONITORING_DEFAULTS, hardwareMonitoringInlineSettingsSchema, type HardwareMonitoringInlineSettings } from '@breeze/shared';
+import {
+  buildResolvedTimeSyncConfigUpdate,
+  type TimeSyncConfigUpdate,
+} from '../../services/timeSync/configUpdate';
 import { resolveUserGroupMembershipCached } from '../../services/onedriveGraph';
 import { captureException } from '../../services/sentry';
+import { isParkedDevice } from '../../services/unassignedPool/deliveryEligibility';
 import { getBinaryEdition } from '../../services/binaryEdition';
 import { redactSecretsDeep, redactOptionalSecretText } from '../../services/secretRedaction';
 import { CloudflareMtlsService } from '../../services/cloudflareMtls';
@@ -484,7 +489,16 @@ export function getSecurityStatusFromResult(resultData: Record<string, unknown> 
   return parsed.data;
 }
 
-export async function upsertSecurityStatusForDevice(deviceId: string, orgId: string, payload: SecurityStatusPayload): Promise<void> {
+/**
+ * Upsert the device's single security_status row. Returns the normalized
+ * `provider` and `threatCount` it wrote so the ingest route can tell a real
+ * change from a re-report (#4340).
+ */
+export async function upsertSecurityStatusForDevice(
+  deviceId: string,
+  orgId: string,
+  payload: SecurityStatusPayload,
+): Promise<{ provider: SecurityProviderValue; threatCount: number }> {
   const avProducts = Array.isArray(payload.avProducts) ? payload.avProducts : [];
   // `preferredProduct` only backfills the top-level summary when the payload
   // omits it entirely. The current Go agent always marshals `provider` and
@@ -496,6 +510,7 @@ export async function upsertSecurityStatusForDevice(deviceId: string, orgId: str
   const preferredProduct = avProducts.find((p) => p.realTimeProtection) ?? avProducts[0];
   const provider = normalizeProvider(payload.provider ?? preferredProduct?.provider);
   const avProductsValue = payload.avProducts ?? null;
+  const threatCount = payload.threatCount ?? 0;
 
   await db
     .insert(securityStatus)
@@ -509,7 +524,7 @@ export async function upsertSecurityStatusForDevice(deviceId: string, orgId: str
       realTimeProtection: payload.realTimeProtection ?? preferredProduct?.realTimeProtection ?? false,
       lastScan: parseDate(payload.lastScan),
       lastScanType: asString(payload.lastScanType) ?? null,
-      threatCount: payload.threatCount ?? 0,
+      threatCount,
       firewallEnabled: payload.firewallEnabled ?? null,
       encryptionStatus: normalizeEncryptionStatus(payload.encryptionStatus),
       encryptionDetails: payload.encryptionDetails ?? null,
@@ -529,7 +544,7 @@ export async function upsertSecurityStatusForDevice(deviceId: string, orgId: str
         realTimeProtection: payload.realTimeProtection ?? preferredProduct?.realTimeProtection ?? false,
         lastScan: parseDate(payload.lastScan),
         lastScanType: asString(payload.lastScanType) ?? null,
-        threatCount: payload.threatCount ?? 0,
+        threatCount,
         firewallEnabled: payload.firewallEnabled ?? null,
         encryptionStatus: normalizeEncryptionStatus(payload.encryptionStatus),
         encryptionDetails: payload.encryptionDetails ?? null,
@@ -540,6 +555,8 @@ export async function upsertSecurityStatusForDevice(deviceId: string, orgId: str
         updatedAt: new Date()
       }
     });
+
+  return { provider, threatCount };
 }
 
 async function updateThreatStatusForAction(command: typeof deviceCommands.$inferSelect): Promise<void> {
@@ -1555,6 +1572,10 @@ export async function maybeQueueThresholdFilesystemAnalysis(
   if (!Number.isFinite(diskPercent) || diskPercent < filesystemDiskThresholdPercent) {
     return { queued: false };
   }
+  // A device parked in a holding org receives lifecycle removal only.
+  if (await isParkedDevice(db, device.id)) {
+    return { queued: false };
+  }
 
   const cooldownStart = new Date(Date.now() - filesystemThresholdCooldownMinutes * 60 * 1000);
   const [recentSnapshot] = await db
@@ -1812,6 +1833,12 @@ export async function handleFilesystemAnalysisCommandResult(
   );
   if (queued.command) {
     await setFilesystemScanGeneration(command.deviceId, orgId, scanPath, queued.command.id);
+    return;
+  }
+
+  // The queue refused (or could not reach) the device. Never hand-write the
+  // row for a device parked in a holding org: it receives removal only.
+  if (await isParkedDevice(db, command.deviceId)) {
     return;
   }
 
@@ -2196,6 +2223,17 @@ export async function buildHardwareMonitoringConfigUpdate(deviceId: string): Pro
 }
 
 /**
+ * Build time_sync_settings config update payload for heartbeat response
+ * (time-sync index §F.2). Defaults are sent when no policy is linked; a
+ * resolver error throws so the heartbeat omits the key.
+ */
+export async function buildTimeSyncConfigUpdate(
+  deviceId: string,
+): Promise<TimeSyncConfigUpdate> {
+  return buildResolvedTimeSyncConfigUpdate(deviceId);
+}
+
+/**
  * Org-scoped retention lookup for the event-log retention worker.
  *
  * Resolves the winning event_log policy for an org across BOTH assignment levels
@@ -2318,7 +2356,7 @@ const MONITOR_WATCH_DEFAULTS = {
   alertAfterConsecutiveFailures: 2,
 } as const;
 
-/** `check_interval_seconds` when monitors deliver watches but no policy resolved. */
+/** Default `check_interval_seconds` when no `monitors` link resolves. */
 const MONITOR_ONLY_CHECK_INTERVAL_SECONDS = 60;
 
 /**
@@ -2415,45 +2453,6 @@ async function resolveMonitorDerivedWatches(deviceId: string): Promise<MonitorDe
 }
 
 /**
- * Union monitor-derived watches with the policy tab's, keyed on
- * (watch_type, lower(name)). The MONITOR wins every field except:
- *  - `auto_restart`, which is OR'd — never lowered, because it drives the
- *    agent's own offline-capable restart; and
- *  - the process thresholds, which fall back to the policy row, because a
- *    `service`/`process` monitor authors none (that is `process_resource`).
- */
-function unionMonitoringWatches(
-  monitorWatches: MonitoringWatchConfig[],
-  policyWatches: MonitoringWatchConfig[],
-): MonitoringWatchConfig[] {
-  const key = (w: MonitoringWatchConfig) => `${w.watch_type}:${w.name.toLowerCase()}`;
-  const merged = new Map<string, MonitoringWatchConfig>();
-
-  for (const w of monitorWatches) merged.set(key(w), { ...w });
-
-  for (const p of policyWatches) {
-    const k = key(p);
-    const existing = merged.get(k);
-    if (!existing) {
-      merged.set(k, { ...p });
-      continue;
-    }
-    existing.auto_restart = existing.auto_restart || p.auto_restart;
-    if (existing.cpu_threshold_percent == null && p.cpu_threshold_percent != null) {
-      existing.cpu_threshold_percent = p.cpu_threshold_percent;
-    }
-    if (existing.memory_threshold_mb == null && p.memory_threshold_mb != null) {
-      existing.memory_threshold_mb = p.memory_threshold_mb;
-    }
-    if (existing.threshold_duration_seconds == null && p.threshold_duration_seconds != null) {
-      existing.threshold_duration_seconds = p.threshold_duration_seconds;
-    }
-  }
-
-  return [...merged.values()];
-}
-
-/**
  * Outcome of resolving a device's monitoring config. Three states, because the
  * wire has three meanings (#2949):
  *  - `unresolved`   — the answer is unknown this cycle (the device vanished
@@ -2474,12 +2473,8 @@ type DeviceMonitoringResolution =
   | { kind: 'resolved'; settings: MonitoringConfigUpdate };
 
 async function resolveDeviceMonitoringSettings(deviceId: string): Promise<DeviceMonitoringResolution> {
-  // Monitors are the primary source and win the union (#5287 W04); the policy
-  // tab is read FIRST only so its query sequence is untouched by this change —
-  // helpers.partnerWidePolicies.test.ts pins that sequence and must stay green
-  // unmodified. Both sources emit the same frozen `MonitoringWatchConfig`
-  // shape; the union below is order-independent.
-  const policyResult = await resolvePolicyMonitoringSettings(deviceId);
+  // W05d: monitors alone supply watches; the monitors link supplies the interval.
+  const policyResult = await resolvePolicyCheckInterval(deviceId);
   const monitorResult = await resolveMonitorDerivedWatches(deviceId);
 
   // A device that vanished between authentication and here (raced a
@@ -2518,7 +2513,7 @@ async function resolveDeviceMonitoringSettings(deviceId: string): Promise<Device
     kind: 'resolved',
     settings: {
       check_interval_seconds: policy?.check_interval_seconds ?? MONITOR_ONLY_CHECK_INTERVAL_SECONDS,
-      watches: unionMonitoringWatches(monitorWatches, policy?.watches ?? []),
+      watches: monitorWatches,
     },
   };
 }
@@ -2528,12 +2523,12 @@ async function resolveDeviceMonitoringSettings(deviceId: string): Promise<Device
  * "no policy applies" — the latter now sends the agent an explicit clear
  * (#2949), the former must omit the update (#5677).
  */
-type PolicyMonitoringResult =
+type PolicyCheckIntervalResult =
   | { kind: 'device_missing' }
   | { kind: 'no_policy' }
-  | { kind: 'resolved'; settings: MonitoringConfigUpdate };
+  | { kind: 'resolved'; settings: { check_interval_seconds: number } };
 
-async function resolvePolicyMonitoringSettings(deviceId: string): Promise<PolicyMonitoringResult> {
+async function resolvePolicyCheckInterval(deviceId: string): Promise<PolicyCheckIntervalResult> {
   // 1. Load device
   const [device] = await db
     .select({
@@ -2584,32 +2579,22 @@ async function resolvePolicyMonitoringSettings(deviceId: string): Promise<Policy
     );
   }
 
-  // 5-7. Policy join + the winning row's watches, both in the CALLER'S OWN
-  // context (#4673 W03). config_policy_monitoring_watches' RLS walks
-  // settings_id → feature link → configuration_policies; for a partner-owned
-  // policy that chain used to need breeze_has_partner_access, which no agent or
-  // org context carries, so the read escaped to a system context. Wave 1's
-  // `config_policy_monitoring_watches_partner_wide_select` now grants exactly
-  // that chain on SELECT via breeze_current_partner_id(), and Wave 2 sets the
-  // GUC on agent contexts — so both reads resolve here without a second pooled
-  // connection. Both are pinned to this device's own hierarchy.
-  // 5. Single query: assignments → active policies → monitoring feature link → settings
+  // #4673 W03: read in the CALLER'S OWN context. The partner-wide SELECT
+  // branch on the feature-link table and the settings table, plus the
+  // agent's breeze.current_partner_id GUC, grant this read without a system
+  // escape or a second pooled connection. Keep it pinned to this hierarchy.
+  // 5. Load eligible assignments independently of attachment inheritance.
   const rows = await db
     .select({
+      policyId: configurationPolicies.id,
+      parentPolicyId: configurationPolicies.parentPolicyId,
       level: configPolicyAssignments.level,
       assignmentPriority: configPolicyAssignments.priority,
       roleFilter: configPolicyAssignments.roleFilter,
       osFilter: configPolicyAssignments.osFilter,
-      settingsId: configPolicyMonitoringSettings.id,
-      checkIntervalSeconds: configPolicyMonitoringSettings.checkIntervalSeconds,
     })
     .from(configPolicyAssignments)
     .innerJoin(configurationPolicies, eq(configPolicyAssignments.configPolicyId, configurationPolicies.id))
-    .innerJoin(configPolicyEffectiveFeatureLinks, and(
-      eq(configPolicyEffectiveFeatureLinks.configPolicyId, configurationPolicies.id),
-      eq(configPolicyEffectiveFeatureLinks.featureType, 'monitoring'),
-    ))
-    .innerJoin(configPolicyMonitoringSettings, eq(configPolicyMonitoringSettings.featureLinkId, configPolicyEffectiveFeatureLinks.id))
     .where(and(
       eq(configurationPolicies.status, 'active'),
       policyOwnershipCondition({ orgId: device.orgId, partnerId: org?.partnerId ?? null }),
@@ -2617,11 +2602,34 @@ async function resolvePolicyMonitoringSettings(deviceId: string): Promise<Policy
       ...buildRoleOsFilterConditions({ deviceRole: device.deviceRole, osType: device.osType }),
     ));
 
-  // Filter by deviceRole and osType using canonical predicate
-  const eligibleRows = rows.filter((r) =>
+  const assignments = rows.filter((r) =>
     matchesRoleOsFilter(r, { deviceRole: device.deviceRole, osType: device.osType })
   );
+  if (assignments.length === 0) return { kind: 'no_policy' };
 
+  // Interval inheritance is field-level: a child's attachment link must not
+  // hide its parent's explicit interval. Parents need not be active/assigned.
+  // Read only these policies and their immediate parents, in this DB context.
+  const policyIds = [...new Set(assignments.flatMap((r) =>
+    r.parentPolicyId ? [r.policyId, r.parentPolicyId] : [r.policyId]
+  ))];
+  const settingsRows = await db
+    .select({
+      policyId: configPolicyFeatureLinks.configPolicyId,
+      checkIntervalSeconds: configPolicyMonitoringSettings.checkIntervalSeconds,
+    })
+    .from(configPolicyFeatureLinks)
+    .innerJoin(configPolicyMonitoringSettings, eq(configPolicyMonitoringSettings.featureLinkId, configPolicyFeatureLinks.id))
+    .where(and(
+      inArray(configPolicyFeatureLinks.configPolicyId, policyIds),
+      eq(configPolicyFeatureLinks.featureType, 'monitors'),
+    ));
+  const intervals = new Map(settingsRows.map((r) => [r.policyId, r.checkIntervalSeconds]));
+  const eligibleRows = assignments.flatMap((r) => {
+    const checkIntervalSeconds = intervals.get(r.policyId)
+      ?? (r.parentPolicyId ? intervals.get(r.parentPolicyId) : undefined);
+    return checkIntervalSeconds === undefined ? [] : [{ ...r, checkIntervalSeconds }];
+  });
   if (eligibleRows.length === 0) return { kind: 'no_policy' };
 
   // 6. Sort by level priority DESC, then assignment priority ASC — first match wins
@@ -2634,45 +2642,9 @@ async function resolvePolicyMonitoringSettings(deviceId: string): Promise<Policy
   const winner = eligibleRows[0];
   if (!winner) return { kind: 'no_policy' };
 
-  // 7. Load watches for the winning settings row
-  const watches = await db
-    .select()
-    .from(configPolicyMonitoringWatches)
-    .where(and(
-      eq(configPolicyMonitoringWatches.settingsId, winner.settingsId),
-      eq(configPolicyMonitoringWatches.enabled, true),
-      isNull(configPolicyMonitoringWatches.retiredAt),
-    ))
-    .orderBy(configPolicyMonitoringWatches.sortOrder);
-
-  // A winning policy row with zero enabled watches is a valid resolution — it
-  // means "clear whatever watches were previously delivered", not "no policy
-  // matched" (that case already returned `no_policy` above).
-  // Collapsing both to null used to make heartbeat.ts omit monitoring_settings
-  // from the payload, so the agent (which handles an empty array fine — see
-  // agent/internal/monitoring/monitor.go ApplyConfig) could never be told to
-  // stop watching something it was configured to watch on a prior heartbeat
-  // (#2949).
   return {
     kind: 'resolved',
-    settings: {
-      check_interval_seconds: winner.checkIntervalSeconds,
-      watches: watches.map((w) => {
-        const entry: MonitoringWatchConfig = {
-          watch_type: w.watchType,
-          name: w.name,
-          alert_on_stop: w.alertOnStop,
-          alert_after_consecutive_failures: w.alertAfterConsecutiveFailures,
-          auto_restart: w.autoRestart,
-          max_restart_attempts: w.maxRestartAttempts,
-          restart_cooldown_seconds: w.restartCooldownSeconds,
-        };
-        if (w.cpuThresholdPercent != null) entry.cpu_threshold_percent = w.cpuThresholdPercent;
-        if (w.memoryThresholdMb != null) entry.memory_threshold_mb = w.memoryThresholdMb;
-        if (w.thresholdDurationSeconds) entry.threshold_duration_seconds = w.thresholdDurationSeconds;
-        return entry;
-      }),
-    },
+    settings: { check_interval_seconds: winner.checkIntervalSeconds },
   };
 }
 
@@ -3672,4 +3644,35 @@ async function resolveDeviceOnedriveSettings(deviceId: string): Promise<Onedrive
 
 export async function buildOnedriveHelperConfigUpdate(deviceId: string): Promise<OnedriveConfigUpdate | null> {
   return resolveDeviceOnedriveSettings(deviceId);
+}
+
+// Roles that dynamic-group filters and attribute-targeted automations most
+// often use to select higher-trust deployment targets (server/DC-style
+// groups, secret-bearing scripts). `deviceRole` is agent-reported and, when
+// `deviceRoleSource` is still 'auto', accepted from the heartbeat with no
+// server-side verification — see shouldAutoApplyAgentReportedDeviceRole.
+export const PRIVILEGED_AGENT_ROLE_TARGETS: ReadonlySet<string> = new Set(['server']);
+
+/**
+ * Whether an agent-reported `deviceRole` may be written straight to the
+ * device row while `deviceRoleSource` is still 'auto' (no admin has pinned
+ * the role by hand).
+ *
+ * Every field an agent reports over heartbeat is self-reported. Since
+ * dynamic groups and automation/script targeting filter on `deviceRole`, an
+ * unconditional auto-write would let a workstation's own report move it into
+ * a privileged role (e.g. `server`) and pull in whatever that role's groups
+ * grant — secret-bearing scripts, elevated policies. A flip INTO a
+ * privileged role therefore isn't auto-applied; the caller should instead
+ * leave the stored role untouched and audit-log the claim so an admin can
+ * review and confirm it explicitly (e.g. by pinning the role by hand).
+ * Flips between non-privileged roles, and any change while the role is
+ * already privileged, remain auto-applied as before.
+ */
+export function shouldAutoApplyAgentReportedDeviceRole(
+  currentRole: string | null | undefined,
+  reportedRole: string,
+): boolean {
+  if (!PRIVILEGED_AGENT_ROLE_TARGETS.has(reportedRole)) return true;
+  return currentRole === reportedRole;
 }

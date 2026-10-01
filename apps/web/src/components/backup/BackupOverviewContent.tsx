@@ -23,6 +23,7 @@ import {
   attentionIconMap,
   buildLinePath,
   formatBytes,
+  localizeIsoTimestamps,
   resolveJobConfig,
   resolveJobDevice,
   resolveJobDuration,
@@ -339,17 +340,28 @@ export default function BackupOverviewContent(props: BackupOverviewContentProps)
               storageProviders.map((provider) => {
                 const percent = resolveProviderPercent(provider);
                 const color = resolveProviderColor(provider.name);
+                const used = typeof provider.usedBytes === 'number'
+                  ? formatBytes(provider.usedBytes)
+                  : provider.used ?? '--';
+                // Only a provider with a known capacity gets a "used / total"
+                // bar; a usage-only row (#2562) would otherwise render an
+                // empty bar that reads as "nothing stored".
+                const hasCapacity = provider.total != null || typeof provider.percent === 'number';
+                const key = provider.id ?? provider.name;
                 return (
-                  <div key={provider.id ?? provider.name} className="space-y-2">
+                  <div key={key} className="space-y-2">
                     <div className="flex items-center justify-between text-sm">
                       <span className="font-medium text-foreground">{provider.name}</span>
                       <span className="text-xs text-muted-foreground">
-                        {provider.used ?? '--'} / {provider.total ?? '--'}
+                        <span data-testid={`storage-provider-used-${key}`}>{used}</span>
+                        {hasCapacity ? ` / ${provider.total ?? '--'}` : null}
                       </span>
                     </div>
-                    <div className="h-2 w-full rounded-full bg-muted">
-                      <div className={cn('h-2 rounded-full', color, widthPercentClass(percent))} />
-                    </div>
+                    {hasCapacity ? (
+                      <div className="h-2 w-full rounded-full bg-muted">
+                        <div className={cn('h-2 rounded-full', color, widthPercentClass(percent))} />
+                      </div>
+                    ) : null}
                   </div>
                 );
               })
@@ -452,7 +464,7 @@ export default function BackupOverviewContent(props: BackupOverviewContentProps)
                       {item.title}
                     </div>
                     {item.description && (
-                      <p className="mt-1 text-xs text-muted-foreground">{item.description}</p>
+                      <p className="mt-1 text-xs text-muted-foreground">{localizeIsoTimestamps(item.description)}</p>
                     )}
                   </div>
                 );

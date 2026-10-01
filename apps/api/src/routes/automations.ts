@@ -7,6 +7,7 @@ import { and, desc, eq, inArray, isNull, or, sql, type SQL } from 'drizzle-orm';
 import { db } from '../db';
 import {
   automations,
+  automationActionResults,
   automationRuns,
   automationRunDeviceResults,
   configurationPolicies,
@@ -14,7 +15,14 @@ import {
   scriptExecutions,
   scripts,
 } from '../db/schema';
-import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthContext } from '../middleware/auth';
+import {
+  authMiddleware,
+  requireMfa,
+  requirePermission,
+  requireScope,
+  withAuthDbAccessContext,
+  type AuthContext,
+} from '../middleware/auth';
 import { writeAuditEvent, writeRouteAudit } from '../services/auditEvents';
 import { getTrustedClientIp } from '../services/clientIp';
 import { PERMISSIONS, type UserPermissions } from '../services/permissions';
@@ -47,6 +55,7 @@ import {
   managedAutomationOwnerIsLive,
 } from '../services/aiAgents/managedAutomation';
 import { UUID_REGEX } from '../utils/uuid';
+import { captureException } from '../services/sentry';
 import { projectAutomationRunsToSites, scanProjectedAutomationRuns } from '../services/automationReadProjection';
 import { managedByMonitorResponse } from '../services/monitors/managedRowGuard';
 
@@ -222,10 +231,23 @@ async function verifyAutomationWebhookSignature(input: {
     return { ok: false, error: 'Invalid webhook signature', status: 401 };
   }
 
-  const replayNonce = input.eventIdHeader?.trim() || normalizedSignature;
-  const replayNonceHash = createHash('sha256').update(replayNonce).digest('hex');
-  const replayKey = `${input.automationId}:${replayNonceHash}`;
-  return reserveAutomationWebhookReplayNonce(replayKey, now);
+  // The replay key is always derived from the verified signature, never from a
+  // caller-supplied header alone — an unsigned event-id is not trustworthy as
+  // the sole dedup key, since a byte-identical resend can carry a fresh one.
+  const signatureNonceHash = createHash('sha256').update(normalizedSignature).digest('hex');
+  const signatureReplayKey = `${input.automationId}:${signatureNonceHash}`;
+  const signatureReservation = await reserveAutomationWebhookReplayNonce(signatureReplayKey, now);
+  if (!signatureReservation.ok) return signatureReservation;
+
+  const trimmedEventId = input.eventIdHeader?.trim();
+  if (trimmedEventId) {
+    const eventIdNonceHash = createHash('sha256').update(trimmedEventId).digest('hex');
+    const eventIdReplayKey = `${input.automationId}:${eventIdNonceHash}`;
+    const eventIdReservation = await reserveAutomationWebhookReplayNonce(eventIdReplayKey, now);
+    if (!eventIdReservation.ok) return eventIdReservation;
+  }
+
+  return { ok: true };
 }
 
 function getPagination(query: { page?: string; limit?: string }) {
@@ -259,26 +281,42 @@ const requireValidRunId = requireUuidParam('runId', 'Automation run not found');
  * an automation (the only gate for unattended schedule/event triggers) and when
  * one is manually triggered (the resolved set may have drifted).
  *
- * Returns a 403 JSON response if the caller is site-restricted and the
- * automation's target set escapes their allowlist, otherwise null (proceed).
- * Unrestricted callers always pass.
+ * Returns `{ denied: <403 JSON response> }` if the caller is site-restricted
+ * and the automation's target set escapes their allowlist, otherwise
+ * `{ denied: null, targetDeviceIds }` (proceed) — `targetDeviceIds` is the
+ * exact target set this check resolved the automation against. A caller that
+ * dispatches a run right after this check (manual trigger) should pass that
+ * same list through as `boundDeviceIds` rather than letting the dispatch
+ * re-resolve independently: group/filter membership (and execution-target
+ * field-provenance exclusions) can change between two separate resolutions
+ * of the same automation, so two calls are not guaranteed to agree (TOCTOU).
+ * Unrestricted callers always pass, with an empty `targetDeviceIds` (the
+ * dispatch path resolves its own target set in that case, same as before).
  */
 async function enforceAutomationSiteScope(
   c: Context,
   automation: Parameters<typeof checkAutomationTargetsWithinSiteScope>[0],
-) {
+): Promise<{ denied: Response | null; targetDeviceIds: string[] | null }> {
   const perms = c.get('permissions') as UserPermissions | undefined;
   const result = await checkAutomationTargetsWithinSiteScope(automation, perms);
   if (!result.ok) {
     if (result.unbounded) {
-      return c.json(
-        { error: 'Site-restricted users cannot create or run automations that target all devices in the organization' },
-        403,
-      );
+      return {
+        denied: c.json(
+          { error: 'Site-restricted users cannot create or run automations that target all devices in the organization' },
+          403,
+        ),
+        targetDeviceIds: null,
+      };
     }
-    return c.json({ error: 'Access to one or more target sites denied' }, 403);
+    return { denied: c.json({ error: 'Access to one or more target sites denied' }, 403), targetDeviceIds: null };
   }
-  return null;
+  // `restricted` distinguishes "unrestricted caller, no resolution attempted"
+  // (targetDeviceIds should stay `null` so a dispatch caller falls back to
+  // its own resolution, exactly as before the field-provenance/TOCTOU fix) from "site-restricted
+  // caller whose resolved target legitimately came back empty" (`[]`, which
+  // must be bound as-is, not treated as "resolve your own").
+  return { denied: null, targetDeviceIds: result.restricted ? result.targetDeviceIds : null };
 }
 
 // Dual-ownership (#2133): an automation is org-owned (orgId set) or
@@ -461,10 +499,10 @@ function takePreview(
 /**
  * Fetch the `script_executions` rows minted by a run's `run_script` actions,
  * grouped by device (#3162). These carry the script's REAL stdout/stderr/exit
- * code, which `automation_run_device_results.output` never has — that column
- * only holds the automation's own log lines. RLS on script_executions (org_id =
- * device's org) scopes rows to the caller's tenancy, same as
- * fetchRunDeviceResults.
+ * code. `automation_run_device_results.output` is only a truncated
+ * concatenation of every action's output/message, not a per-script record.
+ * RLS on script_executions (org_id = device's org) scopes rows to the
+ * caller's tenancy, same as fetchRunDeviceResults.
  *
  * `scriptName` is a LEFT JOIN and can legitimately be null: an org-scoped RLS
  * context cannot see a partner-wide script (`scripts.org_id IS NULL`), so the
@@ -520,18 +558,88 @@ async function fetchRunScriptExecutions(runId: string, auth: AuthContext, allowe
   return byDevice;
 }
 
+const RUN_COMMAND_OUTPUT_PREVIEW_CHARS = 16_384;
+const RUN_COMMAND_ERROR_PREVIEW_CHARS = 8_192;
+
+type RunCommandResult = {
+  actionIndex: number;
+  status: string;
+  output?: string;
+  outputTruncated?: boolean;
+  error?: string;
+  errorTruncated?: boolean;
+  message?: string;
+};
+
+/**
+ * Fetch the per-device results of a run's `execute_command` actions (#3188).
+ * An ad-hoc command has no `scripts` row, so it can never mint a
+ * `script_executions` row; its stdout instead lands on its own
+ * `automation_action_results` row, correlated by command id when the agent
+ * reports (redacted at ingest). This surfaces it the same way
+ * `fetchRunScriptExecutions` surfaces a `run_script` action's stdout. RLS on
+ * automation_action_results (org_id = device's org) scopes rows to the
+ * caller's tenancy; the explicit org condition and site filter mirror the
+ * script-execution query.
+ */
+async function fetchRunCommandResults(runId: string, auth: AuthContext, allowedSiteIds?: string[]) {
+  const conditions: SQL[] = [
+    eq(automationActionResults.runId, runId),
+    eq(automationActionResults.actionType, 'execute_command'),
+  ];
+  const orgCondition = auth.orgCondition?.(automationActionResults.orgId);
+  if (orgCondition) conditions.push(orgCondition);
+  if (allowedSiteIds !== undefined) conditions.push(inArray(devices.siteId, allowedSiteIds));
+
+  const rows = await db
+    .select({
+      deviceId: automationActionResults.deviceId,
+      actionIndex: automationActionResults.actionIndex,
+      status: automationActionResults.status,
+      // +1 so the TS side can tell "exactly at the limit" from "overflowed".
+      output: sql<string | null>`left(${automationActionResults.output}, ${RUN_COMMAND_OUTPUT_PREVIEW_CHARS + 1})`,
+      error: sql<string | null>`left(${automationActionResults.error}, ${RUN_COMMAND_ERROR_PREVIEW_CHARS + 1})`,
+      message: automationActionResults.message,
+    })
+    .from(automationActionResults)
+    .innerJoin(devices, eq(devices.id, automationActionResults.deviceId))
+    .where(and(...conditions))
+    .orderBy(automationActionResults.actionIndex);
+
+  const byDevice = new Map<string, RunCommandResult[]>();
+
+  for (const row of rows) {
+    const output = takePreview(row.output, RUN_COMMAND_OUTPUT_PREVIEW_CHARS);
+    const error = takePreview(row.error, RUN_COMMAND_ERROR_PREVIEW_CHARS);
+    const list = byDevice.get(row.deviceId) ?? [];
+    list.push({
+      actionIndex: row.actionIndex,
+      status: row.status,
+      ...(output.text !== undefined ? { output: output.text } : {}),
+      ...(output.truncated ? { outputTruncated: true } : {}),
+      ...(error.text !== undefined ? { error: error.text } : {}),
+      ...(error.truncated ? { errorTruncated: true } : {}),
+      ...(row.message ? { message: row.message } : {}),
+    });
+    byDevice.set(row.deviceId, list);
+  }
+
+  return byDevice;
+}
+
 /**
  * Fetch the consolidated per-device breakdown for one run (#2023), joined to
  * `devices` for a display name. Shaped to the web `DeviceRunResult` contract:
  * status + start/complete timestamps + duration (ms) + output/error, plus the
- * per-device script executions the run queued (#3162). RLS on
+ * per-device script executions the run queued (#3162) and its execute_command
+ * action results (#3188). RLS on
  * automation_run_device_results (org_id = device's org) already scopes rows to
  * the caller's tenancy, so no extra org filter is needed here.
  */
 async function fetchRunDeviceResults(runId: string, auth: AuthContext, allowedSiteIds?: string[]) {
   const conditions: SQL[] = [eq(automationRunDeviceResults.runId, runId)];
   if (allowedSiteIds !== undefined) conditions.push(inArray(devices.siteId, allowedSiteIds));
-  const [rows, scriptExecutionsByDevice] = await Promise.all([
+  const [rows, scriptExecutionsByDevice, commandResultsByDevice] = await Promise.all([
     db
       .select({
         deviceId: automationRunDeviceResults.deviceId,
@@ -548,6 +656,7 @@ async function fetchRunDeviceResults(runId: string, auth: AuthContext, allowedSi
       .where(and(...conditions))
       .orderBy(desc(automationRunDeviceResults.startedAt)),
     fetchRunScriptExecutions(runId, auth, allowedSiteIds),
+    fetchRunCommandResults(runId, auth, allowedSiteIds),
   ]);
 
   return rows.map((row) => {
@@ -555,6 +664,7 @@ async function fetchRunDeviceResults(runId: string, auth: AuthContext, allowedSi
       ? new Date(row.completedAt).getTime() - new Date(row.startedAt).getTime()
       : undefined;
     const scriptResults = scriptExecutionsByDevice.get(row.deviceId);
+    const commandResults = commandResultsByDevice.get(row.deviceId);
     return {
       deviceId: row.deviceId,
       deviceName: row.displayName ?? row.hostname ?? row.deviceId,
@@ -565,6 +675,7 @@ async function fetchRunDeviceResults(runId: string, auth: AuthContext, allowedSi
       output: row.output ?? undefined,
       error: row.error ?? undefined,
       scriptResults: scriptResults && scriptResults.length > 0 ? scriptResults : undefined,
+      commandResults: commandResults && commandResults.length > 0 ? commandResults : undefined,
     };
   });
 }
@@ -926,7 +1037,7 @@ automationRoutes.post(
 
     // Site scope on top: a site-restricted user must not stop a run spanning
     // sibling sites.
-    const siteScopeDenied = await enforceAutomationSiteScope(c, automation);
+    const { denied: siteScopeDenied } = await enforceAutomationSiteScope(c, automation);
     if (siteScopeDenied) {
       return siteScopeDenied;
     }
@@ -1231,7 +1342,7 @@ automationRoutes.post(
       // Site-scope gate: a site-restricted creator must not own an automation
       // whose resolvable target set escapes their allowlist. This is the only
       // gate for unattended schedule/event triggers (no caller context later).
-      const siteScopeDenied = await enforceAutomationSiteScope(c, {
+      const { denied: siteScopeDenied } = await enforceAutomationSiteScope(c, {
         orgId: owner.orgId,
         partnerId: owner.partnerId,
         conditions: data.conditions,
@@ -1417,7 +1528,7 @@ async function handleUpdateAutomation(c: Context) {
     // Site-scope gate: re-validate the post-update target set against the
     // caller's allowlist. Covers conditions/trigger changes that would widen
     // the target set beyond a site-restricted editor's sites.
-    const siteScopeDenied = await enforceAutomationSiteScope(c, {
+    const { denied: siteScopeDenied } = await enforceAutomationSiteScope(c, {
       ...automation,
       conditions: data.conditions !== undefined ? data.conditions : automation.conditions,
       trigger: updates.trigger !== undefined ? updates.trigger : automation.trigger,
@@ -1569,7 +1680,81 @@ automationRoutes.delete(
 // Manual trigger routes (kept for standalone automations)
 // ============================================
 
+/**
+ * #7347 — `POST /:id/trigger` and `POST /:id/run` are registered in
+ * middleware/selfManagedDbContextRoutes.ts: they run with NO ambient request
+ * transaction. The run row is created and COMMITTED in one short
+ * withAuthDbAccessContext block, and only then is `execute-run` enqueued. The
+ * execute-run worker loads the run on its own connection, so under the request
+ * transaction a fast worker found no run and threw `Automation run not found`.
+ */
 async function triggerAutomationRun(
+  c: Context,
+  automationId: string,
+  triggeredBy: string,
+  details?: Record<string, unknown>,
+) {
+  const auth = c.get('auth');
+
+  const admitted = await withAuthDbAccessContext(auth, () =>
+    admitManualAutomationRun(c, automationId, triggeredBy, details),
+  );
+  if (admitted instanceof Response) return admitted;
+  const { automation, run, targetDeviceIds } = admitted;
+
+  try {
+    await enqueueAutomationRun(run.id, targetDeviceIds);
+  } catch (error) {
+    // The run has already committed `running`, and nothing reaps a run no job
+    // will ever execute: fail it here rather than leave it spinning forever.
+    console.error(`[automations] Failed to enqueue manually triggered run ${run.id}:`, error);
+    captureException(error, undefined, { runId: run.id, automationId: automation.id });
+    await withAuthDbAccessContext(auth, () =>
+      db
+        .update(automationRuns)
+        .set({ status: 'failed', completedAt: new Date() })
+        .where(and(eq(automationRuns.id, run.id), eq(automationRuns.status, 'running'))),
+    ).catch((cleanupError: unknown) => {
+      console.error(`[automations] Failed to mark unenqueued run ${run.id} failed:`, cleanupError);
+    });
+    writeRouteAudit(c, {
+      orgId: automation.orgId,
+      action: 'automation.trigger',
+      resourceType: 'automation',
+      resourceId: automation.id,
+      resourceName: automation.name,
+      details: { runId: run.id, devicesTargeted: targetDeviceIds.length, triggeredBy },
+      result: 'failure',
+    });
+    return c.json({ error: 'Failed to queue the automation run', runId: run.id }, 500);
+  }
+
+  writeRouteAudit(c, {
+    orgId: automation.orgId,
+    action: 'automation.trigger',
+    resourceType: 'automation',
+    resourceId: automation.id,
+    resourceName: automation.name,
+    details: {
+      runId: run.id,
+      devicesTargeted: targetDeviceIds.length,
+      triggeredBy,
+    },
+  });
+
+  return c.json({
+    message: 'Automation triggered',
+    run: {
+      id: run.id,
+      status: toRunStatus(run.status),
+      devicesTargeted: run.devicesTargeted,
+      startedAt: run.startedAt,
+    },
+  });
+}
+
+/** The admission half of triggerAutomationRun; runs inside its own committed context. */
+async function admitManualAutomationRun(
   c: Context,
   automationId: string,
   triggeredBy: string,
@@ -1609,7 +1794,7 @@ async function triggerAutomationRun(
   // Site-scope gate: re-validate the *current* resolved target set. Protects
   // against a target set that drifted (new devices/sites) since creation, and
   // against an automation created before the user's sites were restricted.
-  const siteScopeDenied = await enforceAutomationSiteScope(c, automation);
+  const { denied: siteScopeDenied, targetDeviceIds: siteScopedTargetDeviceIds } = await enforceAutomationSiteScope(c, automation);
   if (siteScopeDenied) {
     return siteScopeDenied;
   }
@@ -1618,32 +1803,17 @@ async function triggerAutomationRun(
     automation,
     triggeredBy,
     details,
+    // Reuse the target set the site-scope check above already resolved
+    // instead of letting createAutomationRunRecord re-resolve independently
+    // (TOCTOU — see enforceAutomationSiteScope's doc comment). `null` means
+    // the caller was unrestricted and no resolution happened above, so
+    // createAutomationRunRecord falls back to its own resolution as before;
+    // an empty array is a real (possibly zero-device) resolved result and is
+    // bound as-is.
+    ...(siteScopedTargetDeviceIds !== null ? { boundDeviceIds: siteScopedTargetDeviceIds } : {}),
   });
 
-  await enqueueAutomationRun(run.id, targetDeviceIds);
-
-  writeRouteAudit(c, {
-    orgId: automation.orgId,
-    action: 'automation.trigger',
-    resourceType: 'automation',
-    resourceId: automation.id,
-    resourceName: automation.name,
-    details: {
-      runId: run.id,
-      devicesTargeted: targetDeviceIds.length,
-      triggeredBy,
-    },
-  });
-
-  return c.json({
-    message: 'Automation triggered',
-    run: {
-      id: run.id,
-      status: toRunStatus(run.status),
-      devicesTargeted: run.devicesTargeted,
-      startedAt: run.startedAt,
-    },
-  });
+  return { automation, run, targetDeviceIds };
 }
 
 automationRoutes.post(

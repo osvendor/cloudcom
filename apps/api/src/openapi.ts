@@ -448,8 +448,77 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           model: { type: 'string', nullable: true },
           motherboardManufacturer: { type: 'string', nullable: true },
           motherboardProduct: { type: 'string', nullable: true },
-          motherboardVersion: { type: 'string', nullable: true }
+          motherboardVersion: { type: 'string', nullable: true },
+          memorySlotsTotal: { type: 'integer', nullable: true, description: 'Physical memory slots in system-memory arrays; null until reported' },
+          memoryMaxCapacityMb: { type: 'integer', nullable: true, description: 'Maximum supported memory (MiB)' },
+          memorySoldered: { type: 'boolean', nullable: true, description: 'true = on-package memory with no slot inventory (e.g. Apple Silicon)' },
+          memoryObservedAt: { type: 'string', format: 'date-time', nullable: true, description: 'When slot inventory was last reported; null = never (agent needs an update)' }
         }
+      },
+      DeviceMemoryModule: {
+        type: 'object',
+        description: 'One physical memory slot, populated or empty (#5351)',
+        properties: {
+          id: { type: 'string', format: 'uuid' },
+          slotKey: { type: 'string', description: 'Agent-computed stable slot identity' },
+          slotIndex: { type: 'integer', description: 'Order as reported by the agent' },
+          locator: { type: 'string', example: 'DIMM_A1' },
+          bankLabel: { type: 'string', nullable: true },
+          populated: { type: 'boolean' },
+          capacityMb: { type: 'integer', nullable: true },
+          memoryType: { type: 'string', nullable: true, example: 'DDR4' },
+          formFactor: { type: 'string', nullable: true, example: 'DIMM' },
+          speedMts: { type: 'integer', nullable: true, description: 'Rated speed (MT/s)' },
+          configuredSpeedMts: { type: 'integer', nullable: true, description: 'Configured speed (MT/s)' },
+          manufacturer: { type: 'string', nullable: true },
+          partNumber: { type: 'string', nullable: true },
+          serialNumber: { type: 'string', nullable: true },
+          updatedAt: { type: 'string', format: 'date-time' }
+        }
+      },
+      AgentMemoryReport: {
+        type: 'object',
+        description: 'Optional per-slot memory snapshot on the agent hardware report. Validated separately: an invalid block is ignored and the base hardware still saves; an absent block leaves stored memory untouched.',
+        required: ['modules'],
+        properties: {
+          slotsTotal: { type: 'integer', minimum: 0, maximum: 256, nullable: true },
+          maxCapacityMb: { type: 'integer', minimum: 0, nullable: true },
+          soldered: { type: 'boolean', nullable: true },
+          modules: {
+            type: 'array',
+            maxItems: 256,
+            description: 'One entry per slot, populated or not; slotKey must be unique',
+            items: {
+              type: 'object',
+              required: ['slotKey', 'locator', 'populated'],
+              properties: {
+                slotKey: { type: 'string', minLength: 1, maxLength: 160 },
+                locator: { type: 'string', minLength: 1, maxLength: 128 },
+                bankLabel: { type: 'string', maxLength: 128, nullable: true },
+                populated: { type: 'boolean' },
+                capacityMb: { type: 'integer', minimum: 0, nullable: true },
+                memoryType: { type: 'string', maxLength: 32, nullable: true },
+                formFactor: { type: 'string', maxLength: 32, nullable: true },
+                speedMts: { type: 'integer', minimum: 0, nullable: true },
+                configuredSpeedMts: { type: 'integer', minimum: 0, nullable: true },
+                manufacturer: { type: 'string', maxLength: 128, nullable: true },
+                partNumber: { type: 'string', maxLength: 128, nullable: true },
+                serialNumber: { type: 'string', maxLength: 128, nullable: true }
+              }
+            }
+          }
+        }
+      },
+      AgentHardwareReport: {
+        allOf: [
+          { $ref: '#/components/schemas/DeviceHardware' },
+          {
+            type: 'object',
+            properties: {
+              memory: { $ref: '#/components/schemas/AgentMemoryReport' }
+            }
+          }
+        ]
       },
       DeviceMetrics: {
         type: 'object',
@@ -1968,6 +2037,56 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
         }
       }
     },
+    '/users/{id}/org-access': {
+      post: {
+        operationId: 'updateUserOrgAccess',
+        tags: ['Users'],
+        summary: 'Change organization access',
+        description: 'Replace a partner user\'s organization access (all, selected organizations, or none). Partner scope only; requires users:invite, the same permission as the invite that first sets it.',
+        parameters: [{ $ref: '#/components/parameters/idParam' }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                properties: {
+                  orgAccess: { type: 'string', enum: ['all', 'selected', 'none'] },
+                  orgIds: {
+                    type: 'array',
+                    items: { type: 'string', format: 'uuid' },
+                    description: 'Required (non-empty) when orgAccess is selected; rejected otherwise'
+                  }
+                },
+                required: ['orgAccess'],
+                additionalProperties: false
+              }
+            }
+          }
+        },
+        responses: {
+          '200': {
+            description: 'Organization access updated (changed=false when the request matched the current access)',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    success: { type: 'boolean' },
+                    changed: { type: 'boolean' },
+                    orgAccess: { type: 'string', enum: ['all', 'selected', 'none'] },
+                    orgIds: { type: 'array', items: { type: 'string', format: 'uuid' }, nullable: true }
+                  }
+                }
+              }
+            }
+          },
+          '400': { $ref: '#/components/responses/BadRequest' },
+          '403': { $ref: '#/components/responses/Forbidden' },
+          '404': { $ref: '#/components/responses/NotFound' }
+        }
+      }
+    },
 
     // ============================================
     // ORGANIZATION ENDPOINTS
@@ -2514,6 +2633,133 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
         },
       },
     },
+    '/pre-assignment/devices': {
+      get: {
+        operationId: 'listParkedDevices',
+        tags: ['Devices'],
+        summary: 'List devices waiting for assignment',
+        description: 'Devices enrolled with a partner deploy key and parked in the partner\'s hidden holding area until assigned to a customer organization. Identity fields are reported by the device and are not verified. Requires partner or system scope, devices:write + organizations:write, an interactive user session (API keys and MCP tokens are refused), an MFA-assured session, and full partner org access (a partner user with access to all organizations, or system scope). System scope must name the partner with ?partnerId=; a partner caller acts on its own partner only.',
+        parameters: [{ name: 'partnerId', in: 'query', required: false, schema: { type: 'string', format: 'uuid' }, description: 'Required for system scope' }],
+        responses: {
+          '200': { description: 'Parked devices, the list of device-reported fields, and a verification notice' },
+          '400': { description: 'System scope without partnerId' },
+          '403': { description: 'Missing permission, non-interactive principal, non-assured session, or not a full partner admin' },
+        },
+      },
+    },
+    '/pre-assignment/devices/{id}/assign': {
+      post: {
+        operationId: 'assignParkedDevice',
+        tags: ['Devices'],
+        summary: 'Assign a parked device to an organization and site',
+        description: 'Moves one parked device into a customer organization and site in one transaction; the device starts counting toward licensed capacity here. Requires partner or system scope, devices:write + organizations:write, an interactive user session (API keys and MCP tokens are refused), an MFA-assured session, and full partner org access (a partner user with access to all organizations, or system scope). System scope must name the partner with ?partnerId=; a partner caller acts on its own partner only. While two-factor authentication is enabled, needs a single-use step-up grant for operation `parked_device_assign` bound to { deviceId, orgId, siteId }.',
+        parameters: [
+          { $ref: '#/components/parameters/idParam' },
+          { name: 'partnerId', in: 'query', required: false, schema: { type: 'string', format: 'uuid' }, description: 'Required for system scope' },
+        ],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['orgId', 'siteId', 'possessionConfirmed'],
+                properties: {
+                  orgId: { type: 'string', format: 'uuid' },
+                  siteId: { type: 'string', format: 'uuid' },
+                  stepUpGrant: { type: 'string', format: 'uuid' },
+                  possessionConfirmed: { type: 'boolean', enum: [true], description: 'The operator confirmed out of band that this machine belongs to this customer' },
+                  acceptIdentityCollision: { type: 'boolean' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': { description: 'Device assigned' },
+          '400': { description: 'Invalid destination organization or site' },
+          '403': { description: 'Gate refusal, or `STEP_UP_REQUIRED`' },
+          '404': { description: 'Parked device not found' },
+          '409': { description: 'Refused: `DEVICE_NOT_PARKED`, `DEVICE_NOT_ASSIGNABLE`, `DEVICE_PARKING_EXPIRED`, `DEVICE_IDENTITY_COLLISION`, `PARTNER_DEVICE_LIMIT_REACHED`, a move-engine refusal, or `ASSIGNMENT_BUSY` (a lost lock race; nothing was written; retry after the `Retry-After` seconds)' },
+        },
+      },
+    },
+    '/pre-assignment/devices/assign-bulk': {
+      post: {
+        operationId: 'assignParkedDevicesBulk',
+        tags: ['Devices'],
+        summary: 'Assign up to 50 parked devices',
+        description: 'Each device is assigned in its own transaction; results are per item, in request order. Requires partner or system scope, devices:write + organizations:write, an interactive user session (API keys and MCP tokens are refused), an MFA-assured session, and full partner org access (a partner user with access to all organizations, or system scope). System scope must name the partner with ?partnerId=; a partner caller acts on its own partner only. While two-factor authentication is enabled, one step-up grant for operation `parked_device_assign_bulk` covers exactly this batch.',
+        parameters: [{ name: 'partnerId', in: 'query', required: false, schema: { type: 'string', format: 'uuid' }, description: 'Required for system scope' }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['items', 'possessionConfirmed'],
+                properties: {
+                  items: {
+                    type: 'array',
+                    minItems: 1,
+                    maxItems: 50,
+                    items: {
+                      type: 'object',
+                      required: ['deviceId', 'orgId', 'siteId'],
+                      properties: {
+                        deviceId: { type: 'string', format: 'uuid' },
+                        orgId: { type: 'string', format: 'uuid' },
+                        siteId: { type: 'string', format: 'uuid' },
+                      },
+                    },
+                  },
+                  stepUpGrant: { type: 'string', format: 'uuid' },
+                  possessionConfirmed: { type: 'boolean', enum: [true] },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '200': { description: 'Per-item results ({ deviceId, ok, code? })' },
+          '403': { description: 'Gate refusal, or `STEP_UP_REQUIRED`' },
+        },
+      },
+    },
+    '/pre-assignment/switch': {
+      post: {
+        operationId: 'setPreAssignmentSwitch',
+        tags: ['Devices'],
+        summary: 'Turn deploy-key enrollment on or off for a partner',
+        description: 'Sets the partner\'s deploy-key enrollment switch (default off). Enrollment into the holding area also requires the platform switch PRE_ASSIGNMENT_ENROLLMENT_ENABLED. Turning it ON needs, while two-factor authentication is enabled, a single-use step-up grant for operation `pre_assignment_enable` bound to { partnerId, enabled: true }; turning it OFF needs none. Audited. Requires partner or system scope, devices:write + organizations:write, an interactive user session (API keys and MCP tokens are refused), an MFA-assured session, and full partner org access (a partner user with access to all organizations, or system scope). System scope must name the partner with ?partnerId=; a partner caller acts on its own partner only.',
+        parameters: [{ name: 'partnerId', in: 'query', required: false, schema: { type: 'string', format: 'uuid' }, description: 'Required for system scope' }],
+        requestBody: {
+          required: true,
+          content: { 'application/json': { schema: { type: 'object', required: ['enabled'], properties: { enabled: { type: 'boolean' }, stepUpGrant: { type: 'string', format: 'uuid', description: 'Required to turn it on while two-factor authentication is enabled' } } } } },
+        },
+        responses: {
+          '200': { description: '{ enabled, previous }' },
+          '403': { description: 'Gate refusal, or `STEP_UP_REQUIRED` when turning it on' },
+          '404': { description: 'Partner not found' },
+        },
+      },
+    },
+    '/pre-assignment/deploy-keys/{deployKeyId}/expire-devices': {
+      post: {
+        operationId: 'expireDevicesParkedByDeployKey',
+        tags: ['Devices'],
+        summary: 'Expire every device a deploy key parked',
+        description: 'Removes (decommissions, and queues the agent uninstall for) every device the holding-area ledger records as enrolled with this deploy key that is still parked. Devices already assigned are left alone. Audited. Requires partner or system scope, devices:write + organizations:write, an interactive user session (API keys and MCP tokens are refused), an MFA-assured session, and full partner org access (a partner user with access to all organizations, or system scope). System scope must name the partner with ?partnerId=; a partner caller acts on its own partner only.',
+        parameters: [
+          { name: 'deployKeyId', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+          { name: 'partnerId', in: 'query', required: false, schema: { type: 'string', format: 'uuid' }, description: 'Required for system scope' },
+        ],
+        responses: {
+          '200': { description: '{ matched, expired, skipped, failed }' },
+          '403': { description: 'Gate refusal' },
+        },
+      },
+    },
     '/devices/{id}/metrics': {
       get: {
         operationId: 'getDeviceMetrics',
@@ -2543,6 +2789,37 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
               }
             }
           }
+        }
+      }
+    },
+    '/devices/{id}/hardware': {
+      get: {
+        operationId: 'getDeviceHardware',
+        tags: ['Devices'],
+        summary: 'Get hardware inventory',
+        description: 'Get the hardware row (including the memory summary), disk drives, network adapters and per-slot memory modules ordered by slot',
+        parameters: [
+          { $ref: '#/components/parameters/idParam' }
+        ],
+        responses: {
+          '200': {
+            description: 'Hardware inventory',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    hardware: { allOf: [{ $ref: '#/components/schemas/DeviceHardware' }], nullable: true },
+                    diskDrives: { type: 'array', items: { type: 'object' } },
+                    networkInterfaces: { type: 'array', items: { type: 'object' } },
+                    memoryModules: { type: 'array', items: { $ref: '#/components/schemas/DeviceMemoryModule' } }
+                  }
+                }
+              }
+            }
+          },
+          '403': { description: 'Access to this site denied' },
+          '404': { description: 'Device not found' }
         }
       }
     },
@@ -4598,7 +4875,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           required: true,
           content: {
             'application/json': {
-              schema: { $ref: '#/components/schemas/DeviceHardware' }
+              schema: { $ref: '#/components/schemas/AgentHardwareReport' }
             }
           }
         },

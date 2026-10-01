@@ -51,6 +51,8 @@ import { deleteObjectKeys } from './ticketAttachmentStorage';
 import { getBlobStorage } from './artifacts/blobStorage';
 import { deleteObjects } from './s3Storage';
 import { releaseSendingDomainsForPartner } from './emailDomains/domainRelease';
+import { deleteOriginDeviceTopologyAlerts } from './siteOwnedAlerts';
+import { captureMessage } from './sentry';
 
 type StorageKeyRow = { storageKey: string | null };
 type CountRow = { count: number | string };
@@ -390,8 +392,22 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'backup_provider_devices',
   'backup_sla_configs',
   'backup_sla_events',
+  // Snapshot attestations: org_id denormalised from the device; every FK
+  // except organizations (snapshot, job, device) is ON DELETE CASCADE, so
+  // position is determinism, not correctness.
+  'backup_snapshot_attestations',
+  // Snapshot id ownership: org_id with device_id; every FK is CASCADE or SET
+  // NULL. Deleting a row tombstones its id (trigger), so erasure never frees
+  // an id for reuse.
+  'backup_snapshot_id_reservations',
   'backup_snapshot_retirements',
   'backup_snapshots',
+  // Multipart uploads of write-scoped storage sessions (FKs CASCADE).
+  'backup_storage_session_uploads',
+  // Brokered storage sessions: org_id denormalised from the executing device;
+  // every FK (command, both devices, snapshot, config) is ON DELETE CASCADE,
+  // so position is determinism, not correctness.
+  'backup_storage_sessions',
   'backup_verifications',
   'bare_metal_recoveries',
   'brain_device_context',
@@ -487,6 +503,9 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   // this (devices carries the FK to device_link_groups), so members are cleared
   // first and the group rows delete cleanly.
   'device_link_groups',
+  // #5351 — per-slot memory inventory. Composite FK (device_id, org_id) ->
+  // devices(id, org_id) ON DELETE CASCADE; leaf table, no children.
+  'device_memory_modules',
   'device_metrics',
   // device_mtls_certificates (Wave 5 Task 2, security remediation): composite
   // FK (device_id, org_id) -> devices(id, org_id) ON UPDATE CASCADE ON DELETE
@@ -504,6 +523,8 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'device_reliability_history',
   'device_sessions',
   'device_software_inventory_state',
+  'device_time_daily',
+  'device_time_status',
   'device_vulnerabilities',
   'device_warranty',
   'devices',
@@ -523,6 +544,14 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'escalation_policies',
   'event_delivery_receipts',
   'executive_summaries',
+  // AI Suggested Fixes W1: fix_memory is dual-owner (org_id XOR partner_id).
+  // Org rows cascade with the org; partner rows (org_id NULL) are untouched by
+  // an org erasure and are rebuilt by jobs/tenantErasure.ts afterwards. FKs out
+  // only (scripts/script_versions/playbooks CASCADE, users SET NULL).
+  'fix_memory',
+  // fix_outcomes: one row per attempt, leaf table (FKs out only, all with an
+  // explicit ON DELETE). Cascades after nothing that references it.
+  'fix_outcomes',
   // Fleet Designer W03 (#5653): apply ledger. report_run_id FK is ON DELETE
   // CASCADE (report_runs is pre-cleared above), org_id reached here too —
   // either order is a no-op for the other. Leaf table, no children.
@@ -704,6 +733,11 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'remediation_suggestions',
   'remote_sessions',
   'report_schedule_recipients',
+  // Multi-org report series W02: shape-1 target rows. FK to organizations is
+  // NO ACTION (organizations is last); its series_id parent (report_series) is
+  // partner-axis and outside this set. report_series itself goes with the
+  // partner sweep (partner_id column).
+  'report_series_org_targets',
   'reports',
   'restore_jobs',
   'roles',
@@ -865,6 +899,9 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'topology_config_templates',
   'topology_diagnostic_runs',
   'topology_diagnostic_steps',
+  // M3 interface samples: partitioned (raw/5m/1h -> daily leaves); the parent
+  // is registered once, leaves are runtime partitions (metric_rollups model).
+  'topology_interface_samples',
   'topology_interfaces',
   'topology_layout',
   'topology_layouts',
@@ -881,6 +918,8 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'topology_relationships',
   'topology_site_state',
   'topology_site_template_bindings',
+  'topology_telemetry_arms',
+  'topology_view_exclusions',
   'tunnel_allowlists',
   'tunnel_sessions',
   'unifi_clients',
@@ -1307,6 +1346,83 @@ export interface CascadeStats {
   durationMs: number;
   tablesDeleted: Record<string, number>;
   totalRowsDeleted: number;
+  /**
+   * Site-owned topology alerts OWNED BY ANOTHER ORG whose origin device was
+   * one of this org's devices (step 1c). Also counted under
+   * `tablesDeleted.alerts`; broken out because they are not this org's rows.
+   */
+  foreignTopologyAlertsDeleted: number;
+}
+
+export type TenantCascadeRefusalCode = 'LEGAL_HOLD_ACTIVE';
+
+/**
+ * Thrown by `cascadeDeleteOrg` when the erasure is refused before any row is
+ * deleted. Distinct from a mid-cascade failure (which throws a plain `Error`
+ * and is recorded as `tenant.erasure.failed`) so callers can tell "nothing
+ * happened, fix the precondition and retry" apart from "something broke
+ * partway through."
+ */
+export class TenantCascadeRefusalError extends Error {
+  constructor(
+    public readonly code: TenantCascadeRefusalCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'TenantCascadeRefusalError';
+  }
+}
+
+export const LEGAL_HOLD_ACTIVE_MESSAGE =
+  'This organization has one or more backup snapshots under legal hold. '
+  + 'Release the hold before erasing the organization.';
+
+/**
+ * True if any `backup_snapshots` row for this org still carries an active
+ * legal hold. Deliberately checks `legal_hold` ONLY — an immutability window
+ * (`is_immutable` / `immutable_until`) does not by itself block a full-tenant
+ * erasure; only an operator-placed hold does, and it must be released first.
+ */
+export async function hasActiveLegalHoldSnapshots(orgId: string): Promise<boolean> {
+  const result = await dbModule.withSystemDbAccessContext(() =>
+    dbModule.db.execute(sql`
+      SELECT id FROM backup_snapshots
+       WHERE org_id = ${orgId}::uuid
+         AND legal_hold = true
+       LIMIT 1
+    `),
+  );
+  return rowsFromExecute<{ id: string }>(result).length > 0;
+}
+
+/**
+ * `backup_snapshots`'s delete step in the main cascade walk (below).
+ *
+ * `hasActiveLegalHoldSnapshots` above is a check-then-act precondition run
+ * once, before the walk starts; the walk itself can run for minutes on a
+ * large tenant (each table is its own committed transaction), so a hold
+ * placed after that entry check but before this specific step would
+ * otherwise slip through. This closes that window by re-checking INSIDE the
+ * same transaction that performs the delete: `SELECT ... FOR UPDATE` locks
+ * every one of the org's snapshot rows first, which also blocks a concurrent
+ * "set legal hold" `UPDATE` on any of those same rows until this transaction
+ * commits or rolls back — so a hold cannot be inserted into the exact set of
+ * rows we are about to check and delete while we hold the lock.
+ */
+export async function deleteBackupSnapshotsCascadeStep(orgId: string): Promise<number> {
+  return dbModule.withSystemDbAccessContext(async () => {
+    const locked = await dbModule.db.execute(sql`
+      SELECT id, legal_hold FROM backup_snapshots
+       WHERE org_id = ${orgId}::uuid
+       FOR UPDATE
+    `);
+    const rows = rowsFromExecute<{ id: string; legal_hold: boolean }>(locked);
+    if (rows.some((row) => row.legal_hold === true)) {
+      throw new TenantCascadeRefusalError('LEGAL_HOLD_ACTIVE', LEGAL_HOLD_ACTIVE_MESSAGE);
+    }
+    const result = await deleteOrgRows('backup_snapshots', orgId);
+    return extractRowCount(result);
+  });
 }
 
 /**
@@ -1317,6 +1433,11 @@ export interface CascadeStats {
  * cascade itself will then drop the org's `audit_logs` rows; the
  * tenant.erasure event survives because it's written with org_id=NULL).
  *
+ * Refuses (before any row is deleted, and before the `tenant.erasure.started`
+ * audit row is even written) while any of the org's backup snapshots carry an
+ * active legal hold. The operator must release the hold(s) first; the refusal
+ * itself is audited so there's a forensic record of the attempt.
+ *
  * Idempotent: re-running on an already-erased org matches zero rows.
  */
 export async function cascadeDeleteOrg(
@@ -1324,6 +1445,29 @@ export async function cascadeDeleteOrg(
   performedBy: string,
   performedByEmail?: string,
 ): Promise<CascadeStats> {
+  if (await hasActiveLegalHoldSnapshots(orgId)) {
+    await createAuditLog({
+      orgId: null,
+      actorType: 'user',
+      actorId: performedBy,
+      actorEmail: performedByEmail,
+      action: 'tenant.erasure.refused_legal_hold',
+      resourceType: 'organization',
+      resourceId: orgId,
+      details: { reason: 'LEGAL_HOLD_ACTIVE' },
+      result: 'failure',
+      errorMessage: LEGAL_HOLD_ACTIVE_MESSAGE,
+    });
+    // A BullMQ job result of `{ skipped: true }` is a job SUCCESS, not a
+    // failure, so nothing else here would otherwise raise an alert — the
+    // audit row above is easy to miss unless someone goes looking for it.
+    captureMessage(
+      `[tenantCascade] erasure refused for org=${orgId}: active legal hold at entry`,
+      { eventCode: 'tenant_erasure_refused_legal_hold', level: 'warning', tags: { stage: 'entry' } },
+    );
+    throw new TenantCascadeRefusalError('LEGAL_HOLD_ACTIVE', LEGAL_HOLD_ACTIVE_MESSAGE);
+  }
+
   const startedAtMs = Date.now();
   const startedAt = new Date(startedAtMs).toISOString();
   const stats: CascadeStats = {
@@ -1333,6 +1477,7 @@ export async function cascadeDeleteOrg(
     durationMs: 0,
     tablesDeleted: {},
     totalRowsDeleted: 0,
+    foreignTopologyAlertsDeleted: 0,
   };
 
   // Write the tenant.erasure audit row FIRST so it survives the cascade.
@@ -1506,6 +1651,46 @@ export async function cascadeDeleteOrg(
     }
   }
 
+  // 1c. Site-owned topology alerts (M3-D6) whose ORIGIN device is one of this
+  //     org's devices but whose owning site is in ANOTHER org — the shape a
+  //     device move-org leaves behind (the ownership guard pins the alert's
+  //     org_id to its site; device_id stays NO ACTION → the moved device).
+  //     The walk deletes alerts by org_id only, so without this the `devices`
+  //     DELETE aborts with 23503 and the erasure never completes (PR #7117
+  //     re-review). A data-level cross-tenant edge the FK-on-delete ledger
+  //     cannot see. Same rule as a permanent device delete: the alert goes
+  //     with its origin device, with its NO ACTION children, in one
+  //     transaction. This org's OWN site-owned alerts are left to the walk.
+  try {
+    // withSystemDbAccessContext runs its callback in ONE transaction, so the
+    // children-then-alerts sequence is atomic.
+    const removed = await dbModule.withSystemDbAccessContext(() =>
+      deleteOriginDeviceTopologyAlerts(
+        dbModule.db,
+        sql`SELECT id FROM devices WHERE org_id = ${orgId}::uuid`,
+        { ownerOrgNot: orgId },
+      ),
+    );
+    if (removed > 0) {
+      stats.foreignTopologyAlertsDeleted = removed;
+      stats.tablesDeleted.alerts = (stats.tablesDeleted.alerts ?? 0) + removed;
+      stats.totalRowsDeleted += removed;
+      console.warn(
+        `[tenantCascade] org=${orgId}: deleted ${removed} site-owned topology alert(s) owned by another org `
+        + 'whose origin device is being erased',
+      );
+    }
+  } catch (err) {
+    if (!isUndefinedTable(err)) {
+      await writeErasureFailedAudit(orgId, performedBy, performedByEmail, 'alerts (foreign topology origin)', stats, err);
+      throw new Error(
+        `[tenantCascade] foreign site-owned topology alert delete failed for org=${orgId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
   // 2. Walk the cascade list in FK-safe order, each table in its OWN
   //    system-context transaction so a failure on one table aborts
   //    cleanly without poisoning the next statement.
@@ -1518,6 +1703,8 @@ export async function cascadeDeleteOrg(
             stats.totalRowsDeleted += deleted.versions;
             return deleted.catalogs;
           })
+        : table === 'backup_snapshots'
+        ? await deleteBackupSnapshotsCascadeStep(orgId)
         : await dbModule.withSystemDbAccessContext(async () => {
             const isAuditAdmin = AUDIT_ADMIN_REQUIRED_TABLES.has(table);
             if (isAuditAdmin) {
@@ -1534,6 +1721,41 @@ export async function cascadeDeleteOrg(
       stats.tablesDeleted[table] = (stats.tablesDeleted[table] ?? 0) + count;
       stats.totalRowsDeleted += count;
     } catch (err) {
+      // A precondition refusal (the `backup_snapshots` re-check above found a
+      // hold that appeared mid-walk) is not a failure — it's the same
+      // "nothing happened, fix the precondition and retry" outcome as the
+      // entry-point check in `cascadeDeleteOrg` above, just discovered later.
+      // Audit and alert it under its own action/event code, with the
+      // progress made so far, and re-throw UNCHANGED so the caller's
+      // `err instanceof TenantCascadeRefusalError` check (tenantErasure.ts)
+      // still recognizes it as a skip rather than a generic job failure.
+      if (err instanceof TenantCascadeRefusalError) {
+        try {
+          await createAuditLog({
+            orgId: null,
+            actorType: 'user',
+            actorId: performedBy,
+            actorEmail: performedByEmail,
+            action: 'tenant.erasure.refused_legal_hold',
+            resourceType: 'organization',
+            resourceId: orgId,
+            details: {
+              reason: err.code,
+              tablesDeleted: stats.tablesDeleted,
+              totalRowsDeleted: stats.totalRowsDeleted,
+            },
+            result: 'failure',
+            errorMessage: err.message,
+          });
+        } catch (auditErr) {
+          console.warn('[tenantCascade] refused-legal-hold audit write failed:', auditErr);
+        }
+        captureMessage(
+          `[tenantCascade] erasure refused for org=${orgId}: active legal hold appeared mid-cascade`,
+          { eventCode: 'tenant_erasure_refused_legal_hold', level: 'warning', tags: { stage: 'mid_cascade' } },
+        );
+        throw err;
+      }
       // A single table failure aborts the WALK. It does NOT roll the erasure
       // back: each table above deletes inside its own
       // `withSystemDbAccessContext` transaction, so every table already
@@ -1572,6 +1794,9 @@ export async function cascadeDeleteOrg(
       durationMs: stats.durationMs,
       totalRowsDeleted: stats.totalRowsDeleted,
       tablesDeleted: stats.tablesDeleted,
+      ...(stats.foreignTopologyAlertsDeleted > 0
+        ? { foreignTopologyAlertsDeleted: stats.foreignTopologyAlertsDeleted }
+        : {}),
     },
     result: 'success',
   });

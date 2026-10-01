@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { and, eq, inArray, isNull, or } from 'drizzle-orm';
 import { HTTPException } from 'hono/http-exception';
 import { nanoid } from 'nanoid';
+import { isPgUniqueViolation } from '../utils/pgErrors';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { users, userPasskeys, partnerUsers, organizationUsers, roles, organizations, partners, ticketPushPreferences } from '../db/schema';
 import { authMiddleware, requireMfa, requirePermission } from '../middleware/auth';
@@ -30,6 +31,7 @@ import {
   getScopeContext,
   getScopedRole,
   validateAssignableRole,
+  assertCanManageTarget,
   type ScopeContext,
 } from '../services/roleAssignment';
 import { createAuditLogAsync } from '../services/auditService';
@@ -150,6 +152,61 @@ const assignRoleSchema = z.object({
   roleId: z.string().guid()
 });
 
+// POST /users/:id/org-access (#7034). Full replacement of a partner member's
+// organization reach. .strict() so a smuggled roleId/name is a 400.
+const updateOrgAccessSchema = z.object({
+  orgAccess: z.enum(['all', 'selected', 'none']),
+  orgIds: z.array(z.string().guid()).optional()
+}).strict();
+
+type PartnerOrgAccess = 'all' | 'selected' | 'none';
+
+/**
+ * Shape rules for a partner membership's organization reach, shared by
+ * POST /users/invite and POST /users/:id/org-access. Returns the value to
+ * persist (org_ids deduplicated for 'selected', NULL otherwise) or the 400
+ * message.
+ */
+function normalizePartnerOrgAccess(
+  orgAccess: PartnerOrgAccess,
+  orgIds: string[] | undefined
+): { ok: true; orgAccess: PartnerOrgAccess; orgIds: string[] | null } | { ok: false; error: string } {
+  const ids = orgIds ?? [];
+  if (orgAccess === 'selected' && ids.length === 0) {
+    return { ok: false, error: 'orgIds required when orgAccess is selected' };
+  }
+  if (orgAccess !== 'selected' && ids.length > 0) {
+    return { ok: false, error: 'orgIds can only be provided when orgAccess is selected' };
+  }
+  return { ok: true, orgAccess, orgIds: orgAccess === 'selected' ? [...new Set(ids)] : null };
+}
+
+/**
+ * Write-time ownership check on a 'selected' org list. The ids are persisted
+ * verbatim into partner_users.org_ids and become the member's organization
+ * allowlist, so every one of them must be an organization of the CALLER's
+ * partner. Downstream access resolution re-scopes by partner, but a foreign id
+ * must never be stored in the first place (defense in depth + data integrity).
+ * Absent and foreign ids get the same answer so the probe is not a
+ * cross-partner existence oracle.
+ *
+ * Reach: this SELECT runs under the caller's own request DB context, so RLS
+ * (`breeze_has_org_access(id)`) bounds it to the orgs the caller can see — for
+ * the full-access partner member the router gate above requires, that is every
+ * active/trial, non-deleted org of the partner. A suspended or soft-deleted
+ * in-partner org is therefore refused too. Deliberate: a caller cannot grant a
+ * member an org the caller cannot see, and the failure mode is fail-closed. Do
+ * NOT lift this probe into a system context to "fix" that.
+ */
+async function allOrgsOwnedByPartner(partnerId: string, orgIds: string[]): Promise<boolean> {
+  const ownedOrgs = await db
+    .select({ id: organizations.id })
+    .from(organizations)
+    .where(and(eq(organizations.partnerId, partnerId), inArray(organizations.id, orgIds)));
+  const owned = new Set(ownedOrgs.map((o) => o.id));
+  return orgIds.every((id) => owned.has(id));
+}
+
 async function getScopedUser(userId: string, scopeContext: ScopeContext) {
   if (scopeContext.scope === 'partner') {
     const [record] = await db
@@ -160,6 +217,7 @@ async function getScopedUser(userId: string, scopeContext: ScopeContext) {
         status: users.status,
         roleId: roles.id,
         roleName: roles.name,
+        roleIsSystem: roles.isSystem,
         orgAccess: partnerUsers.orgAccess,
         orgIds: partnerUsers.orgIds
       })
@@ -180,6 +238,7 @@ async function getScopedUser(userId: string, scopeContext: ScopeContext) {
       status: users.status,
       roleId: roles.id,
       roleName: roles.name,
+      roleIsSystem: roles.isSystem,
       siteIds: organizationUsers.siteIds,
       deviceGroupIds: organizationUsers.deviceGroupIds
     })
@@ -190,6 +249,37 @@ async function getScopedUser(userId: string, scopeContext: ScopeContext) {
     .limit(1);
 
   return record || null;
+}
+
+/**
+ * The target's CURRENT membership in the caller's own tenant — role and (org
+ * scope) site allowlist — for the rank + scope check on member-management
+ * mutations. Reads only the membership row and its role, never `users`: a
+ * member's `users` row is homed in one org, and an org-scoped RLS context
+ * hides it when that home is another org, even though the member is this
+ * org's to manage through this org's membership row.
+ */
+async function getScopedMembership(
+  userId: string,
+  scopeContext: ScopeContext
+): Promise<{ roleId: string; roleIsSystem: boolean; siteIds?: string[] | null } | null> {
+  if (scopeContext.scope === 'partner') {
+    const [row] = await db
+      .select({ roleId: roles.id, roleIsSystem: roles.isSystem })
+      .from(partnerUsers)
+      .innerJoin(roles, eq(partnerUsers.roleId, roles.id))
+      .where(and(eq(partnerUsers.partnerId, scopeContext.partnerId), eq(partnerUsers.userId, userId)))
+      .limit(1);
+    return row ?? null;
+  }
+
+  const [row] = await db
+    .select({ roleId: roles.id, roleIsSystem: roles.isSystem, siteIds: organizationUsers.siteIds })
+    .from(organizationUsers)
+    .innerJoin(roles, eq(organizationUsers.roleId, roles.id))
+    .where(and(eq(organizationUsers.orgId, scopeContext.orgId), eq(organizationUsers.userId, userId)))
+    .limit(1);
+  return row ?? null;
 }
 
 function resolveAuditOrgId(auth: { orgId: string | null }, scopeContext: ScopeContext): string | null {
@@ -1286,17 +1376,11 @@ userRoutes.post(
     const scopeContext = getScopeContext(auth);
     const data = c.req.valid('json');
 
-    if (scopeContext.scope === 'partner') {
-      const orgAccess = data.orgAccess ?? 'none';
-      const orgIds = data.orgIds ?? [];
-
-      if (orgAccess === 'selected' && orgIds.length === 0) {
-        return c.json({ error: 'orgIds required when orgAccess is selected' }, 400);
-      }
-
-      if (orgAccess !== 'selected' && orgIds.length > 0) {
-        return c.json({ error: 'orgIds can only be provided when orgAccess is selected' }, 400);
-      }
+    const partnerOrgAccess = scopeContext.scope === 'partner'
+      ? normalizePartnerOrgAccess(data.orgAccess ?? 'none', data.orgIds)
+      : null;
+    if (partnerOrgAccess && !partnerOrgAccess.ok) {
+      return c.json({ error: partnerOrgAccess.error }, 400);
     }
 
     if (scopeContext.scope === 'organization' && data.orgAccess) {
@@ -1312,32 +1396,15 @@ userRoutes.post(
       return c.json({ error: rolePermissionError }, 403);
     }
 
-    // Write-time ownership check on a 'selected' org list. The ids are
-    // persisted verbatim into partner_users.org_ids and become the invitee's
-    // organization allowlist, so every one of them must be an organization of
-    // the CALLER's partner. Downstream access resolution re-scopes by partner,
-    // but a foreign id must never be stored in the first place (defense in
-    // depth + data integrity). Absent and foreign ids get the same answer so
-    // the probe is not a cross-partner existence oracle.
-    //
-    // Reach: this SELECT runs under the caller's own request DB context, so
-    // RLS (`breeze_has_org_access(id)`) bounds it to the orgs the caller can
-    // see — for the full-access partner member the router gate above requires,
-    // that is every active/trial, non-deleted org of the partner. A suspended
-    // or soft-deleted in-partner org is therefore refused too. Deliberate:
-    // an inviter cannot grant an invitee an org the inviter cannot see, and
-    // the failure mode is fail-closed. Do NOT lift this probe into a system
-    // context to "fix" that.
-    if (scopeContext.scope === 'partner' && (data.orgAccess ?? 'none') === 'selected') {
-      const requestedOrgIds = [...new Set(data.orgIds ?? [])];
-      const ownedOrgs = await db
-        .select({ id: organizations.id })
-        .from(organizations)
-        .where(and(eq(organizations.partnerId, scopeContext.partnerId), inArray(organizations.id, requestedOrgIds)));
-      const owned = new Set(ownedOrgs.map((o) => o.id));
-      if (requestedOrgIds.some((id) => !owned.has(id))) {
-        return c.json({ error: 'One or more organizations are not part of your partner' }, 403);
-      }
+    // Every 'selected' org must belong to the caller's partner — see
+    // allOrgsOwnedByPartner for the reach and fail-closed rationale.
+    if (
+      scopeContext.scope === 'partner' &&
+      partnerOrgAccess?.ok &&
+      partnerOrgAccess.orgIds &&
+      !(await allOrgsOwnedByPartner(scopeContext.partnerId, partnerOrgAccess.orgIds))
+    ) {
+      return c.json({ error: 'One or more organizations are not part of your partner' }, 403);
     }
 
     const normalizedEmail = data.email.toLowerCase();
@@ -1361,7 +1428,45 @@ userRoutes.post(
       await resetAllFactorsAndInvalidate(tombstone.id, 'invite-resurrect', { onlyIfTombstone: true });
     }
 
-    const result = await db.transaction(async (tx) => {
+    // An invite for an email another tenant already holds answers exactly like
+    // an invite for an unused email.
+    //
+    // `tombstone` above already told us whether this email is visible to the
+    // CALLER's own tenant (the ambient RLS context hides a foreign row). If it
+    // is not visible there, resolve — under a narrowly scoped SYSTEM probe —
+    // whether the address is nonetheless claimed by a DIFFERENT tenant. Do
+    // this BEFORE the insert: `users.email` is globally UNIQUE, so attempting
+    // the insert for a foreign hit would 23505. Never insert for that case (no
+    // cross-tenant "invited" row is created), and answer with the exact same
+    // 201 success envelope a new invite returns, so the caller sees two
+    // outcomes: 201 unused-or-foreign / 409 in-tenant (which the caller can
+    // already see via their own tenant).
+    const emailClaimedElsewhere = !tombstone && await runOutsideDbContext(() =>
+      withSystemDbAccessContext(async () => {
+        const [row] = await db
+          .select({ id: users.id })
+          .from(users)
+          .where(eq(users.email, normalizedEmail))
+          .limit(1);
+        return !!row;
+      })
+    );
+
+    if (emailClaimedElsewhere) {
+      return c.json(
+        {
+          id: nanoid(24),
+          email: normalizedEmail,
+          name: data.name,
+          status: 'invited',
+          roleId: data.roleId,
+          inviteEmailSent: false,
+        },
+        201
+      );
+    }
+
+    const runInviteTransaction = () => db.transaction(async (tx) => {
       // The membership row is the authoritative live site ceiling. Lock and
       // re-read it inside the SAME transaction that creates the invitee link:
       // a request snapshot alone would let a concurrent scope reduction race
@@ -1465,17 +1570,14 @@ userRoutes.post(
           return { user, linkCreated: false, delegatedSiteIds };
         }
 
-        const orgAccess = data.orgAccess ?? 'none';
-        const orgIds = orgAccess === 'selected' ? [...new Set(data.orgIds ?? [])] : null;
-
         const [link] = await tx
           .insert(partnerUsers)
           .values({
             partnerId: scopeContext.partnerId,
             userId: user.id,
             roleId: data.roleId,
-            orgAccess,
-            orgIds
+            orgAccess: partnerOrgAccess?.ok ? partnerOrgAccess.orgAccess : 'none',
+            orgIds: partnerOrgAccess?.ok ? partnerOrgAccess.orgIds : null
           })
           .returning();
 
@@ -1505,6 +1607,30 @@ userRoutes.post(
 
       return { user, linkCreated: true, link, delegatedSiteIds };
     });
+
+    let result: Awaited<ReturnType<typeof runInviteTransaction>>;
+    try {
+      result = await runInviteTransaction();
+    } catch (err) {
+      // Belt to the pre-check above: a concurrent invite from a foreign
+      // tenant for the SAME email can still win the race between the probe
+      // and this INSERT. Map that 23505 to the identical no-signal 201
+      // envelope instead of letting it fall through to a distinguishing 500.
+      if (isPgUniqueViolation(err, 'users_email_unique')) {
+        return c.json(
+          {
+            id: nanoid(24),
+            email: normalizedEmail,
+            name: data.name,
+            status: 'invited',
+            roleId: data.roleId,
+            inviteEmailSent: false,
+          },
+          201
+        );
+      }
+      throw err;
+    }
 
     if (!result.linkCreated) {
       return jsonError(c, 409, ERROR_CODES.CONFLICT, 'User already exists in this scope');
@@ -1833,6 +1959,56 @@ async function removeMembershipForScope(
   });
 }
 
+/**
+ * Change a user's role on their membership in the caller's tenant, advance
+ * their auth epoch and durably revoke their refresh families — in one
+ * SYSTEM-scoped transaction, the same shape as removeMembershipForScope.
+ *
+ * Without the epoch bump a role change (including a downgrade meant to end
+ * privileged access) would leave any live MCP OAuth bearer minted under the
+ * prior role authenticatable — the epoch is what `assertLiveOAuthUser` checks
+ * at admission time.
+ *
+ * System scope is required because neither side-effect row is reachable from
+ * the caller's request context: the target's `users` row is hidden when their
+ * home org is another org, and `refresh_token_families` is visible only to
+ * its own user or to system scope. Tenant safety comes from the explicit
+ * membership WHERE clause, pinned to the caller's own partner/org, and the
+ * epoch/family writes only run when that membership update matched.
+ */
+async function assignMembershipRoleForScope(
+  scopeContext: ScopeContext,
+  userId: string,
+  roleId: string
+): Promise<{ updated: boolean }> {
+  return runOutsideDbContext(() =>
+    withSystemDbAccessContext(() =>
+      db.transaction(async (tx) => {
+        const rows =
+          scopeContext.scope === 'partner'
+            ? await tx
+                .update(partnerUsers)
+                .set({ roleId })
+                .where(and(eq(partnerUsers.partnerId, scopeContext.partnerId), eq(partnerUsers.userId, userId)))
+                .returning({ id: partnerUsers.id })
+            : await tx
+                .update(organizationUsers)
+                .set({ roleId })
+                .where(and(eq(organizationUsers.orgId, scopeContext.orgId), eq(organizationUsers.userId, userId)))
+                .returning({ id: organizationUsers.id });
+
+        if (rows.length === 0) {
+          return { updated: false };
+        }
+
+        await advanceUserEpochs(tx, userId, { auth: true });
+        await revokeAllRefreshFamilies(tx, userId, 'role-changed');
+        return { updated: true };
+      })
+    )
+  );
+}
+
 userRoutes.delete(
   '/:id',
   requirePermission(PERMISSIONS.USERS_DELETE.resource, PERMISSIONS.USERS_DELETE.action),
@@ -1841,6 +2017,22 @@ userRoutes.delete(
     const auth = c.get('auth');
     const scopeContext = getScopeContext(auth);
     const userId = c.req.param('id')!;
+
+    // Rank + scope check against the target's CURRENT membership, before any
+    // deletion side effect. Without this, a lower-ranked or site-restricted
+    // admin could remove a higher-ranked or out-of-reach admin.
+    const targetForDelete = await getScopedMembership(userId, scopeContext);
+    if (!targetForDelete) {
+      return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'User not found');
+    }
+    const deleteManageError = await assertCanManageTarget(c, auth, scopeContext, {
+      roleId: targetForDelete.roleId,
+      isSystem: targetForDelete.roleIsSystem,
+      siteIds: targetForDelete.siteIds,
+    });
+    if (deleteManageError) {
+      return c.json({ error: deleteManageError }, 403);
+    }
 
     if (scopeContext.scope === 'partner') {
       const { deleted } = await removeMembershipForScope(scopeContext, userId);
@@ -1925,6 +2117,17 @@ userRoutes.post(
       return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'User not found');
     }
 
+    // Rank + scope check: a lower-ranked or site-restricted admin must not be
+    // able to strip a higher-ranked or out-of-reach admin's second factor.
+    const mfaResetManageError = await assertCanManageTarget(c, auth, scopeContext, {
+      roleId: record.roleId,
+      isSystem: record.roleIsSystem,
+      siteIds: 'siteIds' in record ? record.siteIds : undefined,
+    });
+    if (mfaResetManageError) {
+      return c.json({ error: mfaResetManageError }, 403);
+    }
+
     // RMM-QA-166 (D6): the gate is the factor INVENTORY, not `users.mfa_enabled`.
     // userIsMfaProtected = mfa_enabled OR a live user_passkeys row — the same
     // predicate every enrollment gate uses. A passkey-only leftover (enabled
@@ -1996,6 +2199,24 @@ userRoutes.post(
       return c.json({ error: 'Self role assignment is not allowed' }, 403);
     }
 
+    // Rank + scope check against the target's CURRENT role, before checking
+    // whether the NEW role is one the caller may assign. Without this, a
+    // lower-ranked or site-restricted admin could promote/demote a
+    // higher-ranked or out-of-reach admin as long as the new role itself was
+    // within their own ceiling.
+    const targetForRoleAssign = await getScopedMembership(userId, scopeContext);
+    if (!targetForRoleAssign) {
+      return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'User not found');
+    }
+    const roleAssignManageError = await assertCanManageTarget(c, auth, scopeContext, {
+      roleId: targetForRoleAssign.roleId,
+      isSystem: targetForRoleAssign.roleIsSystem,
+      siteIds: targetForRoleAssign.siteIds,
+    });
+    if (roleAssignManageError) {
+      return c.json({ error: roleAssignManageError }, 403);
+    }
+
     const role = await getScopedRole(roleId, scopeContext);
     if (!role) {
       return c.json({ error: 'Invalid role for this scope' }, 400);
@@ -2006,13 +2227,9 @@ userRoutes.post(
     }
 
     if (scopeContext.scope === 'partner') {
-      const updated = await db
-        .update(partnerUsers)
-        .set({ roleId })
-        .where(and(eq(partnerUsers.partnerId, scopeContext.partnerId), eq(partnerUsers.userId, userId)))
-        .returning({ id: partnerUsers.id });
+      const { updated } = await assignMembershipRoleForScope(scopeContext, userId, roleId);
 
-      if (updated.length === 0) {
+      if (!updated) {
         return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'User not found');
       }
 
@@ -2025,19 +2242,18 @@ userRoutes.post(
           scope: 'partner'
         }
       });
-      await clearPermissionCache(userId);
-      await terminateRemoteSessionsAfterRoleChange(userId);
+      // Post-commit cleanup: Redis token cutoff, permission-cache clear, and
+      // OAuth-artifact revocation (the bearer path the epoch bump alone does
+      // not reach out-of-band).
+      await runPostCommitCleanup(userId);
+      await terminateRemoteSessionsAfterAccessChange(userId);
 
       return c.json({ success: true });
     }
 
-    const updated = await db
-      .update(organizationUsers)
-      .set({ roleId })
-      .where(and(eq(organizationUsers.orgId, scopeContext.orgId), eq(organizationUsers.userId, userId)))
-      .returning({ id: organizationUsers.id });
+    const { updated } = await assignMembershipRoleForScope(scopeContext, userId, roleId);
 
-    if (updated.length === 0) {
+    if (!updated) {
       return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'User not found');
     }
 
@@ -2050,36 +2266,130 @@ userRoutes.post(
         scope: 'organization'
       }
     });
-    await clearPermissionCache(userId);
-    await terminateRemoteSessionsAfterRoleChange(userId);
+    await runPostCommitCleanup(userId);
+    await terminateRemoteSessionsAfterAccessChange(userId);
 
     return c.json({ success: true });
   }
 );
 
+// Change a partner member's organization reach after the invite (#7034).
+//
+// Gated exactly like the invite that first sets it: USERS_INVITE + MFA, the
+// router-level full-access partner gate, and the same shape + ownership rules
+// (normalizePartnerOrgAccess / allOrgsOwnedByPartner). Two extra guards that
+// have no invite-time equivalent because the member already exists:
+//  - self is refused, like POST /:id/role;
+//  - the target's CURRENT role must be one the caller could assign
+//    (validateAssignableRole) — an invite can only ever set org access for a
+//    role inside the caller's ceiling, so neither can this.
+// The partner_users UPDATE of org_access/org_ids bumps permissions_epoch by
+// trigger (breeze_partner_users_permissions_epoch), exactly as a role change.
+userRoutes.post(
+  '/:id/org-access',
+  requirePermission(PERMISSIONS.USERS_INVITE.resource, PERMISSIONS.USERS_INVITE.action),
+  requireMfa(),
+  zValidator('json', updateOrgAccessSchema),
+  async (c) => {
+    const auth = c.get('auth');
+    const scopeContext = getScopeContext(auth);
+    const userId = c.req.param('id')!;
+    const data = c.req.valid('json');
+
+    if (scopeContext.scope !== 'partner') {
+      return c.json({ error: 'orgAccess is only valid for partner scope' }, 400);
+    }
+
+    if (userId === auth.user.id) {
+      return c.json({ error: 'Changing your own organization access is not allowed' }, 403);
+    }
+
+    const next = normalizePartnerOrgAccess(data.orgAccess, data.orgIds);
+    if (!next.ok) {
+      return c.json({ error: next.error }, 400);
+    }
+
+    const record = await getScopedUser(userId, scopeContext);
+    if (!record || !('orgAccess' in record)) {
+      return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'User not found');
+    }
+
+    const targetRole = await getScopedRole(record.roleId, scopeContext);
+    const targetRoleError = targetRole
+      ? await validateAssignableRole(c, auth, targetRole)
+      : 'Cannot resolve the user\'s role for this scope';
+    if (targetRoleError) {
+      return c.json({ error: targetRoleError }, 403);
+    }
+
+    if (next.orgIds && !(await allOrgsOwnedByPartner(scopeContext.partnerId, next.orgIds))) {
+      return c.json({ error: 'One or more organizations are not part of your partner' }, 403);
+    }
+
+    const previousOrgIds = record.orgIds ?? null;
+    const sameIds =
+      (previousOrgIds === null && next.orgIds === null) ||
+      (previousOrgIds !== null &&
+        next.orgIds !== null &&
+        previousOrgIds.length === next.orgIds.length &&
+        next.orgIds.every((id) => previousOrgIds.includes(id)));
+    if (record.orgAccess === next.orgAccess && sameIds) {
+      return c.json({ success: true, changed: false, orgAccess: next.orgAccess, orgIds: next.orgIds });
+    }
+
+    const updated = await db
+      .update(partnerUsers)
+      .set({ orgAccess: next.orgAccess, orgIds: next.orgIds })
+      .where(and(eq(partnerUsers.partnerId, scopeContext.partnerId), eq(partnerUsers.userId, userId)))
+      .returning({ id: partnerUsers.id });
+
+    if (updated.length === 0) {
+      return jsonError(c, 404, ERROR_CODES.NOT_FOUND, 'User not found');
+    }
+
+    writeUserAudit(c, auth, scopeContext, {
+      action: 'user.org_access.update',
+      resourceId: userId,
+      resourceName: record.name,
+      details: {
+        scope: 'partner',
+        previousOrgAccess: record.orgAccess,
+        previousOrgIds,
+        orgAccess: next.orgAccess,
+        orgIds: next.orgIds
+      }
+    });
+    await clearPermissionCache(userId);
+    await terminateRemoteSessionsAfterAccessChange(userId);
+
+    return c.json({ success: true, changed: true, orgAccess: next.orgAccess, orgIds: next.orgIds });
+  }
+);
+
 /**
- * Belt for a role change, matching the one in `removeMembershipForScope`.
+ * Belt for a role or organization-access change, matching the one in
+ * `removeMembershipForScope`.
  *
  * The `organization_users` / `partner_users` UPDATE already advances the
  * target's `permissions_epoch` by trigger, so the next revocation-lease renew
  * (within ~25s) ends any live remote session. Ending it immediately closes that
- * window: a role change is often exactly the moment somebody's remote-control
- * rights were meant to stop.
+ * window: a role or org-access change is often exactly the moment somebody's
+ * remote-control rights were meant to stop.
  *
  * Best-effort by design — a teardown failure is logged (and reported to Sentry
- * inside the service) but never fails the role assignment, which has already
+ * inside the service) but never fails the change, which has already
  * committed.
  */
-async function terminateRemoteSessionsAfterRoleChange(userId: string): Promise<void> {
+async function terminateRemoteSessionsAfterAccessChange(userId: string): Promise<void> {
   try {
     const torn = await terminateUserRemoteSessions(userId);
     if (torn === TEARDOWN_FAILED) {
       console.error(
-        `[users] Remote-session teardown FAILED after role change for user ${userId}; ` +
+        `[users] Remote-session teardown FAILED after access change for user ${userId}; ` +
         'the permissions-epoch recheck remains the only cutoff.'
       );
     }
   } catch (err) {
-    console.error(`[users] Remote-session teardown threw after role change for user ${userId}:`, err);
+    console.error(`[users] Remote-session teardown threw after access change for user ${userId}:`, err);
   }
 }

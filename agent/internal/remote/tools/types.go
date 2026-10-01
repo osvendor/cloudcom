@@ -70,6 +70,11 @@ const (
 	// sends this.
 	CmdHomebrewBootstrap = "homebrew_bootstrap"
 
+	// Time synchronization management (Windows).
+	CmdTimeResync      = "time_resync"
+	CmdTimeSetTimezone = "time_set_timezone"
+	CmdTimeApplyPolicy = "time_apply_policy"
+
 	// Boot performance
 	CmdCollectBootPerformance    = "collect_boot_performance"
 	CmdManageStartupItem         = "manage_startup_item"
@@ -153,6 +158,9 @@ const (
 
 	// SNMP polling
 	CmdSnmpPoll = "snmp_poll"
+	// Server-armed IF-MIB interface state/counter poll (topology M3). The payload
+	// names the exact ifIndex→interface bindings; the result is an if_metrics envelope.
+	CmdTopologyInterfacePoll = "topology_interface_poll"
 
 	// Network monitoring
 	CmdNetworkDiagnostic       = "network_diagnostic"
@@ -190,6 +198,7 @@ const (
 	CmdHardwareProfile     = "hardware_profile"
 	CmdVMRestoreFromBackup = "vm_restore_from_backup"
 	CmdVMRestoreEstimate   = "vm_restore_estimate"
+	CmdVMInstantBoot       = "vm_instant_boot"
 	CmdBMRRecover          = "bmr_recover"
 	// CmdBareMetalRebuild (W05a) runs the rebuild engine on a Linux host
 	// against a server-minted recovery token (payload: recoveryId, token,

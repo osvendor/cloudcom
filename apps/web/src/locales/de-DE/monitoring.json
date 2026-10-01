@@ -97,7 +97,8 @@
       "create": "Monitor erstellen",
       "test": "Auf einem Gerät testen",
       "deploy": "Bereitstellen für…",
-      "delete": "Löschen"
+      "delete": "Löschen",
+      "backToMonitors": "Zurück zu Monitoren"
     },
     "errors": {
       "load": "Monitor konnte nicht geladen werden",
@@ -154,12 +155,20 @@
     },
     "composite": {
       "children": "Teilbedingungen",
-      "add": "Bedingung hinzufügen"
+      "add": "Bedingung hinzufügen",
+      "matchLabel": "Übereinstimmung"
     },
     "restart": {
       "label": "Dienst auf dem Gerät neu starten",
       "maxAttempts": "Maximale Neustartversuche",
       "cooldownSeconds": "Neustartwartezeit (Sekunden)"
+    },
+    "networkCheckAsset": {
+      "label": "Gerät",
+      "unbound": "Keine Asset-Bindung",
+      "failed": "Assets konnten nicht geladen werden",
+      "orgRequired": "Wählen Sie eine Organisation als Eigentümer, um ein Asset zu binden.",
+      "pingName": "Ping für {{label}}"
     }
   },
   "kinds": {
@@ -182,7 +191,8 @@
     "backup_continuity": "Backup-Kontinuität",
     "script": "Skriptprüfung",
     "network_check": "Netzwerkprüfung",
-    "hardware_health": "Hardwarezustand"
+    "hardware_health": "Hardwarezustand",
+    "time_sync": "Zeitsynchronisierung"
   },
   "fields": {
     "operator": "Vergleich",
@@ -223,7 +233,18 @@
     "port": "Portnummer",
     "expectStatus": "Erwarteter Statuscode",
     "pollingIntervalSeconds": "Abfrage alle (Sekunden)",
-    "match": "Übereinstimmung"
+    "match": "Übereinstimmung",
+    "pingCount": "Echo-Anfragen",
+    "expectBanner": "Erwartetes Banner",
+    "httpMethod": "HTTP-Methode",
+    "expectedBody": "Antwort muss enthalten",
+    "followRedirects": "Weiterleitungen folgen",
+    "verifySsl": "TLS-Zertifikat prüfen",
+    "recordType": "Eintragstyp",
+    "expectedValue": "Erwarteter Wert",
+    "nameserver": "DNS-Server",
+    "degradedIsFailure": "Beeinträchtigt als Ausfall werten",
+    "maxResponseMs": "Fehler bei Antwort langsamer als (ms)"
   },
   "operators": {
     "gt": "größer als",
@@ -279,7 +300,8 @@
   },
   "backupChecks": {
     "no_successful_backup": "Kein erfolgreiches Backup",
-    "consecutive_failures": "Aufeinanderfolgende Fehlschläge"
+    "consecutive_failures": "Aufeinanderfolgende Fehlschläge",
+    "completed_with_errors": "Mit Dateifehlern abgeschlossen"
   },
   "checkTypes": {
     "icmp_ping": "ICMP-Ping",
@@ -348,6 +370,7 @@
     "convert": "In Monitor umwandeln",
     "converted": "Umgewandelt",
     "notConvertible": "Die Bedingungen dieser Regel können nicht als einzelner Monitor ausgedrückt werden.",
+    "systemManaged": "Systemverwaltete Regel. Breeze löst diesen Alarm selbst aus, daher gibt es nichts zu konvertieren.",
     "errors": {
       "fetch": "Alarmregeln konnten nicht geladen werden",
       "convert": "Regel konnte nicht umgewandelt werden"
@@ -420,9 +443,9 @@
       "review": "Prüfen",
       "convertEverything": "Alles konvertieren…",
       "confirmTitle": "Alle Altregeln, Überwachungen und alarmausgelösten Automatisierungen in allen Ihren Richtlinien konvertieren?",
-      "confirmBody": "{{rows}} in {{policies}} des gesamten Partners. Konvertierte Zeilen werden stillgelegt. Nicht konvertierbare Zeilen bleiben in W05c zur Prüfung oder manuellen Stilllegung; W05d konvertiert Reste und legt nicht konvertierbare still.",
+      "confirmBody": "{{rows}} in {{policies}} des gesamten Partners. Konvertierte Zeilen werden stillgelegt. Nicht konvertierbare Zeilen bleiben jetzt zur Prüfung oder manuellen Stilllegung; eine künftige Version konvertiert Reste und legt nicht konvertierbare still.",
       "confirmRun": "Alles konvertieren",
-      "convertedAll": "{{converted}} Zeilen in {{policies}} Richtlinien konvertiert; {{unconvertible}} nicht konvertierbar.",
+      "convertedAll": "{{rows}} in {{policies}} konvertiert; {{unconvertible}} nicht konvertierbar.",
       "errors": {
         "convertAll": "Konvertierung aller Einträge fehlgeschlagen"
       }
@@ -493,7 +516,7 @@
       "empty": "Kein Konvertierungsverlauf.",
       "system": "Automatisches System",
       "reverted": "Rückgängig gemacht",
-      "deadline": "Rückgängig ist nach Entfernung der Quelllaufzeit durch W05d nicht verfügbar."
+      "deadline": "Rückgängig ist nach Entfernung der Quelllaufzeit durch die Stilllegung der Legacy-Benachrichtigungen nicht verfügbar."
     },
     "errorCodes": {
       "preview_stale": "Die Richtlinie wurde seit dieser Vorschau geändert. Erstellen Sie vor der Konvertierung erneut eine Vorschau.",
@@ -509,6 +532,46 @@
       "conversion_revert_unavailable": "Diese Konvertierung kann nicht mehr rückgängig gemacht werden.",
       "invalid_reason": "Dieser Stilllegungsgrund ist ungültig.",
       "unknown": "Die Konvertierung ist fehlgeschlagen. Versuchen Sie es erneut."
+    },
+    "retirement": {
+      "summary_one": "{{count}} alte Regel konnte nicht in einen Monitor umgewandelt werden – bitte prüfen.",
+      "summary_other": "{{count}} alte Regeln konnten nicht in Monitore umgewandelt werden – bitte prüfen.",
+      "review": "Prüfen",
+      "dismiss": "Ausblenden",
+      "openAlertsNote": "Diese Regeln lösen nicht mehr aus. Ihre offenen Warnungen bleiben offen, bis jemand sie löst; legen Sie die Bedingung bei Bedarf als Monitor neu an.",
+      "reasons": {
+        "custom_condition": "benutzerdefinierte Bedingung",
+        "nested_group": "verschachtelte Bedingungsgruppe",
+        "no_condition": "keine auswertbare Bedingung",
+        "equivalence_delta": "Umwandlung würde ändern, was auf einigen Geräten auslöst",
+        "escalation_policy_axis": "Eskalationsrichtlinie gehört zu einer einzelnen Organisation",
+        "parent_unconverted": "übergeordnete Richtlinie wurde nicht umgewandelt",
+        "policy_inactive": "Richtlinie ist inaktiv oder archiviert",
+        "prerequisite_missing": "auf diesem Server fehlt eine vorausgesetzte Korrektur",
+        "metric_without_kind": "für die Metrik gibt es keinen Monitortyp",
+        "child_kind_not_composable": "Bedingung ist nicht für zusammengesetzte Monitore geeignet",
+        "too_many_conditions": "zu viele Bedingungen",
+        "too_many_responses": "mehr als zehn Reaktionen wären erforderlich",
+        "auto_resolve_conditions": "benutzerdefinierte Auflösungsbedingungen können nicht beibehalten werden",
+        "target_unconvertible": "das Reaktionsziel kann nicht konvertiert werden",
+        "already_managed": "wird bereits von einem Monitor verwaltet",
+        "no_org": "Prüfung gehört zu keiner Organisation",
+        "asset_missing": "das verknüpfte erkannte Asset existiert nicht mehr",
+        "condition_invalid": "Prüfungseinstellungen ergeben keine gültige Monitorbedingung",
+        "no_active_rules": "Prüfung hat keine aktive Alarmregel",
+        "multiple_network_rules": "Prüfung hat mehr als eine aktive Alarmregel",
+        "network_predicate_unsupported": "Alarmbedingung hat keine Entsprechung bei Monitoren",
+        "network_threshold_out_of_range": "Fehlerschwelle liegt außerhalb des zulässigen Bereichs (höchstens 100 aufeinanderfolgende Fehler)",
+        "site_binding_unrepresentable": "standortgebundene Prüfung ist mit keinem erkannten Asset verknüpft",
+        "config_override_unrepresentable": "benutzerdefiniertes Ziel oder Zeitlimit kann nicht übernommen werden",
+        "built_in": "integrierte Systemregel; sie alarmiert weiterhin selbstständig",
+        "no_rules": "Vorlage hat keine zu konvertierenden Regeln",
+        "target_or_owner": "Ziel oder Besitzer einer Regel weicht von ihrer Vorlage ab",
+        "blocked": "Konvertierung ist blockiert",
+        "disabled_response_automation": "Reaktionsautomatisierung ist deaktiviert",
+        "alert_workflow_kept": "Alarm-Workflow bleibt unverändert",
+        "unknown": "Konvertierung abgelehnt; Quelle prüfen"
+      }
     }
   },
   "device": {
@@ -541,7 +604,41 @@
           "warning": "Warnung",
           "critical": "Kritisch"
         }
+      },
+      "time_sync": {
+        "findings": "Befunde",
+        "consecutiveSnapshots": "Aufeinanderfolgende Momentaufnahmen",
+        "findingOptions": {
+          "pdc_no_external_source": "Der PDC der Gesamtstruktur-Stammdomäne hat keine externe Quelle",
+          "source_local_clock": "Lokale Uhr wird verwendet",
+          "dc_vm_host_sync": "Domänencontroller synchronisiert mit dem VM-Host",
+          "ntp_server_unresolvable": "NTP-Servername ist ungültig oder nicht auflösbar",
+          "ntp_peer_unreachable": "NTP-Gegenstelle ist nicht erreichbar",
+          "domain_source_unavailable": "Domänenzeitquelle nicht verfügbar",
+          "member_not_on_hierarchy": "Domänenhierarchie wird nicht verwendet",
+          "sync_disabled": "Zeitsynchronisierung ist deaktiviert",
+          "sync_stale": "Keine aktuelle erfolgreiche Synchronisierung",
+          "correction_refused": "Zeitkorrektur wurde abgelehnt",
+          "timezone_mismatch": "Zeitzone weicht von der erwarteten Zeitzone ab",
+          "policy_not_applied": "Zeitrichtlinie wurde nicht angewendet",
+          "policy_conflict_gpo": "Gruppenrichtlinie steuert die Zeiteinstellungen"
+        }
       }
     }
+  },
+  "httpMethods": {
+    "GET": "GET (abrufen)",
+    "HEAD": "HEAD (nur Kopfzeilen)",
+    "POST": "POST (senden)",
+    "PUT": "PUT (ersetzen)",
+    "OPTIONS": "OPTIONS (Funktionen)"
+  },
+  "dnsRecordTypes": {
+    "A": "A (IPv4-Adresse)",
+    "AAAA": "AAAA (IPv6-Adresse)",
+    "MX": "MX (Mailserver)",
+    "CNAME": "CNAME (Aliasname)",
+    "TXT": "TXT (Texteintrag)",
+    "NS": "NS (DNS-Server)"
   }
 }

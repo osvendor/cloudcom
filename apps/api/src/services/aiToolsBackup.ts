@@ -6,7 +6,7 @@
  * Each tool wraps existing DB schema with org-scoped isolation.
  */
 
-import { db } from '../db';
+import { db, runOutsideDbContext, withDbAccessContext } from '../db';
 import {
   backupConfigs,
   backupJobs,
@@ -25,12 +25,16 @@ import type { AiTool } from './aiTools';
 import { CommandTypes } from './commandQueue';
 import { aiQueueCommandForExecution } from './aiDispatch';
 import { resolveBackupProviderConfig, resolveBackupDestinationError } from './backupProviderConfig';
+import { backupReadCredentialPayload } from './backupCommandCredentials';
 import { createManualBackupJobIfIdle } from './backupJobCreation';
 import { enqueueBackupDispatch } from '../jobs/backupEnqueue';
 import { deviceScopeCondition, deviceSiteDenied, resolveSiteAllowedDeviceIds } from './aiToolsSiteScope';
 import { loadSnapshotWithSiteAccess } from './aiToolsBackupShared';
+import { authorizeAiRestore } from './aiToolsRestoreAuthorization';
 import { backupJobHistoryOrderBy, latestBackupRunOrderBy } from './backupJobOrdering';
+import { resolveSelectedSnapshotPaths, selectedSnapshotPathError } from './backupSelectedPaths';
 import { inArray } from 'drizzle-orm';
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 
 type BackupHandler = (input: Record<string, unknown>, auth: AuthContext) => Promise<string>;
 
@@ -156,7 +160,7 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
           },
           status: {
             type: 'string',
-            enum: ['pending', 'running', 'completed', 'failed', 'cancelled', 'partial'],
+            enum: ['pending', 'running', 'completed', 'completed_with_errors', 'failed', 'cancelled', 'partial'],
             description: 'Filter jobs by status',
           },
           deviceId: { type: 'string', description: 'Filter by device UUID' },
@@ -209,6 +213,11 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
         if (jobDeviceCond) conditions.push(jobDeviceCond);
 
         const orgId = getOrgId(auth);
+        // Fail closed: a site-restricted caller whose org never
+        // resolves must not fall through to an unfiltered query.
+        if ((auth.allowedSiteIds || auth.allowedDeviceIds) && !orgId) {
+          return JSON.stringify({ jobs: [], showing: 0 });
+        }
         if ((auth.allowedSiteIds || auth.allowedDeviceIds) && orgId) {
           const allowed = await resolveSiteAllowedDeviceIds(orgId, auth);
           if (!allowed || allowed.length === 0) {
@@ -327,7 +336,7 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
         const deviceId = input.deviceId as string;
 
         // Verify device access
-        const deviceConditions: SQL[] = [eq(devices.id, deviceId)];
+        const deviceConditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
         const dc = orgWhere(auth, devices.orgId);
         if (dc) deviceConditions.push(dc);
         const [device] = await db.select({ id: devices.id, siteId: devices.siteId }).from(devices)
@@ -405,6 +414,7 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
         pending: sql<number>`count(*) filter (where ${backupJobs.status} = 'pending')`,
         running: sql<number>`count(*) filter (where ${backupJobs.status} = 'running')`,
         completed: sql<number>`count(*) filter (where ${backupJobs.status} = 'completed')`,
+        completedWithErrors: sql<number>`count(*) filter (where ${backupJobs.status} = 'completed_with_errors')`,
         failed: sql<number>`count(*) filter (where ${backupJobs.status} = 'failed')`,
         cancelled: sql<number>`count(*) filter (where ${backupJobs.status} = 'cancelled')`,
         partial: sql<number>`count(*) filter (where ${backupJobs.status} = 'partial')`,
@@ -462,7 +472,7 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
       if (!deviceId) return JSON.stringify({ error: 'deviceId is required' });
 
       // Verify device access
-      const deviceConditions: SQL[] = [eq(devices.id, deviceId)];
+      const deviceConditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
       const dc = orgWhere(auth, devices.orgId);
       if (dc) deviceConditions.push(dc);
       const [device] = await db.select({ id: devices.id, hostname: devices.hostname, siteId: devices.siteId })
@@ -533,7 +543,7 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
       if (!deviceId || !configId) return JSON.stringify({ error: 'deviceId and configId are required' });
 
       // Verify device access
-      const deviceConditions: SQL[] = [eq(devices.id, deviceId)];
+      const deviceConditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
       const dc = orgWhere(auth, devices.orgId);
       if (dc) deviceConditions.push(dc);
       const [device] = await db.select({ id: devices.id, orgId: devices.orgId, status: devices.status, siteId: devices.siteId }).from(devices)
@@ -557,12 +567,23 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
         .limit(1);
       if (!config || config.orgId !== orgId) return JSON.stringify({ error: 'Backup config not found or access denied' });
 
-      const result = await createManualBackupJobIfIdle({
-        orgId,
-        configId,
-        featureLinkId: null,
-        deviceId,
-      });
+      // #6597: create the row in its OWN transaction that commits before the
+      // dispatch is enqueued below. Escaping the ambient context does not close
+      // the tool's outer transaction; it opens a short one scoped to the
+      // device's org (already verified above), which the backup worker can see
+      // the moment it picks the dispatch up. Created in the ambient
+      // transaction, the row was invisible to the worker until the tool call
+      // finished, and the job was stranded `pending` until the stale reaper
+      // failed it with "Backup dispatch never completed".
+      const result = await runOutsideDbContext(() => withDbAccessContext(
+        { scope: 'organization', orgId, accessibleOrgIds: [orgId] },
+        () => createManualBackupJobIfIdle({
+          orgId,
+          configId,
+          featureLinkId: null,
+          deviceId,
+        }),
+      ));
 
       if (!result) {
         return JSON.stringify({ error: 'Failed to create backup job' });
@@ -633,7 +654,7 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
       if (!snapshotId || !deviceId) return JSON.stringify({ error: 'snapshotId and deviceId are required' });
 
       // Verify device access
-      const deviceConditions: SQL[] = [eq(devices.id, deviceId)];
+      const deviceConditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
       const dc = orgWhere(auth, devices.orgId);
       if (dc) deviceConditions.push(dc);
       const [device] = await db.select({ id: devices.id, orgId: devices.orgId, siteId: devices.siteId }).from(devices)
@@ -655,11 +676,18 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
       if (snapshot.orgId !== orgId) {
         return JSON.stringify({ error: 'Snapshot and target device must belong to the same organization' });
       }
+      // Same resilience check as the route: a restore onto a device at a
+      // different site than the backup source needs backup:cross_site_restore.
+      const restoreAuthorization = await authorizeAiRestore(auth, { snapshot, targetDeviceId: deviceId });
+      if (!restoreAuthorization.ok) {
+        return JSON.stringify({ error: restoreAuthorization.error, ...(restoreAuthorization.code ? { code: restoreAuthorization.code } : {}) });
+      }
 
       // Determine restore type based on selectedPaths
       const selectedPaths = Array.isArray(input.selectedPaths) ? input.selectedPaths as string[] : undefined;
       const restoreType = selectedPaths && selectedPaths.length > 0 ? 'selective' : 'full';
 
+      let resolvedSelectedPaths: string[] = [];
       if (restoreType === 'selective') {
         const snapshotFiles = await db
           .select({ sourcePath: backupSnapshotFiles.sourcePath })
@@ -670,18 +698,23 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ error: 'Selective restore is unavailable for snapshots without indexed files' });
         }
 
-        const availablePaths = new Set(snapshotFiles.map((row) => row.sourcePath));
-        const invalidPath = selectedPaths?.find((path) => !availablePaths.has(path));
-        if (invalidPath) {
-          return JSON.stringify({ error: `Selected path is not available in this snapshot: ${invalidPath}` });
+        // Map each selection (possibly in the browse tree's forward-slash
+        // form) back to the stored original the agent matches against.
+        const resolution = resolveSelectedSnapshotPaths(
+          selectedPaths ?? [],
+          snapshotFiles.map((row) => row.sourcePath)
+        );
+        if (!resolution.ok) {
+          return JSON.stringify({ error: selectedSnapshotPathError(resolution) });
         }
+        resolvedSelectedPaths = resolution.paths;
       }
 
       const deviceOrgCond = orgWhere(auth, devices.orgId);
       const [targetDevice] = await db
         .select({ id: devices.id, status: devices.status })
         .from(devices)
-        .where(and(eq(devices.id, deviceId), ...(deviceOrgCond ? [deviceOrgCond] : [])))
+        .where(and(eq(devices.id, deviceId), notParkedDeviceCondition(), ...(deviceOrgCond ? [deviceOrgCond] : [])))
         .limit(1);
       if (!targetDevice) return JSON.stringify({ error: 'Target device not found or access denied' });
       if (targetDevice.status !== 'online') {
@@ -710,7 +743,7 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
         deviceId,
         restoreType,
         targetPath: (input.targetPath as string) ?? null,
-        selectedPaths: selectedPaths ?? [],
+        selectedPaths: resolvedSelectedPaths,
         status: 'pending',
         initiatedBy: auth.user?.id ?? null,
         createdAt: new Date(),
@@ -729,9 +762,9 @@ export function registerBackupTools(aiTools: Map<string, AiTool>): void {
             restoreJobId: restoreJob.id,
             snapshotId: snapshot.providerSnapshotId,
             targetPath: restoreJob.targetPath ?? '',
-            selectedPaths: restoreType === 'selective' ? (selectedPaths ?? []) : [],
-            provider: backupProviderConfig.provider,
-            providerConfig: backupProviderConfig.providerConfig,
+            selectedPaths: resolvedSelectedPaths,
+            // A reference only: resolved when the command is delivered.
+            ...backupReadCredentialPayload(snapshot.configId!, orgId, backupProviderConfig.provider),
           },
           { userId: auth.user?.id ?? undefined }
         );

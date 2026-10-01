@@ -77,6 +77,10 @@ type HealthChecker struct {
 	// the file alone is what restart-stormed and stranded a fleet install on
 	// 2026-07-24 (#2763). The freshest of (file, sync) wins.
 	lastSyncedHeartbeat time.Time
+	// lastSyncedAuthRejected is the freshest AuthRejectedAt received over IPC
+	// (state_sync). Same file-or-sync corroboration as lastSyncedHeartbeat —
+	// see AgentAuthRejectedAlive.
+	lastSyncedAuthRejected time.Time
 
 	// ipcProbeInterval sizes the state_sync recency window used by
 	// vetoIPCFailureForBackup (D3). Defaults to defaultIPCProbeInterval;
@@ -99,6 +103,9 @@ type HealthChecker struct {
 	// IPC/heartbeat channel is alive right now, not that some past
 	// heartbeat was fresh.
 	lastStateSyncAt time.Time
+	// resumedAt is when the system last resumed from sleep (#6762). See
+	// NoteResume.
+	resumedAt time.Time
 }
 
 // NewHealthChecker constructs a HealthChecker.
@@ -221,6 +228,29 @@ func (h *HealthChecker) NoteStateSync(lastHeartbeat time.Time, activeBackupRuns 
 	h.lastStateSyncAt = time.Now()
 }
 
+// NoteResume records that the system resumed from sleep at `at` (#6762; the
+// Windows watchdog service calls it on PBT_APMRESUME* power events). Heartbeat
+// timestamps are wall-clock, so the whole sleep interval counts toward
+// staleThreshold: without this, the first heartbeat tick after any sleep
+// longer than the threshold judges a healthy agent stale, and on a Modern
+// Standby laptop each short maintenance wake spends one IPC veto until the
+// third wake restarts the agent. After a resume the agent gets one full
+// staleThreshold, measured from the resume, to produce a fresh heartbeat (see
+// CheckHeartbeatStaleness). It is a grace, not liveness evidence: AgentAlive
+// ignores it. Never regresses, so a late out-of-order delivery cannot shorten
+// the grace.
+func (h *HealthChecker) NoteResume(at time.Time) {
+	if at.After(h.resumedAt) {
+		h.resumedAt = at
+	}
+}
+
+// inResumeGrace reports whether the system resumed from sleep within
+// staleThreshold.
+func (h *HealthChecker) inResumeGrace() bool {
+	return !h.resumedAt.IsZero() && time.Since(h.resumedAt) <= h.staleThreshold
+}
+
 // LastKnownHeartbeat returns the freshest heartbeat timestamp known from any
 // source: the on-disk agent.state or the IPC state_sync channel. Zero if
 // neither has ever produced one.
@@ -230,6 +260,52 @@ func (h *HealthChecker) LastKnownHeartbeat(s *state.AgentState) time.Time {
 		hb = s.LastHeartbeat
 	}
 	return hb
+}
+
+// NoteAuthRejected records an agent-reported auth-rejection liveness
+// timestamp delivered over IPC (state_sync). Never regresses.
+func (h *HealthChecker) NoteAuthRejected(t time.Time) {
+	if t.After(h.lastSyncedAuthRejected) {
+		h.lastSyncedAuthRejected = t
+	}
+}
+
+// LastKnownAuthRejected returns the freshest auth-rejection liveness
+// timestamp from either the on-disk agent.state or IPC state_sync.
+func (h *HealthChecker) LastKnownAuthRejected(s *state.AgentState) time.Time {
+	t := h.lastSyncedAuthRejected
+	if s != nil && s.AuthRejectedAt.After(t) {
+		t = s.AuthRejectedAt
+	}
+	return t
+}
+
+// AgentAuthRejectedAlive reports whether the agent is demonstrably running
+// but locked out by the server (#2796): its heartbeat loop has written an
+// auth-rejected marker within staleThreshold.
+//
+// The marker is written from the heartbeat loop itself on every 401/403 and
+// every auth-dead backoff tick, so a wedged loop stops refreshing it and falls
+// back to the ordinary staleness path. That is what lets this hold be
+// unbounded where the IPC-ping veto is not. (A successful heartbeat clears the
+// on-disk marker, and a heartbeat only goes stale after the same threshold, so
+// a fresh marker is always newer than a stale heartbeat.)
+func (h *HealthChecker) AgentAuthRejectedAlive(s *state.AgentState) bool {
+	rejected := h.LastKnownAuthRejected(s)
+	return !rejected.IsZero() && time.Since(rejected) <= h.staleThreshold
+}
+
+// AgentAlive reports whether there is fresh evidence that the agent process
+// is running its heartbeat loop: a heartbeat within staleThreshold, or a
+// fresh auth-rejected marker (AgentAuthRejectedAlive). Used for the FAILOVER
+// self-recovery exit, the STANDBY "agent still here" check and restart
+// verification — none of which a restart could improve on for an agent whose
+// only problem is rejected credentials.
+func (h *HealthChecker) AgentAlive(s *state.AgentState) bool {
+	if hb := h.LastKnownHeartbeat(s); !hb.IsZero() && time.Since(hb) <= h.staleThreshold {
+		return true
+	}
+	return h.AgentAuthRejectedAlive(s)
 }
 
 // CheckHeartbeatStaleness returns CheckOK if the freshest known heartbeat
@@ -242,6 +318,14 @@ func (h *HealthChecker) LastKnownHeartbeat(s *state.AgentState) time.Time {
 // (AV/EDR on ProgramData), not a dead agent.
 func (h *HealthChecker) CheckHeartbeatStaleness(s *state.AgentState) string {
 	hb := h.LastKnownHeartbeat(s)
+	if hb.IsZero() {
+		// No successful heartbeat yet. An auth-rejected marker still proves
+		// the agent got past startup and ran its heartbeat loop (#2796), so
+		// it takes the heartbeat's place as the staleness reference —
+		// otherwise a loop that wedged after being rejected would sit in the
+		// startup grace below forever.
+		hb = h.LastKnownAuthRejected(s)
+	}
 	if s == nil && hb.IsZero() {
 		return CheckHeartbeatStale
 	}
@@ -252,10 +336,14 @@ func (h *HealthChecker) CheckHeartbeatStaleness(s *state.AgentState) string {
 		h.staleVetoCount = 0
 		return CheckOK
 	}
-	if time.Since(hb) > h.staleThreshold {
+	// A heartbeat that aged past the threshold while the system slept is not
+	// a missed heartbeat: within staleThreshold of a resume, measure from the
+	// resume instead (NoteResume).
+	if time.Since(hb) > h.staleThreshold && !h.inResumeGrace() {
 		return CheckHeartbeatStale
 	}
-	// A fresh heartbeat re-arms the stale-veto budget.
+	// A fresh heartbeat (or a resume) re-arms the stale-veto budget, so vetoes
+	// spent during earlier wakes cannot fast-track this one to a restart.
 	h.staleVetoCount = 0
 	return CheckOK
 }
@@ -304,6 +392,12 @@ const (
 	StaleRestart
 	// StaleVetoed — stale but IPC says alive: journal only, no restart.
 	StaleVetoed
+	// StaleAuthRejected — stale, but the agent is alive and the server is
+	// rejecting its credentials (#2796). No restart and no veto budget spent:
+	// a restart cannot repair a rejected credential, and it would reset the
+	// agent's in-memory auth backoff. Holds for as long as the marker stays
+	// fresh.
+	StaleAuthRejected
 )
 
 // EvaluateStaleHeartbeat is the complete heartbeat-ticker decision:
@@ -317,6 +411,10 @@ const (
 func (h *HealthChecker) EvaluateStaleHeartbeat(s *state.AgentState, ipcConnected bool) (StaleHeartbeatDecision, int) {
 	if h.CheckHeartbeatStaleness(s) != CheckHeartbeatStale {
 		return HeartbeatOK, 0
+	}
+	if h.AgentAuthRejectedAlive(s) {
+		h.staleVetoCount = 0
+		return StaleAuthRejected, 0
 	}
 	vetoesBefore := h.staleVetoCount
 	if h.ShouldRestartOnStaleHeartbeat(ipcConnected) {

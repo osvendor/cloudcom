@@ -7,13 +7,15 @@ import { AI_AGENT_RUN_STATUSES } from '@breeze/shared';
  * from the AI model.
  */
 
+import { fleetTimeFiltersSchema } from './timeSync/fleetFilters';
 import { z } from 'zod';
 import { isIP } from 'node:net';
-import { ACTOR_TYPES, AI_AGENT_KINDS, INVOICE_STATUSES, currencyCodeSchema, monitorKindSchema } from '@breeze/shared';
+import { ACTOR_TYPES, AI_AGENT_KINDS, INVOICE_STATUSES, QUOTE_ACCEPT_ON_BEHALF_METHODS, currencyCodeSchema, monitorKindSchema } from '@breeze/shared';
 import {
   backupProfileSelectionsSchema,
   proposeScriptInputSchema,
   ringAutoApproveSchema,
+  scriptVerificationClaimSchema,
   JOURNAL_VACUUM_MAX_BYTES,
   JOURNAL_VACUUM_MIN_BYTES,
   SYSTEM_CLEANUP_ACTION_IDS,
@@ -22,6 +24,7 @@ import { aiRunContextInputShape } from './scriptRunRequest';
 import { keysetZodShape, pageZodShape } from './aiToolPagination';
 import { fleetToolInputSchemas } from './aiToolSchemasFleet';
 import { backupToolSchemas } from './aiToolSchemasBackup';
+import { topologyToolSchemas } from './aiToolSchemasTopology';
 import { m365ToolSchemas } from './aiToolSchemasM365';
 import {
   peripheralDeviceClassEnum,
@@ -30,6 +33,7 @@ import {
   peripheralEventTypeEnum
 } from '../db/schema/peripheralControl';
 import { CONFIG_FEATURE_TYPES } from './configFeatureTypes';
+import { aiPathRefusal } from './aiPathRestriction';
 import { CONTACT_ROLES } from './contacts/types';
 
 // Reusable validators
@@ -44,58 +48,14 @@ const ipAddress = z.string().trim().max(45).refine(
   { message: 'Invalid IP address format' }
 );
 
-// Path traversal defense
-const BLOCKED_PATH_PREFIXES = [
-  '/etc/shadow', '/etc/passwd', '/etc/sudoers',
-  '/proc', '/sys', '/dev',
-  '/root/.ssh', '/home/*/.ssh',
-  '/var/run', '/var/lib/docker',
-  'C:\\Windows\\System32\\config',
-  'C:\\Windows\\SAM',
-  'C:\\Users\\*\\AppData',
-];
+// Default AI path restriction: one chokepoint for every AI-supplied device
+// path (aiPathRestriction.ts). Re-exported for existing importers.
+export { isBlockedPath, normalizePath } from './aiPathRestriction';
 
-export function normalizePath(path: string): string {
-  let result = path
-    .replace(/\\/g, '/')      // Normalize backslashes
-    .replace(/\/+/g, '/')     // Collapse redundant separators (/etc///shadow → /etc/shadow)
-    .toLowerCase();
-  // Iteratively remove dot components until stable
-  let prev: string;
-  do {
-    prev = result;
-    result = result.replace(/\/\.\//g, '/').replace(/\/\.$/, '/');
-  } while (result !== prev);
-  return result;
-}
-
-export function isBlockedPath(path: string): boolean {
-  if (path.includes('..')) return true;
-  const normalized = normalizePath(path);
-  return BLOCKED_PATH_PREFIXES.some(prefix => {
-    const normalizedPrefix = normalizePath(prefix);
-    // Handle wildcard prefixes like /home/*/.ssh
-    if (normalizedPrefix.includes('*')) {
-      const parts = normalizedPrefix.split('*');
-      return parts.length === 2 &&
-        normalized.startsWith(parts[0]!) &&
-        normalized.includes(parts[1]!);
-    }
-    return normalized.startsWith(normalizedPrefix) ||
-      normalized === normalizedPrefix.replace(/\/$/, '');
-  });
-}
-
-export const safePath = z.string().max(4096).refine(
-  (path) => !path.includes('\0'),
-  { message: 'Path contains null bytes' }
-).refine(
-  (path) => !path.includes('..'),
-  { message: 'Path traversal (..) not allowed' }
-).refine(
-  (path) => !isBlockedPath(path),
-  { message: 'Access to this path is blocked' }
-);
+export const safePath = z.string().max(4096).superRefine((path, ctx) => {
+  const refusal = aiPathRefusal(path);
+  if (refusal) ctx.addIssue({ code: 'custom', message: refusal });
+});
 
 const cleanupPath = z.string().max(4096).refine(
   (path) => !path.includes('\0'),
@@ -116,6 +76,71 @@ export const deliveryToolSchema = z.object(deliveryToolShape).strict().superRefi
   if (/^(update|delete)_/.test(v.action) && !v.id) ctx.addIssue({ code: 'custom', path: ['id'], message: 'id is required for update/delete' });
   if ((/^(create|update)_/.test(v.action) || v.action === 'set_default') && !v.data) ctx.addIssue({ code: 'custom', path: ['data'], message: 'data is required for writes' });
 });
+
+/**
+ * #7130: `execute_command`'s `payload` shape varies by `commandType`, but the
+ * SDK-exposed schema used to be a bare `z.record(z.string(), z.unknown())` —
+ * no keys, no `level` values — while the Go agent enforces a real vocabulary
+ * (`agent/internal/remote/tools/eventlogs.go` levelToNumber: critical, error,
+ * warning, information/info, verbose, or 1-5). A model guess that missed cost
+ * a full ~14s dispatch round-trip before the agent rejected it. Typing the
+ * known keys here — shared between the SDK tool() shape and toolInputSchemas
+ * below — surfaces the real vocabulary to the model AND rejects a bad `level`
+ * at `validateToolInput` before the command ever reaches the agent.
+ */
+export const executeCommandPayloadSchema = z.object({
+  // start_service / stop_service / restart_service
+  name: z.string().max(255).describe('start/stop/restart_service: the Windows service name.').optional(),
+  serviceName: z.string().max(255).describe('Alias for name in service control commands.').optional(),
+  // kill_process — the agent (agent/internal/remote/tools/processes.go
+  // KillProcess) only ever reads `pid`; `processName` is display-only, used
+  // for the approval-prompt headline (aiGuardrails.ts), and does nothing on
+  // its own — sending it without `pid` silently fails to kill anything.
+  processName: z.string().max(255).describe('kill_process: display label only (for the approval prompt); pid is required to actually kill it.').optional(),
+  pid: z.coerce.number().int().describe('kill_process: process ID to terminate (required).').optional(),
+  // file_list / file_read
+  path: z.string().max(4096).describe('file_list/file_read: filesystem path.').optional(),
+  // event_logs_query / event_logs_list
+  logName: z.string().max(255).describe('event_logs_query/list: Windows log name, e.g. "System" (default System).').optional(),
+  level: z.union([
+    z.enum(['critical', 'error', 'warning', 'information', 'info', 'verbose']),
+    z.coerce.number().int().min(1).max(5),
+  ]).describe('event_logs_query: severity filter — critical, error, warning, information (or "info"), verbose, or level number 1-5.').optional(),
+  source: z.string().max(255).describe('event_logs_query: filter by event source/provider name.').optional(),
+  eventId: z.coerce.number().int().describe('event_logs_query: filter by numeric event ID.').optional(),
+  query: z.string().max(2000).describe('event_logs_query: raw XPath filter; cannot combine with level/source/eventId.').optional(),
+  page: z.coerce.number().int().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+}).passthrough();
+
+export const executeCommandShape = {
+  deviceId: uuid,
+  commandType: z.enum([
+    'list_processes', 'kill_process',
+    'list_services', 'start_service', 'stop_service', 'restart_service',
+    'file_list', 'file_read',
+    'event_logs_list', 'event_logs_query',
+  ]),
+  payload: executeCommandPayloadSchema
+    .describe('Command-specific parameters — see level/logName for event_logs_query, name for service control, pid (required) for kill_process, path for file ops.')
+    .optional(),
+};
+
+/**
+ * #7130: `set_device_context.summary` is `varchar(255)` in the DB; the SDK
+ * schema enforced max(255) via a bare zod constraint with no explanatory
+ * text, so a caller who overflowed it got an SDK-level `too_big` rejection
+ * with no round-trip context. Shared between toolInputSchemas and the SDK
+ * tool() shape so the limit and its description can't drift apart.
+ */
+export const setDeviceContextShape = {
+  deviceId: uuid,
+  contextType: z.enum(['issue', 'quirk', 'followup', 'preference']),
+  summary: z.string().min(1).max(255)
+    .describe('Brief summary, max 255 chars — longer text is rejected, not truncated; put extra detail in details instead.'),
+  details: z.record(z.string(), z.unknown()).optional(),
+  expiresInDays: z.number().int().positive().max(365).optional(),
+};
 
 // Tool schemas
 export const toolInputSchemas: Record<string, z.ZodType> = {
@@ -147,9 +172,12 @@ export const toolInputSchemas: Record<string, z.ZodType> = {
     deviceId: uuid,
   }),
 
+  get_device_time_status: z.object({ deviceId: uuid }),
+  list_time_sync_issues: fleetTimeFiltersSchema,
   get_device_hardware_health: z.object({
     deviceId: uuid,
     includeEvents: z.boolean().optional(),
+    includeReliability: z.boolean().optional(),
   }),
 
   // BE-16 vulnerability tools. status/severity accept any case (feeds disagree on
@@ -210,6 +238,8 @@ export const toolInputSchemas: Record<string, z.ZodType> = {
   get_network_asset_reachability: z.object({
     asset_id: uuid,
   }),
+  // Topology AI tools (M3-D12 + M4 #6000) — strict, extracted to aiToolSchemasTopology.ts
+  ...topologyToolSchemas,
 
   get_ip_history: z.object({
     device_id: uuid.optional(),
@@ -449,6 +479,12 @@ export const toolInputSchemas: Record<string, z.ZodType> = {
     limit: z.number().int().min(1).max(100).optional(),
   }),
 
+  find_proven_fixes: z.object({
+    alertId: z.string().guid().optional(),
+    anomalyEpisodeId: z.string().guid().optional(),
+    limit: z.number().int().min(1).max(20).optional(),
+  }),
+
   list_incidents: z.object({
     orgId: z.string().guid().optional(),
     status: z.enum(['detected', 'analyzing', 'contained', 'recovering', 'closed']).optional(),
@@ -546,6 +582,11 @@ export const toolInputSchemas: Record<string, z.ZodType> = {
     quantity: z.number().optional(),
     partNumber: z.string().optional(),
     reason: z.string().optional(),
+    // Required (at the handler layer, via
+    // REQUIRED_PARAMS.decline) for the `decline` action only; optional here
+    // like every other action-specific field in this flat multiplexer schema.
+    method: z.enum(QUOTE_ACCEPT_ON_BEHALF_METHODS).optional(),
+    reference: z.string().trim().min(1).max(500).optional(),
     input: z.record(z.string(), z.unknown()).optional(),
     block: z.record(z.string(), z.unknown()).optional(),
     line: z.record(z.string(), z.unknown()).optional(),
@@ -901,15 +942,13 @@ export const toolInputSchemas: Record<string, z.ZodType> = {
     }
   }),
 
-  execute_command: z.object({
-    deviceId: uuid,
-    commandType: z.enum([
-      'list_processes', 'kill_process',
-      'list_services', 'start_service', 'stop_service', 'restart_service',
-      'file_list', 'file_read',
-      'event_logs_list', 'event_logs_query',
-    ]),
-    payload: z.record(z.string(), z.unknown()).optional(),
+  // file_list / file_read read `payload.path` on the device, so it goes through
+  // the same path restriction as file_operations (and is required: the agent
+  // reads an empty path as its own home directory).
+  execute_command: z.object(executeCommandShape).superRefine((value, ctx) => {
+    if (value.commandType !== 'file_list' && value.commandType !== 'file_read') return;
+    const refusal = aiPathRefusal(value.payload?.path);
+    if (refusal) ctx.addIssue({ code: 'custom', path: ['payload', 'path'], message: refusal });
   }),
 
   // AI script authoring (spec §4.2). The full propose_script input contract
@@ -1263,13 +1302,7 @@ export const toolInputSchemas: Record<string, z.ZodType> = {
     includeResolved: z.boolean().optional().default(false),
   }),
 
-  set_device_context: z.object({
-    deviceId: uuid,
-    contextType: z.enum(['issue', 'quirk', 'followup', 'preference']),
-    summary: z.string().min(1).max(255),
-    details: z.record(z.string(), z.unknown()).optional(),
-    expiresInDays: z.number().int().positive().max(365).optional(),
-  }),
+  set_device_context: z.object(setDeviceContextShape),
 
   resolve_device_context: z.object({
     contextId: uuid,

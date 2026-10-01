@@ -67,6 +67,8 @@ x-api-env: &api-env
   REMOTE_WS_LEGACY_TICKET_WRITER_DRAINED_AT: ${REMOTE_WS_LEGACY_TICKET_WRITER_DRAINED_AT:-}
   REMOTE_WS_LEGACY_VIEWER_ISSUER_DRAINED_AT: ${REMOTE_WS_LEGACY_VIEWER_ISSUER_DRAINED_AT:-}
   REMOTE_DESKTOP_FENCE_REQUIRED: ${REMOTE_DESKTOP_FENCE_REQUIRED:-false}
+  APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM: ${APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM:-}
+  PRE_ASSIGNMENT_ENROLLMENT_ENABLED: ${PRE_ASSIGNMENT_ENROLLMENT_ENABLED:-false}
   JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
   PARTNER_API_CURSOR_SIGNING_KEY: ${PARTNER_API_CURSOR_SIGNING_KEY:?Set PARTNER_API_CURSOR_SIGNING_KEY in .env}
   AGENT_ENROLLMENT_SECRET: ${AGENT_ENROLLMENT_SECRET:?Set AGENT_ENROLLMENT_SECRET in .env}
@@ -183,6 +185,13 @@ x-api-env: &api-env
   # Intuit's app-level webhook verifier token. Unset -> the webhook route
   # answers 503 and the 15-minute reconcile sweep is the only pull path.
   QBO_WEBHOOK_VERIFIER_TOKEN: ${QBO_WEBHOOK_VERIFIER_TOKEN:-}
+  # Xero accounting integration (W02). All optional; unset keeps it dark.
+  # Mapped explicitly: Compose only interpolates vars listed in this block.
+  XERO_CLIENT_ID: ${XERO_CLIENT_ID:-}
+  XERO_CLIENT_SECRET: ${XERO_CLIENT_SECRET:-}
+  XERO_REDIRECT_URI: ${XERO_REDIRECT_URI:-}
+  XERO_WEBHOOK_KEY: ${XERO_WEBHOOK_KEY:-}
+  XERO_DAILY_CALL_LIMIT: ${XERO_DAILY_CALL_LIMIT:-}
   # Optional customer Graph-read onboarding. The executor is intentionally
   # not part of this generic Compose stack: deploy it separately with a
   # workload identity, private ingress, and controlled HTTPS egress.
@@ -220,7 +229,9 @@ x-api-env: &api-env
   M365_GRAPH_ACTIONS_EXECUTOR_AUDIENCE: ${M365_GRAPH_ACTIONS_EXECUTOR_AUDIENCE:-m365-graph-actions-executor}
   M365_GRAPH_ACTIONS_EXECUTOR_SIGNING_KID: ${M365_GRAPH_ACTIONS_EXECUTOR_SIGNING_KID:-}
   M365_GRAPH_ACTIONS_EXECUTOR_SIGNING_PRIVATE_JWK_FILE: /run/secrets/m365_graph_actions_executor_signing_private_jwk
-  APP_VERSION: ${BREEZE_VERSION:?Set BREEZE_VERSION in .env}
+  # APP_VERSION is deliberately NOT set here: the image bakes its own version
+  # (docker/Dockerfile.api), and /health, the upgrade preflight and the version
+  # history must report what is running, not what .env says (#7024).
   BREEZE_VERSION: ${BREEZE_VERSION:?Set BREEZE_VERSION in .env}
   # Temporary exact-device PAM local-decision gate for a legacy agent.
   PAM_LEGACY_LOCAL_GATE_DEVICE_IDS: ${PAM_LEGACY_LOCAL_GATE_DEVICE_IDS:-}
@@ -533,6 +544,14 @@ services:
       <<: *healthcheck
       test: ['CMD', 'wget', '--no-verbose', '--tries=1', '--spider', 'http://127.0.0.1:3001/health']
       start_period: 40s
+    # Matches the worker service below: with the default BREEZE_ROLE=all, this
+    # container runs the same background workers (automation runtime, patch
+    # job executor) in-process. Docker's 10s default SIGTERM grace was cutting
+    # those off mid-dispatch on every routine deploy/restart, leaving
+    # in-flight automation actions and patch device jobs with a command
+    # already sent to the agent but no completion recorded — the next attempt
+    # then redispatched a second, duplicate command for the same work.
+    stop_grace_period: 90s
     networks:
       - breeze
 
@@ -757,8 +776,25 @@ services:
       - --relay-threads=4
       - --user-quota=4
       - --total-quota=1000
+      # WebRTC
+      # desktop/viewer sessions only ever need UDP relay allocations; RFC 6062
+      # TURN-TCP relay is unused here, so disable it to shrink the relay/abuse
+      # surface. Does not affect the `?transport=tcp` client-to-TURN-server
+      # control channel already advertised for UDP-blocked networks.
+      - --no-tcp-relay
       - --max-bps=${TURN_MAX_BPS:-5000000}
       - --no-multicast-peers
+      # Relay only to public peers. Refused: loopback, private/VPC, CGNAT
+      # (100.64/10, also used by tailnets), link-local (including the cloud
+      # metadata address 169.254.169.254), documentation/benchmark, 6to4/Teredo,
+      # multicast and reserved ranges, for IPv4 and IPv6. coturn refuses the
+      # unspecified address itself. Never list `::` or `0.0.0.0` on its own, or
+      # start an IPv6 range at `::`: coturn reads an all-zero bound as "no
+      # bound", so such an entry refuses every peer and no relayed session can
+      # connect.
+      # Never add this relay's own public IP (the external-ip) to this list: when
+      # both peers are relayed through this server, relay-to-relay traffic targets
+      # that address and would be refused.
       - --denied-peer-ip=0.0.0.0-0.255.255.255
       - --denied-peer-ip=10.0.0.0-10.255.255.255
       - --denied-peer-ip=100.64.0.0-100.127.255.255
@@ -766,16 +802,30 @@ services:
       - --denied-peer-ip=169.254.0.0-169.254.255.255
       - --denied-peer-ip=172.16.0.0-172.31.255.255
       - --denied-peer-ip=192.0.0.0-192.0.0.255
+      - --denied-peer-ip=192.0.2.0-192.0.2.255
+      - --denied-peer-ip=192.88.99.0-192.88.99.255
       - --denied-peer-ip=192.168.0.0-192.168.255.255
       - --denied-peer-ip=198.18.0.0-198.19.255.255
+      - --denied-peer-ip=198.51.100.0-198.51.100.255
+      - --denied-peer-ip=203.0.113.0-203.0.113.255
       - --denied-peer-ip=224.0.0.0-239.255.255.255
       - --denied-peer-ip=240.0.0.0-255.255.255.255
       - --denied-peer-ip=::1
+      - --denied-peer-ip=64:ff9b:1::-64:ff9b:1:ffff:ffff:ffff:ffff:ffff
+      - --denied-peer-ip=2001::-2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff
+      - --denied-peer-ip=2002::-2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff
       - --denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
       - --denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
       - --denied-peer-ip=ff00::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+      # IPv4-mapped IPv6 (::ffff:0:0/96) and the NAT64 well-known prefix
+      # (64:ff9b::/96) are IPv6 spellings of IPv4 addresses. No legitimate peer
+      # uses them, and relay-to-relay is unaffected (it targets the relay's own
+      # address).
+      - --denied-peer-ip=::ffff:0:0-::ffff:ffff:ffff
+      - --denied-peer-ip=64:ff9b::-64:ff9b::ffff:ffff
+      # verbose is off: it logs detail for every session, including
+      # unauthenticated ones. Enable it temporarily when debugging.
       - --log-file=stdout
-      - --verbose
       - --min-port=49152
       - --max-port=65535
       - --no-cli

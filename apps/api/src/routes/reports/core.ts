@@ -1,8 +1,9 @@
 import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
-import { and, eq, or, sql, desc, inArray, type SQL } from 'drizzle-orm';
+import { and, eq, isNull, isNotNull, or, sql, desc, inArray, getTableColumns, type SQL } from 'drizzle-orm';
 import { db } from '../../db';
-import { reports, reportRuns } from '../../db/schema';
+import { organizations, reports, reportRuns, reportSeries } from '../../db/schema';
+import type { ReportDeliveryStatus } from '../../services/reportDelivery';
 import {
   authMiddleware,
   requirePermission,
@@ -11,6 +12,11 @@ import {
 } from '../../middleware/auth';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { PERMISSIONS, type UserPermissions } from '../../services/permissions';
+import { ReportSeriesError } from '../../services/reportSeries/errors';
+import { detachSeriesChild, seriesWriteAllowed } from '../../services/reportSeries/store';
+import { seriesManagedRefusal } from '../../services/reportSeries/types';
+import { seriesErrorResponse } from './seriesErrors';
+import { callerMaySetEmailRecipients, RECIPIENTS_NEED_EXPORT_AND_MFA } from './recipientGate';
 import {
   missingReportTypePermission,
   reportAudienceCondition,
@@ -32,6 +38,7 @@ import {
   isPortalSelfServiceLocked,
   isSystemManagedReportDefinition,
   partnerOwnedReportVisibility,
+  reportConfigEmailRecipients,
   partnerWideListTarget,
   systemPartnerWideListArm,
   PORTAL_SELF_SERVICE_REPORT,
@@ -112,6 +119,15 @@ const PARTNER_WIDE_DENIED = 'partner_wide_denied' as const;
 const AUDIENCE_DENIED = 'audience_denied' as const;
 /** #3198 W01 — PUT's refusal to re-home a partner-owned definition. */
 const OWNERSHIP_IMMUTABLE = 'ownership_immutable' as const;
+
+function recipientExportGateFails(
+  config: unknown,
+  permissions: UserPermissions | undefined,
+  auth: AuthContext,
+): boolean {
+  if (reportConfigEmailRecipients(config).length === 0) return false;
+  return !callerMaySetEmailRecipients(auth, permissions);
+}
 
 type DefinitionListScopeResult =
   | { ok: true; tenantCondition?: SQL<unknown>; definitionScopePredicate: SQL<unknown> }
@@ -377,6 +393,12 @@ coreRoutes.get(
       conditions.push(reportOwnerScopeListFilter(query.ownerScope));
     }
 
+    // Multi-org report series W02: narrowing filters; archived children are
+    // hidden by default (spec §3.6).
+    if (query.series === 'only') conditions.push(isNotNull(reports.seriesId));
+    if (query.series === 'exclude') conditions.push(isNull(reports.seriesId));
+    if (query.includeArchived !== 'true') conditions.push(isNull(reports.archivedAt));
+
     const whereCondition = and(...conditions);
 
     // Get total count
@@ -386,10 +408,33 @@ coreRoutes.get(
       .where(whereCondition);
     const total = Number(countResult[0]?.count ?? 0);
 
-    // Get reports
+    // Get reports. Multi-org series W01 (spec §3.6):
+    //  - orgName — LEFT join: a partner-owned row has no org (null), and an org
+    //    the caller's RLS context cannot read yields null instead of dropping
+    //    the row; which rows are listed is still decided by whereCondition.
+    //  - lastDeliveryStatus — the newest SCHEDULED delivery outcome (manual
+    //    'not_scheduled' runs and pre-W01 NULL runs are skipped), for the list's
+    //    no-recipients warning. One indexed lookup per listed row
+    //    (report_runs_report_id_created_at_idx); report_runs RLS applies inside.
     const reportsList = await db
-      .select()
+      .select({
+        ...getTableColumns(reports),
+        orgName: organizations.name,
+        lastDeliveryStatus: sql<Exclude<ReportDeliveryStatus, 'not_scheduled'> | null>`(
+          SELECT ${reportRuns.deliveryStatus}
+          FROM ${reportRuns}
+          WHERE ${reportRuns.reportId} = ${reports.id}
+            AND ${reportRuns.deliveryStatus} IN ('sent', 'partial', 'no_recipients', 'failed')
+          ORDER BY ${reportRuns.createdAt} DESC, ${reportRuns.id} DESC
+          LIMIT 1
+        )`,
+        // Partner-axis RLS: an org token's join yields null here while
+        // seriesId stays set (W03's "Managed by your MSP" badge).
+        seriesName: reportSeries.name,
+      })
       .from(reports)
+      .leftJoin(organizations, eq(organizations.id, reports.orgId))
+      .leftJoin(reportSeries, eq(reportSeries.id, reports.seriesId))
       .where(whereCondition)
       .orderBy(desc(reports.updatedAt), desc(reports.id))
       .limit(limit)
@@ -433,6 +478,10 @@ coreRoutes.get(
     if (query.ownerScope) {
       conditions.push(reportOwnerScopeListFilter(query.ownerScope));
     }
+    // W02: an archived series child is history, not a template.
+    conditions.push(isNull(reports.archivedAt));
+    // W03: a series child is one org's copy of a multi-org report, not a template.
+    conditions.push(isNull(reports.seriesId));
     const whereCondition = and(...conditions);
 
     const countResult = await db
@@ -468,7 +517,7 @@ coreRoutes.get(
     // Skip non-UUID sub-paths so they don't hit the `where id = $1` uuid cast.
     // 'templates' has its own handler above; listed here as defense-in-depth in
     // case route registration order ever changes.
-    if (['runs', 'data', 'generate', 'templates'].includes(reportId)) {
+    if (['runs', 'data', 'generate', 'templates', 'series'].includes(reportId)) {
       return c.notFound();
     }
 
@@ -552,6 +601,10 @@ coreRoutes.post(
     const auth = c.get('auth');
     const data = c.req.valid('json');
     const permissions = c.get('permissions') as UserPermissions | undefined;
+
+    if (recipientExportGateFails(data.config, permissions, auth)) {
+      return c.json(RECIPIENTS_NEED_EXPORT_AND_MFA, 403);
+    }
 
     // #3198 W01 — a partner-owned definition. partner_id is ALWAYS the
     // caller's own token partner; `data.orgId` and any client-supplied partner
@@ -713,6 +766,10 @@ coreRoutes.put(
     const { orgId: bodyOrgId, ownerScope: _ownerScope, ...data } = c.req.valid('json');
     const permissions = c.get('permissions') as UserPermissions | undefined;
 
+    if (data.config !== undefined && recipientExportGateFails(data.config, permissions, auth)) {
+      return c.json(RECIPIENTS_NEED_EXPORT_AND_MFA, 403);
+    }
+
     if (Object.keys(data).length === 0) {
       return c.json({ error: 'No updates provided' }, 400);
     }
@@ -734,6 +791,11 @@ coreRoutes.put(
       if (locked === PARTNER_WIDE_DENIED) return PARTNER_WIDE_DENIED;
       if (locked === AUDIENCE_DENIED) return TYPE_PERMISSION_DENIED;
       if (!locked) return null;
+      // Multi-org report series W02 (spec §3.3 "Child writers"): a child's
+      // shared fields belong to its series; only recipient overrides and
+      // Detach change a child outside the reconciler.
+      const managingSeriesId = locked.locked.seriesId;
+      if (managingSeriesId) return { seriesManaged: managingSeriesId };
       // #3198 W01: ownership is immutable. The report_schedule_recipients /
       // service_deliverables composite FKs are ON UPDATE NO ACTION, so flipping
       // the axis would 23503 anyway — refuse it as what it is.
@@ -807,6 +869,10 @@ coreRoutes.put(
     if (!mutation) {
       return c.json(REPORT_NOT_FOUND, 404);
     }
+    if ('seriesManaged' in mutation) {
+      // Only ever set from a truthy series id (see the locked-row check).
+      return c.json(seriesManagedRefusal(mutation.seriesManaged as string), 409);
+    }
     if ('invalidConfig' in mutation && mutation.invalidConfig) {
       return c.json(mutation.invalidConfig satisfies ValidationErrorBody, 400);
     }
@@ -847,6 +913,9 @@ coreRoutes.post(
       if (locked === PARTNER_WIDE_DENIED) return { kind: 'partner_wide_denied' as const };
       if (locked === AUDIENCE_DENIED) return { kind: 'type_permission_denied' as const };
       if (!locked) return { kind: 'not_found' as const };
+      if (locked.locked.seriesId) {
+        return { kind: 'series_managed' as const, seriesId: locked.locked.seriesId };
+      }
       // #3198 W02 (rulings P8, T11b). Reauthorize re-stamps the CALLER as the
       // execution user, so it needs the stored type's underlying read
       // permissions exactly as PUT does. After the row is authorized, so the
@@ -893,6 +962,9 @@ coreRoutes.post(
         : { kind: 'changed' as const };
     });
 
+    if (result.kind === 'series_managed') {
+      return c.json(seriesManagedRefusal(result.seriesId), 409);
+    }
     if (result.kind === 'system_managed') {
       // The reason this route in particular must refuse: the update below
       // stamps `persistedSiteScopeValues`, whose principal_kind is ALWAYS
@@ -926,6 +998,73 @@ coreRoutes.post(
   },
 );
 
+// POST /reports/:id/detach — Multi-org report series W02 (spec §3.6, D5).
+// Turns a series child into a standalone org report: clears series_id (no
+// series revision bump), un-targets the org so the reconciler never mints a
+// replacement, and keeps its current customers receiving it (finishDetach).
+coreRoutes.post(
+  '/:id/detach',
+  requireScope('partner'),
+  requirePermission(PERMISSIONS.REPORTS_WRITE.resource, PERMISSIONS.REPORTS_WRITE.action),
+  async (c) => {
+    const auth = c.get('auth');
+    const reportId = c.req.param('id')!;
+    const permissions = c.get('permissions') as UserPermissions | undefined;
+    try {
+      if (!seriesWriteAllowed(auth)) {
+        throw new ReportSeriesError('series_write_denied', 403, { message: PARTNER_WIDE_WRITE_DENIED_MESSAGE });
+      }
+      const detached = await db.transaction(async (tx) => {
+        // Authorization + which series, read WITHOUT a lock. Detach does not
+        // read or change the child's execution scope, so it deliberately does
+        // not go through loadLockedDefinition (whose scope decode 404s a
+        // blocked_no_authority child with an all-NULL scope — the very child
+        // an operator most needs to detach). Tenant, type-permission, audience
+        // and system-managed checks are the same ones that loader applies.
+        const [meta] = await tx
+          .select(reportDefinitionMetadataProjection)
+          .from(reports)
+          .where(tenantAuthorizedReportCondition(reportId, auth, permissions))
+          .limit(1);
+        if (
+          !meta
+          || reportTypeHiddenByPermission(meta.type, permissions)
+          || reportTypeHiddenFromCaller(meta.type, auth)
+          || isSystemManagedReportDefinition(meta)
+        ) {
+          return null;
+        }
+        if (!meta.seriesId || !meta.orgId || meta.archivedAt !== null) {
+          throw new ReportSeriesError('report_not_series_child', 409);
+        }
+        // Lock order: series row, THEN child row (see detachSeriesChild).
+        const { row, recipients } = await detachSeriesChild(
+          tx,
+          { seriesId: meta.seriesId, orgId: meta.orgId, reportId },
+          auth,
+        );
+        return { row, seriesId: meta.seriesId, orgId: meta.orgId, recipients };
+      });
+      if (!detached) return c.json(REPORT_NOT_FOUND, 404);
+      writeRouteAudit(c, {
+        orgId: detached.orgId,
+        action: 'report.detach',
+        resourceType: 'report',
+        resourceId: detached.row.id,
+        resourceName: detached.row.name,
+        details: {
+          seriesId: detached.seriesId,
+          recipientsMaterialized: detached.recipients.added,
+          removeOverridesDropped: detached.recipients.removedDropped,
+        },
+      });
+      return c.json(detached.row);
+    } catch (err) {
+      return seriesErrorResponse(c, err);
+    }
+  },
+);
+
 // DELETE /reports/:id - Delete report
 coreRoutes.delete(
   '/:id',
@@ -947,6 +1086,11 @@ coreRoutes.delete(
       if (locked === PARTNER_WIDE_DENIED) return PARTNER_WIDE_DENIED;
       if (locked === AUDIENCE_DENIED) return AUDIENCE_DENIED;
       if (!locked) return null;
+      // Exclude the org from the series (or detach it) instead: a deleted
+      // child would be re-created by the next reconcile.
+      if (locked.locked.seriesId) {
+        return { kind: 'series_managed' as const, seriesId: locked.locked.seriesId };
+      }
 
       if (await isPortalSelfServiceLocked(tx, locked.locked)) {
         return { kind: PORTAL_SELF_SERVICE };
@@ -988,6 +1132,9 @@ coreRoutes.delete(
     }
     if (deleted === AUDIENCE_DENIED) {
       return c.json(REPORT_TYPE_PERMISSION_DENIED, 403);
+    }
+    if (deleted?.kind === 'series_managed') {
+      return c.json(seriesManagedRefusal(deleted.seriesId), 409);
     }
     if (deleted?.kind === PORTAL_SELF_SERVICE) {
       return c.json(PORTAL_SELF_SERVICE_REPORT, 409);

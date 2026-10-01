@@ -10,11 +10,12 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   createSessionPreToolUse,
   settleApprovalWaits,
+  settleBlockedTurnForNewMessage,
   waitForTurnToSettle,
   APPROVAL_WAIT_BUDGET_MS,
   TERMINAL_READBACK_BUDGET_MS,
 } from './aiAgentSdk';
-import { db } from '../db';
+import { db, assertOutsideHeldDbContext } from '../db';
 import { actionIntents } from '../db/schema/actionIntents';
 import { checkGuardrails, checkToolPermission, checkToolRateLimit } from './aiGuardrails';
 import { waitForApproval } from './aiAgent';
@@ -25,6 +26,7 @@ import type { ActionIntentSnapshot } from './actionIntents/intentService';
 // ============================================
 
 vi.mock('../db', () => ({
+  assertOutsideHeldDbContext: vi.fn(),
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
@@ -36,6 +38,9 @@ vi.mock('../db', () => ({
 }));
 
 vi.mock('../db/schema', () => ({
+  // services/patchSeverityOverlay.ts builds module-level SQL fragments from these at import time.
+  patches: { severity: 'patches.severity', category: 'patches.category' },
+  devicePatches: { reportedSeverity: 'device_patches.reported_severity', reportedCategory: 'device_patches.reported_category' },
   aiSessions: { id: 'id', status: 'status', orgId: 'orgId' },
   aiMessages: {},
   aiToolExecutions: { id: 'id', status: 'status' },
@@ -86,6 +91,7 @@ vi.mock('./aiAgentSdkTools', () => ({
   TOOL_TIERS: {
     execute_command: 3,
     take_screenshot: 2,
+    diagnose_connectivity: 3,
   },
   BREEZE_MCP_TOOL_NAMES: [],
 }));
@@ -606,6 +612,37 @@ describe('waitForTurnToSettle (#3089)', () => {
   });
 });
 
+describe('settleBlockedTurnForNewMessage — held-context tripwire (#3127)', () => {
+  beforeEach(() => {
+    vi.mocked(assertOutsideHeldDbContext).mockReset();
+  });
+
+  it('checks it is outside a held DB transaction before waiting on the turn', async () => {
+    const session = makeActiveSession({ state: 'processing', pendingApprovalWaits: 1 });
+    setTimeout(() => { session.state = 'idle'; }, 50);
+
+    await expect(settleBlockedTurnForNewMessage(session, 1_000)).resolves.toBe('concluded');
+    expect(assertOutsideHeldDbContext).toHaveBeenCalledWith('settleBlockedTurnForNewMessage');
+  });
+
+  it('refuses before touching the session when the tripwire fires (strict mode)', async () => {
+    vi.mocked(assertOutsideHeldDbContext).mockImplementation(() => {
+      throw new Error('ran inside a held withDbAccessContext transaction');
+    });
+    const abort = new AbortController();
+    const session = makeActiveSession({
+      state: 'processing',
+      pendingApprovalWaits: 1,
+      approvalWaitAbort: abort,
+    });
+
+    await expect(settleBlockedTurnForNewMessage(session, 1_000)).rejects.toThrow(/held withDbAccessContext/);
+    // Nothing was settled: the approval wait is still armed.
+    expect(abort.signal.aborted).toBe(false);
+    expect(session.approvalWaitAbort).toBe(abort);
+  });
+});
+
 // ============================================
 // W04 (#5612): an intent approved AT CREATION (script_reviewer / ticket
 // autonomy) has no approval row — the session gets an informational
@@ -690,6 +727,57 @@ describe('approved-at-creation intent (unattended lane, #5612 W04)', () => {
     const types = vi.mocked(session.eventBus.publish).mock.calls.map((c: unknown[]) => (c[0] as { type: string }).type);
     expect(types).toContain('approval_required');
     expect(types).not.toContain('unattended_release');
+  });
+});
+
+// ============================================
+// Topology M4 Task 5 (#6000): the approval card shows the PINNED effect
+// ============================================
+
+describe('diagnose_connectivity approval card (M4-D3)', () => {
+  const pinnedArguments = {
+    site_id: '20000000-0000-4000-8000-000000000001', subject: { kind: 'node', id: '30000000-0000-4000-8000-000000000001' },
+    recipe_id: 'gateway_basic', recipe_version: 1, graph_revision: '7', origin_device_id: '50000000-0000-4000-8000-000000000001',
+    context_key: 'default', family: 'ipv4', proposal_expires_at: '2026-09-26T12:15:00.000Z',
+  };
+  const pinnedLabel = 'Run gateway reachability check from core-sw-1 (context default, ipv4) to gateway 10.0.0.1 — 2 bounded steps, 60s max; approval expires 2026-09-26 12:15 UTC';
+
+  it('carries the server-materialized arguments and approval text, never the model input', async () => {
+    tier3Guardrail('supervised');
+    mockInsertReturning({ id: 'exec-diag' });
+    mockUpdateChain();
+    mockCreateActionIntent.mockResolvedValue(makeIntentSnapshot({ id: 'intent-diag', actionName: 'diagnose_connectivity', requesterApprovalRequestId: 'appr-self' }));
+    mockWaitForIntentDecision.mockResolvedValue('rejected');
+    vi.mocked(db.select).mockImplementation((() => ({
+      from: (table: unknown) => ({
+        where: () => ({ limit: async () => (table === actionIntents ? [{ arguments: pinnedArguments, reason: pinnedLabel }] : []) }),
+      }),
+    })) as never);
+    const session = makeActiveSession();
+
+    await createSessionPreToolUse(session)('diagnose_connectivity', { site_id: pinnedArguments.site_id, recipe_id: 'gateway_basic', note: 'MODEL SUPPLIED' });
+
+    const card = vi.mocked(session.eventBus.publish).mock.calls.map((c: unknown[]) => c[0] as Record<string, unknown>)
+      .find((event: Record<string, unknown>) => event.type === 'approval_required')!;
+    expect(card).toMatchObject({ toolName: 'diagnose_connectivity', input: pinnedArguments, description: pinnedLabel, selfApprovalRequestId: 'appr-self' });
+    expect(JSON.stringify(card)).not.toContain('MODEL SUPPLIED');
+  });
+
+  it('falls back to a fixed description, never the model input, when the pinned effect cannot be read', async () => {
+    tier3Guardrail('supervised');
+    mockInsertReturning({ id: 'exec-diag-2' });
+    mockUpdateChain();
+    mockCreateActionIntent.mockResolvedValue(makeIntentSnapshot({ id: 'intent-diag-2', actionName: 'diagnose_connectivity' }));
+    mockWaitForIntentDecision.mockResolvedValue('rejected');
+    vi.mocked(db.select).mockImplementation((() => ({ from: () => ({ where: () => ({ limit: async () => [] }) }) })) as never);
+    const session = makeActiveSession();
+
+    await createSessionPreToolUse(session)('diagnose_connectivity', { site_id: pinnedArguments.site_id, note: 'MODEL SUPPLIED' });
+
+    const card = vi.mocked(session.eventBus.publish).mock.calls.map((c: unknown[]) => c[0] as Record<string, unknown>)
+      .find((event: Record<string, unknown>) => event.type === 'approval_required')!;
+    expect(card.input).toEqual({});
+    expect(JSON.stringify(card)).not.toContain('MODEL SUPPLIED');
   });
 });
 

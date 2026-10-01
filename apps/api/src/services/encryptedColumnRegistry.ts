@@ -32,6 +32,22 @@ export interface EncryptedColumnSpec {
    * value under the wrong AAD.
    */
   aadBinding?: 'column' | 'row';
+  /**
+   * Override the `table.column` part of the AAD. Only for a column MOVED to a
+   * new table, whose existing ciphertext was sealed under its old location:
+   * the tag stays the column's logical identity so every stored value still
+   * decrypts (notification channel config, #6379).
+   */
+  aadTag?: string;
+  /**
+   * JSON columns only: secret leaves identified by WHERE they sit, in addition
+   * to the global `SECRET_JSON_KEYS` names. For a key too generic to seal in
+   * every registered JSON column (`webhooks`), or one that only names a
+   * credential in one place. Each path is object keys from the column root;
+   * array positions are not segments, so a path to an array covers every
+   * string entry in it.
+   */
+  secretJsonPaths?: readonly (readonly string[])[];
   description: string;
 }
 
@@ -41,7 +57,7 @@ export interface EncryptedColumnSpec {
  * binding for the same column.
  */
 export function columnAad(spec: EncryptedColumnSpec, rowId?: string): string {
-  const base = `${spec.table}.${spec.column}`;
+  const base = spec.aadTag ?? `${spec.table}.${spec.column}`;
   if (spec.aadBinding !== 'row') return base;
   if (!rowId) {
     throw new Error(`${base} is row-bound: a row id is required to derive its AAD`);
@@ -71,6 +87,22 @@ export interface ReencryptSecretsStats {
   errors: Array<{ table: string; column: string; id: string; error: string }>;
 }
 
+/**
+ * Secrets in the `settings` JSON columns (organizations, partners, sites) that
+ * are identified by path: notification-channel destinations and credentials.
+ * A Slack incoming-webhook URL and the extra webhook URLs carry their
+ * credential in the URL itself; the Pushover application token and user key
+ * are the same pair a Pushover channel config seals (notificationChannelSecrets
+ * `secretKeysForType('pushover')`). Shared with response masking
+ * (settingsSecretMasking.ts), which serves all three columns.
+ */
+export const SETTINGS_SECRET_JSON_PATHS: readonly (readonly string[])[] = [
+  ['notifications', 'slackWebhookUrl'],
+  ['notifications', 'webhooks'],
+  ['notifications', 'pushoverAppToken'],
+  ['notifications', 'pushoverDefaultUser'],
+];
+
 export const encryptedColumnRegistry: EncryptedColumnSpec[] = [
   { table: 'sso_providers', column: 'client_secret', kind: 'text', description: 'OIDC client secret' },
   { table: 'user_sso_identities', column: 'access_token', kind: 'text', description: 'SSO access token' },
@@ -81,7 +113,9 @@ export const encryptedColumnRegistry: EncryptedColumnSpec[] = [
   { table: 'webhooks', column: 'url', kind: 'text', description: 'outbound webhook delivery URL (may embed credentials in userinfo/query)' },
   { table: 'webhooks', column: 'secret', kind: 'text', description: 'outbound webhook signing secret' },
   { table: 'webhooks', column: 'headers', kind: 'json', description: 'outbound webhook encrypted headers' },
-  { table: 'notification_channels', column: 'config', kind: 'json', description: 'notification channel secret config' },
+  // Moved off notification_channels (#6379); the AAD tag keeps its old
+  // location so existing ciphertext decrypts (notificationChannelSecrets.ts).
+  { table: 'notification_channel_configs', column: 'config', kind: 'json', idColumn: 'channel_id', aadTag: 'notification_channels.config', description: 'notification channel secret config' },
   { table: 'discovery_profiles', column: 'snmp_communities', kind: 'text-array', description: 'SNMP community strings' },
   { table: 'discovery_profiles', column: 'snmp_credentials', kind: 'json', description: 'SNMP credential secrets' },
   { table: 'snmp_devices', column: 'community', kind: 'text', description: 'SNMP v1/v2c community string' },
@@ -106,9 +140,9 @@ export const encryptedColumnRegistry: EncryptedColumnSpec[] = [
   { table: 'dns_filter_integrations', column: 'api_key', kind: 'text', description: 'DNS filter API key' },
   { table: 'dns_filter_integrations', column: 'api_secret', kind: 'text', description: 'DNS filter API secret' },
   { table: 'storage_encryption_keys', column: 'encrypted_private_key', kind: 'text', description: 'backup private key material' },
-  { table: 'organizations', column: 'settings', kind: 'json', description: 'organization settings with encrypted log-forwarding secrets' },
-  { table: 'partners', column: 'settings', kind: 'json', description: 'partner settings with encrypted remote-access launcher passwords (#716)' },
-  { table: 'sites', column: 'settings', kind: 'json', description: 'site-level settings with encrypted overrides' },
+  { table: 'organizations', column: 'settings', kind: 'json', secretJsonPaths: SETTINGS_SECRET_JSON_PATHS, description: 'organization settings with encrypted log-forwarding and notification-channel secrets' },
+  { table: 'partners', column: 'settings', kind: 'json', secretJsonPaths: SETTINGS_SECRET_JSON_PATHS, description: 'partner settings with encrypted remote-access launcher passwords (#716) and notification-channel secrets' },
+  { table: 'sites', column: 'settings', kind: 'json', secretJsonPaths: SETTINGS_SECRET_JSON_PATHS, description: 'site-level settings with encrypted overrides' },
   { table: 'td_synnex_digital_bridge_integrations', column: 'credentials', kind: 'json', description: 'TD SYNNEX Digital Bridge API credentials' },
   { table: 'td_synnex_ec_express_integrations', column: 'credentials', kind: 'json', description: 'TD SYNNEX EC Express API credentials' },
   { table: 'td_synnex_sftp_integrations', column: 'credentials', kind: 'json', description: 'TD SYNNEX nightly SFTP P&A password (credentials.password)' },
@@ -145,6 +179,34 @@ const SECRET_JSON_KEYS = new Set([
   'authPassword',
   'privPassword',
 ]);
+
+function pathsEqual(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((segment, index) => segment === b[index]);
+}
+
+/**
+ * Whether the leaf at `path` (object keys from the column root) inside a
+ * registered JSON column is a secret: its key is one of `SECRET_JSON_KEYS`, or
+ * the path is one of the column's `secretJsonPaths`. The single definition
+ * behind at-rest sealing below.
+ */
+export function isSecretJsonPath(
+  path: readonly string[],
+  secretPaths: readonly (readonly string[])[] = [],
+): boolean {
+  const key = path[path.length - 1];
+  if (key !== undefined && SECRET_JSON_KEYS.has(key)) return true;
+  return secretPaths.some((secretPath) => pathsEqual(secretPath, path));
+}
+
+/**
+ * `isSecretJsonPath` for the `settings` columns. Response masking
+ * (services/settingsSecretMasking.ts) and partner-lock checks use this, so a
+ * leaf sealed on write is always masked on read.
+ */
+export function isSettingsSecretPath(path: readonly string[]): boolean {
+  return isSecretJsonPath(path, SETTINGS_SECRET_JSON_PATHS);
+}
 
 function rowsFromResult(result: unknown): Array<Record<string, unknown>> {
   if (Array.isArray(result)) return result as Array<Record<string, unknown>>;
@@ -186,23 +248,30 @@ function maybeReencryptString(value: string, force: boolean, aad?: string, alway
   return encryptSecret(value, opts) ?? value;
 }
 
-function transformJsonSecrets(value: unknown, key?: string, aad?: string, alwaysAad = false): unknown {
+interface JsonSecretWalk {
+  secretPaths: readonly (readonly string[])[];
+  aad?: string;
+  alwaysAad: boolean;
+}
+
+function transformJsonSecrets(value: unknown, path: readonly string[], walk: JsonSecretWalk): unknown {
   if (typeof value === 'string') {
-    if (isEncryptedSecret(value) || (key && SECRET_JSON_KEYS.has(key) && value.length > 0)) {
-      return maybeReencryptString(value, Boolean(key && SECRET_JSON_KEYS.has(key)), aad, alwaysAad);
+    const secret = isSecretJsonPath(path, walk.secretPaths);
+    if (isEncryptedSecret(value) || (secret && value.length > 0)) {
+      return maybeReencryptString(value, secret, walk.aad, walk.alwaysAad);
     }
     return value;
   }
 
   if (Array.isArray(value)) {
-    return value.map((entry) => transformJsonSecrets(entry, key, aad, alwaysAad));
+    return value.map((entry) => transformJsonSecrets(entry, path, walk));
   }
 
   if (value && typeof value === 'object') {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>).map(([entryKey, entryValue]) => [
         entryKey,
-        transformJsonSecrets(entryValue, entryKey, aad, alwaysAad),
+        transformJsonSecrets(entryValue, [...path, entryKey], walk),
       ])
     );
   }
@@ -236,7 +305,7 @@ export function transformEncryptedColumnValue(
       : value;
   }
 
-  return transformJsonSecrets(value, undefined, aad, alwaysAad);
+  return transformJsonSecrets(value, [], { secretPaths: spec.secretJsonPaths ?? [], aad, alwaysAad });
 }
 
 /**

@@ -64,13 +64,15 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'query_devices', description: 'Search and filter devices', category: 'Devices & Hardware' },
       { name: 'get_device_details', description: 'Get comprehensive device info', category: 'Devices & Hardware' },
       { name: 'get_device_hardware_health', description: 'Get RAID, disk and hardware collector health', category: 'Devices & Hardware' },
+      { name: 'get_device_time_status', description: 'Get Windows time sync health and expected timezone', category: 'Devices & Hardware' },
+      { name: 'list_time_sync_issues', description: 'List observed time synchronization findings', category: 'Devices & Hardware' },
       { name: 'analyze_metrics', description: 'Time-series metrics analysis', category: 'Devices & Hardware' },
       { name: 'get_active_users', description: 'Active user sessions', category: 'Devices & Hardware' },
       { name: 'get_user_experience_metrics', description: 'Login performance and session trends', category: 'Devices & Hardware' },
       { name: 'get_fleet_health', description: 'Fleet health overview and aggregates', category: 'Devices & Hardware' },
       { name: 'get_fleet_findings', description: 'Deduplicated fleet hygiene findings', category: 'Devices & Hardware' },
       { name: 'analyze_fleet_metrics', description: 'Fleet-wide metric aggregation from rollups', category: 'Devices & Hardware' },
-      { name: 'analyze_boot_performance', description: 'Boot performance analysis', category: 'Devices & Hardware' },
+      { name: 'analyze_boot_performance', description: 'Boot performance analysis from stored boot history', category: 'Devices & Hardware' },
       { name: 'get_device_context', description: 'Brain device context lookup', category: 'Devices & Hardware' },
       // Network & DNS
       { name: 'list_network_assets', description: 'List network assets', category: 'Network & DNS' },
@@ -78,6 +80,14 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'get_network_changes', description: 'Network change detection', category: 'Network & DNS' },
       { name: 'get_ip_history', description: 'IP address history', category: 'Network & DNS' },
       { name: 'get_network_asset_reachability', description: 'Network asset reachability with source and age', category: 'Network & DNS' },
+      { name: 'get_interface_history', description: 'Bounded topology port history', category: 'Network & DNS' },
+      { name: 'get_link_health', description: 'Current topology link health per endpoint', category: 'Network & DNS' },
+      { name: 'get_topology_impact', description: 'Possible topology impact with cited evidence', category: 'Network & DNS' },
+      { name: 'get_recent_network_changes', description: 'Bounded topology change history', category: 'Network & DNS' },
+      { name: 'get_topology_monitoring_status', description: 'Recurring topology monitoring status for a site', category: 'Network & DNS' },
+      { name: 'get_topology', description: 'Bounded topology graph for a pinned site', category: 'Network & DNS' },
+      { name: 'get_link_evidence', description: 'Observations behind one topology link', category: 'Network & DNS' },
+      { name: 'get_diagnostic_run', description: 'One topology diagnostic run result', category: 'Network & DNS' },
       { name: 'get_dns_security', description: 'DNS security analysis', category: 'Network & DNS' },
       // Security & Compliance
       { name: 'get_security_posture', description: 'Security posture scores', category: 'Security & Compliance' },
@@ -85,17 +95,27 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'get_software_compliance', description: 'Software compliance checks', category: 'Security & Compliance' },
       { name: 'query_compliance_policies', description: 'List compliance policies', category: 'Security & Compliance' },
       { name: 'get_compliance_status', description: 'Device-level compliance status', category: 'Security & Compliance' },
+      // W01 (#6755)
+      { name: 'get_elevation_history', description: 'Admin elevation request history', category: 'Security & Compliance' },
+      { name: 'get_user_risk_scores', description: 'User security risk scores', category: 'Security & Compliance' },
+      { name: 'get_user_risk_detail', description: "One user's risk history", category: 'Security & Compliance' },
+      { name: 'get_peripheral_activity', description: 'USB and peripheral device activity', category: 'Security & Compliance' },
+      // W01 (#6755) follow-up
+      { name: 'get_browser_security', description: 'Browser extensions and browser policy compliance', category: 'Security & Compliance' },
+      { name: 'get_sensitive_data_overview', description: 'Sensitive data scan findings (chat only, not agents)', category: 'Security & Compliance' },
+      { name: 'get_incident_timeline', description: 'Incident details and timeline', category: 'Security & Compliance' },
+      { name: 'generate_incident_report', description: 'Incident report', category: 'Security & Compliance' },
       // Alerts & Notifications
       { name: 'list_incidents', description: 'List incidents', category: 'Alerts & Notifications' },
       { name: 'list_remediation_suggestions', description: 'List remediation suggestions', category: 'Alerts & Notifications' },
+      { name: 'find_proven_fixes', description: 'Find fixes proven on the same problem', category: 'Alerts & Notifications' },
       { name: 'manage_alerts (list/get)', description: 'View alerts', category: 'Alerts & Notifications' },
       { name: 'manage_delivery (resolve/list_routing/list_escalation)', description: 'Preview alert delivery and view routing rules and escalation policies', category: 'Alerts & Notifications' },
       { name: 'manage_notification_channels (list)', description: 'List notification channels', category: 'Alerts & Notifications' },
       { name: 'manage_alert_rules (list_rules/get_rule/test_rule)', description: 'View alert rules', category: 'Alerts & Notifications' },
       // Files, Disk & Registry
-      { name: 'analyze_disk_usage', description: 'Filesystem analysis', category: 'Files, Disk & Registry' },
+      { name: 'analyze_disk_usage', description: 'Filesystem analysis from the latest stored scan', category: 'Files, Disk & Registry' },
       { name: 'disk_cleanup (preview)', description: 'Preview cleanup candidates', category: 'Files, Disk & Registry' },
-      { name: 'system_cleanup (list)', description: 'List OS-native cleaners and their estimated reclaim', category: 'Files, Disk & Registry' },
       { name: 'system_cleanup (status)', description: 'Read the progress and result of a native cleanup run', category: 'Files, Disk & Registry' },
       // Logs & Audit
       { name: 'query_audit_log', description: 'Search audit logs', category: 'Logs & Audit' },
@@ -103,14 +123,14 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'search_logs', description: 'Event log search', category: 'Logs & Audit' },
       { name: 'get_log_trends', description: 'Log trend analysis', category: 'Logs & Audit' },
       { name: 'search_agent_logs', description: 'Agent diagnostic log search', category: 'Logs & Audit' },
-      // Services & Processes
-      { name: 'manage_processes (list)', description: 'List running processes with CPU/memory', category: 'Services & Processes' },
-      { name: 'manage_scheduled_tasks (list)', description: 'List Windows scheduled tasks', category: 'Services & Processes' },
       // Scripts & Automation
       { name: 'search_script_library', description: 'Search scripts and templates', category: 'Scripts & Automation' },
       { name: 'get_script_details', description: 'Script content, versions, and stats', category: 'Scripts & Automation' },
       { name: 'get_script_execution_history', description: 'Past execution results for a script', category: 'Scripts & Automation' },
       { name: 'get_script_execution', description: 'One script execution with its output', category: 'Scripts & Automation' },
+      // W01 (#6755)
+      { name: 'list_scripts', description: 'List scripts in the library', category: 'Scripts & Automation' },
+      { name: 'list_script_templates', description: 'List script templates', category: 'Scripts & Automation' },
       // AI script authoring (behind BREEZE_AI_SCRIPT_AUTHORING_ENABLED). A
       // proposal is inert: nothing runs until run_script consumes it (Tier 3).
       { name: 'propose_script', description: 'Author a script as a proposal for independent review', category: 'Scripts & Automation' },
@@ -134,9 +154,27 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'query_backups', description: 'List backup configs, jobs, and policies', category: 'Backup & Recovery' },
       { name: 'get_backup_status', description: 'Backup health summary', category: 'Backup & Recovery' },
       { name: 'browse_snapshots', description: 'Browse backup snapshots', category: 'Backup & Recovery' },
+      // W01 (#6755): Hyper-V, MSSQL, vault, SLA and C2C reads
+      { name: 'get_hyperv_vm_details', description: 'Hyper-V VM details', category: 'Backup & Recovery' },
+      { name: 'query_hyperv_vms', description: 'List Hyper-V VMs', category: 'Backup & Recovery' },
+      { name: 'get_mssql_backup_status', description: 'SQL Server backup status', category: 'Backup & Recovery' },
+      { name: 'query_mssql_instances', description: 'List SQL Server instances', category: 'Backup & Recovery' },
+      { name: 'get_vault_status', description: 'Backup vault sync status', category: 'Backup & Recovery' },
+      { name: 'get_vm_restore_estimate', description: 'VM restore time estimate', category: 'Backup & Recovery' },
+      { name: 'query_backup_sla', description: 'Backup SLA configurations', category: 'Backup & Recovery' },
+      { name: 'get_sla_breaches', description: 'Backup SLA breach events', category: 'Backup & Recovery' },
+      { name: 'get_sla_compliance_report', description: 'Backup SLA compliance report', category: 'Backup & Recovery' },
+      { name: 'query_c2c_jobs', description: 'Cloud-to-cloud backup jobs', category: 'Backup & Recovery' },
+      { name: 'search_c2c_items', description: 'Search cloud mailbox/file items', category: 'Backup & Recovery' },
+      // W01 (#6755) follow-up: vault, C2C connection and DR reads
+      { name: 'query_vaults', description: 'List backup vaults', category: 'Backup & Recovery' },
+      { name: 'query_c2c_connections', description: 'Cloud-to-cloud backup connections', category: 'Backup & Recovery' },
+      { name: 'query_dr_plans', description: 'List disaster recovery plans', category: 'Backup & Recovery' },
+      { name: 'get_dr_plan_details', description: 'Disaster recovery plan details', category: 'Backup & Recovery' },
+      { name: 'get_dr_execution_status', description: 'Disaster recovery execution status', category: 'Backup & Recovery' },
       // Monitoring & Analytics
       { name: 'query_monitors', description: 'List monitors with status', category: 'Monitoring & Analytics' },
-      { name: 'manage_monitors (get)', description: 'Monitor details and history', category: 'Monitoring & Analytics' },
+      { name: 'manage_monitors (get/create/update/delete)', description: 'Monitor details and history; retired writes return guidance', category: 'Monitoring & Analytics' },
       { name: 'query_analytics', description: 'SLA compliance and capacity predictions', category: 'Monitoring & Analytics' },
       { name: 'get_executive_summary', description: 'Executive summary metrics', category: 'Monitoring & Analytics' },
       // Monitor definitions (#5289 Task 8) — distinct from the network-monitor
@@ -191,8 +229,12 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       // Devices & Hardware
       { name: 'set_device_context', description: 'Set brain device context', category: 'Devices & Hardware' },
       { name: 'resolve_device_context', description: 'Resolve brain device context', category: 'Devices & Hardware' },
-      // Services & Processes
+      // Live device reads — each runs a command on the device (devices.execute)
+      { name: 'analyze_boot_performance (triggerCollection)', description: 'Collect fresh boot metrics from the device', category: 'Devices & Hardware' },
+      // Services & Processes — live listings run a command on the device
       { name: 'manage_services (list)', description: 'List services on device', category: 'Services & Processes' },
+      { name: 'manage_processes (list)', description: 'List running processes with CPU/memory', category: 'Services & Processes' },
+      { name: 'manage_scheduled_tasks (list)', description: 'List Windows scheduled tasks', category: 'Services & Processes' },
       // Network & DNS
       { name: 'acknowledge_network_device', description: 'Acknowledge network device', category: 'Network & DNS' },
       { name: 'configure_network_baseline', description: 'Configure network baseline', category: 'Network & DNS' },
@@ -201,6 +243,8 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'execute_command (list_processes/file_list/event_logs_list)', description: 'Read-only device commands (process list, directory listings, event log channel list)', category: 'Remote Access & Control' },
       // Files, Disk & Registry
       { name: 'file_operations (list)', description: 'List directory contents on device', category: 'Files, Disk & Registry' },
+      { name: 'analyze_disk_usage (refresh)', description: 'Run a fresh filesystem scan on the device', category: 'Files, Disk & Registry' },
+      { name: 'system_cleanup (list)', description: 'List OS-native cleaners and their estimated reclaim', category: 'Files, Disk & Registry' },
       { name: 'registry_operations (read_key/get_value)', description: 'Read Windows registry values on device', category: 'Files, Disk & Registry' },
       // Logs & Audit
       { name: 'detect_log_correlations', description: 'Log correlation detection', category: 'Logs & Audit' },
@@ -210,8 +254,6 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'apply_configuration_policy', description: 'Assign config policy', category: 'Configuration Policies' },
       { name: 'remove_configuration_policy_assignment', description: 'Remove config assignment', category: 'Configuration Policies' },
       { name: 'manage_configuration_policy (activate/deactivate)', description: 'Toggle policy status', category: 'Configuration Policies' },
-      // Integrations
-      { name: 'test_webhook', description: 'Test webhook delivery', category: 'Integrations' },
       // Other
       { name: 'manage_tags (add/remove)', description: 'Add or remove device tags', category: 'Other' },
       { name: 'manage_saved_filters (create/delete)', description: 'Create or delete saved filters', category: 'Other' },
@@ -266,19 +308,20 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'registry_operations (set_value/create_key/delete_key)', description: 'Modify Windows registry', category: 'Files, Disk & Registry' },
       // Network & DNS
       { name: 'network_discovery', description: 'Network discovery scan', category: 'Network & DNS' },
+      { name: 'diagnose_connectivity', description: 'One approved topology connectivity check (fresh MFA)', category: 'Network & DNS' },
       // Scripts & Automation
       { name: 'execute_playbook', description: 'Execute self-healing playbook', category: 'Scripts & Automation' },
       // Backup & Recovery
       { name: 'trigger_backup', description: 'Initiate on-demand backup', category: 'Backup & Recovery' },
       { name: 'restore_snapshot', description: 'Restore a backup snapshot', category: 'Backup & Recovery' },
       // Monitoring & Analytics
-      { name: 'manage_monitors (create/update/delete)', description: 'Create, update, or delete monitors', category: 'Monitoring & Analytics' },
       { name: 'manage_delivery (create_routing/update_routing/delete_routing/set_default/create_escalation/update_escalation/delete_escalation)', description: 'Manage alert routing, default destinations, and escalation policies (requires approval)', category: 'Alerts & Notifications' },
       // Monitor definitions (#5289 Task 8): ordinary config-object CRUD
       // (create/update/delete/enable/disable/attach/detach) — supervised, same
       // class as the software/browser/peripheral policy tools.
       { name: 'manage_monitor_definitions', description: 'Create, update, delete, or attach/detach a monitor definition', category: 'Monitoring & Analytics' },
       // Integrations
+      { name: 'test_webhook', description: 'Test webhook delivery — sends a real outbound POST; route requires MFA', category: 'Integrations' },
       { name: 'trigger_agent_upgrade', description: 'Queue agent upgrade', category: 'Integrations' },
       { name: 'trigger_agent_restart', description: 'Restart a wedged/silent agent via the watchdog', category: 'Integrations' },
       // Configuration Policies
@@ -337,9 +380,9 @@ export const RATE_LIMIT_CONFIGS: RateLimitConfig[] = [
   { toolName: 'resolve_device_context', tier: 2, permission: 'devices.write', category: 'Devices & Hardware' },
   // Services & Processes
   { toolName: 'manage_services', tier: 3, permission: 'devices.execute', category: 'Services & Processes' },
-  { toolName: 'manage_processes', tier: 1, permission: 'devices.read', category: 'Services & Processes' },
+  { toolName: 'manage_processes', tier: 1, permission: 'devices.execute', category: 'Services & Processes' },
   { toolName: 'manage_startup_items', tier: 3, permission: 'devices.execute', category: 'Services & Processes' },
-  { toolName: 'manage_scheduled_tasks', tier: 1, permission: 'devices.read', category: 'Services & Processes' },
+  { toolName: 'manage_scheduled_tasks', tier: 1, permission: 'devices.execute', category: 'Services & Processes' },
   // Security & Compliance
   { toolName: 'security_scan', tier: 3, permission: 'devices.execute', category: 'Security & Compliance' },
   // Files, Disk & Registry
@@ -350,6 +393,7 @@ export const RATE_LIMIT_CONFIGS: RateLimitConfig[] = [
   { toolName: 'registry_operations', tier: 2, permission: 'devices.execute', category: 'Files, Disk & Registry' },
   // Network & DNS
   { toolName: 'network_discovery', tier: 3, permission: 'devices.execute', category: 'Network & DNS' },
+  { toolName: 'diagnose_connectivity', tier: 3, permission: 'devices.execute', category: 'Network & DNS' },
   // Logs & Audit
   { toolName: 'search_logs', tier: 1, permission: 'devices.read', category: 'Logs & Audit' },
   { toolName: 'get_log_trends', tier: 1, permission: 'devices.read', category: 'Logs & Audit' },
@@ -370,9 +414,9 @@ export const RATE_LIMIT_CONFIGS: RateLimitConfig[] = [
   { toolName: 'trigger_backup', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
   { toolName: 'restore_snapshot', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
   // Monitoring & Analytics
-  { toolName: 'manage_monitors', tier: 1, permission: 'devices.write', category: 'Monitoring & Analytics' },
+  { toolName: 'manage_monitors', tier: 1, permission: 'devices.read', category: 'Monitoring & Analytics' },
   // Integrations
-  { toolName: 'test_webhook', tier: 2, permission: 'devices.write', category: 'Integrations' },
+  { toolName: 'test_webhook', tier: 3, permission: 'organizations.write', category: 'Integrations' },
   { toolName: 'trigger_agent_upgrade', tier: 3, permission: 'devices.execute', category: 'Integrations' },
   { toolName: 'trigger_agent_restart', tier: 3, permission: 'devices.execute', category: 'Integrations' },
   { toolName: 'manage_notification_channels', tier: 1, permission: 'alerts.read', category: 'Alerts & Notifications' },
@@ -410,7 +454,7 @@ export const RATE_LIMIT_CONFIGS: RateLimitConfig[] = [
   { toolName: 'configure_vault', tier: 2, permission: 'organizations.write', category: 'Backup & Recovery' },
   { toolName: 'trigger_vault_sync', tier: 2, permission: 'devices.execute', category: 'Backup & Recovery' },
   { toolName: 'execute_dr_plan', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
-  { toolName: 'manage_dr_plan', tier: 2, permission: 'organizations.write', category: 'Backup & Recovery' },
+  { toolName: 'manage_dr_plan', tier: 2, permission: 'devices.write', category: 'Backup & Recovery' },
   { toolName: 'instant_boot_vm', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
   { toolName: 'restore_as_vm', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
   { toolName: 'manage_hyperv_vm', tier: 3, permission: 'devices.execute', category: 'Backup & Recovery' },
@@ -442,19 +486,30 @@ export const RBAC_MAPPINGS: Record<string, string | Record<string, string>> = {
   query_devices: 'devices.read',
   get_device_details: 'devices.read',
   get_device_hardware_health: 'devices.read',
+  get_device_time_status: 'devices.read',
+  list_time_sync_issues: 'devices.read',
   analyze_metrics: 'devices.read',
   get_active_users: 'devices.read',
   get_user_experience_metrics: 'devices.read',
   get_fleet_health: 'devices.read',
   get_fleet_findings: 'devices.read',
   analyze_fleet_metrics: 'devices.read',
-  analyze_boot_performance: 'devices.read',
-  analyze_disk_usage: 'devices.read',
-  manage_processes: { list: 'devices.read', kill: 'devices.execute' },
+  // Stored data needs read; the live-read input flag needs execute.
+  analyze_boot_performance: { stored: 'devices.read', triggerCollection: 'devices.execute' },
+  analyze_disk_usage: { stored: 'devices.read', refresh: 'devices.execute' },
+  manage_processes: { list: 'devices.execute', kill: 'devices.execute' },
   // Network
   get_network_changes: 'devices.read',
   get_ip_history: 'devices.read',
   get_network_asset_reachability: 'devices.read',
+  get_interface_history: 'topology.read',
+  get_link_health: 'topology.read',
+  get_topology_impact: 'topology.read',
+  get_recent_network_changes: 'topology.read',
+  get_topology_monitoring_status: 'topology.read',
+  get_topology: 'topology.read',
+  get_link_evidence: 'topology.read',
+  get_diagnostic_run: 'topology.read',
   get_dns_security: 'devices.read',
   acknowledge_network_device: 'devices.write',
   configure_network_baseline: 'devices.write',
@@ -474,13 +529,13 @@ export const RBAC_MAPPINGS: Record<string, string | Record<string, string>> = {
   // Services & startup
   manage_services: 'devices.execute',
   manage_startup_items: 'devices.execute',
-  manage_scheduled_tasks: { list: 'devices.read', run: 'devices.execute', disable: 'devices.execute', enable: 'devices.execute' },
+  manage_scheduled_tasks: { list: 'devices.execute', run: 'devices.execute', disable: 'devices.execute', enable: 'devices.execute' },
   // Security
   security_scan: { scan: 'devices.execute', status: 'devices.execute', quarantine: 'devices.execute', remove: 'devices.execute', restore: 'devices.execute', vulnerabilities: 'devices.read' },
   get_security_posture: 'devices.read',
   // Files & disk
   disk_cleanup: { preview: 'devices.read', execute: 'devices.execute' },
-  system_cleanup: { list: 'devices.read', run: 'devices.execute', status: 'devices.read' },
+  system_cleanup: { list: 'devices.execute', run: 'devices.execute', status: 'devices.read' },
   file_operations: { list: 'devices.read', read: 'devices.read', write: 'devices.execute', delete: 'devices.execute', mkdir: 'devices.execute', rename: 'devices.execute' },
   // Registry
   registry_operations: { read_key: 'devices.execute', get_value: 'devices.execute', set_value: 'devices.execute', create_key: 'devices.execute', delete_key: 'devices.execute' },
@@ -501,6 +556,7 @@ export const RBAC_MAPPINGS: Record<string, string | Record<string, string>> = {
   analyze_screen: 'devices.execute',
   // Network discovery
   network_discovery: 'devices.execute',
+  diagnose_connectivity: 'devices.execute',
   // Brain device context
   get_device_context: 'devices.read',
   set_device_context: 'devices.write',
@@ -533,21 +589,25 @@ export const RBAC_MAPPINGS: Record<string, string | Record<string, string>> = {
   apply_configuration_policy: 'devices.write',
   remove_configuration_policy_assignment: 'devices.write',
   // Backup & DR
-  query_backups: 'organizations.read',
+  // Per-action map, matching routes/backup/configs.ts (backup:read),
+  // routes/backup/jobs.ts (organizations:read) and routes/configurationPolicies/
+  // crud.ts (devices:read).
+  query_backups: { list_configs: 'backup.read', list_jobs: 'organizations.read', list_policies: 'devices.read' },
   get_backup_status: 'organizations.read',
   browse_snapshots: 'backup.read',
   trigger_backup: 'devices.execute',
   restore_snapshot: 'devices.execute',
   // Monitoring
   query_monitors: 'devices.read',
-  manage_monitors: { get: 'devices.read', create: 'devices.write', update: 'devices.write', delete: 'devices.write' },
+  manage_monitors: { get: 'devices.read', create: 'devices.read', update: 'devices.read', delete: 'devices.read' },
   // Analytics
   query_analytics: 'devices.read',
   get_executive_summary: 'devices.read',
   // Integrations
   query_webhooks: 'devices.read',
-  query_psa_status: 'devices.read',
-  test_webhook: 'devices.write',
+  // Route requires organizations:read (routes/psa.ts:435).
+  query_psa_status: 'organizations.read',
+  test_webhook: 'organizations.write',
   // Agent management
   query_agent_versions: 'devices.read',
   trigger_agent_upgrade: 'devices.execute',

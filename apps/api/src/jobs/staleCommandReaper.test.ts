@@ -34,6 +34,9 @@ const { selectMock, updateMock, deviceCommandsTable, restoreJobsTable, backupJob
     deviceId: 'backup_jobs.device_id',
     status: 'backup_jobs.status',
     lastProgressAt: 'backup_jobs.last_progress_at',
+    lastKeepaliveAt: 'backup_jobs.last_keepalive_at',
+    totalSize: 'backup_jobs.total_size',
+    transferredSize: 'backup_jobs.transferred_size',
     startedAt: 'backup_jobs.started_at',
     createdAt: 'backup_jobs.created_at',
     completedAt: 'backup_jobs.completed_at',
@@ -142,6 +145,9 @@ import {
   SOFTWARE_INSTALL_TIMEOUT_MS,
   reapStaleScriptExecutions,
   reapCommandlessPendingRestores,
+  backupNoTransferWindowMs,
+  BACKUP_NO_TRANSFER_MIN_WINDOW_MS,
+  BACKUP_NO_TRANSFER_MAX_WINDOW_MS,
 } from './staleCommandReaper';
 
 function selectChain(resolvedValue: unknown) {
@@ -333,6 +339,159 @@ describe('stale command reaper', () => {
     expect(reaped).toBe(0);
     expect(updateMock).not.toHaveBeenCalled();
     expect(applyAutomationActionTerminalMock).not.toHaveBeenCalled();
+  });
+
+  // #7105 item 3 — a timed-out backup command used to fail only its
+  // device_commands row; the backup_jobs row it owns stayed `running` until
+  // the backup reaper's 24 h absolute cap. mssql_backup / hyperv_backup rows
+  // (routes: payload.jobId; AI tools: payload.backupJobId) are the live case.
+  describe('backup command timeout → backup_jobs (#7105)', () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const JOB_ID = '6f1c2b1e-5b0a-4c55-9d7e-2a8f3c1b9e40';
+
+    // Walks a drizzle condition tree for a string — the mocked table columns
+    // are plain strings, so a dropped `eq(backupJobs.deviceId, …)` disappears
+    // from the tree.
+    function conditionMentions(root: unknown, needle: string): boolean {
+      const seen = new WeakSet<object>();
+      const walk = (value: unknown): boolean => {
+        if (typeof value === 'string') return value === needle;
+        if (!value || typeof value !== 'object') return false;
+        if (seen.has(value as object)) return false;
+        seen.add(value as object);
+        return Object.values(value as Record<string, unknown>).some(walk);
+      };
+      return walk(root);
+    }
+
+    const backupWhere = vi.fn();
+
+    function wireUpdates(backupReturning: unknown[] = [{ id: JOB_ID }]) {
+      backupWhere.mockImplementation(() => ({ returning: vi.fn().mockResolvedValue(backupReturning) }));
+      const backupSet = vi.fn(() => ({ where: backupWhere }));
+      updateMock.mockImplementation((table: unknown) => {
+        if (table === deviceCommandsTable) {
+          return { set: vi.fn(() => ({ where: vi.fn(() => ({ returning: vi.fn().mockResolvedValue([{ id: 'cmd' }]) })) })) };
+        }
+        if (table === deploymentResultsTable) return { set: vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) })) };
+        if (table === restoreJobsTable) return { set: vi.fn(() => ({ where: vi.fn().mockResolvedValue([]) })) };
+        if (table === backupJobsTable) return { set: backupSet };
+        throw new Error(`Unexpected table update: ${String(table)}`);
+      });
+      return backupSet;
+    }
+
+    it.each([
+      ['mssql_backup (route payload.jobId)', 'mssql_backup', { jobId: JOB_ID }, 3 * 60 * 60 * 1000],
+      ['hyperv_backup (AI tool payload.backupJobId)', 'hyperv_backup', { backupJobId: JOB_ID }, 3 * 60 * 60 * 1000],
+      ['backup_run (24 h tier)', 'backup_run', { jobId: JOB_ID }, DAY + 60_000],
+    ])('fails the owning backup job when a %s command times out', async (_label, type, payload, ageMs) => {
+      const executedAt = new Date(Date.now() - ageMs);
+      selectMock
+        .mockReturnValueOnce(selectChain([{
+          id: 'cmd', type, status: 'sent', payload, deviceId: 'device-1',
+          createdAt: executedAt, executedAt, deliverBy: null,
+        }]))
+        .mockReturnValueOnce(selectChain([{ errorLog: 'queued on agent' }]));
+      const backupSet = wireUpdates();
+
+      expect(await reapStaleDeviceCommands()).toBe(1);
+
+      // Both the lookup and the write are fenced on the COMMAND's device, so a
+      // payload naming another device's job can touch nothing.
+      const lookupChain = selectMock.mock.results[1]!.value as { where: ReturnType<typeof vi.fn> };
+      const lookupWhere = lookupChain.where.mock.calls[0]?.[0];
+      expect(conditionMentions(lookupWhere, 'backup_jobs.device_id')).toBe(true);
+      expect(conditionMentions(lookupWhere, 'device-1')).toBe(true);
+      const updateWhere = backupWhere.mock.calls[0]?.[0];
+      expect(conditionMentions(updateWhere, 'backup_jobs.device_id')).toBe(true);
+      expect(conditionMentions(updateWhere, 'device-1')).toBe(true);
+
+      expect(backupSet).toHaveBeenCalledTimes(1);
+      const set = (backupSet.mock.calls[0] as unknown as [Record<string, unknown>])[0];
+      expect(set.status).toBe('failed');
+      // Marker-stamped so a late genuine completion can still flip the row
+      // failed→completed (STALE_BACKUP_REAP_MARKER / FIX 7), and appended to
+      // the existing log rather than replacing it.
+      expect(set.errorLog).toMatch(/^queued on agent\n\[stale-backup-reaper\] Backup command timed out: /);
+      expect(queueBackupStopCommandMock).not.toHaveBeenCalled();
+    });
+
+    it('contains a backup_jobs failure so the rest of the propagation (DR reconcile) still runs', async () => {
+      const executedAt = new Date(Date.now() - 3 * 60 * 60 * 1000);
+      selectMock
+        .mockReturnValueOnce(selectChain([{
+          id: 'cmd', type: 'mssql_backup', status: 'sent', payload: { jobId: JOB_ID }, deviceId: 'device-1',
+          createdAt: executedAt, executedAt, deliverBy: null,
+        }]))
+        .mockImplementationOnce(() => { throw new Error('connection reset'); });
+      wireUpdates();
+      const { captureException } = await import('../services/sentry');
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      try {
+        expect(await reapStaleDeviceCommands()).toBe(1);
+        expect(captureException).toHaveBeenCalledWith(expect.objectContaining({ message: 'connection reset' }));
+        // Contained INSIDE propagation, not by the caller's catch: the caller's
+        // catch logs "Failed to propagate stale command", which must not fire.
+        expect(errorSpy.mock.calls.some((c) => String(c[0]).includes('Failed to propagate stale command'))).toBe(false);
+        expect(errorSpy.mock.calls.some((c) => String(c[0]).includes('Failed to fail backup job'))).toBe(true);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    it('leaves backup_jobs alone for a non-backup command that happens to carry a jobId', async () => {
+      const executedAt = new Date(Date.now() - 3 * 60 * 60 * 1000);
+      selectMock.mockReturnValueOnce(selectChain([{
+        id: 'cmd', type: 'software_install', status: 'sent', payload: { jobId: JOB_ID }, deviceId: 'device-1',
+        createdAt: executedAt, executedAt, deliverBy: null,
+      }]));
+      const backupSet = wireUpdates();
+
+      expect(await reapStaleDeviceCommands()).toBe(1);
+      expect(backupSet).not.toHaveBeenCalled();
+    });
+
+    it('does not touch a backup job that is no longer in flight (or belongs to another device)', async () => {
+      const executedAt = new Date(Date.now() - 3 * 60 * 60 * 1000);
+      selectMock
+        .mockReturnValueOnce(selectChain([{
+          id: 'cmd', type: 'mssql_backup', status: 'sent', payload: { jobId: JOB_ID }, deviceId: 'device-1',
+          createdAt: executedAt, executedAt, deliverBy: null,
+        }]))
+        // The lookup is fenced on (id, device_id, status in pending/running).
+        .mockReturnValueOnce(selectChain([]));
+      const backupSet = wireUpdates();
+
+      expect(await reapStaleDeviceCommands()).toBe(1);
+      expect(backupSet).not.toHaveBeenCalled();
+    });
+
+    it('skips a job id that is not a uuid instead of aborting the lookup (22P02)', async () => {
+      const executedAt = new Date(Date.now() - 3 * 60 * 60 * 1000);
+      selectMock.mockReturnValueOnce(selectChain([{
+        id: 'cmd', type: 'mssql_backup', status: 'sent', payload: { jobId: 'not-a-uuid' }, deviceId: 'device-1',
+        createdAt: executedAt, executedAt, deliverBy: null,
+      }]));
+      const backupSet = wireUpdates();
+
+      expect(await reapStaleDeviceCommands()).toBe(1);
+      expect(selectMock).toHaveBeenCalledTimes(1);
+      expect(backupSet).not.toHaveBeenCalled();
+    });
+
+    it('does not time out a backup_run command 3 hours in (the 24 h tier, not the 30 min default)', async () => {
+      const executedAt = new Date(Date.now() - 3 * 60 * 60 * 1000);
+      selectMock.mockReturnValueOnce(selectChain([{
+        id: 'cmd', type: 'backup_run', status: 'sent', payload: { jobId: JOB_ID }, deviceId: 'device-1',
+        createdAt: executedAt, executedAt, deliverBy: null,
+      }]));
+      wireUpdates();
+
+      expect(await reapStaleDeviceCommands()).toBe(0);
+      expect(updateMock).not.toHaveBeenCalled();
+    });
   });
 
   // #2774 — a drain-window self_uninstall must outlive the 30-min timeout
@@ -1086,6 +1245,143 @@ describe('reapStaleBackupJobs — boundary pins (frozen clock, N±1ms)', () => {
   });
 });
 
+describe('reapStaleBackupJobs — liveness vs progress (#2798)', () => {
+  const T = new Date('2026-07-17T00:00:00.000Z').getTime();
+  const MIN = 60 * 1000;
+  const GiB = 1024 * 1024 * 1024;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(T);
+    queueBackupStopCommandMock.mockResolvedValue({ command: {} });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function liveRow(progressAgeMs: number, extra: Record<string, unknown> = {}) {
+    return {
+      id: 'job-live',
+      deviceId: 'device-live',
+      lastKeepaliveAt: new Date(T - 30 * 1000),
+      lastProgressAt: new Date(T - progressAgeMs),
+      totalSize: null as number | null,
+      transferredSize: null as number | null,
+      startedAt: new Date(T - progressAgeMs - 10 * MIN),
+      createdAt: new Date(T - progressAgeMs - 11 * MIN),
+      errorLog: null,
+      deviceStatus: 'online',
+      deviceLastSeenAt: new Date(T - 1000),
+      ...extra,
+    };
+  }
+
+  function captureSet() {
+    const setMock = vi.fn(() => ({
+      where: vi.fn(() => ({ returning: vi.fn().mockResolvedValue([{ id: 'job-live' }]) })),
+    }));
+    updateMock.mockImplementation(() => ({ set: setMock }));
+    return setMock;
+  }
+
+  it('does NOT reap a live agent whose counters have not moved for 20 minutes (one large file still uploading)', async () => {
+    // Before #2798 last_progress_at was liveness, so 20 minutes without a bump
+    // meant a dead agent. Now it means only "no file finished in 20 minutes",
+    // which is normal while one large file uploads (no in-file progress, #5417).
+    selectMock.mockReturnValueOnce(selectChain([liveRow(20 * MIN)])).mockReturnValueOnce(selectChain([]));
+    expect(await reapStaleBackupJobs()).toBe(0);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it('reaps a live-but-wedged agent once no bytes or files moved for longer than the window, and stops it', async () => {
+    const setMock = captureSet();
+    selectMock
+      .mockReturnValueOnce(selectChain([liveRow(BACKUP_NO_TRANSFER_MIN_WINDOW_MS + 1)]))
+      .mockReturnValueOnce(selectChain([]));
+
+    expect(await reapStaleBackupJobs()).toBe(1);
+    expect(setMock).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed',
+      errorLog: '[stale-backup-reaper] Backup stalled: no data transferred for 2h while the agent was still responding (limit 2h)',
+    }));
+    // The agent is alive, so it must be told to stop the wedged upload.
+    expect(queueBackupStopCommandMock).toHaveBeenCalledWith('device-live', { jobId: 'job-live' });
+  });
+
+  it('no-transfer window boundary: MIN_WINDOW-1ms is spared', async () => {
+    selectMock
+      .mockReturnValueOnce(selectChain([liveRow(BACKUP_NO_TRANSFER_MIN_WINDOW_MS - 1)]))
+      .mockReturnValueOnce(selectChain([]));
+    expect(await reapStaleBackupJobs()).toBe(0);
+  });
+
+  it('no-transfer rule measures from startedAt when no transfer ever happened (pre-upload phases)', async () => {
+    captureSet();
+    selectMock
+      .mockReturnValueOnce(selectChain([liveRow(0, { lastProgressAt: null, startedAt: new Date(T - BACKUP_NO_TRANSFER_MIN_WINDOW_MS - 1) })]))
+      .mockReturnValueOnce(selectChain([]));
+    expect(await reapStaleBackupJobs()).toBe(1);
+  });
+
+  it('spares a live job with enough bytes left that one file could still be in flight', async () => {
+    // 90 GiB left at the 512 KiB/s floor rate is > 24h → window is the 24h cap.
+    selectMock
+      .mockReturnValueOnce(selectChain([liveRow(5 * 60 * MIN, { totalSize: 100 * GiB, transferredSize: 10 * GiB })]))
+      .mockReturnValueOnce(selectChain([]));
+    expect(await reapStaleBackupJobs()).toBe(0);
+  });
+
+  it('a silent agent (keepalive stale) is still reaped on the 15-minute liveness rule', async () => {
+    const setMock = captureSet();
+    selectMock
+      .mockReturnValueOnce(selectChain([liveRow(20 * MIN, { lastKeepaliveAt: new Date(T - 16 * MIN) })]))
+      .mockReturnValueOnce(selectChain([]));
+    expect(await reapStaleBackupJobs()).toBe(1);
+    expect(setMock).toHaveBeenCalledWith(expect.objectContaining({
+      errorLog: '[stale-backup-reaper] Backup stalled: no progress reported for 15 minutes',
+    }));
+  });
+
+  it('a fresh keepalive keeps an online job off the 24h legacy absolute rule', async () => {
+    // Liveness present means rule C (never signalled) must not apply.
+    selectMock
+      .mockReturnValueOnce(selectChain([liveRow(0, {
+        lastProgressAt: null, totalSize: 1000 * GiB, transferredSize: 0,
+        startedAt: new Date(T - 23 * 60 * MIN), createdAt: new Date(T - 25 * 60 * MIN),
+      })]))
+      .mockReturnValueOnce(selectChain([]));
+    expect(await reapStaleBackupJobs()).toBe(0);
+  });
+
+  it('spares a pending job kept alive by a fresh keepalive even when lastProgressAt is NULL', async () => {
+    selectMock
+      .mockReturnValueOnce(selectChain([]))
+      .mockReturnValueOnce(selectChain([{
+        id: 'job-q', deviceId: 'device-q', errorLog: null, createdAt: new Date(T - 2 * 60 * MIN),
+        lastProgressAt: null, lastKeepaliveAt: new Date(T - MIN),
+        deviceStatus: 'online', deviceLastSeenAt: new Date(T - 1000), deviceBackupVersion: '0.110.0',
+      }]));
+    expect(await reapStaleBackupJobs()).toBe(0);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('backupNoTransferWindowMs', () => {
+  const MiB = 1024 * 1024;
+  it.each([
+    ['unknown totals', null, null, BACKUP_NO_TRANSFER_MIN_WINDOW_MS],
+    ['nothing left', 10 * MiB, 10 * MiB, BACKUP_NO_TRANSFER_MIN_WINDOW_MS],
+    ['counter past total', 10 * MiB, 20 * MiB, BACKUP_NO_TRANSFER_MIN_WINDOW_MS],
+    ['small remainder uses the floor', 1024 * MiB, 0, BACKUP_NO_TRANSFER_MIN_WINDOW_MS],
+    ['scales with remaining bytes at 512 KiB/s', 6 * 1024 * MiB, 0, (6 * 1024 * MiB / (512 * 1024)) * 1000],
+    ['capped at 24h', 1024 * 1024 * MiB, 0, BACKUP_NO_TRANSFER_MAX_WINDOW_MS],
+  ])('%s', (_label, total, transferred, expected) => {
+    expect(backupNoTransferWindowMs(total, transferred)).toBe(expected);
+  });
+});
+
 describe('reapStaleSoftwareDeploymentResults', () => {
   const minutesAgo = (n: number) => new Date(Date.now() - n * 60 * 1000);
   const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000);
@@ -1505,6 +1801,26 @@ describe('reapStaleScriptExecutions terminal-command guard (#3097)', () => {
     const written = execSet.mock.calls[0]![0];
     expect(written.status).toBe('failed');
     expect(String(written.errorMessage)).not.toContain('no response from agent');
+  });
+
+  // #3445: `reapStaleDeviceCommands` runs first in the same tick and stamps a
+  // timed-out command `failed` with `result.timedOutBy = 'server'`. That row is
+  // terminal, but it is the SERVER's verdict, not an agent reply — reporting
+  // "Agent result was delivered" for it sent the #3445 investigation down the
+  // wrong path. It is a timeout with no response from the agent.
+  it('reports a command the server itself timed out as a timeout, not as a delivered agent result (#3445)', async () => {
+    const { execSet } = arrange({
+      payload: { executionId: 'exec-1' },
+      status: 'failed',
+      result: { status: 'timeout', error: 'Server-side timeout: no response from agent', timedOutBy: 'server' },
+    });
+
+    await reapStaleScriptExecutions();
+
+    const written = execSet.mock.calls[0]![0];
+    expect(written.status).toBe('timeout');
+    expect(String(written.errorMessage)).toContain('no response from agent');
+    expect(String(written.errorMessage)).not.toContain('was delivered');
   });
 
   // #5128: a `pending`/`queued` execution whose command is still `sent` is now

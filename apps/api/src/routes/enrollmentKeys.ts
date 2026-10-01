@@ -1,8 +1,8 @@
 import { Hono } from "hono";
-import type { Context } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import { zValidator } from '../lib/validation';
 import { z } from "zod";
-import { and, eq, ne, sql, desc, inArray, lt, isNull, isNotNull, or, asc } from "drizzle-orm";
+import { and, eq, sql, desc, inArray, lt, isNull, isNotNull, or, asc, getTableColumns } from "drizzle-orm";
 import { customAlphabet } from "nanoid";
 import { db, withSystemDbAccessContext } from "../db";
 import { enrollmentKeys, organizations } from "../db/schema";
@@ -13,6 +13,7 @@ import {
 } from "../db/schema/installerBootstrapTokens";
 import {
   authMiddleware,
+  hasSatisfiedMfa,
   requireMfa,
   requirePermission,
   requireScope,
@@ -23,7 +24,12 @@ import { userRateLimit } from "../middleware/userRateLimit";
 import { randomBytes } from "crypto";
 import { createAuditLogAsync } from "../services/auditService";
 import { ANONYMOUS_ACTOR_ID } from "../services/auditEvents";
-import { PERMISSIONS } from "../services/permissions";
+import {
+  PERMISSIONS,
+  getUserPermissions,
+  hasPermission,
+  type UserPermissions,
+} from "../services/permissions";
 import { hashEnrollmentKey, hashEnrollmentKeyCandidates } from "../services/enrollmentKeySecurity";
 import {
   getTrustedClientIp,
@@ -58,6 +64,7 @@ import { captureException } from "../services/sentry";
 import { evaluateCapability, requireCapability } from "../services/partnerTrust";
 import { partnerTrustMode } from "../config/partnerTrustMode";
 
+import { notHiddenOrgType } from '../services/unassignedPool/visibility';
 // ============================================================
 // Signing-spend caps for the authenticated installer endpoint.
 // These bound how many costly MSI-sign / child-key operations
@@ -131,6 +138,20 @@ const DEFAULT_ENROLLMENT_KEY_TTL_MINUTES = getDefaultEnrollmentKeyTtlMinutes();
 const CHILD_ENROLLMENT_KEY_TTL_MINUTES = envInt(
   "CHILD_ENROLLMENT_KEY_TTL_MINUTES",
   60 * 24 * 30,
+);
+
+// A child minted by redeeming a public /s/:code short-link is a transport
+// container for ONE anonymous install, not a long-lived credential — unlike
+// the general CHILD_ENROLLMENT_KEY_TTL_MINUTES default above (30 days), it
+// has no business surviving for weeks. clampTtlToCap only ever narrows the
+// TTL down to the partner's configured cap, so a partner with a loose or
+// unset cap would otherwise still hand out a 30-day-lived download key —
+// exactly the window an already-redeemed, not-yet-consumed key stays valid
+// for even after its parent link is rotated (rotation revocation narrows
+// that further, but a hard ceiling here bounds it independent of rotation).
+const PUBLIC_DOWNLOAD_KEY_MAX_TTL_MINUTES = envInt(
+  "PUBLIC_DOWNLOAD_KEY_MAX_TTL_MINUTES",
+  60 * 24,
 );
 
 // Parent keys that are within this window of expiry are refused as installer
@@ -246,6 +267,109 @@ function writeEnrollmentKeyAudit(
     userAgent: c.req.header("user-agent"),
     result: "success",
   });
+}
+
+// ============================================================
+// Discard-on-failure for single-purpose parent keys (#7217)
+// ============================================================
+
+const DISCARD_KEY_ON_FAILURE_PARAM = "discardKeyOnFailure";
+const keyIdSchema = z.string().guid();
+
+/**
+ * Add Device mints a fresh parent key (`POST /`) and then asks for the
+ * artifact in a second request. When that second request fails, the key it
+ * minted would otherwise stay live for its whole TTL with nothing to show for
+ * it — five failed clicks left five live credentials (#7217). A caller that
+ * sets `?discardKeyOnFailure=1` asks the route to delete the key whenever it
+ * does not produce the artifact: any status >= 400, or a thrown error.
+ *
+ * Mount right AFTER the permission gate — a caller without write access never
+ * reaches the delete — and BEFORE the rate limiter, MFA gate and validators:
+ * Add Device's create and link calls share the `enroll-write` bucket, so the
+ * request most likely to be refused (a 429 on the link) is exactly the one
+ * whose key must still be discarded. Running ahead of MFA is safe because the
+ * only row it can touch is one this caller created (which itself required
+ * MFA) and never used.
+ *
+ * The delete is one guarded statement (see discardUnusedKeyAfterFailure): only
+ * a key this caller created, that has never been used, inside the caller's
+ * org and site reach. The flag therefore cannot remove a key already in
+ * service, or anyone else's.
+ */
+function discardKeyOnFailure(
+  route: "installer" | "installer-link",
+): MiddlewareHandler {
+  return async (c, next) => {
+    if (c.req.query(DISCARD_KEY_ON_FAILURE_PARAM) !== "1") return next();
+    try {
+      await next();
+    } catch (err) {
+      await discardUnusedKeyAfterFailure(c, route, 500);
+      throw err;
+    }
+    if (c.error || c.res.status >= 400) {
+      await discardUnusedKeyAfterFailure(c, route, c.res.status);
+    }
+  };
+}
+
+async function discardUnusedKeyAfterFailure(
+  c: Context,
+  route: "installer" | "installer-link",
+  status: number,
+): Promise<void> {
+  const auth = c.get("auth") as AuthContext | undefined;
+  const keyId = c.req.param("id");
+  if (!auth?.user?.id || !keyIdSchema.safeParse(keyId).success) return;
+
+  // One try around everything: this runs while the caller's original error is
+  // in flight, and a throw here must never replace it.
+  try {
+    const conditions = [
+      eq(enrollmentKeys.id, keyId!),
+      eq(enrollmentKeys.createdBy, auth.user.id),
+      eq(enrollmentKeys.usageCount, 0),
+    ];
+    const orgScope = auth.orgCondition(enrollmentKeys.orgId);
+    if (orgScope) conditions.push(orgScope as ReturnType<typeof eq>);
+    if (auth.scope === "organization" && auth.allowedSiteIds !== undefined) {
+      if (auth.allowedSiteIds.length === 0) return;
+      conditions.push(
+        inArray(enrollmentKeys.siteId, auth.allowedSiteIds) as ReturnType<typeof eq>,
+      );
+    }
+
+    // Bootstrap tokens issued from this key before the failure go with it
+    // (installer_bootstrap_tokens.parent_enrollment_key_id ON DELETE CASCADE).
+    const [deleted] = await db
+      .delete(enrollmentKeys)
+      .where(and(...conditions))
+      .returning({
+        id: enrollmentKeys.id,
+        orgId: enrollmentKeys.orgId,
+        name: enrollmentKeys.name,
+      });
+    if (!deleted) return;
+    writeEnrollmentKeyAudit(c, auth, {
+      orgId: deleted.orgId,
+      action: "enrollment_key.delete",
+      keyId: deleted.id,
+      keyName: deleted.name,
+      details: { reason: "artifact_not_produced", route, status },
+    });
+  } catch (err) {
+    console.error(
+      "[enrollment-keys] could not discard the key after a failed artifact request; it stays live until it expires or is deleted",
+      {
+        keyId,
+        route,
+        status,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    captureException(err, c);
+  }
 }
 
 // fetchRegularMsi and the macOS installer helpers live in installerBuilder.ts
@@ -465,9 +589,9 @@ export async function mintChildEnrollmentKey(
     const [org] = await db
       .select({ id: organizations.id })
       .from(organizations)
-      // The hidden 'quick_support' org may be the partner's oldest org — a child
-      // enrollment key must never default into it.
-      .where(and(eq(organizations.partnerId, input.partnerId), ne(organizations.type, 'quick_support')))
+      // A hidden org (Quick Support, the holding org) may be the partner's
+      // oldest org — a child enrollment key must never default into one.
+      .where(and(eq(organizations.partnerId, input.partnerId), notHiddenOrgType()))
       .orderBy(asc(organizations.createdAt))
       .limit(1);
     if (!org) {
@@ -596,11 +720,56 @@ const installerLinkSchema = z.object({
   ttlMinutes: z.number().int().min(1).max(MAX_TTL_MINUTES).optional(),
 }).strict();
 
+// `shortCode` is an enrollment-capable secret: anyone who can read it can
+// hit the unauthenticated `/s/:code` route and self-service enroll a fully
+// credentialed, auto-admitted device (see canRevealShortCode below). Callers
+// that already went through the same gate this route requires for minting
+// one (ORGS_WRITE + MFA — the create/rotate routes) pass `true` directly;
+// read-only callers get it redacted to a boolean presence flag instead.
 export function sanitizeEnrollmentKey(
   enrollmentKey: typeof enrollmentKeys.$inferSelect,
+  canRevealShortCode: boolean,
 ) {
-  const { key, keySecretHash, credentialGeneration, ...safeRecord } = enrollmentKey;
-  return safeRecord;
+  const { key, keySecretHash, credentialGeneration, shortCode, ...safeRecord } =
+    enrollmentKey;
+  return {
+    ...safeRecord,
+    shortCode: canRevealShortCode ? shortCode : null,
+    hasShortLink: shortCode != null,
+  };
+}
+
+/**
+ * Gate for revealing `shortCode` on a read response. Mirrors the permission
+ * the enrollment-key create/rotate/installer-distribution routes already
+ * require (`organizations:write` + MFA-when-policy-requires-it) — a caller
+ * who could not mint or manage a short-lived enrollment link should not be
+ * able to read one off an existing key either (SEC finding: read-only roles
+ * holding only `organizations:read` could self-service enroll a fully
+ * credentialed device via a key's short code).
+ *
+ * Prefers permissions already resolved earlier in the middleware chain
+ * (`requirePermission` sets `c.get('permissions')`) and only re-resolves
+ * when that is unavailable.
+ */
+async function canRevealShortCode(c: Context, auth: AuthContext): Promise<boolean> {
+  if (!hasSatisfiedMfa(auth)) return false;
+
+  let userPerms = c.get("permissions") as UserPermissions | undefined;
+  if (!userPerms) {
+    userPerms = (await getUserPermissions(auth.user.id, {
+      partnerId: auth.partnerId || undefined,
+      orgId: auth.orgId || undefined,
+      scope: auth.scope,
+    })) ?? undefined;
+  }
+  if (!userPerms) return false;
+
+  return hasPermission(
+    userPerms,
+    PERMISSIONS.ORGS_WRITE.resource,
+    PERMISSIONS.ORGS_WRITE.action,
+  );
 }
 
 /**
@@ -963,8 +1132,16 @@ enrollmentKeyRoutes.get(
       .where(whereCondition);
     const total = Number(countResult[0]?.count ?? 0);
 
+    // siteName (#7217): Add Device mints keys with identical names, so the
+    // list needs the bound site to tell them apart. A correlated subquery
+    // rather than a join keeps the row shape and every existing filter as is;
+    // it runs under the caller's RLS, so a site the caller cannot see reads
+    // as null rather than leaking its name.
     const keyList = await db
-      .select()
+      .select({
+        ...getTableColumns(enrollmentKeys),
+        siteName: sql<string | null>`(select ${sites.name} from ${sites} where ${sites.id} = ${enrollmentKeys.siteId})`,
+      })
       .from(enrollmentKeys)
       .where(whereCondition)
       .orderBy(desc(enrollmentKeys.createdAt), desc(enrollmentKeys.id))
@@ -989,9 +1166,11 @@ enrollmentKeyRoutes.get(
       c,
     );
 
+    const revealShortCode = await canRevealShortCode(c, auth);
+
     return c.json({
       data: keyList.map((keyRecord) => ({
-        ...sanitizeEnrollmentKey(keyRecord),
+        ...sanitizeEnrollmentKey(keyRecord, revealShortCode),
         installerTokens: installerUsage.get(keyRecord.id) ?? null,
       })),
       pagination: { page, limit, total },
@@ -1147,7 +1326,10 @@ enrollmentKeyRoutes.post(
 
     return c.json(
       {
-        ...sanitizeEnrollmentKey(enrollmentKey),
+        // Caller already passed requirePermission(ORGS_WRITE) + requireMfa()
+        // to reach this route, so it is the one that just minted this key's
+        // short code (if any) — reveal unconditionally.
+        ...sanitizeEnrollmentKey(enrollmentKey, true),
         key: rawKey,
       },
       201,
@@ -1325,9 +1507,10 @@ enrollmentKeyRoutes.get(
     // decide (#3034) — there is no per-key branch left for the two to disagree
     // about.
     const installerUsage = await fetchInstallerTokenUsage([enrollmentKey.id], c);
+    const revealShortCode = await canRevealShortCode(c, auth);
 
     return c.json({
-      ...sanitizeEnrollmentKey(enrollmentKey),
+      ...sanitizeEnrollmentKey(enrollmentKey, revealShortCode),
       installerTokens: installerUsage.get(enrollmentKey.id) ?? null,
     });
   },
@@ -1390,6 +1573,14 @@ enrollmentKeyRoutes.post(
     const maxUsage =
       data.maxUsage !== undefined ? data.maxUsage : existingKey.maxUsage;
 
+    // Rotation invalidates the OLD shortCode: an /s/ or /i/ code must stop
+    // resolving once the key is rotated, and must not inherit the usageCount
+    // reset below. Reallocate a fresh code for link rows so the link keeps
+    // working under a new code; rows with no short link stay null.
+    const nextShortCode = existingKey.shortCode
+      ? await allocateShortCode()
+      : existingKey.shortCode;
+
     const [rotatedKey] = await db
       .update(enrollmentKeys)
       .set({
@@ -1398,6 +1589,7 @@ enrollmentKeyRoutes.post(
         usageCount: 0,
         expiresAt,
         maxUsage,
+        shortCode: nextShortCode,
       })
       .where(eq(enrollmentKeys.id, keyId))
       .returning();
@@ -1410,17 +1602,28 @@ enrollmentKeyRoutes.post(
     // enrollment key. Revoking only the token would leave that child as a
     // working old-credential capability. Delete only unused children from old
     // epochs; a concurrently claimed child is preserved by usage_count = 0.
+    // Two independent lineages feed into this: bootstrap-token-derived
+    // children (installer_bootstrap_tokens.parent_enrollment_key_id) and
+    // /s/:code short-link-derived children (enrollment_keys.source_link_key_id
+    // — stamped directly against this parent, with no bootstrap-token row in
+    // between). Rotation revokes unused children from both lineages.
     const revokedDerivedKeys = await db
       .delete(enrollmentKeys)
       .where(
         and(
           eq(enrollmentKeys.usageCount, 0),
-          sql`${enrollmentKeys.bootstrapTokenId} in (
-            select ${installerBootstrapTokens.id}
-            from ${installerBootstrapTokens}
-            where ${installerBootstrapTokens.parentEnrollmentKeyId} = ${keyId}
-              and ${installerBootstrapTokens.parentCredentialGeneration} < ${rotatedKey.credentialGeneration}
-          )`,
+          or(
+            sql`${enrollmentKeys.bootstrapTokenId} in (
+              select ${installerBootstrapTokens.id}
+              from ${installerBootstrapTokens}
+              where ${installerBootstrapTokens.parentEnrollmentKeyId} = ${keyId}
+                and ${installerBootstrapTokens.parentCredentialGeneration} < ${rotatedKey.credentialGeneration}
+            )`,
+            and(
+              eq(enrollmentKeys.sourceLinkKeyId, keyId),
+              lt(enrollmentKeys.sourceLinkKeyGeneration, rotatedKey.credentialGeneration),
+            ),
+          ),
         ),
       )
       .returning({ id: enrollmentKeys.id });
@@ -1443,7 +1646,9 @@ enrollmentKeyRoutes.post(
     });
 
     return c.json({
-      ...sanitizeEnrollmentKey(rotatedKey),
+      // Caller already passed requirePermission(ORGS_WRITE) + requireMfa()
+      // to reach this route.
+      ...sanitizeEnrollmentKey(rotatedKey, true),
       key: rawKey,
     });
   },
@@ -1512,6 +1717,7 @@ enrollmentKeyRoutes.get(
     PERMISSIONS.ORGS_WRITE.resource,
     PERMISSIONS.ORGS_WRITE.action,
   ),
+  discardKeyOnFailure("installer"),
   requireMfa(),
   // No requireCapability("installer_distribute") here: this is the console's
   // authenticated own-device installer download (AddDeviceModal,
@@ -2106,6 +2312,7 @@ enrollmentKeyRoutes.post(
     PERMISSIONS.ORGS_WRITE.resource,
     PERMISSIONS.ORGS_WRITE.action,
   ),
+  discardKeyOnFailure("installer-link"),
   userRateLimit("enroll-write", 10, 60),
   requireMfa(),
   requireCapability("installer_distribute"),
@@ -2174,6 +2381,31 @@ enrollmentKeyRoutes.post(
       );
     }
 
+    // Resolve the public URL BEFORE minting the child: a link we cannot build
+    // must not leave a live short-link key behind (#7217).
+    const serverUrl = process.env.PUBLIC_API_URL || process.env.API_URL;
+    if (!serverUrl) {
+      return c.json(
+        { error: "Server URL not configured (set PUBLIC_API_URL or API_URL)" },
+        500,
+      );
+    }
+
+    // A Windows link is answered by the filename-token MSI, which needs a
+    // server URL the agent can redeem over https (#2341). When this server
+    // cannot serve one, every redemption of the link would fail — refuse to
+    // issue it, with the same reason the download route gives (#7217).
+    if (platform === "windows") {
+      try {
+        windowsFilenameApiHost(serverUrl);
+      } catch (err) {
+        if (err instanceof InstallerFilenameHostError) {
+          return c.json({ error: err.message }, 400);
+        }
+        throw err;
+      }
+    }
+
     // For macOS, validate that both architecture PKGs are reachable before
     // creating a child key — prevents links that 500 on every click.
     // Windows uses the bootstrap path (no signing dependency), so no probe needed.
@@ -2238,18 +2470,29 @@ enrollmentKeyRoutes.post(
       return c.json({ error: "Failed to generate installer link" }, 500);
     }
 
-    // Build public URL
-    const serverUrl = process.env.PUBLIC_API_URL || process.env.API_URL;
-    if (!serverUrl) {
-      return c.json(
-        { error: "Server URL not configured (set PUBLIC_API_URL or API_URL)" },
-        500,
-      );
-    }
-
     // Issue a one-time download handle so the raw token never appears in the URL.
-    const { issueDownloadHandle } = await import("../services/downloadHandle");
-    const handle = await issueDownloadHandle(rawChildKey);
+    // If that fails the caller never receives the link, so the child row we
+    // just minted — a live, short-coded credential — must go with it (#7217).
+    let handle: string;
+    try {
+      const { issueDownloadHandle } = await import("../services/downloadHandle");
+      handle = await issueDownloadHandle(rawChildKey);
+    } catch (err) {
+      console.error("[installer-link] download handle issuance failed:", err);
+      captureException(err, c);
+      await db
+        .delete(enrollmentKeys)
+        .where(eq(enrollmentKeys.id, childKey.id))
+        .catch((cleanupErr) => {
+          console.error(
+            "[installer-link] could not delete the unissued link key; it stays live until it expires:",
+            childKey.id,
+            cleanupErr instanceof Error ? cleanupErr.message : cleanupErr,
+          );
+          captureException(cleanupErr, c);
+        });
+      return c.json({ error: "Failed to generate installer link" }, 500);
+    }
 
     const publicUrl = `${serverUrl.replace(/\/$/, "")}/api/v1/enrollment-keys/public-download/${platform}?h=${handle}`;
     const shortUrl = `${serverUrl.replace(/\/$/, "")}/s/${shortCode}`;
@@ -2334,6 +2577,48 @@ enrollmentKeyRoutes.post(
 // Public routes (no auth middleware)
 // ============================================
 
+// Shared per-IP rate limit for every public/unauthenticated installer-serving
+// route (`/s/:code`, `/public-download/:platform`, and the MCP invite
+// landing `/i/:shortCode/download/:os`). Factored out so a new public
+// download route can't ship without it. Fails CLOSED on Redis errors — an
+// a Redis outage must not thereby disable the limiter.
+// 10 requests per minute per (trusted) client IP.
+export async function enforcePublicInstallerIpRateLimit(
+  c: Context,
+): Promise<Response | null> {
+  const ip = getTrustedClientIp(c, "unknown");
+  try {
+    const { getRedis } = await import("../services");
+    const { rateLimiter } = await import("../services/rate-limit");
+    const redis = getRedis();
+    if (!redis) {
+      console.error(
+        "[public-installer] rate-limit unavailable: redis client missing",
+      );
+      return c.json({ error: "Service temporarily unavailable" }, 503);
+    }
+    const rateResult = await rateLimiter(
+      redis,
+      `public-installer:${rateLimitIpKey(ip)}`,
+      10,
+      60,
+    );
+    if (!rateResult.allowed) {
+      return c.json(
+        { error: "Too many requests. Please try again later." },
+        429,
+      );
+    }
+    return null;
+  } catch (err) {
+    console.error(
+      "[public-installer] rate-limit check failed (failing closed):",
+      err instanceof Error ? err.message : err,
+    );
+    return c.json({ error: "Service temporarily unavailable" }, 503);
+  }
+}
+
 // checkInstallerSignSpend gates the (expensive) installer-signing path with
 // a per-(short-code OR enrollment-key id) bucket, on top of the per-IP cap
 // applied separately by callers. Without this, an attacker rotating source
@@ -2400,7 +2685,6 @@ async function serveInstaller(
   keyRow: typeof enrollmentKeys.$inferSelect,
   platform: "windows" | "macos",
   rawToken: string,
-  cleanupOnFailure = false,
   signSpendBucketChecked = false,
   linkExpiresAt: Date | null = keyRow.expiresAt,
 ): Promise<Response> {
@@ -2620,28 +2904,18 @@ async function serveInstaller(
     // fire Sentry so operators can still see the underlying cause.
     captureException(err, c);
 
-    if (cleanupOnFailure) {
-      await db
-        .delete(enrollmentKeys)
-        .where(eq(enrollmentKeys.id, keyRow.id))
-        .catch((cleanupErr) => {
-          console.error(
-            "[public-download] Failed to clean up orphaned child key:",
-            keyRow.id,
-            cleanupErr instanceof Error ? cleanupErr.message : cleanupErr,
-          );
-        });
-    }
-
+    // The /s/:code caller removes its transport key and refunds the claimed
+    // use on ANY failed serve (see releaseFailedShortLinkClaim), not only
+    // this one.
     return c.json({ error: "Failed to build installer" }, 500);
   }
 }
 
 export const publicEnrollmentRoutes = new Hono();
 
-async function anonymousInstallerDistributionAllowed(
+export async function anonymousInstallerDistributionAllowed(
   orgId: string,
-  route: "public-download" | "short-link",
+  route: "public-download" | "short-link" | "invite-landing",
 ): Promise<boolean> {
   if (partnerTrustMode() === "off") return true;
 
@@ -2797,53 +3071,125 @@ publicShortLinkRoutes.get("/:code", async (c) => {
       );
     }
 
-    // Only now create the child key — no cleanup needed on failure.
-    // The short-link row holds only the hashed token — the raw token was never stored.
-    // We create a fresh single-use child key so we have something to embed in the installer.
-    // Child gets a FRESH TTL independent of the short-link row's remaining
-    // lifetime so the installer survives the trip to the target machine even
-    // if the short-link row is near its own expiry.
-    const rawToken = generateEnrollmentKey();
-    const tokenHash = hashEnrollmentKey(rawToken);
-    // Clamp (never reject — public, unauthenticated redemption path with no
-    // interactive caller) the child's default TTL to the partner cap (fix
-    // round 3, #2776): the cap bounds KEY LIFETIME, not just interactively-
-    // chosen input, so this short-link download must not hand out a child
-    // key longer-lived than the partner allows just because it uses the
-    // server-constant default.
-    const cappedTtlMinutes = await clampTtlToCap(row.orgId, CHILD_ENROLLMENT_KEY_TTL_MINUTES);
+    // The use is claimed. From here on, every path that does not hand the
+    // visitor an installer gives it back (#7217): a failed download is not a
+    // use. Before this, a server that could not build the installer burned
+    // one slot of the link per click.
+    const platform = row.installerPlatform;
+    let downloadKeyId: string | null = null;
+    let response: Response;
+    try {
+      // The short-link row holds only the hashed token — the raw token was never stored.
+      // We create a fresh single-use child key so we have something to embed in the installer.
+      // Child gets a FRESH TTL independent of the short-link row's remaining
+      // lifetime so the installer survives the trip to the target machine even
+      // if the short-link row is near its own expiry.
+      const rawToken = generateEnrollmentKey();
+      const tokenHash = hashEnrollmentKey(rawToken);
+      // Clamp (never reject — public, unauthenticated redemption path with no
+      // interactive caller) the child's default TTL to the partner cap (fix
+      // round 3, #2776): the cap bounds KEY LIFETIME, not just interactively-
+      // chosen input, so this short-link download must not hand out a child
+      // key longer-lived than the partner allows just because it uses the
+      // server-constant default.
+      const cappedTtlMinutes = Math.min(
+        await clampTtlToCap(row.orgId, CHILD_ENROLLMENT_KEY_TTL_MINUTES),
+        PUBLIC_DOWNLOAD_KEY_MAX_TTL_MINUTES,
+      );
 
-    const [downloadKey] = await db
-      .insert(enrollmentKeys)
-      .values({
-        orgId: row.orgId,
-        siteId: row.siteId,
-        name: `${row.name} (short-link download)`,
-        key: tokenHash,
-        keySecretHash: row.keySecretHash,
-        maxUsage: 1,
-        expiresAt: freshChildExpiresAt(cappedTtlMinutes),
-        createdBy: null,
-        installerPlatform: row.installerPlatform,
-      })
-      .returning();
+      const [downloadKey] = await db
+        .insert(enrollmentKeys)
+        .values({
+          orgId: row.orgId,
+          siteId: row.siteId,
+          name: `${row.name} (short-link download)`,
+          key: tokenHash,
+          keySecretHash: row.keySecretHash,
+          maxUsage: 1,
+          expiresAt: freshChildExpiresAt(cappedTtlMinutes),
+          createdBy: null,
+          installerPlatform: platform,
+          // Parent lineage (fix round, #2776 lineage follow-up): lets rotation
+          // find and revoke this child if the parent link is rotated before
+          // it's consumed — see the DELETE below in the /:id/rotate handler.
+          sourceLinkKeyId: row.id,
+          sourceLinkKeyGeneration: row.credentialGeneration,
+        })
+        .returning();
 
-    if (!downloadKey) {
-      return c.json({ error: "Failed to prepare installer" }, 500);
+      if (!downloadKey) {
+        response = c.json({ error: "Failed to prepare installer" }, 500);
+      } else {
+        downloadKeyId = downloadKey.id;
+        response = await serveInstaller(
+          c,
+          downloadKey,
+          platform,
+          rawToken,
+          true, // signSpendBucketChecked — debited against short code above
+          // The SHORT-LINK row's expiry, not downloadKey's: the download key is a
+          // fresh 24h transport container, while `row` is the link the admin
+          // configured — its remaining lifetime is what the Windows bootstrap
+          // token must inherit (#3038).
+          row.expiresAt,
+        );
+      }
+    } catch (err) {
+      await releaseFailedShortLinkClaim(c, row.id, downloadKeyId, 500);
+      throw err;
     }
 
-    return serveInstaller(
-      c,
-      downloadKey,
-      row.installerPlatform,
-      rawToken,
-      true,
-      true, // signSpendBucketChecked — debited against short code above
-      // The SHORT-LINK row's expiry, not downloadKey's: the download key is a
-      // fresh 24h transport container, while `row` is the link the admin
-      // configured — its remaining lifetime is what the Windows bootstrap
-      // token must inherit (#3038).
-      row.expiresAt,
-    );
+    if (response.status >= 400) {
+      await releaseFailedShortLinkClaim(c, row.id, downloadKeyId, response.status);
+    }
+    return response;
   });
 });
+
+/**
+ * Undo a /s/:code redemption that produced no installer (#7217): delete the
+ * transport download key it minted (cascading any bootstrap token issued from
+ * it) and give the claimed use back to the link. Runs inside the route's
+ * system DB context. Failures are logged and reported, never thrown — the
+ * visitor still gets the original error response.
+ */
+async function releaseFailedShortLinkClaim(
+  c: Context,
+  linkKeyId: string,
+  downloadKeyId: string | null,
+  status: number,
+): Promise<void> {
+  if (downloadKeyId) {
+    try {
+      await db.delete(enrollmentKeys).where(eq(enrollmentKeys.id, downloadKeyId));
+    } catch (err) {
+      console.error(
+        "[short-link] could not delete the download key of a failed redemption; it stays live until it expires",
+        {
+          keyId: downloadKeyId,
+          status,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+      captureException(err, c);
+    }
+  }
+
+  try {
+    await db
+      .update(enrollmentKeys)
+      .set({ usageCount: sql`GREATEST(${enrollmentKeys.usageCount} - 1, 0)` })
+      .where(eq(enrollmentKeys.id, linkKeyId))
+      .returning({ id: enrollmentKeys.id });
+  } catch (err) {
+    console.error(
+      "[short-link] could not refund the use claimed by a failed redemption",
+      {
+        keyId: linkKeyId,
+        status,
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+    captureException(err, c);
+  }
+}

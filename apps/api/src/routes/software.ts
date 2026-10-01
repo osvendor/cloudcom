@@ -13,9 +13,18 @@ import {
   devices,
   deviceCommands,
 } from '../db/schema';
-import { authMiddleware, requireMfa, requirePermission, requireScope, requireSiteAccess, type AuthContext } from '../middleware/auth';
+import {
+  authMiddleware,
+  requireMfa,
+  requirePermission,
+  requireScope,
+  requireSiteAccess,
+  withAuthDbAccessContext,
+  type AuthContext,
+} from '../middleware/auth';
 import { canManagePartnerWidePolicies } from '../services/partnerWideAccess';
 import { writeRouteAudit } from '../services/auditEvents';
+import { dateFromSqlValue } from '../services/portal/sqlTimestamp';
 import { resolveDeploymentTargets } from '../services/deploymentTargetResolver';
 import {
   getOrganizationSoftwareDownloadPolicy,
@@ -55,6 +64,7 @@ import {
 } from '../services/softwareDependencyIdentity';
 import {
   detectionRulesSchema,
+  successExitCodesSchema,
   softwareDownloadPolicySchema,
   SOFTWARE_FILE_TYPES,
   defaultSilentArgsForFileType,
@@ -587,7 +597,9 @@ const createVersionSchema = z.object({
   silentUninstallArgs: z.string().max(2000).optional(),
   preInstallScript: z.string().optional(),
   postInstallScript: z.string().optional(),
-  detectionRules: detectionRulesSchema.optional()
+  detectionRules: detectionRulesSchema.optional(),
+  // #7038: vendor-documented success exit codes, additive to the defaults.
+  successExitCodes: successExitCodesSchema.optional()
 });
 
 /**
@@ -617,7 +629,9 @@ const updateVersionSchema = z.object({
   architecture: z.string().max(20).optional(),
   silentInstallArgs: z.string().max(2000).nullable().optional(),
   silentUninstallArgs: z.string().max(2000).nullable().optional(),
-  detectionRules: detectionRulesSchema.nullable().optional()
+  detectionRules: detectionRulesSchema.nullable().optional(),
+  // null or [] clears the declared codes back to the built-in defaults.
+  successExitCodes: successExitCodesSchema.nullable().optional()
 });
 
 const listDeploymentsSchema = z.object({
@@ -1169,6 +1183,7 @@ softwareRoutes.post(
       preInstallScript: payload.preInstallScript ?? null,
       postInstallScript: payload.postInstallScript ?? null,
       detectionRules: payload.detectionRules ?? null,
+      successExitCodes: payload.successExitCodes ?? [],
     });
 
     if (!version) {
@@ -1290,6 +1305,23 @@ softwareRoutes.post(
         detectionRules = parsedDetection.data;
       }
 
+      // #7038: same stance as detectionRules — a malformed declaration is a 400,
+      // never silently dropped (dropping it reports every such install failed).
+      let successExitCodes: number[] = [];
+      if (typeof fields.successExitCodes === 'string' && fields.successExitCodes.trim() !== '') {
+        let rawCodes: unknown;
+        try {
+          rawCodes = JSON.parse(fields.successExitCodes);
+        } catch {
+          return c.json({ error: 'successExitCodes must be valid JSON' }, 400);
+        }
+        const parsedCodes = successExitCodesSchema.safeParse(rawCodes);
+        if (!parsedCodes.success) {
+          return c.json({ error: 'successExitCodes is invalid', details: parsedCodes.error.issues }, 400);
+        }
+        successExitCodes = parsedCodes.data;
+      }
+
       let supportedOs: string[] | null = null;
       if (typeof fields.supportedOs === 'string') {
         try {
@@ -1375,6 +1407,7 @@ softwareRoutes.post(
           preInstallScript,
           postInstallScript,
           detectionRules,
+          successExitCodes,
         });
       } catch (err) {
         captureException(err, c);
@@ -1440,6 +1473,7 @@ softwareRoutes.patch(
     if (payload.silentInstallArgs !== undefined) updates.silentInstallArgs = payload.silentInstallArgs;
     if (payload.silentUninstallArgs !== undefined) updates.silentUninstallArgs = payload.silentUninstallArgs;
     if (payload.detectionRules !== undefined) updates.detectionRules = payload.detectionRules;
+    if (payload.successExitCodes !== undefined) updates.successExitCodes = payload.successExitCodes ?? [];
     if (Object.keys(updates).length === 0) {
       return c.json({ error: 'No fields to update' }, 400);
     }
@@ -1674,7 +1708,7 @@ softwareRoutes.get(
         entry.groups.push({ status: row.status, count: Number(row.count) });
       }
       if (row.lastCompletedAt) {
-        const t = new Date(row.lastCompletedAt as string | Date).getTime();
+        const t = dateFromSqlValue(row.lastCompletedAt as string | Date).getTime();
         if (Number.isFinite(t) && t > entry.lastCompletedAt) entry.lastCompletedAt = t;
       }
     }
@@ -1771,6 +1805,36 @@ export function pickInstallMethodForPlatform<
   return ofPlatform[0]!;
 }
 
+/**
+ * #7347 — the pushes a deferred fan-out hands back, run once its transaction
+ * has committed. Each entry is a `deliver()` from `createSoftwareDeployment` /
+ * `buildAndDispatchSoftwareInstalls` with `deferDelivery`; none rejects.
+ */
+type PendingInstallDeliveries = Array<() => Promise<unknown>>;
+
+/**
+ * #7347 — the deployment create routes (`POST /deployments`, `POST /deploy`)
+ * and `POST /deployments/:id/retry` are registered in
+ * middleware/selfManagedDbContextRoutes.ts: they run with NO ambient request
+ * transaction. `admit` does all the route's DB work in ONE short
+ * withAuthDbAccessContext block — the same single-transaction semantics the
+ * request transaction gave it — with every software_install push deferred;
+ * the pushes go out only after that block commits. The agent result path reads
+ * `device_commands` on its own connection, so a push made inside the
+ * transaction let a fast agent answer a row it could not see yet, and its
+ * result was dropped as an orphan. A block that throws (including a failed
+ * commit) propagates before anything is pushed.
+ */
+async function commitThenDeliver(
+  c: Context,
+  admit: (deliveries: PendingInstallDeliveries) => Promise<Response>,
+): Promise<Response> {
+  const deliveries: PendingInstallDeliveries = [];
+  const response = await withAuthDbAccessContext(c.get('auth'), () => admit(deliveries));
+  for (const deliver of deliveries) await deliver();
+  return response;
+}
+
 type ManagerDeploymentPayload = {
   name: string;
   catalogId: string;
@@ -1803,6 +1867,7 @@ async function createManagerDeployments(
   c: Context,
   orgId: string,
   payload: ManagerDeploymentPayload,
+  deliveries: PendingInstallDeliveries,
 ) {
   const auth = c.get('auth');
 
@@ -1913,7 +1978,9 @@ async function createManagerDeployments(
         payload.targetType === 'filter'
           ? { ...(payload.options ?? {}), targetFilter: payload.targetFilter ?? null }
           : payload.options ?? undefined,
+      deferDelivery: true,
     });
+    if (result.deliver) deliveries.push(result.deliver);
     results.push(result);
 
     writeRouteAudit(c, {
@@ -1953,7 +2020,8 @@ softwareRoutes.post(
   requireSoftwareExecute,
   requireMfa(),
   zValidator('json', createDeploymentSchema),
-  async (c) => {
+  // #7347 — self-managed: every row commits before any push (commitThenDeliver).
+  async (c) => commitThenDeliver(c, async (deliveries) => {
     const auth = c.get('auth');
     const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
     if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
@@ -1963,7 +2031,7 @@ softwareRoutes.post(
 
     // Package-manager path: the request names a catalog item, not a version.
     if (payload.catalogId) {
-      return createManagerDeployments(c, orgId, payload as ManagerDeploymentPayload);
+      return createManagerDeployments(c, orgId, payload as ManagerDeploymentPayload, deliveries);
     }
 
     // Verify version exists and get catalog info
@@ -2010,7 +2078,9 @@ softwareRoutes.post(
         payload.targetType === 'filter'
           ? { ...(payload.options ?? {}), targetFilter: payload.targetFilter ?? null }
           : payload.options ?? undefined,
+      deferDelivery: true,
     });
+    if (result.deliver) deliveries.push(result.deliver);
 
     if (result.status === 'failed') {
       return c.json({ data: { id: result.deploymentId, status: result.status, message: result.message } }, 200);
@@ -2030,7 +2100,7 @@ softwareRoutes.post(
     });
 
     return c.json({ data: result.deployment }, 201);
-  }
+  })
 );
 
 // POST /deploy - Legacy deployment endpoint (used by DeploymentWizard)
@@ -2072,7 +2142,8 @@ softwareRoutes.post(
       }
     })
   ),
-  async (c) => {
+  // #7347 — self-managed: every row commits before any push (commitThenDeliver).
+  async (c) => commitThenDeliver(c, async (deliveries) => {
     const auth = c.get('auth');
     const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
     if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
@@ -2146,7 +2217,9 @@ softwareRoutes.post(
       name: `Deploy ${catalogItem.name} v${version}`,
       targetType: 'devices',
       targetIds: resolvedDeviceIds,
+      deferDelivery: true,
     });
+    if (result.deliver) deliveries.push(result.deliver);
 
     // Preserve the legacy failure contract: HTTP 200 with a failed status body
     // (EDR resolution error / no installer available), no audit write.
@@ -2174,7 +2247,7 @@ softwareRoutes.post(
 
     // Legacy response shape: full row under `data` plus a top-level `id`.
     return c.json({ data: result.deployment, id: result.deploymentId }, 201);
-  }
+  })
 );
 
 // GET /deployments/:id - Get deployment
@@ -2343,8 +2416,10 @@ async function redispatchSoftwareInstall(opts: {
   createdBy: string | null;
   /** Post-bump retryCount per device, keyed by deviceId — see the caller. */
   deviceRetryCounts: Record<string, number>;
+  /** #7347 — collects the fan-out's deferred push; the route runs it after commit. */
+  deliveries: PendingInstallDeliveries;
 }): Promise<{ dispatchedDeviceIds: string[]; error?: string }> {
-  const { deployment, orgId, deviceIds, createdBy, deviceRetryCounts } = opts;
+  const { deployment, orgId, deviceIds, createdBy, deviceRetryCounts, deliveries } = opts;
 
   const failTargets = async (errorMessage: string) => {
     await db.update(deploymentResults)
@@ -2401,7 +2476,9 @@ async function redispatchSoftwareInstall(opts: {
       createdBy,
       markDispatched: false,
       deviceRetryCounts,
+      deferDelivery: true,
     });
+    if (fanout.deliver) deliveries.push(fanout.deliver);
     return {
       dispatchedDeviceIds: fanout.dispatchedDeviceIds,
       ...(fanout.status === 'failed' && fanout.message ? { error: fanout.message } : {}),
@@ -2452,7 +2529,9 @@ async function redispatchSoftwareInstall(opts: {
     createdBy,
     markDispatched: false,
     deviceRetryCounts,
+    deferDelivery: true,
   });
+  if (fanout.deliver) deliveries.push(fanout.deliver);
 
   return {
     dispatchedDeviceIds: fanout.dispatchedDeviceIds,
@@ -2468,7 +2547,8 @@ softwareRoutes.post(
   requireMfa(),
   zValidator('param', deploymentIdParamSchema),
   optionalJsonValidator(retryDeploymentSchema),
-  async (c) => {
+  // #7347 — self-managed: every row commits before any push (commitThenDeliver).
+  async (c) => commitThenDeliver(c, async (deliveries) => {
     const auth = c.get('auth');
     const orgResult = resolveScopedOrgId(auth, c.req.query('orgId'));
     if ('error' in orgResult) return c.json({ error: orgResult.error }, orgResult.status);
@@ -2573,6 +2653,7 @@ softwareRoutes.post(
         deviceIds: retriedDeviceIds,
         createdBy: auth.user?.id ?? null,
         deviceRetryCounts,
+        deliveries,
       });
       dispatchError = dispatchResult.error;
     }
@@ -2595,7 +2676,7 @@ softwareRoutes.post(
       skippedDeviceIds,
       ...(dispatchError ? { message: dispatchError } : {}),
     });
-  }
+  })
 );
 
 // GET /deployments/:id/results - Get per-device results (enriched)
@@ -2677,6 +2758,14 @@ softwareRoutes.get(
         deviceCommandId: deploymentResults.deviceCommandId,
         hostname: devices.hostname,
         queuedOffline: sql<boolean>`coalesce(${deploymentResults.status} = 'pending' and ${deploymentResults.deviceCommandId} is not null and ${deviceCommands.status} = 'pending', false)`,
+        // #3578 in-flight signals, read off the same join. sentAt is when the
+        // command was handed to the agent (WS push or poll claim) — the
+        // server's own stamp, so it works for every agent version. agentStage/
+        // agentStageAt are the last stage the agent reported
+        // (services/commandProgress.ts); NULL from agents that predate it.
+        sentAt: deviceCommands.executedAt,
+        agentStage: deviceCommands.progressStage,
+        agentStageAt: deviceCommands.progressAt,
       })
         .from(deploymentResults)
         .leftJoin(devices, eq(deploymentResults.deviceId, devices.id))

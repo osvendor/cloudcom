@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { envFlag } from '../../utils/envFlag';
 import type { StepUpOperation } from '../../services/mfaStepUpGrant';
 import { MAINTENANCE_MAX_BULK_DEVICES, MAINTENANCE_MAX_DURATION_HOURS } from '../../services/maintenanceStepUpLimits';
+import { PARKED_ASSIGN_MAX_BULK_ITEMS } from '../../services/unassignedPool/limits';
 
 // ============================================
 // Feature flags
@@ -146,6 +147,10 @@ const stepUpAssertion = z.object({ id: z.string().min(1) }).passthrough();
 // only after a forced IdP round-trip proves identity for a PASSWORDLESS
 // account; letting a client request one here would turn a re-authentication
 // proof into a checkbox for anyone who can already satisfy step-up.
+// #4045: `sso_reauth_manage_factor`, the callback's other output, is excluded
+// for the same reason — it stands in for the PASSWORD leg of factor
+// management, so minting it from a factor proof would collapse two proofs
+// into one.
 //
 // A plain `satisfies readonly StepUpOperation[]` would NOT have stopped that —
 // it only constrains membership, so appending 'enroll_first_factor' still
@@ -160,10 +165,15 @@ const STEP_UP_OPERATIONS = [
   'agent_rollback',
   'device_maintenance',
   'device_move_org',
+  'parked_device_assign',
+  'parked_device_assign_bulk',
+  'pre_assignment_enable',
   'ai_script_lane_grant',
+  'ai_partner_script_ceiling_grant',
+  'topology_arm',
 ] as const satisfies readonly Exclude<
   StepUpOperation,
-  'enroll_first_factor' | 'approval_decide'
+  'enroll_first_factor' | 'sso_reauth_manage_factor' | 'approval_decide'
 >[];
 const stepUpOperation = z
   .enum(STEP_UP_OPERATIONS)
@@ -196,18 +206,60 @@ export const moveOrgStepUpResource = z.object({
   targetSiteId: z.string().uuid(),
   acceptCurrencyMismatch: z.boolean().optional(),
 });
+// Parked-device assignment bindings. Mirror the pre-assignment route bodies
+// (routes/preAssignment.ts): one device + destination, or a batch of them.
+export const parkedAssignStepUpResource = z.object({
+  deviceId: z.string().uuid(),
+  targetOrgId: z.string().uuid(),
+  targetSiteId: z.string().uuid(),
+});
+export const parkedBulkAssignStepUpResource = z.object({
+  items: z.array(parkedAssignStepUpResource).min(1).max(PARKED_ASSIGN_MAX_BULK_ITEMS),
+});
+// Turning ON deploy-key enrollment for a partner: bound to the partner, and
+// only ever to enabled=true (turning it off needs no step-up).
+export const preAssignmentEnableStepUpResource = z.object({
+  partnerId: z.string().uuid(),
+  enabled: z.literal(true),
+});
 // Coarse pre-filter only. The AUTHORITY on "does this resource match this
 // operation" is RESOURCE_BOUND_OPERATIONS in routes/auth/mfa.ts, which
 // re-parses under the operation's own schema — a union member alone would
 // happily accept a rollback-shaped body under operation:'device_maintenance'.
 // AI script authoring W04 (#5612): the unattended-lane grant / reset binding.
 // One org, one value — mirrors scriptLanePolicyResourceDigest exactly.
+// `widening` is present only for a WIDENING save (tier/classes/rate/emptied
+// protectedResources/reviewerModel/proposingEnabled) on an already-enabled
+// lane, so the grant is bound to the exact wider values shown to the
+// operator, not just the boolean flip.
+const scriptLaneWideningResource = z.object({
+  maxUnattendedRiskTier: z.enum(['low', 'medium']),
+  unattendedAllowedClasses: z.array(z.string()),
+  maxUnattendedPerHour: z.number().int().min(0).max(100),
+  protectedResourcesEmptied: z.boolean(),
+  reviewerModel: z.string().nullable(),
+  proposingEnabled: z.boolean(),
+});
 export const scriptLaneStepUpResource = z.object({
   orgId: z.string().uuid(),
   unattendedEnabled: z.boolean(),
   reset: z.boolean().optional(),
+  widening: scriptLaneWideningResource.optional(),
 });
-const stepUpResource = z.union([rollbackStepUpResource, maintenanceStepUpResource, moveOrgStepUpResource, scriptLaneStepUpResource]);
+// Partner-wide sibling: raising the PARTNER ceiling (`unattendedAllowed`) is
+// the same class of action, fanned out to every opted-in org under it.
+export const partnerScriptCeilingStepUpResource = z.object({
+  partnerId: z.string().uuid(),
+  unattendedAllowed: z.boolean(),
+  widening: scriptLaneWideningResource.optional(),
+});
+// Topology M3 arm binding — mirrors topologyArmResourceDigest exactly.
+export const topologyArmStepUpResource = z.object({
+  siteId: z.string().uuid(),
+  action: z.enum(['arm_policy', 'arm_telemetry']),
+  subjectId: z.string().uuid(),
+});
+const stepUpResource = z.union([rollbackStepUpResource, maintenanceStepUpResource, moveOrgStepUpResource, parkedAssignStepUpResource, parkedBulkAssignStepUpResource, scriptLaneStepUpResource, partnerScriptCeilingStepUpResource, topologyArmStepUpResource, preAssignmentEnableStepUpResource]);
 export const mfaStepUpSchema = z.discriminatedUnion('method', [
   z.object({
     method: z.literal('totp'),

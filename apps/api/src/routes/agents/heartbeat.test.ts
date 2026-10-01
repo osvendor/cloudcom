@@ -178,6 +178,7 @@ vi.mock('./helpers', () => ({
   compareAgentVersions: vi.fn(() => 0),
   buildEventLogConfigUpdate: vi.fn(() => undefined),
   buildHardwareMonitoringConfigUpdate: vi.fn(),
+  buildTimeSyncConfigUpdate: vi.fn(),
   buildMonitoringConfigUpdate: vi.fn(() => undefined),
   buildHelperConfigUpdate: vi.fn(() => undefined),
   buildPamConfigUpdate: vi.fn(async () => ({ uacInterceptionEnabled: false })),
@@ -206,6 +207,10 @@ vi.mock('./helpers', () => ({
   // that don't exercise it. The edition-gate describe overrides per-test and
   // restores this implementation in afterEach (clearAllMocks does not).
   agentAcceptsServedEdition: vi.fn(() => true),
+  // Mirrors the real helper: only a flip INTO 'server' from a different role
+  // is withheld from auto-apply; every other transition passes through.
+  shouldAutoApplyAgentReportedDeviceRole: vi.fn((current: string | null | undefined, reported: string) =>
+    reported !== 'server' || current === 'server'),
 }));
 
 vi.mock('../../services/auditEvents', () => ({
@@ -235,6 +240,14 @@ vi.mock('../../services/eventBus', () => ({
 
 vi.mock('../../services/agentRollbackResult', () => ({
   ingestRollbackObservation: ingestRollbackObservationMock,
+}));
+
+const { promotePendingAgentCredentialsMock } = vi.hoisted(() => ({
+  promotePendingAgentCredentialsMock: vi.fn(),
+}));
+vi.mock('../../services/agentTokenPromotion', () => ({
+  promotePendingAgentCredentials: promotePendingAgentCredentialsMock,
+  PREVIOUS_TOKEN_GRACE_MS: 5 * 60 * 1000,
 }));
 
 vi.mock('../../middleware/agentAuth', () => ({
@@ -312,7 +325,7 @@ vi.mock('../../jobs/deviceGroupJobs', () => ({
 }));
 
 import { and, eq, notInArray } from 'drizzle-orm';
-import { heartbeatRoutes } from './heartbeat';
+import { heartbeatRoutes, tccPermissionsMeaningfullyChanged } from './heartbeat';
 import { devices, bareMetalRecoveries } from '../../db/schema';
 import { hashRecoveryNonce } from '../../services/bareMetalRecoveryCodes';
 
@@ -2292,6 +2305,83 @@ describe('POST /agents/:id/heartbeat — artifact-edition offer gate (#4072)', (
       }
     });
 
+    // #4073 — the update-attempt record stamped by WS update_status is closed
+    // by the first heartbeat reporting the target (or a newer) version.
+    describe('update attempt record (#4073)', () => {
+      const openRecord = {
+        updateAttemptStartedAt: new Date('2026-10-01T00:00:00Z'),
+        updateAttemptLastAt: new Date('2026-10-01T01:00:00Z'),
+        updateAttemptCount: 60,
+      };
+
+      // ./helpers is mocked with compareAgentVersions → 0; this block needs
+      // the real ordering to tell "below target" from "reached it".
+      beforeEach(async () => {
+        const { compareAgentVersions } = await import('./helpers');
+        const real = await vi.importActual<typeof import('../../services/agentEditionCompat')>(
+          '../../services/agentEditionCompat',
+        );
+        vi.mocked(compareAgentVersions).mockImplementation(real.compareAgentVersions);
+      });
+      afterEach(async () => {
+        const { compareAgentVersions } = await import('./helpers');
+        vi.mocked(compareAgentVersions).mockImplementation(() => 0);
+      });
+
+      it('clears the record once the reported version reaches the target', async () => {
+        const setSpy = captureSet();
+        primeWithRow({ ...openRecord, updateAttemptTargetVersion: '0.105.1' });
+
+        expect((await beat()).status).toBe(200);
+        const cleared = setCalls(setSpy).find((s) => 'updateAttemptTargetVersion' in s);
+        expect(cleared).toMatchObject({
+          updateAttemptTargetVersion: null,
+          updateAttemptStartedAt: null,
+          updateAttemptLastAt: null,
+          updateAttemptCount: null,
+        });
+      });
+
+      it('clears the record when the device lands on a version past the target', async () => {
+        const setSpy = captureSet();
+        primeWithRow({ ...openRecord, updateAttemptTargetVersion: '0.105.0' });
+
+        expect((await beat()).status).toBe(200);
+        const cleared = setCalls(setSpy).find((s) => 'updateAttemptTargetVersion' in s);
+        expect(cleared?.updateAttemptTargetVersion).toBeNull();
+      });
+
+      it('keeps the record while the device is still below the target (the stuck case)', async () => {
+        const setSpy = captureSet();
+        primeWithRow({ ...openRecord, updateAttemptTargetVersion: '0.110.0' });
+
+        expect((await beat()).status).toBe(200);
+        for (const s of setCalls(setSpy)) {
+          expect(s).not.toHaveProperty('updateAttemptTargetVersion');
+          expect(s).not.toHaveProperty('updateAttemptStartedAt');
+        }
+      });
+
+      it('closes the record when the version cannot be compared (never a false stuck alarm)', async () => {
+        const setSpy = captureSet();
+        primeWithRow({ ...openRecord, updateAttemptTargetVersion: 'not-a-version' });
+
+        expect((await beat()).status).toBe(200);
+        const cleared = setCalls(setSpy).find((s) => 'updateAttemptTargetVersion' in s);
+        expect(cleared?.updateAttemptTargetVersion).toBeNull();
+      });
+
+      it('writes nothing for a device with no open record', async () => {
+        const setSpy = captureSet();
+        primeWithRow({ updateAttemptTargetVersion: null });
+
+        expect((await beat()).status).toBe(200);
+        for (const s of setCalls(setSpy)) {
+          expect(s).not.toHaveProperty('updateAttemptTargetVersion');
+        }
+      });
+    });
+
     it('writes nothing for a healthy device that was never withheld', async () => {
       const setSpy = captureSet();
       primeWithRow({ updateOfferWithheldReason: null, updateOfferWithheldSince: null });
@@ -2299,6 +2389,80 @@ describe('POST /agents/:id/heartbeat — artifact-edition offer gate (#4072)', (
       expect((await beat()).status).toBe(200);
       for (const s of setCalls(setSpy)) {
         expect(s).not.toHaveProperty('updateOfferWithheldReason');
+      }
+    });
+  });
+
+  describe('persisted Breeze Assist install issue (#6925)', () => {
+    function primeWithRow(row: Record<string, unknown>) {
+      selectMock.mockReturnValueOnce(selectChainResolving([{ ...agentDeviceRow, ...row }]));
+      selectMock.mockReturnValue(selectChainResolving([{ version: '0.66.0' }]));
+    }
+    function captureSet() {
+      const setSpy = vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) }));
+      updateMock.mockReturnValue({ set: setSpy });
+      return setSpy;
+    }
+    const setCalls = (spy: ReturnType<typeof captureSet>) =>
+      spy.mock.calls.map((c) => (c as unknown[])[0] as Record<string, unknown>);
+
+    it('stamps issue + since when the agent first reports it is waiting for a helper offer', async () => {
+      const setSpy = captureSet();
+      primeWithRow({ helperInstallIssue: null, helperInstallIssueSince: null });
+
+      expect((await beat({ helperInstallIssue: 'awaiting_server_offer' })).status).toBe(200);
+      const stamped = setCalls(setSpy).find((s) => 'helperInstallIssue' in s);
+      expect(stamped?.helperInstallIssue).toBe('awaiting_server_offer');
+      expect(stamped?.helperInstallIssueSince).toBeInstanceOf(Date);
+    });
+
+    it('does NOT rewrite the columns while the reported issue is unchanged', async () => {
+      const setSpy = captureSet();
+      primeWithRow({
+        helperInstallIssue: 'awaiting_server_offer',
+        helperInstallIssueSince: new Date('2026-10-01T00:00:00Z'),
+      });
+
+      expect((await beat({ helperInstallIssue: 'awaiting_server_offer' })).status).toBe(200);
+      for (const s of setCalls(setSpy)) {
+        expect(s).not.toHaveProperty('helperInstallIssue');
+        expect(s).not.toHaveProperty('helperInstallIssueSince');
+      }
+    });
+
+    it('restarts the episode when the issue changes (offer wait → install abandoned)', async () => {
+      const setSpy = captureSet();
+      primeWithRow({
+        helperInstallIssue: 'awaiting_server_offer',
+        helperInstallIssueSince: new Date('2026-10-01T00:00:00Z'),
+      });
+
+      await beat({ helperInstallIssue: 'install_abandoned' });
+      const changed = setCalls(setSpy).find((s) => 'helperInstallIssue' in s);
+      expect(changed?.helperInstallIssue).toBe('install_abandoned');
+      expect(changed?.helperInstallIssueSince).toBeInstanceOf(Date);
+    });
+
+    it('clears both columns when the agent stops reporting an issue', async () => {
+      const setSpy = captureSet();
+      primeWithRow({
+        helperInstallIssue: 'awaiting_server_offer',
+        helperInstallIssueSince: new Date('2026-10-01T00:00:00Z'),
+      });
+
+      expect((await beat()).status).toBe(200);
+      const cleared = setCalls(setSpy).find((s) => 'helperInstallIssue' in s);
+      expect(cleared?.helperInstallIssue).toBeNull();
+      expect(cleared?.helperInstallIssueSince).toBeNull();
+    });
+
+    it('writes nothing for a healthy device (or an agent too old to report the field)', async () => {
+      const setSpy = captureSet();
+      primeWithRow({ helperInstallIssue: null, helperInstallIssueSince: null });
+
+      expect((await beat()).status).toBe(200);
+      for (const s of setCalls(setSpy)) {
+        expect(s).not.toHaveProperty('helperInstallIssue');
       }
     });
   });
@@ -2962,6 +3126,100 @@ describe('outboundNetworkPolicyVersion capability handshake (Wave 6)', () => {
     expect(updateArg.desktopFenceProtocolVersion).toBe(expectedFence);
     expect(updateArg.revocationLeaseProtocolVersion).toBe(expectedLease);
   });
+
+  // consentPromptProtocolVersion: same non-sticky contract — the server must
+  // be able to tell whether this build honors a `prompt` block on a desktop
+  // stream start, and an agent that stops reporting it (old build, or a
+  // downgrade) must self-heal back to capability 0 so a policy requiring
+  // consent/notification is refused rather than silently started unfenced.
+  it.each([
+    { name: 'recognized version 1', capabilities: { consentPromptProtocolVersion: 1 }, expected: 1 },
+    { name: 'omitted capability object', capabilities: undefined, expected: 0 },
+    { name: 'omitted key (pre-consent-gate agent)', capabilities: {}, expected: 0 },
+    { name: 'explicit zero downgrade', capabilities: { consentPromptProtocolVersion: 0 }, expected: 0 },
+    { name: 'unknown integer version', capabilities: { consentPromptProtocolVersion: 2 }, expected: 0 },
+    { name: 'fractional version', capabilities: { consentPromptProtocolVersion: 1.5 }, expected: 0 },
+    { name: 'string version', capabilities: { consentPromptProtocolVersion: '1' }, expected: 0 },
+  ])('persists tolerant non-sticky consent-prompt capability: $name', async ({
+    capabilities,
+    expected,
+  }) => {
+    const setSpy = vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) }));
+    await setupMocks(setSpy);
+
+    const body = capabilities === undefined
+      ? minimalHeartbeatBody
+      : { ...minimalHeartbeatBody, securityCapabilities: capabilities };
+    const resp = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    expect(resp.status).toBe(200);
+    const updateArg = (setSpy.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
+    expect(updateArg.consentPromptProtocolVersion).toBe(expected);
+  });
+
+  // The backup helper's brokered-read protocol is a TOP-LEVEL heartbeat field
+  // (not inside securityCapabilities), reported from the INSTALLED helper and
+  // recorded non-sticky on every beat: omitted, lower, unknown, fractional and
+  // string values all persist as 0 so a helper downgrade stops delivery of
+  // storage sessions on the next beat.
+  it.each([
+    { name: 'recognized version 1', extra: { backupReadProtocolVersion: 1 }, expected: 1 },
+    { name: 'omitted (older helper or agent)', extra: {}, expected: 0 },
+    { name: 'explicit zero downgrade', extra: { backupReadProtocolVersion: 0 }, expected: 0 },
+    { name: 'unknown future version', extra: { backupReadProtocolVersion: 2 }, expected: 0 },
+    { name: 'fractional version', extra: { backupReadProtocolVersion: 1.5 }, expected: 0 },
+    { name: 'string version', extra: { backupReadProtocolVersion: '1' }, expected: 0 },
+    { name: 'nested in securityCapabilities is not the field', extra: { securityCapabilities: { backupReadProtocolVersion: 1 } }, expected: 0 },
+  ])('persists the non-sticky backup read protocol version: $name', async ({ extra, expected }) => {
+    const setSpy = vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) }));
+    await setupMocks(setSpy);
+
+    const resp = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...minimalHeartbeatBody, ...extra }),
+    });
+
+    expect(resp.status).toBe(200);
+    const updateArg = (setSpy.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
+    expect(updateArg.backupReadProtocolVersion).toBe(expected);
+  });
+
+  // The integrity and write protocols follow the same top-level, non-sticky
+  // contract as the read protocol: only versions this server implements are
+  // stored, anything else (including omission by an older agent) is 0.
+  it.each([
+    { name: 'recognized versions', extra: { backupIntegrityProtocolVersion: 2, backupWriteProtocolVersion: 1 }, integrity: 2, write: 1 },
+    { name: 'integrity version 1', extra: { backupIntegrityProtocolVersion: 1 }, integrity: 1, write: 0 },
+    { name: 'omitted (older helper or agent)', extra: {}, integrity: 0, write: 0 },
+    { name: 'unknown future versions', extra: { backupIntegrityProtocolVersion: 3, backupWriteProtocolVersion: 2 }, integrity: 0, write: 0 },
+    { name: 'fractional and string versions', extra: { backupIntegrityProtocolVersion: 1.5, backupWriteProtocolVersion: '1' }, integrity: 0, write: 0 },
+    { name: 'negative versions', extra: { backupIntegrityProtocolVersion: -1, backupWriteProtocolVersion: -1 }, integrity: 0, write: 0 },
+    {
+      name: 'nested in securityCapabilities is not the field',
+      extra: { securityCapabilities: { backupIntegrityProtocolVersion: 2, backupWriteProtocolVersion: 1 } },
+      integrity: 0,
+      write: 0,
+    },
+  ])('persists the non-sticky backup integrity and write protocol versions: $name', async ({ extra, integrity, write }) => {
+    const setSpy = vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) }));
+    await setupMocks(setSpy);
+
+    const resp = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...minimalHeartbeatBody, ...extra }),
+    });
+
+    expect(resp.status).toBe(200);
+    const updateArg = (setSpy.mock.calls as any[])[0]?.[0] as Record<string, unknown>;
+    expect(updateArg.backupIntegrityProtocolVersion).toBe(integrity);
+    expect(updateArg.backupWriteProtocolVersion).toBe(write);
+  });
 });
 
 // ---------------------------------------------------------------------
@@ -3516,6 +3774,45 @@ describe('POST /agents/:id/heartbeat — uacInterceptionEnabled delivery', () =>
     });
     expect(res.status).toBe(200);
     expect(((await res.json()) as Record<string, any>).configUpdate ?? {}).not.toHaveProperty('hardware_monitoring_settings');
+  });
+
+  it('delivers time settings after releasing org scope inside the shared system context', async () => {
+    const { buildTimeSyncConfigUpdate } = await import('./helpers');
+    const payload = {
+      enforce_ntp: false,
+      ntp_servers: [],
+      poll_interval_minutes: 60,
+      timezone: { expected_windows_id: null, auto_fix: false },
+      fingerprint: 'sha256:test',
+    };
+    callOrder.length = 0;
+    vi.mocked(buildTimeSyncConfigUpdate).mockImplementationOnce(async () => {
+      expect(callOrder).toContain('dbContext:released');
+      expect(callOrder.lastIndexOf('systemCtx:enter')).toBeGreaterThan(
+        callOrder.lastIndexOf('systemCtx:exit'),
+      );
+      return payload;
+    });
+    const res = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as Record<string, any>).configUpdate.time_sync_settings).toEqual(payload);
+    expect(buildTimeSyncConfigUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it('omits time settings on resolver failure while preserving the heartbeat', async () => {
+    const { buildTimeSyncConfigUpdate } = await import('./helpers');
+    vi.mocked(buildTimeSyncConfigUpdate).mockRejectedValueOnce(new Error('policy read failed'));
+    const res = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as Record<string, any>).configUpdate ?? {}).not.toHaveProperty('time_sync_settings');
   });
 
   it('includes monitoring_settings in configUpdate when the resolver succeeds', async () => {
@@ -4111,13 +4408,36 @@ describe('POST /agents/:id/heartbeat — dynamic device group re-evaluation enqu
       hostname: 'new-host',
       osVersion: '10.0.22631',
       osBuild: '22631',
-      deviceRole: 'server',
+      // 'nas' is a non-privileged flip target (unlike 'server' below), so it
+      // still auto-applies and this test can keep exercising the general
+      // changedFields plumbing.
+      deviceRole: 'nas',
     });
 
     expect(resp.status).toBe(200);
     const request = requestDeviceGroupReevaluationMock.mock.calls[0]?.[0];
     expect(request?.changedFields).toEqual(
       expect.arrayContaining(['hostname', 'osVersion', 'osBuild', 'deviceRole']),
+    );
+  });
+
+  it('does not auto-apply or re-evaluate on an agent-reported flip into a privileged role, and audit-logs the claim', async () => {
+    arrange();
+
+    const resp = await post({ agentVersion: '0.66.0', deviceRole: 'server' });
+
+    expect(resp.status).toBe(200);
+    // deviceRole is not in the update set, so it is excluded from the
+    // filterable-change list and never reaches dynamic-group re-evaluation.
+    expect(requestDeviceGroupReevaluationMock).not.toHaveBeenCalled();
+    const { writeAuditEvent } = await import('../../services/auditEvents');
+    expect(vi.mocked(writeAuditEvent)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: 'device.role.self_reported_privileged_flip_blocked',
+        resourceId: 'device-1',
+        details: { from: 'workstation', reported: 'server' },
+      }),
     );
   });
 
@@ -4670,6 +4990,10 @@ describe('POST /agents/:id/heartbeat — terminal-status guard (#2230)', () => {
 // transition, and NOT on a steady-state beat.
 // ---------------------------------------------------------------------
 describe('POST /agents/:id/heartbeat — state-change audit (finding #10)', () => {
+  // Wire-valid shapes (see heartbeatSchema): a steady beat re-reports these
+  // verbatim, a "change" flips an access-deciding field.
+  const TCC = { screenRecording: true, accessibility: true, fullDiskAccess: true, checkedAt: '2026-09-01T00:00:00.000Z' };
+  const DESKTOP = { mode: 'user_session', loginUiReachable: true, virtualDisplayReady: true, checkedAt: '2026-09-01T00:00:00.000Z' };
   // Steady-state baseline the handler will diff against. status already online,
   // hostname/agentServerUrl/tcc/desktop already match what a steady beat sends.
   const baselineDevice = {
@@ -4688,8 +5012,8 @@ describe('POST /agents/:id/heartbeat — state-change audit (finding #10)', () =
     tokenIssuedAt: new Date(),
     status: 'online',
     agentServerUrl: 'https://cp.example.com',
-    tccPermissions: { screenRecording: 'granted' },
-    desktopAccess: { level: 'full' },
+    tccPermissions: TCC,
+    desktopAccess: DESKTOP,
     mainAgentSilentSince: null,
   };
 
@@ -4728,8 +5052,8 @@ describe('POST /agents/:id/heartbeat — state-change audit (finding #10)', () =
       ...minimalHeartbeatBody,
       hostname: 'host-1', // unchanged
       serverUrl: 'https://cp.example.com', // unchanged
-      tccPermissions: { screenRecording: 'granted' }, // unchanged
-      desktopAccess: { level: 'full' }, // unchanged
+      tccPermissions: TCC, // unchanged
+      desktopAccess: DESKTOP, // unchanged
     });
     expect(resp.status).toBe(200);
 
@@ -4771,19 +5095,161 @@ describe('POST /agents/:id/heartbeat — state-change audit (finding #10)', () =
     });
   });
 
+  it('a backup read protocol drop from 1 to 0 is audited per device and logged', async () => {
+    arrange({ backupReadProtocolVersion: 1 });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const resp = await beat({ ...minimalHeartbeatBody });
+    expect(resp.status).toBe(200);
+
+    const calls = await auditCalls();
+    expect(calls).toHaveLength(1);
+    const changes = (calls[0]![1] as unknown as { details: { changes: any[] } }).details.changes;
+    expect(changes).toContainEqual({ field: 'backupReadProtocolVersion', before: 1, after: 0 });
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('backup read protocol'),
+      expect.objectContaining({ deviceId: 'device-1', orgId: 'org-1', before: 1, after: 0 }),
+    );
+    warn.mockRestore();
+  });
+
+  it.each([
+    { name: 'steady at 1', before: 1, extra: { backupReadProtocolVersion: 1 } },
+    { name: 'steady at 0', before: 0, extra: {} },
+    { name: 'first report of 1', before: 0, extra: { backupReadProtocolVersion: 1 } },
+  ])('no backup read protocol audit when $name', async ({ before, extra }) => {
+    arrange({ backupReadProtocolVersion: before });
+    const resp = await beat({ ...minimalHeartbeatBody, ...extra });
+    expect(resp.status).toBe(200);
+    const changes = (await auditCalls()).flatMap((c) => (c[1] as unknown as { details: { changes: any[] } }).details.changes);
+    expect(changes.filter((ch) => ch.field === 'backupReadProtocolVersion')).toEqual([]);
+  });
+
+  describe('backup helper capability regression', () => {
+    const regressed = vi.fn();
+    beforeEach(async () => {
+      regressed.mockReset();
+      const { setBackupMetricsRecorder } = await import('../../services/backupMetrics');
+      setBackupMetricsRecorder({ onCapabilityRegressed: regressed });
+    });
+    afterEach(async () => {
+      const { setBackupMetricsRecorder } = await import('../../services/backupMetrics');
+      setBackupMetricsRecorder(null);
+    });
+
+    async function regressionAudits() {
+      const { writeAuditEvent } = await import('../../services/auditEvents');
+      return vi
+        .mocked(writeAuditEvent)
+        .mock.calls.filter((c) => (c[1] as { action?: string })?.action === 'device.backup_capability.regressed')
+        .map((c) => c[1] as unknown as Record<string, unknown>);
+    }
+
+    it('a lower integrity protocol is audited once as a capability regression', async () => {
+      arrange({ backupIntegrityProtocolVersion: 2, backupWriteProtocolVersion: 0 });
+      const resp = await beat({ ...minimalHeartbeatBody, backupIntegrityProtocolVersion: 1 });
+      expect(resp.status).toBe(200);
+
+      const audits = await regressionAudits();
+      expect(audits).toHaveLength(1);
+      expect(audits[0]).toMatchObject({
+        orgId: 'org-1',
+        actorType: 'agent',
+        resourceType: 'device',
+        resourceId: 'device-1',
+        details: { capability: 'integrity', before: 2, after: 1 },
+      });
+      expect(regressed).toHaveBeenCalledTimes(1);
+      expect(regressed).toHaveBeenCalledWith('integrity', 1);
+      const changes = (await auditCalls()).flatMap((c) => (c[1] as unknown as { details: { changes: any[] } }).details.changes);
+      expect(changes).toContainEqual({ field: 'backupIntegrityProtocolVersion', before: 2, after: 1 });
+    });
+
+    it('the first report after enrollment (stored NULL) is recorded, and is not a regression', async () => {
+      arrange({ backupReadProtocolVersion: null, backupIntegrityProtocolVersion: null, backupWriteProtocolVersion: null });
+      const resp = await beat({ ...minimalHeartbeatBody });
+      expect(resp.status).toBe(200);
+      expect(await regressionAudits()).toEqual([]);
+      expect(regressed).not.toHaveBeenCalled();
+    });
+
+    it('a steady report after the drop is not audited again', async () => {
+      arrange({ backupIntegrityProtocolVersion: 1 });
+      const resp = await beat({ ...minimalHeartbeatBody, backupIntegrityProtocolVersion: 1 });
+      expect(resp.status).toBe(200);
+      expect(await regressionAudits()).toEqual([]);
+      expect(regressed).not.toHaveBeenCalled();
+    });
+
+    it('an agent that stops reporting the fields drops them to 0 and audits each drop', async () => {
+      arrange({ backupIntegrityProtocolVersion: 2, backupWriteProtocolVersion: 1 });
+      const resp = await beat({ ...minimalHeartbeatBody });
+      expect(resp.status).toBe(200);
+
+      const audits = await regressionAudits();
+      expect(audits.map((a) => a.details)).toEqual([
+        { capability: 'integrity', before: 2, after: 0 },
+        { capability: 'write', before: 1, after: 0 },
+      ]);
+      expect(regressed.mock.calls).toEqual([['integrity', 1], ['write', 1]]);
+    });
+
+    it('an unknown future version reads as 0 and counts as a regression from 1', async () => {
+      arrange({ backupIntegrityProtocolVersion: 1 });
+      const resp = await beat({ ...minimalHeartbeatBody, backupIntegrityProtocolVersion: 3 });
+      expect(resp.status).toBe(200);
+      const audits = await regressionAudits();
+      expect(audits).toHaveLength(1);
+      expect(audits[0]!.details).toEqual({ capability: 'integrity', before: 1, after: 0 });
+    });
+
+    it('the read protocol drop is also recorded as a capability regression', async () => {
+      arrange({ backupReadProtocolVersion: 1 });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const resp = await beat({ ...minimalHeartbeatBody });
+      expect(resp.status).toBe(200);
+      const audits = await regressionAudits();
+      expect(audits.map((a) => a.details)).toEqual([{ capability: 'read', before: 1, after: 0 }]);
+      expect(regressed).toHaveBeenCalledWith('read', 1);
+      warn.mockRestore();
+    });
+
+    it.each([
+      { name: 'first report', before: {}, extra: { backupIntegrityProtocolVersion: 1, backupWriteProtocolVersion: 1 } },
+      { name: 'upgrade', before: { backupIntegrityProtocolVersion: 1 }, extra: { backupIntegrityProtocolVersion: 2 } },
+      { name: 'steady at 0', before: {}, extra: {} },
+    ])('no capability regression audit on $name', async ({ before, extra }) => {
+      arrange(before);
+      const resp = await beat({ ...minimalHeartbeatBody, ...extra });
+      expect(resp.status).toBe(200);
+      expect(await regressionAudits()).toEqual([]);
+      expect(regressed).not.toHaveBeenCalled();
+    });
+
+    it('a write the status guard rejected is never audited as a regression', async () => {
+      arrange({ backupIntegrityProtocolVersion: 2 });
+      updateMock.mockReturnValue({
+        set: vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning([])) })),
+      });
+      const resp = await beat({ ...minimalHeartbeatBody });
+      expect(resp.status).toBe(200);
+      expect(await regressionAudits()).toEqual([]);
+      expect(regressed).not.toHaveBeenCalled();
+    });
+  });
+
   it('tccPermissions change emits a state_change audit', async () => {
     arrange();
     const resp = await beat({
       ...minimalHeartbeatBody,
-      tccPermissions: { screenRecording: 'denied' },
+      tccPermissions: { ...TCC, screenRecording: false },
     });
     expect(resp.status).toBe(200);
 
     const changes = ((await auditCalls())[0]?.[1] as unknown as { details: { changes: any[] } }).details.changes;
     expect(changes).toContainEqual({
       field: 'tccPermissions',
-      before: { screenRecording: 'granted' },
-      after: { screenRecording: 'denied' },
+      before: TCC,
+      after: { ...TCC, screenRecording: false },
     });
   });
 
@@ -4791,15 +5257,15 @@ describe('POST /agents/:id/heartbeat — state-change audit (finding #10)', () =
     arrange();
     const resp = await beat({
       ...minimalHeartbeatBody,
-      desktopAccess: { level: 'restricted' },
+      desktopAccess: { ...DESKTOP, mode: 'unavailable' },
     });
     expect(resp.status).toBe(200);
 
     const changes = ((await auditCalls())[0]?.[1] as unknown as { details: { changes: any[] } }).details.changes;
     expect(changes).toContainEqual({
       field: 'desktopAccess',
-      before: { level: 'full' },
-      after: { level: 'restricted' },
+      before: DESKTOP,
+      after: { ...DESKTOP, mode: 'unavailable' },
     });
   });
 
@@ -4809,8 +5275,8 @@ describe('POST /agents/:id/heartbeat — state-change audit (finding #10)', () =
       ...minimalHeartbeatBody,
       hostname: 'host-1',
       serverUrl: 'https://cp.example.com',
-      tccPermissions: { screenRecording: 'granted' },
-      desktopAccess: { level: 'full' },
+      tccPermissions: TCC,
+      desktopAccess: DESKTOP,
     });
     expect(resp.status).toBe(200);
 
@@ -4825,12 +5291,86 @@ describe('POST /agents/:id/heartbeat — state-change audit (finding #10)', () =
       // Re-report identical values — must not be treated as changes.
       hostname: 'host-1',
       serverUrl: 'https://cp.example.com',
-      tccPermissions: { screenRecording: 'granted' },
-      desktopAccess: { level: 'full' },
+      tccPermissions: TCC,
+      desktopAccess: DESKTOP,
     });
     expect(resp.status).toBe(200);
 
     expect(await auditCalls()).toHaveLength(0);
+  });
+
+  // #4340 — the agent stamps a fresh `checkedAt` on tccPermissions and
+  // desktopAccess on EVERY heartbeat (macOS/Linux). A raw JSON.stringify diff
+  // therefore read every such beat as a "change" and chained one audit row per
+  // device per minute. Only the access-deciding fields may count as a change.
+  describe('checkedAt-only re-reports (#4340)', () => {
+    const storedTcc = {
+      screenRecording: true,
+      accessibility: true,
+      fullDiskAccess: false,
+      remoteDesktop: null,
+      checkedAt: '2026-09-01T00:00:00.000Z',
+    };
+    const storedDesktop = {
+      mode: 'user_session',
+      loginUiReachable: true,
+      virtualDisplayReady: false,
+      reason: null,
+      remoteDesktopPermission: null,
+      checkedAt: '2026-09-01T00:00:00.000Z',
+    };
+    const later = '2026-09-01T00:01:00.000Z';
+
+    it('a heartbeat whose tcc/desktop state differs only in checkedAt emits NO audit', async () => {
+      arrange({ tccPermissions: storedTcc, desktopAccess: storedDesktop });
+      const resp = await beat({
+        ...minimalHeartbeatBody,
+        hostname: 'host-1',
+        serverUrl: 'https://cp.example.com',
+        // Agent omits the null optionals on the wire — still not a change.
+        tccPermissions: { screenRecording: true, accessibility: true, fullDiskAccess: false, checkedAt: later },
+        desktopAccess: { mode: 'user_session', loginUiReachable: true, virtualDisplayReady: false, checkedAt: later },
+      });
+      expect(resp.status).toBe(200);
+
+      expect(await auditCalls()).toHaveLength(0);
+    });
+
+    it('a real tcc permission flip is still audited even when checkedAt also moved', async () => {
+      arrange({ tccPermissions: storedTcc, desktopAccess: storedDesktop });
+      const reported = { ...storedTcc, screenRecording: false, checkedAt: later };
+      const resp = await beat({
+        ...minimalHeartbeatBody,
+        hostname: 'host-1',
+        serverUrl: 'https://cp.example.com',
+        tccPermissions: reported,
+        desktopAccess: { ...storedDesktop, checkedAt: later },
+      });
+      expect(resp.status).toBe(200);
+
+      const calls = await auditCalls();
+      expect(calls).toHaveLength(1);
+      const changes = (calls[0]![1] as unknown as { details: { changes: any[] } }).details.changes;
+      expect(changes).toEqual([{ field: 'tccPermissions', before: storedTcc, after: reported }]);
+    });
+
+    it('a real desktopAccess mode change is still audited even when checkedAt also moved', async () => {
+      arrange({ tccPermissions: storedTcc, desktopAccess: storedDesktop });
+      const reported = { ...storedDesktop, mode: 'login_window', checkedAt: later };
+      const resp = await beat({
+        ...minimalHeartbeatBody,
+        hostname: 'host-1',
+        serverUrl: 'https://cp.example.com',
+        tccPermissions: { ...storedTcc, checkedAt: later },
+        desktopAccess: reported,
+      });
+      expect(resp.status).toBe(200);
+
+      const calls = await auditCalls();
+      expect(calls).toHaveLength(1);
+      const changes = (calls[0]![1] as unknown as { details: { changes: any[] } }).details.changes;
+      expect(changes).toEqual([{ field: 'desktopAccess', before: storedDesktop, after: reported }]);
+    });
   });
 
   it('batches multiple simultaneous changes into a single audit event', async () => {
@@ -5548,6 +6088,187 @@ describe('PUT /:id/monitoring-results — secret redaction (#2434)', () => {
   });
 });
 
+// The monitoring ingest opens its own short org-scoped DB context for the
+// device read + insert, and runs the per-result failure-counter Redis work
+// only AFTER that context has been released, so a pooled connection is never
+// held idle-in-transaction across Redis round trips. The per-request result
+// count is bounded before any DB or Redis work.
+describe('PUT /:id/monitoring-results — DB context and per-request bounds', () => {
+  function recordingRedis(initial: Record<string, string> = {}) {
+    const store = new Map<string, string>(Object.entries(initial));
+    const run = (cmd: string, key: string): unknown => {
+      callOrder.push(`redis:${cmd}`);
+      if (cmd === 'incr') {
+        const next = Number(store.get(key) ?? '0') + 1;
+        store.set(key, String(next));
+        return next;
+      }
+      if (cmd === 'expire') return 1;
+      if (cmd === 'get') return store.get(key) ?? null;
+      if (cmd === 'del') {
+        const had = store.has(key);
+        store.delete(key);
+        return had ? 1 : 0;
+      }
+      return null;
+    };
+    const client = {
+      incr: vi.fn(async (key: string) => run('incr', key)),
+      expire: vi.fn(async (key: string) => run('expire', key)),
+      get: vi.fn(async (key: string) => run('get', key)),
+      del: vi.fn(async (key: string) => run('del', key)),
+      pipeline: vi.fn(() => {
+        const queued: Array<[string, string]> = [];
+        const p: Record<string, unknown> = {};
+        for (const cmd of ['incr', 'expire', 'get', 'del']) {
+          p[cmd] = (key: string) => {
+            queued.push([cmd, key]);
+            return p;
+          };
+        }
+        p.exec = async () => queued.map(([cmd, key]) => [null, run(cmd, key)]);
+        return p;
+      }),
+    };
+    return { client, store };
+  }
+
+  function mockDeviceLookup() {
+    selectMock.mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([
+            { id: 'device-1', orgId: 'org-1', siteId: 'site-1' },
+          ]),
+        }),
+      }),
+    });
+  }
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    callOrder.length = 0;
+    orgDbContexts.length = 0;
+    const { getRedis } = await import('../../services/redis');
+    vi.mocked(getRedis).mockReturnValue(null);
+  });
+
+  it('opens an org-scoped context carrying the agent partner for the read + insert', async () => {
+    mockDeviceLookup();
+    insertMock.mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) });
+
+    const res = await buildApp().request('/agents/agent-1/monitoring-results', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ results: [{ watchType: 'service', name: 'sshd', status: 'running' }] }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(orgDbContexts).toHaveLength(1);
+    expect(orgDbContexts[0]).toMatchObject({
+      scope: 'organization',
+      orgId: 'org-1',
+      accessibleOrgIds: ['org-1'],
+      accessiblePartnerIds: [],
+      currentPartnerId: 'partner-1',
+    });
+  });
+
+  it('runs the failure-counter Redis work only after the DB context is released', async () => {
+    mockDeviceLookup();
+    insertMock.mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) });
+    const { client, store } = recordingRedis({ 'svc-mon:device-1:nginx:failures': '3' });
+    const { getRedis } = await import('../../services/redis');
+    vi.mocked(getRedis).mockReturnValue(client as any);
+
+    const res = await buildApp().request('/agents/agent-1/monitoring-results', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        results: [
+          { watchType: 'service', name: 'sshd', status: 'stopped' },
+          { watchType: 'process', name: 'nginx', status: 'running' },
+        ],
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ accepted: 2 });
+
+    const released = callOrder.lastIndexOf('dbContext:released');
+    const redisIdx = callOrder
+      .map((entry, i) => (entry.startsWith('redis:') ? i : -1))
+      .filter((i) => i >= 0);
+    expect(released).toBeGreaterThanOrEqual(0);
+    expect(redisIdx.length).toBeGreaterThan(0);
+    expect(Math.min(...redisIdx)).toBeGreaterThan(released);
+
+    // Same counter semantics as before: a failure increments with a 1h TTL, a
+    // recovery clears the counter and reports how many failures preceded it.
+    expect(store.get('svc-mon:device-1:sshd:failures')).toBe('1');
+    expect(store.has('svc-mon:device-1:nginx:failures')).toBe(false);
+
+    const { publishEvent } = await import('../../services/eventBus');
+    expect(publishEvent).toHaveBeenCalledWith(
+      'monitoring.check_failed',
+      'org-1',
+      { deviceId: 'device-1', name: 'sshd', watchType: 'service', status: 'stopped', consecutiveFailures: 1 },
+      'agent-monitoring',
+      { siteId: 'site-1' },
+    );
+    expect(publishEvent).toHaveBeenCalledWith(
+      'monitoring.check_recovered',
+      'org-1',
+      { deviceId: 'device-1', name: 'nginx', watchType: 'process', previousFailures: 3 },
+      'agent-monitoring',
+      { siteId: 'site-1' },
+    );
+  });
+
+  it('refuses a batch above the per-request result cap before any DB or Redis work', async () => {
+    const { client } = recordingRedis();
+    const { getRedis } = await import('../../services/redis');
+    vi.mocked(getRedis).mockReturnValue(client as any);
+
+    const results = Array.from({ length: 1001 }, (_, i) => ({
+      watchType: 'service',
+      name: `n${i}`,
+      status: 'stopped',
+    }));
+    const res = await buildApp().request('/agents/agent-1/monitoring-results', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ results }),
+    });
+
+    expect(res.status).toBe(413);
+    expect(selectMock).not.toHaveBeenCalled();
+    expect(insertMock).not.toHaveBeenCalled();
+    expect(callOrder.filter((e) => e.startsWith('redis:'))).toEqual([]);
+  });
+
+  it('still accepts a batch at the per-request result cap', async () => {
+    mockDeviceLookup();
+    const values = vi.fn().mockResolvedValue(undefined);
+    insertMock.mockReturnValue({ values });
+
+    const results = Array.from({ length: 1000 }, (_, i) => ({
+      watchType: 'process',
+      name: `n${i}`,
+      status: 'running',
+    }));
+    const res = await buildApp().request('/agents/agent-1/monitoring-results', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ results }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ accepted: 1000 });
+    expect(values).toHaveBeenCalledTimes(1);
+  });
+});
+
 // #3986 Layer 4 — the MINIMAL DRAIN BEAT. Being on the drain ROUTE allowlist is
 // not the same as being harmless: the normal heartbeat both INGESTS (metrics,
 // IP history, OneDrive state, threshold-scan command creation, audit events)
@@ -5827,6 +6548,168 @@ describe('POST /agents/:id/heartbeat — device-remove uninstall drain (#3986)',
     expect(resp.status).toBe(200);
     const body = (await resp.json()) as Record<string, unknown>;
     expect(body.rotateToken).toBe(true);
+  });
+
+  // Characterisation of the main beat's credential signals, pinned across the
+  // extraction into heartbeatCredentialMaintenance.ts (the parked beat shares it).
+  function deviceRow(overrides: Record<string, unknown>) {
+    return {
+      id: 'device-1',
+      orgId: 'org-1',
+      siteId: 'site-1',
+      hostname: 'host-1',
+      osType: 'linux',
+      architecture: 'amd64',
+      agentVersion: '0.65.10',
+      agentTokenHash: 'hash',
+      watchdogTokenHash: 'watchdog-hash',
+      tokenIssuedAt: new Date(),
+      ...overrides,
+    };
+  }
+
+  it('an ACTIVE tenant past two thirds of its certificate lifetime gets renewCert', async () => {
+    selectMock.mockReset();
+    selectMock.mockReturnValueOnce(selectChainResolving([deviceRow({
+      mtlsCertIssuedAt: new Date(Date.now() - 80 * 3_600_000),
+      mtlsCertExpiresAt: new Date(Date.now() + 10 * 3_600_000),
+    })]));
+    selectMock.mockReturnValue(selectChainResolving([]));
+
+    const resp = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body.renewCert).toBe(true);
+    expect(body.rotateToken).toBeUndefined();
+    expect(body.confirmTokenRotation).toBeUndefined();
+  });
+
+  it('a live staged rotation suppresses a new rotateToken on the main beat', async () => {
+    selectMock.mockReset();
+    selectMock.mockReturnValueOnce(selectChainResolving([deviceRow({
+      watchdogTokenHash: null,
+      pendingTokenHash: 'pending-hash',
+      pendingTokenExpiresAt: new Date(Date.now() + 3_600_000),
+    })]));
+    selectMock.mockReturnValue(selectChainResolving([]));
+
+    const resp = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body.rotateToken).toBeUndefined();
+    expect(body.confirmTokenRotation).toBeUndefined();
+    expect(body.renewCert).toBeUndefined();
+  });
+});
+
+// #2773 — the heartbeat's IMPLICIT promotion must promote the hash the caller
+// authenticated with (agent.authTokenHash), never the handler's own re-read of
+// `pendingTokenHash`. The pure decision is covered in
+// heartbeatTokenRotation.test.ts; this pins the route wiring.
+describe('POST /agents/:id/heartbeat implicit pending-rotation promotion (#2773)', () => {
+  function buildPendingPresentedApp(): Hono {
+    const app = new Hono();
+    app.use('*', async (c, next) => {
+      c.set('agent', {
+        deviceId: 'device-1',
+        agentId: 'agent-1',
+        orgId: 'org-1',
+        partnerId: 'partner-1',
+        siteId: 'site-1',
+        role: 'agent',
+        authTokenHash: 'presented-hash',
+      });
+      c.set('agentPendingTokenPresented', true);
+      await next();
+    });
+    app.route('/agents', heartbeatRoutes);
+    return app;
+  }
+
+  function stubDeviceRow(pendingTokenHash: string) {
+    selectMock.mockReset();
+    selectMock.mockReturnValueOnce(
+      selectChainResolving([
+        {
+          id: 'device-1',
+          orgId: 'org-1',
+          siteId: 'site-1',
+          hostname: 'host-1',
+          osType: 'linux',
+          architecture: 'amd64',
+          agentVersion: '0.65.10',
+          agentTokenHash: 'current-hash',
+          watchdogTokenHash: 'watchdog-hash',
+          helperTokenHash: 'helper-hash',
+          pendingTokenHash,
+          pendingWatchdogTokenHash: 'pending-watchdog-hash',
+          pendingHelperTokenHash: 'pending-helper-hash',
+          pendingTokenExpiresAt: new Date(Date.now() + 30 * 60 * 1000),
+          tokenIssuedAt: new Date(),
+        },
+      ]),
+    );
+    selectMock.mockReturnValue(selectChainResolving([]));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    updateMock.mockReset();
+    insertMock.mockReset();
+    getActiveTrustKeysetMock.mockReset();
+    getActiveManifestKeyDelegationsMock.mockReset();
+    getActiveTrustKeysetMock.mockResolvedValue([]);
+    getActiveManifestKeyDelegationsMock.mockResolvedValue([]);
+    updateMock.mockReturnValue({
+      set: vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) })),
+    });
+    insertMock.mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) });
+    promotePendingAgentCredentialsMock.mockReset();
+    promotePendingAgentCredentialsMock.mockResolvedValue(true);
+  });
+
+  it('promotes the presented hash when it is still the staged hash', async () => {
+    stubDeviceRow('presented-hash');
+
+    const resp = await buildPendingPresentedApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+
+    expect(resp.status).toBe(200);
+    expect(promotePendingAgentCredentialsMock).toHaveBeenCalledTimes(1);
+    expect(promotePendingAgentCredentialsMock.mock.calls[0]![0]).toMatchObject({
+      deviceId: 'device-1',
+      pendingTokenHash: 'presented-hash',
+      expectedAgentTokenHash: 'current-hash',
+    });
+  });
+
+  it('does not promote a set re-staged after the caller authenticated', async () => {
+    // agentAuth matched the presented token against ITS read of the row; this
+    // handler's re-read shows a different staged hash. Promoting that one would
+    // make current a credential the endpoint never presented.
+    stubDeviceRow('restaged-hash');
+
+    const resp = await buildPendingPresentedApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+
+    expect(resp.status).toBe(200);
+    expect(promotePendingAgentCredentialsMock).not.toHaveBeenCalled();
   });
 });
 
@@ -6150,5 +7033,345 @@ describe('POST /agents/:id/heartbeat — recovery marker check-in', () => {
     expect(res.status).toBe(200);
     expect((await res.json()).recoveryMarkerAck).toBeUndefined();
     expect(recoverySetCalls).toHaveLength(0);
+  });
+});
+
+// #4340 — every access-deciding TCC bit must still register as a change, or a
+// real permission flip would silently drop out of the state-change audit.
+describe('tccPermissionsMeaningfullyChanged (#4340)', () => {
+  const base = {
+    screenRecording: true,
+    accessibility: true,
+    fullDiskAccess: true,
+    remoteDesktop: null,
+    checkedAt: '2026-09-01T00:00:00.000Z',
+  };
+  const later = '2026-09-01T00:01:00.000Z';
+
+  it.each([
+    ['screenRecording', { screenRecording: false }],
+    ['accessibility', { accessibility: false }],
+    ['fullDiskAccess', { fullDiskAccess: false }],
+    ['remoteDesktop null → true', { remoteDesktop: true }],
+    ['remoteDesktop null → false', { remoteDesktop: false }],
+  ])('detects a %s change', (_label, patch) => {
+    expect(tccPermissionsMeaningfullyChanged(base, { ...base, ...patch, checkedAt: later })).toBe(true);
+  });
+
+  it('ignores checkedAt and treats a missing remoteDesktop as null', () => {
+    const { remoteDesktop: _omit, ...withoutRemote } = base;
+    expect(tccPermissionsMeaningfullyChanged(base, { ...withoutRemote, checkedAt: later })).toBe(false);
+  });
+
+  it('treats null ↔ object as a change and null ↔ null as none', () => {
+    expect(tccPermissionsMeaningfullyChanged(null, base)).toBe(true);
+    expect(tccPermissionsMeaningfullyChanged(base, undefined)).toBe(true);
+    expect(tccPermissionsMeaningfullyChanged(null, undefined)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------
+// Pre-assignment — a device parked in its partner's
+// holding org gets a minimal beat: liveness plus credential rotation and
+// lifecycle removal. No configuration, upgrade target, trust material,
+// helper settings or policy, and no ingest.
+// ---------------------------------------------------------------------
+describe('POST /agents/:id/heartbeat — parked (pre-assignment) heartbeat', () => {
+  const PARKED_ALLOWED_KEYS = ['commands', 'renewCert', 'rotateToken', 'confirmTokenRotation'];
+  const FORBIDDEN_KEYS = [
+    'configUpdate',
+    'upgradeTo',
+    'helperUpgradeTo',
+    'watchdogUpgradeTo',
+    'backup_server_url',
+    'mergedConfigUpdate',
+    'manifestTrustKeys',
+    'manifestKeyDelegations',
+    'manageRemoteManagement',
+    'remoteAccess',
+    'networkContextReceipt',
+    'helperEnabled',
+    'helperSettings',
+    'uacInterceptionEnabled',
+    'policyProbe',
+    'onedriveHelper',
+    'recoveryMarkerAck',
+    'acknowledgedRollbackObservationId',
+  ];
+
+  // Every ingest branch of the normal path would fire on this body, so "no
+  // ingest" is a real assertion rather than a consequence of an empty payload.
+  const richHeartbeatBody = {
+    agentVersion: '0.70.1',
+    hostname: 'renamed-host',
+    osVersion: 'Ubuntu 24.04',
+    metrics: { cpuPercent: 99, ramPercent: 99, ramUsedMb: 4096, diskPercent: 99, diskUsedGb: 500 },
+    ipHistoryUpdate: { deviceId: 'device-1', currentIPs: ['10.0.0.9'] },
+    onedriveDeviceState: {
+      signedIn: true,
+      filesOnDemandOn: true,
+      kfmFolderStates: {},
+      mountedLibraries: [],
+      entitledLibraries: [],
+      signedInUpns: ['user@example.com'],
+      driftEntries: [],
+    },
+    healthStatus: { schemaVersion: 1, deviceId: 'device-1', overall: 'healthy' },
+  };
+
+  // Credential state that makes BOTH rotation signals due: the certificate is
+  // past two thirds of its lifetime and there is no watchdog credential yet.
+  const parkedDeviceRow = {
+    id: 'device-1',
+    orgId: 'pool-org-1',
+    siteId: 'pool-site-1',
+    hostname: 'host-1',
+    osType: 'linux',
+    architecture: 'amd64',
+    agentVersion: '0.70.0',
+    status: 'online',
+    agentTokenHash: 'hash',
+    watchdogTokenHash: null,
+    helperTokenHash: 'helper-hash',
+    pendingTokenHash: null,
+    pendingTokenExpiresAt: null,
+    pendingWatchdogTokenHash: null,
+    pendingHelperTokenHash: null,
+    tokenIssuedAt: new Date(),
+    mtlsCertIssuedAt: new Date(Date.now() - 80 * 3_600_000),
+    mtlsCertExpiresAt: new Date(Date.now() + 10 * 3_600_000),
+  };
+
+  function buildParkedApp(
+    role: 'agent' | 'watchdog' = 'agent',
+    flags: { rotationRequired?: boolean; pendingPresented?: boolean } = {},
+  ): Hono {
+    const app = new Hono();
+    app.use('*', async (c, next) => {
+      c.set('agentTokenRotationRequired', flags.rotationRequired === true);
+      c.set('agentPendingTokenPresented', flags.pendingPresented === true);
+      c.set('agent', {
+        deviceId: 'device-1',
+        agentId: 'agent-1',
+        orgId: 'pool-org-1',
+        partnerId: 'partner-1',
+        siteId: 'pool-site-1',
+        role,
+        tenantDraining: false,
+        deviceUninstallDraining: false,
+        isPreAssignment: true,
+        claimTypeAllowlist: ['self_uninstall'] as const,
+        // The token the caller authenticated with: the staged one when it
+        // presented the staged credential.
+        authTokenHash: flags.pendingPresented ? 'pending-hash' : 'current-hash',
+      });
+      await next();
+    });
+    app.route('/agents', heartbeatRoutes);
+    return app;
+  }
+
+  let setSpy: ReturnType<typeof vi.fn>;
+  let whereSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    selectMock.mockReset();
+    updateMock.mockReset();
+    insertMock.mockReset();
+    orgDbContexts.length = 0;
+    getActiveTrustKeysetMock.mockReset();
+    getActiveManifestKeyDelegationsMock.mockReset();
+    // Armed with values the normal path WOULD return, so a fall-through
+    // produces a loudly non-empty body.
+    getActiveTrustKeysetMock.mockResolvedValue([
+      { keyId: 'k-1', publicKeyB64: 'AAA=', validFrom: '2026-01-01T00:00:00.000Z' },
+    ]);
+    getActiveManifestKeyDelegationsMock.mockResolvedValue([{ keyId: 'k-1' }]);
+    selectMock.mockReturnValue(selectChainResolving([parkedDeviceRow]));
+    whereSpy = vi.fn(() => whereResultWithReturning());
+    setSpy = vi.fn(() => ({ where: whereSpy }));
+    updateMock.mockReturnValue({ set: setSpy });
+    insertMock.mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) });
+    claimPendingCommandsForDeviceMock.mockResolvedValue([]);
+  });
+
+  async function parkedBeat(role: 'agent' | 'watchdog' = 'agent', body: unknown = richHeartbeatBody) {
+    return buildParkedApp(role).request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(role === 'watchdog' ? { ...(body as object), role: 'watchdog' } : body),
+    });
+  }
+
+  for (const role of ['agent', 'watchdog'] as const) {
+    it(`${role}: response carries only commands and credential rotation fields`, async () => {
+      const resp = await parkedBeat(role);
+
+      expect(resp.status).toBe(200);
+      const body = (await resp.json()) as Record<string, unknown>;
+      for (const key of Object.keys(body)) {
+        expect(PARKED_ALLOWED_KEYS).toContain(key);
+      }
+      for (const key of FORBIDDEN_KEYS) {
+        expect(body).not.toHaveProperty(key);
+      }
+    });
+
+    it(`${role}: claims only self_uninstall`, async () => {
+      await parkedBeat(role);
+
+      expect(claimPendingCommandsForDeviceMock).toHaveBeenCalledTimes(1);
+      expect(claimPendingCommandsForDeviceMock).toHaveBeenCalledWith('device-1', 10, role, ['self_uninstall']);
+    });
+
+    it(`${role}: runs no ingest, config, upgrade, policy or trust resolution`, async () => {
+      await parkedBeat(role);
+
+      expect(insertMock).not.toHaveBeenCalled();
+      const { writeAuditEvent } = await import('../../services/auditEvents');
+      expect(writeAuditEvent).not.toHaveBeenCalled();
+      const { processDeviceIPHistoryUpdate } = await import('../../services/deviceIpHistory');
+      expect(processDeviceIPHistoryUpdate).not.toHaveBeenCalled();
+      const { publishEvent } = await import('../../services/eventBus');
+      expect(publishEvent).not.toHaveBeenCalled();
+      expect(recordAgentHealthObservationMock).not.toHaveBeenCalled();
+      expect(ingestRollbackObservationMock).not.toHaveBeenCalled();
+      expect(requestDeviceGroupReevaluationMock).not.toHaveBeenCalled();
+      expect(loadTopologyFlagsMock).not.toHaveBeenCalled();
+      expect(withResolvedTopologyFlagsMock).not.toHaveBeenCalled();
+      expect(getActiveTrustKeysetMock).not.toHaveBeenCalled();
+      expect(getActiveManifestKeyDelegationsMock).not.toHaveBeenCalled();
+
+      const helpers = await import('./helpers');
+      expect(helpers.maybeQueueThresholdFilesystemAnalysis).not.toHaveBeenCalled();
+      expect(helpers.getOrgAgentUpdateConfig).not.toHaveBeenCalled();
+      expect(helpers.resolvePinnedUpgradeTarget).not.toHaveBeenCalled();
+      expect(helpers.buildEventLogConfigUpdate).not.toHaveBeenCalled();
+      expect(helpers.buildMonitoringConfigUpdate).not.toHaveBeenCalled();
+      expect(helpers.buildPamConfigUpdate).not.toHaveBeenCalled();
+      expect(helpers.buildPatchSourceConfigUpdate).not.toHaveBeenCalled();
+      expect(helpers.buildOnedriveHelperConfigUpdate).not.toHaveBeenCalled();
+      expect(helpers.buildPolicyProbeConfigUpdate).not.toHaveBeenCalled();
+      expect(helpers.buildHelperConfigUpdate).not.toHaveBeenCalled();
+      expect(helpers.buildWarrantyConfigUpdate).not.toHaveBeenCalled();
+      const { resolveRemoteAccessForDevice } = await import('../../services/remoteAccessPolicy');
+      expect(resolveRemoteAccessForDevice).not.toHaveBeenCalled();
+    });
+
+    it(`${role}: reads and writes under an org context without the partner-wide read axis`, async () => {
+      await parkedBeat(role);
+
+      expect(orgDbContexts.length).toBeGreaterThan(0);
+      for (const ctx of orgDbContexts) {
+        expect(ctx).toMatchObject({ scope: 'organization', orgId: 'pool-org-1', accessibleOrgIds: ['pool-org-1'] });
+        expect(ctx.currentPartnerId ?? null).toBeNull();
+      }
+    });
+  }
+
+  it('agent: still delivers certificate renewal and token rotation', async () => {
+    const resp = await parkedBeat('agent');
+
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body).toEqual({ commands: [], renewCert: true, rotateToken: true });
+  });
+
+  it('agent: a superseded-token caller is not asked to rotate (request flags reach the shared helper)', async () => {
+    const resp = await buildParkedApp('agent', { rotationRequired: true }).request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(richHeartbeatBody),
+    });
+
+    expect(await resp.json()).toEqual({ commands: [], renewCert: true });
+  });
+
+  it('agent: a staged-token caller is told to confirm when the implicit promotion does not land', async () => {
+    selectMock.mockReturnValue(selectChainResolving([{
+      ...parkedDeviceRow,
+      pendingTokenHash: 'pending-hash',
+      pendingTokenExpiresAt: new Date(Date.now() + 3_600_000),
+    }]));
+    // The promotion CAS matches no row.
+    promotePendingAgentCredentialsMock.mockResolvedValueOnce(false);
+
+    const resp = await buildParkedApp('agent', { pendingPresented: true }).request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(richHeartbeatBody),
+    });
+
+    expect(await resp.json()).toEqual({ commands: [], renewCert: true, confirmTokenRotation: true });
+    // Promotion was attempted for exactly the staged hash the caller presented.
+    expect(promotePendingAgentCredentialsMock).toHaveBeenCalledWith(expect.objectContaining({
+      deviceId: 'device-1',
+      pendingTokenHash: 'pending-hash',
+      expectedAgentTokenHash: 'hash',
+    }));
+  });
+
+  it('agent: delivers a queued self_uninstall', async () => {
+    claimPendingCommandsForDeviceMock.mockResolvedValueOnce([
+      { id: 'cmd-uninstall', type: 'self_uninstall', deviceId: 'device-1', payload: {}, executedAt: new Date() },
+    ]);
+
+    const resp = await parkedBeat('agent');
+
+    const body = (await resp.json()) as { commands: Array<{ type: string }> };
+    expect(body.commands.map((cmd) => cmd.type)).toEqual(['self_uninstall']);
+  });
+
+  it('agent: records liveness only — lastSeenAt, online status and agent version, guarded against terminal statuses', async () => {
+    await parkedBeat('agent');
+
+    expect(setSpy).toHaveBeenCalledTimes(1);
+    const written = setSpy.mock.calls[0]![0] as Record<string, unknown>;
+    expect(Object.keys(written).sort()).toEqual(['agentVersion', 'lastSeenAt', 'status']);
+    expect(written.status).toBe('online');
+    expect(written.agentVersion).toBe('0.70.1');
+    expect(written.lastSeenAt).toBeInstanceOf(Date);
+    expect(whereSpy.mock.calls[0]![0]).toEqual(
+      and(eq(devices.id, 'device-1'), notInArray(devices.status, ['decommissioned', 'quarantined'])),
+    );
+  });
+
+  it('watchdog: records watchdog liveness only and receives no rotation signal', async () => {
+    const resp = await parkedBeat('watchdog');
+
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body).toEqual({ commands: [] });
+    expect(setSpy).toHaveBeenCalledTimes(1);
+    const written = setSpy.mock.calls[0]![0] as Record<string, unknown>;
+    expect(Object.keys(written).sort()).toEqual(['watchdogLastSeen', 'watchdogStatus', 'watchdogVersion']);
+    expect(whereSpy.mock.calls[0]![0]).toEqual(
+      and(eq(devices.id, 'device-1'), notInArray(devices.status, ['decommissioned', 'quarantined'])),
+    );
+  });
+
+  it('refuses a credential role mismatch the same way the full beat does', async () => {
+    const resp = await buildParkedApp('agent').request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...richHeartbeatBody, role: 'watchdog' }),
+    });
+
+    expect(resp.status).toBe(401);
+    expect(await resp.json()).toMatchObject({ code: 're_enrollment_required' });
+    expect(claimPendingCommandsForDeviceMock).not.toHaveBeenCalled();
+    expect(setSpy).not.toHaveBeenCalled();
+  });
+
+  it('a device in a regular org still gets the full heartbeat (positive control)', async () => {
+    const resp = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(minimalHeartbeatBody),
+    });
+
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(Object.keys(body)).toContain('configUpdate');
+    expect(Object.keys(body)).toContain('manifestTrustKeys');
   });
 });

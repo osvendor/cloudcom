@@ -2,6 +2,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { unifiCollectors } from '../../db/schema';
 import { encryptSecret, decryptForColumn } from '../secretCrypto';
 import type { DbExecutor } from './unifiConnectionService';
+import { notInHoldingOrgCondition } from '../unassignedPool/selectorPredicate';
 
 export type { DbExecutor } from './unifiConnectionService';
 
@@ -33,6 +34,18 @@ export interface AgentCollectorConfig {
   controllerUrl: string;
   apiKey: string;
   pollIntervalSeconds: number;
+  // Optional topology negotiation (M2 Task 5, Collection §8). Present only when
+  // the server authorizes UniFi topology for this collector; the agent then
+  // attaches `topologyV1` bound to this epoch + source identity.
+  acceptedUnifiTopologyVersions?: number[];
+  topologyProducerEpoch?: string;
+  topologySourceIdentity?: string;
+}
+
+export interface CollectorTopologyAdvertisement {
+  acceptedUnifiTopologyVersions: number[];
+  topologyProducerEpoch: string;
+  topologySourceIdentity: string;
 }
 
 function toCollector(row: any): UnifiCollector {
@@ -167,7 +180,18 @@ export async function deleteCollector(db: DbExecutor, integrationId: string, uni
 }
 
 // Agent-pull: configs for the agent whose device is the collector. Decrypts the key.
-export async function listCollectorsForDevice(db: DbExecutor, deviceId: string): Promise<AgentCollectorConfig[]> {
+// `orgId` is the token-resolved agent org and is load-bearing: the caller reads
+// in system scope, and a collector row can outlive a move of its device to
+// another org (the org-move path does not rewrite unifi_collectors).
+// `topologyAdvertisement` (services/topology/unifiAuthority.ts
+// unifiTopologyAdvertisement) decides per collector whether topology v1 is
+// offered; without it every collector is legacy-only.
+export async function listCollectorsForDevice(
+  db: DbExecutor,
+  deviceId: string,
+  orgId: string,
+  opts: { topologyAdvertisement?: (collectorId: string) => Promise<CollectorTopologyAdvertisement | null> } = {},
+): Promise<AgentCollectorConfig[]> {
   const rows = await db
     .select({
       id: unifiCollectors.id,
@@ -177,14 +201,27 @@ export async function listCollectorsForDevice(db: DbExecutor, deviceId: string):
       pollIntervalSeconds: unifiCollectors.pollIntervalSeconds,
     })
     .from(unifiCollectors)
-    .where(and(eq(unifiCollectors.collectorDeviceId, deviceId), eq(unifiCollectors.isEnabled, true)));
-  return rows.map((r: any) => ({
-    collectorId: r.id,
-    unifiHostId: r.unifiHostId,
-    controllerUrl: r.controllerUrl,
-    apiKey: decryptForColumn('unifi_collectors', 'local_api_key_encrypted', r.localApiKeyEncrypted),
-    pollIntervalSeconds: r.pollIntervalSeconds,
-  }));
+    .where(and(
+      eq(unifiCollectors.collectorDeviceId, deviceId),
+      eq(unifiCollectors.orgId, orgId),
+      eq(unifiCollectors.isEnabled, true),
+      // Never hand a controller key to a device parked in a holding org.
+      notInHoldingOrgCondition(sql`(SELECT d.org_id FROM devices d WHERE d.id = ${unifiCollectors.collectorDeviceId})`),
+    ));
+  const out: AgentCollectorConfig[] = [];
+  for (const r of rows as any[]) {
+    const topology = opts.topologyAdvertisement ? await opts.topologyAdvertisement(r.id) : null;
+    out.push({
+      collectorId: r.id,
+      unifiHostId: r.unifiHostId,
+      controllerUrl: r.controllerUrl,
+      // local_api_key_encrypted is NOT NULL, so decryption yields a string.
+      apiKey: decryptForColumn('unifi_collectors', 'local_api_key_encrypted', r.localApiKeyEncrypted) as string,
+      pollIntervalSeconds: r.pollIntervalSeconds,
+      ...(topology ?? {}),
+    });
+  }
+  return out;
 }
 
 // Returns the device that owns a collector, or null if the collector is unknown.

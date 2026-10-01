@@ -81,6 +81,19 @@ async function seedRestore(orgId: string) {
     INSERT INTO restore_jobs (org_id, snapshot_id, device_id, restore_type, command_id)
     VALUES (${orgId}, ${snapshot!.id as string}, ${deviceId}, 'full', ${command!.id as string}) RETURNING id
   `);
+  // A brokered storage session for the same command: erased with the org,
+  // untouched for the other org.
+  await db.execute(sql`
+    INSERT INTO backup_storage_sessions (
+      org_id, command_id, device_id, source_device_id, snapshot_id, config_id, storage_identity,
+      use_file_index, token_hash, generation, max_calls, max_resolved_objects, expires_at, deadline,
+      rate_calls_available, rate_objects_available, rate_refilled_at
+    ) VALUES (
+      ${orgId}, ${command!.id as string}, ${deviceId}, ${deviceId}, ${snapshot!.id as string}, ${config!.id as string},
+      'local::/restore-fixture', true, ${crypto.randomUUID().replace(/-/g, '').padEnd(64, '0')}, 1, 10, 10,
+      now() + interval '5 minutes', now() + interval '30 minutes', 10, 10, now()
+    )
+  `);
   return { restoreId: restore!.id as string, commandId: command!.id as string };
 }
 
@@ -707,8 +720,12 @@ describe('tenant export + erasure round-trip (live DB)', () => {
 
     expect(await rowCount(db, 'restore_jobs', orgA)).toBe(1);
     expect(await rowCount(db, 'restore_jobs', orgB)).toBe(1);
+    expect(await rowCount(db, 'backup_storage_sessions', orgA)).toBe(1);
+    expect(await rowCount(db, 'backup_storage_sessions', orgB)).toBe(1);
     const stats = await cascadeDeleteOrg(orgA, PERFORMED_BY, PERFORMED_EMAIL);
     expect(await rowCount(db, 'restore_jobs', orgA)).toBe(0);
+    expect(await rowCount(db, 'backup_storage_sessions', orgA)).toBe(0);
+    expect(await rowCount(db, 'backup_storage_sessions', orgB)).toBe(1);
     expect(stats.tablesDeleted.restore_jobs).toBe(1);
     expect([...(await db.execute(sql`SELECT id FROM device_commands WHERE id = ${restoreA.commandId}`))]).toEqual([]);
     expect([...(await db.execute(sql`SELECT command_id FROM restore_jobs WHERE id = ${restoreB.restoreId}`))])
@@ -766,6 +783,41 @@ describe('tenant export + erasure round-trip (live DB)', () => {
     // ON DELETE CASCADE — proves the table is genuinely wired into the walk.
     expect(stats.tablesDeleted['device_mtls_certificates']).toBe(1);
     expect(stats.tablesDeleted['devices']).toBe(1);
+  });
+
+  it('exports interface samples without their open readings and erases them child-first (M3 Task 2)', async () => {
+    const db = getTestDb();
+    const { orgA, orgB } = await seedTwoOrgs();
+    const readingsSentinel = `IF-READINGS-${crypto.randomUUID()}`;
+    for (const orgId of [orgA, orgB]) {
+      const [site] = await db.execute(sql`SELECT id FROM sites WHERE org_id = ${orgId} LIMIT 1`);
+      const siteId = site!.id as string;
+      const nodeId = crypto.randomUUID(), interfaceId = crypto.randomUUID(), sourceId = crypto.randomUUID();
+      await db.execute(sql`INSERT INTO topology_nodes (id, org_id, site_id, identity_key, identity_material, kind)
+        VALUES (${nodeId}, ${orgId}, ${siteId}, ${nodeId}, ${JSON.stringify({ version: 1, kind: 'endpoint', sourceKey: nodeId })}::jsonb, 'endpoint')`);
+      await db.execute(sql`INSERT INTO topology_interfaces (id, org_id, site_id, owner_node_id, interface_key, epoch)
+        VALUES (${interfaceId}, ${orgId}, ${siteId}, ${nodeId}, 'port-1', 'gen:1')`);
+      await db.execute(sql`INSERT INTO topology_collection_sources (id, org_id, site_id, producer_id, producer_kind, producer_epoch, protocol, context_key)
+        VALUES (${sourceId}, ${orgId}, ${siteId}, ${crypto.randomUUID()}, 'snmp', 'epoch-1', 'if_metrics', 'snmp:192.0.2.10')`);
+      await db.execute(sql`INSERT INTO topology_interface_samples
+        (org_id, site_id, interface_id, interface_epoch, source_id, producer_epoch, source_sequence, sampled_at, resolution, readings, sample_count)
+        VALUES (${orgId}, ${siteId}, ${interfaceId}, 'gen:1', ${sourceId}, 'epoch-1', 18446744073709551615, now() - interval '1 minute', 'raw',
+          ${JSON.stringify({ v: 1, note: readingsSentinel })}::jsonb, 1)`);
+    }
+
+    const { manifest, zipBuffer } = await buildOrgExportZip(orgA, PERFORMED_BY, PERFORMED_EMAIL);
+    expect(manifest.files.find((f) => f.name === 'topology_interface_samples.json')?.rowCount).toBe(1);
+    const rows = await archiveTable(await JSZip.loadAsync(zipBuffer), 'topology_interface_samples');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ org_id: orgA, source_sequence: '18446744073709551615', resolution: 'raw' });
+    expect(rows[0]).not.toHaveProperty('readings');
+    expect(JSON.stringify(rows)).not.toContain(readingsSentinel);
+
+    const stats = await cascadeDeleteOrg(orgA, PERFORMED_BY, PERFORMED_EMAIL);
+    expect(stats.tablesDeleted['topology_interface_samples']).toBe(1);
+    expect(await rowCount(db, 'topology_interface_samples', orgA)).toBe(0);
+    expect(await rowCount(db, 'topology_interfaces', orgA)).toBe(0);
+    expect(await rowCount(db, 'topology_interface_samples', orgB)).toBe(1);
   });
 
   it('aborts erasure before any row when an S3-backed org document cannot be cleared, then completes once the object is gone (W03)', async () => {

@@ -40,10 +40,19 @@ var rootCmd = &cobra.Command{
 	Use:   "breeze-backup",
 	Short: "Breeze RMM Backup Helper",
 	Long:  "Backup helper binary spawned by the Breeze agent for backup operations.",
-	Run:   func(cmd *cobra.Command, args []string) { runBackupHelper() },
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if protocolInfo {
+			return printProtocolInfo(cmd.OutOrStdout())
+		}
+		runBackupHelper()
+		return nil
+	},
 }
 
 var socketPath string
+
+// protocolInfo is set by --protocol-info.
+var protocolInfo bool
 
 // backupStopDrainTimeout bounds how long a targeted backup_stop waits for the
 // cancelled workload to unwind before replying. Pinned below the agent's
@@ -161,6 +170,7 @@ func (c *activeCommandCanceller) cancelAll() bool {
 
 func init() {
 	rootCmd.Flags().StringVar(&socketPath, "socket", "", "IPC socket path to connect to the main agent")
+	rootCmd.Flags().BoolVar(&protocolInfo, backupipc.ProtocolInfoFlag, false, "print the storage protocol versions this helper implements as JSON and exit")
 
 	// Stable, parseable `breeze-backup --version` output, mirroring the
 	// watchdog's "Watchdog Version:" line (cmd/breeze-watchdog). The heartbeat's
@@ -258,6 +268,12 @@ func runBackupHelper() {
 	log := logging.L("backup-helper")
 	if cfgErr != nil {
 		log.Warn("failed to load config, using defaults", "error", cfgErr.Error())
+	}
+	helperStagingDir = resolveBackupStagingDir(cfg.BackupStagingDir)
+	// #5460: a helper killed mid-export never ran its deferred cleanup; reclaim
+	// those VM-sized dirs from both places they could have been staged.
+	if n := sweepOrphanedHypervStaging([]string{helperStagingDir, os.TempDir()}, hypervOrphanMinAge, hypervOrphanLegacyMinAge); n > 0 {
+		log.Info("removed orphaned Hyper-V staging dirs", "count", n)
 	}
 	log.Info("breeze-backup starting",
 		"version", version,
@@ -405,13 +421,7 @@ func initBackupManager(cfg *config.Config) *backup.BackupManager {
 	}
 
 	// Ensure the configured staging directory exists before use.
-	stagingDir := cfg.BackupStagingDir
-	if stagingDir != "" {
-		if err := os.MkdirAll(stagingDir, 0700); err != nil {
-			slog.Error("configured backup staging dir cannot be created, falling back to OS temp dir", "dir", stagingDir, "error", err.Error())
-			stagingDir = ""
-		}
-	}
+	stagingDir := resolveBackupStagingDir(cfg.BackupStagingDir)
 
 	mgr := backup.NewBackupManager(backup.BackupConfig{
 		Provider:           backupProvider,
@@ -740,6 +750,22 @@ func executeCommand(req backupipc.BackupCommandRequest, mgr *backup.BackupManage
 			return ok(fmt.Sprintf(`{"stopped":%t,"drained":%t}`, stopped, drained))
 		}
 	}
+	// A restore-shaped command carrying a storage session is served through
+	// that session only — never through agent.yaml, a vault or a payload
+	// providerConfig — whether or not an agent.yaml manager exists.
+	if brokeredReadCommands[req.CommandType] {
+		if result, handled := executeBrokeredRead(req, mgr, conn, commandCanceller); handled {
+			return result
+		}
+	}
+	// A backup carrying a write-scoped storage session writes through that
+	// session only — never through agent.yaml storage or a payload
+	// providerConfig.
+	if brokeredWriteCommands[req.CommandType] {
+		if result, handled := executeBrokeredWrite(req, conn, commandCanceller); handled {
+			return result
+		}
+	}
 	if req.CommandType == "backup_run" {
 		payloadMgr, err := managerFromBackupRunPayload(req.Payload)
 		if err != nil {
@@ -866,35 +892,13 @@ func executeCommand(req backupipc.BackupCommandRequest, mgr *backup.BackupManage
 		if err := applyCommandStorageEncryption(mgr.GetProvider(), req.Payload); err != nil {
 			return fail(err.Error())
 		}
-		excludes, err := parseBackupRunExcludes(req.Payload)
-		if err != nil {
-			return fail(err.Error())
-		}
 		// Track this command with the canceller so backup_stop's cancelAll()
 		// can abort the run even though mgr may be an ephemeral
 		// payload-built manager that never goes through Stop() (see
 		// managerFromBackupRunPayload above).
 		ctx, cleanup := commandCanceller.track(req.CommandID)
 		defer cleanup()
-		// mgr here may be the ephemeral payload-built manager resolved above
-		// (not the long-lived agent.yaml manager), so the progress fn is set
-		// on it directly, right before the run that actually uses it.
-		mgr.SetProgressFn(func(filesDone, filesTotal int, bytesDone, bytesTotal int64, snapshotID string) {
-			sendBackupRunProgress(conn, req.CommandID, backupipc.BackupProgress{
-				CommandID: req.CommandID, Phase: "uploading",
-				Current: bytesDone, Total: bytesTotal,
-				FilesDone: filesDone, FilesTotal: filesTotal,
-				// Forwarded so the server records backup_jobs.snapshot_id
-				// mid-run (#3006). Empty on pre-snapshot keepalives.
-				SnapshotID: snapshotID,
-			})
-		})
-		result := marshalBackupRunResult(mgr.RunBackupContext(ctx, excludes))
-		// Auto-sync to vault after successful backup (async — don't block command response)
-		if result.Success {
-			go autoSyncToVault(result.Stdout, vaultState, conn)
-		}
-		return result
+		return runBackupRunCommand(ctx, req, mgr, vaultState, conn)
 	case "backup_list":
 		return marshalResult(backup.ListSnapshots(mgr.GetProvider()))
 	case "backup_stop":
@@ -973,6 +977,34 @@ func executeCommand(req backupipc.BackupCommandRequest, mgr *backup.BackupManage
 	}
 }
 
+// runBackupRunCommand runs a backup_run through mgr (whose provider already
+// carries the command's storage encryption) and reports its progress.
+func runBackupRunCommand(ctx context.Context, req backupipc.BackupCommandRequest, mgr *backup.BackupManager, vaultState *vaultManagerRef, conn *ipc.Conn) backupipc.BackupCommandResult {
+	excludes, err := parseBackupRunExcludes(req.Payload)
+	if err != nil {
+		return fail(err.Error())
+	}
+	// mgr here may be the ephemeral payload-built manager resolved above
+	// (not the long-lived agent.yaml manager), so the progress fn is set
+	// on it directly, right before the run that actually uses it.
+	mgr.SetProgressFn(func(filesDone, filesTotal int, bytesDone, bytesTotal int64, snapshotID string) {
+		sendBackupRunProgress(conn, req.CommandID, backupipc.BackupProgress{
+			CommandID: req.CommandID, Phase: "uploading",
+			Current: bytesDone, Total: bytesTotal,
+			FilesDone: filesDone, FilesTotal: filesTotal,
+			// Forwarded so the server records backup_jobs.snapshot_id
+			// mid-run (#3006). Empty on pre-snapshot keepalives.
+			SnapshotID: snapshotID,
+		})
+	})
+	result := marshalBackupRunResult(mgr.RunBackupContext(ctx, excludes))
+	// Auto-sync to vault after successful backup (async — don't block command response)
+	if result.Success {
+		go autoSyncToVault(result.Stdout, vaultState, conn)
+	}
+	return result
+}
+
 // --- helpers ---
 
 func ok(stdout string) backupipc.BackupCommandResult {
@@ -1015,9 +1047,23 @@ func marshalBackupRunResult(job *backup.BackupJob, err error) backupipc.BackupCo
 	return result
 }
 
+// failureBodyCarrier is a result whose body still travels with a failed
+// command: Success stays false and Stderr carries the reason, so the server
+// records the command and its restore job as failed, and the body adds the
+// counts (files restored and failed) to that failure.
+type failureBodyCarrier interface {
+	CarryResultOnFailure() bool
+}
+
 func marshalResult(v any, err error) backupipc.BackupCommandResult {
 	if err != nil {
-		return fail(err.Error())
+		result := fail(err.Error())
+		if carrier, ok := v.(failureBodyCarrier); ok && carrier.CarryResultOnFailure() {
+			if data, merr := json.Marshal(v); merr == nil {
+				result.Stdout = string(data)
+			}
+		}
+		return result
 	}
 	data, merr := json.Marshal(v)
 	if merr != nil {

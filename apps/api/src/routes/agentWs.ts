@@ -43,6 +43,7 @@ import {
   isLegacyBackupTimeoutResult,
   tryParseBackupResultPayload,
 } from '../services/backupProgress';
+import { applyCommandProgress } from '../services/commandProgress';
 import { backupCommandResultSchema } from './backup/resultSchemas';
 import { describeZodIssues } from '../lib/zodIssues';
 import { matchRoleScopedAgentTokenHash, suspendAgentToken, type AgentCredentialRole } from '../middleware/agentAuth';
@@ -57,6 +58,8 @@ import {
   checkDeviceTenantState,
   checkDeviceTokenSuspension,
 } from '../middleware/deviceCredentialLifecycle';
+import { isUnassignedPoolOrgType } from '../services/unassignedPool/orgType';
+import { isParkedDeliverableCommandType } from '../services/unassignedPool/deliveryEligibility';
 import { createAuditLogAsync } from '../services/auditService';
 import { ANONYMOUS_ACTOR_ID, writeAuditEvent, requestLikeFromSnapshot } from '../services/auditEvents';
 import { redactSecretsFromOutput, redactOptionalSecretText, redactAgentResultErrorFields } from '../services/secretRedaction';
@@ -79,7 +82,9 @@ import {
   resolveConsentMarkerSessionId,
   parseDesktopStartCommandId,
 } from './remote/helpers';
+import { consentDeniedMessage } from './remote/consentTiming';
 import { getActiveTrustKeyset } from '../services/manifestSigning';
+import { nextAgentUpdateAttempt } from '@breeze/shared';
 import { resolvePendingAgentCommand } from '../services/agentCommandAwait';
 import {
   reconcileSoftwareInstallResult,
@@ -97,8 +102,10 @@ import { applyCommandAutomationTerminal } from '../services/automationTerminalEv
 import {
   commandAcceptsAgentResult,
   commandAcceptsAgentResultCondition,
+  collapseAgentReportedTimeoutStatus,
   BACKUP_QUEUE_ACK_RESULT_STATUS,
 } from '../services/commandResultAcceptance';
+import { markCommandResultProcessingFailed } from '../services/commandResultProcessingFailure';
 import { QUEUED_BACKUP_WORKLOAD_COMMAND_TYPES } from '../services/commandTypes';
 import { redactResultAgainstCommandSecrets } from '../services/commandSecretRedaction';
 import { INSTANCE_ID } from '../services/instanceIdentity';
@@ -112,8 +119,19 @@ import {
   loadTrustState,
   partnerIdForDevice,
 } from '../services/partnerTrust';
+import { checkAgentWsMessageBudget } from '../services/agentWsMessageBudget';
+import { beginAgentUpdateStatusWrite, finishAgentUpdateStatusWrite } from '../services/agentUpdateStatusCoalescer';
+import { sniffCommandId, sniffTerminalMessageType } from '../services/agentWsTerminalMessageSniff';
 /** Capabilities advertised to agents in the post-connect `connected` message. */
-export const AGENT_WS_CAPABILITIES = ['terminal_output_base64', 'backup_run_async', 'backup_queue_async'] as const;
+export const AGENT_WS_CAPABILITIES = [
+  'terminal_output_base64',
+  'backup_run_async',
+  'backup_queue_async',
+  // #3578: agents send `command_progress` frames only when this is advertised.
+  // Literal (not the imported constant) so the tuple stays `as const`; the
+  // agentWs test pins it to COMMAND_PROGRESS_CAPABILITY.
+  'command_progress',
+] as const;
 
 declare module 'hono' {
   interface ContextVariableMap {
@@ -236,6 +254,13 @@ interface ActiveAgentConnection {
   trustState: PartnerTrustState;
   credentialTokenHash?: string;
   credentialRevoked: boolean;
+  /**
+   * The device's org was a holding org when this socket was admitted. The
+   * upgrade refuses such a device, so this is false for every real socket; it
+   * is carried so the send primitive refuses non-removal commands on its own
+   * should that admission ever change.
+   */
+  parked: boolean;
 }
 
 // Store active WebSocket connections and their connect-time trust snapshot by agentId.
@@ -749,12 +774,17 @@ function buildStoredCommandResult(
   // megabytes of random base64 and would silently corrupt the artifact (#2401).
   const skipStdoutRedaction = isRawStdoutArtifactCommand(commandType);
   return {
-    status: result.status,
+    // See collapseAgentReportedTimeoutStatus: an agent-reported 'timeout'
+    // must never be stored verbatim — that literal string doubles as the
+    // server's own reopen marker.
+    status: collapseAgentReportedTimeoutStatus(result.status),
     exitCode: result.exitCode,
     stdout: stdout != null && !skipStdoutRedaction ? redactSecretsFromOutput(stdout) : stdout,
     stderr: result.stderr != null ? redactSecretsFromOutput(result.stderr) : result.stderr,
     durationMs: result.durationMs,
-    error: result.error != null ? redactSecretsFromOutput(result.error) : result.error,
+    error: result.error != null
+      ? redactSecretsFromOutput(result.error)
+      : result.status === 'timeout' ? 'Agent reported a timeout' : result.error,
   };
 }
 
@@ -903,11 +933,23 @@ const revocationLeaseRenewSchema = z.object({
   syncNonce: z.string().min(1).max(64).optional(),
 });
 
+// #3578: in-flight stage for a command the agent is executing (agent side:
+// websocket.Client.SendCommandProgress). Sent only to servers advertising the
+// `command_progress` capability. `stage` is loose here on purpose — an agent
+// newer than this server may know stages this server does not, and that must
+// be a quiet drop in applyCommandProgress, not an INVALID_MESSAGE error frame.
+const commandProgressMessageSchema = z.object({
+  type: z.literal('command_progress'),
+  commandId: z.string().max(128),
+  stage: z.string().max(32),
+});
+
 const agentMessageSchema = z.discriminatedUnion('type', [
   commandResultSchema,
   heartbeatMessageSchema,
   terminalOutputSchema,
-  backupProgressMessageSchema
+  backupProgressMessageSchema,
+  commandProgressMessageSchema,
 ]);
 
 // Command types sent to agent
@@ -933,6 +975,8 @@ type AgentDbContext = {
    */
   partnerId: string;
   role?: AgentCredentialRole;
+  /** The device's org is a holding org (see ActiveAgentConnection.parked). */
+  parked?: boolean;
 };
 
 type AgentTokenValidation =
@@ -978,6 +1022,8 @@ export async function isAgentDeviceStillAuthorized(
             pendingTokenHash: devices.pendingTokenHash,
             pendingWatchdogTokenHash: devices.pendingWatchdogTokenHash,
             pendingTokenExpiresAt: devices.pendingTokenExpiresAt,
+            // The device's org type, for the holding-org refusal below.
+            orgType: sql<string | null>`(SELECT o.type FROM organizations o WHERE o.id = ${devices.orgId})`,
           })
           .from(devices)
           .where(eq(devices.agentId, agentId))
@@ -992,6 +1038,10 @@ export async function isAgentDeviceStillAuthorized(
     // Shared predicates — middleware/deviceCredentialLifecycle.ts.
     if (checkDeviceStatus(row)) return false;
     if (checkDeviceTokenSuspension(row)) return false;
+    // A device parked in a holding org never holds a socket: the upgrade
+    // refuses it, and this re-check closes any socket that finds its device
+    // there, whatever admitted it.
+    if (isUnassignedPoolOrgType(row.orgType)) return false;
     if (authenticatedTokenHash !== undefined) {
       const match = matchRoleScopedAgentTokenHash({
         ...row,
@@ -1070,6 +1120,8 @@ export async function validateAgentToken(
         // an FK, so a device with no org row is not authenticable anyway, and a
         // LEFT join would silently degrade it to the pre-W02 blind behaviour.
         partnerId: organizations.partnerId,
+        // Pre-assignment: a device parked in a holding org is refused below.
+        organizationType: organizations.type,
       })
       .from(devices)
       .innerJoin(organizations, eq(organizations.id, devices.orgId))
@@ -1135,6 +1187,17 @@ export async function validateAgentToken(
     return { ok: false, reason: 'unauthorized' };
   }
 
+  // Pre-assignment: a device parked in its partner's
+  // holding org gets credential rotation and lifecycle removal over REST, and
+  // nothing else. A socket is a fully-capable control channel (the same reason
+  // a draining tenant is refused above), so the upgrade is refused here — one
+  // closed door instead of gating every push primitive on an open socket. The
+  // agent keeps its REST heartbeat, which carries everything it may receive.
+  if (isUnassignedPoolOrgType(device.organizationType)) {
+    console.warn('[agentWs] agent_ws_refused_pending_assignment', { agentId, deviceId: device.id });
+    return { ok: false, reason: 'unauthorized' };
+  }
+
   // Security remediation Wave 5, Task 6 — shared certificate/device binding
   // decision. Runs after every other auth/lifecycle/tenant check and BEFORE
   // the WS upgrade is accepted. In the default `off` mode this never touches
@@ -1156,6 +1219,7 @@ export async function validateAgentToken(
       partnerId: device.partnerId,
       role: match.role,
       credentialTokenHash: tokenHash,
+      parked: isUnassignedPoolOrgType(device.organizationType),
     },
   };
 }
@@ -1566,7 +1630,13 @@ export async function processOrphanedCommandResult(
 
   // Check if this is a discovery job result
   const [discoveryJob] = await db
-    .select({ id: discoveryJobs.id, orgId: discoveryJobs.orgId, siteId: discoveryJobs.siteId, agentId: discoveryJobs.agentId })
+    .select({
+      id: discoveryJobs.id,
+      orgId: discoveryJobs.orgId,
+      siteId: discoveryJobs.siteId,
+      agentId: discoveryJobs.agentId,
+      status: discoveryJobs.status
+    })
     .from(discoveryJobs)
     .where(eq(discoveryJobs.id, result.commandId))
     .limit(1);
@@ -1574,6 +1644,17 @@ export async function processOrphanedCommandResult(
   if (discoveryJob) {
     if (!discoveryJob.agentId || discoveryJob.agentId !== agentId) {
       console.warn(`[AgentWs] Rejecting discovery result for job ${discoveryJob.id} from unexpected agent ${agentId}`);
+      return;
+    }
+    // A job that already left 'running' (completed, failed, cancelled) has
+    // either finished or been superseded by a later dispatch of the same job
+    // id. Accepting a late/replayed result here would let the probe agent
+    // rewrite site assets or job history at any later time, with no time
+    // bound. Guarding on status also serves as a coarse consume-once: the
+    // conditional updates below only take effect for the first result to
+    // land while the job is still 'running'.
+    if (discoveryJob.status !== 'running') {
+      console.warn(`[AgentWs] Rejecting stale discovery result for job ${discoveryJob.id} (status=${discoveryJob.status})`);
       return;
     }
     console.log(`[AgentWs] Processing discovery result for job ${discoveryJob.id} from agent ${agentId}`);
@@ -1596,7 +1677,7 @@ export async function processOrphanedCommandResult(
             errors: { message: errorMsg },
             updatedAt: new Date()
           })
-          .where(eq(discoveryJobs.id, discoveryJob.id));
+          .where(and(eq(discoveryJobs.id, discoveryJob.id), eq(discoveryJobs.status, 'running')));
         console.warn(`[AgentWs] Discovery job ${discoveryJob.id} failed: ${errorMsg}`);
         return;
       }
@@ -1632,7 +1713,7 @@ export async function processOrphanedCommandResult(
             errors: { message: 'Results received but could not be processed: job queue unavailable' },
             updatedAt: new Date()
           })
-          .where(eq(discoveryJobs.id, discoveryJob.id));
+          .where(and(eq(discoveryJobs.id, discoveryJob.id), eq(discoveryJobs.status, 'running')));
       }
     } catch (err) {
       console.error(`[AgentWs] Failed to process discovery results for ${agentId}:`, err);
@@ -1646,7 +1727,7 @@ export async function processOrphanedCommandResult(
             errors: { message: err instanceof Error ? err.message : 'Failed to enqueue discovery results' },
             updatedAt: new Date()
           })
-          .where(eq(discoveryJobs.id, discoveryJob.id));
+          .where(and(eq(discoveryJobs.id, discoveryJob.id), eq(discoveryJobs.status, 'running')));
       } catch (dbErr) {
         // #3530: the orphaned-result twin of the registry handler's fallback.
         console.error(`[AgentWs] Additionally failed to mark discovery job ${discoveryJob.id} as failed:`, dbErr);
@@ -1775,13 +1856,17 @@ export async function processOrphanedCommandResult(
             bareMetal: backupData?.bareMetal,
             vssMetadata: backupData?.vssMetadata,
             snapshot: backupData?.snapshot,
+            attestation: backupData?.attestation,
             error: malformedPayloadError || result.error || result.stderr,
           },
           {
             actorType: 'agent',
             actorId: agentId,
             source: 'route:agentWs:backup-result',
-          }
+          },
+          // The expectation was consumed above; the consumer may record an
+          // attestation for this result.
+          { dispatchExpectationVerified: true },
         ));
       } else {
         console.warn(`[AgentWs] Redis unavailable, marking backup job ${backupJob.id} with inline result`);
@@ -1795,6 +1880,7 @@ export async function processOrphanedCommandResult(
             ...(backupData ?? {}),
             error: malformedPayloadError || result.error || result.stderr,
           },
+          dispatchExpectationVerified: true,
         });
         if (!persisted.applied) {
           console.warn(`[AgentWs] Ignoring stale inline backup result for job ${backupJob.id} from agent ${agentId}`);
@@ -1932,6 +2018,30 @@ export async function processOrphanedCommandResult(
  * follow-up, now bounded by short per-operation wraps instead of a
  * message-long one.
  */
+/** See processCommandResult's @returns. */
+type CommandResultIngestOutcome = 'handled' | 'processing_failed';
+
+/**
+ * #3530 — the frame sent instead of an `ack` when a command result reached the
+ * server but could not be recorded. Same shape as buildAgentMessageRejection's
+ * frame (`type`/`code`/`message`/`messageType`/`commandId`), which is what the
+ * agent's `logServerErrorFrame` (agent/internal/websocket/client.go) parses, so
+ * the failure is attributable to the job in the agent's own log. Agents with
+ * #7365 resend the result a bounded number of times on this frame (the row is
+ * reopenable, and a duplicate after a successful record is a 0-row CAS no-op);
+ * older agents only log it. agent/internal/websocket/result_resend_test.go pins
+ * this frame's shape from the agent side.
+ */
+export function buildResultProcessingFailedFrame(commandId: string) {
+  return {
+    type: 'error' as const,
+    code: 'RESULT_PROCESSING_FAILED' as const,
+    message: 'Command result received but could not be recorded',
+    messageType: 'command_result',
+    commandId: commandId.slice(0, MAX_ECHOED_FIELD_CHARS),
+  };
+}
+
 async function runWithAgentOrgDbAccess<T>(
   label: string,
   orgId: string,
@@ -1970,12 +2080,19 @@ async function runWithAgentOrgDbAccess<T>(
  * no step on this path directly acquires a second pooled connection while
  * another context's connection is held open (#1105).
  *
- * Trade-off (deliberate): the terminal CAS commits independently, so a
- * failure AFTER it (e.g. a handler wrap failing to open under pool
- * exhaustion) reaches the function-level catch with the command row already
- * terminal and the ack still sent — the agent won't redeliver, and the
- * downstream org-table transition is left to the stale-timeout sweeps. The
- * catch logs + Sentry-captures, so this is loud, not silent.
+ * #3530: the terminal CAS no longer commits independently. It runs in ONE
+ * short org-scoped transaction (`agentWs.commandResult.finalize`) with the
+ * per-type persistence, so a persistence failure rolls the terminal
+ * transition back with it; the row is then parked as a reopenable
+ * `result_processing_failed` and the caller answers the agent with an error
+ * frame instead of an ack. The terminal audit and the automation-ledger
+ * terminal run only after that transaction committed.
+ *
+ * @returns 'processing_failed' when the result could not be recorded — a
+ *   persistence failure (row parked reopenable) or an unexpected error before
+ *   the finalize transaction settled (logged + captured, row untouched);
+ *   'handled' for everything else (recorded, duplicate, orphaned, ignored, or
+ *   an error in a post-commit follow-up).
  */
 async function processCommandResult(
   agentId: string,
@@ -1988,7 +2105,11 @@ async function processCommandResult(
   // remaining agent path where partner-wide rows stay invisible.
   partnerId: string,
   credentialAlreadyReauthorized = false,
-): Promise<void> {
+): Promise<CommandResultIngestOutcome> {
+  // #3530: set once the finalize transaction has committed (or found the
+  // result already recorded). An unexpected error BEFORE that point means
+  // nothing was recorded, so the function-level catch nacks rather than acks.
+  let resultSettled = false;
   try {
     // #2434 chokepoint — FIRST statement, so "any agent result that enters this
     // function is redacted" is a true invariant for every exit path below
@@ -2009,7 +2130,7 @@ async function processCommandResult(
       stdout: result.stdout,
       error: result.error,
     });
-    if (consumed) return;
+    if (consumed) return 'handled';
 
     // Non-UUID command IDs (for example mon-* and snmp-*) are dispatched directly
     // over WebSocket and do not have a device_commands row.
@@ -2021,7 +2142,7 @@ async function processCommandResult(
       await runWithAgentOrgDbAccess('agentWs.commandResult.orphaned', orgId, partnerId, () =>
         processOrphanedCommandResult(agentId, deviceId ?? '', result)
       );
-      return;
+      return 'handled';
     }
 
     // Look up command by ID + deviceId directly (device_commands has no RLS).
@@ -2114,12 +2235,12 @@ async function processCommandResult(
       await runWithAgentOrgDbAccess('agentWs.commandResult.orphaned', orgId, partnerId, () =>
         processOrphanedCommandResult(agentId, deviceId ?? '', result)
       );
-      return;
+      return 'handled';
     }
 
     if (command.targetRole && command.targetRole !== 'agent') {
       console.warn(`[AgentWs] Ignoring ${command.targetRole} command result ${result.commandId} on agent websocket for ${agentId}`);
-      return;
+      return 'handled';
     }
 
     // Finding #3 (defense-in-depth): before terminally updating a device-bound
@@ -2135,7 +2256,7 @@ async function processCommandResult(
         `[AgentWs] Aborting command result ${result.commandId} for ${agentId}: device contained (decommissioned/quarantined/suspended). Severing socket.`
       );
       disconnectAgent(agentId, 4001, 'Device no longer authorized');
-      return;
+      return 'handled';
     }
 
     // `result` was already redacted at the top of this function (#2434), and
@@ -2176,7 +2297,7 @@ async function processCommandResult(
     };
     if (['file_delete', 'system_cleanup_run'].includes(command.type) && !commandAcceptsAgentResult(command.status, command.result, command.type)) {
       await recordSupplementalCleanup();
-      return;
+      return 'handled';
     }
 
     // D20-D: mssql_backup/hyperv_backup are QUEUED_BACKUP_WORKLOAD_COMMAND_TYPES
@@ -2200,12 +2321,24 @@ async function processCommandResult(
         return isBackupQueuedAck(parsed) || isBackupStartedAck(parsed);
       })();
 
-    // Update outside transaction for same visibility reasons as the lookup, and
-    // under an explicit system context so the compare-and-set is not a
-    // contextless bare-pool write (#1375). device_commands is intentionally
-    // system-scoped (no RLS), so this changes nothing about what the write can
-    // touch — it just makes the guard's invariant ("device_commands writes run
-    // under an explicit system context", db/index.ts) actually true here.
+    // #3530 — the terminal compare-and-set and the per-type persistence
+    // (script_executions, backup verification, restore job, CIS / sensitive-
+    // data findings, deployment_results, DR state, …) now commit in ONE org-
+    // scoped transaction. Previously the CAS committed on its own first and the
+    // handlers swallowed their failures, so the history said "completed" while
+    // the feature record was missing, and the row — already terminal — refused
+    // every resubmission. Now a persistence failure rolls the CAS back with
+    // it, and the row is parked below as a reopenable `result_processing_failed`.
+    //
+    // Why the CAS moved from outside+system into the org transaction:
+    // device_commands has no RLS (intentionally system-scoped), so the org
+    // context changes nothing about what the write can touch — it is still an
+    // explicit context, satisfying the #1375 contextless-write guard — and it
+    // is the only way to share a transaction with the handlers, which need the
+    // tenant RLS context. One pooled connection, as before (#3021 / #1105).
+    // Holding the row lock across the handlers is safe: no handler writes or
+    // locks this device_commands row on a separate connection (swept for
+    // #3530); a concurrent duplicate's CAS simply waits and then matches 0 rows.
     //
     // dbWriteExpectingRows (#1379 A2): the SELECT above matched this exact
     // predicate and returned a row, so a 0-row result here means another writer
@@ -2219,7 +2352,7 @@ async function processCommandResult(
     //   - the cancellation paths (admin/abuse.ts, software.ts, scripts.ts,
     //     cisHardening.ts, discovery.ts, backup/restore.ts, maintenance.ts,
     //     playbookRetention.ts, backup/verificationScheduled.ts).
-    // Every other cause — a contextless/denied write, a future RLS policy on
+    // Every other cause — a denied write, a future RLS policy on
     // device_commands, a misrouted connection — is a defect that would
     // otherwise vanish into the console.warn below. The prior_status tag
     // (resolved ONLY on the 0-row branch, so the happy path pays nothing) is
@@ -2234,9 +2367,28 @@ async function processCommandResult(
     // for the REAL result later is the BACKUP_QUEUE_ACK_RESULT_STATUS marker
     // written into the STORED result.status (see commandAcceptsAgentResultCondition).
     const storedResult = buildStoredCommandResult(command.type, normalizedResult, stdout);
-    const updatedCommands = await runOutsideDbContext(() =>
-      withSystemDbAccessContext(() =>
-        dbWriteExpectingRows(
+    const finalizedCommand = command;
+    const commandPayload =
+      command.payload && typeof command.payload === 'object' && !Array.isArray(command.payload)
+        ? command.payload as Record<string, unknown>
+        : {};
+    const drExecutionId =
+      DR_COMMAND_TYPES.has(command.type) && typeof commandPayload.drExecutionId === 'string'
+        ? commandPayload.drExecutionId
+        : null;
+    const handlerInput = {
+      agentId,
+      command: finalizedCommand,
+      commandId: result.commandId,
+      result: normalizedResult,
+      resolvedDeviceId: resolvedDeviceId!,
+      stdout,
+    };
+
+    let finalized: 'stale' | 'queue_ack' | 'recorded';
+    try {
+      finalized = await runWithAgentOrgDbAccess('agentWs.commandResult.finalize', orgId, partnerId, async () => {
+        const updatedCommands = await dbWriteExpectingRows(
           'device_commands.ws_result_terminal_cas',
           () =>
             db
@@ -2259,36 +2411,120 @@ async function processCommandResult(
                   // but the first late result rewrites `result.status` away
                   // from 'timeout', so a duplicate frame still finds 0 rows.
                   // D20-D: same idea for a queue-ack-marked row — see
-                  // BACKUP_QUEUE_ACK_RESULT_STATUS.
+                  // BACKUP_QUEUE_ACK_RESULT_STATUS. #3530: and for a row parked
+                  // as result_processing_failed.
                   commandAcceptsAgentResultCondition()
                 )
               )
               .returning({ id: deviceCommands.id }),
           () => commandCasPriorStatusTags(result.commandId)
-        )
-      )
-    );
+        );
+        if (updatedCommands.length === 0) return 'stale';
 
-    if (updatedCommands.length === 0) {
+        if (isBackupAck) {
+          // Non-terminal signal: device_commands is 'completed' only so the
+          // synchronous executeCommand() caller unblocks with the ack (item C
+          // in routes/backup/mssql.ts, hyperv.ts decides what to do with it
+          // from there). No terminal side effect fires for a mere queue
+          // admission — NOT applyCommandAutomationTerminal, NOT the audit
+          // event, and critically NOT the per-type handler dispatch
+          // (handleProviderBackedBackupResult would otherwise parse
+          // {"queued":true}/{"started":true} against backupCommandResultSchema
+          // — which is all-optional-fields and would vacuously "succeed" — and
+          // mark the backup_jobs row completed with no snapshot at all).
+          return 'queue_ack';
+        }
+
+        if (validationError) {
+          // Still dispatch to the per-type handler for verify/restore
+          // families so the linked backup_verifications / restore_jobs record
+          // transitions to a terminal 'failed' state instead of stranding
+          // until the stale-timeout sweep. normalizedResult already carries
+          // status 'failed' + the rejection reason as `error`, so the
+          // handler's normal failure path applies.
+          const rejectedFamily = detectResultValidationFamily(finalizedCommand.type);
+          if (rejectedFamily && TERMINAL_TRANSITION_FAMILIES_ON_VALIDATION_FAILURE.has(rejectedFamily)) {
+            const rejectedHandler = commandResultHandlers[finalizedCommand.type];
+            if (rejectedHandler) await rejectedHandler(handlerInput);
+          }
+          return 'recorded';
+        }
+
+        if (drExecutionId) {
+          const { handleDrCommandResult } = await import('./backup/drResultHandler');
+          await handleDrCommandResult({
+            commandId: result.commandId,
+            commandType: finalizedCommand.type,
+            deviceId: resolvedDeviceId!,
+            status: normalizedResult.status,
+            result: normalizedResult.result,
+            payload: commandPayload,
+          });
+        }
+
+        // Software installs use persisted command UUIDs on both transports.
+        // Reconciliation is idempotent (pending status + matching attempt), so
+        // a result reaching both transports — or resubmitted after a
+        // rolled-back attempt — is applied once.
+        if (finalizedCommand.type === 'software_install') {
+          await reconcileSoftwareInstallResult(finalizedCommand, resolvedDeviceId!, normalizedResult);
+        }
+
+        const handler = commandResultHandlers[finalizedCommand.type];
+        if (handler) await handler(handlerInput);
+        return 'recorded';
+      });
+    } catch (persistErr) {
+      // The transaction rolled back: the CAS and any partial persistence are
+      // gone, so the row still holds its pre-result state. Park it as failed +
+      // reopenable in a FRESH system context (the failed one is closed), so
+      // the history is honest and a resubmission is reprocessed. No terminal
+      // audit and no automation terminal — neither describes what happened.
+      console.error(
+        `[AgentWs] Failed to record ${finalizedCommand.type} result ${result.commandId} for agent ${agentId}; ` +
+        'command parked as result_processing_failed:',
+        persistErr,
+      );
+      captureException(persistErr, undefined, {
+        command_result_phase: 'ws_result_persistence',
+        commandType: finalizedCommand.type,
+        commandId: result.commandId,
+      });
+      try {
+        await runOutsideDbContext(() =>
+          withSystemDbAccessContext(() =>
+            markCommandResultProcessingFailed({
+              commandId: result.commandId,
+              deviceId: resolvedDeviceId!,
+              targetRole: 'agent',
+              storedResult,
+            })
+          )
+        );
+      } catch (markErr) {
+        // The row keeps its pre-result (sent / timeout-marked) state and the
+        // stale reaper will fail it; the persistence failure above is already
+        // reported.
+        console.error(`[AgentWs] Failed to park command ${result.commandId} as result_processing_failed:`, markErr);
+        captureException(markErr, undefined, {
+          command_result_phase: 'ws_result_processing_failed_mark',
+          commandId: result.commandId,
+        });
+      }
+      return 'processing_failed';
+    }
+
+    resultSettled = true;
+
+    if (finalized === 'stale') {
       await recordSupplementalCleanup();
       console.warn(`[AgentWs] Ignoring stale or already-processed command result ${result.commandId} for agent ${agentId}`);
-      return;
+      return 'handled';
     }
+    if (finalized === 'queue_ack') return 'handled';
 
-    if (isBackupAck) {
-      // Non-terminal signal: device_commands is 'completed' only so the
-      // synchronous executeCommand() caller unblocks with the ack (item C in
-      // routes/backup/mssql.ts, hyperv.ts decides what to do with it from
-      // there). No terminal side effect fires for a mere queue admission —
-      // NOT applyCommandAutomationTerminal, NOT the audit event below, and
-      // critically NOT the per-type handler dispatch further down
-      // (handleProviderBackedBackupResult would otherwise parse
-      // {"queued":true}/{"started":true} against backupCommandResultSchema —
-      // which is all-optional-fields and would vacuously "succeed" — and mark
-      // the backup_jobs row completed with no snapshot at all).
-      return;
-    }
-
+    // Derived from the authoritative command state, so it runs only AFTER that
+    // state committed. It opens its own system context (automation ledger).
     await applyCommandAutomationTerminal({
       commandId: result.commandId,
       result: normalizedResult,
@@ -2298,12 +2534,12 @@ async function processCommandResult(
     });
 
     // Finding #8: emit the append-only audit event for a WS-ingested command
-    // result, matching the REST path (routes/agents/commands.ts). Placed
-    // immediately after the compare-and-set above so it fires EXACTLY ONCE and
-    // ONLY when the row actually transitioned to a terminal state — a
-    // duplicate/late result no-ops the UPDATE and returns above, never audited.
-    // Emitted before the validationError early-return because a
-    // validation-rejected result still transitioned the row to 'failed'.
+    // result, matching the REST path (routes/agents/commands.ts). Emitted
+    // EXACTLY ONCE and ONLY once the terminal transition AND its persistence
+    // committed (#3530) — a duplicate/late result no-ops the CAS and returns
+    // above, and a persistence failure returns before this, never audited.
+    // Emitted before the validationError return because a validation-rejected
+    // result still transitioned the row to 'failed'.
     writeAuditEvent(WS_AUDIT_REQUEST, {
       orgId: orgId ?? null,
       actorType: 'agent',
@@ -2321,59 +2557,16 @@ async function processCommandResult(
 
     if (validationError) {
       console.warn(`[AgentWs] ${validationError} — command ${result.commandId} rejected for agent ${agentId}`);
-      // Still dispatch to the per-type handler for verify/restore families so
-      // the linked backup_verifications / restore_jobs record transitions to a
-      // terminal 'failed' state instead of stranding until the stale-timeout
-      // sweep. normalizedResult already carries status 'failed' + the rejection
-      // reason as `error`, so the handler's normal failure path applies.
-      const rejectedFamily = detectResultValidationFamily(command.type);
-      if (rejectedFamily && TERMINAL_TRANSITION_FAMILIES_ON_VALIDATION_FAILURE.has(rejectedFamily)) {
-        const rejectedHandler = commandResultHandlers[command.type];
-        if (rejectedHandler) {
-          try {
-            // Short org wrap (#3021): handlers touch RLS-guarded org tables
-            // through the ambient db (same as the happy-path dispatch below).
-            await runWithAgentOrgDbAccess('agentWs.commandResult.handler', orgId, partnerId, () =>
-              rejectedHandler({ agentId, command, commandId: result.commandId, result: normalizedResult, resolvedDeviceId: resolvedDeviceId!, stdout })
-            );
-          } catch (handlerErr) {
-            console.error(`[AgentWs] Failed to finalize rejected ${command.type} result ${result.commandId}:`, handlerErr);
-            captureException(handlerErr);
-          }
-        }
-      }
-      return;
+      return 'handled';
     }
 
     console.log(`Command ${result.commandId} ${normalizedResult.status} for agent ${agentId}`);
 
-    const commandPayload =
-      command.payload && typeof command.payload === 'object' && !Array.isArray(command.payload)
-        ? command.payload as Record<string, unknown>
-        : {};
-    if (DR_COMMAND_TYPES.has(command.type) && typeof commandPayload.drExecutionId === 'string') {
-      try {
-        const { handleDrCommandResult } = await import('./backup/drResultHandler');
-        // Short org wrap (#3021): DR result persistence reads/writes
-        // RLS-guarded org tables through the ambient db.
-        await runWithAgentOrgDbAccess('agentWs.commandResult.drResult', orgId, partnerId, () =>
-          handleDrCommandResult({
-            commandId: result.commandId,
-            commandType: command.type,
-            deviceId: resolvedDeviceId!,
-            status: normalizedResult.status,
-            result: normalizedResult.result,
-            payload: commandPayload,
-          })
-        );
-      } catch (err) {
-        console.error(`[AgentWs] Failed to persist DR result state for ${result.commandId}:`, err);
-        captureException(err);
-      }
-
+    // Best-effort after commit: the DR worker's reconcile also runs on its own
+    // schedule, so a failed enqueue only delays it.
+    if (drExecutionId) {
       try {
         const { enqueueDrExecutionReconcile } = await import('../jobs/drExecutionWorker');
-        const drExecutionId = commandPayload.drExecutionId as string;
         // No ambient context here since #3021; runOutsideDbContext kept so the
         // instrumented-queue tripwire stays satisfied if one is reintroduced.
         await runOutsideDbContext(() => enqueueDrExecutionReconcile(drExecutionId));
@@ -2383,6 +2576,11 @@ async function processCommandResult(
       }
     }
 
+    // Topology ingestion stays OUTSIDE the transaction and best-effort (#3530
+    // classification): both sinks deliberately open their own bounded system
+    // transaction (runOutsideDbContext + withSystemDbAccessContext), so they
+    // cannot share the CAS's transaction, and they are observational telemetry
+    // re-collected on the next diagnostic / poll cycle.
     if (command.type === 'network_diagnostic') {
       try {
         // No org wrap: the topology result path establishes its own bounded
@@ -2401,35 +2599,31 @@ async function processCommandResult(
       }
     }
 
-    // Software installs use persisted command UUIDs on both transports.
-    // Reconciliation is idempotent (pending status + matching attempt), so
-    // a result reaching both transports is applied once.
-    if (command.type === 'software_install') {
+    if (command.type === 'topology_interface_poll') {
       try {
-        // Short org wrap (#3021): deployment_results is an RLS-guarded org table.
-        await runWithAgentOrgDbAccess('agentWs.commandResult.softwareInstall', orgId, partnerId, () =>
-          reconcileSoftwareInstallResult(command, resolvedDeviceId!, normalizedResult)
-        );
+        // Own bounded system context; scope/authority come from the stored
+        // command and the registered telemetry authority, never this reply.
+        const { ingestTopologyInterfacePollResult } = await import('../services/topology/snmpInterfaceMetrics');
+        await ingestTopologyInterfacePollResult({
+          commandType: command.type,
+          commandId: result.commandId,
+          deviceId: resolvedDeviceId!,
+          status: normalizedResult.status,
+          result: normalizedResult.result,
+          stdout: normalizedResult.stdout,
+        });
       } catch (err) {
-        console.error(`[AgentWs] Failed to reconcile software-install result ${result.commandId}:`, err);
+        console.error(`[AgentWs] Failed to persist topology interface poll result ${result.commandId}:`, err);
         captureException(err);
       }
     }
-
-    // Dispatch to per-command-type handler if one is registered.
-    // Short org wrap (#3021): handlers read/write RLS-guarded org tables
-    // (script_executions, discovery_jobs, backup/restore jobs, …) through the
-    // ambient db, so they need the tenant context — but ONLY they do, which is
-    // why the wrap sits here instead of around the whole message.
-    const handler = commandResultHandlers[command.type];
-    if (handler) {
-      await runWithAgentOrgDbAccess('agentWs.commandResult.handler', orgId, partnerId, () =>
-        handler({ agentId, command, commandId: result.commandId, result: normalizedResult, resolvedDeviceId: resolvedDeviceId!, stdout })
-      );
-    }
+    return 'handled';
   } catch (error) {
     console.error(`[AgentWs] Failed to process command result for ${agentId}:`, error);
     captureException(error);
+    // After the result was recorded, a failing follow-up (automation ledger,
+    // audit) must not tell the agent the result was lost.
+    return resultSettled ? 'handled' : 'processing_failed';
   }
 }
 
@@ -2574,6 +2768,7 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
         trustState,
         credentialTokenHash: agentDb.credentialTokenHash,
         credentialRevoked: false,
+        parked: agentDb.parked === true,
       });
       socketEpoch = installAgentSocketEpoch(agentId);
       void setAgentPresence(agentId, { instanceId: INSTANCE_ID, connectionToken });
@@ -2706,6 +2901,64 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
 
     onMessage: async (event: MessageEvent, ws: WSContext) => {
       try {
+        // Per-socket message-rate budget: cheaper than any other check on
+        // this path (in-memory, synchronous), so it runs before even the
+        // reauthorization check below — a flooding socket should be shed
+        // before it costs a single allocation or DB round trip, not after.
+        //
+        // command_result/update_status carry TERMINAL STATUS (#3001: a
+        // silently dropped command_result reads as a job vanishing, reaped as
+        // "stalled" 15 minutes later with zero trace). A cheap, bounded-prefix
+        // sniff of the raw frame — NOT a full JSON.parse, which stays exactly
+        // as expensive as before and still only runs once, below — routes
+        // each type to its OWN lane instead of sharing the general one:
+        // command_result gets real headroom for a reconnect-burst of queued
+        // results, while update_status — the frame type that serializes most on
+        // the devices row — stays capped at or below the general
+        // lane's own ceiling, never wider (see agentWsMessageBudget.ts).
+        const rawFrameText = typeof event.data === 'string' ? event.data : null;
+        const terminalMessageType = rawFrameText ? sniffTerminalMessageType(rawFrameText) : null;
+        const budgetKind = terminalMessageType ?? 'general';
+        const budgetVerdict = checkAgentWsMessageBudget(ws, agentId, Date.now(), budgetKind);
+        if (budgetVerdict === 'close') {
+          if (terminalMessageType) {
+            // Sustained abuse dressed up as terminal-status frames is still
+            // sustained abuse — closes exactly like the general lane — but the
+            // loss of whatever terminal status was in flight gets the same
+            // error-level trace a dropped one does, for the same #3001 reason.
+            const commandId = sniffCommandId(rawFrameText!);
+            console.error(
+              `[AgentWs] Closing connection for agent ${agentId} after sustained abuse on the ` +
+              `${terminalMessageType} lane; last frame's commandId=${commandId ?? 'unknown'}`,
+            );
+          }
+          ws.close(1008, 'Message rate budget exceeded');
+          return;
+        }
+        if (budgetVerdict === 'drop') {
+          if (terminalMessageType) {
+            // A dropped terminal-state frame must never be silent — log at
+            // error with everything needed to find the job, matching
+            // buildAgentMessageRejection's posture for the validation-
+            // rejection path below, and tell the agent so it can log the loss
+            // locally instead of assuming delivery.
+            const commandId = sniffCommandId(rawFrameText!);
+            console.error(
+              `[AgentWs] DROPPED ${terminalMessageType} from agent ${agentId} by the message-rate ` +
+              `budget — the job will have no terminal status and will be failed by a reaper. ` +
+              `commandId=${commandId ?? 'unknown'}`,
+            );
+            ws.send(JSON.stringify({
+              type: 'error',
+              code: 'MESSAGE_RATE_BUDGET_EXCEEDED',
+              message: 'Message dropped by rate budget',
+              messageType: terminalMessageType,
+              ...(commandId !== undefined ? { commandId } : {}),
+            }));
+          }
+          return;
+        }
+
         const authenticatedAgent = agentDb;
 
         // This is deliberately the first frame operation: stale oversized or
@@ -2795,16 +3048,38 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
           }
           const { sessionId, data: termData, encoding } = parsed.data;
           const termSession = getActiveTerminalSession(sessionId);
-          // Output can already be in flight when a terminal is disconnected or
-          // its owning API instance restarts. Missing live state is not proof of
-          // a foreign session. Drop it without forwarding or suspending the agent,
-          // just as late terminal-start failures are handled below.
-          if (!termSession) {
-            return;
-          }
-          if (termSession.agentId !== agentId) {
+          if (termSession && termSession.agentId !== agentId) {
+            // The session IS tracked locally, and this process's own memory
+            // already says it belongs to a DIFFERENT, specific agent — an
+            // unambiguous same-process ownership conflict, not something a
+            // restart or a just-closed socket could produce. No lookup
+            // needed; count it exactly as before.
             console.warn(`[AgentWs] Dropping terminal_output for unowned session ${sessionId} from agent ${agentId}`);
             recordCrossTenantDrop(agentId, authenticatedAgent?.deviceId, 'terminal_output');
+            return;
+          }
+          if (!termSession) {
+            // A session missing from THIS process's in-memory map is not, on
+            // its own, evidence of a cross-tenant probe: it's also exactly
+            // what a just-closed session (the socket closed mid-output) or an
+            // API replica restart (the map is process-local and starts empty)
+            // looks like from here, and the agent's shell/PTY can still be
+            // producing real output for either of those for a while after.
+            // Resolve the session's actual owning device (short-lived local
+            // cache, else one DB read — this branch is rare on the hot path;
+            // ordinary owned output never reaches it) and only count this as
+            // a probe when that device is provably NOT the sender's own.
+            const ownerDeviceId = await resolveTerminalSessionOwnerDeviceId(
+              sessionId,
+              runWithAgentDbAccess,
+            );
+            const senderDeviceId = authenticatedAgent?.deviceId;
+            if (ownerDeviceId && senderDeviceId && ownerDeviceId !== senderDeviceId) {
+              console.warn(`[AgentWs] Dropping terminal_output for unowned session ${sessionId} from agent ${agentId} (belongs to a different device)`);
+              recordCrossTenantDrop(agentId, senderDeviceId, 'terminal_output');
+            } else {
+              console.warn(`[AgentWs] Dropping terminal_output for session ${sessionId} not tracked locally from agent ${agentId} (own device — not counted toward auto-suspension)`);
+            }
             return;
           }
           const decodedOutput = decodeTerminalOutput(termData, encoding);
@@ -2895,28 +3170,88 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
 
         // Handle update_status messages: agent is about to self-update
         if (message.type === 'update_status' && typeof message.targetVersion === 'string') {
-          if (agentDb) {
-            await runWithAgentDbAccess('agentWs.updateStatus', async () => {
-              try {
-                // Same terminal-status guard as updateDeviceStatus (#2230):
-                // this write must not resurrect a decommissioned/quarantined
-                // row to 'updating'.
-                await db
-                  .update(devices)
-                  .set({
-                    status: 'updating',
-                    lastSeenAt: new Date(),
-                    updatedAt: new Date()
-                  })
-                  .where(and(
-                    eq(devices.agentId, agentId),
-                    notInArray(devices.status, [...TERMINAL_DEVICE_STATUSES])
-                  ));
-                console.log(`[AgentWs] Agent ${agentId} entering update to ${message.targetVersion}`);
-              } catch (error) {
-                console.error(`[AgentWs] Failed to set updating status for ${agentId}:`, error);
-              }
-            });
+          const targetVersion: string = message.targetVersion;
+          // Coalesce repeats per agent (services/agentUpdateStatusCoalescer.ts):
+          // a frame arriving while a write is in flight, or naming the same
+          // target version just written, is absorbed without opening a
+          // transaction against the devices row. The dedupe window is shorter
+          // than the heartbeat-driven retry cadence, so every real update
+          // attempt still reaches the attempt record below.
+          if (agentDb && beginAgentUpdateStatusWrite(agentId, targetVersion)) {
+            let written = false;
+            try {
+              await runWithAgentDbAccess('agentWs.updateStatus', async () => {
+                try {
+                  const now = new Date();
+                  // #4073 — every update_status precedes an update ATTEMPT (a
+                  // wedged update re-sends it on every heartbeat), so record the
+                  // episode on the device row: first attempt, last attempt,
+                  // count. The heartbeat clears it on convergence; an old open
+                  // record that is still retrying is a stuck update, visible
+                  // without depending on log shipping. A failed read must never
+                  // cost the status flip — it just starts a fresh episode.
+                  // Oversized targets (column is varchar(50)) are not recorded.
+                  let attempt: ReturnType<typeof nextAgentUpdateAttempt> | null = null;
+                  if (targetVersion.length > 0 && targetVersion.length <= 50) {
+                    let prev: {
+                      targetVersion: string | null;
+                      startedAt: Date | null;
+                      lastAttemptAt: Date | null;
+                      attemptCount: number | null;
+                    } | undefined;
+                    try {
+                      [prev] = await db
+                        .select({
+                          targetVersion: devices.updateAttemptTargetVersion,
+                          startedAt: devices.updateAttemptStartedAt,
+                          lastAttemptAt: devices.updateAttemptLastAt,
+                          attemptCount: devices.updateAttemptCount,
+                        })
+                        .from(devices)
+                        .where(eq(devices.agentId, agentId))
+                        .limit(1);
+                    } catch (readError) {
+                      console.error(`[AgentWs] Failed to read update attempt record for ${agentId}:`, readError);
+                    }
+                    attempt = nextAgentUpdateAttempt(
+                      prev ?? { targetVersion: null, startedAt: null, lastAttemptAt: null, attemptCount: null },
+                      targetVersion,
+                      now,
+                    );
+                  } else {
+                    console.warn(`[AgentWs] Not recording update attempt for ${agentId}: targetVersion length ${targetVersion.length} is outside 1..50`);
+                  }
+                  // Same terminal-status guard as updateDeviceStatus (#2230):
+                  // this write must not resurrect a decommissioned/quarantined
+                  // row to 'updating'.
+                  await db
+                    .update(devices)
+                    .set({
+                      status: 'updating',
+                      lastSeenAt: now,
+                      updatedAt: now,
+                      ...(attempt
+                        ? {
+                            updateAttemptTargetVersion: attempt.targetVersion,
+                            updateAttemptStartedAt: attempt.startedAt,
+                            updateAttemptLastAt: attempt.lastAttemptAt,
+                            updateAttemptCount: attempt.attemptCount,
+                          }
+                        : {}),
+                    })
+                    .where(and(
+                      eq(devices.agentId, agentId),
+                      notInArray(devices.status, [...TERMINAL_DEVICE_STATUSES])
+                    ));
+                  written = true;
+                  console.log(`[AgentWs] Agent ${agentId} entering update to ${targetVersion}`);
+                } catch (error) {
+                  console.error(`[AgentWs] Failed to set updating status for ${agentId}:`, error);
+                }
+              });
+            } finally {
+              finishAgentUpdateStatusWrite(agentId, targetVersion, written);
+            }
           }
           return;
         }
@@ -3102,7 +3437,10 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
                   // endpoint refused the start, so the phase is 'confirmed'.
                   const denied = await commitDesktopTerminalIntent({
                     sessionId,
-                    write: { status: 'denied', endedAt: new Date() },
+                    // #6818: record why, so the viewer's answer poll can tell the
+                    // technician "declined" / "did not respond" instead of a
+                    // generic "session ended".
+                    write: { status: 'denied', endedAt: new Date(), errorMessage: consentDeniedMessage(reason) },
                     phase: 'confirmed',
                     where: [
                       eq(remoteSessions.deviceId, authenticatedAgent.deviceId),
@@ -3116,13 +3454,10 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
                     // Kill the viewer token so a lingering token can't resurrect
                     // a denied session via /viewer/offer.
                     await revokeViewerSession(sessionId);
-                    // A genuine user denial or a consent timeout is a "denied"
-                    // decision; any other reason (no user present, helper absent,
-                    // malformed reply) is a bypass/unavailable path, audited
-                    // distinctly.
-                    const action = updated.promptMode === 'consent'
-                      ? classifyConsentDenyAction(reason)
-                      : 'session_consent_bypassed';
+                    // The start was refused, so never `session_consent_bypassed`: an
+                    // explicit user denial, an unanswered prompt, and a prompt
+                    // that could not be shown/answered are audited distinctly.
+                    const action = classifyConsentDenyAction(reason);
                     await logSessionAudit(
                       action,
                       authenticatedAgent.deviceId,
@@ -3373,7 +3708,7 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
             // old request-long wrap held one pooled connection idle-in-
             // transaction while the nested system contexts inside acquired a
             // second, doubling pool pressure per command result (#1105).
-            await processCommandResult(
+            const ingestOutcome = await processCommandResult(
               agentId,
               parsed.data as z.infer<typeof commandResultSchema>,
               authenticatedAgent.deviceId,
@@ -3381,10 +3716,12 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
               authenticatedAgent.partnerId,
               authenticatedAgent.credentialTokenHash !== undefined,
             );
-            ws.send(JSON.stringify({
-              type: 'ack',
-              commandId: parsed.data.commandId
-            }));
+            // #3530: never ack a result that was not recorded.
+            ws.send(JSON.stringify(
+              ingestOutcome === 'processing_failed'
+                ? buildResultProcessingFailedFrame(parsed.data.commandId)
+                : { type: 'ack', commandId: parsed.data.commandId }
+            ));
             break;
 
           case 'backup_progress': {
@@ -3394,7 +3731,8 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
                 agentId,
                 commandId: progressMessage.commandId,
                 // Default to {} so a bare keepalive ping (no counters) still
-                // parses and bumps last_progress_at instead of being dropped as
+                // parses and bumps last_keepalive_at (liveness; #2798 — it no
+                // longer touches last_progress_at) instead of being dropped as
                 // invalid-payload. All fields on the progress schema are
                 // optional, so an empty body is a valid "still alive" signal.
                 progress: progressMessage.progress ?? {},
@@ -3406,7 +3744,7 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
                 // agent-mismatch is a real anomaly (an agent pinging another
                 // device's job) and stays at warn. invalid-payload joins it:
                 // since #3006 it means an agent is sending progress this server
-                // cannot understand, which starves last_progress_at and gets
+                // cannot understand, which starves last_keepalive_at and gets
                 // healthy uploads reaped. Everything else is routine traffic —
                 // restore progress reuses this WS type with a commandId that
                 // matches no backup job (not-found), a garbage or non-UUID
@@ -3433,6 +3771,42 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
               }
             });
             // Fire-and-forget: no ack expected by the agent for progress pings.
+            break;
+          }
+
+          case 'command_progress': {
+            // Same delivery-epoch fence as command_result: a dying socket must
+            // not speak for the live connection.
+            if (!ownsCurrentAgentSocket(agentId, ws, socketEpoch)) {
+              console.debug(
+                `[AgentWs] Dropping command_progress ${parsed.data.commandId} from superseded socket for agent ${agentId}`
+              );
+              break;
+            }
+            const progressMessage = parsed.data as z.infer<typeof commandProgressMessageSchema>;
+            // Advisory and fire-and-forget (no ack): a lost stage costs the UI
+            // a label, never the command. A failure is logged and swallowed so
+            // it can never surface as an error frame or break the socket loop.
+            try {
+              const applied = await applyCommandProgress({
+                // The AUTHENTICATED device — never anything the agent sent.
+                deviceId: authenticatedAgent.deviceId,
+                commandId: progressMessage.commandId,
+                stage: progressMessage.stage,
+              });
+              if (!applied.applied) {
+                // Routine: the terminal result won the race, a duplicate or
+                // out-of-order frame, or a stage this server predates.
+                console.debug(
+                  `[AgentWs] Dropping command_progress for ${progressMessage.commandId} from agent ${agentId}: reason=${applied.reason}`
+                );
+              }
+            } catch (err) {
+              console.warn(
+                `[AgentWs] Failed to record command_progress for ${progressMessage.commandId} from agent ${agentId}:`,
+                err instanceof Error ? err.message : err,
+              );
+            }
             break;
           }
 
@@ -3827,6 +4201,62 @@ const desktopCommandResultSchema = z.object({
   }).strict().optional(),
 }).passthrough();
 
+// Short-lived local cache for the owner-device lookup below — bounds DB load
+// from a burst of trailing frames for the SAME just-closed/unknown session
+// (leg a: socket closed mid-output; leg b: a fresh replica with an empty
+// in-memory map) without adding a persistence dependency. Deliberately tiny
+// TTL: this only needs to survive one burst, not become a second source of
+// truth for session ownership.
+const TERMINAL_OUTPUT_OWNER_CACHE_TTL_MS = 30_000;
+const TERMINAL_OUTPUT_OWNER_CACHE_MAX_ENTRIES = 500;
+const terminalOutputOwnerCache = new Map<string, { deviceId: string | null; expiresAt: number }>();
+
+/**
+ * Resolve which device a `remote_sessions` row actually belongs to, for a
+ * sessionId this process's in-memory `activeTerminalSessions` map does not
+ * (or no longer) recognize. Used ONLY to distinguish a genuine cross-tenant
+ * probe (a sessionId naming a DIFFERENT device) from the two benign cases
+ * that look identical from the in-memory map alone: a session that just
+ * closed on this same device, or a session this replica never saw because it
+ * started after the session did (restart). Returns null on "not found" or on
+ * any lookup failure — the caller treats null as "don't count toward
+ * auto-suspension", which is the fail-safe direction for a signal whose whole
+ * purpose is to avoid falsely locking a device's management channel.
+ */
+async function resolveTerminalSessionOwnerDeviceId(
+  sessionId: string,
+  runWithAgentDbAccess: <T>(label: string, fn: () => Promise<T>) => Promise<T>,
+): Promise<string | null> {
+  const now = Date.now();
+  const cached = terminalOutputOwnerCache.get(sessionId);
+  if (cached && cached.expiresAt > now) {
+    return cached.deviceId;
+  }
+  let deviceId: string | null = null;
+  try {
+    const [row] = await runWithAgentDbAccess('agentWs.terminalOutput.resolveOwner', async () =>
+      db.select({ deviceId: remoteSessions.deviceId })
+        .from(remoteSessions)
+        .where(eq(remoteSessions.id, sessionId))
+        .limit(1)
+    );
+    deviceId = row?.deviceId ?? null;
+  } catch {
+    // Fail toward "unknown" (not counted), not toward "probe" — see doc
+    // comment above.
+    deviceId = null;
+  }
+  if (terminalOutputOwnerCache.size >= TERMINAL_OUTPUT_OWNER_CACHE_MAX_ENTRIES) {
+    for (const [key, entry] of terminalOutputOwnerCache) {
+      if (entry.expiresAt <= now) terminalOutputOwnerCache.delete(key);
+    }
+  }
+  if (terminalOutputOwnerCache.size < TERMINAL_OUTPUT_OWNER_CACHE_MAX_ENTRIES) {
+    terminalOutputOwnerCache.set(sessionId, { deviceId, expiresAt: now + TERMINAL_OUTPUT_OWNER_CACHE_TTL_MS });
+  }
+  return deviceId;
+}
+
 // M-D1 / Task 18: Cross-tenant probe detection.
 //
 // Increments per agentId on each schema-passing-but-ownership-failing
@@ -3948,7 +4378,7 @@ export function __resetCrossTenantDropsForTest() {
 export function registerConnection(
   agentId: string,
   ws: { send(data: string): void },
-  trust: { partnerId: string; trustState: PartnerTrustState } = {
+  trust: { partnerId: string; trustState: PartnerTrustState; parked?: boolean } = {
     partnerId: 'test-partner',
     trustState: 'trusted',
   },
@@ -3958,8 +4388,10 @@ export function registerConnection(
   }
   activeConnections.set(agentId, {
     ws: ws as never,
-    ...trust,
+    partnerId: trust.partnerId,
+    trustState: trust.trustState,
     credentialRevoked: false,
+    parked: trust.parked === true,
   });
   installAgentSocketEpoch(agentId);
 }
@@ -4060,6 +4492,12 @@ export function sendCommandToAgent(agentId: string, command: AgentCommand): bool
   assertSocketLocalDispatchAllowed('sendCommandToAgent');
   const conn = activeConnections.get(agentId);
   if (!conn) {
+    return false;
+  }
+
+  // A device parked in a holding org receives lifecycle removal only. Checked
+  // before trust: no trust state makes other work deliverable to it.
+  if (conn.parked && !isParkedDeliverableCommandType(command.type)) {
     return false;
   }
 

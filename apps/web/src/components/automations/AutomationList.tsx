@@ -20,6 +20,7 @@ import {
   MoreHorizontal,
   Bot} from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { FilterSelect } from '../shared/FilterSelect';
 
 export type TriggerType = 'schedule' | 'event' | 'webhook' | 'manual';
 export type AutomationStatus = 'idle' | 'running' | 'success' | 'failed';
@@ -215,35 +216,46 @@ export default function AutomationList({
               className="h-10 w-full rounded-md border bg-background pl-9 pr-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring sm:w-48"
             />
           </div>
-          <select
+          <FilterSelect
+            label={t('automationList.filters.triggerLabel')}
             value={triggerFilter}
             onChange={event => {
               setTriggerFilter(event.target.value as TriggerFilter);
               setCurrentPage(1);
             }}
-            className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring sm:w-36"
+            className="w-full sm:w-36"
           >
             <option value="all">{t('automationList.filters.allTriggers')}</option>
             <option value="schedule">{t('automationList.trigger.schedule')}</option>
             <option value="event">{t('automationList.trigger.event')}</option>
             <option value="webhook">{t('automationList.trigger.webhook')}</option>
             <option value="manual">{t('automationList.trigger.manual')}</option>
-          </select>
-          <select
+          </FilterSelect>
+          <FilterSelect
+            label={t('automationList.filters.statusLabel')}
             value={statusFilter}
             onChange={event => {
               setStatusFilter(event.target.value);
               setCurrentPage(1);
             }}
-            className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring sm:w-32"
+            className="w-full sm:w-32"
           >
             <option value="all">{t('automationList.filters.allStatus')}</option>
             <option value="enabled">{t('common:states.enabled')}</option>
             <option value="disabled">{t('common:states.disabled')}</option>
-          </select>
+          </FilterSelect>
         </div>
       </div>
 
+      {paginatedAutomations.length === 0 ? (
+        // Rendered as a plain block outside the table (not a colSpan cell)
+        // deliberately: a colSpan td matches the table's full (often
+        // wider-than-viewport) width, so centered text inside it gets cut off
+        // by the visible edge of the scroll container instead of wrapping (#7155).
+        <div className="mt-6 rounded-md border px-4 py-6 text-center text-sm text-muted-foreground">
+          {t('automationList.empty')}
+        </div>
+      ) : (
       <div className="mt-6 overflow-x-auto rounded-md border">
         <table className="min-w-full divide-y">
           <thead className="bg-muted/40">
@@ -257,14 +269,7 @@ export default function AutomationList({
             </tr>
           </thead>
           <tbody className="divide-y">
-            {paginatedAutomations.length === 0 ? (
-              <tr>
-                <td colSpan={6} className="px-4 py-6 text-center text-sm text-muted-foreground">
-                  {t('automationList.empty')}
-                </td>
-              </tr>
-            ) : (
-              paginatedAutomations.map(automation => {
+            {paginatedAutomations.map(automation => {
                 const TriggerIcon = triggerConfig[automation.triggerType].icon;
                 const lastStatus = (automation.lastRunStatus ?? 'idle') as StatusKey;
                 const StatusIcon = statusConfig[lastStatus].icon;
@@ -431,11 +436,11 @@ export default function AutomationList({
                     </td>
                   </tr>
                 );
-              })
-            )}
+              })}
           </tbody>
         </table>
       </div>
+      )}
 
       {totalPages > 1 && (
         <div className="mt-4 flex items-center justify-between">

@@ -25,14 +25,16 @@ import { breezeRegion, MCP_OAUTH_ENABLED, OAUTH_ISSUER } from '../config/env';
 import { apiKeyAuthMiddleware, requireApiKeyScope } from '../middleware/apiKeyAuth';
 import { bearerTokenAuthMiddleware, resolvePartnerAccessibleOrgIds } from '../middleware/bearerTokenAuth';
 import { getToolDefinitions, executeTool, getToolTier, getToolDomain } from '../services/aiTools';
+import { isTopologyAiToolName } from '../services/topology/aiToolGate';
 import { checkGuardrails, checkToolPermission, checkToolRateLimit, checkPermissionRequirement, checkPermissionRequirements, TIER3_ACTIONS } from '../services/aiGuardrails';
 import { isTenantToolName } from '@breeze/shared/validators';
 import type { TenantToolDescriptor } from '../services/toolSources/resolver';
+import { MCP_SKIP_AMBIENT_DB_CONTEXT_KEY } from '../middleware/mcpTenantToolSelfManagedContext';
 import { tenantToolPermissionRequirement, checkTenantToolRateLimit } from '../services/toolSources/guardrails';
 import { db } from '../db';
 import { readWithPartnerAxisVisibility } from '../db/partnerAxisRead';
 import { devices, alerts, scripts, automations, partners, organizations } from '../db/schema';
-import { eq, ne, and, asc, desc, inArray, isNull, or, getTableColumns, type SQL } from 'drizzle-orm';
+import { eq, and, asc, desc, inArray, isNull, or, getTableColumns, type SQL } from 'drizzle-orm';
 import type { PgColumn } from 'drizzle-orm/pg-core';
 import type { AuthContext, PrincipalKind } from '../middleware/auth';
 import { siteAccessCheck } from '../middleware/auth';
@@ -41,6 +43,7 @@ import { authorizeHumanApiKeyCreator, authorizeServicePrincipalKey } from '../se
 import { getActiveOrgTenant } from '../services/tenantStatus';
 import { resolveServerUrl } from '../services/recoveryBootstrap';
 import { resolveSiteAllowedDeviceIds, deviceSiteDenied } from '../services/aiToolsSiteScope';
+import { alertSiteScopeByDeviceIds } from './alerts/helpers';
 import { writeAuditEvent } from '../services/auditEvents';
 import { sanitizeAuditPayload, summarizePayload, summarizeToolResult } from '../services/auditPayloadSanitizer';
 import { compactToolResultForChat, redactAiToolOutputText } from '../services/aiToolOutput';
@@ -65,6 +68,8 @@ import type { BootstrapTool } from '../modules/mcpInvites/types';
 import { BootstrapError } from '../modules/mcpInvites/types';
 import { canonicalPrincipalRef, parseUnattendedPrincipals } from '../services/mcpUnattendedPrincipals';
 
+import { notHiddenOrgType } from '../services/unassignedPool/visibility';
+import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 export const mcpServerRoutes = new Hono();
 
 function parseCsvSet(raw: string | undefined): Set<string> {
@@ -189,6 +194,37 @@ async function readJsonRpcBodyWithLimit(
   }
 }
 
+/**
+ * Cheap, side-effect-free predicate: does this request's body already look
+ * like a `tools/call` against a tenant (BYO MCP) tool? Used only to decide
+ * whether the auth middleware may skip opening the ambient per-request DB
+ * transaction — see MCP_SKIP_AMBIENT_DB_CONTEXT_KEY's doc comment.
+ *
+ * Reads the body via a CLONED request (`{ clone: true }`), so the original
+ * stream is untouched for `preflightMcpRequest`'s real parse later. Any
+ * failure (no body, wrong method, oversized, malformed JSON) is a safe false
+ * negative: the request just keeps today's ambient-context behavior.
+ */
+export async function __isMcpTenantToolCallRequestForTests(c: Context): Promise<boolean> {
+  return isMcpTenantToolCallRequest(c);
+}
+
+async function isMcpTenantToolCallRequest(c: Context): Promise<boolean> {
+  if (c.req.method !== 'POST') return false;
+  try {
+    const parsed = await readJsonRpcBodyWithLimit(c.req.raw, { clone: true });
+    if (parsed.tooLarge || parsed.parseError || !parsed.body || typeof parsed.body !== 'object') {
+      return false;
+    }
+    const body = parsed.body as { method?: unknown; params?: { name?: unknown } };
+    if (body.method !== 'tools/call') return false;
+    const name = body.params?.name;
+    return typeof name === 'string' && isTenantToolName(name);
+  } catch {
+    return false;
+  }
+}
+
 // ============================================
 // Bootstrap module (authenticated tools only)
 // ============================================
@@ -250,6 +286,13 @@ function zodToJsonSchema(schema: z.ZodSchema<any>): Record<string, unknown> {
  * account-creation path is OAuth Create Account → /auth/register-partner.
  */
 async function mcpAuthMiddleware(c: Context, next: Next) {
+  // See MCP_SKIP_AMBIENT_DB_CONTEXT_KEY's doc comment: a cheap, side-effect-free
+  // peek at the JSON-RPC body decides whether the auth middlewares below may
+  // skip opening the ambient per-request DB transaction. Set unconditionally
+  // (false for every non-tenant-tool-call request) so the two middlewares
+  // never fall back to a stale value from a prior request.
+  c.set(MCP_SKIP_AMBIENT_DB_CONTEXT_KEY, await isMcpTenantToolCallRequest(c));
+
   const authHeader = c.req.header('Authorization') ?? '';
   const hasBearer = MCP_OAUTH_ENABLED && authHeader.startsWith('Bearer ');
   if (hasBearer) {
@@ -1623,7 +1666,13 @@ async function handleToolsCall(
         ...auth,
         aiOrigin: ledger?.aiOrigin ?? ({ kind: 'ai_assistant' } as const),
       };
-      const result = await executeTool(toolName, toolInput, toolAuth);
+      // Topology M4-D1 (#6000): MCP has no session anchor, so a topology tool
+      // is confined to the API key's OWN site restriction — exactly one site —
+      // and refused for an org-wide or multi-site key. Name-gated so every
+      // other tool keeps the three-argument call.
+      const result = isTopologyAiToolName(toolName)
+        ? await executeTool(toolName, toolInput, toolAuth, { topologyBinding: { kind: 'mcp_site_key' } })
+        : await executeTool(toolName, toolInput, toolAuth);
       const safeResult = compactToolResultForChat(toolName, result);
 
       // #6408: a pure returned `{error}` is a tool-execution error, not a
@@ -2560,7 +2609,7 @@ async function handleResourcesRead(
       // Ephemeral Quick Support devices live in the partner's hidden
       // 'quick_support' org, which deliberately stays inside accessibleOrgIds —
       // orgCond() will not filter them, so exclude them explicitly.
-      const deviceSiteConditions: SQL[] = [eq(devices.isEphemeral, false)];
+      const deviceSiteConditions: SQL[] = [eq(devices.isEphemeral, false), notParkedDeviceCondition()];
       deviceSiteConditions.push(
         ...(siteAllowedDeviceIds === null
           ? []
@@ -2585,16 +2634,14 @@ async function handleResourcesRead(
         eq(alerts.status, 'active' as typeof alerts.status.enumValues[number]),
       ];
       if (siteAllowedDeviceIds !== null) {
-        // Narrow alerts to those raised on devices the caller may see. Empty
-        // allowlist → impossible deviceId so no alert rows leak.
-        alertSiteConditions.push(
-          inArray(
-            alerts.deviceId,
-            siteAllowedDeviceIds.length === 0
-              ? ['00000000-0000-0000-0000-000000000000']
-              : siteAllowedDeviceIds,
-          ),
-        );
+        // Narrow alerts to those raised on devices the caller may see; a
+        // site-owned topology alert follows its OWNING topology site (M3-D6),
+        // never its origin device's. Empty allowlists match no rows.
+        alertSiteConditions.push(alertSiteScopeByDeviceIds({
+          allowedSiteIds: auth.allowedSiteIds,
+          allowedDeviceIds: siteAllowedDeviceIds,
+          deviceAxis: auth.allowedDeviceIds !== undefined,
+        })!);
       }
       return await readOrgScopedResource(id, uri, alerts, {
         id: alerts.id,
@@ -2705,14 +2752,15 @@ function jsonRpcError(id: string | number | null, code: number, message: string,
  * Inlined here after activationRoutes.ts was deleted in Phase 4 — the only
  * remaining caller is this file.
  */
-async function resolveDefaultOrgId(partnerId: string): Promise<string | null> {
+export async function resolveDefaultOrgId(partnerId: string): Promise<string | null> {
   try {
     const [row] = await db
       .select({ id: organizations.id })
       .from(organizations)
-      // The hidden 'quick_support' org can be the partner's oldest org — it must
-      // never become the default org for audit scoping or authTool dispatch.
-      .where(and(eq(organizations.partnerId, partnerId), ne(organizations.type, 'quick_support')))
+      // The hidden Quick Support and holding orgs can be the partner's oldest
+      // org — neither may become the default org for audit scoping or authTool
+      // dispatch.
+      .where(and(eq(organizations.partnerId, partnerId), notHiddenOrgType()))
       .orderBy(asc(organizations.createdAt))
       .limit(1);
     return row?.id ?? null;

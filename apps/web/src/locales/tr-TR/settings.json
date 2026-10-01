@@ -306,6 +306,11 @@
     "indexPlaceholder": "esinti günlükleri",
     "description": "Etkinleştirildiğinde, tüm alt kuruluşlar olay günlüklerini yapılandırılmış uç noktaya gönderecektir. Herhangi bir Elasticsearch/OpenSearch uyumlu <bulk>_bulk</bulk> deposuyla çalışır (Elasticsearch, OpenSearch, Wazuh indeksleyici, AWS OpenSearch Service). Her kuruluşun ayrı ayrı yapılandırmasına izin vermek için devre dışı bırakın."
   },
+  "savedSecret": {
+    "savedPlaceholder": "Kaydedildi — korumak için boş bırakın",
+    "removedPlaceholder": "Kaydettiğinizde kaldırılacak",
+    "remove": "Kaldır"
+  },
   "agentVersionPins": {
     "title": "Sürüm hedeflerini güncelleyin",
     "description": "Temsilciyi ve gözlemciyi belirli bir kayıtlı sürüme sabitleyin veya küresel olarak tanıtılan sürümü takip etmek için <strong>En son tanıtılan</strong>'i bırakın. Ajan ve gözlemci bağımsızdır.",
@@ -534,7 +539,7 @@
       "saveFailed": "Bu ayar değiştirilemedi",
       "remediation": {
         "title": "Önerilen düzeltmeler",
-        "description": "Uyarı ayrıntı sayfasında yapay zekâ tarafından oluşturulan düzeltme önerileri. Bu, her kuruluş için varsayılandır; bir kuruluş bunu kendi Yapay Zekâ sekmesinde geçersiz kılabilir.",
+        "description": "Uyarı ayrıntı sayfasında betiklerinizden, şablonlarınızdan ve playbook'larınızdan eşleştirilen düzeltme önerileri. Bu, her kuruluş için varsayılandır; bir kuruluş bunu kendi Yapay Zekâ sekmesinde geçersiz kılabilir.",
         "enabled": "Önerilen düzeltmeleri oluştur",
         "enabledDescription": "Teknisyenlerin bir uyarı için ayrıntı sayfasından önerilen düzeltmeler oluşturmasına izin verin."
       }
@@ -853,6 +858,7 @@
     "hideExpired": "Süresi dolmuşları gizle",
     "deleteExpired": "Silinme süresi doldu",
     "shortCode": "Kısa kod",
+    "shortCodeHidden": "Gizli — kayıt izni gerektirir",
     "installerUsage": "Kurulum cihazları {{consumed}} / {{max}}",
     "installerUsageExpired": "Kurulum cihazları {{consumed}} / {{max}} (süresi doldu)",
     "installerUsageMixed": "Yükleyici cihazlar {{liveConsumed}} / {{liveMax}} yayında · {{expired}} süresi doldu",
@@ -1073,8 +1079,19 @@
       "3": "L3 — biyometrik + PIN",
       "4": "L4 — donanım anahtarı + PIN"
     },
+    "unreachableLevelHint": "Bir onay cihazının bir risk düzeyi için ulaşamayacağı seviyeler kullanılamaz.",
     "requireEnrollment": "Kayıtlı bir onay cihazı gerektir (uygulama — yetersiz güvence altına alınan onayları engelleme)",
+    "enforcement": {
+      "inherit": "Platform varsayılanı",
+      "required": "Zorunlu",
+      "notRequired": "Zorunlu değil",
+      "inheritedValue": "Platform varsayılanı: {{date}} tarihinden itibaren yüksek ve kritik riskli onaylar için bir onay cihazı gerekir.",
+      "inheritedSource": "Burada bir seçim kaydedilmediği için platform tarafından belirlenir. Geçersiz kılmak için Zorunlu veya Zorunlu değil seçeneğini belirleyin.",
+      "requiredHint": "Zorunlu, aşağıdaki tarihten itibaren her risk düzeyine uygulanır.",
+      "notRequiredHint": "Alt sınırın altındaki onaylara izin verilir ve düşürülmüş olarak kaydedilir."
+    },
     "enforceFrom": "Şu tarihten itibaren uygula (ek pencere kesmesi)",
+    "enforceFromHint": "Hemen uygulamak için boş bırakın.",
     "toasts": {
       "saved": "Onay güvenliği politikası kaydedildi."
     },
@@ -1272,6 +1289,7 @@
       "usernamePlaceholder": "elastik",
       "password": "Şifre",
       "passwordPlaceholder": "Şifreyi girin",
+      "savedSecretPlaceholder": "Kaydedildi — korumak için boş bırakın",
       "credentialsDescription": "Kimlik bilgileri şifrelenmiş olarak saklanır. Mevcut kimlik bilgileri yüklendiğinde maskelenir."
     },
     "collection": {
@@ -1318,7 +1336,8 @@
     "webhooks": {
       "title": "Web kancası bildirimleri",
       "placeholder": "https://api.example.com/alerts",
-      "empty": "Yapılandırılmış web kancası yok."
+      "empty": "Yapılandırılmış web kancası yok.",
+      "savedEntry": "Kaydedilmiş webhook (URL gizli)"
     },
     "preferences": {
       "title": "Bildirim tercihleri",
@@ -3418,7 +3437,8 @@
     "tryAdjustingYourSearchOrFilters": "Aramanızı veya filtrelerinizi ayarlamayı deneyin.",
     "active": "Aktif",
     "revoked": "İptal edildi",
-    "expired": "Süresi dolmuş"
+    "expired": "Süresi dolmuş",
+    "statusFilterLabel": "Anahtar durumu"
   },
   "apiKeysPage": {
     "loadingAPIKeys": "API anahtarlar yükleniyor...",
@@ -3822,7 +3842,9 @@
     "verifyYourIdentity": "Kimliğinizi doğrulayın",
     "thisAccountSignsInThroughAnIdentityProviderAndHasNoPassw": "Bu hesap bir kimlik sağlayıcısı üzerinden oturum açar ve parolası yoktur. Kimlik doğrulayıcı uygulama kurulumuna başlamak için sağlayıcınızda kimliğinizi yeniden doğrulayın.",
     "verifyWithYourIdentityProvider": "Kimlik sağlayıcınızla doğrulayın",
-    "ssoReauthProofExpired": "Kimlik sağlayıcısı doğrulamanızın süresi doldu. Kimlik doğrulayıcı uygulamanızın kurulumunu tamamlamak için yeniden doğrulayın."
+    "ssoReauthProofExpired": "Kimlik sağlayıcısı doğrulamanızın süresi doldu. Kimlik doğrulayıcı uygulamanızın kurulumunu tamamlamak için yeniden doğrulayın.",
+    "ssoReauthManageHint": "Bu hesap bir kimlik sağlayıcısı üzerinden oturum açar ve parolası yoktur. Bu değişikliği onaylamak için sağlayıcınızla doğrulayın.",
+    "ssoReauthManageVerified": "Kimliğiniz sağlayıcınızla doğrulandı. Bu değişikliği onaylamak için aşağıdaki adımı tamamlayın."
   },
   "pax8CatalogDrawer": {
     "importFromPax8": "Pax8'den içe aktar",
@@ -3939,7 +3961,11 @@
     "passkeyStepUpVerificationExpired": "Doğrulamanın süresi doldu. Lütfen tekrar doğrulayın.",
     "passkeyRegistrationServerError": "Geçiş anahtarı kaydı başarısız oldu. Lütfen tekrar deneyin.",
     "deletePasskeyVerifyHeading": "Bir geçiş anahtarını silmek için doğrulayın",
-    "deletePasskeyVerifyHint": "Yukarıdaki geçiş anahtarlarından birini kaldırmadan önce buraya güncel bir MFA kodu girin. Bu kod yeni bir geçiş anahtarı eklemeyi etkilemez."
+    "deletePasskeyVerifyHint": "Yukarıdaki geçiş anahtarlarından birini kaldırmadan önce buraya güncel bir MFA kodu girin. Bu kod yeni bir geçiş anahtarı eklemeyi etkilemez.",
+    "ssoReauthManageProofExpired": "Kimlik sağlayıcısı doğrulamanızın süresi doldu. Bu değişikliği onaylamak için yeniden doğrulayın.",
+    "verifyWithIdpToDeletePasskey": "Bu hesabın parolası yok. Bir geçiş anahtarını kaldırmadan önce kimlik sağlayıcınızla doğrulayın.",
+    "deletePasskeySsoReauth": "Bir geçiş anahtarını kaldırmak için kimliği doğrulayın",
+    "deletePasskeySsoVerified": "Kimlik doğrulandı. Kaldırmak istediğiniz geçiş anahtarında Sil seçeneğini seçin."
   },
   "roleManager": {
     "roles": "Roller",
@@ -4007,13 +4033,18 @@
     "createANewCustomRoleBasedOnThisOne": "Buna dayalı olarak yeni bir özel rol oluşturun.",
     "saving": "Kaydediliyor...",
     "cloneRole2": "Klon Rolü",
+    "mfaRequired": "MFA zorunlu",
+    "mfaRequiredTooltip": "Bu roldeki üyelerin çok faktörlü kimlik doğrulamayı etkinleştirmesi gerekir.",
+    "requireMfaForThisRole": "Bu rol için MFA zorunlu olsun",
+    "requireMfaForThisRoleHelp": "Bu role atanan üyeler Breeze'i kullanabilmek için önce çok faktörlü kimlik doğrulamayı etkinleştirmelidir.",
     "saveChanges": "Değişiklikleri Kaydet",
     "deleting": "Siliniyor...",
     "networkErrorLoadingPermissions": "İzinler yüklenirken ağ hatası",
     "cannotDeleteAssignedRole": "Atanan kullanıcılarla rol silinemiyor",
     "inheritedFromParentRole": "Üst rolden devralındı",
     "waitingForPermissionCatalog": "İzin kataloğunun yüklenmesi bekleniyor",
-    "summary": "{{filtered}} / {{total}} rol"
+    "summary": "{{filtered}} / {{total}} rol",
+    "typeFilterLabel": "Rol türü"
   },
   "roleSelector": {
     "currentRole": "Mevcut görev",
@@ -4062,6 +4093,9 @@
     "thisOrganization": "Bu kuruluş",
     "partnerTechnicianLogin": "Ortak (teknisyen girişi)",
     "yourOwnTeamSignsInWithThis": "(kendi ekibiniz bununla oturum açar)",
+    "selectAnOrganizationToCreateAnOrgProvider": "O kuruluş için sağlayıcı oluşturmak üzere kuruluş değiştiriciden bir kuruluş seçin.",
+    "partnerProviderRequiresFullPartnerAccess": "Ortak genelindeki sağlayıcılar tüm kuruluşlara erişim gerektirir.",
+    "selectAnOrganizationBeforeCreatingAProvider": "Sağlayıcı oluşturmadan önce kuruluş değiştiriciden bir kuruluş seçin.",
     "basicInformation": "Temel Bilgiler",
     "providerName": "Sağlayıcı adı",
     "eGOktaProduction": "örneğin Okta Üretimi",
@@ -4138,7 +4172,8 @@
     "delete": "Sil",
     "allStatuses": "Tüm durumlar",
     "deactivate": "Devre dışı bırak",
-    "activate": "Etkinleştir"
+    "activate": "Etkinleştir",
+    "statusFilterLabel": "Sağlayıcı durumu"
   },
   "ssoProvidersPage": {
     "failedToFetchSSOProviders": "SSO sağlayıcıları getirilemedi",
@@ -4168,6 +4203,7 @@
     "failedToDeleteProvider": "Sağlayıcı silinemedi",
     "anErrorOccurred": "Bir hata oluştu",
     "failedToSaveProvider": "Sağlayıcı kaydedilemedi",
+    "providerNeedsOrganization": "Kuruluş değiştiriciden bir kuruluş seçin veya ortak genelinde bir sağlayıcı oluşturmak için “Şunlar için geçerlidir” seçeneğini “Ortak (teknisyen girişi)” olarak ayarlayın.",
     "addSSOProvider": "SSO Sağlayıcısı Ekle",
     "editSSOProvider": "SSO Sağlayıcısını Düzenle",
     "configureANewSSOProviderForYourOrganization": "Kuruluşunuz için yeni bir SSO sağlayıcısı yapılandırın.",
@@ -4749,7 +4785,7 @@
         "killSwitch": "Anomali tespiti, operatör tarafından tüm platform için kapatıldı. Bu ayarlar yeniden açıldığında geçerli olacaktır.",
         "remediation": {
           "title": "Önerilen düzeltmeler",
-          "description": "Bu kuruluşun uyarıları için yapay zekâ tarafından oluşturulan düzeltme önerileri. Boş bırakılırsa iş ortağı varsayılanı uygulanır.",
+          "description": "Bu kuruluşun uyarıları için betiklerinizden, şablonlarınızdan ve playbook'larınızdan eşleştirilen düzeltme önerileri. Boş bırakılırsa iş ortağı varsayılanı uygulanır.",
           "enabled": "Önerilen düzeltmeleri oluştur",
           "enabledDescription": "Teknisyenlerin bir uyarı için ayrıntı sayfasından önerilen düzeltmeler oluşturmasına izin verin.",
           "killSwitch": "Önerilen düzeltmeler operatör tarafından tüm platformda kapatıldı. Bu ayar yeniden açıldıklarında geçerli olur."
@@ -5417,7 +5453,8 @@
       "title": "Özel Alanı Sil",
       "messagePrefix": "Silmek istediğinizden emin misiniz?",
       "messageSuffix": "Bu, alan tanımını ve cihazlarda depolanan tüm değerleri kaldıracaktır."
-    }
+    },
+    "typeFilterLabel": "Alan türü"
   },
   "knownGuestsSettings": {
     "title": "Bilinen Misafirler",
@@ -5529,6 +5566,7 @@
       "sendInvite": "Davetiye gönderilemedi",
       "updateUser": "Kullanıcı güncellenemedi",
       "updateRole": "Rol güncellenemedi",
+      "updateOrgAccess": "Kuruluş erişimi güncellenemedi",
       "removeUser": "Kullanıcı kaldırılamadı",
       "resetMfa": "MFA sıfırlanamadı"
     },
@@ -5556,7 +5594,9 @@
       "inviteSent": "Davetiye {{email}} adresine gönderildi",
       "copied": "Kopyalandı!",
       "copyLink": "Bağlantıyı kopyala",
-      "mfaReset": "{{email}} için MFA sıfırlandı"
+      "mfaReset": "{{email}} için MFA sıfırlandı",
+      "roleUpdated": "Rol güncellendi",
+      "orgAccessUpdated": "Kuruluş erişimi güncellendi"
     },
     "resetMfa": {
       "title": "MFA sıfırlansın mı?",

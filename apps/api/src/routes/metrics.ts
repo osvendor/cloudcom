@@ -67,6 +67,7 @@ import { registerRetentionPrometheusMetrics } from '../services/retentionMetrics
 import { setExtensionMetricsRecorder } from '../extensions/metrics';
 import { envFloat } from '../utils/envFloat';
 
+import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 export {
   recordBackupCommandTimeout,
   recordBackupDispatchFailure,
@@ -237,6 +238,19 @@ const agentHeartbeatTotal = new Counter({
   registers: [register]
 });
 
+// #4340 — routine agent-telemetry submits used to be chained into audit_logs
+// (~97% of its volume). They are audited now only on failure or on a real
+// change; this counter is where the routine volume stays observable.
+export type AgentIngestKind = 'logs' | 'eventlogs' | 'sessions' | 'security_status' | 'management_posture';
+export type AgentIngestOutcome = 'success' | 'partial' | 'failed';
+
+const agentIngestSubmissionsTotal = new Counter({
+  name: 'breeze_agent_ingest_submissions_total',
+  help: 'Agent telemetry submissions by kind and outcome',
+  labelNames: ['kind', 'outcome'] as const,
+  registers: [register]
+});
+
 const scriptsExecutedTotal = new Counter({
   name: 'breeze_scripts_executed_total',
   help: 'Total scripts executed',
@@ -247,6 +261,83 @@ const backupDispatchFailuresTotal = new Counter({
   name: 'breeze_backup_dispatch_failures_total',
   help: 'Backup, restore, and verification start failures by operation and reason',
   labelNames: ['operation', 'reason'] as const,
+  registers: [register]
+});
+
+const backupReadDispatchesTotal = new Counter({
+  name: 'breeze_backup_read_dispatch_total',
+  help: 'Restore-shaped backup command delivery attempts by command type, mode (brokered, local, deferred, refused, legacy) and reason',
+  labelNames: ['command_type', 'mode', 'reason'] as const,
+  registers: [register]
+});
+
+const backupStorageSessionCallsTotal = new Counter({
+  name: 'breeze_backup_storage_session_calls_total',
+  help: 'Agent storage-session endpoint calls by session scope, operation and HTTP status (410 = expired, revoked or ended)',
+  labelNames: ['scope', 'op', 'status'] as const,
+  registers: [register]
+});
+
+const backupStorageSessionObjectsTotal = new Counter({
+  name: 'breeze_backup_storage_session_objects_total',
+  help: 'Presigned object URLs issued through storage sessions by session scope and method',
+  labelNames: ['scope', 'method'] as const,
+  registers: [register]
+});
+
+const backupStorageSessionMintsTotal = new Counter({
+  name: 'breeze_backup_storage_session_mint_total',
+  help: 'Storage-session issuance decisions at command delivery by session scope, outcome (minted, refused, deferred, legacy) and reason',
+  labelNames: ['scope', 'outcome', 'reason'] as const,
+  registers: [register]
+});
+
+const backupWriteUnexpectedLegacyTotal = new Counter({
+  name: 'breeze_backup_write_dispatch_unexpected_legacy_total',
+  help: 'Backup write deliveries that carried the storage destination for a reason other than an older helper or a non-S3 destination, by command type and reason',
+  labelNames: ['command_type', 'reason'] as const,
+  registers: [register]
+});
+
+const backupConditionalWriteProbeTotal = new Counter({
+  name: 'breeze_backup_storage_conditional_write_probe_total',
+  help: 'Destination probes for create-only write support by outcome (supported, unsupported) and reason',
+  labelNames: ['outcome', 'reason'] as const,
+  registers: [register]
+});
+
+const backupSnapshotPublishRefusedTotal = new Counter({
+  name: 'breeze_backup_snapshot_publish_refused_total',
+  help: 'Backup results whose snapshot row was refused because the id is owned elsewhere, by reason (not_current_job, foreign_claim)',
+  labelNames: ['reason'] as const,
+  registers: [register]
+});
+
+const backupWriteJanitorTotal = new Counter({
+  name: 'breeze_backup_write_janitor_total',
+  help: 'Brokered backup write cleanup actions by action (abort_upload, sweep_prefix, publish, abandon) and outcome (ok, failed)',
+  labelNames: ['action', 'outcome'] as const,
+  registers: [register]
+});
+
+const backupCapabilityRegressionsTotal = new Counter({
+  name: 'breeze_backup_capability_regressed_total',
+  help: 'Backup helper protocol drops below the stored device value, by capability (read, integrity, write)',
+  labelNames: ['capability'] as const,
+  registers: [register]
+});
+
+const backupWriteDispatchesTotal = new Counter({
+  name: 'breeze_backup_write_dispatch_total',
+  help: 'Backup write commands handed to agents by command type, mode (brokered, legacy_credential, local, refused) and reason',
+  labelNames: ['command_type', 'mode', 'reason'] as const,
+  registers: [register]
+});
+
+const backupAttestationsTotal = new Counter({
+  name: 'breeze_backup_attestation_total',
+  help: 'Snapshot attestation outcomes, at recording (recorded, duplicate_same, conflict, binding_mismatch, invalid, missing_from_capable, not_offered, missing_expectation, job_reuse_refused) and at server verification (verified, mismatch, verify_unavailable, verify_parked)',
+  labelNames: ['outcome'] as const,
   registers: [register]
 });
 
@@ -728,6 +819,10 @@ export function recordAgentHeartbeat(status: 'success' | 'failed'): void {
   upsertCounterState(agentHeartbeatState, { status });
 }
 
+export function recordAgentIngestSubmission(kind: AgentIngestKind, outcome: AgentIngestOutcome): void {
+  agentIngestSubmissionsTotal.labels(kind, outcome).inc();
+}
+
 export function updateBusinessMetrics(metrics: {
   devicesActive?: number;
   organizationsTotal?: number;
@@ -811,6 +906,88 @@ function recordBackupDispatchFailureMetric(operation: string, reason: string, co
     operation: normalizedOperation,
     reason: normalizedReason,
   }, safeCount);
+}
+
+function recordBackupReadDispatchMetric(commandType: string, mode: string, reason: string, count = 1): void {
+  const safeCount = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+  if (safeCount === 0) return;
+  backupReadDispatchesTotal
+    .labels(normalizeMetricLabel(commandType, 'unknown'), normalizeMetricLabel(mode, 'unknown'), normalizeMetricLabel(reason, 'unknown'))
+    .inc(safeCount);
+}
+
+function safeMetricCount(count: number): number {
+  return Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+}
+
+function recordStorageSessionCallMetric(scope: string, op: string, status: number, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  const statusLabel = Number.isInteger(status) && status >= 100 && status <= 599 ? String(status) : 'unknown';
+  backupStorageSessionCallsTotal
+    .labels(normalizeMetricLabel(scope, 'unknown'), normalizeMetricLabel(op, 'unknown'), statusLabel)
+    .inc(safeCount);
+}
+
+const STORAGE_SESSION_OBJECT_METHODS = new Set(['GET', 'PUT', 'UPLOAD_PART']);
+
+function recordStorageSessionObjectsMetric(scope: string, method: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  const methodLabel = STORAGE_SESSION_OBJECT_METHODS.has(method) ? method : 'unknown';
+  backupStorageSessionObjectsTotal.labels(normalizeMetricLabel(scope, 'unknown'), methodLabel).inc(safeCount);
+}
+
+function recordStorageSessionMintMetric(scope: string, outcome: string, reason: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupStorageSessionMintsTotal
+    .labels(normalizeMetricLabel(scope, 'unknown'), normalizeMetricLabel(outcome, 'unknown'), normalizeMetricLabel(reason, 'unknown'))
+    .inc(safeCount);
+}
+
+function recordBackupWriteDispatchMetric(commandType: string, mode: string, reason: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupWriteDispatchesTotal
+    .labels(normalizeMetricLabel(commandType, 'unknown'), normalizeMetricLabel(mode, 'unknown'), normalizeMetricLabel(reason, 'unknown'))
+    .inc(safeCount);
+}
+
+function recordBackupAttestationMetric(outcome: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupAttestationsTotal.labels(normalizeMetricLabel(outcome, 'unknown')).inc(safeCount);
+}
+
+function recordUnexpectedLegacyWriteMetric(commandType: string, reason: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupWriteUnexpectedLegacyTotal.labels(normalizeMetricLabel(commandType, 'unknown'), normalizeMetricLabel(reason, 'unknown')).inc(safeCount);
+}
+
+function recordConditionalWriteProbeMetric(outcome: string, reason: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupConditionalWriteProbeTotal.labels(normalizeMetricLabel(outcome, 'unknown'), normalizeMetricLabel(reason, 'unknown')).inc(safeCount);
+}
+
+function recordSnapshotPublishRefusedMetric(reason: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupSnapshotPublishRefusedTotal.labels(normalizeMetricLabel(reason, 'unknown')).inc(safeCount);
+}
+
+function recordBackupWriteJanitorMetric(action: string, outcome: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupWriteJanitorTotal.labels(normalizeMetricLabel(action, 'unknown'), normalizeMetricLabel(outcome, 'unknown')).inc(safeCount);
+}
+
+function recordBackupCapabilityRegressedMetric(capability: string, count = 1): void {
+  const safeCount = safeMetricCount(count);
+  if (safeCount === 0) return;
+  backupCapabilityRegressionsTotal.labels(normalizeMetricLabel(capability, 'unknown')).inc(safeCount);
 }
 
 function recordBackupVerificationSkipMetric(
@@ -993,6 +1170,17 @@ function bindMetricsRecorders(): void {
     onCommandTimeout: recordBackupCommandTimeoutMetric,
     onVerificationResult: recordBackupVerificationResultMetric,
     onLowReadinessDevices: setLowReadinessDevicesMetric,
+    onReadDispatch: recordBackupReadDispatchMetric,
+    onCapabilityRegressed: recordBackupCapabilityRegressedMetric,
+    onStorageSessionCall: recordStorageSessionCallMetric,
+    onStorageSessionObjects: recordStorageSessionObjectsMetric,
+    onStorageSessionMint: recordStorageSessionMintMetric,
+    onWriteDispatch: recordBackupWriteDispatchMetric,
+    onAttestation: recordBackupAttestationMetric,
+    onWriteJanitor: recordBackupWriteJanitorMetric,
+    onUnexpectedLegacyWrite: recordUnexpectedLegacyWriteMetric,
+    onConditionalWriteProbe: recordConditionalWriteProbeMetric,
+    onSnapshotPublishRefused: recordSnapshotPublishRefusedMetric,
   });
 
   setAnomalyMetricsRecorder({
@@ -1154,7 +1342,7 @@ async function readFleetGauges(nowMs: number): Promise<void> {
       .where(
         and(
           gte(devices.lastSeenAt, activeSince),
-          eq(devices.isEphemeral, false),
+          eq(devices.isEphemeral, false), notParkedDeviceCondition(),
           sql`${devices.status} != 'decommissioned'`
         )
       );
@@ -1304,7 +1492,7 @@ metricsRoutes.get('/', authMiddleware, requireScope('organization', 'partner', '
     // they never inflate the fleet counts or skew the uptime denominator.
     const deviceStatusCondition = and(
       sql`${devices.status} != 'decommissioned'`,
-      eq(devices.isEphemeral, false),
+      eq(devices.isEphemeral, false), notParkedDeviceCondition(),
       orgCondition,
       siteCondition
     );

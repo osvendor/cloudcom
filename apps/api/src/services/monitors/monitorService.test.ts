@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import { monitorConversions, monitorDefinitions, networkMonitors } from '../../db/schema';
 
 // Every assertion below fails BEFORE any DB work (ownership and shape checks
 // run first, deliberately), so the db module only needs to exist.
@@ -32,6 +34,8 @@ import {
   updateMonitorDefinition,
   deleteMonitorDefinition,
   getMonitorDefinition,
+  listMonitorDefinitions,
+  listMonitorDefinitionsPage,
   MonitorHasDependentsError,
   MonitorOwnershipError,
   MonitorValidationError,
@@ -439,17 +443,25 @@ it('creates a system monitor with a null actor using the supplied executor throu
 
 
 describe('conversion executor propagation', () => {
-  it('reads and deletes only through the caller executor', async () => {
-    const row = existingRow();
+  it.each(['cpu', 'network_check'])('deletes an unadopted %s monitor only through the caller executor', async (kind) => {
+    const row = existingRow({ kind });
     const where = vi.fn(async () => undefined);
+    const tx = {
+      select: vi.fn(() => ({ from: (table: unknown) => ({ where: () => {
+        const query = { orderBy: () => query, for: async () => table === monitorDefinitions ? [row] : [] };
+        return query;
+      } }) })),
+      delete: vi.fn(() => ({ where })),
+    };
     const executor = {
       select: vi.fn(() => ({ from: () => ({ where: () => ({ limit: async () => [row] }) }) })),
-      delete: vi.fn(() => ({ where })),
+      transaction: vi.fn(async (work: (value: typeof tx) => Promise<void>) => work(tx)),
     };
     expect(await getMonitorDefinition('monitor-1', auth(), executor as never)).toEqual(row);
     await deleteMonitorDefinition('monitor-1', auth(), executor as never);
     expect(executor.select).toHaveBeenCalledTimes(2);
-    expect(executor.delete).toHaveBeenCalledTimes(1);
+    expect(tx.delete).toHaveBeenCalledTimes(1);
+    expect(executor.transaction).toHaveBeenCalledOnce();
     expect(dbMock.select).not.toHaveBeenCalled();
     expect(dbMock.delete).not.toHaveBeenCalled();
   });
@@ -475,9 +487,16 @@ describe('deleteMonitorDefinition: dependent-row FK violation (#6509)', () => {
     const where = vi.fn(async () => {
       throw pgForeignKeyError;
     });
+    const tx = {
+      select: vi.fn(() => ({ from: (table: unknown) => ({ where: () => {
+        const query = { orderBy: () => query, for: async () => table === monitorDefinitions ? [row] : [] };
+        return query;
+      } }) })),
+      delete: vi.fn(() => ({ where })),
+    };
     const executor = {
       select: vi.fn(() => ({ from: () => ({ where: () => ({ limit: async () => [row] }) }) })),
-      delete: vi.fn(() => ({ where })),
+      transaction: vi.fn(async (work: (value: typeof tx) => Promise<void>) => work(tx)),
     };
 
     await expect(
@@ -491,9 +510,16 @@ describe('deleteMonitorDefinition: dependent-row FK violation (#6509)', () => {
     const where = vi.fn(async () => {
       throw otherError;
     });
+    const tx = {
+      select: vi.fn(() => ({ from: (table: unknown) => ({ where: () => {
+        const query = { orderBy: () => query, for: async () => table === monitorDefinitions ? [row] : [] };
+        return query;
+      } }) })),
+      delete: vi.fn(() => ({ where })),
+    };
     const executor = {
       select: vi.fn(() => ({ from: () => ({ where: () => ({ limit: async () => [row] }) }) })),
-      delete: vi.fn(() => ({ where })),
+      transaction: vi.fn(async (work: (value: typeof tx) => Promise<void>) => work(tx)),
     };
 
     await expect(
@@ -546,5 +572,309 @@ describe('Fleet Design savepoint executor propagation (W05c2 Task 16)', () => {
       expect(dbMock.select).not.toHaveBeenCalled();
       expect(dbMock.transaction).not.toHaveBeenCalled();
     } finally { compile.mockRestore(); }
+  });
+});
+
+describe('listMonitorDefinitions / listMonitorDefinitionsPage paging (#6735)', () => {
+  /** A select chain that records every builder call and resolves to `rows`. */
+  function recordingChain(rows: unknown[]) {
+    type Method = 'from' | 'where' | 'orderBy' | 'limit' | 'offset' | 'leftJoin';
+    const calls: Record<Method, unknown[][]> = { from: [], where: [], orderBy: [], limit: [], offset: [], leftJoin: [] };
+    const chain: Record<string, unknown> = {};
+    for (const method of Object.keys(calls) as Method[]) {
+      chain[method] = vi.fn((...args: unknown[]) => { calls[method].push(args); return chain; });
+    }
+    // A subquery alias: exposes a `total` field for the outer projection.
+    chain.as = vi.fn(() => ({ total: 'counted.total' }));
+    const executed = { count: 0 };
+    chain.then = (resolve: (v: unknown) => unknown, reject: (e: unknown) => unknown) => {
+      executed.count++;
+      return Promise.resolve(rows).then(resolve, reject);
+    };
+    return { chain, calls, executed };
+  }
+
+  /** The three builders listMonitorDefinitionsPage makes: count, page ids, outer statement. */
+  function pageChains(outerRows: unknown[]) {
+    const counted = recordingChain([]);
+    const pageIds = recordingChain([]);
+    const outer = recordingChain(outerRows);
+    dbMock.select
+      .mockReturnValueOnce(counted.chain)
+      .mockReturnValueOnce(pageIds.chain)
+      .mockReturnValueOnce(outer.chain);
+    return { counted, pageIds, outer };
+  }
+
+  it('without a page argument issues no LIMIT/OFFSET and keeps the name-only ordering', async () => {
+    const { chain, calls } = recordingChain([{ id: 'a' }]);
+    dbMock.select.mockReturnValue(chain);
+
+    const rows = await listMonitorDefinitions(auth(), { kind: 'cpu' });
+
+    expect(rows).toEqual([{ id: 'a' }]);
+    expect(calls.limit).toHaveLength(0);
+    expect(calls.offset).toHaveLength(0);
+    expect(calls.orderBy).toHaveLength(1);
+    expect(calls.orderBy[0]).toHaveLength(1);
+  });
+
+  it('executes ONE statement: a count LEFT JOINed to the LIMIT/OFFSET page, over the same WHERE, with an id tiebreaker', async () => {
+    const { counted, pageIds, outer } = pageChains([
+      { total: 60, row: { id: 'a' } },
+      { total: 60, row: { id: 'b' } },
+    ]);
+
+    const out = await listMonitorDefinitionsPage(auth(), { kind: 'cpu', enabled: true }, { limit: 25, offset: 50 });
+
+    expect(out).toEqual({ rows: [{ id: 'a' }, { id: 'b' }], total: 60 });
+    // Only the outer builder is executed; the other two are embedded in it,
+    // so the page and its total come from one snapshot.
+    expect(outer.executed.count).toBe(1);
+    expect(counted.executed.count).toBe(0);
+    expect(pageIds.executed.count).toBe(0);
+    expect(dbMock.select).toHaveBeenCalledTimes(3);
+    expect(outer.calls.leftJoin).toHaveLength(1);
+    expect(pageIds.calls.limit).toEqual([[25]]);
+    expect(pageIds.calls.offset).toEqual([[50]]);
+    expect(pageIds.calls.orderBy[0]).toHaveLength(2);
+    expect(outer.calls.orderBy[0]).toHaveLength(2);
+    // The count is never paged, and it counts over exactly the page's WHERE.
+    expect(counted.calls.limit).toHaveLength(0);
+    expect(counted.calls.offset).toHaveLength(0);
+    expect(counted.calls.where[0]).toEqual(pageIds.calls.where[0]);
+    expect(counted.calls.where[0]![0]).toBeDefined();
+  });
+
+  it('an empty page past the end still carries the total from the same statement', async () => {
+    const { outer } = pageChains([{ total: 42, row: null }]);
+    const out = await listMonitorDefinitionsPage(auth(), { kind: 'cpu', enabled: false }, { limit: 10, offset: 500 });
+    expect(out).toEqual({ rows: [], total: 42 });
+    expect(outer.executed.count).toBe(1);
+    expect(dbMock.select).toHaveBeenCalledTimes(3);
+  });
+
+  it('nothing visible is an empty page with total 0, not NaN', async () => {
+    pageChains([{ total: 0, row: null }]);
+    expect(await listMonitorDefinitionsPage(auth(), undefined, { limit: 25, offset: 0 })).toEqual({ rows: [], total: 0 });
+  });
+
+  it('pages get the same display-safe projection as the unpaged list for an org-scope caller', async () => {
+    const partnerWide = {
+      id: 'pw', orgId: null, partnerId: PARTNER,
+      responses: [{ type: 'run_script', scriptId: 's1' }],
+      recurrenceActions: [{ type: 'run_script', scriptId: 's2' }],
+      deliveryChannelIds: ['c1'], escalationPolicyId: 'e1', aiAgentId: 'a1',
+    };
+    const ownOrg = { ...partnerWide, id: 'own', orgId: ORG, partnerId: null };
+    pageChains([{ total: 2, row: partnerWide }, { total: 2, row: ownOrg }]);
+
+    const out = await listMonitorDefinitionsPage(auth(), undefined, { limit: 25, offset: 0 });
+
+    expect(out.rows[0]).toMatchObject({
+      id: 'pw', responses: [], recurrenceActions: [], deliveryChannelIds: [], escalationPolicyId: null, aiAgentId: null,
+    });
+    // The caller's own org row is returned as stored.
+    expect(out.rows[1]).toEqual(ownOrg);
+  });
+});
+
+describe('network check asset ownership', () => {
+  const assetId = '33333333-3333-4333-8333-333333333333';
+  const condition = { checkType: 'icmp_ping', target: 'example.com', assetId };
+
+  it('create rejects an asset outside the definition org before writing', async () => {
+    mockSelectQueue([undefined]);
+    await expect(createMonitorDefinition(input({ kind: 'network_check', condition }), auth()))
+      .rejects.toThrow('asset_not_owned');
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+    expect(dbMock.insert).not.toHaveBeenCalled();
+  });
+
+  it('create rejects partner-owned asset bindings without a lookup', async () => {
+    await expect(createMonitorDefinition(input({ ownerScope: 'partner', kind: 'network_check', condition }),
+      auth({ scope: 'partner', partnerOrgAccess: 'all' })))
+      .rejects.toThrow('asset_requires_org_owner');
+    expect(dbMock.select).not.toHaveBeenCalled();
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('validates the merged update against its persisted owner (replacement=%s)', async (replacement) => {
+    mockSelectQueue([existingRow({ kind: 'network_check', condition }), undefined]);
+    await expect(updateMonitorDefinition('monitor-1', replacement ? { condition: { ...condition, assetId: OTHER_PARTNER } } : { name: 'Renamed' }, auth()))
+      .rejects.toThrow('asset_not_owned');
+    expect(dbMock.update).not.toHaveBeenCalled();
+    expect(dbMock.transaction).not.toHaveBeenCalled();
+  });
+
+  it('uses the supplied executor for asset validation and preserves validation errors', async () => {
+    const executor = {
+      select: vi.fn(() => ({ from: () => ({ where: () => ({ limit: async () => [] }) }) })),
+    };
+    await expect(createMonitorDefinition(input({ kind: 'network_check', condition }), auth(), {}, executor as never))
+      .rejects.toBeInstanceOf(MonitorValidationError);
+    expect(executor.select).toHaveBeenCalledTimes(1);
+    expect(dbMock.select).not.toHaveBeenCalled();
+  });
+});
+
+describe('deleteMonitorDefinition: adopted network history', () => {
+  it('locks the definition, then probes, then conversion ledgers before release', async () => {
+    const lockedTables: unknown[] = [];
+    const tx = {
+      select: vi.fn(() => ({ from: (table: unknown) => {
+        const tables = [table];
+        const query = {
+          innerJoin: (joined: unknown) => { tables.push(joined); return query; },
+          where: () => query,
+          orderBy: () => query,
+          for: async () => {
+            lockedTables.push(...tables);
+            if (table === monitorDefinitions) return [existingRow({ kind: 'network_check' })];
+            if (table === networkMonitors) return [{ id: 'legacy', orgId: ORG, conversionId: 'conversion', sourceState: {} }];
+            return [{ id: 'legacy', conversionId: 'conversion', sourceState: {} }];
+          },
+        };
+        return query;
+      } })),
+      update: vi.fn(() => ({ set: () => ({ where: async () => undefined }) })),
+      delete: vi.fn(() => ({ where: async () => undefined })),
+    };
+    const executor = {
+      select: vi.fn(() => ({ from: () => ({ where: () => ({ limit: async () => [existingRow({ kind: 'network_check' })] }) }) })),
+      transaction: vi.fn(async (work: (value: typeof tx) => Promise<void>) => work(tx)),
+    };
+    await deleteMonitorDefinition('monitor-1', auth(), executor as never);
+    expect(lockedTables.map((table) => table === monitorDefinitions ? 'definition' : table === networkMonitors ? 'probe' : 'ledger'))
+      .toEqual(['definition', 'probe', 'ledger']);
+  });
+
+  it('releases only live adoption sources and marks their ledger before deleting in the same transaction', async () => {
+    const writes: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const predicates: unknown[] = [];
+    const tx = {
+      select: vi.fn(() => ({ from: (table: unknown) => ({ where: (predicate: unknown) => {
+        predicates.push(predicate);
+        const query = {
+          orderBy: () => query,
+          for: async () => table === monitorDefinitions ? [existingRow({ kind: 'network_check' })]
+            : table === networkMonitors ? [{ id: 'legacy', orgId: ORG }]
+              : [{ id: 'legacy', conversionId: 'conversion', sourceState: { name: 'Gateway' } }],
+        };
+        return query;
+      } }) })),
+      update: vi.fn((table: unknown) => ({ set: (values: Record<string, unknown>) => ({ where: async () => { writes.push({ table, values }); } }) })),
+      delete: vi.fn(() => ({ where: async () => {
+        expect(writes).toEqual([
+          { table: networkMonitors, values: { managedByMonitorId: null, isActive: false,
+            retiredAt: expect.any(Date), retiredReason: 'monitor_deleted', updatedAt: expect.any(Date) } },
+          { table: monitorConversions, values: { sourceState: { name: 'Gateway', sourceReleased: true } } },
+        ]);
+      } })),
+    };
+    const executor = {
+      select: vi.fn(() => ({ from: () => ({ where: () => ({ limit: async () => [existingRow({ kind: 'network_check' })] }) }) })),
+      delete: vi.fn(() => ({ where: async () => undefined })),
+      transaction: vi.fn(async (work: (value: typeof tx) => Promise<void>) => work(tx)),
+    };
+    await deleteMonitorDefinition('monitor-1', auth(), executor as never);
+    expect(executor.transaction).toHaveBeenCalledOnce();
+    expect(executor.delete).not.toHaveBeenCalled();
+    expect(tx.delete).toHaveBeenCalledWith(monitorDefinitions);
+    const probePredicate = new PgDialect().sqlToQuery(predicates[1] as never);
+    expect(probePredicate.sql).toContain('"managed_by_monitor_id" =');
+    expect(probePredicate.params).toContain('monitor-1');
+    const predicate = new PgDialect().sqlToQuery(predicates[2] as never);
+    expect(predicate.sql).toContain('"source_table" =');
+    expect(predicate.sql).toContain('"reverted_at" is null');
+    expect(predicate.params).toContain('legacy');
+    expect(predicate.params).toContain(ORG);
+    expect(predicate.params).toContain('network_monitors');
+  });
+});
+
+/**
+ * Display-safe projection of a partner-wide monitor for an org-scope reader.
+ * Action payloads, delivery routing and escalation/AI-agent wiring are
+ * stripped; everything else (id, name, condition, severity, ownership) stays
+ * intact so the org technician can still tell what the monitor does and that
+ * it exists.
+ */
+describe('monitor read projection for org-scope callers', () => {
+  function partnerWideRow(overrides: Record<string, unknown> = {}) {
+    return existingRow({
+      orgId: null,
+      partnerId: PARTNER,
+      responses: [{ type: 'execute_command', command: 'rm -rf /secret' }],
+      recurrenceActions: [{ type: 'run_script', parameters: { token: 'shh' } }],
+      deliveryChannelIds: ['channel-1'],
+      escalationPolicyId: ESCALATION_POLICY,
+      aiAgentId: 'agent-1',
+      ...overrides,
+    });
+  }
+
+  it('getMonitorDefinition strips action/delivery/escalation fields for an org-scope caller', async () => {
+    mockExisting(partnerWideRow());
+
+    const monitor = await getMonitorDefinition('monitor-1', auth());
+
+    expect(monitor).toMatchObject({
+      id: 'monitor-1',
+      orgId: null,
+      partnerId: PARTNER,
+      responses: [],
+      recurrenceActions: [],
+      deliveryChannelIds: [],
+      escalationPolicyId: null,
+      aiAgentId: null,
+    });
+  });
+
+  it('getMonitorDefinition returns the row unredacted for a partner-scope caller', async () => {
+    mockExisting(partnerWideRow());
+
+    const monitor = await getMonitorDefinition(
+      'monitor-1',
+      auth({ scope: 'partner', orgId: null, canAccessOrg: () => true }),
+    );
+
+    expect(monitor).toMatchObject({
+      responses: [{ type: 'execute_command', command: 'rm -rf /secret' }],
+      deliveryChannelIds: ['channel-1'],
+      escalationPolicyId: ESCALATION_POLICY,
+      aiAgentId: 'agent-1',
+    });
+  });
+
+  it('getMonitorDefinition leaves an org-owned row untouched for an org-scope caller', async () => {
+    mockExisting(existingRow({
+      orgId: ORG,
+      partnerId: null,
+      responses: [{ type: 'execute_command', command: 'echo hi' }],
+    }));
+
+    const monitor = await getMonitorDefinition('monitor-1', auth());
+
+    expect(monitor).toMatchObject({ responses: [{ type: 'execute_command', command: 'echo hi' }] });
+  });
+
+  it('listMonitorDefinitions strips action/delivery/escalation fields on partner-wide rows for an org-scope caller', async () => {
+    dbMock.select.mockReturnValue({
+      from: () => ({
+        where: () => ({
+          orderBy: () => Promise.resolve([partnerWideRow(), existingRow({ orgId: ORG, partnerId: null })]),
+        }),
+      }),
+    });
+
+    const rows = await listMonitorDefinitions(auth());
+
+    expect(rows[0]).toMatchObject({ orgId: null, responses: [], deliveryChannelIds: [], aiAgentId: null });
+    // The org-owned row (unaffected by the projection) keeps its own
+    // (empty-by-default) responses array untouched, confirming the
+    // redaction is keyed on `orgId === null`, not applied blanket to every
+    // row in the list.
+    expect(rows[1]).toMatchObject({ orgId: ORG, responses: [] });
   });
 });

@@ -933,7 +933,7 @@
         "subtotal": "Ara Toplam",
         "tax": "Vergi",
         "taxRate": "Vergi oranı",
-        "taxRateHelp": "Vergiye tabi olarak işaretlenen satırlar için geçerlidir. Kuruluşun vergi ayarlarında ayarlayın.",
+        "taxRateHelp": "Vergiye tabi olarak işaretlenen satırlar için geçerlidir. Bu oran teklif oluşturulurken belirlendi; gelecekteki teklifler için değiştirmek üzere kuruluşun vergi ayarlarını güncelleyin.",
         "title": "Canlı toplamlar",
         "total": "Toplam"
       },
@@ -1051,7 +1051,8 @@
         "readOnlyHint": "Şablonu, sürümü veya değişkenleri değiştirmek için bu bölümü kaldırıp yeniden ekleyin.",
         "updateToVersion": "v{{version}} Güncellemesi",
         "saveVariables": "Değişkenleri kaydet",
-        "unresolvedWarning": "Çözümlenmemiş değişkenler (göndermeyi engelleyecek): {{names}}"
+        "unresolvedWarning": "Çözümlenmemiş değişkenler (göndermeyi engelleyecek): {{names}}",
+        "placementHint": "Müşteriler bunu toplamlardan sonra, açana kadar daraltılmış olarak görür. PDF’te fiyattan sonra gelir."
       },
       "coverPage": {
         "title": "Kapak sayfası",
@@ -1209,7 +1210,7 @@
         "signerEmailLabel": "E-posta adresi (isteğe bağlı)",
         "consequenceInvoice": "{{amount}} tutarında bir fatura şimdi oluşturulup numaralandırılacak.",
         "consequenceContracts": "Yinelenen satırlar, sonradan etkinleştireceğiniz taslak sözleşmelere dönüşür.",
-        "consequenceEmail": "Fatura müşteriye e-postayla gönderilecek.",
+        "consequenceEmail": "Fatura {{recipients}} adresine e-postayla gönderilecek.",
         "consequenceDraft": "Bu teklif hiç gönderilmedi. Müşterinin onu ilk görüşü fatura olacak.",
         "submit": "Kabul et ve fatura oluştur",
         "success": "Teklif kabul edildi. {{number}} numaralı fatura oluşturuldu.",
@@ -1222,7 +1223,9 @@
         "evidenceHelp": "PDF, PNG veya JPEG, 10 MB'a kadar — örneğin imzalı sipariş formu veya belge.",
         "evidenceTooLarge": "Bu dosya 10 MB'tan büyük. Daha küçük bir dosya seçin.",
         "evidenceAttached": "Kanıt eklendi.",
-        "evidenceError": "Kabul kaydedildi, ancak kanıt dosyası eklenemedi. Teklif sayfasından ekleyin."
+        "evidenceError": "Kabul kaydedildi, ancak kanıt dosyası eklenemedi. Teklif sayfasından ekleyin.",
+        "consequenceEmailNoRecipient": "Bu teklifte kayıtlı alıcı yok; bu nedenle fatura e-postayla gönderilmeyebilir. Gerekirse müşteriye kendiniz gönderin.",
+        "successNoRecipient": "Teklif kabul edildi. {{number}} numaralı fatura düzenlendi. E-postayla gönderilmemiş olabilir: bu teklifte kayıtlı alıcı yok."
       },
       "declineOnBehalf": {
         "button": "Müşteri adına reddet",
@@ -1446,6 +1449,18 @@
         "unavailable": "Anlaşma dosyası mevcut değil",
         "versionFooter": "{{name}} — v{{version}}"
       },
+      "agreements": {
+        "heading": "Anlaşmalar",
+        "termsTitle": "Şartlar ve Koşullar",
+        "read": "Oku",
+        "hide": "Gizle",
+        "readTime": "~{{minutes}} dk okuma",
+        "sectionsReadTime_one": "{{count}} bölüm · ~{{minutes}} dk okuma",
+        "sectionsReadTime_other": "{{count}} bölüm · ~{{minutes}} dk okuma",
+        "pdfDocument": "PDF belgesi",
+        "unavailable": "Kullanılamıyor",
+        "untitled": "Anlaşma"
+      },
       "draft": "Taslak",
       "empty": "Bu teklifin henüz içeriği yok.",
       "imageUnavailable": "Resim kullanılamıyor",
@@ -1473,7 +1488,6 @@
         "tax": "Vergi",
         "unitPrice": "Birim fiyatı"
       },
-      "terms": "Şartlar",
       "totals": {
         "annualRecurring": "Yıllık yinelenen",
         "depositDue": "Depozito ödenmesi gerekiyor",
@@ -1930,19 +1944,18 @@
       },
       "reverseError": "Ödeme geri alınamadı.",
       "reverseSuccess": "Ödeme geri alındı",
-      "reverseInQuickbooksToo": "Bu ödemeyi QuickBooks’ta da iptal edin",
       "sendLink": "Ödeme bağlantısını gönder",
       "setUp": "Kurulum",
       "shareLinkPrompt": "Bu ödeme bağlantısını müşterinizle paylaşın:",
       "stripeNudge": "Çevrimiçi kart ödemelerini kabul etmek için Stripe bağlanın.",
       "title": "Ödemeler",
       "viaStripe": "Stripe aracılığıyla",
-      "quickbooks": "QuickBooks",
-      "viaQuickbooks": "QuickBooks aracılığıyla",
-      "inQuickbooks": "QuickBooks'ta",
-      "syncingToQuickbooks": "Eşitleniyor…",
-      "quickbooksSyncFailed": "QuickBooks eşitlemesi başarısız oldu",
-      "currencyUnknown": "Stripe hesabınızın ödeme para birimi henüz önbelleğe alınmadığından bu {{documentCurrency}} faturayla karşılaştırılamadı. Uyuşmazlık kontrolünü etkinleştirmek için Ayarlar → Entegrasyonlar altından Stripe hesap bilgilerinizi yenileyin."
+      "currencyUnknown": "Stripe hesabınızın ödeme para birimi henüz önbelleğe alınmadığından bu {{documentCurrency}} faturayla karşılaştırılamadı. Uyuşmazlık kontrolünü etkinleştirmek için Ayarlar → Entegrasyonlar altından Stripe hesap bilgilerinizi yenileyin.",
+      "inProvider": "{{provider}} tarafında",
+      "syncingToProvider": "Eşitleniyor…",
+      "providerSyncFailed": "{{provider}} eşitlemesi başarısız oldu",
+      "reverseInProviderToo": "Bu ödemeyi {{provider}} tarafında da iptal edin",
+      "overpayment": "Tutar, ödenmesi gereken bakiyeden ({{balance}}) fazla."
     },
     "requestPayment": {
       "invoiceSent": "Fatura gönderildi",
@@ -1982,22 +1995,22 @@
       "error": "Bağlantı sıfırlanamadı"
     },
     "accountingSync": {
-      "title": "QuickBooks eşitlemesi",
+      "title": "{{provider}} eşitlemesi",
       "status": {
         "pending": "Henüz gönderilmedi",
         "synced": "Eşitlendi",
         "error": "Eşitleme başarısız",
         "synced_with_tax_variance": "Vergi farkıyla eşitlendi"
       },
-      "taxVarianceHint": "QuickBooks farklı bir vergi toplamı hesapladı. Dönemi kapatmadan önce iki kaydı karşılaştırın.",
-      "docNumber": "QuickBooks belgesi {{docNumber}}",
+      "taxVarianceHint": "{{provider}} farklı bir vergi toplamı hesapladı. Dönemi kapatmadan önce iki kaydı karşılaştırın.",
+      "docNumber": "{{provider}} belgesi {{docNumber}}",
       "lastSynced": "Son eşitleme: {{when}}",
       "syncing": "Eşitleniyor…",
-      "push": "QuickBooks'a gönder",
-      "pushed": "Fatura QuickBooks'a gönderildi.",
-      "pushFailed": "Fatura QuickBooks'a gönderilemedi.",
-      "voidedHint": "Bu fatura iptal edildi — QuickBooks'a gönderilecek bir şey yok.",
-      "remoteDeletedHint": "Bu fatura QuickBooks'ta silindi. Yeniden göndermek bir kopya oluşturur — önce QuickBooks'ta çözün."
+      "push": "{{provider}} hizmetine gönder",
+      "pushed": "Fatura {{provider}} hizmetine gönderildi.",
+      "pushFailed": "Fatura {{provider}} hizmetine gönderilemedi.",
+      "voidedHint": "Bu fatura iptal edildi — {{provider}} hizmetine gönderilecek bir şey yok.",
+      "remoteDeletedHint": "Bu fatura {{provider}} tarafında silindi. Yeniden göndermek bir kopya oluşturur — önce {{provider}} tarafında çözün."
     }
   },
   "invoiceDocument": {
@@ -2060,11 +2073,11 @@
       "success": "{{succeeded}} {{verb}}",
       "void": "Geçersiz",
       "voidedVerb": "geçersiz kılındı",
-      "quickbooks": "QuickBooks'a gönder",
-      "quickbooksQueued": "{{enqueued}} kayıt QuickBooks kuyruğunda",
-      "quickbooksQueuedPartial": "{{enqueued}} kayıt QuickBooks kuyruğunda, {{skipped}} atlandı",
-      "quickbooksQueuedFailed": "{{enqueued}} kayıt QuickBooks kuyruğunda, {{skipped}} atlandı, {{failed}} kuyruğa alınamadı",
-      "quickbooksFailed": "QuickBooks gönderimi kuyruğa alınamadı. Yeniden deneyin."
+      "pushToProvider": "{{provider}} hizmetine gönder",
+      "providerQueued": "{{enqueued}} kayıt {{provider}} kuyruğunda",
+      "providerQueuedPartial": "{{enqueued}} kayıt {{provider}} kuyruğunda, {{skipped}} atlandı",
+      "providerQueuedFailed": "{{enqueued}} kayıt {{provider}} kuyruğunda, {{skipped}} atlandı, {{failed}} kuyruğa alınamadı",
+      "providerFailed": "{{provider}} gönderimi kuyruğa alınamadı. Yeniden deneyin."
     },
     "bulkDelete": {
       "message": "Seçilen {{count}} fatura(lar) silinsin mi? Yalnızca TASLAK faturalar silinecektir; bu geri alınamaz.",
@@ -2159,11 +2172,11 @@
       "title": "Fatura adresi"
     },
     "contact": {
-      "description": "Fiyat teklifleri ve faturalar bu adrese e-postayla gönderilir. Bu olmadan, bir teklif gönderildiğinde, teklif Gönderildi olarak işaretlenir ancak hiçbir şey e-postayla gönderilmez.",
-      "email": "İletişim e-postası",
-      "emailInvalid": "Geçerli bir e-posta adresi girin",
-      "emailPlaceholder": "faturalama@müşteri.örnek",
-      "name": "Kişi adı",
+      "description": "Fiyat teklifleri ve faturalar varsayılan olarak kuruluşun faturalandırma iletişim kişisine, yani Faturalama rolüne sahip kuruluş düzeyindeki kişiye e-postayla gönderilir. Her gönderimde alıcıları yine de değiştirebilirsiniz.",
+      "manage": "Kişileri yönet",
+      "noEmail": "{{name}} Faturalama rolüne sahip ancak e-posta adresi yok; bir adres eklenene kadar fiyat teklifleri ve faturalar e-postayla gönderilemez.",
+      "none": "Hiçbir kişi Faturalama rolüne sahip değil. Biri bu role sahip olana kadar, bir teklif gönderildiğinde Gönderildi olarak işaretlenir ancak hiçbir şey e-postayla gönderilmez.",
+      "recipientLabel": "Varsayılan alıcı:",
       "title": "Faturalandırma iletişim kişisi"
     },
     "currency": {
@@ -2277,7 +2290,8 @@
     "loading": "Faturalandırma ayarları yükleniyor…",
     "saveButton": "Faturalandırma ayarlarını kaydet",
     "saveError": "Faturalandırma ayarları kaydedilemedi.",
-    "saveSuccess": "Faturalandırma ayarları kaydedildi"
+    "saveSuccess": "Faturalandırma ayarları kaydedildi",
+    "readOnlyNotice": "Faturalandırma ayarlarına yalnızca görüntüleme erişiminiz var. Değiştirmek için bir yöneticiden yardım isteyin."
   },
   "shared": {
     "documentWorkspace": {
@@ -2302,7 +2316,7 @@
   "billingConnectionsTab": {
     "accounting": {
       "title": "Muhasebe",
-      "description": "Stripe ve QuickBooks, Entegrasyonlar altında bağlanır — onları orada yönetin.",
+      "description": "Stripe, QuickBooks ve Xero bağlantıları Entegrasyonlar altında yönetilir.",
       "cta": "Muhasebe bağlantılarını yönet →"
     },
     "catalog": {

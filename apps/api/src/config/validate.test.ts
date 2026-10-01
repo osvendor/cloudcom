@@ -100,6 +100,28 @@ describe('validateConfig', () => {
     });
   });
 
+  describe('APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM', () => {
+    it('is valid when unset or blank', () => {
+      withEnv(validEnv, () => { expect(() => validateConfig()).not.toThrow(); });
+      withEnv({ ...validEnv, APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM: '' }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+    it('accepts an ISO date or timestamp', () => {
+      withEnv({ ...validEnv, APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM: '2027-01-15' }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+      withEnv({ ...validEnv, APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM: '2027-01-15T09:00:00Z' }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    });
+    it('refuses to boot on an unparseable value', () => {
+      withEnv({ ...validEnv, APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM: 'next tuesday' }, () => {
+        expect(() => validateConfig()).toThrow(/APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM/);
+      });
+    });
+  });
+
   it('does not require IP classification provider configuration', () => {
     const previousProvider = process.env.IP_CLASSIFY_PROVIDER;
     const previousKey = process.env.IP_CLASSIFY_API_KEY;
@@ -3030,6 +3052,22 @@ describe('envSchema ↔ validateConfig parse-input contract (#2896)', () => {
   ])('validates %s (regression: silently dropped before #2896)', (key) => {
     expect(ENV_SCHEMA_KEYS).toContain(key);
     expect(buildEnvParseInput({ [key]: 'sentinel' })[key]).toBe('sentinel');
+  });
+});
+
+describe('Xero env (W02)', () => {
+  const KEYS = ['XERO_CLIENT_ID', 'XERO_CLIENT_SECRET', 'XERO_REDIRECT_URI', 'XERO_WEBHOOK_KEY', 'XERO_DAILY_CALL_LIMIT'] as const;
+  it.each(KEYS)('declares %s in the env schema', (key) => {
+    expect(ENV_SCHEMA_KEYS).toContain(key);
+    expect(buildEnvParseInput({ [key]: 'sentinel' })[key]).toBe('sentinel');
+  });
+  it('boots with every Xero var unset (all optional)', () => {
+    withEnv({ ...validEnv }, () => { expect(() => validateConfig()).not.toThrow(); });
+  });
+  it.each(['unlimited', '0', '-3', '12.5'])('refuses an invalid XERO_DAILY_CALL_LIMIT %s', (value) => {
+    withEnv({ ...validEnv, XERO_DAILY_CALL_LIMIT: value }, () => {
+      expect(() => validateConfig()).toThrow(/XERO_DAILY_CALL_LIMIT/);
+    });
   });
 });
 

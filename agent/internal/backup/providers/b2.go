@@ -82,7 +82,7 @@ func (p *B2Provider) UploadContext(ctx context.Context, localPath, remotePath st
 	obj := bucket.Object(remotePath)
 	writer := obj.NewWriter(ctx)
 
-	if _, err := io.Copy(writer, file); err != nil {
+	if _, err := io.Copy(writer, uploadProgressSource(ctx, file)); err != nil {
 		_ = writer.Close()
 		return fmt.Errorf("failed to upload file to b2: %w", err)
 	}
@@ -192,6 +192,9 @@ func (p *B2Provider) Delete(remotePath string) error {
 
 	ctx := context.Background()
 	if err := bucket.Object(remotePath).Delete(ctx); err != nil {
+		if b2IsNotFound(err) {
+			return nil // already gone: the delete's goal holds
+		}
 		return fmt.Errorf("failed to delete b2 object: %w", err)
 	}
 	return nil
@@ -224,4 +227,10 @@ func (p *B2Provider) getBucket() (*b2.Bucket, error) {
 		}
 	}
 	return nil, fmt.Errorf("b2 bucket %q not found", p.bucketName)
+}
+
+// b2IsNotFound reports whether err (as returned by the B2 client, unwrapped)
+// says the object does not exist.
+func b2IsNotFound(err error) bool {
+	return b2.IsNotExist(err)
 }

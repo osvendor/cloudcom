@@ -98,7 +98,18 @@ vi.mock('../services/ticketService', () => ({
   }
 }));
 
+// The unified backup read model (#6012) builds SQL fragments from schema
+// columns at module load, which this file's partial schema mock does not
+// carry. No test here exercises a backup handler, so it is stubbed whole.
+vi.mock('../services/backupHealthReadModel', () => ({
+  listBackupHealthRows: vi.fn(async () => ({ rows: [], nextCursor: null })),
+  getFirstPartyCoverageForDevices: vi.fn(async () => new Map()),
+  getProviderCoverageForDevices: vi.fn(async () => new Map()),
+}));
+
 vi.mock('../db/schema', () => ({
+  // services/patchSeverityOverlay.ts builds module-level SQL fragments from these at import time.
+  patches: { severity: 'patches.severity', category: 'patches.category' },
   assetCheckouts: {},
   backupConfigs: {},
   backupJobs: {},
@@ -117,7 +128,8 @@ vi.mock('../db/schema', () => ({
   portalBranding: {},
   portalUsers: {},
   recoveryReadiness: {},
-  RESTORABLE_BACKUP_JOB_STATUSES: ['completed', 'partial'],
+  RESTORABLE_BACKUP_JOB_STATUSES: ['completed', 'completed_with_errors', 'partial'],
+  DEGRADED_BACKUP_JOB_STATUSES: ['completed_with_errors', 'partial'],
   s1Agents: {},
   securityStatus: {},
   ticketComments: {},

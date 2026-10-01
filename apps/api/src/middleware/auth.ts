@@ -7,7 +7,8 @@ import { normalizeSiteAllowlist } from '../services/siteAllowlist';
 import { isTokenIssuedBeforePasswordChange, isUserTokenRevoked } from '../services/tokenRevocation';
 import { db, runOutsideDbContext, withDbAccessContext, withSystemDbAccessContext, type DbAccessContext, type DbAccessScope } from '../db';
 import { users, partnerUsers, organizations } from '../db/schema';
-import { and, eq, inArray, isNull, or, SQL } from 'drizzle-orm';
+import { UNASSIGNED_POOL_ORG_TYPE } from '../services/unassignedPool/orgType';
+import { and, eq, inArray, isNull, ne, or, SQL } from 'drizzle-orm';
 import type { PgColumn } from 'drizzle-orm/pg-core';
 import type { AiOriginRef } from '@breeze/shared';
 import type { PartnerTrustState } from '../db/schema/orgs';
@@ -125,6 +126,18 @@ export interface AuthContext {
    * options bag as well. Use `services/aiDispatch.ts` -- do not hand-thread it.
    */
   aiOrigin?: AiOriginRef;
+
+  /**
+   * AI chat TOOL auth only (#6675): the org an org-scoped AI write defaults to
+   * when the tool input names none. Set to the session org for a chat whose
+   * org was anchored by the device page it was opened from (recorded
+   * server-side in `ai_sessions.context_snapshot`, `aiSessionOrgAnchor.ts`).
+   *
+   * A default, never a grant: `resolveWritableToolOrgId` re-checks
+   * `canAccessOrg` on every call and an explicit `orgId` always wins. It does
+   * not narrow reads — the caller's reach is unchanged.
+   */
+  aiWriteDefaultOrgId?: string;
 
   user: {
     id: string;
@@ -454,6 +467,8 @@ export async function computeAccessibleOrgIds(
               eq(organizations.partnerId, partnerId),
               orgFilter,
               inArray(organizations.status, ['active', 'trial']),
+              // Holding org is never human-reachable.
+              ne(organizations.type, UNASSIGNED_POOL_ORG_TYPE),
               isNull(organizations.deletedAt)
             )
           );
@@ -469,6 +484,8 @@ export async function computeAccessibleOrgIds(
           and(
             eq(organizations.partnerId, partnerId),
             inArray(organizations.status, ['active', 'trial']),
+            // Holding org is never human-reachable.
+            ne(organizations.type, UNASSIGNED_POOL_ORG_TYPE),
             isNull(organizations.deletedAt)
           )
         );

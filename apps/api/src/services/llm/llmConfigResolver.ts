@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { and, eq } from 'drizzle-orm';
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
+import { db, getCurrentDbAccessContext, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
 import { organizations, partnerLlmConfigs } from '../../db/schema';
 import type { LlmEgressSurface } from '../../db/schema/llmEgressEvents';
 import type { CatalogPricingSnapshot } from '../aiCostTracker';
@@ -10,6 +10,7 @@ import { decryptPartnerLlmApiKey } from '../partnerLlmConfig';
 import { SecretKeyMaterialError } from '../secretCrypto';
 import { captureException, captureMessage } from '../sentry';
 import { buildGuardedLlmFetch, type GuardedLlmFetchAttempt } from './guardedLlmFetch';
+import { isPlatformLlmConfigured, type LlmUnusableCode } from './llmAvailability';
 import { recordLlmEgressEvent } from './llmEgressRecorder';
 
 const SENTRY_CAPTURE_THROTTLE_MS = 60 * 60 * 1000;
@@ -367,6 +368,54 @@ export async function resolveLlmConfigForOrg(orgId: string): Promise<ResolvedLlm
   const partnerId = await readOrganizationPartnerId(orgId);
   if (partnerId === undefined) throw new LlmOrgResolutionError(orgId);
   return resolveLlmConfig(partnerId ?? null);
+}
+
+/**
+ * Readiness view of `resolveLlmConfigForOrg` + `llmUnusableCode` for a caller
+ * ALREADY inside a system DB context (topology AI readiness, review R1): the
+ * same decisions — no partner config means the platform path, which is usable
+ * only with a platform credential (`isPlatformLlmConfigured`); an `error`
+ * status, an undecryptable key or an unusable catalog pin means unavailable —
+ * read on the caller's own connection. Returns null when a model can be
+ * called. It never escapes to a second pooled connection (the resolver's
+ * `runOutsideDbContext` reads would, which under a held transaction is the
+ * #6671 pool-exhaustion shape) and has no side effects: it never marks a
+ * config errored — only a real model call does. The authoritative resolution
+ * still happens before any model call.
+ */
+export async function llmUnusableCodeForOrgInSystemContext(orgId: string): Promise<LlmUnusableCode | null> {
+  if (getCurrentDbAccessContext()?.scope !== 'system') {
+    throw new Error('llmUnusableCodeForOrgInSystemContext requires a held system DB context');
+  }
+  const platform = (): LlmUnusableCode | null => (isPlatformLlmConfigured() ? null : 'ai_not_configured');
+  const [organization] = await db
+    .select({ partnerId: organizations.partnerId })
+    .from(organizations)
+    .where(eq(organizations.id, orgId))
+    .limit(1);
+  if (!organization) return 'ai_unavailable';
+  if (!organization.partnerId) return platform();
+  const [row] = await db
+    .select({
+      id: partnerLlmConfigs.id,
+      apiKeyEncrypted: partnerLlmConfigs.apiKeyEncrypted,
+      defaultModel: partnerLlmConfigs.defaultModel,
+      catalogEntryId: partnerLlmConfigs.catalogEntryId,
+      status: partnerLlmConfigs.status,
+    })
+    .from(partnerLlmConfigs)
+    .where(eq(partnerLlmConfigs.partnerId, organization.partnerId))
+    .limit(1);
+  if (!row) return platform();
+  if (row.status === 'error') return 'ai_unavailable';
+  try {
+    decryptPartnerLlmApiKey({ id: row.id, apiKeyEncrypted: row.apiKeyEncrypted });
+  } catch {
+    return 'ai_unavailable';
+  }
+  if (!row.catalogEntryId) return null;
+  const catalog = await resolveCatalogEndpoint(row.catalogEntryId, row.defaultModel ?? resolveDefaultModel());
+  return catalog.ok ? null : 'ai_unavailable';
 }
 
 export async function getLlmBillingSourceForOrg(

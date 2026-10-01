@@ -2,7 +2,8 @@ import type { Context, Next } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import * as Sentry from '@sentry/node';
 import { createRemoteJWKSet, jwtVerify, type JWTPayload, type JWTVerifyResult } from 'jose';
-import { and, eq, gt, inArray, isNull, or, sql } from 'drizzle-orm';
+import { and, eq, gt, inArray, isNull, ne, or, sql } from 'drizzle-orm';
+import { UNASSIGNED_POOL_ORG_TYPE } from '../services/unassignedPool/orgType';
 import {
   OAUTH_AUTH_EPOCH_ENFORCE_AFTER,
   OAUTH_ISSUER,
@@ -18,6 +19,7 @@ import { oauthClientBlocks, oauthGrants, organizations, partnerUsers, users } fr
 import { isGrantRevoked, isJtiRevoked } from '../oauth/revocationCache';
 import { activeGrantCondition } from '../oauth/grantStatus';
 import { assertActiveTenantContext, TenantInactiveError } from '../services/tenantStatus';
+import { MCP_SKIP_AMBIENT_DB_CONTEXT_KEY } from './mcpTenantToolSelfManagedContext';
 
 interface OAuthApiKeyContext {
   id: string;
@@ -301,6 +303,8 @@ export async function resolvePartnerAccessibleOrgIds(
             eq(organizations.partnerId, partnerId),
             orgFilter,
             inArray(organizations.status, ['active', 'trial']),
+            // Holding org is never human-reachable.
+            ne(organizations.type, UNASSIGNED_POOL_ORG_TYPE),
             isNull(organizations.deletedAt),
           ),
         );
@@ -315,6 +319,8 @@ export async function resolvePartnerAccessibleOrgIds(
         and(
           eq(organizations.partnerId, partnerId),
           inArray(organizations.status, ['active', 'trial']),
+          // Holding org is never human-reachable.
+          ne(organizations.type, UNASSIGNED_POOL_ORG_TYPE),
           isNull(organizations.deletedAt),
         ),
       );
@@ -497,6 +503,16 @@ export async function bearerTokenAuthMiddleware(c: Context, next: Next) {
         await resolvePartnerAccessibleOrgIds(payload.partner_id, payload.sub),
         clientIdClaim,
       );
+
+  // See MCP_SKIP_AMBIENT_DB_CONTEXT_KEY's doc comment: set only by
+  // mcpAuthMiddleware, only for an MCP tools/call request already known to
+  // target a tenant (BYO MCP) tool. Every DB read/write on that path manages
+  // its own short context, so the ambient wrap below is skipped rather than
+  // pinning a pooled connection across the tool's outbound call.
+  if (c.get(MCP_SKIP_AMBIENT_DB_CONTEXT_KEY) === true) {
+    await next();
+    return;
+  }
 
   await withDbAccessContext(
     payload.org_id

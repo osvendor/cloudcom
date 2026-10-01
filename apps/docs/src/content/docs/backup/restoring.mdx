@@ -10,6 +10,10 @@ import { Steps, Aside } from '@astrojs/starlight/components';
 
 Breeze supports several restore methods depending on what you need to recover — from a single file to a complete system.
 
+<Aside title="S3 restores need HTTPS">
+Restores and verification from S3 or S3-compatible storage need the v0.118 agent or later, an HTTPS agent API and an HTTPS storage endpoint. See [HTTPS for Restores](/backup/https-restores/).
+</Aside>
+
 ---
 
 ## Browsing Snapshots
@@ -54,7 +58,7 @@ A `system_image` snapshot taken by a v0.112.0 or later agent on Linux or Windows
 2. Select the snapshot to restore from.
 3. Choose **Full Restore**.
 4. Choose the destination:
-   - **Original location** — despite the name, this does **not** restore files to their original paths. With no destination path set, the agent restores into a temporary directory on the device instead (under the system temp directory). To restore in place — overwriting the originals — choose **Alternate path** and type in the original root path yourself.
+   - **Staging folder on the device** — the default. Files are restored under the device's system temp directory (`breeze-restore/<original path>`); the originals are never overwritten. (Earlier releases labelled this option "Original location", which it never was.) To restore in place — overwriting the originals — choose **Alternate path** and type in the original root path yourself.
    - **Alternate path** — specify a directory (e.g., `/var/restore` or `D:\Restored`); files are written there preserving their relative structure.
 5. Review the summary and click **Restore**. The restore always runs on the device that owns the snapshot — the wizard does not offer a way to target a different device (see [Cross-Device Restore](#cross-device-restore) below).
 </Steps>
@@ -66,7 +70,7 @@ A `system_image` snapshot taken by a v0.112.0 or later agent on Linux or Windows
 2. Select the snapshot.
 3. Choose **Selective Restore**.
 4. Browse the file tree and check the boxes next to the individual files you want to recover. Selection is per-file — checking a folder is not supported, and the API rejects a folder path submitted directly; select the files inside it instead.
-5. Choose the destination path (the same "Original location" caveat above applies).
+5. Choose the destination path (see the staging-folder default above).
 6. Review and click **Restore**.
 </Steps>
 
@@ -89,6 +93,35 @@ If the target device is offline, Breeze rejects the restore request immediately 
 
 ---
 
+## How restores reach storage
+
+**v0.118.0+.** Restore commands no longer carry your storage credentials. This covers file restores, verification and test restores, SQL Server restores and verification, Hyper-V restores, restore as VM, and instant boot. Breeze looks up the storage destination when it delivers the command, not when you start it.
+
+With the 0.118 backup helper, the device does not receive the storage destination at all. Instead:
+
+1. Breeze issues a short-lived, read-only storage session for that one command on that one device.
+2. For each file it needs, the helper asks Breeze for a download link. Breeze checks that the file belongs to the snapshot being restored, then returns a link that expires within minutes.
+3. The helper downloads the file directly from storage over that link, and renews the session for as long as the restore runs.
+
+Breeze uses this path when all of these hold:
+
+- the device's backup helper is 0.118.0 or later;
+- the snapshot is on S3-compatible storage reached over HTTPS, and its storage location still matches the destination's current settings;
+- the server address the device uses is HTTPS;
+- Breeze has a verified file list for the snapshot (it builds one automatically when it is missing), or, for SQL Server, the snapshot's manifest and backup file.
+
+Otherwise the restore uses the previous path, where the device receives the storage destination with the command. This is the case for devices whose backup helper predates 0.118 until they update. Restores keep working either way.
+
+<Aside type="note">
+  A backup, restore or verify command still queued when its device moves to another organization, including during an organization merge, is not delivered. It is expired with a reason. Run it again after the move.
+</Aside>
+
+<Aside type="tip">
+  Self-hosted operators can see which path each restore took from the `breeze_backup_read_dispatch_total` metric on `/metrics`. Its `mode` label is `brokered` (storage session) or `legacy` (previous path), and its `reason` label says why.
+</Aside>
+
+---
+
 ## Cross-Device Restore
 
 The restore API (`POST /backup/restore`) accepts a target `deviceId`, so a snapshot can be restored to a different device than the one it was taken from — both devices must be in the same organization. This is **API-only today**: the Restore Wizard in the web UI never sends a `deviceId`, so any restore started from the wizard runs on the device that owns the snapshot. To restore to a different device, call the API directly with the target `deviceId`.
@@ -107,6 +140,6 @@ Cross-device restores also require the destination device to be online when you 
 
 ## Restore Considerations
 
-- **Destination path.** See the "Original location" caveat above — an explicit destination path is the only way to control where files land, including restoring in place.
+- **Destination path.** See the staging-folder default above — an explicit destination path is the only way to control where files land, including restoring in place.
 - **Permissions.** See "What Is and Isn't Preserved" above. If restoring to a different device or OS, permissions may need adjustment regardless.
 - **Disk space.** Ensure the target device has enough free space for the restore. The snapshot's total size is shown in the Restore Wizard summary.

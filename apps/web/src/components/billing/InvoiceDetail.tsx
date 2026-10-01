@@ -27,12 +27,18 @@ import {
   computeInvoiceProfit,
 } from './invoiceTypes';
 import { StatusPill } from './shared/StatusPill';
+import { LineItemsTable } from './shared/LineItemsTable';
 import InvoiceActions from './InvoiceActions';
 import AccountingSyncCard from './AccountingSyncCard';
 import { MarginPanel, MarginToggle, useShowMargin } from './billingUi';
 import { computeChargeNow } from '@breeze/shared';
 import InvoiceLineDevices from './InvoiceLineDevices';
 import { useStableT } from '@/lib/i18n/useStableT';
+import {
+  ACCOUNTING_PROVIDER_NAMES,
+  isAccountingProviderId,
+  useActivePushProvider,
+} from '../../lib/accountingProviders';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -52,6 +58,28 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
   const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const { can } = usePermissions();
   const { invoice, lines } = detail;
+  const canPushInvoices = can('invoices', 'write');
+  // Where a push from the sync card goes when the invoice has no mapping row
+  // yet: the partner's active connection, iff it can push invoices. Only asked
+  // when a push could actually be made — the push route also requires
+  // accounting:manage (same gate as the InvoicesPage bulk push), and a mapped
+  // invoice already names its provider. `null` hides only the push action;
+  // the card itself (status + post-Issue watch) always mounts.
+  const pushProvider = useActivePushProvider(
+    canPushInvoices && can('accounting', 'manage') && !detail.accountingSync,
+  );
+  const syncProvider = detail.accountingSync?.provider ?? pushProvider;
+  // Display name for the {{provider}} interpolation on payment-row sync
+  // badges, used as a fallback when a payment's own accountingSync carries no
+  // provider (an older API response — see paymentBadgeProvider below).
+  // Deliberately no brand fallback (never guess "QuickBooks"): when the
+  // provider genuinely isn't known, the interpolation is left blank rather
+  // than naming the wrong one.
+  const syncProviderName = syncProvider ? ACCOUNTING_PROVIDER_NAMES[syncProvider] : '';
+  // A pushed payment's badge names the provider it was pushed to (W01d "Invoice
+  // badge" deferral); the invoice-level name only for an older API response.
+  const paymentBadgeProvider = (p: InvoicePayment): string =>
+    p.accountingSync?.provider ? ACCOUNTING_PROVIDER_NAMES[p.accountingSync.provider] : syncProviderName;
   const currency = invoice.currencyCode;
   const invoiceStatusLabel = invoice.status === 'sent' && !invoice.sentAt
     ? t('invoice.status.issued')
@@ -212,8 +240,12 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
     }
   }, [busy, dueDateDraft, invoice.id, refresh, t]);
 
+  // Client-side mirror of the server's OVERPAYMENT check (kept server-side too):
+  // compare in whole cents so 0.1 + 0.2 style float noise can't misfire.
+  const payOverBalance = payAmount !== '' && Math.round(Number(payAmount) * 100) > Math.round(Number(invoice.balance) * 100);
+
   const recordPayment = useCallback(async () => {
-    if (busy || !payAmount) return;
+    if (busy || !payAmount || payOverBalance) return;
     setBusy(true);
     try {
       await runAction({
@@ -237,19 +269,28 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
     } finally {
       setBusy(false);
     }
-  }, [busy, payAmount, payMethod, payRef, payDate, invoice.id, refresh, t]);
+  }, [busy, payAmount, payOverBalance, payMethod, payRef, payDate, invoice.id, refresh, t]);
 
   const voidPayment = useCallback(async (paymentId: string) => {
     if (busy) return;
     setBusy(true);
     try {
-      const result = await runAction<{ quickbooksRecordUntouched?: boolean }>({
+      const result = await runAction<{ providerRecordUntouched?: boolean; quickbooksRecordUntouched?: boolean }>({
         request: () => fetchWithAuth(`/invoices/${invoice.id}/payments/${paymentId}`, { method: 'DELETE' }),
         errorFallback: t('invoiceDetail.payments.reverseError'),
         onUnauthorized: UNAUTHORIZED,
       });
-      showToast(result.quickbooksRecordUntouched
-        ? { type: 'warning', message: t('invoiceDetail.payments.reverseInQuickbooksToo') }
+      // The payment being reversed names its own provider when it originated
+      // there (`p.source` is an accounting-provider id) — a more precise
+      // signal than the invoice-level `syncProviderName` for THIS specific
+      // payment, and available even when the invoice itself has no known
+      // active connection.
+      const reversalProviderName = reversePayment?.source && isAccountingProviderId(reversePayment.source)
+        ? ACCOUNTING_PROVIDER_NAMES[reversePayment.source]
+        : syncProviderName;
+      const untouched = result.providerRecordUntouched ?? result.quickbooksRecordUntouched ?? false;
+      showToast(untouched
+        ? { type: 'warning', message: t('invoiceDetail.payments.reverseInProviderToo', { provider: reversalProviderName }) }
         : { type: 'success', message: t('invoiceDetail.payments.reverseSuccess') });
       setReversePayment(null);
       refresh();
@@ -258,7 +299,7 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
     } finally {
       setBusy(false);
     }
-  }, [busy, invoice.id, refresh, t]);
+  }, [busy, invoice.id, refresh, t, syncProviderName, reversePayment]);
 
   // Revoke every issued public view-and-pay link; the next send/copy dispenses
   // a fresh url. Rare action — for a link forwarded to the wrong hands.
@@ -381,89 +422,79 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
               )}
             </div>
           ) : (
-          <div className="rounded-lg border bg-card shadow-xs">
-            {/* #3205 W07: invoice-level provenance, rendered once. */}
-            {invoice.evidenceVersion === null && (
+          <LineItemsTable<InvoiceLine>
+            header={invoice.evidenceVersion === null ? (
+              // #3205 W07: invoice-level provenance, rendered once.
               <p className="mb-2 px-3 pt-2 text-xs text-muted-foreground" data-testid="invoice-devices-not-recorded">
                 {t('invoiceDetail.devices.notRecorded')}
               </p>
-            )}
-            {/* Labeled, keyboard-reachable scroll region: the internal view runs
-                to 7 columns, well past a phone viewport — scroll inside the card
-                instead of bleeding past its rounded edge (QuoteDetail pattern). */}
-            <div className="overflow-x-auto" role="region" aria-label={t('invoiceDetail.linesScrollAria')} tabIndex={0}>
-            <table className="w-full min-w-[32rem] text-sm" data-testid="invoice-detail-lines">
-              <thead>
-                <tr className="border-b text-left text-xs uppercase tracking-wide text-muted-foreground">
-                  <th className="px-3 py-2 font-medium">{t('invoiceDetail.lines.description')}</th>
-                  <th className="px-3 py-2 text-right font-medium">{t('invoiceDetail.lines.qty')}</th>
-                  <th className="px-3 py-2 text-right font-medium">{t('invoiceDetail.lines.price')}</th>
-                  {internalView && <th className="px-3 py-2 text-right font-medium">{t('invoiceDetail.lines.cost')}</th>}
-                  {internalView && <th className="px-3 py-2 text-right font-medium">{t('invoiceDetail.lines.margin')}</th>}
-                  {showTax && <th className="px-3 py-2 text-right font-medium">{t('invoiceDetail.lines.tax')}</th>}
-                  <th className="px-3 py-2 text-right font-medium">{t('invoiceDetail.lines.total')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {visibleLines.length === 0 ? (
-                  // Lines exist but every one is internal-only and the internal
-                  // view is off — say so instead of rendering a bare header.
-                  <tr>
-                    <td colSpan={4 + (showTax ? 1 : 0)} className="px-3 py-6 text-center text-sm text-muted-foreground" data-testid="invoice-detail-all-hidden">
-                      {t('invoiceDetail.lines.allHidden')}
-                    </td>
-                  </tr>
-                ) : (
-                visibleLines.map((l) => {
-                  const tax = showTax ? lineTaxAmount(l.lineTotal, l.taxable, invoice.taxRate) : null;
-                  const workedVsBilledNote = lineWorkedVsBilledNote(l, t);
-                  return (
-                  <tr
-                    key={l.id}
-                    data-testid={`invoice-detail-line-${l.id}`}
-                    className={`border-t ${l.parentLineId ? 'bg-muted/20 text-xs text-muted-foreground' : ''}`}
-                  >
-                    <td className={`px-3 py-2 ${l.parentLineId ? 'pl-8' : ''}`}>
-                      {/* sweep F9: Preview/PDF/portal already show the frozen
-                          `ticketLabel` (#6940) via this same `ticketNumber`
-                          API field — the default view was the one surface
-                          still silent about it. */}
-                      {l.ticketNumber && (
-                        <div className="mb-1 text-xs">
-                          <span
-                            data-testid={`invoice-detail-line-ticket-${l.id}`}
-                            className="inline-flex items-center rounded bg-primary/10 px-1.5 py-0.5 font-medium text-primary"
-                          >
-                            {t('invoiceDocument.ticketHeader', { number: l.ticketNumber })}
-                          </span>
-                        </div>
-                      )}
-                      <span className={l.parentLineId ? '' : 'font-medium text-foreground'}>
-                        {l.parentLineId ? <span aria-hidden="true">↳ </span> : ''}{lineTitle(l)}
+            ) : undefined}
+            rows={visibleLines}
+            keyFor={(l) => l.id}
+            rowTestId={(l) => `invoice-detail-line-${l.id}`}
+            tableTestId="invoice-detail-lines"
+            scrollAriaLabel={t('invoiceDetail.linesScrollAria')}
+            descriptionHeader={t('invoiceDetail.lines.description')}
+            // Lines exist but every one is internal-only and the internal view
+            // is off — say so instead of rendering a bare header.
+            emptyMessage={t('invoiceDetail.lines.allHidden')}
+            emptyTestId="invoice-detail-all-hidden"
+            rowClassName={(l) => (l.parentLineId ? 'bg-muted/20 text-xs text-muted-foreground' : '')}
+            descriptionCellClassName={(l) => (l.parentLineId ? 'pl-8' : '')}
+            renderDescription={(l) => {
+              const workedVsBilledNote = lineWorkedVsBilledNote(l, t);
+              return (
+                <>
+                  {/* sweep F9: Preview/PDF/portal already show the frozen
+                      `ticketLabel` (#6940) via this same `ticketNumber`
+                      API field — the default view was the one surface
+                      still silent about it. */}
+                  {l.ticketNumber && (
+                    <div className="mb-1 text-xs">
+                      <span
+                        data-testid={`invoice-detail-line-ticket-${l.id}`}
+                        className="inline-flex items-center rounded bg-primary/10 px-1.5 py-0.5 font-medium text-primary"
+                      >
+                        {t('invoiceDocument.ticketHeader', { number: l.ticketNumber })}
                       </span>
-                      {internalView && !l.customerVisible ? t('invoiceDetail.lines.hiddenMarker') : ''}
-                      {lineBlurb(l) && <div className="text-xs text-muted-foreground">{lineBlurb(l)}</div>}
-                      {workedVsBilledNote && (
-                        <div className="text-xs text-muted-foreground" data-testid={`invoice-detail-line-worked-vs-billed-${l.id}`}>
-                          {workedVsBilledNote}
-                        </div>
-                      )}
-                      <InvoiceLineDevices invoiceId={invoice.id} line={l} />
-                    </td>
-                    <td className="px-3 py-2 text-right">{l.quantity}</td>
-                    <td className="px-3 py-2 text-right">{formatMoney(l.unitPrice, currency)}</td>
-                    {internalView && <td className="px-3 py-2 text-right">{l.costBasis == null ? '—' : formatMoney(l.costBasis, currency)}</td>}
-                    {internalView && <td className="px-3 py-2 text-right">{lineMargin(l)}</td>}
-                    {showTax && <td className="px-3 py-2 text-right text-muted-foreground">{tax === null ? '—' : formatMoney(tax, currency)}</td>}
-                    <td className="px-3 py-2 text-right">{formatMoney(l.lineTotal, currency)}</td>
-                  </tr>
-                  );
-                })
-                )}
-              </tbody>
-            </table>
-            </div>
-          </div>
+                    </div>
+                  )}
+                  <span className={l.parentLineId ? '' : 'font-medium text-foreground'}>
+                    {l.parentLineId ? <span aria-hidden="true">↳ </span> : ''}{lineTitle(l)}
+                  </span>
+                  {internalView && !l.customerVisible ? t('invoiceDetail.lines.hiddenMarker') : ''}
+                  {lineBlurb(l) && <div className="text-xs text-muted-foreground">{lineBlurb(l)}</div>}
+                  {workedVsBilledNote && (
+                    <div className="text-xs text-muted-foreground" data-testid={`invoice-detail-line-worked-vs-billed-${l.id}`}>
+                      {workedVsBilledNote}
+                    </div>
+                  )}
+                  <InvoiceLineDevices invoiceId={invoice.id} line={l} />
+                </>
+              );
+            }}
+            columns={[
+              { key: 'qty', header: t('invoiceDetail.lines.qty'), align: 'right' as const, cell: (l: InvoiceLine) => l.quantity },
+              { key: 'price', header: t('invoiceDetail.lines.price'), align: 'right' as const, cell: (l: InvoiceLine) => formatMoney(l.unitPrice, currency) },
+              ...(internalView ? [
+                { key: 'cost', header: t('invoiceDetail.lines.cost'), align: 'right' as const, cell: (l: InvoiceLine) => (l.costBasis == null ? '—' : formatMoney(l.costBasis, currency)) },
+                { key: 'margin', header: t('invoiceDetail.lines.margin'), align: 'right' as const, cell: (l: InvoiceLine) => lineMargin(l) },
+              ] : []),
+              ...(showTax ? [
+                {
+                  key: 'tax',
+                  header: t('invoiceDetail.lines.tax'),
+                  align: 'right' as const,
+                  cellClassName: 'text-muted-foreground',
+                  cell: (l: InvoiceLine) => {
+                    const tax = lineTaxAmount(l.lineTotal, l.taxable, invoice.taxRate);
+                    return tax === null ? '—' : formatMoney(tax, currency);
+                  },
+                },
+              ] : []),
+              { key: 'total', header: t('invoiceDetail.lines.total'), align: 'right' as const, cell: (l: InvoiceLine) => formatMoney(l.lineTotal, currency) },
+            ]}
+          />
           )}
         </div>
 
@@ -531,13 +562,22 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
             </dl>
             {/* Balance-due focal number */}
             <div className="mt-3 flex min-w-0 items-end justify-between gap-2 border-t pt-3">
-              <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">{t('invoiceDetail.summary.balanceDue')}</span>
-              <span
-                className={`break-words text-2xl font-semibold tabular-nums ${Number(invoice.balance) > 0 && invoice.status !== 'void' ? '' : 'text-muted-foreground'}`}
-                data-testid="invoice-detail-balance"
-              >
-                {formatMoney(invoice.balance, currency)}
-              </span>
+              {invoice.status === 'void' ? (
+                // A void invoice owes nothing — show the state, not a stale balance.
+                <span className="text-2xl font-semibold uppercase tracking-wide text-muted-foreground" data-testid="invoice-detail-void-state">
+                  {invoiceStatusLabel}
+                </span>
+              ) : (
+                <>
+                  <span className="shrink-0 text-xs font-medium uppercase tracking-wide text-muted-foreground">{t('invoiceDetail.summary.balanceDue')}</span>
+                  <span
+                    className={`break-words text-2xl font-semibold tabular-nums ${Number(invoice.balance) > 0 ? '' : 'text-muted-foreground'}`}
+                    data-testid="invoice-detail-balance"
+                  >
+                    {formatMoney(invoice.balance, currency)}
+                  </span>
+                </>
+              )}
             </div>
             {/* Deposit strip — mirrors the customer portal so the operator sees the
                 same deposit-first framing the customer's Pay button uses. */}
@@ -582,16 +622,17 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
             </div>
           )}
 
-          {/* QuickBooks push status (Phase C). Renders only when the API
-              returned a mapping row — no connection, or an org-scoped read that
-              RLS-hides the partner-axis row, both come back null and the card
-              stays off the rail rather than implying "not synced". */}
+          {/* Accounting push status (Phase C). Always mounted: with no mapping
+              row it renders nothing, but its post-Issue watch still polls until
+              the auto-push lands the row. `provider` null (no push-capable
+              connection known to this caller) hides only the push action. */}
           <AccountingSyncCard
+            provider={syncProvider}
             invoiceId={invoice.id}
             sync={detail.accountingSync}
             invoiceStatus={invoice.status}
             invoiceTouchedAt={invoice.updatedAt}
-            canPush={can('invoices', 'write')}
+            canPush={canPushInvoices}
             onChanged={onChanged}
           />
 
@@ -669,12 +710,12 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                           {t('invoiceDetail.payments.online')}
                         </span>
                       )}
-                      {p.source === 'quickbooks' && (
+                      {p.source && isAccountingProviderId(p.source) && (
                         <span
                           className="rounded border border-border bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground"
-                          data-testid={`invoice-payment-quickbooks-${p.id}`}
+                          data-testid={`invoice-payment-${p.source}-${p.id}`}
                         >
-                          {t('invoiceDetail.payments.quickbooks')}
+                          {ACCOUNTING_PROVIDER_NAMES[p.source]}
                         </span>
                       )}
                       {p.accountingSync && (
@@ -688,10 +729,10 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                           title={p.accountingSync.lastError ?? undefined}
                         >
                           {p.accountingSync.status === 'error'
-                            ? t('invoiceDetail.payments.quickbooksSyncFailed')
+                            ? t('invoiceDetail.payments.providerSyncFailed', { provider: paymentBadgeProvider(p) })
                             : p.accountingSync.status === 'pending'
-                              ? t('invoiceDetail.payments.syncingToQuickbooks')
-                              : t('invoiceDetail.payments.inQuickbooks')}
+                              ? t('invoiceDetail.payments.syncingToProvider', { provider: paymentBadgeProvider(p) })
+                              : t('invoiceDetail.payments.inProvider', { provider: paymentBadgeProvider(p) })}
                         </span>
                       )}
                     </span>
@@ -778,8 +819,13 @@ export default function InvoiceDetail({ detail, onChanged, actionsInHeader = fal
                     className="h-9 rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
                   />
                 </div>
+                {payOverBalance && (
+                  <p role="alert" className="text-xs text-destructive" data-testid="invoice-payment-overpayment">
+                    {t('invoiceDetail.payments.overpayment', { balance: formatMoney(invoice.balance, currency) })}
+                  </p>
+                )}
                 <button
-                  type="button" onClick={() => setPayConfirmOpen(true)} disabled={busy || !payAmount}
+                  type="button" onClick={() => setPayConfirmOpen(true)} disabled={busy || !payAmount || payOverBalance}
                   title={!payAmount ? t('invoiceDetail.payments.amountRequired') : undefined}
                   aria-describedby={!payAmount ? 'invoice-payment-submit-hint' : undefined}
                   data-testid="invoice-payment-submit"

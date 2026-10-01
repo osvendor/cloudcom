@@ -13,8 +13,8 @@
  * - get_script_execution_history (Tier 1): Get past execution results for a script
  * - get_script_execution (Tier 1): Get a single execution by ID (status + output)
  * - search_script_library (Tier 1): Search scripts and templates together
- * - manage_processes (Tier 1): List or kill running processes on a device
- * - manage_scheduled_tasks (Tier 1): List/run/enable/disable/delete scheduled tasks
+ * - manage_processes (Tier 2 list, Tier 3 kill): List or kill running processes on a device
+ * - manage_scheduled_tasks (Tier 2 list, Tier 3 run/enable/disable): List, run, enable or disable scheduled tasks
  * - registry_operations (Tier 1): Read or modify Windows registry keys/values
  */
 
@@ -30,13 +30,14 @@ import {
   executionStatusEnum,
 } from '../db/schema';
 import { eq, and, desc, sql, ilike, inArray, isNull, or, SQL } from 'drizzle-orm';
-import type { AuthContext } from '../middleware/auth';
+import { isAiAgentPrincipal, type AuthContext } from '../middleware/auth';
 import { escapeLike } from '../utils/sql';
 import type { AiTool } from './aiTools';
 // Type-only: the runtime import stays dynamic inside the handler.
 import type { CancelOutcome } from './scriptCancellation';
 import type { ToolExecutionContext, VerifiedRunScript } from './toolExecutionContext';
 import { aiDispatchScriptToDevice, aiExecuteCommand } from './aiDispatch';
+import { deliverDeferredDispatch } from './scriptDeferredDelivery';
 import { approvalMethodForRelease, assertProposalRunnable, proposalDispatchSnapshot, transitionProposal } from './scriptProposals';
 import { aiScriptAuthoringEnabled } from '../config/env';
 import { executeScriptSchema, AI_RUN_CONTEXT_JSON_SCHEMA_PROPERTIES } from './scriptRunRequest';
@@ -46,6 +47,8 @@ import { scriptNeedsVariableScope } from './sourcedParameters';
 import { deviceScopeCondition, siteScopeCondition } from './aiToolsSiteScope';
 import { shrinkToJsonBudget } from './aiToolOutput';
 import { sha256Content } from './scriptVersions';
+import { isDeniedRegistryTarget } from '../routes/systemTools/sensitiveTargets';
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 
 // Fix 4b: headroom under MAX_TOOL_RESULT_CHARS (8000) for the rest of the
 // get_script_execution envelope once stdout/stderr are counted at their
@@ -103,7 +106,7 @@ async function verifyDeviceAccess(
   if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
     return { error: 'Device not found or access denied' };
   }
-  const conditions: SQL[] = [eq(devices.id, deviceId)];
+  const conditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
   const orgCond = auth.orgCondition(devices.orgId);
   if (orgCond) conditions.push(orgCond);
   const [device] = await db.select().from(devices).where(and(...conditions)).limit(1);
@@ -295,7 +298,7 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
       const access = await verifyDeviceAccess(deviceId, auth, true);
       if ('error' in access) { proposalResults[deviceId] = { error: access.error }; continue; }
       try {
-        const dispatch = await runOutsideDbContext(() => withSystemDbAccessContext(() =>
+        const created = await runOutsideDbContext(() => withSystemDbAccessContext(() =>
           aiDispatchScriptToDevice(auth, 'run_script', {
             device: access.device,
             source: { kind: 'proposal', proposal: runnable.proposal, snapshot },
@@ -310,7 +313,10 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
               approvalMethod,
               reviewRiskTier: runnable.proposal.riskTier,
             },
+            // #7103 — the send waits for the system context above to commit.
+            deferDelivery: true,
           })));
+        const dispatch = await deliverDeferredDispatch(created, { deviceId, tool: 'run_script' });
         if (!dispatch.ok) { proposalResults[deviceId] = { error: dispatch.error }; continue; }
         if (!markedExecuted) {
           // W03 (#5612): the proposal has now produced a real execution.
@@ -346,6 +352,20 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
   const { waitForCommandResult } = await getCommandQueue();
   const deviceIds = input.deviceIds as string[];
   const results: Record<string, unknown> = {};
+
+  // run_script is Tier 3 and always requires approval
+  // (`requiresApproval: true`, see the module docstring) — the ONLY way an
+  // `ai_agent` principal ever reaches this branch (no `proposalId`, so not
+  // the reviewed-proposal path above) is act mode's manifest-matched
+  // unattended dispatch (`aiGuardrails.ts`'s `disposition: 'act'`): every
+  // other Tier-3 outcome for this principal either denies, or records a
+  // proposal that a human reviews before execution. The manifest
+  // (`actManifest.ts`) pins only `{scriptId, deviceIds}` — it never carries
+  // `runAs` or `targetSessionId`, so a model-chosen value for either here
+  // has no human review and no revalidation behind it at all. Ignore both
+  // for this principal; dispatch falls back to the SAVED script's own
+  // `runAs` (its `targetSessionId`, unset, already defaults to none).
+  const isUnattendedAgentDispatch = isAiAgentPrincipal(auth);
 
   // #4888 — an assistant-chosen run context clears the SAME gate a human
   // one does. Not a copy of the rules, the actual object the HTTP route
@@ -519,7 +539,7 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
       // would reproduce the 0-row trap this escape exists to avoid). One
       // device per iteration here (max 10, capped above), so one org per
       // preload — there is no wider fan-out to batch it against.
-      const dispatch = await runOutsideDbContext(() =>
+      const created = await runOutsideDbContext(() =>
         withSystemDbAccessContext(async () => {
           // #3409 PR3 P1: gated on `scriptNeedsVariableScope`, not
           // content tokens alone — a `tenantVariable`-bound parameter
@@ -546,18 +566,24 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
             createdBy: auth.user.id,
             // #4888 — undefined when the assistant did not choose one, in
             // which case dispatch falls back to `script.runAs` exactly as
-            // it always did.
-            runAs: runContext.data.runAs,
-            targetSessionId: runContext.data.targetSessionId,
+            // it always did. Undefined UNCONDITIONALLY for an unattended
+            // act-mode dispatch — see the comment above.
+            runAs: isUnattendedAgentDispatch ? undefined : runContext.data.runAs,
+            targetSessionId: isUnattendedAgentDispatch ? undefined : runContext.data.targetSessionId,
             // #5128 W4 — the AI run_script tool answers synchronously and
             // has no way to surface a later result, so it keeps the hard
             // offline rejection the `requireOnline` alias used to give it.
             // W5 softens the error TEXT, not the behaviour.
             offlinePolicy: { kind: 'reject' },
             variableScope,
+            // #7103 — Phase 1 only CREATES the rows. The send happens below,
+            // after this system context has committed, so the agent's result
+            // can never race an invisible device_commands row.
+            deferDelivery: true,
           });
         })
       );
+      const dispatch = await deliverDeferredDispatch(created, { deviceId, tool: 'run_script' });
       if (!dispatch.ok) {
         if (dispatch.code === 'maintenance_suppressed') {
           // #4919 — NOT an error. A maintenance window is the operator's
@@ -626,10 +652,11 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
     tier: 3,
     domain: 'scripts',
     searchHint: 'device system commands, process and service control, files and event log diagnostics',
+    alwaysLoad: true,
     deviceArgs: ['deviceId'],
     definition: {
       name: 'execute_command',
-      description: "Execute a system command on a device. list_processes, file_list, event_logs_list skip durable approval in auto-execute modes (audit logged); per-step mode requires inline confirmation. All other command types, including file_read, require full user approval.",
+      description: "Execute a system command on a device. list_processes/file_list/event_logs_list skip approval in auto-execute (audited); per-step needs inline confirm. Others, incl. file_read, need full approval. list_processes cpuPercent is per-core (100%=1 core).",
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -644,7 +671,13 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
             ],
             description: 'The type of command to execute'
           },
-          payload: { type: 'object', description: 'Command-specific parameters: serviceName (name alias) for service control; processName/pid for kill_process; path for file_read/file_list.' }
+          payload: {
+            type: 'object',
+            description: 'Command-specific parameters — see level/logName for event_logs_query, name for service control, pid (required) for kill_process, path for file ops.',
+            properties: {
+              level: { type: ['string', 'number'], description: 'event_logs_query: severity — critical, error, warning, information (or "info"), verbose, or level number 1-5.' },
+            },
+          }
         },
         required: ['deviceId', 'commandType']
       }
@@ -698,12 +731,12 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceIds'],
     definition: {
       name: 'run_script',
-      description: "Run a saved scriptId or reviewed proposalId from propose_script on devices; never both. Maintenance-window suppression is deferred, not failure: report it and do not retry now. Approval is required; the approver sees the run context.",
+      description: "Run a saved scriptId or reviewed proposalId from propose_script on devices; never both. A pending proposalId is refused with proposal_review_pending — poll get_script_proposal until it finishes, then retry. Maintenance-window suppression is deferred, not failure. Approval is required.",
       input_schema: {
         type: 'object' as const,
         properties: {
           scriptId: { type: 'string', description: 'UUID of an existing library script to run' },
-          proposalId: { type: 'string', description: 'UUID of a reviewed AI-authored proposal to run. Mutually exclusive with scriptId; takes no parameters.' },
+          proposalId: { type: 'string', description: 'UUID of a REVIEWED AI-authored proposal from propose_script; mutually exclusive with scriptId. If pending, poll get_script_proposal until done, then retry.' },
           deviceIds: { type: 'array', items: { type: 'string' }, description: 'Device UUIDs to run on' },
           parameters: { type: 'object', description: 'Script parameters (library scripts only)' },
           expectedContentSha256: { type: 'string', description: 'Optional: contentSha256 from get_script_details. If the script changed, nothing runs and it returns error script_content_mismatch.' },
@@ -857,7 +890,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
   });
 
   // ============================================
-  // manage_processes - Tier 1 (list), Tier 3 via guardrails (kill)
+  // manage_processes - Tier 2 read-only via guardrails (list), Tier 3 (kill)
   // ============================================
 
   registerTool({
@@ -938,6 +971,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
     tier: 1,
     domain: 'scripts',
     searchHint: 'organization script library, names, descriptions, languages, OS targets and categories',
+    alwaysLoad: true,
     definition: {
       name: 'list_scripts',
       description: 'Search and filter scripts in the organization library. Returns a list of matching scripts including name, description, language, OS targets, and category.',
@@ -1648,6 +1682,16 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
       // tool's keyPath into hive + path so the payload matches what the agent
       // actually parses.
       const { hive, path } = splitRegistryKeyPath(input.keyPath as string);
+
+      // Deny SAM/SECURITY (and any LSA-secrets subkey under SECURITY)
+      // outright, regardless of the caller's permission — this tool
+      // does not go through routes/systemTools/registry.ts (it calls
+      // aiExecuteCommand directly), so it must carry its own copy of the
+      // same check the REST registry routes apply.
+      if (isDeniedRegistryTarget(hive, path)) {
+        return JSON.stringify({ error: 'Access to this registry path is not permitted' });
+      }
+
       const payload: Record<string, unknown> = { hive, path };
 
       if (input.valueName) payload.name = input.valueName;

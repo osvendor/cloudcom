@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+// The holding-org refusal reads the org; the positional db mocks below do not model it.
+vi.mock('../../services/unassignedPool/protectedOrg', () => ({ isHoldingOrg: vi.fn(async () => false) }));
+
 const PARTNER_ID = '11111111-1111-1111-1111-111111111111';
 const ORG_ID = '22222222-2222-2222-2222-222222222222';
 const SITE_ID = '33333333-3333-3333-3333-333333333333';
@@ -119,10 +122,19 @@ vi.mock('../../jobs/unifiWorker', () => ({
   enqueueUnifiSync: vi.fn(async () => undefined),
 }));
 
+vi.mock('../../services/topology/unifiAuthority', () => ({
+  snapshotUnifiMappings: vi.fn(async () => [{ id: 'before-mapping' }]),
+  revokeUnifiMappingDrift: vi.fn(async () => 0),
+  snapshotUnifiCollectors: vi.fn(async () => [{ id: 'before-collector' }]),
+  revokeUnifiCollectorDrift: vi.fn(async () => 0),
+}));
+
 import { unifiRoutes } from './index';
 import * as svc from '../../services/unifi/unifiConnectionService';
 import * as collectorSvc from '../../services/unifi/unifiCollectorService';
 import { db, runOutsideDbContext } from '../../db';
+import * as topologyAuthority from '../../services/topology/unifiAuthority';
+import { isHoldingOrg } from '../../services/unassignedPool/protectedOrg';
 
 describe('unifi routes', () => {
   beforeEach(() => {
@@ -228,6 +240,17 @@ describe('unifi routes', () => {
     await expect(res.json()).resolves.toMatchObject({ success: true });
   });
 
+  it('POST /disconnect revokes UniFi topology of every collector the integration held', async () => {
+    vi.mocked(svc.getConnection).mockResolvedValue({ id: CONN_ID } as any);
+    vi.mocked(svc.deleteConnection).mockResolvedValue(true);
+    const res = await unifiRoutes.request('/disconnect', { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(topologyAuthority.snapshotUnifiCollectors).toHaveBeenCalledWith(CONN_ID);
+    expect(topologyAuthority.revokeUnifiCollectorDrift).toHaveBeenCalledWith(CONN_ID, [{ id: 'before-collector' }]);
+    expect(vi.mocked(topologyAuthority.snapshotUnifiCollectors).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(svc.deleteConnection).mock.invocationCallOrder[0]!);
+    expect(vi.mocked(topologyAuthority.revokeUnifiCollectorDrift).mock.invocationCallOrder[0]).toBeGreaterThan(vi.mocked(svc.deleteConnection).mock.invocationCallOrder[0]!);
+  });
+
   it('POST /disconnect is idempotent: success:true even when nothing was active', async () => {
     // Already-disconnected is the desired end state — must not surface as a failure
     // (runAction would toast it). The route reports success regardless of row count.
@@ -314,6 +337,45 @@ describe('unifi routes', () => {
     await expect(res.json()).resolves.toMatchObject({ success: false, message: 'Not connected' });
   });
 
+  it("PUT /mappings refuses a site of another partner's org, even when org reach allows it", async () => {
+    vi.mocked(svc.getConnection).mockResolvedValue({
+      id: CONN_ID, partnerId: PARTNER_ID, connectionType: 'cloud', baseUrl: 'https://api.ui.com', accountLabel: null,
+      isActive: true, status: 'connected', lastSyncAt: null, lastSyncStatus: null, lastSyncError: null,
+    });
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn(() => ({ where: vi.fn(() => ({ limit: vi.fn(async () => [{ id: SITE_ID, orgId: ORG_ID, partnerId: 'ffffffff-ffff-4fff-8fff-ffffffffffff' }]) })) })),
+    } as any);
+
+    const res = await unifiRoutes.request('/mappings', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mappings: [{ unifiHostId: 'host-1', unifiSiteId: 'site-1', siteId: SITE_ID }] }),
+    });
+    expect(res.status).toBe(403);
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('PUT /mappings refuses a site of a holding org before writing anything', async () => {
+    vi.mocked(svc.getConnection).mockResolvedValue({
+      id: CONN_ID, partnerId: PARTNER_ID, connectionType: 'cloud', baseUrl: 'https://api.ui.com', accountLabel: null,
+      isActive: true, status: 'connected', lastSyncAt: null, lastSyncStatus: null, lastSyncError: null,
+    });
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn(() => ({ where: vi.fn(() => ({ limit: vi.fn(async () => [{ id: SITE_ID, orgId: ORG_ID, partnerId: PARTNER_ID }]) })) })),
+    } as any);
+    vi.mocked(isHoldingOrg).mockResolvedValueOnce(true);
+
+    const res = await unifiRoutes.request('/mappings', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mappings: [{ unifiHostId: 'host-1', unifiSiteId: 'site-1', siteId: SITE_ID }] }),
+    });
+    expect(res.status).toBe(409);
+    await expect(res.json()).resolves.toMatchObject({ success: false, code: 'ORG_PROTECTED' });
+    expect(isHoldingOrg).toHaveBeenCalledWith(ORG_ID);
+    expect(db.insert).not.toHaveBeenCalled();
+  });
+
   it('PUT /mappings derives orgId from Breeze site and upserts', async () => {
     vi.mocked(svc.getConnection).mockResolvedValue({
       id: CONN_ID,
@@ -331,7 +393,7 @@ describe('unifi routes', () => {
     vi.mocked(db.select).mockReturnValueOnce({
       from: vi.fn(() => ({
         where: vi.fn(() => ({
-          limit: vi.fn(async () => [{ id: SITE_ID, orgId: ORG_ID }]),
+          limit: vi.fn(async () => [{ id: SITE_ID, orgId: ORG_ID, partnerId: PARTNER_ID }]),
         })),
       })),
     } as any);
@@ -387,7 +449,7 @@ describe('unifi routes', () => {
     // Site lookup for the single submitted mapping.
     vi.mocked(db.select).mockReturnValueOnce({
       from: vi.fn(() => ({
-        where: vi.fn(() => ({ limit: vi.fn(async () => [{ id: SITE_ID, orgId: ORG_ID }]) })),
+        where: vi.fn(() => ({ limit: vi.fn(async () => [{ id: SITE_ID, orgId: ORG_ID, partnerId: PARTNER_ID }]) })),
       })),
     } as any);
     vi.mocked(db.insert).mockReturnValueOnce({
@@ -417,6 +479,10 @@ describe('unifi routes', () => {
     expect(res.status).toBe(200);
     expect(db.delete).toHaveBeenCalledTimes(1);
     expect(deleteWhere).toHaveBeenCalledTimes(1);
+    // Remap/delete revokes the UniFi topology sources the old rows authorized.
+    expect(topologyAuthority.snapshotUnifiMappings).toHaveBeenCalledWith(CONN_ID);
+    expect(topologyAuthority.revokeUnifiMappingDrift).toHaveBeenCalledWith(CONN_ID, [{ id: 'before-mapping' }]);
+    expect(vi.mocked(topologyAuthority.revokeUnifiMappingDrift).mock.invocationCallOrder[0]).toBeGreaterThan(deleteWhere.mock.invocationCallOrder[0]!);
   });
 
   it('PUT /mappings does NOT delete mappings for hosts absent from hostIds (transient-host guard)', async () => {
@@ -434,7 +500,7 @@ describe('unifi routes', () => {
     });
     vi.mocked(db.select).mockReturnValueOnce({
       from: vi.fn(() => ({
-        where: vi.fn(() => ({ limit: vi.fn(async () => [{ id: SITE_ID, orgId: ORG_ID }]) })),
+        where: vi.fn(() => ({ limit: vi.fn(async () => [{ id: SITE_ID, orgId: ORG_ID, partnerId: PARTNER_ID }]) })),
       })),
     } as any);
     vi.mocked(db.insert).mockReturnValueOnce({
@@ -480,7 +546,7 @@ describe('unifi routes', () => {
     });
     vi.mocked(db.select).mockReturnValueOnce({
       from: vi.fn(() => ({
-        where: vi.fn(() => ({ limit: vi.fn(async () => [{ id: SITE_ID, orgId: ORG_ID }]) })),
+        where: vi.fn(() => ({ limit: vi.fn(async () => [{ id: SITE_ID, orgId: ORG_ID, partnerId: PARTNER_ID }]) })),
       })),
     } as any);
     vi.mocked(db.insert).mockReturnValueOnce({
@@ -715,7 +781,7 @@ describe('unifi routes', () => {
     vi.mocked(db.select).mockReturnValueOnce({
       from: vi.fn(() => ({
         where: vi.fn(() => ({
-          limit: vi.fn(async () => [{ id: SITE_ID, orgId: ORG_ID }]),
+          limit: vi.fn(async () => [{ id: SITE_ID, orgId: ORG_ID, partnerId: PARTNER_ID }]),
         })),
       })),
     } as any);
@@ -819,6 +885,18 @@ describe('unifi routes', () => {
     });
     expect(res.status).toBe(200);
     expect(collectorSvc.upsertCollector).toHaveBeenCalled();
+    // A collector reassignment revokes its old topology sources.
+    expect(topologyAuthority.revokeUnifiCollectorDrift).toHaveBeenCalledWith(CONN_ID, [{ id: 'before-collector' }]);
+    expect(vi.mocked(topologyAuthority.revokeUnifiCollectorDrift).mock.invocationCallOrder[0]).toBeGreaterThan(vi.mocked(collectorSvc.upsertCollector).mock.invocationCallOrder[0]!);
+  });
+
+  it('DELETE /collectors/:hostId revokes the deleted collector\'s topology sources', async () => {
+    vi.mocked(svc.getConnection).mockResolvedValue({ id: CONN_ID } as any);
+    vi.mocked(collectorSvc.deleteCollector).mockResolvedValue(true);
+    const res = await unifiRoutes.request('/collectors/host-1', { method: 'DELETE' });
+    expect(res.status).toBe(200);
+    expect(topologyAuthority.revokeUnifiCollectorDrift).toHaveBeenCalledWith(CONN_ID, [{ id: 'before-collector' }]);
+    expect(vi.mocked(topologyAuthority.revokeUnifiCollectorDrift).mock.invocationCallOrder[0]).toBeGreaterThan(vi.mocked(collectorSvc.deleteCollector).mock.invocationCallOrder[0]!);
   });
 
   it('PUT /collectors returns 403 when canAccessOrg is false', async () => {

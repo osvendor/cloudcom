@@ -36,6 +36,7 @@ import { isQuoteExpired } from './quoteExpiry';
 import { buildSellerSnapshot, buildBillToAddress } from './sellerSnapshot';
 import { resolveThemeId, resolvePageSize } from './documentThemes';
 import { resolvePartnerDocumentLocale } from './documentLocale';
+import { freezeDocumentFooter, resolveDocumentFooter } from './documentFooter';
 import { loadContractBlockRenderData, resolveAutoVariables, findUnresolvedVariables, loadContractPdfInputs, type ContractBlockRenderData } from './contractTemplateRender';
 import { portalBase } from './portalUrl';
 import { emitQuoteEvent } from './quoteEvents';
@@ -142,7 +143,8 @@ export interface QuoteSentSnapshot {
   presentationSnapshot: unknown;
   documentLocale: string;
   termsAndConditions: string | null;
-  terms: string | null;
+  /** Frozen footer line — never NULL; `''` = frozen "no footer" (#7216, freezeDocumentFooter). */
+  terms: string;
   partnerRow: typeof partners.$inferSelect | undefined;
   org: { name: string | null; billingContact: unknown; taxId: string | null } | undefined;
 }
@@ -231,7 +233,29 @@ export async function freezeQuoteSentSnapshot(
   // keeps a locale the draft already carries.
   const documentLocale = quote.documentLocale ?? resolvePartnerDocumentLocale(partnerRow);
   const termsAndConditions = quote.termsAndConditions ?? partnerRow?.billingTermsAndConditions ?? null;
-  const terms = quote.terms ?? partnerRow?.invoiceFooter ?? null;
+  // The footer line freezes through the SAME three-level chain every quote
+  // render uses (resolveDocumentFooter — admin preview/PDF via
+  // resolveQuoteBranding, portal PDF, the emailed attachment), so the stamped
+  // value is exactly what the live render showed at send. The portal-branding
+  // level was missing here (#6232): a sent quote with no partner footer
+  // stamped NULL and then followed later portal-footer edits instead of
+  // freezing. Read last, after the partner/org reads — a plain SELECT on a
+  // table this transaction takes no lock on.
+  //
+  // freezeDocumentFooter, not resolveDocumentFooter: with no footer at any
+  // level it stamps '' (frozen "none"), never NULL — NULL means "not frozen"
+  // to every render path, so a footer added after send would otherwise print
+  // on the already-sent quote (#7216).
+  const [brandRow] = await db
+    .select({ footerText: portalBranding.footerText })
+    .from(portalBranding)
+    .where(eq(portalBranding.orgId, quote.orgId))
+    .limit(1);
+  const terms = freezeDocumentFooter({
+    documentTerms: quote.terms,
+    partnerFooter: partnerRow?.invoiceFooter ?? null,
+    brandingFooter: brandRow?.footerText ?? null,
+  });
 
   return {
     quoteNumber, issueDate, billToName, billToAddress, billToTaxId,
@@ -629,6 +653,9 @@ export async function sendQuote(
     presentationSnapshot,
     // The just-stamped locale, so the same-request PDF + email render with it.
     documentLocale,
+    // The just-stamped footer line (#6232), so the emailed attachment prints
+    // the same frozen footer every later render of this sent quote reads.
+    terms: frozen.terms,
   };
 
   // A revision arrives in the same thread as the original, so the default
@@ -922,7 +949,15 @@ async function deliverQuoteEmail(
           const presentationSnap = frozenQuote.presentationSnapshot as { theme?: string; pageSize?: string } | null;
           const emailBranding = {
             partnerName: partnerName ?? 'Proposal', logoUrl: brand?.logoUrl ?? null, primaryColor: brand?.primaryColor ?? null,
-            footer: quote.terms ?? brand?.footerText ?? null, currencyCode: quote.currencyCode ?? 'USD',
+            // Same chain as every other quote render (#6232). frozenQuote, not
+            // the pre-freeze `quote`: on a first send only frozenQuote carries
+            // the just-stamped terms; on a resend they are the same value.
+            footer: resolveDocumentFooter({
+              documentTerms: frozenQuote.terms,
+              partnerFooter: partnerRow?.invoiceFooter ?? null,
+              brandingFooter: brand?.footerText ?? null,
+            }),
+            currencyCode: quote.currencyCode ?? 'USD',
             theme: resolveThemeId(presentationSnap?.theme ?? partnerRow?.documentTheme),
             pageSize: resolvePageSize(presentationSnap?.pageSize ?? partnerRow?.documentPageSize),
             // Send-time locale snapshot → partner language → 'en' (#3777).

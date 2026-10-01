@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { FLEET_DESIGN_PRECURSOR_THRESHOLDS } from '@breeze/shared';
 import { readFileSync } from 'node:fs';
+import { withHostTimeZone } from '../../testUtils/hostTimeZone';
 
 // ---------------------------------------------------------------------------
 // db + leaf-service mocks for the `loadDesignEvidence` suite at the bottom of
@@ -63,6 +64,7 @@ vi.mock('../securityPosture', () => ({
 // (written before W05) keeps seeing `approvedDesign`/`driftLive` resolve to
 // null without wiring up a `db.select` double it never needed.
 vi.mock('../fleetDesign/drift', () => ({
+  uuidArray: vi.fn((ids: string[]) => ids),
   loadApprovedDesign: vi.fn(async () => null),
   loadDriftLiveState: vi.fn(async () => ({ policies: [], assignments: [], groupMembers: {} })),
 }));
@@ -76,6 +78,7 @@ function sqlText(node: unknown): string {
   return '';
 }
 
+import { db } from '../../db';
 import { captureException } from '../sentry';
 import { loadApprovedDesign, loadDriftLiveState, type ApprovedDesignSummary, type DriftLiveState } from '../fleetDesign/drift';
 import {
@@ -223,6 +226,33 @@ describe('loadDesignEvidence (loader failure isolation)', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
+
+  it('excludes retired legacy watches and rules from configuration evidence', async () => {
+    rowsFor.push({ match: 'FROM configuration_policies cp', rows: [{ id: uuid(9), name: 'Policy', status: 'active', org_id: ORG, partner_id: null }] });
+    await loadDesignEvidence(ORG, { siteId: null });
+    const queries = vi.mocked(db.execute).mock.calls.map(([statement]) => sqlText(statement));
+    expect(queries.find((query) => query.includes('FROM config_policy_monitoring_watches w'))).toContain('w.retired_at IS NULL');
+    expect(queries.find((query) => query.includes('FROM config_policy_alert_rules r'))).toContain('r.retired_at IS NULL');
+  });
+
+  it.each(['America/Denver', 'Asia/Tokyo'] as const)(
+    'reads offsetless devices.last_seen_at text as UTC on a %s host',
+    async (zone) => {
+      await withHostTimeZone(zone, async () => {
+        rowsFor.push({
+          match: 'ORDER BY d.last_seen_at DESC NULLS LAST',
+          rows: [{
+            id: uuid(1), hostname: 'FS01', display_name: null, os_type: 'windows', os_version: '2022',
+            device_role: 'server', device_role_source: 'auto', last_seen_at: '2026-09-11 00:00:00.500',
+            status: 'online', site_name: 'HQ', group_names: [], tags: [], custom_fields: null,
+            pending_reboot: false, reliability_score: null,
+          }],
+        });
+        const evidence = await loadDesignEvidence(ORG, { siteId: null });
+        expect(evidence.devices[0]?.lastSeenAt).toBe('2026-09-11T00:00:00.500Z');
+      });
+    },
+  );
 
   it('a genuinely failing loader statement costs exactly its own section — never an invented zero', async () => {
     failOn = ['FROM software_inventory'];

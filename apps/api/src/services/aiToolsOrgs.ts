@@ -23,7 +23,7 @@ import { ensureDefaultProfile } from './billingProfileService';
  *    GET /orgs/organizations route uses (no settings/ssoConfig/billing leak).
  *  - `create_org` is a PARTNER-scope operation: an organization-scoped caller
  *    gets a clean PARTNER_SCOPE_REQUIRED error. The insert mirrors the
- *    POST /orgs/organizations route + quickbooksCustomerImport service:
+ *    POST /orgs/organizations route + accountingCustomerImport service:
  *    tenant creation must escape the request RLS context
  *    (runOutsideDbContext → withSystemDbAccessContext) because the new org id
  *    cannot be in the caller's accessible set yet. Like the QB customer import
@@ -58,6 +58,8 @@ import { ensureOrgAccess } from '../routes/systemTools/helpers';
 import { deviceScopeCondition, siteScopeCondition } from './aiToolsSiteScope';
 import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination';
 import { normalizeSiteAllowlist } from './siteAllowlist';
+import { resolveWritableToolOrgId } from './aiToolWriteOrg';
+import { notHoldingOrgCondition, notInHoldingOrgCondition } from './unassignedPool/selectorPredicate';
 
 // Mirrors the org PATCH route's status set (schema orgStatusEnum). Kept as a
 // literal array (not orgStatusEnum.enumValues) so schema mocks in tests don't
@@ -68,7 +70,7 @@ import { normalizeSiteAllowlist } from './siteAllowlist';
 const ORG_STATUSES = ['active', 'suspended', 'trial', 'churned'] as const;
 type OrgStatus = (typeof ORG_STATUSES)[number];
 
-// Local copy of the slug helpers from services/accounting/quickbooksCustomerImport.ts
+// Local copy of the slug helpers from services/accounting/accountingCustomerImport.ts
 // (duplicated rather than imported so this file doesn't drag the accounting
 // provider stack into every consumer; keep the two in sync).
 export function slugifyOrgName(name: string): string {
@@ -87,39 +89,6 @@ export function generateUniqueOrgSlug(base: string, taken: Set<string>): string 
     const candidate = `${base}-${n}`;
     if (!taken.has(candidate)) return candidate;
   }
-}
-
-// Local copy of the shared hub helper (same rules as resolveWritableToolOrgId
-// in services/aiTools.ts, duplicated like aiToolsBrowser/aiToolsCompliance do
-// so tests don't need to load the whole tool hub).
-function resolveWritableOrgId(
-  auth: AuthContext,
-  inputOrgId?: string
-): { orgId?: string; error?: string } {
-  if (auth.scope === 'organization') {
-    if (!auth.orgId) return { error: 'Organization context required' };
-    if (inputOrgId && inputOrgId !== auth.orgId) {
-      return { error: 'Cannot access another organization' };
-    }
-    return { orgId: auth.orgId };
-  }
-
-  if (inputOrgId) {
-    if (!auth.canAccessOrg(inputOrgId)) {
-      return { error: 'Access denied to this organization' };
-    }
-    return { orgId: inputOrgId };
-  }
-
-  if (auth.orgId) {
-    return { orgId: auth.orgId };
-  }
-
-  if (Array.isArray(auth.accessibleOrgIds) && auth.accessibleOrgIds.length === 1) {
-    return { orgId: auth.accessibleOrgIds[0] };
-  }
-
-  return { error: 'orgId is required for this operation' };
 }
 
 /**
@@ -200,7 +169,8 @@ async function handleListOrganizations(
   // by the scope conditions below and must be excluded explicitly. (The slug read
   // in handleCreateOrg deliberately does NOT exclude it — its slug must stay in
   // the taken-set.)
-  const conditions: SQL[] = [isNull(organizations.deletedAt), ne(organizations.type, 'quick_support')];
+  // The holding org for unassigned devices is never listed, whatever the scope.
+  const conditions: SQL[] = [isNull(organizations.deletedAt), ne(organizations.type, 'quick_support'), notHoldingOrgCondition()];
   if (searchCondition) conditions.push(searchCondition);
 
   if (auth.scope === 'organization') {
@@ -280,7 +250,7 @@ async function handleCreateOrg(
 
   // Tenant creation must escape the request RLS context: the new org id cannot
   // be in the caller's accessible set yet (same rationale + pattern as
-  // POST /orgs/organizations and quickbooksCustomerImport). Partner authority
+  // POST /orgs/organizations and accountingCustomerImport). Partner authority
   // was checked above. The slug read, org insert, and default-site insert share
   // one system-context transaction.
   const createOrgWithDefaultSite = () => runOutsideDbContext(() =>
@@ -461,7 +431,7 @@ async function handleCreateSite(
   input: Record<string, unknown>,
   auth: AuthContext
 ): Promise<string> {
-  const resolved = resolveWritableOrgId(
+  const resolved = resolveWritableToolOrgId(
     auth,
     typeof input.orgId === 'string' ? input.orgId : undefined
   );
@@ -508,7 +478,7 @@ async function handleAddContact(
 ): Promise<string> {
   // Same tenancy rule as create_site: org-scoped callers may only write their
   // OWN org; partner-scoped callers may target any org in their accessible set.
-  const resolved = resolveWritableOrgId(
+  const resolved = resolveWritableToolOrgId(
     auth,
     typeof input.orgId === 'string' ? input.orgId : undefined
   );
@@ -636,7 +606,7 @@ export function registerOrgTools(aiTools: Map<string, AiTool>): void {
         conditions.push(sql`NOT EXISTS (
     SELECT 1 FROM ${organizations} qs_org
     WHERE qs_org.id = ${sites.orgId} AND qs_org.type = 'quick_support'
-  )`, siteScopeCondition(auth, sites.id));
+  )`, notInHoldingOrgCondition(sites.orgId), siteScopeCondition(auth, sites.id));
         const search = typeof input.search === 'string' ? input.search.trim() : '';
         if (search) conditions.push(ilike(sites.name, `%${escapeLike(search)}%`));
         const whereCondition = and(...conditions);

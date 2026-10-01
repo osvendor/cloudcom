@@ -97,7 +97,8 @@
       "create": "Créer un moniteur",
       "test": "Tester sur un appareil",
       "deploy": "Déployer vers…",
-      "delete": "Supprimer"
+      "delete": "Supprimer",
+      "backToMonitors": "Retour aux moniteurs"
     },
     "errors": {
       "load": "Impossible de charger le moniteur",
@@ -154,12 +155,20 @@
     },
     "composite": {
       "children": "Conditions enfants",
-      "add": "Ajouter une condition"
+      "add": "Ajouter une condition",
+      "matchLabel": "Correspondance"
     },
     "restart": {
       "label": "Redémarrer le service sur l'appareil",
       "maxAttempts": "Nombre maximal de redémarrages",
       "cooldownSeconds": "Délai entre redémarrages (secondes)"
+    },
+    "networkCheckAsset": {
+      "label": "Actif",
+      "unbound": "Aucun actif lié",
+      "failed": "Impossible de charger les actifs",
+      "orgRequired": "Sélectionnez une organisation propriétaire pour lier un actif.",
+      "pingName": "Ping vers {{label}}"
     }
   },
   "kinds": {
@@ -182,7 +191,8 @@
     "backup_continuity": "Continuité des sauvegardes",
     "script": "Vérification de script",
     "network_check": "Vérification réseau",
-    "hardware_health": "État du matériel"
+    "hardware_health": "État du matériel",
+    "time_sync": "Synchronisation de l’heure"
   },
   "fields": {
     "operator": "Comparaison",
@@ -223,7 +233,18 @@
     "port": "Numéro de port",
     "expectStatus": "Code de statut attendu",
     "pollingIntervalSeconds": "Interroger toutes les (secondes)",
-    "match": "Correspondance"
+    "match": "Correspondance",
+    "pingCount": "Requêtes d’écho",
+    "expectBanner": "Bannière attendue",
+    "httpMethod": "Méthode HTTP",
+    "expectedBody": "La réponse doit contenir",
+    "followRedirects": "Suivre les redirections",
+    "verifySsl": "Vérifier le certificat TLS",
+    "recordType": "Type d’enregistrement",
+    "expectedValue": "Valeur attendue",
+    "nameserver": "Serveur de noms",
+    "degradedIsFailure": "Considérer « dégradé » comme un échec",
+    "maxResponseMs": "Échec au-delà de (ms)"
   },
   "operators": {
     "gt": "supérieur à",
@@ -279,7 +300,8 @@
   },
   "backupChecks": {
     "no_successful_backup": "Aucune sauvegarde réussie",
-    "consecutive_failures": "Défaillances consécutives"
+    "consecutive_failures": "Défaillances consécutives",
+    "completed_with_errors": "Terminée avec des erreurs de fichiers"
   },
   "checkTypes": {
     "icmp_ping": "Ping ICMP",
@@ -348,6 +370,7 @@
     "convert": "Convertir en moniteur",
     "converted": "Convertie",
     "notConvertible": "Les conditions de cette règle ne peuvent pas être exprimées comme un seul moniteur.",
+    "systemManaged": "Règle gérée par le système. Breeze déclenche cette alerte lui-même, il n'y a donc rien à convertir.",
     "errors": {
       "fetch": "Impossible de charger les règles d’alerte",
       "convert": "Impossible de convertir la règle"
@@ -420,9 +443,9 @@
       "review": "Examiner",
       "convertEverything": "Tout convertir…",
       "confirmTitle": "Convertir toutes les règles héritées, surveillances et automatisations déclenchées par alerte de toutes vos politiques ?",
-      "confirmBody": "{{rows}} dans {{policies}} de tout le partenaire. Les lignes converties sont retirées sur place. Les autres restent à examiner ou retirer manuellement en W05c ; W05d convertit les restantes et retire celles non convertibles.",
+      "confirmBody": "{{rows}} dans {{policies}} de tout le partenaire. Les lignes converties sont retirées sur place. Les autres restent maintenant à examiner ou retirer manuellement; une future version convertit les restantes et retire celles non convertibles.",
       "confirmRun": "Tout convertir",
-      "convertedAll": "{{converted}} lignes converties dans {{policies}} politiques ; {{unconvertible}} n'ont pas pu l'être.",
+      "convertedAll": "{{rows}} converties dans {{policies}} ; {{unconvertible}} n'ont pas pu l'être.",
       "errors": {
         "convertAll": "Échec de la conversion globale"
       }
@@ -493,7 +516,7 @@
       "empty": "Aucun historique de conversion.",
       "system": "Système",
       "reverted": "Annulée",
-      "deadline": "L'annulation est indisponible après la suppression du moteur source par W05d."
+      "deadline": "L'annulation est indisponible après la suppression du moteur source par le retrait des alertes héritées."
     },
     "errorCodes": {
       "preview_stale": "La politique a changé depuis cet aperçu. Générez un nouvel aperçu avant de convertir.",
@@ -509,6 +532,46 @@
       "conversion_revert_unavailable": "Cette conversion ne peut plus être annulée.",
       "invalid_reason": "Ce motif de retrait n'est pas valide.",
       "unknown": "La conversion a échoué. Réessayez."
+    },
+    "retirement": {
+      "summary_one": "{{count}} règle héritée n’a pas pu être convertie en moniteur — à vérifier.",
+      "summary_other": "{{count}} règles héritées n’ont pas pu être converties en moniteurs — à vérifier.",
+      "review": "Vérifier",
+      "dismiss": "Ignorer",
+      "openAlertsNote": "Ces règles ne se déclenchent plus. Leurs alertes ouvertes le restent jusqu’à ce que quelqu’un les résolve ; recréez la condition sous forme de moniteur si elle est encore nécessaire.",
+      "reasons": {
+        "custom_condition": "condition personnalisée",
+        "nested_group": "groupe de conditions imbriqué",
+        "no_condition": "aucune condition évaluable",
+        "equivalence_delta": "la conversion changerait ce qui se déclenche sur certains appareils",
+        "escalation_policy_axis": "la politique d’escalade appartient à une seule organisation",
+        "parent_unconverted": "la politique parente n’a pas été convertie",
+        "policy_inactive": "la politique est inactive ou archivée",
+        "prerequisite_missing": "un correctif préalable manque sur ce serveur",
+        "metric_without_kind": "aucun type de moniteur pour cette métrique",
+        "child_kind_not_composable": "condition incompatible avec un moniteur composite",
+        "too_many_conditions": "trop de conditions",
+        "too_many_responses": "plus de dix réponses seraient nécessaires",
+        "auto_resolve_conditions": "les conditions de résolution personnalisées ne peuvent pas être conservées",
+        "target_unconvertible": "la cible de la réponse ne peut pas être convertie",
+        "already_managed": "déjà gérée par un moniteur",
+        "no_org": "la vérification n’appartient à aucune organisation",
+        "asset_missing": "l’actif découvert associé n’existe plus",
+        "condition_invalid": "les paramètres de la vérification ne forment pas une condition de moniteur valide",
+        "no_active_rules": "la vérification n’a aucune règle d’alerte active",
+        "multiple_network_rules": "la vérification a plus d’une règle d’alerte active",
+        "network_predicate_unsupported": "la condition d’alerte n’a pas d’équivalent dans les moniteurs",
+        "network_threshold_out_of_range": "le seuil d’échec est hors limites (100 échecs consécutifs au maximum)",
+        "site_binding_unrepresentable": "la vérification liée à un site n’est associée à aucun actif découvert",
+        "config_override_unrepresentable": "la cible ou le délai personnalisé ne peut pas être conservé",
+        "built_in": "règle système intégrée ; elle continue d’alerter d’elle-même",
+        "no_rules": "le modèle n’a aucune règle à convertir",
+        "target_or_owner": "la cible ou le propriétaire d’une règle diffère de son modèle",
+        "blocked": "la conversion est bloquée",
+        "disabled_response_automation": "l’automatisation de réponse est désactivée",
+        "alert_workflow_kept": "le flux d’alerte est conservé tel quel",
+        "unknown": "conversion refusée ; vérifiez la source"
+      }
     }
   },
   "device": {
@@ -541,7 +604,41 @@
           "warning": "Avertissement",
           "critical": "Critique"
         }
+      },
+      "time_sync": {
+        "findings": "Constats",
+        "consecutiveSnapshots": "Instantanés consécutifs",
+        "findingOptions": {
+          "pdc_no_external_source": "Le PDC racine de la forêt n’a pas de source externe",
+          "source_local_clock": "Utilisation de l’horloge locale",
+          "dc_vm_host_sync": "Le contrôleur de domaine se synchronise avec l’hôte de la machine virtuelle",
+          "ntp_server_unresolvable": "Le nom du serveur NTP est invalide ou non résolu",
+          "ntp_peer_unreachable": "Le pair NTP est injoignable",
+          "domain_source_unavailable": "La source de temps du domaine est indisponible",
+          "member_not_on_hierarchy": "La hiérarchie du domaine n’est pas utilisée",
+          "sync_disabled": "La synchronisation de l’heure est désactivée",
+          "sync_stale": "Aucune synchronisation réussie récemment",
+          "correction_refused": "La correction de l’heure a été refusée",
+          "timezone_mismatch": "Le fuseau horaire diffère de celui attendu",
+          "policy_not_applied": "La stratégie horaire n’a pas été appliquée",
+          "policy_conflict_gpo": "Une stratégie de groupe contrôle les paramètres horaires"
+        }
       }
     }
+  },
+  "httpMethods": {
+    "GET": "GET (récupérer)",
+    "HEAD": "HEAD (en-têtes seulement)",
+    "POST": "POST (envoyer)",
+    "PUT": "PUT (remplacer)",
+    "OPTIONS": "OPTIONS (capacités)"
+  },
+  "dnsRecordTypes": {
+    "A": "A (adresse IPv4)",
+    "AAAA": "AAAA (adresse IPv6)",
+    "MX": "MX (serveur de messagerie)",
+    "CNAME": "CNAME (nom alternatif)",
+    "TXT": "TXT (texte)",
+    "NS": "NS (serveur de noms)"
   }
 }

@@ -2,12 +2,15 @@ package heartbeat
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/breeze-rmm/agent/internal/backupipc"
 )
 
 // backupVersionPrefix is the line prefix `breeze-backup --version` prints the
@@ -232,6 +235,9 @@ func (h *Heartbeat) invalidateBackupVersionCache() {
 	h.backupVersionOutcome = backupProbeOK
 	h.backupVersionProbeFailedAt = time.Time{}
 	h.backupVersionReadWarned = false
+	h.backupProtocolRead = false
+	h.backupProtocolValue = backupipc.ProtocolInfo{}
+	h.backupProtocolFailedAt = time.Time{}
 }
 
 // parseBackupVersion extracts the version from `breeze-backup --version`
@@ -245,4 +251,104 @@ func parseBackupVersion(out string) string {
 		}
 	}
 	return ""
+}
+
+// backupProtocols returns the storage protocol versions the INSTALLED
+// breeze-backup helper implements (brokered reads, snapshot integrity,
+// brokered writes), all from ONE `breeze-backup --protocol-info` probe. Every
+// value is 0 when the helper is not installed, cannot be probed, or predates
+// the flag; a helper that predates a single field reports 0 for it. Caching
+// mirrors installedBackupVersionOutcome: a stable answer (ok / not installed)
+// is kept until invalidateBackupVersionCache runs after a helper install; a
+// failed probe is retried after backupVersionProbeCooldown.
+func (h *Heartbeat) backupProtocols() backupipc.ProtocolInfo {
+	h.backupVersionMu.Lock()
+	if h.backupProtocolRead {
+		v := h.backupProtocolValue
+		h.backupVersionMu.Unlock()
+		return v
+	}
+	if !h.backupProtocolFailedAt.IsZero() && time.Since(h.backupProtocolFailedAt) < backupVersionProbeCooldown {
+		h.backupVersionMu.Unlock()
+		return backupipc.ProtocolInfo{}
+	}
+	h.backupVersionMu.Unlock()
+
+	read := h.backupProtocolReader
+	if read == nil {
+		read = h.readInstalledBackupProtocols
+	}
+	v, outcome := read()
+	v = nonNegativeProtocols(v)
+
+	h.backupVersionMu.Lock()
+	defer h.backupVersionMu.Unlock()
+	switch outcome {
+	case backupProbeOK, backupProbeNotInstalled:
+		h.backupProtocolValue = v
+		h.backupProtocolRead = true
+		h.backupProtocolFailedAt = time.Time{}
+	case backupProbeFailed:
+		h.backupProtocolValue = backupipc.ProtocolInfo{}
+		h.backupProtocolFailedAt = time.Now()
+		v = backupipc.ProtocolInfo{}
+	default: // unresolved: never cached
+		v = backupipc.ProtocolInfo{}
+	}
+	return v
+}
+
+// nonNegativeProtocols reads any negative version as 0.
+func nonNegativeProtocols(v backupipc.ProtocolInfo) backupipc.ProtocolInfo {
+	if v.BackupReadProtocolVersion < 0 {
+		v.BackupReadProtocolVersion = 0
+	}
+	if v.BackupIntegrityProtocolVersion < 0 {
+		v.BackupIntegrityProtocolVersion = 0
+	}
+	if v.BackupWriteProtocolVersion < 0 {
+		v.BackupWriteProtocolVersion = 0
+	}
+	return v
+}
+
+// readInstalledBackupProtocols execs the on-disk helper with
+// --protocol-info. A helper that predates the flag exits non-zero (unknown
+// flag) and is reported as backupProbeFailed, i.e. every version 0.
+func (h *Heartbeat) readInstalledBackupProtocols() (backupipc.ProtocolInfo, backupProbeOutcome) {
+	path, err := h.resolveBackupBinaryPath()
+	if err != nil {
+		return backupipc.ProtocolInfo{}, backupProbeUnresolved
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		return backupipc.ProtocolInfo{}, backupProbeNotInstalled
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), backupVersionReadTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "--"+backupipc.ProtocolInfoFlag).Output()
+	if err != nil {
+		log.Debug("backup helper did not report protocol info", "path", path, "error", err.Error())
+		return backupipc.ProtocolInfo{}, backupProbeFailed
+	}
+	v, ok := parseBackupProtocols(string(out))
+	if !ok {
+		log.Debug("backup helper protocol info unparseable", "path", path)
+		return backupipc.ProtocolInfo{}, backupProbeFailed
+	}
+	return v, backupProbeOK
+}
+
+// parseBackupProtocols decodes --protocol-info output. ok is false for
+// anything that is not a JSON object with integer versions, or whose read
+// version is negative (the field every helper with the flag reports). A
+// negative integrity or write version reads as 0; an absent one is 0.
+func parseBackupProtocols(out string) (backupipc.ProtocolInfo, bool) {
+	var info backupipc.ProtocolInfo
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &info); err != nil {
+		return backupipc.ProtocolInfo{}, false
+	}
+	if info.BackupReadProtocolVersion < 0 {
+		return backupipc.ProtocolInfo{}, false
+	}
+	return nonNegativeProtocols(info), true
 }

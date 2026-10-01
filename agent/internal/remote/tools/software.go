@@ -176,7 +176,11 @@ func uninstallSoftwareOS(name, version string, userExec UserUninstallExec) error
 	}
 }
 
-func uninstallSoftwareWindows(name, version string, userExec UserUninstallExec) error {
+func uninstallSoftwareWindows(name, version string, userExecutors ...UserUninstallExec) error {
+	var userExec UserUninstallExec
+	if len(userExecutors) > 0 {
+		userExec = userExecutors[0]
+	}
 	// Resolve winget once for all attempts: under the SYSTEM service the
 	// per-user "winget" PATH alias doesn't exist (see resolveWingetCommand).
 	wingetCmd := resolveWingetCommand()
@@ -220,33 +224,28 @@ func uninstallSoftwareWindows(name, version string, userExec UserUninstallExec) 
 			},
 		})
 	}
-	attempts = append(attempts, []uninstallAttempt{
-		{
-			command: wingetCmd,
-			args: []string{
-				"uninstall",
-				"--name", name,
-				"--silent",
-				"--accept-source-agreements",
-				"--disable-interactivity",
-			},
+	attempts = append(attempts, uninstallAttempt{
+		command: wingetCmd,
+		args: []string{
+			"uninstall", "--name", name,
+			"--silent", "--accept-source-agreements", "--disable-interactivity",
 		},
-		{
-			command: "wmic",
-			args: []string{
-				"product",
-				"where",
-				fmt.Sprintf("name='%s'", name),
-				"call",
-				"uninstall",
-				"/nointeractive",
-			},
-		},
-	}...)
+	})
 
-	if err := runUninstallAttempts(name, attempts); err != nil {
-		return err
+	if attemptsErr := runUninstallAttempts(name, attempts); attemptsErr != nil {
+		// Windows 11 no longer ships wmic. Use the upstream machine-wide
+		// registry fallback, with validated MSI GUIDs or trusted quiet commands.
+		if regErr := uninstallViaRegistryEntries(name, version); regErr != nil {
+			return fmt.Errorf("%w; registry fallback: %v", attemptsErr, regErr)
+		}
+		// Registry-key disappearance is independent removal evidence when the
+		// inventory collector cannot run; a positive inventory match still fails.
+		stillPresent, verifyErr := uninstallVerifyStillPresent(name)
+		if verifyErr == nil && stillPresent {
+			return fmt.Errorf("removed the machine-wide Uninstall entries for %q, but it is still present in this device's software inventory", name)
+		}
 	}
+
 	if msiAttempt != nil {
 		return verifyWindowsMSIExecutableRemoved(name, msiAttempt.installLocation)
 	}
@@ -271,7 +270,7 @@ func verifyWindowsMSIExecutableRemoved(name, installLocation string) error {
 	return nil
 }
 
-var msiProductCodePattern = regexp.MustCompile(`(?i)^/[xi]\s*(\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\})(?:\s|$)`)
+var inventoryMSIProductCodePattern = regexp.MustCompile(`(?i)^/[xi]\s*(\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\})(?:\s|$)`)
 
 // msiProductCode extracts a GUID only from a standard msiexec uninstall
 // registration. Arguments after the GUID are deliberately ignored.
@@ -300,7 +299,7 @@ func msiProductCode(uninstallString string) string {
 	if !strings.EqualFold(base, "msiexec.exe") && !strings.EqualFold(base, "msiexec") {
 		return ""
 	}
-	match := msiProductCodePattern.FindStringSubmatch(args)
+	match := inventoryMSIProductCodePattern.FindStringSubmatch(args)
 	if len(match) != 2 {
 		return ""
 	}

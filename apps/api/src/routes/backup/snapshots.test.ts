@@ -2,6 +2,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { snapshotsRoutes } from './snapshots';
 
+const attachNamesMock = vi.hoisted(() => vi.fn(async (_orgId: string, rows: unknown[]) => rows));
+vi.mock('./deviceNames', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./deviceNames')>()),
+  attachDeviceNames: (...args: [string, unknown[]]) => attachNamesMock(...args),
+}));
+
 const ORG_ID = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 const SNAPSHOT_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const SITE_A = '11111111-1111-4111-8111-111111111111';
@@ -76,6 +82,10 @@ vi.mock('../../db/schema', () => ({
     id: 'devices.id',
     orgId: 'devices.org_id',
     siteId: 'devices.site_id',
+  },
+  organizations: {
+    id: 'organizations.id',
+    status: 'organizations.status',
   },
 }));
 
@@ -231,6 +241,20 @@ describe('snapshot routes', () => {
     expect(res.status).toBe(200);
     expect((await res.json()).data).toHaveLength(2);
     expect(selectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns the device-name-enriched snapshot rows (#7213)', async () => {
+    attachNamesMock.mockImplementationOnce(async (_orgId, rows) =>
+      (rows as Array<{ deviceId: string }>).map((r) => ({ ...r, deviceName: 'FRONT-DESK-01' })));
+    selectMock.mockReturnValueOnce(chainMock([makeSnapshot({ deviceId: 'device-in' })]));
+
+    const res = await app.request('/backup/snapshots', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).data[0].deviceName).toBe('FRONT-DESK-01');
   });
 
   it('denies GET /snapshots/:id for a site-restricted caller when the source device is out-of-site', async () => {
@@ -428,6 +452,69 @@ describe('snapshot routes', () => {
     expect(body.data[0].layoutManifest).toBeUndefined();
   });
 
+  it('exposes the layout platform so Restore-as-VM can match the rebuild host OS (W06d)', async () => {
+    selectMock.mockReturnValueOnce(chainMock([
+      makeSnapshot({ snapshotId: 'snap-win', layoutManifest: { platform: 'windows', disks: [] } }),
+      makeSnapshot({ id: 'snapshot-2', snapshotId: 'snap-lin', layoutManifest: { platform: 'linux', disks: [] } }),
+      makeSnapshot({ id: 'snapshot-3', snapshotId: 'snap-old', layoutManifest: { disks: [] } }),
+      makeSnapshot({ id: 'snapshot-4', snapshotId: 'snap-mac', layoutManifest: { platform: 'darwin' } }),
+      makeSnapshot({ id: 'snapshot-5', snapshotId: 'snap-none', layoutManifest: null }),
+    ]));
+
+    const res = await app.request('/backup/snapshots', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.map((row: { layoutPlatform: unknown }) => row.layoutPlatform)).toEqual([
+      'windows',
+      'linux',
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  it('exposes the sizing fields of the stored hardware profile so Restore-as-VM cards can show CPU / memory / disk', async () => {
+    selectMock.mockReturnValueOnce(chainMock([
+      makeSnapshot({
+        hardwareProfile: {
+          cpuModel: 'Xeon',
+          cpuCores: 8,
+          totalMemoryMB: 16384,
+          disks: [
+            { name: 'disk0', sizeBytes: 256 * 1024 ** 3, model: 'NVMe', partitions: [{ name: 'C:' }] },
+            { name: 'disk1', sizeBytes: 1024 ** 4 },
+          ],
+          networkAdapters: [{ name: 'eth0', macAddress: '00:11:22:33:44:55' }],
+          biosVersion: '1.2.3',
+          isUefi: true,
+          motherboard: 'Board',
+        },
+      }),
+      makeSnapshot({ id: 'snapshot-2', snapshotId: 'snap-2', hardwareProfile: null }),
+      makeSnapshot({ id: 'snapshot-3', snapshotId: 'snap-3', hardwareProfile: { cpuCores: 'eight', disks: 'none' } }),
+    ]));
+
+    const res = await app.request('/backup/snapshots', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Only the sizing fields ride on the list — no NICs/MACs, BIOS or board strings.
+    expect(body.data[0].hardwareProfile).toEqual({
+      cpuCores: 8,
+      totalMemoryMB: 16384,
+      disks: [{ sizeBytes: 256 * 1024 ** 3 }, { sizeBytes: 1024 ** 4 }],
+    });
+    expect(body.data[1].hardwareProfile).toBeNull();
+    expect(body.data[2].hardwareProfile).toEqual({ cpuCores: null, totalMemoryMB: null, disks: [] });
+  });
+
   it('returns a null bare-metal verdict (never assessed) as null + empty reasons, not false', async () => {
     selectMock.mockReturnValueOnce(chainMock([
       makeSnapshot({ bareMetalRestorable: null, bareMetalReasons: null }),
@@ -447,6 +534,7 @@ describe('snapshot routes', () => {
   });
 
   it('applies legal hold with a required reason', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{ status: 'active' }]));
     selectMock.mockReturnValueOnce(chainMock([makeSnapshot()]));
     updateMock.mockReturnValueOnce(chainMock([
       makeSnapshot({
@@ -475,6 +563,19 @@ describe('snapshot routes', () => {
       expect.anything(),
       expect.objectContaining({ action: 'backup.snapshot.legal_hold.apply' }),
     );
+  });
+
+  it('refuses to apply a legal hold while the organization is being erased', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{ status: 'purging' }]));
+
+    const res = await app.request(`/backup/snapshots/${SNAPSHOT_ID}/legal-hold`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ reason: 'Litigation' }),
+    });
+
+    expect(res.status).toBe(409);
+    expect(updateMock).not.toHaveBeenCalled();
   });
 
   it('releases legal hold via DELETE', async () => {

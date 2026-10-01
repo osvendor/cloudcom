@@ -1,4 +1,4 @@
-import { AI_AGENT_RUN_STATUSES } from '@breeze/shared';
+import { AI_AGENT_RUN_STATUSES, TOPOLOGY_INTERFACE_METRIC_SERIES } from '@breeze/shared';
 /**
  * AI Agent SDK Tool Definitions
  *
@@ -15,6 +15,7 @@ import { db, withDbAccessContext, runOutsideDbContext } from '../db';
 import type { DbAccessContext } from '../db';
 import { eq } from 'drizzle-orm';
 import { executeTool, aiTools, getAllRegisteredToolNames, getToolAlwaysLoad, getToolSearchHint, type ExecuteToolOptions } from './aiTools';
+import { isTopologyAiToolName, loadTopologyAiPreconditions, withTopologyAiPreconditions, type TopologyToolBinding } from './topology/aiToolGate';
 import { WORKSPACE_MCP_SHAPES } from './workspace/workspaceTools';
 import type { CaptureScope } from './artifacts/toolResultCapture';
 import type { ToolExecutionContext } from './toolExecutionContext';
@@ -33,10 +34,10 @@ import {
 import { CONFIG_FEATURE_TYPES } from './configFeatureTypes';
 import { CONTACT_ROLES } from './contacts/types';
 import { ACTOR_TYPES, AI_AGENT_KINDS, INVOICE_STATUSES } from '@breeze/shared';
-import { JOURNAL_VACUUM_MAX_BYTES, JOURNAL_VACUUM_MIN_BYTES, SYSTEM_CLEANUP_ACTION_IDS } from '@breeze/shared/validators';
+import { JOURNAL_VACUUM_MAX_BYTES, JOURNAL_VACUUM_MIN_BYTES, SYSTEM_CLEANUP_ACTION_IDS, scriptVerificationClaimSchema } from '@breeze/shared/validators';
 import { getToolTimeout, withToolTimeout } from './toolTimeouts';
 import { aiRunContextInputShape } from './scriptRunRequest';
-import { deliveryToolShape } from './aiToolSchemas';
+import { deliveryToolShape, executeCommandShape, setDeviceContextShape, toolInputSchemas } from './aiToolSchemas';
 import { aiScriptAuthoringEnabled } from '../config/env';
 import { keysetZodShape, pageZodShape } from './aiToolPagination';
 import { captureMessage } from './sentry';
@@ -174,6 +175,8 @@ export const TOOL_TIERS = {
   search_documentation: 1,
   get_device_details: 1,
   get_device_hardware_health: 1,
+  get_device_time_status: 1,
+  list_time_sync_issues: 1,
   analyze_metrics: 1,
   get_active_users: 1,
   get_user_experience_metrics: 1,
@@ -204,6 +207,12 @@ export const TOOL_TIERS = {
   list_script_templates: 1,
   get_script_execution_history: 1,
   get_script_execution: 1,
+  // Spec 2026-09-23 W01 (#6755): read-only, previously registered but untiered.
+  // Devices, integrations and scripts reads.
+  list_remote_sessions: 1,
+  query_agent_versions: 1,
+  query_webhooks: 1,
+  search_script_library: 1,
   manage_services: 3,
   security_scan: 3,
   get_security_posture: 1,
@@ -284,6 +293,45 @@ export const TOOL_TIERS = {
   manage_software_policies: 1,     // Action-level escalation in guardrails
   manage_peripheral_policies: 1,   // Action-level escalation in guardrails
   manage_backup_configs: 1,        // Action-level escalation in guardrails
+  // Spec 2026-09-23 W01 (#6755): read-only, previously registered but untiered.
+  // Security and compliance reads.
+  get_software_compliance: 1,
+  query_compliance_policies: 1,
+  get_elevation_history: 1,
+  get_peripheral_activity: 1,
+  get_user_risk_scores: 1,
+  get_user_risk_detail: 1,
+  // Spec 2026-09-23 W01 (#6755): read-only, previously registered but untiered.
+  // Backup, Hyper-V, MSSQL, vault, SLA and C2C reads.
+  get_backup_status: 1,
+  browse_snapshots: 1,
+  get_vm_restore_estimate: 1,
+  query_mssql_instances: 1,
+  get_mssql_backup_status: 1,
+  query_hyperv_vms: 1,
+  get_hyperv_vm_details: 1,
+  get_vault_status: 1,
+  query_backup_sla: 1,
+  get_sla_breaches: 1,
+  get_sla_compliance_report: 1,
+  query_c2c_jobs: 1,
+  search_c2c_items: 1,
+  // Spec 2026-09-23 W01 (#6755) follow-up: read-only, previously registered
+  // but untiered. Held until their route-permission parity fixes landed.
+  query_custom_fields: 1,
+  get_browser_security: 1,
+  get_sensitive_data_overview: 1,
+  query_vaults: 1,
+  query_backups: 1,
+  get_executive_summary: 1,
+  query_c2c_connections: 1,
+  query_dr_plans: 1,
+  get_dr_plan_details: 1,
+  get_dr_execution_status: 1,
+  get_incident_timeline: 1,
+  generate_incident_report: 1,
+  query_psa_status: 1,
+  get_compliance_status: 1,
   // Playbook tools
   list_playbooks: 1,
   execute_playbook: 3,
@@ -291,7 +339,7 @@ export const TOOL_TIERS = {
   propose_action_plan: 1,
   // Monitoring tools
   query_monitors: 1,
-  manage_monitors: 1,           // Action-level escalation in guardrails
+  manage_monitors: 1,           // Read-only; retired mutations return guidance
   get_service_monitoring_status: 1,
   // W01 (spec §4.4) — read-only reachability for a discovered network asset,
   // with the source and age of the evidence. Wired here rather than added to
@@ -301,15 +349,46 @@ export const TOOL_TIERS = {
   list_network_assets: 1,
   get_network_asset: 1,
   get_network_asset_reachability: 1,
+  // M3 Task 6 (M3-D12) — thin bounded topology reads; tier and tool() both
+  // wired so they are callable (#2605).
+  get_interface_history: 1,
+  get_link_health: 1,
+  // M3 Task 10 — cautious impact and topology change history (read-only).
+  get_topology_impact: 1,
+  get_recent_network_changes: 1,
+  // M3-D12 (#5999): read-only topology monitoring status for one site.
+  get_topology_monitoring_status: 1,
+  // M4 Task 1 (#6000): bounded topology graph, link evidence and diagnostic
+  // run reads. Like every topology tool they run only under the M4-D1
+  // site-pinned gate in executeTool.
+  get_topology: 1,
+  get_link_evidence: 1,
+  get_diagnostic_run: 1,
+  // M4 Task 4 (#6000): the one topology action — approval-gated (supervised,
+  // fresh second factor, pinned effect digest); runs only as a release.
+  diagnose_connectivity: 3,
   // Monitor definition activity/escalation tools (#5290 W03). list_monitors /
-  // get_monitor / manage_monitor_definitions remain in the frozen
+  // get_monitor remain in the frozen
   // KNOWN_MISSING_TOOL_TIERS baseline (aiAgentSdkTools.registryParity.contract.test.ts)
   // — these two are new and wired directly instead of widening that list.
   get_monitor_activity: 2,
   reset_monitor_escalation: 2,
+  // #6669: the only chat path to author a monitor (e.g. software_presence
+  // "alert me when <app> is removed"). Tier 3 = approval-gated, matching its
+  // registered tier; the handler's site-ceiling gate (canMutateOrgWideGovernance)
+  // and the alerts:write RBAC map in aiGuardrails.ts were already in place.
+  manage_monitor_definitions: 3,
   // Org lifecycle tools (issue #2366) — new-customer intake (org → site → quote)
   list_remediation_suggestions: 1,
+  find_proven_fixes: 1,
   list_incidents: 1,
+  // Spec 2026-09-23 W01 (#6755): read-only, previously registered but untiered.
+  // Monitoring, analytics and network reads.
+  query_analytics: 1,
+  list_monitors: 1,
+  get_monitor: 1,
+  get_ip_history: 1,
+  get_network_changes: 1,
   list_ai_agents: 1,
   list_ai_agent_runs: 1,
   get_ai_agent_run: 1,
@@ -539,6 +618,25 @@ function registryDescription(toolName: string): string {
   return description;
 }
 
+/** The topology investigation's one approval-gated action (aiInvestigation.ts). */
+const TOPOLOGY_PROPOSAL_TOOL = 'diagnose_connectivity';
+
+/**
+ * The SDK Zod shape IS the validated shape: derived from `toolInputSchemas`
+ * so the model is never told a key `validateToolInput` strips (W01-D7,
+ * spec 2026-09-23). Declarations themselves stay literal `tool(` calls with
+ * a quoted name rather than a `.map()` loop: `aiAgentSdkTools.mcpCoverage.test.ts`
+ * greps the source text for each quoted name, and a loop would silently empty
+ * that static scan.
+ */
+function inputShape(toolName: string): z.ZodRawShape {
+  const shape = (toolInputSchemas as Record<string, { shape?: z.ZodRawShape }>)[toolName]?.shape;
+  if (!shape) {
+    throw new Error(`toolInputSchemas.${toolName} is not a plain z.object — hand-mirror its shape instead`);
+  }
+  return shape;
+}
+
 function makeToolHandler(
   toolName: string,
   getAuth: () => AuthContext,
@@ -636,16 +734,46 @@ function makeToolHandler(
       // An absent member means no KEY at all, and an empty bag means no FOURTH
       // ARGUMENT at all — both are behaviour changes for an ordinary chat tool
       // call, and `aiAgentSdkTools.verifiedContext.test.ts` pins the arity.
+      // Topology M4-D1 (#6000): a topology tool names the ACTIVE session as
+      // its binding — a pointer to the server-owned ai_sessions row, whose
+      // pinned site the gate re-reads on every call. Name-gated so every other
+      // tool's options bag is unchanged.
+      const topologyBinding: TopologyToolBinding | undefined = captureSession && isTopologyAiToolName(toolName)
+        ? { kind: 'ai_session', sessionId: captureSession.breezeSessionId }
+        : undefined;
       const execOptions: ExecuteToolOptions = {
         ...(verifiedContext ? { context: verifiedContext } : {}),
         ...(capture ? { capture } : {}),
+        ...(topologyBinding ? { topologyBinding } : {}),
       };
+      const runTool = () =>
+        Object.keys(execOptions).length > 0
+          ? executeTool(toolName, args, auth, execOptions)
+          : executeTool(toolName, args, auth);
+      // A self-managed tool (#7128) gets NO per-call transaction: it hands work
+      // to another process and waits on it, which under this wrapper meant an
+      // uncommitted row the other process could not see and a pooled
+      // connection idle-in-transaction for the whole wait. `executeTool` and
+      // the handler open their own short contexts built from the same `auth`.
+      // This whole handler already runs under `runOutsideDbContext`, so there
+      // is no ambient context for the tool to join by accident.
+      const runInToolContext = () =>
+        aiTools.get(toolName)?.selfManagedDbContext
+          ? runTool()
+          : withDbAccessContext(dbContext, runTool);
+      // Review R1 (#6671 shape): a topology tool's gate needs the org's
+      // topology flags and AI readiness — partner-axis reads the tool's
+      // org-scoped transaction cannot see. Resolve them HERE, outside any held
+      // context, for the SESSION's org, and carry them in, so nothing inside
+      // the tool transaction reaches for a second pooled connection. The gate
+      // still re-checks the session pin and the caller's live permissions.
+      const topologyOrgId = captureSession && (isTopologyAiToolName(toolName) || toolName === TOPOLOGY_PROPOSAL_TOOL)
+        ? captureSession.orgId
+        : null;
       const result = await withToolTimeout(
-        withDbAccessContext(dbContext, () =>
-          Object.keys(execOptions).length > 0
-            ? executeTool(toolName, args, auth, execOptions)
-            : executeTool(toolName, args, auth),
-        ),
+        topologyOrgId
+          ? loadTopologyAiPreconditions(topologyOrgId).then((pre) => withTopologyAiPreconditions(pre, runInToolContext))
+          : runInToolContext(),
         toolTimeout,
         toolName,
       );
@@ -927,7 +1055,7 @@ const makeHandler = (
   onPostToolUse?: PostToolUseCallback,
 ) => makeToolHandler(toolName, getAuth, undefined, onPreToolUse, onPostToolUse);
 
-export const __test__ = { makeSessionAwareHandler, makeHandler };
+export const __test__ = { makeSessionAwareHandler, makeHandler, makeToolHandler };
 
 // ============================================
 // SDK MCP Server Factory
@@ -977,7 +1105,7 @@ export function scriptProposalToolDefinitions(
         content: z.string().min(1).max(65536),
         goal: z.string().min(1).max(2000),
         expectedEffect: z.string().min(1).max(2000),
-        verification: z.record(z.string(), z.unknown()),
+        verification: scriptVerificationClaimSchema,
         rollbackNote: z.string().max(2000).optional(),
         deviceIds: z.array(uuid).min(1).max(10),
         runAs: z.enum(['system', 'user']).optional(),
@@ -1442,9 +1570,23 @@ export function buildBreezeSdkTools(
     ),
 
     tool(
+      'get_device_time_status',
+      registryDescription('get_device_time_status'),
+      { deviceId: uuid },
+      makeHandler('get_device_time_status', getAuth, onPreToolUse, onPostToolUse),
+    ),
+
+    tool(
+      'list_time_sync_issues',
+      registryDescription('list_time_sync_issues'),
+      inputShape('list_time_sync_issues'),
+      makeHandler('list_time_sync_issues', getAuth, onPreToolUse, onPostToolUse),
+    ),
+
+    tool(
       'get_device_hardware_health',
       registryDescription('get_device_hardware_health'),
-      { deviceId: uuid, includeEvents: z.boolean().optional() },
+      { deviceId: uuid, includeEvents: z.boolean().optional(), includeReliability: z.boolean().optional() },
       makeHandler('get_device_hardware_health', getAuth, onPreToolUse, onPostToolUse)
     ),
 
@@ -1644,16 +1786,7 @@ export function buildBreezeSdkTools(
     tool(
       'execute_command',
       registryDescription('execute_command'),
-      {
-        deviceId: uuid,
-        commandType: z.enum([
-          'list_processes', 'kill_process',
-          'list_services', 'start_service', 'stop_service', 'restart_service',
-          'file_list', 'file_read',
-          'event_logs_list', 'event_logs_query',
-        ]),
-        payload: z.record(z.string(), z.unknown()).optional(),
-      },
+      executeCommandShape,
       makeHandler('execute_command', getAuth, onPreToolUse, onPostToolUse)
     ),
 
@@ -1697,6 +1830,71 @@ export function buildBreezeSdkTools(
         stderrMaxChars: z.number().int().min(1).max(8000).optional(),
       },
       makeHandler('get_script_execution', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    // The four script-library reads below (W01-D2, spec 2026-09-23) were
+    // previously declared only on the separate script-builder MCP server
+    // (scriptBuilderTools.ts), which left the main chat/agent surface with
+    // run_script but no way to find a scriptId to run it against. The
+    // script-builder declarations are unaffected — that server keeps its own
+    // tier map and descriptions.
+    tool(
+      'list_scripts',
+      registryDescription('list_scripts'),
+      inputShape('list_scripts'),
+      makeHandler('list_scripts', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_script_details',
+      registryDescription('get_script_details'),
+      inputShape('get_script_details'),
+      makeHandler('get_script_details', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'list_script_templates',
+      registryDescription('list_script_templates'),
+      inputShape('list_script_templates'),
+      makeHandler('list_script_templates', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_script_execution_history',
+      registryDescription('get_script_execution_history'),
+      inputShape('get_script_execution_history'),
+      makeHandler('get_script_execution_history', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'search_script_library',
+      registryDescription('search_script_library'),
+      inputShape('search_script_library'),
+      makeHandler('search_script_library', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    // Spec 2026-09-23 W01 (#6755): read-only, previously registered but
+    // untiered. Devices and integrations reads. Shape derived from
+    // toolInputSchemas (W01-D7).
+    tool(
+      'list_remote_sessions',
+      registryDescription('list_remote_sessions'),
+      inputShape('list_remote_sessions'),
+      makeHandler('list_remote_sessions', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'query_agent_versions',
+      registryDescription('query_agent_versions'),
+      inputShape('query_agent_versions'),
+      makeHandler('query_agent_versions', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'query_webhooks',
+      registryDescription('query_webhooks'),
+      inputShape('query_webhooks'),
+      makeHandler('query_webhooks', getAuth, onPreToolUse, onPostToolUse)
     ),
 
     tool(
@@ -2146,15 +2344,8 @@ export function buildBreezeSdkTools(
       'manage_alert_rules',
       registryDescription('manage_alert_rules'),
       {
-        action: z.enum(['list_templates', 'list_rules', 'get_rule', 'create_rule', 'update_rule', 'delete_rule', 'test_rule', 'list_channels', 'alert_summary']),
+        action: z.enum(['list_rules', 'get_rule', 'test_rule', 'list_channels', 'alert_summary']),
         ruleId: uuid.optional(),
-        name: z.string().max(200).optional(),
-        templateId: uuid.optional(),
-        targetType: z.enum(['device', 'group', 'site', 'org', 'all']).optional(),
-        targetId: uuid.optional(),
-        overrideSettings: z.record(z.string(), z.unknown()).optional(),
-        isActive: z.boolean().optional(),
-        category: z.string().max(100).optional(),
         severity: z.enum(['critical', 'high', 'medium', 'low', 'info']).optional(),
         limit: z.number().int().min(1).max(100).optional(),
       },
@@ -2202,13 +2393,7 @@ export function buildBreezeSdkTools(
     tool(
       'set_device_context',
       registryDescription('set_device_context'),
-      {
-        deviceId: uuid,
-        contextType: z.enum(['issue', 'quirk', 'followup', 'preference']),
-        summary: z.string().min(1).max(255),
-        details: z.record(z.string(), z.unknown()).optional(),
-        expiresInDays: z.number().int().positive().max(365).optional(),
-      },
+      setDeviceContextShape,
       makeHandler('set_device_context', getAuth, onPreToolUse, onPostToolUse)
     ),
 
@@ -2574,6 +2759,51 @@ export function buildBreezeSdkTools(
       makeHandler('manage_peripheral_policies', getAuth, onPreToolUse, onPostToolUse)
     ),
 
+    // Spec 2026-09-23 W01 (#6755): read-only, previously registered but
+    // untiered. Security and compliance reads. Shape derived from
+    // toolInputSchemas (W01-D7).
+    tool(
+      'get_software_compliance',
+      registryDescription('get_software_compliance'),
+      inputShape('get_software_compliance'),
+      makeHandler('get_software_compliance', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'query_compliance_policies',
+      registryDescription('query_compliance_policies'),
+      inputShape('query_compliance_policies'),
+      makeHandler('query_compliance_policies', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_elevation_history',
+      registryDescription('get_elevation_history'),
+      inputShape('get_elevation_history'),
+      makeHandler('get_elevation_history', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_peripheral_activity',
+      registryDescription('get_peripheral_activity'),
+      inputShape('get_peripheral_activity'),
+      makeHandler('get_peripheral_activity', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_user_risk_scores',
+      registryDescription('get_user_risk_scores'),
+      inputShape('get_user_risk_scores'),
+      makeHandler('get_user_risk_scores', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_user_risk_detail',
+      registryDescription('get_user_risk_detail'),
+      inputShape('get_user_risk_detail'),
+      makeHandler('get_user_risk_detail', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
     tool(
       'manage_backup_configs',
       registryDescription('manage_backup_configs'),
@@ -2592,6 +2822,101 @@ export function buildBreezeSdkTools(
         limit: z.number().int().min(1).max(100).optional(),
       },
       makeHandler('manage_backup_configs', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    // Spec 2026-09-23 W01 (#6755): read-only reads, previously registered but
+    // untiered (aiAgentSdkTools.registryParity.contract.test.ts's
+    // KNOWN_MISSING_TOOL_TIERS). Backup, Hyper-V, MSSQL, vault, SLA and
+    // C2C reads. Shape derived from toolInputSchemas (W01-D7).
+    tool(
+      'get_backup_status',
+      registryDescription('get_backup_status'),
+      inputShape('get_backup_status'),
+      makeHandler('get_backup_status', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'browse_snapshots',
+      registryDescription('browse_snapshots'),
+      inputShape('browse_snapshots'),
+      makeHandler('browse_snapshots', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_vm_restore_estimate',
+      registryDescription('get_vm_restore_estimate'),
+      inputShape('get_vm_restore_estimate'),
+      makeHandler('get_vm_restore_estimate', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'query_mssql_instances',
+      registryDescription('query_mssql_instances'),
+      inputShape('query_mssql_instances'),
+      makeHandler('query_mssql_instances', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_mssql_backup_status',
+      registryDescription('get_mssql_backup_status'),
+      inputShape('get_mssql_backup_status'),
+      makeHandler('get_mssql_backup_status', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'query_hyperv_vms',
+      registryDescription('query_hyperv_vms'),
+      inputShape('query_hyperv_vms'),
+      makeHandler('query_hyperv_vms', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_hyperv_vm_details',
+      registryDescription('get_hyperv_vm_details'),
+      inputShape('get_hyperv_vm_details'),
+      makeHandler('get_hyperv_vm_details', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_vault_status',
+      registryDescription('get_vault_status'),
+      inputShape('get_vault_status'),
+      makeHandler('get_vault_status', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'query_backup_sla',
+      registryDescription('query_backup_sla'),
+      inputShape('query_backup_sla'),
+      makeHandler('query_backup_sla', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_sla_breaches',
+      registryDescription('get_sla_breaches'),
+      inputShape('get_sla_breaches'),
+      makeHandler('get_sla_breaches', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_sla_compliance_report',
+      registryDescription('get_sla_compliance_report'),
+      inputShape('get_sla_compliance_report'),
+      makeHandler('get_sla_compliance_report', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'query_c2c_jobs',
+      registryDescription('query_c2c_jobs'),
+      inputShape('query_c2c_jobs'),
+      makeHandler('query_c2c_jobs', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'search_c2c_items',
+      registryDescription('search_c2c_items'),
+      inputShape('search_c2c_items'),
+      makeHandler('search_c2c_items', getAuth, onPreToolUse, onPostToolUse)
     ),
 
     // Playbook tools
@@ -2680,6 +3005,116 @@ export function buildBreezeSdkTools(
       makeHandler('get_network_asset_reachability', getAuth, onPreToolUse, onPostToolUse)
     ),
 
+    // M3 Task 6 (M3-D12) — bounded topology port history and link health.
+    tool(
+      'get_interface_history',
+      registryDescription('get_interface_history'),
+      {
+        site_id: uuid,
+        interface_id: uuid,
+        series: z.array(z.enum(TOPOLOGY_INTERFACE_METRIC_SERIES)).min(1).max(4),
+        from: z.string().datetime(),
+        to: z.string().datetime(),
+        resolution: z.enum(['auto', 'raw', '5m', '1h']).optional(),
+        max_buckets: z.number().int().min(1).max(120).optional(),
+      },
+      makeHandler('get_interface_history', getAuth, onPreToolUse, onPostToolUse)
+    ),
+    tool(
+      'get_link_health',
+      registryDescription('get_link_health'),
+      {
+        site_id: uuid,
+        relationship_id: uuid,
+      },
+      makeHandler('get_link_health', getAuth, onPreToolUse, onPostToolUse)
+    ),
+    // M3 Task 10 — cautious incident impact and bounded topology change history.
+    tool(
+      'get_topology_impact',
+      registryDescription('get_topology_impact'),
+      {
+        site_id: uuid,
+        subject_kind: z.enum(['node', 'relationship']),
+        subject_id: uuid,
+        window_minutes: z.number().int().min(1).max(30).optional(),
+        graph_revision: z.string().regex(/^(0|[1-9]\d*)$/).optional(),
+      },
+      makeHandler('get_topology_impact', getAuth, onPreToolUse, onPostToolUse)
+    ),
+    tool(
+      'get_recent_network_changes',
+      registryDescription('get_recent_network_changes'),
+      {
+        site_id: uuid,
+        since: z.string().datetime(),
+        until: z.string().datetime(),
+        limit: z.number().int().min(1).max(100).optional(),
+        cursor: z.string().max(2048).optional(),
+      },
+      makeHandler('get_recent_network_changes', getAuth, onPreToolUse, onPostToolUse)
+    ),
+    // M3-D12 (#5999): bounded, read-only recurring monitoring status for one
+    // site. Arming is human-only and has no tool.
+    tool(
+      'get_topology_monitoring_status',
+      registryDescription('get_topology_monitoring_status'),
+      {
+        site_id: uuid,
+      },
+      makeHandler('get_topology_monitoring_status', getAuth, onPreToolUse, onPostToolUse)
+    ),
+    // M4 Task 1 (#6000) — bounded topology reads under the M4-D1 site pin.
+    tool(
+      'get_topology',
+      registryDescription('get_topology'),
+      {
+        site_id: uuid,
+        view: z.enum(['overview', 'physical', 'logical']).optional(),
+        focus_node_id: uuid.optional(),
+        graph_revision: z.string().regex(/^(0|[1-9]\d{0,19})$/).optional(),
+        limit: z.number().int().min(1).max(150).optional(),
+      },
+      makeHandler('get_topology', getAuth, onPreToolUse, onPostToolUse)
+    ),
+    tool(
+      'get_link_evidence',
+      registryDescription('get_link_evidence'),
+      {
+        site_id: uuid,
+        relationship_id: uuid,
+        limit: z.number().int().min(1).max(100).optional(),
+        cursor: z.string().max(2048).optional(),
+      },
+      makeHandler('get_link_evidence', getAuth, onPreToolUse, onPostToolUse)
+    ),
+    tool(
+      'get_diagnostic_run',
+      registryDescription('get_diagnostic_run'),
+      {
+        site_id: uuid,
+        run_id: uuid,
+      },
+      makeHandler('get_diagnostic_run', getAuth, onPreToolUse, onPostToolUse)
+    ),
+    // M4 Task 4 (#6000) — same strict shape as aiToolSchemasTopology.ts.
+    tool(
+      'diagnose_connectivity',
+      registryDescription('diagnose_connectivity'),
+      {
+        site_id: uuid,
+        subject: z.object({ kind: z.enum(['node', 'relationship', 'destination']), id: uuid }).strict(),
+        recipe_id: z.enum(['gateway_basic', 'dns_basic', 'internet_basic', 'target_connectivity', 'trace_route']),
+        recipe_version: z.literal(1),
+        graph_revision: z.string().regex(/^(0|[1-9]\d*)$/),
+        origin_device_id: uuid.optional(),
+        context_key: z.string().min(1).max(255).optional(),
+        family: z.enum(['ipv4', 'ipv6']).optional(),
+        proposal_expires_at: z.string().datetime().optional(),
+      },
+      makeHandler('diagnose_connectivity', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
     tool(
       'manage_monitors',
       registryDescription('manage_monitors'),
@@ -2720,6 +3155,24 @@ export function buildBreezeSdkTools(
       makeHandler('reset_monitor_escalation', getAuth, onPreToolUse, onPostToolUse)
     ),
 
+    // Monitor definition authoring (#6669). `definition` stays an open record
+    // here: the handler deep-validates it with createMonitorDefinitionSchema /
+    // updateMonitorDefinitionSchema and returns the first issue to the model.
+    tool(
+      'manage_monitor_definitions',
+      registryDescription('manage_monitor_definitions'),
+      {
+        action: z.enum(['create', 'update', 'delete', 'enable', 'disable', 'attach', 'detach']),
+        monitorId: uuid.optional(),
+        definition: z.record(z.string(), z.unknown()).optional(),
+        configPolicyId: uuid.optional(),
+        attachmentId: uuid.optional(),
+        enabled: z.boolean().optional(),
+        overrides: z.record(z.string(), z.unknown()).nullable().optional(),
+      },
+      makeHandler('manage_monitor_definitions', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
     tool(
       'get_service_monitoring_status',
       registryDescription('get_service_monitoring_status'),
@@ -2753,6 +3206,17 @@ export function buildBreezeSdkTools(
     ),
 
     tool(
+      'find_proven_fixes',
+      registryDescription('find_proven_fixes'),
+      {
+        alertId: z.string().guid().optional(),
+        anomalyEpisodeId: z.string().guid().optional(),
+        limit: z.number().int().min(1).max(20).optional(),
+      },
+      makeHandler('find_proven_fixes', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
       'list_incidents',
       registryDescription('list_incidents'),
       {
@@ -2767,6 +3231,144 @@ export function buildBreezeSdkTools(
         offset: z.number().int().min(0).optional(),
       },
       makeHandler('list_incidents', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    // Spec 2026-09-23 W01 (#6755) follow-up: read-only, previously registered
+    // but untiered. Shape derived from toolInputSchemas (W01-D7).
+    tool(
+      'query_custom_fields',
+      registryDescription('query_custom_fields'),
+      inputShape('query_custom_fields'),
+      makeHandler('query_custom_fields', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_browser_security',
+      registryDescription('get_browser_security'),
+      inputShape('get_browser_security'),
+      makeHandler('get_browser_security', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_sensitive_data_overview',
+      registryDescription('get_sensitive_data_overview'),
+      inputShape('get_sensitive_data_overview'),
+      makeHandler('get_sensitive_data_overview', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'query_vaults',
+      registryDescription('query_vaults'),
+      inputShape('query_vaults'),
+      makeHandler('query_vaults', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'query_backups',
+      registryDescription('query_backups'),
+      inputShape('query_backups'),
+      makeHandler('query_backups', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_executive_summary',
+      registryDescription('get_executive_summary'),
+      inputShape('get_executive_summary'),
+      makeHandler('get_executive_summary', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'query_c2c_connections',
+      registryDescription('query_c2c_connections'),
+      inputShape('query_c2c_connections'),
+      makeHandler('query_c2c_connections', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'query_dr_plans',
+      registryDescription('query_dr_plans'),
+      inputShape('query_dr_plans'),
+      makeHandler('query_dr_plans', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_dr_plan_details',
+      registryDescription('get_dr_plan_details'),
+      inputShape('get_dr_plan_details'),
+      makeHandler('get_dr_plan_details', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_dr_execution_status',
+      registryDescription('get_dr_execution_status'),
+      inputShape('get_dr_execution_status'),
+      makeHandler('get_dr_execution_status', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_incident_timeline',
+      registryDescription('get_incident_timeline'),
+      inputShape('get_incident_timeline'),
+      makeHandler('get_incident_timeline', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'generate_incident_report',
+      registryDescription('generate_incident_report'),
+      inputShape('generate_incident_report'),
+      makeHandler('generate_incident_report', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'query_psa_status',
+      registryDescription('query_psa_status'),
+      inputShape('query_psa_status'),
+      makeHandler('query_psa_status', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_compliance_status',
+      registryDescription('get_compliance_status'),
+      inputShape('get_compliance_status'),
+      makeHandler('get_compliance_status', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    // Spec 2026-09-23 W01 (#6755): read-only, previously registered but
+    // untiered. Monitoring, analytics and network reads. Shape
+    // derived from toolInputSchemas (W01-D7).
+    tool(
+      'query_analytics',
+      registryDescription('query_analytics'),
+      inputShape('query_analytics'),
+      makeHandler('query_analytics', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'list_monitors',
+      registryDescription('list_monitors'),
+      inputShape('list_monitors'),
+      makeHandler('list_monitors', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_monitor',
+      registryDescription('get_monitor'),
+      inputShape('get_monitor'),
+      makeHandler('get_monitor', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_ip_history',
+      registryDescription('get_ip_history'),
+      inputShape('get_ip_history'),
+      makeHandler('get_ip_history', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_network_changes',
+      registryDescription('get_network_changes'),
+      inputShape('get_network_changes'),
+      makeHandler('get_network_changes', getAuth, onPreToolUse, onPostToolUse)
     ),
 
     tool(

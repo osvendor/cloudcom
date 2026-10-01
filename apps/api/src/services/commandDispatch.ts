@@ -1,15 +1,29 @@
 import { and, eq, gt, inArray, isNull, notInArray, or, sql } from 'drizzle-orm';
 import { db, withSystemDbAccessContext } from '../db';
-import { deviceCommands, devices, peripheralPolicyDeviceStates } from '../db/schema';
+import { deviceCommands, devices, organizations, peripheralPolicyDeviceStates } from '../db/schema';
 import { partitionClaimable, revalidateCommandForDelivery } from './commandClaimEligibility';
 import { terminalPayloadErasureSet } from './sensitiveCommandPayload';
+import {
+  isParkedDeliverableCommandType,
+  PARKED_DEVICE_CANCEL_REASON,
+} from './unassignedPool/deliveryEligibility';
+import { isUnassignedPoolOrgType } from './unassignedPool/orgType';
 // Side-effect import: registers the `network_diagnostic` delivery
 // revalidation. Both delivery legs live in this module, so this is the one
 // place that guarantees it is loaded. `REVALIDATION_REQUIRED_TYPES` still
 // fails the row closed if it ever is not.
 import './topology/diagnosticDispatch';
+// Side-effect import: registers the `topology_interface_poll` revalidation (M3-D2).
+import './topology/telemetryPollDelivery';
+// Side-effect import: registers the `script` delivery revalidation (rehydrates
+// the requester's live RBAC — role/org-access/site — at claim time, same
+// rationale as the diagnostic import above).
+import './scriptCommandRevalidation';
 
 type DeviceCommandRow = typeof deviceCommands.$inferSelect;
+
+/** Refused rows a parked device's claim cancels per heartbeat; the rest go on the next one. */
+const PARKED_REFUSED_CANCEL_BATCH = 100;
 
 export async function claimPendingCommandForDelivery(
   commandId: string,
@@ -24,18 +38,30 @@ export async function claimPendingCommandForDelivery(
     // site, context or deadline moved cannot reach the agent through the direct
     // push instead. The claim itself stays a compare-and-set on `pending`, so a
     // concurrent heartbeat claim still wins or loses atomically.
+    //
+    // The device's org type rides the same read: a device parked in a holding
+    // org receives lifecycle removal only, on this leg exactly as on the batch
+    // claim. Inner joins, so a row whose device or org this context cannot see
+    // is simply not delivered here (it stays `pending` for the heartbeat).
     const [candidate] = await db
       .select({
         id: deviceCommands.id,
         type: deviceCommands.type,
         deviceId: deviceCommands.deviceId,
         payload: deviceCommands.payload,
+        createdBy: deviceCommands.createdBy,
+        orgType: organizations.type,
       })
       .from(deviceCommands)
+      .innerJoin(devices, eq(devices.id, deviceCommands.deviceId))
+      .innerJoin(organizations, eq(organizations.id, devices.orgId))
       .where(and(eq(deviceCommands.id, commandId), eq(deviceCommands.status, 'pending')))
       .limit(1);
     if (!candidate) return [];
-    const revalidation = await revalidateCommandForDelivery(db, candidate);
+    const revalidation =
+      isUnassignedPoolOrgType(candidate.orgType) && !isParkedDeliverableCommandType(candidate.type)
+        ? PARKED_DEVICE_CANCEL_REASON
+        : await revalidateCommandForDelivery(db, candidate);
     if (revalidation) {
       await db
         .update(deviceCommands)
@@ -113,11 +139,57 @@ export async function countInFlightCommandsForDevice(
 export async function releaseClaimedCommandDelivery(
   commandId: string,
   executedAt: Date,
+  /** Why delivery was deferred, kept on the row for the stale reaper to report. */
+  deferral?: string,
 ): Promise<void> {
   await withSystemDbAccessContext(() =>
     db
       .update(deviceCommands)
-      .set({ status: 'pending', executedAt: null })
+      .set(
+        deferral === undefined
+          ? { status: 'pending', executedAt: null }
+          : { status: 'pending', executedAt: null, result: { deliveryDeferred: deferral } },
+      )
+      .where(
+        and(
+          eq(deviceCommands.id, commandId),
+          eq(deviceCommands.status, 'sent'),
+          eq(deviceCommands.executedAt, executedAt),
+        ),
+      ),
+  );
+}
+
+/**
+ * Put a claimed command whose delivery was REFUSED back to `pending` with a
+ * delivery deadline of "now", recording why in `result.deliveryRefusal`.
+ *
+ * Why not a plain release: a refusal (a storage destination reference that no
+ * longer resolves, say) is permanent, so a released row would be re-claimed
+ * and refused on every heartbeat until its execution clock ran out — up to 24
+ * hours for a whole-machine restore. Why not a terminal write here: the stale
+ * reaper's delivery clock is the one owner of "never delivered" propagation
+ * (restore jobs, DR executions, script and patch records). A `deliver_by` in
+ * the past is excluded by every claim query and picked up by that clock on its
+ * next pass, which reports `result.deliveryRefusal` as the reason.
+ *
+ * Same `(id, status='sent', executedAt=<claim ts>)` fence as
+ * `releaseClaimedCommandDelivery`, and the same context note applies.
+ */
+export async function expireRefusedClaimedCommandDelivery(
+  commandId: string,
+  executedAt: Date,
+  reason: string,
+): Promise<void> {
+  await withSystemDbAccessContext(() =>
+    db
+      .update(deviceCommands)
+      .set({
+        status: 'pending',
+        executedAt: null,
+        deliverBy: new Date(),
+        result: { deliveryRefusal: reason },
+      })
       .where(
         and(
           eq(deviceCommands.id, commandId),
@@ -194,6 +266,46 @@ export async function claimPendingCommandsForDevice(
       unsupportedProtocolTypes.push('pam_apply_v2');
     }
 
+    // A device parked in a holding org is claimed under the removal allowlist
+    // (agentAuth narrows it), so the scan below never sees its other rows —
+    // they would sit `pending` until the reaper's clock. Cancel them here, in
+    // this claim transaction, through the same claim-time eligibility that
+    // terminalises and propagates every other refusal. Only on the narrowed
+    // path: an unrestricted claim reaches that eligibility through the scan,
+    // and a drained device in an ordinary org keeps its rows pending.
+    if (typeAllowlist !== undefined) {
+      const [parkedDevice] = await tx
+        .select({
+          id: devices.id,
+          orgId: devices.orgId,
+          status: devices.status,
+          orgType: organizations.type,
+        })
+        .from(devices)
+        .innerJoin(organizations, eq(organizations.id, devices.orgId))
+        .where(eq(devices.id, deviceId))
+        .limit(1);
+      if (parkedDevice && isUnassignedPoolOrgType(parkedDevice.orgType)) {
+        const refused = await tx
+          .select()
+          .from(deviceCommands)
+          .where(
+            and(
+              eq(deviceCommands.deviceId, deviceId),
+              eq(deviceCommands.status, 'pending'),
+              eq(deviceCommands.targetRole, targetRole),
+              notInArray(deviceCommands.type, [...typeAllowlist]),
+            ),
+          )
+          .orderBy(deviceCommands.createdAt)
+          .limit(PARKED_REFUSED_CANCEL_BATCH)
+          .for('update', { skipLocked: true });
+        if (refused.length > 0) {
+          await partitionClaimable(tx, parkedDevice, refused);
+        }
+      }
+    }
+
     const now = new Date();
     const pendingCommands = await tx
       .select()
@@ -222,13 +334,18 @@ export async function claimPendingCommandsForDevice(
     // this rejects cannot be delivered by a concurrent claim.
     let deliverable = pendingCommands;
     if (pendingCommands.length > 0) {
+      // Inner join for the org type (a holding-org device gets lifecycle
+      // removal only). A device whose org this context cannot see is treated
+      // like a vanished device: nothing in the batch is delivered.
       const [dev] = await tx
         .select({
           id: devices.id,
           orgId: devices.orgId,
           status: devices.status,
+          orgType: organizations.type,
         })
         .from(devices)
+        .innerJoin(organizations, eq(organizations.id, devices.orgId))
         .where(eq(devices.id, deviceId))
         .limit(1);
       if (!dev) return [];

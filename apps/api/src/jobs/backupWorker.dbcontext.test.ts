@@ -49,6 +49,13 @@ const { mockDb, ctxState } = vi.hoisted(() => {
   };
 });
 
+// A device parked in a holding org is covered in backupWorker.test.ts; here
+// every device is an ordinary customer device.
+vi.mock('../services/unassignedPool/deliveryEligibility', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/unassignedPool/deliveryEligibility')>()),
+  isParkedDevice: vi.fn(async () => false),
+}));
+
 vi.mock('../db', () => ({
   db: mockDb,
   // Real-ish context wrapper: tracks depth around fn so the tests can assert
@@ -118,6 +125,18 @@ const agentRelayMock = {
   isAgentConnectedAnywhere: vi.fn(async () => true),
   dispatchCommandToAgent: vi.fn(async (): Promise<DispatchOutcome> => ({ status: 'sent', via: 'local' })),
 };
+// Brokered write delivery is covered by backupStorageWriteDelivery.test.ts and
+// the write-session integration suites; here the helper never reports it
+// unless a test says otherwise.
+const writeDeliveryMock = vi.hoisted(() => ({
+  broker: vi.fn(async (input: { provider: string; payload: Record<string, unknown> }) => ({
+    mode: input.provider === 'local' ? 'local' : 'legacy',
+    reason: input.provider === 'local' ? 'no_credential' : 'helper_unsupported',
+    payload: input.payload,
+  })),
+}));
+vi.mock('../services/backupStorageWriteDelivery', () => ({ brokerWorkerBackupPayload: writeDeliveryMock.broker }));
+
 vi.mock('../services/agentCommandRelay', () => ({
   isAgentConnectedAnywhere: agentRelayMock.isAgentConnectedAnywhere,
   dispatchCommandToAgent: agentRelayMock.dispatchCommandToAgent,
@@ -147,8 +166,9 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
         rows = cancelled ? [{ status: 'cancelled' }] : []; label = 'cancelledSelect'; // isBackupJobCancelled
       } else if (keys.length === 1 && keys[0] === 'orgId') {
         rows = [{ orgId: 'org-1' }]; label = 'deviceOrgSelect';
-      } else if (keys.length === 1 && keys[0] === 'agentId') {
-        rows = [{ agentId: 'agent-1' }]; label = 'deviceSelect'; // device -> agent lookup
+      } else if (keys[0] === 'agentId') {
+        // device -> agent lookup + the helper protocols it reported (an older helper)
+        rows = [{ agentId: 'agent-1', backupWriteProtocolVersion: 0, backupIntegrityProtocolVersion: 0 }]; label = 'deviceSelect';
       } else if (keys.includes('featureLinkId')) {
         rows = [JOB_ROW]; label = 'jobSelect'; // job mode lookup
       } else if (keys.length === 2 && keys.includes('id') && keys.includes('snapshotId')) {
@@ -162,6 +182,10 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
         rows = []; label = 'baseFallbackProbeSelect';
       } else if (keys.length === 1 && keys[0] === 'id') {
         rows = []; label = 'baseLockOrRetirementSelect';
+      } else if (keys.length === 1 && keys[0] === 'integrityVersion') {
+        // stampDispatchPinAndIdentity's helper-capability read: an older
+        // helper, so the legacy base selection runs.
+        rows = []; label = 'deviceIntegritySelect';
       } else {
         throw new Error(`unexpected select shape: ${JSON.stringify(keys)}`);
       }
@@ -240,6 +264,7 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
       // D18 W01: stampDispatchPinAndIdentity's base-candidate lookup + the
       // tentative identity/lease stamp UPDATE, both inside this same short
       // context (no eligible base -> one candidate select, one update).
+      'deviceIntegritySelect@depth1',
       'baseCandidateSelect@depth1',
       'update@depth1',
       'baseFallbackProbeSelect@depth1',
@@ -331,6 +356,7 @@ describe('processDispatchBackup DB-context scoping (final-review fix, #4084/#110
       // D18 W01: stampDispatchPinAndIdentity's base-candidate lookup + the
       // tentative identity/lease stamp UPDATE, both inside this same short
       // context (no eligible base -> one candidate select, one update).
+      'deviceIntegritySelect@depth1',
       'baseCandidateSelect@depth1',
       'update@depth1',
       'baseFallbackProbeSelect@depth1',

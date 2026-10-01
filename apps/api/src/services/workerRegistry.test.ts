@@ -34,15 +34,18 @@ const EXPECTED_WORKER_NAMES = [
   'topologyTemplateApplyWorker',
   // M1 Task 18 — durable diagnostic dispatch and its expiry sweeper.
   'topologyDiagnosticWorker',
+  'topologyMonitoringWorker',
   'topologyDiagnosticSweeper',
+  // M3 Task 5 — interface sample partitions, retention and rollups.
+  'topologyTelemetryMaintenance',
   'alertWorkers', 'monitorConversionPreviewWorker', 'alertCorrelationWorker', 'metricRollupsWorker', 'metricRollupMaintenance',
-  'metricAnomaliesWorker', 'aiBudgetAlertDeliveryWorker', 'aiArtifactSweeper', 'fleetFindingsWorker', 'fleetRemediationDispatchWorker', 'mlOutputRetention',
+  'metricAnomaliesWorker', 'aiBudgetAlertDeliveryWorker', 'aiArtifactSweeper', 'helperScreenshotRetentionWorker', 'fleetFindingsWorker', 'fleetRemediationDispatchWorker', 'mlOutputRetention',
   'offlineDetector', 'notificationDispatcher', 'webhookDelivery', 'webhookDeliveryRecovery',
   'policyEvaluationWorker', 'softwareComplianceWorker', 'softwareRemediationWorker', 'aiAgentRunner',
   'agentNotifyRetry', 'fixWatchWorker',
   'auditBaselineJobs', 'cisJobs', 'automationWorker', 'securityPostureWorker',
   'reliabilityWorker', 'userRiskWorker', 'abuseSignalsWorker', 'userRiskRetention',
-  'backupVerificationJobs', 'eventLogRetention', 'hardwareHealthRetention', 'logCorrelationWorker', 'agentLogRetention',
+  'backupVerificationJobs', 'eventLogRetention', 'hardwareHealthRetention', 'timeSyncRetention', 'logCorrelationWorker', 'agentLogRetention',
   'ticketOutboxRetention', 'intentOutboxRetention', 'metricAnomalyIncidentRetention',
   'ipHistoryRetention', 'reliabilityRetention', 'processSampleRetention', 'deviceMetricsRetention',
   'm365SyncRetention',
@@ -53,7 +56,7 @@ const EXPECTED_WORKER_NAMES = [
   'exchangeRateSync', 'oauthRevocationRetryWorker', 'mtlsCertificateRevocationWorker', 'authEmailWorker',
   'quoteSendWorker', 'enrollmentKeyCleanup', 'quickSupportReaper', 'softwareUploadSessionCleanup',
   'softwareRemediationRequestCleanup', 'auditRetention', 'auditChainVerify', 'auditChainAnchor',
-  'tenantErasure', 'orgMerge', 'deviceBulkPurge', 'removedDevicePurge', 'desktopSessionFinalization', 'desktopSessionOrphanRecovery', 'playbookRetention',
+  'tenantErasure', 'orgMerge', 'deviceBulkPurge', 'removedDevicePurge', 'parkedDeviceExpiry', 'parkedDevicePurge', 'desktopSessionFinalization', 'desktopSessionOrphanRecovery', 'playbookRetention',
   'discoveryWorker', 'networkBaselineWorker', 'snmpWorker', 'monitorWorker',
   // #5291 W04 — dispatches `script` monitors' diagnostic probes.
   'monitorScriptWorker',
@@ -64,7 +67,7 @@ const EXPECTED_WORKER_NAMES = [
   'backupProviderSyncWorker',
   'cloudCommandM365SnapshotWorker', 'm365SyncWorker', 'pax8SyncWorker',
   'tdSynnexSftpSyncWorker', 'logForwardingWorker', 'patchJobWorker', 'patchSchedulerWorker',
-  'maintenanceRebootWorker', 'backupWorker', 'backupSnapshotFileIndexWorker', 'sensitiveDataWorker',
+  'maintenanceRebootWorker', 'backupWorker', 'backupSnapshotFileIndexWorker', 'backupSnapshotAttestationWorker', 'backupWriteSessionJanitor', 'sensitiveDataWorker',
   // YARA/IOC scanning W01 (#6263) — dispatches security.scan agent commands.
   'securityScanWorker',
   'peripheralJobs',
@@ -96,6 +99,8 @@ const EXPECTED_WORKER_NAMES = [
   // Partner sending domains W03 (#6183) — the one place that calls the
   // email-domain provider; registered only when EMAIL_DOMAINS_PROVIDER is set.
   'sendingDomainsWorker',
+  // AI Suggested Fixes W1 — fix-outcome sweeper.
+  'fixOutcomeWorker',
 ];
 
 describe('workerRegistry: losslessness', () => {

@@ -68,7 +68,8 @@ vi.mock('../../db/schema', () => ({
   },
   // `partial` counts as a restore point (#3000) — the status route reads this
   // to decide lastSuccessAt.
-  RESTORABLE_BACKUP_JOB_STATUSES: ['completed', 'partial'] as const,
+  RESTORABLE_BACKUP_JOB_STATUSES: ['completed', 'completed_with_errors', 'partial'],
+  DEGRADED_BACKUP_JOB_STATUSES: ['completed_with_errors', 'partial'] as const,
 }));
 
 vi.mock('../../services/featureConfigResolver', () => ({
@@ -103,6 +104,12 @@ vi.mock('../../services/backupHealthReadModel', () => ({
   getProviderCoverageForDevices: (...a: unknown[]) => getProviderCoverageMock(...(a as [])),
   getFirstPartyCoverageForDevices: (...a: unknown[]) => getFirstPartyCoverageMock(...(a as [])),
   getProviderAttentionItems: (...a: unknown[]) => getProviderAttentionItemsMock(...(a as [])),
+}));
+
+const getStorageByProviderMock = vi.fn(async (..._args: unknown[]) => [] as unknown[]);
+
+vi.mock('../../services/backupStorageByProvider', () => ({
+  getStorageByProvider: (...a: unknown[]) => getStorageByProviderMock(...(a as [])),
 }));
 
 describe('backup dashboard routes', () => {
@@ -160,6 +167,34 @@ describe('backup dashboard routes', () => {
     expect(body.data.totals.policies).toBe(1);
     expect(body.data.coverage.protectedDevices).toBe(1);
     expect(body.data.latestJobs.map((job: any) => job.deviceId)).toEqual([DEVICE_ID]);
+  });
+
+  it('serializes storageProviders so the Overview panel is not stuck on its empty state (#2562)', async () => {
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+    const rows = [{ id: 'backblaze', name: 'Backblaze B2', usedBytes: 4096, snapshots: 2, configs: 1 }];
+    getStorageByProviderMock.mockResolvedValueOnce(rows);
+
+    const res = await app.request('/backup/dashboard');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.storageProviders).toEqual(rows);
+    // Unrestricted caller: no site narrowing.
+    expect(getStorageByProviderMock).toHaveBeenCalledWith(ORG_ID, null);
+  });
+
+  it('passes the site-scoped device list to the storage-by-provider read', async () => {
+    permissionsState = { allowedSiteIds: [SITE_A] };
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+    selectMock.mockReturnValueOnce(chainMock([
+      { id: DEVICE_ID, siteId: SITE_A },
+      { id: OTHER_DEVICE_ID, siteId: SITE_B },
+    ]));
+
+    const res = await app.request('/backup/dashboard');
+
+    expect(res.status).toBe(200);
+    expect(getStorageByProviderMock).toHaveBeenCalledWith(ORG_ID, [DEVICE_ID]);
   });
 
   it('keeps unrestricted dashboard behavior unchanged', async () => {
@@ -282,6 +317,57 @@ describe('backup dashboard routes', () => {
     // response body made the web success-rate fix inert while every unit test
     // still passed, because the web test hand-mocked a shape the API never sent.
     expect(body.data.jobsLast24h).toMatchObject({ completed: 0, failed: 0, partial: 1 });
+  });
+
+  // #5396: `completed` now means every file was read. A latest run that missed
+  // files under the threshold (completed_with_errors) is a restore point, but
+  // an operator must see it — as its own warning, never as a failure streak.
+  it('flags a device whose latest backup completed with file errors, and serializes the counter', async () => {
+    resolveAllBackupAssignedDevicesMock.mockResolvedValueOnce([]);
+    selectMock
+      .mockReturnValueOnce(chainMock([{ count: 0 }])) // configCount
+      .mockReturnValueOnce(chainMock([{ count: 1 }])) // jobCount
+      .mockReturnValueOnce(chainMock([{ count: 0 }])) // snapshotCount
+      .mockReturnValueOnce(chainMock([{ completed: 0, completedWithErrors: 1, failed: 1, partial: 0, running: 0, pending: 0 }])) // last24hStats
+      .mockReturnValueOnce(chainMock([{ totalBytes: 0, count: 0 }])) // storageStats
+      .mockReturnValueOnce(chainMock([])) // recentJobsRaw
+      .mockReturnValueOnce(chainMock([])) // ranked-jobs subquery build (value unused)
+      .mockReturnValueOnce(chainMock([
+        {
+          deviceId: FAILING_DEVICE_ID,
+          status: 'completed_with_errors',
+          errorLog: '1 file(s) could not be read during collection: perm-denied.txt: permission denied',
+          completedAt: new Date('2026-07-14T10:00:00.000Z'),
+          createdAt: new Date('2026-07-14T09:55:00.000Z'),
+          rn: 1,
+          deviceName: 'Finance Laptop',
+          deviceHostname: 'fin-laptop-01',
+        },
+        {
+          deviceId: FAILING_DEVICE_ID,
+          status: 'failed',
+          errorLog: 'provider unreachable',
+          completedAt: new Date('2026-07-13T10:00:00.000Z'),
+          createdAt: new Date('2026-07-13T09:55:00.000Z'),
+          rn: 2,
+          deviceName: 'Finance Laptop',
+          deviceHostname: 'fin-laptop-01',
+        },
+      ])); // ranked-jobs rows
+
+    const res = await app.request('/backup/dashboard');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.data.attentionItems).toHaveLength(1);
+    expect(body.data.attentionItems[0]).toMatchObject({
+      id: `backup-failing-${FAILING_DEVICE_ID}`,
+      severity: 'warning',
+    });
+    expect(body.data.attentionItems[0].title).toContain('completed with file errors');
+    expect(body.data.attentionItems[0].title).not.toContain('consecutive');
+    expect(body.data.attentionItems[0].description).toContain('perm-denied.txt');
+    expect(body.data.jobsLast24h).toMatchObject({ completed: 0, completedWithErrors: 1, failed: 1 });
   });
 
   // Two consecutive partial runs are two degraded-but-usable restore points.

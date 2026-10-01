@@ -132,7 +132,7 @@ describe('backup verification service', () => {
     expect(readiness.riskFactors.some((factor) => factor.code === 'no_verification_history')).toBe(true);
   });
 
-  it('penalizes missing restore proof and surfaces zero-history assigned devices', async () => {
+  it('penalizes missing restore proof exactly once (single -20, no double charge) and surfaces zero-history assigned devices', async () => {
     const orgId = `org-readiness-${Date.now()}`;
     const deviceId = `dev-readiness-${Date.now()}`;
     const assignedDeviceId = `dev-assigned-${Date.now()}`;
@@ -167,7 +167,11 @@ describe('backup verification service', () => {
       verificationOrgById.set(verificationId, orgId);
 
       const readiness = await recomputeRecoveryReadinessForDevice(orgId, deviceId);
-      expect(readiness.readinessScore).toBeLessThan(70);
+      // 100% pass rate, fresh, zero failures, no restore test -> 100 - 20
+      // (single MISSING_RESTORE_PROOF_PENALTY charge) = 80, at/above the 70
+      // low-readiness threshold. Pre-#3970-fix this scored 50 (double-charged
+      // by also zeroing the 30-point restoreQuality band).
+      expect(readiness.readinessScore).toBe(80);
       expect(readiness.riskFactors.some((factor) => factor.code === 'restore_test_missing')).toBe(true);
 
       const rows = await listRecoveryReadiness(orgId);
@@ -241,7 +245,7 @@ describe('backup verification service', () => {
     expect(summary.verification.coveragePercent).toBe(0);
   });
 
-  it('includes the resolved provider + providerConfig in the dispatched verification command', async () => {
+  it('dispatches the verification command with a destination reference, never the stored credential', async () => {
     vi.mocked(queueCommandForExecution).mockResolvedValueOnce({
       command: { id: 'cmd-verify-1', status: 'sent' } as any,
     });
@@ -259,10 +263,13 @@ describe('backup verification service', () => {
       'backup_verify',
       expect.objectContaining({
         provider: 's3',
-        providerConfig: expect.objectContaining({ bucket: 'breeze-backups' }),
+        providerConfigRef: { configId: 'cfg-s3-primary', orgId: 'org-123' },
       }),
       expect.objectContaining({ expectedOrgId: 'org-123' })
     );
+    const dispatched = vi.mocked(queueCommandForExecution).mock.calls.at(-1)![2] as Record<string, unknown>;
+    expect(dispatched).not.toHaveProperty('providerConfig');
+    expect(JSON.stringify(dispatched)).not.toContain('breeze-backups');
 
     const idx = backupVerifications.findIndex((v) => v.id === verification.id);
     if (idx >= 0) backupVerifications.splice(idx, 1);
@@ -358,6 +365,23 @@ describe('backup verification service', () => {
     })).rejects.toThrow('Device is offline, cannot execute command');
 
     expect(backupVerifications.length).toBe(priorCount);
+  });
+
+  it('answers a helper that cannot read backups as a 409 carrying the update instruction', async () => {
+    const { BACKUP_HELPER_UPDATE_REQUIRED_MESSAGE } = await import('../../services/backupReadHelperGate');
+    const { BackupVerificationDispatchError } = await import('./verificationService');
+    vi.mocked(queueCommandForExecution).mockResolvedValueOnce({ error: BACKUP_HELPER_UPDATE_REQUIRED_MESSAGE });
+
+    const err = await runBackupVerification({
+      orgId: 'org-123',
+      deviceId: 'dev-001',
+      verificationType: 'integrity',
+      source: 'test'
+    }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(BackupVerificationDispatchError);
+    expect((err as InstanceType<typeof BackupVerificationDispatchError>).message).toBe(BACKUP_HELPER_UPDATE_REQUIRED_MESSAGE);
+    expect((err as InstanceType<typeof BackupVerificationDispatchError>).statusCode).toBe(409);
   });
 
   it('does not let a manual source string select scheduled system authority', async () => {

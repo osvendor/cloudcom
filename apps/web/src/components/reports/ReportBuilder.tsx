@@ -24,19 +24,28 @@ import {
 } from 'lucide-react';
 import { cn, widthPercentClass } from '@/lib/utils';
 import { formatNumber } from '@/lib/i18n/format';
+import { formatDateTime } from '@/lib/dateTimeFormat';
 import type { ReportFormat, ReportSchedule, ReportType as LegacyReportType } from './ReportsList';
 import { fetchWithAuth } from '../../stores/auth';
 import { useOrgStore } from '../../stores/orgStore';
+import { OrgPickerField, useReportTargetOrg } from './OrgPickerField';
 import { runAction, ActionError } from '@/lib/runAction';
 import { navigateTo } from '@/lib/navigation';
 import type { FilterConditionGroup } from '@breeze/shared';
 import { FilterBuilder, DEFAULT_FILTER_FIELDS } from '../filters/FilterBuilder';
+import { FilterSelect } from '../shared/FilterSelect';
 import { FilterPreview } from '../filters/FilterPreview';
 import { useFilterPreview } from '../../hooks/useFilterPreview';
 import { useTranslation } from 'react-i18next';
 import { useStableT } from '@/lib/i18n/useStableT';
 import { isBusinessReportType } from './businessReportAccess';
 import { BUSINESS_REFUSED_CONFIG_KEYS, omitConfigKeys } from './businessReportConfig';
+import { CoversControl } from './series/CoversControl';
+import { SeriesRecipientsSection } from './series/SeriesRecipientsSection';
+import { ORG_SPECIFIC_CONDITION_FIELDS, availableCoversModes, coversFromSeries, firstCoveredOrgId, isSeriesEligibleReportType, sameTargets, stripSeriesConfig } from './series/seriesConfig';
+import { useDefaultReportOwnerScope } from './ReportOwnerScopeField';
+import { createSeries, replaceSeriesTargets, updateSeries } from './series/seriesApi';
+import type { CoversValue, SeriesDetail } from './series/types';
 
 type BuilderReportType = 'devices' | 'alerts' | 'patches' | 'compliance' | 'activity';
 type ReportBuilderType = BuilderReportType | LegacyReportType;
@@ -118,6 +127,26 @@ type ReportBuilderProps = {
    * partner-owned row, `null` included, and ownership never changes on edit.
    */
   partnerOwned?: boolean;
+  /**
+   * Edit an existing multi-org report series (W03). The builder renders the
+   * Covers control locked to series mode and saves through
+   * PATCH /reports/series/:id (+ PUT /targets when the targets changed).
+   * Mutually exclusive with `reportId`.
+   */
+  series?: SeriesDetail;
+  /**
+   * Multi-org series W01: the org to preselect in the All-organizations org
+   * picker (the templates page passes the org chosen on the page). Ignored
+   * when the switcher names an org, and in edit mode.
+   */
+  defaultOrgId?: string | null;
+  /**
+   * Edit mode: the org the edited report belongs to (ReportEditPage passes
+   * `report.orgId`). Contact recipients are that org's contacts, whatever the
+   * header switcher shows (All organizations included). Null for a
+   * partner-owned report, which takes no contact recipients.
+   */
+  reportOrgId?: string | null;
   /**
    * The caller's own options (rendered outside the builder, e.g. a business
    * report's options panel on the edit page) are invalid: submit is disabled
@@ -226,8 +255,17 @@ const legacyToBuilderType: Record<LegacyReportType, BuilderReportType> = {
   // `reportTypeSurvivesBuilder` is false for all three.
   ticket_sla_attainment: 'alerts',
   technician_time_billability: 'activity',
-  ar_aging: 'compliance'
+  ar_aging: 'compliance',
+  // Backup Status Report (#6013 W05) — same reasoning as Hardware Lifecycle:
+  // delivered only via its own curated template and options form
+  // (BackupStatusOptionsForm.tsx). Mapping to the devices source keeps this
+  // Record exhaustive and `reportTypeSurvivesBuilder` false.
+  backup_status: 'devices'
 };
+
+/** Listed only for a report opened as one-time (see `offersOneTime`). */
+const oneTimeScheduleOption: { value: ReportSchedule; label: string; description: string } =
+  { value: 'one_time', label: 'One-time', description: 'Run only when generated' };
 
 const scheduleOptions: { value: ReportSchedule; label: string; description: string }[] = [
   { value: 'daily', label: 'Daily', description: 'Run every day' },
@@ -736,16 +774,18 @@ export const reportTypeSurvivesBuilder = (value: ReportBuilderType): boolean => 
   return builderToLegacyType[normalizeBuilderType(value)] === value;
 };
 
-const normalizeSchedule = (value?: ReportSchedule): ReportSchedule => {
-  if (!value || value === 'one_time') return 'weekly';
-  return value;
-};
+// A loaded schedule is kept as it is, one_time included: saving must never
+// change a report's cadence the user did not touch. Only a missing one
+// defaults (to weekly, the builder's create default).
+const normalizeSchedule = (value?: ReportSchedule): ReportSchedule => value ?? 'weekly';
 
 const formatLabel = (value: string) =>
   value
     .replace(/_/g, ' ')
     .replace(/([a-z])([A-Z])/g, '$1 $2')
     .replace(/^./, char => char.toUpperCase());
+
+const ISO_DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
 
 let filterIdCounter = 0;
 const buildFilterId = (prefix: string = 'filter') => {
@@ -759,6 +799,9 @@ export default function ReportBuilder({
   reportId,
   baseConfig,
   partnerOwned = false,
+  series,
+  defaultOrgId,
+  reportOrgId,
   submitBlocked = false,
   onSubmit,
   onPreview,
@@ -769,10 +812,41 @@ export default function ReportBuilder({
   // (#3632); JSX keeps the plain `t` so rendered text still re-translates.
   const stableT = useStableT(t);
   const { currentOrgId } = useOrgStore();
+  // Multi-org series W01 (spec §3.7): create/builder/adhoc need an org; edit
+  // never re-homes a report, and a partner-owned report has no org at all.
+  // Covers (W03): one org / one per org / combined. Create mode, and the locked
+  // series edit; ownership is immutable once a report exists. Which org a
+  // single-org report targets stays with W01's useReportTargetOrg below.
+  const [covers, setCovers] = useState<CoversValue>(() => (series ? coversFromSeries(series) : { mode: 'org' }));
+  const seriesMode = covers.mode === 'series';
+  const showCovers = mode === 'create' || Boolean(series);
+  const { canChoose: coversPartnerWide } = useDefaultReportOwnerScope();
+  const orgTarget = useReportTargetOrg(defaultOrgId ?? null);
+  const orgPickerApplies = mode !== 'edit' && !partnerOwned;
+  // W03: a series has no single org. Its live preview reads the first org it
+  // covers; its create/edit never sends an orgId (submitSeries returns before
+  // the org payload is used). The org-required guard applies to org mode only.
+  // Edit (no picker): the report's own org, whatever the switcher shows.
+  const targetOrgId =
+    covers.mode === 'series'
+      ? firstCoveredOrgId(covers, orgTarget.options)
+      : orgPickerApplies ? orgTarget.orgId : (reportOrgId ?? currentOrgId);
+  const orgMissing = orgPickerApplies && covers.mode === 'org' && orgTarget.missing;
+  // No org yet only because the org list has not arrived: the preview waits
+  // rather than POST without an org (400 for a partner with several orgs).
+  const previewOrgPending = !targetOrgId && orgTarget.pending;
   const defaultsAppliedRef = useRef(false);
   const initialType = normalizeBuilderType(defaultValues?.builderType ?? defaultValues?.type);
 
   const [builderType, setBuilderType] = useState<BuilderReportType>(initialType);
+  // The Covers card renders only when it has something to show (W03 final
+  // review): more than one mode, W01's org picker, or the "can't fan out" note.
+  const coversType: string = series ? series.series.type : builderToLegacyType[builderType];
+  const coversCardHasContent =
+    Boolean(series)
+    || availableCoversModes(coversType, coversPartnerWide).length > 1
+    || (orgPickerApplies && orgTarget.pickerVisible)
+    || (coversPartnerWide && !isBusinessReportType(coversType) && !isSeriesEligibleReportType(coversType));
   const [reportName, setReportName] = useState(defaultValues?.name ?? '');
   const [dataSource, setDataSource] = useState<Record<string, string | boolean>>(
     defaultValues?.dataSource ?? dataSourceDefaultsByType[initialType]
@@ -787,6 +861,11 @@ export default function ReportBuilder({
   const [aggregation, setAggregation] = useState<Aggregation>(defaultValues?.aggregation ?? { type: 'count' });
   const [chartType, setChartType] = useState<ChartType>(defaultValues?.chartType ?? 'table');
   const [schedule, setSchedule] = useState<ReportSchedule>(normalizeSchedule(defaultValues?.schedule));
+  // A one-time report (one being edited, or a one-time template's) keeps a
+  // One-time choice next to the recurring ones; nothing else offers it, and a
+  // multi-org report (recurring-only, submitSeries) never does.
+  const offersOneTime = defaultValues?.schedule === 'one_time' && !seriesMode;
+  const visibleScheduleOptions = offersOneTime ? [oneTimeScheduleOption, ...scheduleOptions] : scheduleOptions;
   const [scheduleTime, setScheduleTime] = useState(defaultValues?.scheduleTime ?? '09:00');
   const [scheduleDay, setScheduleDay] = useState(defaultValues?.scheduleDay ?? 'monday');
   const [scheduleDate, setScheduleDate] = useState(defaultValues?.scheduleDate ?? '1');
@@ -849,11 +928,15 @@ export default function ReportBuilder({
     setTemplateName(defaultValues.templateName ?? '');
   }, [defaultValues]);
 
+  // The report's own org, never the header switcher's: under All
+  // organizations the switcher names none, and under another org it names the
+  // wrong one. `currentOrgId` only for a caller that does not say.
+  const contactsOrgId = reportOrgId ?? currentOrgId;
   useEffect(() => {
-    if (!currentOrgId || !reportId || schedule === 'one_time' || contactRecipientsRefused) return;
+    if (!contactsOrgId || !reportId || schedule === 'one_time' || contactRecipientsRefused) return;
 
     void Promise.all([
-      fetchWithAuth(`/orgs/organizations/${currentOrgId}/contacts`),
+      fetchWithAuth(`/orgs/organizations/${contactsOrgId}/contacts`, { orgIdOverride: contactsOrgId }),
       fetchWithAuth(`/reports/${reportId}/recipients`)
     ]).then(async ([contactsResponse, recipientsResponse]) => {
       if (!contactsResponse.ok || !recipientsResponse.ok) {
@@ -878,9 +961,16 @@ export default function ReportBuilder({
     }).catch(() => {
       setError(stableT('reports.reportBuilder.recipients.loadFailed'));
     });
-  }, [currentOrgId, reportId, schedule, contactRecipientsRefused, stableT]);
+  }, [contactsOrgId, reportId, schedule, contactRecipientsRefused, stableT]);
 
   const fieldDefinitions = fieldDefinitionsByType[builderType];
+  // Series mode (spec §3.7): nothing that names one org's sites/devices/groups.
+  const conditionFieldDefinitions = seriesMode
+    ? fieldDefinitions.filter((field) => !ORG_SPECIFIC_CONDITION_FIELDS.has(field.id))
+    : fieldDefinitions;
+  useEffect(() => {
+    if (seriesMode) setFilterMode('simple');
+  }, [seriesMode]);
   const dataSourceFields = dataSourceFieldsByType[builderType];
   const numericFields = useMemo(
     () => fieldDefinitions.filter(field => field.dataType === 'number'),
@@ -935,6 +1025,23 @@ export default function ReportBuilder({
 
   useEffect(() => {
     if (mode === 'adhoc') return;
+    if (orgMissing) {
+      // No org chosen under All organizations: the preview would 400. Drop any
+      // in-flight preview and say what to do instead.
+      previewRequestIdRef.current += 1;
+      setLivePreviewRows([]);
+      setLivePreviewSummary(null);
+      setLivePreviewLoading(false);
+      setLivePreviewError(stableT('reports.orgPicker.previewNeedsOrg'));
+      return;
+    }
+    if (previewOrgPending) {
+      // Show loading and send nothing; this effect re-runs once the org resolves.
+      previewRequestIdRef.current += 1;
+      setLivePreviewLoading(true);
+      setLivePreviewError(undefined);
+      return;
+    }
 
     let mounted = true;
     const requestId = previewRequestIdRef.current + 1;
@@ -1002,7 +1109,7 @@ export default function ReportBuilder({
             type: builderToLegacyType[builderType],
             config,
             format: exportFormats[0] ?? 'csv',
-            ...(currentOrgId ? { orgId: currentOrgId } : {})
+            ...(targetOrgId ? { orgId: targetOrgId } : {})
           })
         });
 
@@ -1045,7 +1152,7 @@ export default function ReportBuilder({
       mounted = false;
       window.clearTimeout(timer);
     };
-  }, [builderType, currentOrgId, dataSource, defaultValues?.dateRange, defaultValues?.filters, exportFormats, filterConditions, mode, stableT]);
+  }, [builderType, targetOrgId, orgMissing, previewOrgPending, dataSource, defaultValues?.dateRange, defaultValues?.filters, exportFormats, filterConditions, mode, stableT]);
 
   const normalizedPreviewRows = useMemo(
     () => livePreviewRows.map(row => normalizePreviewRow(builderType, row)),
@@ -1363,6 +1470,9 @@ export default function ReportBuilder({
   const formatCellValue = (value: unknown) => {
     if (value === null || value === undefined || value === '') return '-';
     if (typeof value === 'number') return formatNumber(value);
+    // An ISO timestamp (Last seen, …) reads in the app's date format. Only a
+    // full date-time: a bare date would shift a day in a zone west of UTC.
+    if (typeof value === 'string' && ISO_DATE_TIME.test(value)) return formatDateTime(value);
     return String(value);
   };
 
@@ -1406,11 +1516,75 @@ export default function ReportBuilder({
     }
   };
 
+  type SeriesSubmitPayload = {
+    name: string;
+    type: string;
+    schedule?: ReportSchedule;
+    format: ReportFormat;
+    config: Record<string, unknown>;
+  };
+
+  /** Create or edit a series. Owns its navigation: a saved series lands on its
+   *  drill-down (`/reports#series/<id>`), not on the host's onSubmit. */
+  const submitSeries = async (payload: SeriesSubmitPayload) => {
+    if (covers.mode !== 'series') return;
+    if (covers.targetMode === 'selected' && covers.orgIds.length === 0) {
+      setError(t('reports.series.targeting.noneSelected'));
+      return;
+    }
+    // Recurring-only. One-time is offered only for a report opened as
+    // one-time; a multi-org report needs a recurring choice, never a silent
+    // substitution.
+    if (!payload.schedule || payload.schedule === 'one_time') {
+      setError(t('reports.series.schedule.required'));
+      return;
+    }
+    const config = stripSeriesConfig(payload.config);
+    const targets = { targetMode: covers.targetMode, orgIds: covers.orgIds };
+    setSaving(true);
+    try {
+      if (series) {
+        const id = series.series.id;
+        await updateSeries(
+          id,
+          { name: payload.name, format: payload.format, schedule: payload.schedule, config, recipientRule: covers.recipientRule, internalCc: covers.internalCc },
+          { errorFallback: t('reports.series.builder.saveFailed'), successMessage: t('reports.series.builder.saved', { name: payload.name }) },
+        );
+        // Only when changed: PUT /targets bumps the revision and reconciles.
+        // A failure here throws past the navigation (Review Focus 4).
+        if (!sameTargets(targets, { targetMode: series.series.targetMode, orgIds: series.targets })) {
+          await replaceSeriesTargets(id, targets, { errorFallback: t('reports.series.builder.targetsFailed') });
+        }
+        void navigateTo(`/reports#series/${id}`);
+        return;
+      }
+      const created = await createSeries(
+        { name: payload.name, type: payload.type, format: payload.format, schedule: payload.schedule, config, ...targets, recipientRule: covers.recipientRule, internalCc: covers.internalCc },
+        { errorFallback: t('reports.series.builder.saveFailed'), successMessage: t('reports.series.builder.created', { name: payload.name }) },
+      );
+      const id = created?.series?.id;
+      void navigateTo(id ? `/reports#series/${id}` : '/reports');
+    } catch (err) {
+      if (err instanceof ActionError && err.status === 401) return;
+      if (!(err instanceof ActionError)) {
+        setError(err instanceof Error ? err.message : t('reports.series.builder.saveFailed'));
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const handleFormSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (submitBlocked) return;
     setError(undefined);
     setEmailError(undefined);
+
+    // Multi-org series W01: never send a create that would 400 on orgId.
+    if (orgMissing) {
+      setError(t('reports.orgPicker.required'));
+      return;
+    }
 
     if (mode !== 'adhoc' && !reportName.trim()) {
       setError(t('reports.reportBuilder.errors.reportNameRequired'));
@@ -1452,7 +1626,7 @@ export default function ReportBuilder({
       type: isBusiness && defaultValues?.type ? defaultValues.type : values.type,
       schedule: values.schedule,
       format: primaryFormat,
-      ...(currentOrgId && !partnerOwned ? { orgId: currentOrgId } : {}),
+      ...(targetOrgId && !partnerOwned ? { orgId: targetOrgId } : {}),
       config: isBusiness
         ? {
             ...omitConfigKeys(baseConfig, BUSINESS_REFUSED_CONFIG_KEYS),
@@ -1480,6 +1654,11 @@ export default function ReportBuilder({
           }
     };
 
+    if (covers.mode === 'series') {
+      await submitSeries(payload);
+      return;
+    }
+
     setSaving(true);
     try {
       if (mode === 'adhoc') {
@@ -1492,7 +1671,7 @@ export default function ReportBuilder({
             type: payload.type,
             config: payload.config,
             format: primaryFormat,
-            ...(currentOrgId ? { orgId: currentOrgId } : {})
+            ...(targetOrgId ? { orgId: targetOrgId } : {})
           })
         });
 
@@ -1550,7 +1729,7 @@ export default function ReportBuilder({
     }
 
     return (
-      <div className="overflow-hidden rounded-md border">
+      <div className="overflow-x-auto rounded-md border">
         <table className={cn('w-full text-left text-sm', compact && 'text-xs')}>
           <thead className="bg-muted/40">
             <tr>
@@ -1707,10 +1886,33 @@ export default function ReportBuilder({
       onSubmit={handleFormSubmit}
       className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_420px]"
     >
-      <div className="space-y-6">
+      <div className="min-w-0 space-y-6">
         {error && (
           <div className="rounded-md border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
             {error}
+          </div>
+        )}
+
+        {showCovers && coversCardHasContent && (
+          <div data-testid="report-builder-covers" className="rounded-lg border bg-card p-6 shadow-xs">
+            <CoversControl
+              reportType={series ? series.series.type : builderToLegacyType[builderType]}
+              value={covers}
+              onChange={setCovers}
+              lockMode={Boolean(series)}
+              orgField={
+                orgPickerApplies && orgTarget.pickerVisible ? (
+                  <OrgPickerField
+                    value={orgTarget.pickedOrgId}
+                    onChange={(orgId) => {
+                      orgTarget.setPickedOrgId(orgId);
+                      setError(undefined);
+                    }}
+                    options={orgTarget.options}
+                  />
+                ) : null
+              }
+            />
           </div>
         )}
 
@@ -1720,13 +1922,25 @@ export default function ReportBuilder({
             <p className="text-xs text-muted-foreground">{t('reports.reportBuilder.sections.reportDetails.description')}</p>
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-2">
+          {orgPickerApplies && orgTarget.pickerVisible && !showCovers && (
+            <OrgPickerField
+              value={orgTarget.pickedOrgId}
+              onChange={(orgId) => {
+                orgTarget.setPickedOrgId(orgId);
+                setError(undefined);
+              }}
+              options={orgTarget.options}
+            />
+          )}
+
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
+            <div className="space-y-2 min-w-0">
               <label htmlFor="report-name" className="text-sm font-medium">
                 {t('reports.reportBuilder.fieldsShared.reportName')}
               </label>
               <input
                 id="report-name"
+                data-testid="report-builder-name"
                 placeholder={t('reports.reportBuilder.placeholders.reportName')}
                 value={reportName}
                 onChange={event => setReportName(event.target.value)}
@@ -1778,7 +1992,7 @@ export default function ReportBuilder({
             </div>
           </div>
 
-          <div className="grid gap-3 sm:grid-cols-2">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
             {reportTypeOptions.map(type => {
               const isSelected = builderType === type.value;
               return (
@@ -1787,13 +2001,13 @@ export default function ReportBuilder({
                   type="button"
                   onClick={() => handleTypeSelect(type.value)}
                   className={cn(
-                    'flex flex-col items-start gap-2 rounded-lg border p-4 text-left transition',
+                    'flex min-w-0 flex-col items-start gap-2 rounded-lg border p-4 text-left transition',
                     isSelected ? 'border-primary bg-primary/5 ring-1 ring-primary' : 'hover:bg-muted'
                   )}
                 >
-                  <div className="flex items-center gap-2">
-                    <type.icon className={cn('h-5 w-5', isSelected ? 'text-primary' : 'text-muted-foreground')} />
-                    <span className="font-medium">{getReportTypeOptionLabel(type.value)}</span>
+                  <div className="flex min-w-0 w-full items-center gap-2">
+                    <type.icon className={cn('h-5 w-5 shrink-0', isSelected ? 'text-primary' : 'text-muted-foreground')} />
+                    <span className="truncate font-medium">{getReportTypeOptionLabel(type.value)}</span>
                   </div>
                   <p className="text-xs text-muted-foreground">{getReportTypeOptionDescription(type.value)}</p>
                 </button>
@@ -1811,10 +2025,15 @@ export default function ReportBuilder({
             </div>
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
             {dataSourceFields.map(field => (
-              <div key={field.id} className="space-y-2">
-                <label className="text-xs font-medium text-muted-foreground">{getDataSourceFieldLabel(field.id)}</label>
+              <div key={field.id} className="space-y-2 min-w-0">
+                <label
+                  htmlFor={field.type === 'toggle' ? undefined : `data-source-${field.id}`}
+                  className="text-xs font-medium text-muted-foreground"
+                >
+                  {getDataSourceFieldLabel(field.id)}
+                </label>
                 {field.type === 'toggle' ? (
                   <label className="flex items-center gap-2 text-sm font-medium">
                     <input
@@ -1832,6 +2051,7 @@ export default function ReportBuilder({
                   </label>
                 ) : (
                   <select
+                    id={`data-source-${field.id}`}
                     value={String(dataSource[field.id] ?? '')}
                     onChange={event =>
                       setDataSource(prev => ({
@@ -1862,8 +2082,8 @@ export default function ReportBuilder({
             </div>
           </div>
 
-          <div className="grid gap-4 lg:grid-cols-2">
-            <div className="space-y-3">
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
+            <div className="min-w-0 space-y-3">
               <p className="text-xs font-medium text-muted-foreground">{t('reports.reportBuilder.availableFields')}</p>
               <div className="flex flex-wrap gap-2">
                 {fieldDefinitions.map(field => {
@@ -1886,7 +2106,7 @@ export default function ReportBuilder({
                 })}
               </div>
             </div>
-            <div className="space-y-3">
+            <div className="min-w-0 space-y-3">
               <p className="text-xs font-medium text-muted-foreground">{t('reports.reportBuilder.selectedFields')}</p>
               {selectedFields.length === 0 ? (
                 <div className="rounded-md border border-dashed p-4 text-xs text-muted-foreground">
@@ -1916,14 +2136,15 @@ export default function ReportBuilder({
                         draggedIndex === index && 'border-primary/60 bg-primary/5'
                       )}
                     >
-                      <div className="flex items-center gap-2">
-                        <GripVertical className="h-4 w-4 text-muted-foreground" />
-                        <span>{getFieldLabel(field)}</span>
+                      <div className="flex min-w-0 items-center gap-2">
+                        <GripVertical className="h-4 w-4 shrink-0 text-muted-foreground" />
+                        <span className="truncate">{getFieldLabel(field)}</span>
                       </div>
                       <button
                         type="button"
                         onClick={() => toggleField(field)}
-                        className="text-muted-foreground hover:text-foreground"
+                        aria-label={t('reports.reportBuilder.removeField', { field: getFieldLabel(field) })}
+                        className="shrink-0 text-muted-foreground hover:text-foreground"
                       >
                         <X className="h-4 w-4" />
                       </button>
@@ -1958,8 +2179,10 @@ export default function ReportBuilder({
               <button
                 type="button"
                 onClick={() => setFilterMode('advanced')}
+                data-testid="report-builder-filter-mode-advanced"
+                disabled={seriesMode}
                 className={cn(
-                  'px-3 py-1.5 text-xs font-medium rounded-r-md transition',
+                  'px-3 py-1.5 text-xs font-medium rounded-r-md transition disabled:opacity-50',
                   filterMode === 'advanced' ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'
                 )}
               >
@@ -1968,6 +2191,11 @@ export default function ReportBuilder({
               </button>
             </div>
           </div>
+          {seriesMode && (
+            <p data-testid="series-filters-disabled-note" role="status" className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+              {t('reports.series.builder.filtersDisabled')}
+            </p>
+          )}
 
           {filterMode === 'simple' ? (
             <>
@@ -1984,37 +2212,40 @@ export default function ReportBuilder({
                           {t('reports.reportBuilder.where')}
                         </div>
                       ) : (
-                        <select
+                        <FilterSelect
+                          label={t('reports.reportBuilder.filterLabels.logic')}
                           value={condition.logic}
                           onChange={event => updateFilterCondition(condition.id, { logic: event.target.value as 'and' | 'or' })}
-                          className="h-9 rounded-md border bg-background px-2 text-xs focus:outline-hidden focus:ring-2 focus:ring-ring"
+                          className="h-9 px-2 text-xs"
                         >
                           <option value="and">{t('reports.reportBuilder.logic.and')}</option>
                           <option value="or">{t('reports.reportBuilder.logic.or')}</option>
-                        </select>
+                        </FilterSelect>
                       )}
-                      <select
+                      <FilterSelect
+                        label={t('reports.reportBuilder.filterLabels.field')}
                         value={condition.field}
                         onChange={event => updateFilterCondition(condition.id, { field: event.target.value })}
-                        className="h-9 rounded-md border bg-background px-2 text-xs focus:outline-hidden focus:ring-2 focus:ring-ring"
+                        className="h-9 px-2 text-xs"
                       >
-                        {fieldDefinitions.map(field => (
+                        {conditionFieldDefinitions.map(field => (
                           <option key={field.id} value={field.id}>
                             {getFieldLabel(field.id)}
                           </option>
                         ))}
-                      </select>
-                      <select
+                      </FilterSelect>
+                      <FilterSelect
+                        label={t('reports.reportBuilder.filterLabels.operator')}
                         value={condition.operator}
                         onChange={event => updateFilterCondition(condition.id, { operator: event.target.value })}
-                        className="h-9 rounded-md border bg-background px-2 text-xs focus:outline-hidden focus:ring-2 focus:ring-ring"
+                        className="h-9 px-2 text-xs"
                       >
                         {filterOperators.map(operator => (
                           <option key={operator.value} value={operator.value}>
                             {getFilterOperatorLabel(operator.value)}
                           </option>
                         ))}
-                      </select>
+                      </FilterSelect>
                       <input
                         value={condition.value}
                         onChange={event => updateFilterCondition(condition.id, { value: event.target.value })}
@@ -2073,10 +2304,13 @@ export default function ReportBuilder({
             </div>
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2">
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
             <div className="space-y-2">
-              <label className="text-xs font-medium text-muted-foreground">{t('reports.reportBuilder.groupBy')}</label>
+              <label htmlFor="report-group-by" className="text-xs font-medium text-muted-foreground">
+                {t('reports.reportBuilder.groupBy')}
+              </label>
               <select
+                id="report-group-by"
                 value={groupBy}
                 onChange={event => setGroupBy(event.target.value)}
                 className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
@@ -2090,8 +2324,11 @@ export default function ReportBuilder({
               </select>
             </div>
             <div className="space-y-2">
-              <label className="text-xs font-medium text-muted-foreground">{t('reports.reportBuilder.aggregation')}</label>
+              <label htmlFor="report-aggregation" className="text-xs font-medium text-muted-foreground">
+                {t('reports.reportBuilder.aggregation')}
+              </label>
               <select
+                id="report-aggregation"
                 value={aggregation.type}
                 onChange={event => {
                   const nextType = event.target.value as AggregationType;
@@ -2114,8 +2351,11 @@ export default function ReportBuilder({
 
           {aggregation.type !== 'count' && (
             <div className="space-y-2">
-              <label className="text-xs font-medium text-muted-foreground">{t('reports.reportBuilder.aggregationField')}</label>
+              <label htmlFor="report-aggregation-field" className="text-xs font-medium text-muted-foreground">
+                {t('reports.reportBuilder.aggregationField')}
+              </label>
               <select
+                id="report-aggregation-field"
                 value={aggregation.field ?? ''}
                 onChange={event => setAggregation(prev => ({ ...prev, field: event.target.value }))}
                 className="h-10 w-full rounded-md border bg-background px-3 text-sm focus:outline-hidden focus:ring-2 focus:ring-ring"
@@ -2140,7 +2380,7 @@ export default function ReportBuilder({
             </div>
           </div>
 
-          <div className="grid gap-3 sm:grid-cols-4">
+          <div className="grid gap-3 sm:grid-cols-4 lg:grid-cols-1 xl:grid-cols-4">
             {chartTypeOptions.map(option => {
               const isSelected = chartType === option.value;
               return (
@@ -2149,12 +2389,12 @@ export default function ReportBuilder({
                   type="button"
                   onClick={() => setChartType(option.value)}
                   className={cn(
-                    'flex flex-col items-center gap-2 rounded-md border px-3 py-3 text-xs font-medium transition',
+                    'flex min-w-0 flex-col items-center gap-2 rounded-md border px-3 py-3 text-xs font-medium transition',
                     isSelected ? 'border-primary bg-primary/10 text-foreground' : 'hover:bg-muted'
                   )}
                 >
                   <option.icon className={cn('h-4 w-4', isSelected ? 'text-primary' : 'text-muted-foreground')} />
-                  {getChartTypeLabel(option.value)}
+                  <span className="w-full truncate text-center">{getChartTypeLabel(option.value)}</span>
                 </button>
               );
             })}
@@ -2176,10 +2416,11 @@ export default function ReportBuilder({
             <div className="space-y-3">
               <p className="text-xs font-medium text-muted-foreground">{t('reports.reportBuilder.schedule')}</p>
               <div className="flex flex-wrap gap-2">
-                {scheduleOptions.map(option => (
+                {visibleScheduleOptions.map(option => (
                   <button
                     key={option.value}
                     type="button"
+                    aria-pressed={schedule === option.value}
                     onClick={() => setSchedule(option.value)}
                     className={cn(
                       'rounded-md border px-3 py-2 text-xs font-medium transition',
@@ -2193,10 +2434,12 @@ export default function ReportBuilder({
                 ))}
               </div>
 
-              <div className="grid gap-3 sm:grid-cols-3">
+              {schedule !== 'one_time' && (
+              <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-1 xl:grid-cols-3">
                 <div className="space-y-2">
-                  <label className="text-xs font-medium text-muted-foreground">{t('reports.reportBuilder.runTime')}</label>
+                  <label htmlFor="report-builder-run-time" className="text-xs font-medium text-muted-foreground">{t('reports.reportBuilder.runTime')}</label>
                   <input
+                    id="report-builder-run-time"
                     type="time"
                     value={scheduleTime}
                     onChange={event => setScheduleTime(event.target.value)}
@@ -2205,8 +2448,11 @@ export default function ReportBuilder({
                 </div>
                 {schedule === 'weekly' && (
                   <div className="space-y-2">
-                    <label className="text-xs font-medium text-muted-foreground">{t('reports.reportBuilder.dayOfWeek')}</label>
+                    <label htmlFor="report-schedule-day-of-week" className="text-xs font-medium text-muted-foreground">
+                      {t('reports.reportBuilder.dayOfWeek')}
+                    </label>
                     <select
+                      id="report-schedule-day-of-week"
                       value={scheduleDay}
                       onChange={event => setScheduleDay(event.target.value)}
                       className="h-9 w-full rounded-md border bg-background px-2 text-xs focus:outline-hidden focus:ring-2 focus:ring-ring"
@@ -2221,8 +2467,11 @@ export default function ReportBuilder({
                 )}
                 {schedule === 'monthly' && (
                   <div className="space-y-2">
-                    <label className="text-xs font-medium text-muted-foreground">{t('reports.reportBuilder.dayOfMonth')}</label>
+                    <label htmlFor="report-schedule-day-of-month" className="text-xs font-medium text-muted-foreground">
+                      {t('reports.reportBuilder.dayOfMonth')}
+                    </label>
                     <select
+                      id="report-schedule-day-of-month"
                       value={scheduleDate}
                       onChange={event => setScheduleDate(event.target.value)}
                       className="h-9 w-full rounded-md border bg-background px-2 text-xs focus:outline-hidden focus:ring-2 focus:ring-ring"
@@ -2236,11 +2485,12 @@ export default function ReportBuilder({
                   </div>
                 )}
               </div>
+              )}
             </div>
 
             <div className="space-y-3">
               <p className="text-xs font-medium text-muted-foreground">{t('reports.reportBuilder.exportFormatsTitle')}</p>
-              <div className="grid gap-3 sm:grid-cols-3">
+              <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-1 xl:grid-cols-3">
                 {exportFormatOptions.map(format => {
                   const isSelected = exportFormats.includes(format.value);
                   return (
@@ -2249,12 +2499,12 @@ export default function ReportBuilder({
                       type="button"
                       onClick={() => toggleExportFormat(format.value)}
                       className={cn(
-                        'flex flex-col items-start gap-1 rounded-md border px-3 py-2 text-left text-xs transition',
+                        'flex min-w-0 flex-col items-start gap-1 rounded-md border px-3 py-2 text-left text-xs transition',
                         isSelected ? 'border-primary bg-primary/10 text-foreground' : 'hover:bg-muted'
                       )}
                     >
-                      <span className="font-medium">{getExportFormatLabel(format.value)}</span>
-                      <span className="text-muted-foreground">{getExportFormatDescription(format.value)}</span>
+                      <span className="w-full truncate font-medium">{getExportFormatLabel(format.value)}</span>
+                      <span className="w-full truncate text-muted-foreground">{getExportFormatDescription(format.value)}</span>
                     </button>
                   );
                 })}
@@ -2266,97 +2516,113 @@ export default function ReportBuilder({
                 <Mail className="h-4 w-4 text-muted-foreground" />
                 <p className="text-xs font-medium text-muted-foreground">{t('reports.reportBuilder.emailDistributionList')}</p>
               </div>
-              <div className="space-y-3">
-                {contactRecipientsRefused ? (
-                  <p data-testid="report-partner-recipients-note" className="text-xs text-muted-foreground">
-                    {businessType
-                      ? t('reports.reportBuilder.recipients.businessEmailOnly')
-                      : t('reports.reportBuilder.recipients.partnerOwnedEmailOnly')}
-                  </p>
-                ) : (
+              {seriesMode && covers.mode === 'series' ? (
+                <SeriesRecipientsSection
+                  value={{ recipientRule: covers.recipientRule, internalCc: covers.internalCc }}
+                  onChange={(recipients) => setCovers({ ...covers, ...recipients })}
+                  targets={{ targetMode: covers.targetMode, orgIds: covers.orgIds }}
+                />
+              ) : (
                 <>
-                <p className="text-xs font-medium text-muted-foreground">
-                  {t('reports.reportBuilder.recipients.contacts')}
-                </p>
-                <div className="grid gap-2 sm:grid-cols-2">
-                  {contacts.map(contact => (
-                    <label
-                      key={contact.id}
-                      data-testid={`report-recipient-contact-${contact.id}`}
-                      className="flex items-center gap-2 rounded-md border p-3 text-sm"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={selectedContactIds.has(contact.id)}
-                        onChange={() => void toggleContact(contact.id)}
-                      />
-                      <span>
-                        {contact.name || contact.email}
-                        {contact.name && (
-                          <span className="block text-xs text-muted-foreground">
-                            {contact.email}
-                          </span>
-                        )}
-                      </span>
-                    </label>
-                  ))}
-                </div>
-                </>
-                )}
-
-                {emailRecipients.length > 0 && (
-                  <div>
-                    <p className="text-xs font-medium text-muted-foreground">
-                      {contactRecipientsRefused
-                        ? t('reports.reportBuilder.recipients.emailAddresses')
-                        : t('reports.reportBuilder.recipients.legacy')}
+                <div className="space-y-3">
+                  {contactRecipientsRefused ? (
+                    <p data-testid="report-partner-recipients-note" className="text-xs text-muted-foreground">
+                      {businessType
+                        ? t('reports.reportBuilder.recipients.businessEmailOnly')
+                        : t('reports.reportBuilder.recipients.partnerOwnedEmailOnly')}
                     </p>
-                    {emailRecipients.map(email => (
-                      <div key={email} className="flex items-center justify-between gap-3 py-2">
-                        <span className="text-sm">{email}</span>
-                        <div className="flex items-center gap-2">
-                          {reportId && !contactRecipientsRefused && (
-                            <button
-                              type="button"
-                              data-testid={`report-recipient-convert-${email}`}
-                              onClick={() => void convertLegacyRecipient(email)}
-                              className="text-xs font-medium text-primary"
-                            >
-                              {t('reports.reportBuilder.recipients.convert')}
-                            </button>
+                  ) : schedule === 'one_time' ? (
+                    // Contacts are not loaded for a one-time report: it is never
+                    // emailed (runs.ts records no delivery; the worker skips it).
+                    <p data-testid="report-one-time-recipients-note" className="text-xs text-muted-foreground">
+                      {t('reports.reportBuilder.recipients.oneTimeNotEmailed')}
+                    </p>
+                  ) : (
+                  <>
+                  <p className="text-xs font-medium text-muted-foreground">
+                    {t('reports.reportBuilder.recipients.contacts')}
+                  </p>
+                  <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
+                    {contacts.map(contact => (
+                      <label
+                        key={contact.id}
+                        data-testid={`report-recipient-contact-${contact.id}`}
+                        className="flex items-center gap-2 rounded-md border p-3 text-sm"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedContactIds.has(contact.id)}
+                          onChange={() => void toggleContact(contact.id)}
+                        />
+                        <span className="min-w-0 break-all">
+                          {contact.name || contact.email}
+                          {contact.name && (
+                            <span className="block text-xs text-muted-foreground">
+                              {contact.email}
+                            </span>
                           )}
-                          <button type="button" onClick={() => removeEmailRecipient(email)}>
-                            <X className="h-3 w-3 text-muted-foreground" />
-                          </button>
-                        </div>
-                      </div>
+                        </span>
+                      </label>
                     ))}
                   </div>
-                )}
-              </div>
-              <div className="flex flex-col gap-2 sm:flex-row">
-                <input
-                  type="email"
-                  value={emailInput}
-                  onChange={event => setEmailInput(event.target.value)}
-                  onKeyDown={event => {
-                    if (event.key === 'Enter') {
-                      event.preventDefault();
-                      addEmailRecipient();
-                    }
-                  }}
-                  placeholder={t('reports.reportBuilder.placeholders.email')}
-                  className="h-9 flex-1 rounded-md border bg-background px-2 text-xs focus:outline-hidden focus:ring-2 focus:ring-ring"
-                />
-                <button
-                  type="button"
-                  onClick={addEmailRecipient}
-                  className="h-9 rounded-md border px-3 text-xs font-medium hover:bg-muted"
-                >
-                  {t('reports.reportBuilder.addRecipient')}
-                </button>
-              </div>
-              {emailError && <p className="text-xs text-destructive">{emailError}</p>}
+                  </>
+                  )}
+
+                  {emailRecipients.length > 0 && (
+                    <div>
+                      <p className="text-xs font-medium text-muted-foreground">
+                        {contactRecipientsRefused
+                          ? t('reports.reportBuilder.recipients.emailAddresses')
+                          : t('reports.reportBuilder.recipients.legacy')}
+                      </p>
+                      {emailRecipients.map(email => (
+                        <div key={email} className="flex items-center justify-between gap-3 py-2">
+                          <span className="text-sm">{email}</span>
+                          <div className="flex items-center gap-2">
+                            {reportId && !contactRecipientsRefused && (
+                              <button
+                                type="button"
+                                data-testid={`report-recipient-convert-${email}`}
+                                onClick={() => void convertLegacyRecipient(email)}
+                                className="text-xs font-medium text-primary"
+                              >
+                                {t('reports.reportBuilder.recipients.convert')}
+                              </button>
+                            )}
+                            <button type="button" onClick={() => removeEmailRecipient(email)}>
+                              <X className="h-3 w-3 text-muted-foreground" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="flex flex-col gap-2 sm:flex-row lg:flex-col xl:flex-row">
+                  <input
+                    type="email"
+                    value={emailInput}
+                    onChange={event => setEmailInput(event.target.value)}
+                    onKeyDown={event => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        addEmailRecipient();
+                      }
+                    }}
+                    placeholder={t('reports.reportBuilder.placeholders.email')}
+                    className="h-9 flex-1 rounded-md border bg-background px-2 text-xs focus:outline-hidden focus:ring-2 focus:ring-ring"
+                  />
+                  <button
+                    type="button"
+                    onClick={addEmailRecipient}
+                    className="h-9 rounded-md border px-3 text-xs font-medium hover:bg-muted"
+                  >
+                    {t('reports.reportBuilder.addRecipient')}
+                  </button>
+                </div>
+                {emailError && <p className="text-xs text-destructive">{emailError}</p>}
+                </>
+              )}
             </div>
           </div>
         )}
@@ -2405,7 +2671,7 @@ export default function ReportBuilder({
           options form doesn't populate, so it renders stale/generic content
           (sweep F1 — the #B1 fix above hid the input sections but not this). */}
       {!businessType && (
-      <div data-testid="report-builder-live-preview" className="space-y-6 lg:sticky lg:top-6 self-start">
+      <div data-testid="report-builder-live-preview" className="min-w-0 space-y-6 lg:sticky lg:top-6 self-start">
         <div className="rounded-lg border bg-card p-6 shadow-xs space-y-5">
           <div className="flex items-center justify-between">
             <div>
@@ -2424,7 +2690,9 @@ export default function ReportBuilder({
 
           <div className="flex flex-wrap gap-2">
             <span className="rounded-md border bg-muted/30 px-2 py-1 text-xs">{scheduleLabel}</span>
-            <span className="rounded-md border bg-muted/30 px-2 py-1 text-xs">{scheduleDetail}</span>
+            {schedule !== 'one_time' && (
+              <span className="rounded-md border bg-muted/30 px-2 py-1 text-xs">{scheduleDetail}</span>
+            )}
             <span className="rounded-md border bg-muted/30 px-2 py-1 text-xs">
               {exportFormats.map(format => format.toUpperCase()).join(', ')}
             </span>

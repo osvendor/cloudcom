@@ -1,3 +1,4 @@
+import { SOFTWARE_INSTALL_SERVER_TIMEOUT_MS } from '@breeze/shared';
 import { Job, Queue, Worker } from 'bullmq';
 import { and, eq, lt, sql, inArray, isNotNull, isNull, or } from 'drizzle-orm';
 import * as dbModule from '../db';
@@ -21,7 +22,12 @@ import {
   STALE_BACKUP_REAP_MARKER,
 } from '../db/schema';
 import { getBullMQConnection } from '../services/redis';
-import { getCommandTimeoutMs, EXCLUDED_COMMAND_TYPES, SCRIPT_GRACE_BUFFER_MS } from '../services/commandTimeouts';
+import {
+  getCommandTimeoutMs,
+  BACKUP_JOB_ABSOLUTE_TIMEOUT_MS,
+  EXCLUDED_COMMAND_TYPES,
+  SCRIPT_GRACE_BUFFER_MS,
+} from '../services/commandTimeouts';
 import { DEFAULT_OFFLINE_THRESHOLD_MINUTES } from '../services/deviceLiveness';
 import { UNINSTALL_REASON_DEVICE_REMOVE } from '../services/deviceUninstallDrain';
 import { captureException } from '../services/sentry';
@@ -87,7 +93,9 @@ const DEPLOYMENT_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
 // ceilings (15 min download + 30 min install,
 // agent/internal/remote/tools/software_install.go:22-26), so the server only
 // declares a timeout after the agent's ceilings have provably lapsed.
-export const SOFTWARE_INSTALL_TIMEOUT_MS = 55 * 60 * 1000;
+// Lives in @breeze/shared (#3578) so the web deployment view's "no update from
+// the agent" hint quotes the same number this reaper enforces.
+export const SOFTWARE_INSTALL_TIMEOUT_MS = SOFTWARE_INSTALL_SERVER_TIMEOUT_MS;
 // #5128: the old Tier 2 constant (a flat 7-day expiry for an install queued
 // against an offline device) is gone. `device_commands.deliver_by` is the one
 // delivery deadline now, and `reapStaleDeviceCommands` is its only owner.
@@ -97,8 +105,50 @@ const REMOTE_SESSION_ACTIVE_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours (zombi
 // Backup job orphan/stall reconciliation thresholds.
 const BACKUP_STALL_TIMEOUT_MS = 15 * 60 * 1000;      // progress-capable agent went silent
 const BACKUP_OFFLINE_GRACE_MS = 10 * 60 * 1000;      // device offline mid-job (covers reboot)
-const BACKUP_ABSOLUTE_TIMEOUT_MS = 24 * 60 * 60 * 1000; // legacy agents: no progress signal exists
+const BACKUP_ABSOLUTE_TIMEOUT_MS = BACKUP_JOB_ABSOLUTE_TIMEOUT_MS; // legacy agents: no progress signal exists
 const BACKUP_PENDING_TIMEOUT_MS = 60 * 60 * 1000;    // dispatch enqueued but never flipped/failed
+
+// #2798 no-transfer rule: the agent is alive (keepalive fresh) but neither
+// bytes nor files have advanced. Helpers before v0.118.0 report counters only
+// when a whole FILE completes, so a single large file legitimately shows zero
+// advance for its entire upload. The window is therefore sized from the bytes
+// still to go, not a flat timer: the file in flight is at most
+// `total - transferred`, and at the floor rate below it would have finished
+// inside the window. The 2h floor also covers the pre-upload phases (VSS,
+// scan, manifest), which report 0/0 counters throughout.
+//
+// #7097 (v0.118.0) added in-file byte progress, but this window can NOT yet
+// shrink to a flat value for those helpers (#7105): the in-file counter is a
+// per-file HIGH-WATER mark kept across the file's retry
+// (agent/internal/backup/inflight_progress.go `track`), so a large file that
+// fails part-way and is retried reports no advance until the retry re-reads
+// past the old offset. A flat 2h window would reap that healthy retry on any
+// link where the catch-up takes longer. Shortening needs the agent to make a
+// retry's progress observable first.
+export const BACKUP_NO_TRANSFER_MIN_WINDOW_MS = 2 * 60 * 60 * 1000;
+export const BACKUP_NO_TRANSFER_MAX_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const BACKUP_NO_TRANSFER_FLOOR_RATE_BYTES_PER_SEC = 512 * 1024; // ~4 Mbit/s
+
+/**
+ * How long a live backup may go without any byte/file advance before the
+ * reaper treats it as wedged. See BACKUP_NO_TRANSFER_MIN_WINDOW_MS.
+ */
+export function backupNoTransferWindowMs(
+  totalSize: number | null | undefined,
+  transferredSize: number | null | undefined,
+): number {
+  const remaining = Math.max(0, (totalSize ?? 0) - (transferredSize ?? 0));
+  const scaled = (remaining / BACKUP_NO_TRANSFER_FLOOR_RATE_BYTES_PER_SEC) * 1000;
+  return Math.min(BACKUP_NO_TRANSFER_MAX_WINDOW_MS, Math.max(BACKUP_NO_TRANSFER_MIN_WINDOW_MS, scaled));
+}
+
+function formatWindow(ms: number): string {
+  const totalMinutes = Math.round(ms / 60_000);
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  if (h === 0) return `${m}m`;
+  return m === 0 ? `${h}h` : `${h}h ${m}m`;
+}
 // D18 W01 (#5429/§3.2 F8): a restore_jobs row created pending BEFORE its
 // command_id exists — see reapCommandlessPendingRestores's docstring.
 const RESTORE_COMMANDLESS_PENDING_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour
@@ -157,6 +207,9 @@ export async function propagateTimedOutDeviceCommand(params: {
   errorMsg: string;
   completedAt: Date;
   kind?: 'expired' | 'timeout';
+  /** Needed to fail an owning `backup_jobs` row (#7105); omitted = skipped. */
+  commandType?: string;
+  deviceId?: string | null;
 }): Promise<void> {
   const { commandId, payload, errorMsg, completedAt } = params;
 
@@ -178,6 +231,9 @@ export async function propagateTimedOutDeviceCommand(params: {
       outcome: 'failed',
       errorMessage: errorMsg,
       completedAt,
+      // The delivery clock: the script never reached the device, so a fix
+      // attempt riding on it is inconclusive rather than a failed fix.
+      neverDelivered: params.kind === 'expired',
     });
   }
 
@@ -242,6 +298,29 @@ export async function propagateTimedOutDeviceCommand(params: {
         inArray(restoreJobs.status, ['pending', 'running']),
       ),
     );
+
+  // #7105 — a backup command that owns a backup_jobs row. Before this only
+  // the device_commands row was failed and the job sat `running` until the
+  // backup reaper's 24 h absolute cap.
+  if (params.commandType && BACKUP_JOB_OWNING_COMMAND_TYPES.has(params.commandType) && params.deviceId) {
+    const backupJobId = backupJobIdFromCommandPayload(payload);
+    if (backupJobId) {
+      // Contained like the patch finalizer above: a failure here must not
+      // skip the DR reconcile below. The backup reaper's own rules remain
+      // the backstop for the job row.
+      try {
+        await failBackupJobForTimedOutCommand(backupJobId, params.deviceId, errorMsg);
+      } catch (err) {
+        console.error(`[StaleCommandReaper] Failed to fail backup job ${backupJobId} for timed-out command ${commandId}:`, err);
+        captureException(err instanceof Error ? err : new Error(String(err)));
+      }
+    } else if (payload && ('jobId' in payload || 'backupJobId' in payload)) {
+      console.warn(
+        `[StaleCommandReaper] Timed-out ${params.commandType} command ${commandId} names no valid backup job id; ` +
+        'its job is left to the backup reaper',
+      );
+    }
+  }
 
   const drExecutionId =
     payload && typeof payload.drExecutionId === 'string' && payload.drExecutionId.trim().length > 0
@@ -414,9 +493,11 @@ export async function reapStaleDeviceCommands(): Promise<number> {
       type: deviceCommands.type,
       status: deviceCommands.status,
       payload: deviceCommands.payload,
+      deviceId: deviceCommands.deviceId,
       createdAt: deviceCommands.createdAt,
       executedAt: deviceCommands.executedAt,
       deliverBy: deviceCommands.deliverBy,
+      result: deviceCommands.result,
     })
     .from(deviceCommands)
     .where(and(...whereConditions))
@@ -441,10 +522,31 @@ export async function reapStaleDeviceCommands(): Promise<number> {
     let due: boolean;
     let kind: 'expired' | 'timeout';
     let errorMsg: string;
+    // A row whose delivery was REFUSED (commandDispatch
+    // `expireRefusedClaimedCommandDelivery`) sits `pending` with a deadline of
+    // the refusal instant and the reason in `result.deliveryRefusal`. It is on
+    // the delivery clock like any other expired row, but the device may well
+    // be connected, so report the refusal rather than a reconnect deadline.
+    const pendingResult = cmd.result as Record<string, unknown> | null | undefined;
+    const deliveryRefusal =
+      cmd.status === 'pending' && typeof pendingResult?.deliveryRefusal === 'string'
+        ? pendingResult.deliveryRefusal
+        : null;
+    // A row a delivery refresher DEFERRED (released with
+    // `result.deliveryDeferred`) was offered to a connected device but could
+    // not be prepared yet; if it ages out, that is why it was never delivered.
+    const deliveryDeferred =
+      cmd.status === 'pending' && typeof pendingResult?.deliveryDeferred === 'string'
+        ? pendingResult.deliveryDeferred
+        : null;
     if (cmd.status === 'pending' && cmd.deliverBy) {
       due = cmd.deliverBy.getTime() <= now;
       kind = 'expired';
-      errorMsg = `Device did not reconnect before ${cmd.deliverBy.toISOString()}; command was never delivered`;
+      errorMsg = deliveryRefusal
+        ? `Command was not delivered: ${deliveryRefusal}`
+        : deliveryDeferred
+          ? `Command was not delivered: ${deliveryDeferred}`
+          : `Device did not reconnect before ${cmd.deliverBy.toISOString()}; command was never delivered`;
     } else if (cmd.status === 'sent' && cmd.executedAt) {
       due = now - cmd.executedAt.getTime() >= timeoutMs;
       kind = 'timeout';
@@ -462,7 +564,9 @@ export async function reapStaleDeviceCommands(): Promise<number> {
         cmd.type === 'software_install' ? LEGACY_SOFTWARE_INSTALL_QUEUE_MS : timeoutMs;
       due = now - cmd.createdAt.getTime() >= legacyTimeoutMs;
       kind = 'timeout';
-      errorMsg = `Command expired: agent never received the command (${Math.round(legacyTimeoutMs / 60000)} min timeout)`;
+      errorMsg = deliveryDeferred
+        ? `Command was not delivered: ${deliveryDeferred}`
+        : `Command expired: agent never received the command (${Math.round(legacyTimeoutMs / 60000)} min timeout)`;
     }
 
     if (!due) continue;
@@ -481,12 +585,19 @@ export async function reapStaleDeviceCommands(): Promise<number> {
       kind === 'expired'
         ? {
             status: SERVER_TIMEOUT_RESULT_STATUS,
-            reason: 'not_delivered_before_deadline',
+            reason: deliveryRefusal
+              ? 'delivery_refused'
+              : deliveryDeferred ? 'delivery_deferred' : 'not_delivered_before_deadline',
             clock: 'delivery',
             error: errorMsg,
             timedOutBy: 'server',
           }
-        : { status: SERVER_TIMEOUT_RESULT_STATUS, error: errorMsg, timedOutBy: 'server' };
+        : {
+            status: SERVER_TIMEOUT_RESULT_STATUS,
+            ...(deliveryDeferred ? { reason: 'delivery_deferred' } : {}),
+            error: errorMsg,
+            timedOutBy: 'server',
+          };
 
     // #5128 — CAS on the OBSERVED state, not `status IN ('pending','sent')`.
     // A row observed `pending` here but claimed between the SELECT and this
@@ -539,6 +650,8 @@ export async function reapStaleDeviceCommands(): Promise<number> {
         errorMsg,
         completedAt,
         kind,
+        commandType: cmd.type,
+        deviceId: cmd.deviceId,
       });
     } catch (error) {
       console.error(`[StaleCommandReaper] Failed to propagate stale command ${cmd.id}:`, error);
@@ -628,17 +741,18 @@ export async function reapStaleScriptExecutions(): Promise<number> {
     // batch. It runs first now because it also answers whether the agent
     // actually replied.
     //
-    // Script results submitted over the HTTP path never reach `script_executions`
-    // (only agentWs registers `script: handleScriptResult`), so the row stays
-    // pending and lands here — where the reaper stamped it `timeout` with
-    // "no response from agent". That claim is false whenever a terminal
-    // `device_commands` row exists: the agent DID respond, the result simply was
-    // not mirrored. On one live instance 89 executions read `timeout` while their
-    // command had completed successfully with captured output.
+    // Historically (#3097) HTTP-path script results never reached
+    // `script_executions`, so a row whose command had completed landed here and
+    // was stamped `timeout` / "no response from agent" — false, the agent DID
+    // respond. Both transports now dispatch through the shared
+    // services/commandResultHandlers.ts, so a terminal command with a
+    // non-terminal execution means the result write missed the row (e.g. the
+    // #3445 send-before-commit race). This records the outcome the command
+    // actually reached.
     //
-    // This does not persist the result — that belongs with the shared-handler
-    // work. It stops the reaper asserting something it cannot know, and records
-    // the outcome the command actually reached.
+    // A command `failed` with `result.timedOutBy = 'server'` is NOT an agent
+    // reply: `reapStaleDeviceCommands` wrote it earlier in this same tick when
+    // the command's own deadline passed (#3445). That is a timeout.
     const relatedCmd = await db
       .select({
         payload: deviceCommands.payload,
@@ -685,8 +799,10 @@ export async function reapStaleScriptExecutions(): Promise<number> {
       continue;
     }
 
-    const cmdIsTerminal = cmd?.status === 'completed' || cmd?.status === 'failed';
-    const cmdResultStatus = (cmd?.result as Record<string, unknown> | null | undefined)?.status;
+    const cmdResult = cmd?.result as Record<string, unknown> | null | undefined;
+    const cmdResultStatus = cmdResult?.status;
+    const cmdTimedOutByServer = cmd?.status === 'failed' && cmdResult?.timedOutBy === 'server';
+    const cmdIsTerminal = !cmdTimedOutByServer && (cmd?.status === 'completed' || cmd?.status === 'failed');
     // Mirror handleScriptResult's mapping so a reaped row agrees with what the
     // WS path would have written for the same command.
     const reapedStatus: 'timeout' | 'completed' | 'failed' = !cmdIsTerminal
@@ -1312,6 +1428,7 @@ async function reapBackupJobRow(
   jobId: string,
   existingErrorLog: string | null | undefined,
   errorMsg: string,
+  opts: { deviceId?: string } = {},
 ): Promise<boolean> {
   const now = new Date();
   // Stamp the reaper marker so the result-persistence path can later recognize a
@@ -1333,6 +1450,7 @@ async function reapBackupJobRow(
       and(
         eq(backupJobs.id, jobId),
         inArray(backupJobs.status, ['pending', 'running']),
+        ...(opts.deviceId ? [eq(backupJobs.deviceId, opts.deviceId)] : []),
       ),
     )
     .returning({ id: backupJobs.id });
@@ -1341,17 +1459,86 @@ async function reapBackupJobRow(
 }
 
 /**
+ * Command types whose device_commands row drives a `backup_jobs` row (#7105).
+ * mssql_backup / hyperv_backup are the live case: `routes/backup/{mssql,hyperv}.ts`
+ * (payload.jobId) and the `trigger_*_backup` AI tools (payload.backupJobId)
+ * both write a command row. backup_run is here for completeness — the
+ * scheduled path (`jobs/backupWorker.ts`) sends it over the socket without a
+ * command row, keyed by the backup_jobs id itself.
+ */
+const BACKUP_JOB_OWNING_COMMAND_TYPES = new Set<string>([
+  CommandTypes.BACKUP_RUN,
+  CommandTypes.MSSQL_BACKUP,
+  CommandTypes.HYPERV_BACKUP,
+]);
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function backupJobIdFromCommandPayload(payload: Record<string, unknown> | null): string | null {
+  for (const key of ['jobId', 'backupJobId'] as const) {
+    const value = payload?.[key];
+    // A non-uuid would abort the lookup with 22P02, not merely miss.
+    if (typeof value === 'string' && UUID_RE.test(value)) return value;
+  }
+  return null;
+}
+
+/**
+ * Fail the backup job a timed-out backup command owns. Stamped with the stale
+ * reaper marker, like every other reaper-driven failure, so a late genuine
+ * `completed` result still lands (FIX 7 in backupResultPersistence.ts) — the
+ * device_commands row stays open to a late result for the same reason
+ * (`result.status = 'timeout'`). Fenced on the command's own device, so a
+ * payload naming another device's job touches nothing.
+ *
+ * No backup_stop is queued: a command timeout is not evidence the helper is
+ * dead (a legacy helper with no queue ack simply never answers), and a late
+ * result is still accepted. The backup reaper's own rules stop genuinely
+ * wedged jobs.
+ */
+async function failBackupJobForTimedOutCommand(
+  backupJobId: string,
+  deviceId: string,
+  errorMsg: string,
+): Promise<void> {
+  const [job] = await db
+    .select({ errorLog: backupJobs.errorLog })
+    .from(backupJobs)
+    .where(
+      and(
+        eq(backupJobs.id, backupJobId),
+        eq(backupJobs.deviceId, deviceId),
+        inArray(backupJobs.status, ['pending', 'running']),
+      ),
+    )
+    .limit(1);
+  if (!job) return;
+
+  const reaped = await reapBackupJobRow(backupJobId, job.errorLog, `Backup command timed out: ${errorMsg}`, { deviceId });
+  if (reaped) {
+    console.warn(`[StaleCommandReaper] Failed backup job ${backupJobId} after its command timed out: ${errorMsg}`);
+  }
+}
+
+/**
  * Reap orphaned/stalled `backup_jobs` rows the normal WS result path will
  * never terminate on its own: a silently-dead agent (stall), a device that
  * went offline mid-upload, a legacy agent with no progress signal at all
  * (absolute cap), or a dispatch that never flipped out of `pending`.
  *
+ * Two clocks (#2798): liveness = lastKeepaliveAt (any agent signal; falls
+ * back to lastProgressAt for rows written before the column existed), and
+ * progress = lastProgressAt (bytes or files actually advanced).
+ *
  * A `running` job is reaped when ANY of:
- *  A (stall):    lastProgressAt is set and stale past BACKUP_STALL_TIMEOUT_MS
+ *  A (silent):   liveness is set and stale past BACKUP_STALL_TIMEOUT_MS
  *  B (offline):  the owning device is offline (see isDeviceOfflineForReap)
- *                AND coalesce(lastProgressAt, startedAt) is stale past
+ *                AND coalesce(liveness, startedAt) is stale past
  *                BACKUP_OFFLINE_GRACE_MS
- *  C (absolute): no progress signal was ever reported (legacy agent) and
+ *  D (no transfer): liveness is fresh but coalesce(lastProgressAt,
+ *                startedAt, createdAt) is stale past backupNoTransferWindowMs
+ *                — a live agent whose upload has wedged
+ *  C (absolute): no signal was ever reported (legacy agent) and
  *                startedAt is stale past BACKUP_ABSOLUTE_TIMEOUT_MS
  *
  * A `pending` job is reaped when createdAt is stale past
@@ -1376,6 +1563,9 @@ export async function reapStaleBackupJobs(): Promise<number> {
       id: backupJobs.id,
       deviceId: backupJobs.deviceId,
       lastProgressAt: backupJobs.lastProgressAt,
+      lastKeepaliveAt: backupJobs.lastKeepaliveAt,
+      totalSize: backupJobs.totalSize,
+      transferredSize: backupJobs.transferredSize,
       startedAt: backupJobs.startedAt,
       createdAt: backupJobs.createdAt,
       errorLog: backupJobs.errorLog,
@@ -1390,7 +1580,10 @@ export async function reapStaleBackupJobs(): Promise<number> {
         // Fall back to createdAt so a `running` row with BOTH last_progress_at
         // and started_at NULL is still a candidate (createdAt is NOT NULL) —
         // otherwise COALESCE(null, null) is NULL, the `< cutoff` is never true,
-        // and the row is an unreapable zombie.
+        // and the row is an unreapable zombie. Keyed on progress, not
+        // liveness: last_progress_at <= last_keepalive_at always, so a
+        // silent job is selected too, and a live-but-wedged one (fresh
+        // keepalive, stale progress) is no longer filtered out here (#2798).
         sql`COALESCE(${backupJobs.lastProgressAt}, ${backupJobs.startedAt}, ${backupJobs.createdAt}) < ${conservativeCutoff.toISOString()}`,
       ),
     )
@@ -1399,19 +1592,26 @@ export async function reapStaleBackupJobs(): Promise<number> {
   for (const job of runningCandidates) {
     if (reaped >= MAX_REAP_PER_RUN) break;
 
-    // createdAt is NOT NULL, so progressRef is always defined even for a row
-    // whose last_progress_at and started_at are both NULL (the zombie case).
-    const progressRef = job.lastProgressAt ?? job.startedAt ?? job.createdAt;
-    if (!progressRef) continue;
+    // Liveness falls back to lastProgressAt for rows last touched before
+    // last_keepalive_at existed (the old column meant liveness then).
+    const liveness = job.lastKeepaliveAt ?? job.lastProgressAt ?? null;
+    // createdAt is NOT NULL, so these are always defined even for a row whose
+    // timestamps are otherwise all NULL (the zombie case).
+    const livenessRef = liveness ?? job.startedAt ?? job.createdAt;
+    const transferRef = job.lastProgressAt ?? job.startedAt ?? job.createdAt;
+    if (!livenessRef || !transferRef) continue;
 
     const deviceOffline = isDeviceOfflineForReap(job.deviceStatus, job.deviceLastSeenAt);
+    const noTransferWindowMs = backupNoTransferWindowMs(job.totalSize, job.transferredSize);
 
     let errorMsg: string | null = null;
-    if (job.lastProgressAt && now - job.lastProgressAt.getTime() > BACKUP_STALL_TIMEOUT_MS) {
+    if (liveness && now - liveness.getTime() > BACKUP_STALL_TIMEOUT_MS) {
       errorMsg = 'Backup stalled: no progress reported for 15 minutes';
-    } else if (deviceOffline && now - progressRef.getTime() > BACKUP_OFFLINE_GRACE_MS) {
+    } else if (deviceOffline && now - livenessRef.getTime() > BACKUP_OFFLINE_GRACE_MS) {
       errorMsg = 'Device went offline during backup';
-    } else if (!job.lastProgressAt && now - progressRef.getTime() > BACKUP_ABSOLUTE_TIMEOUT_MS) {
+    } else if (liveness && now - transferRef.getTime() > noTransferWindowMs) {
+      errorMsg = `Backup stalled: no data transferred for ${formatWindow(now - transferRef.getTime())} while the agent was still responding (limit ${formatWindow(noTransferWindowMs)})`;
+    } else if (!liveness && now - livenessRef.getTime() > BACKUP_ABSOLUTE_TIMEOUT_MS) {
       // No progress signal ever (legacy agent) OR a zombie with no started_at —
       // reap on the absolute cap against progressRef (started_at ?? createdAt).
       errorMsg = 'Backup timed out (no completion after 24h)';
@@ -1433,11 +1633,11 @@ export async function reapStaleBackupJobs(): Promise<number> {
   }
 
   const pendingCutoff = new Date(now - BACKUP_PENDING_TIMEOUT_MS);
-  // Queued acknowledgements / progress keep a `pending` job alive by bumping
-  // last_progress_at WITHOUT promoting it to `running`, so a pending job that is
-  // still receiving progress pings is alive and must NOT be reaped on createdAt
-  // alone. Spare any pending job whose last_progress_at is recent (within the
-  // stall window).
+  // Queued acknowledgements / pings keep a `pending` job alive by bumping
+  // last_keepalive_at WITHOUT promoting it to `running`, so a pending job that
+  // is still receiving pings is alive and must NOT be reaped on createdAt
+  // alone. Spare any pending job whose liveness is recent (within the stall
+  // window). COALESCE covers rows written before last_keepalive_at existed.
   const pendingProgressCutoff = new Date(now - BACKUP_STALL_TIMEOUT_MS);
   const pendingCandidates = await db
     .select({
@@ -1446,6 +1646,7 @@ export async function reapStaleBackupJobs(): Promise<number> {
       errorLog: backupJobs.errorLog,
       createdAt: backupJobs.createdAt,
       lastProgressAt: backupJobs.lastProgressAt,
+      lastKeepaliveAt: backupJobs.lastKeepaliveAt,
       deviceStatus: devices.status,
       deviceLastSeenAt: devices.lastSeenAt,
       deviceBackupVersion: devices.backupVersion,
@@ -1456,7 +1657,7 @@ export async function reapStaleBackupJobs(): Promise<number> {
       and(
         eq(backupJobs.status, 'pending'),
         lt(backupJobs.createdAt, pendingCutoff),
-        sql`(${backupJobs.lastProgressAt} IS NULL OR ${backupJobs.lastProgressAt} < ${pendingProgressCutoff.toISOString()})`,
+        sql`(COALESCE(${backupJobs.lastKeepaliveAt}, ${backupJobs.lastProgressAt}) IS NULL OR COALESCE(${backupJobs.lastKeepaliveAt}, ${backupJobs.lastProgressAt}) < ${pendingProgressCutoff.toISOString()})`,
       ),
     )
     .limit(MAX_REAP_PER_RUN);
@@ -1464,8 +1665,9 @@ export async function reapStaleBackupJobs(): Promise<number> {
   for (const job of pendingCandidates) {
     if (reaped >= MAX_REAP_PER_RUN) break;
     if (now - job.createdAt.getTime() < BACKUP_PENDING_TIMEOUT_MS) continue;
-    // A pending job still being kept alive by recent progress pings is not dead.
-    if (job.lastProgressAt && now - job.lastProgressAt.getTime() < BACKUP_STALL_TIMEOUT_MS) continue;
+    // A pending job still being kept alive by recent pings is not dead.
+    const pendingLiveness = job.lastKeepaliveAt ?? job.lastProgressAt ?? null;
+    if (pendingLiveness && now - pendingLiveness.getTime() < BACKUP_STALL_TIMEOUT_MS) continue;
 
     const wasReaped = await reapBackupJobRow(job.id, job.errorLog, 'Backup dispatch never completed');
     if (!wasReaped) continue;
@@ -1480,7 +1682,7 @@ export async function reapStaleBackupJobs(): Promise<number> {
     // admission ack proves the helper speaks the protocol, or the device's
     // reported helper version does (covers an ack lost on the agent WS).
     const deviceOffline = isDeviceOfflineForReap(job.deviceStatus, job.deviceLastSeenAt);
-    const helperQueues = !!job.lastProgressAt || backupHelperSupportsQueue(job.deviceBackupVersion);
+    const helperQueues = !!pendingLiveness || backupHelperSupportsQueue(job.deviceBackupVersion);
     if (deviceOffline || !helperQueues) {
       if (!deviceOffline) {
         console.warn(`[StaleCommandReaper] Reaped pending backup job ${job.id} without helper reconciliation (helper ${job.deviceBackupVersion ?? 'unknown'} predates the execution queue)`);
@@ -1565,56 +1767,151 @@ export const REAPER_DOMAINS = [
   ['commandlessRestores', reapCommandlessPendingRestores],
 ] as const;
 
+/**
+ * One reaper pass over every domain. Shared by the BullMQ worker and the
+ * Redis-less fallback below, so the two can never reap different things.
+ * Throws only when EVERY domain failed.
+ */
+async function runStaleCommandReaperCycle(): Promise<Record<string, number>> {
+  const results: Record<string, number> = {};
+
+  const domains = REAPER_DOMAINS;
+
+  // Each domain runs in its own transaction so a failure in one
+  // doesn't abort the Postgres transaction for the others.
+  for (const [name, fn] of domains) {
+    try {
+      results[name] = await runWithSystemDbAccess(fn);
+    } catch (err) {
+      console.error(`[StaleCommandReaper] Error reaping ${name}:`, err);
+      captureException(err instanceof Error ? err : new Error(String(err)));
+      results[name] = -1;
+    }
+  }
+
+  const total = Object.values(results).filter((n) => n > 0).reduce((a, b) => a + b, 0);
+  if (total > 0) {
+    console.log(
+      `[StaleCommandReaper] Reaped ${total} stale items:`,
+      Object.entries(results)
+        .filter(([, n]) => n > 0)
+        .map(([k, n]) => `${k}=${n}`)
+        .join(', '),
+    );
+  }
+
+  // Log and escalate failures
+  const failures = Object.entries(results).filter(([, n]) => n === -1);
+  if (failures.length > 0) {
+    console.error(
+      `[StaleCommandReaper] ${failures.length}/${domains.length} domains failed:`,
+      failures.map(([k]) => k).join(', '),
+    );
+  }
+  if (failures.length === domains.length) {
+    throw new Error(`All reaper domains failed: ${failures.map(([k]) => k).join(', ')}`);
+  }
+
+  return results;
+}
+
 function createWorker(): Worker<ReaperJobData> {
   return new Worker<ReaperJobData>(
     QUEUE_NAME,
-    async (job: Job<ReaperJobData>) => {
-      const results: Record<string, number> = {};
-
-      const domains = REAPER_DOMAINS;
-
-      // Each domain runs in its own transaction so a failure in one
-      // doesn't abort the Postgres transaction for the others.
-      for (const [name, fn] of domains) {
-        try {
-          results[name] = await runWithSystemDbAccess(fn);
-        } catch (err) {
-          console.error(`[StaleCommandReaper] Error reaping ${name}:`, err);
-          captureException(err instanceof Error ? err : new Error(String(err)));
-          results[name] = -1;
-        }
-      }
-
-      const total = Object.values(results).filter((n) => n > 0).reduce((a, b) => a + b, 0);
-      if (total > 0) {
-        console.log(
-          `[StaleCommandReaper] Reaped ${total} stale items:`,
-          Object.entries(results)
-            .filter(([, n]) => n > 0)
-            .map(([k, n]) => `${k}=${n}`)
-            .join(', '),
-        );
-      }
-
-      // Log and escalate failures
-      const failures = Object.entries(results).filter(([, n]) => n === -1);
-      if (failures.length > 0) {
-        console.error(
-          `[StaleCommandReaper] ${failures.length}/${domains.length} domains failed:`,
-          failures.map(([k]) => k).join(', '),
-        );
-      }
-      if (failures.length === domains.length) {
-        throw new Error(`All reaper domains failed: ${failures.map(([k]) => k).join(', ')}`);
-      }
-
-      return results;
-    },
+    async (_job: Job<ReaperJobData>) => runStaleCommandReaperCycle(),
     {
       connection: getBullMQConnection(),
       concurrency: 1,
     },
   );
+}
+
+// ── Redis-less fallback (#7105) ───────────────────────────────────
+
+/** Same cadence as the repeatable job, so reaping latency does not change. */
+export const STALE_REAPER_INLINE_INTERVAL_MS = REAP_INTERVAL_MS;
+
+/** A cycle running this long is reported as stuck (see the interval below). */
+export const STALE_REAPER_INLINE_STUCK_MS = 5 * STALE_REAPER_INLINE_INTERVAL_MS;
+
+let inlineTimer: ReturnType<typeof setInterval> | null = null;
+let inlineCycleRunning = false;
+let inlineCycleStartedAt = 0;
+let inlineStuckReported = false;
+let inlineGeneration = 0;
+
+/**
+ * Run the reaper on an in-process interval instead of the BullMQ repeatable
+ * job. Used when Redis is unavailable: at boot, index.ts skips every BullMQ
+ * worker (`skipped-no-redis`, #2798's "reaper disabled when Redis is down at
+ * boot"), and `initializeStaleCommandReaper` falls back here if scheduling the
+ * repeatable job fails. The reaper needs only Postgres, and it is what
+ * terminalises commands and backup jobs whose agent went silent — without it
+ * they sit `running` forever. Same pattern as `reportScheduleWorker`'s inline
+ * scheduler.
+ *
+ * Every API replica in this state runs its own interval, where BullMQ would
+ * have run one. That is safe: every reaper write is a compare-and-set on the
+ * observed status, so a row reaped by one replica is a 0-row no-op for the
+ * next. The cost is a few duplicate candidate SELECTs per cycle.
+ *
+ * Reported to Sentry once, on start: the process is degraded (no queues are
+ * consumed, /ready stays not-ready) and an operator should know the reaper is
+ * the one thing still running.
+ *
+ * Idempotent. Stopped by `shutdownStaleCommandReaper`.
+ */
+export function startStaleCommandReaperWithoutRedis(): void {
+  if (inlineTimer) return;
+
+  const message =
+    '[StaleCommandReaper] Redis unavailable: running the stale command reaper on an in-process ' +
+    `interval (${Math.round(STALE_REAPER_INLINE_INTERVAL_MS / 1000)}s) instead of the BullMQ repeatable job`;
+  console.error(message);
+  captureException(new Error(message));
+
+  inlineTimer = setInterval(() => {
+    // A slow cycle must not stack a second one on top of it (BullMQ gives
+    // the same guarantee with concurrency: 1).
+    if (inlineCycleRunning) {
+      // A cycle that never settles would silently stop the fallback, the only
+      // reaper this process has. Say so once per stuck cycle.
+      const runningMs = Date.now() - inlineCycleStartedAt;
+      if (!inlineStuckReported && runningMs >= STALE_REAPER_INLINE_STUCK_MS) {
+        inlineStuckReported = true;
+        const stuck = new Error(
+          `[StaleCommandReaper] Inline reaper cycle still running after ${Math.round(runningMs / 60000)} minutes; ` +
+          'no further cycles run until it settles',
+        );
+        console.error(stuck.message);
+        captureException(stuck);
+      }
+      return;
+    }
+    inlineCycleRunning = true;
+    inlineCycleStartedAt = Date.now();
+    inlineStuckReported = false;
+    const generation = inlineGeneration;
+    runStaleCommandReaperCycle()
+      .catch((err) => {
+        console.error('[StaleCommandReaper] Inline reaper cycle failed:', err);
+        captureException(err instanceof Error ? err : new Error(String(err)));
+      })
+      .finally(() => {
+        // A cycle from before a stop/restart must not clear the new timer's flag.
+        if (generation === inlineGeneration) inlineCycleRunning = false;
+      });
+  }, STALE_REAPER_INLINE_INTERVAL_MS);
+  inlineTimer.unref?.();
+}
+
+function stopInlineReaper(): void {
+  if (inlineTimer) {
+    clearInterval(inlineTimer);
+    inlineTimer = null;
+  }
+  inlineGeneration++;
+  inlineCycleRunning = false;
 }
 
 async function scheduleRepeatableJob(): Promise<void> {
@@ -1643,29 +1940,40 @@ async function scheduleRepeatableJob(): Promise<void> {
 export async function initializeStaleCommandReaper(): Promise<void> {
   if (reaperWorker) return;
 
-  reaperWorker = createWorker();
-  attachWorkerObservability(reaperWorker, 'staleCommandReaper');
-  reaperWorker.on('error', (error) => {
-    console.error('[StaleCommandReaper] Worker error:', error);
-    captureException(error);
-  });
-  reaperWorker.on('failed', (job, error) => {
-    console.error(`[StaleCommandReaper] Job ${job?.id} failed:`, error);
-    captureException(error);
-  });
-
   try {
+    reaperWorker = createWorker();
+    attachWorkerObservability(reaperWorker, 'staleCommandReaper');
+    reaperWorker.on('error', (error) => {
+      console.error('[StaleCommandReaper] Worker error:', error);
+      captureException(error);
+    });
+    reaperWorker.on('failed', (job, error) => {
+      console.error(`[StaleCommandReaper] Job ${job?.id} failed:`, error);
+      captureException(error);
+    });
+
     await scheduleRepeatableJob();
   } catch (err) {
-    await reaperWorker.close();
+    const worker = reaperWorker;
     reaperWorker = null;
+    if (worker) {
+      try { await worker.close(); } catch (closeErr) {
+        console.error('[StaleCommandReaper] Error closing worker after failed init:', closeErr);
+      }
+    }
+    // #7105: never leave the process with no reaper at all. Still rethrow, so
+    // the registry records the failure (CRITICAL log, Sentry, readiness).
+    startStaleCommandReaperWithoutRedis();
     throw err;
   }
 
+  // A reaper running on the repeatable job no longer needs the fallback.
+  stopInlineReaper();
   console.log('[StaleCommandReaper] Initialized');
 }
 
 export async function shutdownStaleCommandReaper(): Promise<void> {
+  stopInlineReaper();
   const worker = reaperWorker;
   const queue = reaperQueue;
   reaperWorker = null;

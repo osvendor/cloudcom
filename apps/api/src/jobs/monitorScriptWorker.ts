@@ -58,8 +58,11 @@ import { scriptKind } from '../services/monitors/kinds/script';
 import { getBullMQConnection } from '../services/redis';
 import { createInstrumentedQueue } from '../services/bullmqQueue';
 import { assertQueueJobName } from '../services/bullmqValidation';
+import { excludeEphemeralDevices, excludeQuickSupportOrgs } from '../services/quickSupportOrg';
 import { withQueueMeta, type QueueActorMeta } from './queueSchemas';
 import { attachWorkerObservability } from './workerObservability';
+import { captureException } from '../services/sentry';
+import { notHoldingOrgCondition, notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 
 const { db } = dbModule;
 // Same pattern as monitorWorker.ts: a background worker legitimately reads
@@ -110,10 +113,15 @@ async function resolveCandidateOrgIds(monitor: {
     return [];
   }
 
+  // Exclude the hidden per-partner 'quick_support' org: its devices are a
+  // stranger's own machine mid support-session, not fleet the partner's
+  // library of monitor probes is authored against. Mirrors
+  // automationWorker.ts's/featureConfigResolver.ts's identical partner-wide
+  // fan-out exclusion.
   const rows = await db
     .select({ id: organizations.id })
     .from(organizations)
-    .where(eq(organizations.partnerId, monitor.partnerId));
+    .where(and(eq(organizations.partnerId, monitor.partnerId), excludeQuickSupportOrgs(), notHoldingOrgCondition()));
 
   if (rows.length > PARTNER_FANOUT_ORG_LIMIT) {
     console.error(
@@ -159,7 +167,14 @@ async function isDeviceDueForProbe(
  * short of wiring a `Worker` around it.
  */
 export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResult> {
-  return runWithSystemDbAccess(async () => {
+  // #3445: the tick's system transaction stays open across every dispatch
+  // below, and each dispatch writes its script_executions + device_commands
+  // rows through it. The agent sends are deferred until that transaction has
+  // committed; sending inside it lets a fast agent answer against rows the
+  // result path cannot see yet, which drops the result and strands the probe
+  // until the stale reaper times it out.
+  const pendingDeliveries: Array<{ commandId: string; deviceId: string; deliver: () => Promise<unknown> }> = [];
+  const tick = await runWithSystemDbAccess(async () => {
     const result: ScriptMonitorTickResult = {
       monitorsConsidered: 0,
       devicesConsidered: 0,
@@ -209,7 +224,11 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
           customFields: devices.customFields,
         })
         .from(devices)
-        .where(inArray(devices.orgId, orgIds));
+        // Defense in depth alongside the quick_support org exclusion above:
+        // an ephemeral (Quick Support session) device must never be a
+        // candidate for an unattended monitor probe, same exclusion
+        // automationWorker.ts/featureConfigResolver.ts apply.
+        .where(and(inArray(devices.orgId, orgIds), excludeEphemeralDevices(), notParkedDeviceCondition()));
 
       for (const device of deviceRows) {
         result.devicesConsidered++;
@@ -271,10 +290,18 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
           triggerType: 'monitor',
           monitorId: monitor.id,
           timeoutSeconds: effectiveCondition.timeoutSeconds,
+          deferDelivery: true,
         });
 
         if (dispatchResult.ok) {
           result.dispatched++;
+          if (dispatchResult.deliver) {
+            pendingDeliveries.push({
+              commandId: dispatchResult.commandId,
+              deviceId: device.id,
+              deliver: dispatchResult.deliver,
+            });
+          }
         } else {
           result.skipped++;
         }
@@ -283,6 +310,23 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
 
     return result;
   });
+
+  // Committed. A delivery that throws is not a tick failure: the command row
+  // exists, so the heartbeat claim delivers it when the agent next checks in.
+  for (const pending of pendingDeliveries) {
+    try {
+      await dbModule.runOutsideDbContext(pending.deliver);
+    } catch (err) {
+      console.error('[monitorScriptWorker] deferred probe delivery threw; the committed command stays queued', {
+        commandId: pending.commandId,
+        deviceId: pending.deviceId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      captureException(err, undefined, { commandId: pending.commandId, deviceId: pending.deviceId });
+    }
+  }
+
+  return tick;
 }
 
 

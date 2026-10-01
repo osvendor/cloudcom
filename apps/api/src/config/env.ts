@@ -125,6 +125,43 @@ export function remoteDesktopFenceRequired(): boolean {
   return envFlag('REMOTE_DESKTOP_FENCE_REQUIRED', false);
 }
 
+// Approver assurance platform default. A partner that has not chosen an
+// approval-security enforcement setting (no policy row, or a row whose
+// enforcement choice is blank) is treated as enforcing for high- and
+// critical-risk approvals from this instant: those approvals then need the
+// tier floor (a registered approver device) instead of a session tap. Default
+// enforcement begins 2026-11-05T00:00:00Z, about 30 days after the release
+// that introduces it, with an in-app notice beforehand. Self-hosters may move
+// the date with APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM (ISO date or
+// timestamp); config/validate.ts refuses to boot on an unparseable value.
+export const APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM = '2026-11-05T00:00:00.000Z';
+
+/** Parse APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM; `null` when unset/blank or unparseable. */
+export function parseApproverAssuranceDefaultEnforceFrom(raw: string | undefined): Date | null {
+  const trimmed = raw?.trim();
+  if (!trimmed) return null;
+  const ms = Date.parse(trimmed);
+  return Number.isNaN(ms) ? null : new Date(ms);
+}
+
+// Read at CALL time so an override (and a test) applies without a reload.
+// Returns a fresh Date so no caller can mutate the shared default.
+export function approverAssuranceDefaultEnforceFrom(): Date {
+  return (
+    parseApproverAssuranceDefaultEnforceFrom(process.env.APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM)
+    ?? new Date(APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM)
+  );
+}
+
+// Pre-assignment enrollment: the platform switch for deploy-key enrollment
+// into a partner's holding area. Default OFF. Deploy-key enrollment runs only
+// when this AND the partner's own deploy_key_enrollment_enabled column are on
+// (services/unassignedPool/switches.ts). Turning it off stops it everywhere.
+// Read at CALL time so it can be flipped without a module reload.
+export function preAssignmentEnrollmentEnabled(): boolean {
+  return envFlag('PRE_ASSIGNMENT_ENROLLMENT_ENABLED', false);
+}
+
 // Caller verification (anti-vishing, #6354). W01 ships the backend dark:
 // every caller-verification route returns 404 `feature_disabled` to an
 // AUTHENTICATED caller (auth runs first, so an anonymous request still gets
@@ -363,6 +400,34 @@ export const QBO_ENVIRONMENT = process.env.QBO_ENVIRONMENT?.trim() ?? '';
 // (Phase D). '' when unset — a region without the Intuit webhook configured
 // relies entirely on the 15-minute reconcile sweep instead.
 export const QBO_WEBHOOK_VERIFIER_TOKEN = process.env.QBO_WEBHOOK_VERIFIER_TOKEN?.trim() ?? '';
+
+// Xero (accounting integration, Xero W02). Read at CALL time (not module load)
+// so tests can flip them without vi.resetModules(). '' = unset: the Xero card
+// stays hidden and every Xero route answers provider_not_configured.
+export function xeroOAuthConfig(): { clientId: string; clientSecret: string; redirectUri: string } {
+  return {
+    clientId: process.env.XERO_CLIENT_ID?.trim() ?? '',
+    clientSecret: process.env.XERO_CLIENT_SECRET?.trim() ?? '',
+    redirectUri: process.env.XERO_REDIRECT_URI?.trim() ?? '',
+  };
+}
+// The Xero webhook signing key (x-xero-signature HMAC). Registered in W02 so the
+// deploy plumbing lands once; only POST /webhooks/xero (W05) reads it.
+export function xeroWebhookKey(): string {
+  return process.env.XERO_WEBHOOK_KEY?.trim() ?? '';
+}
+// Per-organisation daily call budget. 1000 = Xero Starter tier; hosted sets its
+// tier's value (spec "Commercial constraint"). validate.ts refuses a bad value at
+// boot, so the fallback here guards direct callers in tests as well as any
+// process path that reads config without ever running validateConfig() (a
+// script, a job, an unrelated test suite importing this module directly).
+export const XERO_DEFAULT_DAILY_CALL_LIMIT = 1000;
+export function xeroDailyCallLimit(): number {
+  const raw = process.env.XERO_DAILY_CALL_LIMIT?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return XERO_DEFAULT_DAILY_CALL_LIMIT;
+  const value = Number(raw);
+  return value > 0 ? value : XERO_DEFAULT_DAILY_CALL_LIMIT;
+}
 
 // Read at call time so tests can flip `IS_HOSTED` per-test without `vi.resetModules()`.
 export function isHosted(): boolean {

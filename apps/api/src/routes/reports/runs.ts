@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { zValidator } from '../../lib/validation';
 import { and, eq, or, sql, desc, inArray, type SQL } from 'drizzle-orm';
 import { db } from '../../db';
-import { reports, reportRuns } from '../../db/schema';
+import { organizations, reports, reportRuns, reportSeries } from '../../db/schema';
 import { authMiddleware, requirePermission, requireScope } from '../../middleware/auth';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { auditSensitiveRead } from '../../services/sensitiveReadAudit';
@@ -194,7 +194,14 @@ runsRoutes.post(
       throw error;
     }
 
-    // Create a new report run
+    // Create a new report run. Multi-org series W01 (spec §3.2): this route
+    // never emails, so a manual run of a SCHEDULED definition is recorded as
+    // 'not_scheduled' — distinct from the schedule's own deliveries, which the
+    // list's latest-delivery warning reads. A one-time definition has no
+    // schedule to contrast with and stays NULL.
+    const deliveryStatus = report.schedule && report.schedule !== 'one_time'
+      ? ('not_scheduled' as const)
+      : null;
     const [run] = await db
       .insert(reportRuns)
       .values({
@@ -204,6 +211,7 @@ runsRoutes.post(
         requestedByKind: 'user',
         requestedByUserId: auth.user.id,
         requestedByPortalUserId: null,
+        deliveryStatus,
         ...persistedSiteScopeValues(executionAuthority),
       })
       .returning();
@@ -416,7 +424,9 @@ runsRoutes.get(
       .where(whereCondition);
     const total = Number(countResult[0]?.count ?? 0);
 
-    // Get runs with report info
+    // Get runs with report info. Multi-org series W01 (spec §3.6): the owning
+    // org (LEFT join — a partner-owned definition has none) and the run's
+    // delivery summary.
     const runsList = await db
       .select({
         id: reportRuns.id,
@@ -429,10 +439,18 @@ runsRoutes.get(
         rowCount: reportRuns.rowCount,
         createdAt: reportRuns.createdAt,
         reportName: reports.name,
-        reportType: reports.type
+        reportType: reports.type,
+        orgId: reports.orgId,
+        orgName: organizations.name,
+        seriesId: reports.seriesId,
+        seriesName: reportSeries.name,
+        deliveryStatus: reportRuns.deliveryStatus,
+        recipientCount: reportRuns.recipientCount
       })
       .from(reportRuns)
       .innerJoin(reports, eq(reportRuns.reportId, reports.id))
+      .leftJoin(organizations, eq(organizations.id, reports.orgId))
+      .leftJoin(reportSeries, eq(reportSeries.id, reports.seriesId))
       .where(whereCondition)
       .orderBy(desc(reportRuns.createdAt), desc(reportRuns.id))
       .limit(limit)
@@ -687,9 +705,18 @@ runsRoutes.post(
     // reports suite's module graph and breaks the ones whose partial
     // `vi.mock('../../db/schema')` factories do not declare it. Same reason
     // routes/tickets/attachments.ts and ticketAttachmentStorage defer it.
-    const { resolveArtifact } = await import('../../services/artifacts/artifactService');
-    const artifact = await resolveArtifact(handle, { orgId });
-    if (!artifact) {
+    //
+    // OBJECT-LEVEL check (not a coarse permission) — same as the ticket
+    // attachment sibling route: `findArtifactForAuth` is the canonical
+    // `GET /ai/artifacts/:id` route's own authorization helper, proving the
+    // CALLER may read this specific artifact under their own org-axis scoping
+    // without requiring `ai_agents:read` as a standing grant. That alone is
+    // not sufficient — the artifact must ALSO belong to the RUN's own org,
+    // never just an org the caller happens to be able to reach, or a sibling
+    // org's file could land on this report.
+    const { findArtifactForAuth } = await import('../../services/artifacts/artifactService');
+    const artifact = await findArtifactForAuth(handle, auth);
+    if (!artifact || artifact.orgId !== orgId) {
       return c.json(
         { error: 'No such artifact is available to this organization', code: 'ARTIFACT_NOT_FOUND' },
         404,

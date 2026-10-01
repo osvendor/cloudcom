@@ -3,7 +3,7 @@ import { PgDialect } from 'drizzle-orm/pg-core';
 
 const {
   assertAllowedMock,
-  userStatusMock,
+  requesterActiveMock,
   updateMock,
   setMock,
   whereMock,
@@ -12,7 +12,7 @@ const {
   captureExceptionMock,
 } = vi.hoisted(() => ({
   assertAllowedMock: vi.fn(),
-  userStatusMock: vi.fn(),
+  requesterActiveMock: vi.fn(),
   updateMock: vi.fn(),
   setMock: vi.fn(),
   whereMock: vi.fn(),
@@ -44,7 +44,6 @@ vi.mock('../db/schema', () => ({
     result: 'dc.result',
     payload: 'dc.payload',
   },
-  users: { id: 'users.id', status: 'users.status' },
 }));
 vi.mock('./sensitiveCommandPayload', () => ({ terminalPayloadErasureSet: () => ({ payload: null }) }));
 vi.mock('./sentry', () => ({ captureException: (...a: unknown[]) => captureExceptionMock(...(a as [])) }));
@@ -68,7 +67,7 @@ const ORG = '22222222-2222-4222-8222-222222222222';
 const OTHER_ORG = '33333333-3333-4333-8333-333333333333';
 const USER = '44444444-4444-4444-8444-444444444444';
 const OTHER_USER = '55555555-5555-4555-8555-555555555555';
-const device = { id: 'd1', orgId: ORG, status: 'online' };
+const device = { id: 'd1', orgId: ORG, status: 'online', orgType: 'customer' };
 
 type Row = Parameters<typeof partitionClaimable>[2][number];
 const row = (over: Partial<Row> = {}): Row => ({
@@ -93,7 +92,9 @@ function tx() {
   updateMock.mockReturnValue({ set: (...a: unknown[]) => setMock(...(a as [])) });
   return {
     update: (...a: unknown[]) => updateMock(...(a as [])),
-    select: () => ({ from: () => ({ where: () => ({ limit: async () => userStatusMock() }) }) }),
+    // The requester gate runs one SQL function call inside a savepoint.
+    transaction: async (fn: (sp: unknown) => Promise<unknown>) =>
+      fn({ execute: async (q: unknown) => requesterActiveMock(q) }),
   } as never;
 }
 
@@ -101,7 +102,7 @@ describe('partitionClaimable (#5128 W1 §G)', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     assertAllowedMock.mockResolvedValue(undefined);
-    userStatusMock.mockResolvedValue([{ status: 'active' }]);
+    requesterActiveMock.mockResolvedValue([{ active: true }]);
     __resetTypeHoldsForTests();
     __resetEligibilityFaultThrottleForTests();
   });
@@ -149,6 +150,32 @@ describe('partitionClaimable (#5128 W1 §G)', () => {
     expect(r.claimable.map((x) => x.id)).toEqual(['c2']);
   });
 
+  it('a device parked in a holding org has every non-removal row cancelled', async () => {
+    const r = await partitionClaimable(tx(), { ...device, orgType: 'unassigned_pool' }, [
+      row(),
+      row({ id: 'c2', type: 'self_uninstall' }),
+      row({ id: 'c3', type: 'script', createdBy: USER }),
+      row({ id: 'c4', type: 'desktop_stream_stop' }),
+    ]);
+    expect(r.cancelled).toEqual([
+      { id: 'c1', reason: 'device_pending_assignment' },
+      { id: 'c3', reason: 'device_pending_assignment' },
+      { id: 'c4', reason: 'device_pending_assignment' },
+    ]);
+    expect(r.claimable.map((x) => x.id)).toEqual(['c2']);
+    // Refused before the trust, requester and revalidation checks run.
+    expect(assertAllowedMock).not.toHaveBeenCalled();
+    expect(requesterActiveMock).not.toHaveBeenCalled();
+  });
+
+  it('a device in an ordinary org is not affected by the holding-org rule', async () => {
+    for (const orgType of ['customer', 'internal', 'quick_support']) {
+      const r = await partitionClaimable(tx(), { ...device, orgType }, [row()]);
+      expect(r.claimable).toHaveLength(1);
+      expect(r.cancelled).toEqual([]);
+    }
+  });
+
   it('an offline or maintenance device is NOT a lifecycle cancellation', async () => {
     for (const status of ['offline', 'maintenance', 'updating', 'pending']) {
       const r = await partitionClaimable(tx(), { ...device, status }, [row()]);
@@ -183,22 +210,22 @@ describe('partitionClaimable (#5128 W1 §G)', () => {
   });
 
   it('cancels when the requesting user is no longer active', async () => {
-    userStatusMock.mockResolvedValue([{ status: 'disabled' }]);
+    requesterActiveMock.mockResolvedValue([{ active: false }]);
     const r = await partitionClaimable(tx(), device, [row({ createdBy: USER })]);
     expect(r.cancelled).toEqual([{ id: 'c1', reason: 'requester_inactive' }]);
   });
 
   it('cancels when the requesting user row is gone entirely', async () => {
-    userStatusMock.mockResolvedValue([]);
+    requesterActiveMock.mockResolvedValue([]);
     const r = await partitionClaimable(tx(), device, [row({ createdBy: USER })]);
     expect(r.cancelled).toEqual([{ id: 'c1', reason: 'requester_inactive' }]);
   });
 
   it('system-issued rows (created_by NULL) are never cancelled for an inactive requester', async () => {
-    userStatusMock.mockResolvedValue([{ status: 'disabled' }]);
+    requesterActiveMock.mockResolvedValue([{ active: false }]);
     const r = await partitionClaimable(tx(), device, [row({ createdBy: null })]);
     expect(r.claimable).toHaveLength(1);
-    expect(userStatusMock).not.toHaveBeenCalled();
+    expect(requesterActiveMock).not.toHaveBeenCalled();
   });
 
   it('the requester probe is cached per user across a batch', async () => {
@@ -208,7 +235,40 @@ describe('partitionClaimable (#5128 W1 §G)', () => {
       row({ id: 'c', createdBy: OTHER_USER }),
     ]);
     expect(r.claimable).toHaveLength(3);
-    expect(userStatusMock).toHaveBeenCalledTimes(2);
+    expect(requesterActiveMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('resolves the requester through the tenant-aware SQL resolver, keyed on the DEVICE org', async () => {
+    // A plain `SELECT status FROM users` under the agent's org-scoped RLS
+    // context cannot see a partner-level technician (org_id NULL), which read
+    // every technician as inactive. The resolver is the only sanctioned seam.
+    await partitionClaimable(tx(), device, [row({ createdBy: USER })]);
+    expect(requesterActiveMock).toHaveBeenCalledTimes(1);
+    const { sql: sqlText, params } = new PgDialect().sqlToQuery(requesterActiveMock.mock.calls[0]![0] as never);
+    expect(sqlText).toContain('public.breeze_command_requester_is_active(');
+    expect(params).toEqual([USER, ORG]);
+  });
+
+  it('a requester-resolver fault HOLDS the row (fail closed, recoverable) and spares siblings', async () => {
+    requesterActiveMock.mockImplementation(async (q: unknown) => {
+      const { params } = new PgDialect().sqlToQuery(q as never);
+      if (params[0] === USER) throw new Error('function breeze_command_requester_is_active does not exist');
+      return [{ active: true }];
+    });
+    const r = await partitionClaimable(tx(), device, [
+      row({ id: 'a', createdBy: USER }),
+      row({ id: 'b', createdBy: USER }),
+      row({ id: 'c', createdBy: OTHER_USER }),
+    ]);
+    expect(r.held).toEqual([
+      { id: 'a', reason: 'eligibility_check_failed' },
+      { id: 'b', reason: 'eligibility_check_failed' },
+    ]);
+    expect(r.cancelled).toEqual([]);
+    expect(r.claimable.map((x) => x.id)).toEqual(['c']);
+    // The fault is cached per user: one failing probe, not one per row.
+    expect(requesterActiveMock).toHaveBeenCalledTimes(2);
+    expect(updateMock).not.toHaveBeenCalled();
   });
 
   it('power-state rows are held while other work is claimable in the same batch', async () => {
@@ -375,7 +435,7 @@ describe('partitionClaimable (#5128 W1 §G)', () => {
     // machine next checks in. Cancelling it here leaves the agent installed on
     // a customer box the MSP has decided to stop managing — the same drain
     // core.ts protects with its ne(type,'self_uninstall') exclusion.
-    userStatusMock.mockResolvedValue([{ status: 'disabled' }]);
+    requesterActiveMock.mockResolvedValue([{ active: false }]);
     const r = await partitionClaimable(tx(), device, [
       row({ id: 'u', type: 'self_uninstall', createdBy: USER }),
       row({ id: 'other', createdBy: USER }),
@@ -395,7 +455,7 @@ describe('partitionClaimable (#5128 W1 §G)', () => {
     assertAllowedMock.mockRejectedValue(
       new TrustDeniedError('TRUST_RESTRICTED', 'suspended', 'd1', 'self_uninstall'),
     );
-    userStatusMock.mockResolvedValue([{ status: 'disabled' }]);
+    requesterActiveMock.mockResolvedValue([{ active: false }]);
 
     const r = await partitionClaimable(tx(), { ...device, status: 'decommissioned' }, [
       row({

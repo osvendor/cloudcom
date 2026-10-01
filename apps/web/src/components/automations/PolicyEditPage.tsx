@@ -11,6 +11,7 @@ import Breadcrumbs from '../layout/Breadcrumbs';
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
 import { useStableT } from '@/lib/i18n/useStableT';
+import { usePageItemName } from '../layout/usePageItemName';
 
 type Site = { id: string; name: string };
 type Group = { id: string; name: string };
@@ -202,6 +203,8 @@ export default function PolicyEditPage({ policyId, isNew = false }: PolicyEditPa
     void navigateTo('/policies');
   };
 
+  usePageItemName(defaultValues?.name);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
@@ -238,6 +241,7 @@ export default function PolicyEditPage({ policyId, isNew = false }: PolicyEditPa
         <a
           href="/policies"
           className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+          aria-label={t('policyEditPage.actions.backToPolicies')}
         >
           <ArrowLeft className="h-5 w-5" />
         </a>

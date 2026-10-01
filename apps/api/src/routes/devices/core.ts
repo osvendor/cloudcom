@@ -2,14 +2,13 @@ import { readEnrolledRustDeskId } from '../../services/cloudcom/remoteAccessEnro
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { optionalJsonValidator, zValidator } from '../../lib/validation';
-import { and, eq, gte, like, ne, sql, desc, inArray, type SQL } from 'drizzle-orm';
+import { and, asc, eq, gte, like, ne, sql, desc, inArray, type SQL } from 'drizzle-orm';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
 import { createHash, randomBytes } from 'crypto';
 import { getRedis } from '../../services/redis';
 import { invalidateOrgDeviceCount } from '../../services/agentOrgRateLimit';
 import {
   devices,
-  deviceCommands,
   deviceHardware,
   deviceHardwareHealth,
   deviceReliability,
@@ -22,8 +21,6 @@ import {
   organizations,
   users,
 } from '../../db/schema';
-import { terminalPayloadErasureSet } from '../../services/sensitiveCommandPayload';
-import { propagateCancelledDeviceCommands } from '../../services/commandCancelPropagation';
 import {
   authMiddleware,
   isInteractiveUserSession,
@@ -77,7 +74,7 @@ import {
   publishAgentCredentialRevocation,
 } from '../agentWs';
 import { terminateDeviceRemoteSessions, TEARDOWN_FAILED } from '../../services/remoteSessionTeardown';
-import { queueDeviceUninstall } from '../../services/deviceUninstallDrain';
+import { decommissionDeviceInTransaction } from '../../services/deviceDecommission';
 import { getDeviceUninstallStatus } from '../../services/deviceUninstallState';
 import { getGlobalEnrollmentSecret } from '../agents/enrollment';
 import { assertTtlWithinCap } from '../../services/enrollmentDefaults';
@@ -91,8 +88,13 @@ import { validateCustomFieldMap, INVALID_CUSTOM_FIELD_VALUE_MESSAGE } from '../.
 import { persistDeviceCustomFieldValues, type CustomFieldValueWrite } from '../../services/customFields/queries';
 import { schedulePeripheralPolicyDevice } from '../../jobs/peripheralJobs';
 import { requireCapability } from '../../services/partnerTrust';
+import {
+  isParkedDevice,
+  PARKED_DEVICE_COMMAND_REFUSAL_CODE,
+} from '../../services/unassignedPool/deliveryEligibility';
 
 
+import { notParkedDeviceCondition } from '../../services/unassignedPool/selectorPredicate';
 /**
  * Tables where linked_device_id (not device_id) references devices.id.
  * These get SET NULL rather than deleted during cascade.
@@ -262,6 +264,15 @@ export const DEVICE_DETACH_DEVICE_ID_TABLES = [
  * fragility applies the moment the two orgs sit under different partners.
  * It is listed in INTENTIONALLY_NO_ORG_ID in moveOrg.coverage.test.ts.
  *
+ * fix_outcomes is deliberately ABSENT too (AI Suggested Fixes W1): it has
+ * org_id and device_id but is cascade-deleted, not moved — identical
+ * reasoning to ai_agent_fix_watches: an attempt's proof belongs to the org it
+ * ran in, and its (org_id, partner_id) composite FK would 23503 on a
+ * cross-partner move. It is excluded from breeze_device_child_orgid_tables()
+ * by 2026-11-08-170000-fix-memory-tables.sql and listed in
+ * INTENTIONALLY_NO_ORG_ID in moveOrg.coverage.test.ts. The outcome sweeper
+ * cancels in-flight rows whose device left the org.
+ *
  * invoice_line_devices is deliberately ABSENT too (#3205 W07): it has both
  * org_id and device_id, but its org_id belongs to the INVOICE, which does not
  * move. Re-stamping it would break the (invoice_line_id, org_id) and
@@ -289,8 +300,9 @@ const CORE_DEVICE_ORG_DENORMALIZED_TABLES = [
   'agent_health_observations', 'agent_logs', 'ai_screenshots', 'ai_sessions', 'alerts', 'asset_checkouts',
   'audit_baseline_results', 'audit_policy_states',
   'automation_action_results', 'automation_run_device_results',
-  'backup_chains', 'backup_jobs', 'backup_sla_events', 'backup_snapshot_retirements',
-  'backup_snapshots', 'backup_verifications', 'bare_metal_recoveries',
+  'backup_chains', 'backup_jobs', 'backup_sla_events', 'backup_snapshot_attestations', 'backup_snapshot_id_reservations',
+  'backup_snapshot_retirements', 'backup_snapshots', 'backup_storage_session_uploads', 'backup_storage_sessions',
+  'backup_verifications', 'bare_metal_recoveries',
   'brain_device_context', 'browser_extensions', 'browser_policy_violations',
   'capacity_predictions',
   'cis_baseline_results', 'cis_remediation_actions',
@@ -303,11 +315,13 @@ const CORE_DEVICE_ORG_DENORMALIZED_TABLES = [
   'device_function_assessments',
   'device_group_memberships', 'device_hardware',
   'device_hardware_components', 'device_hardware_events', 'device_hardware_health',
-  'device_ip_history',
+  'device_ip_history', 'device_memory_modules',
   'device_metrics', 'device_mtls_certificates', 'device_network', 'device_patches',
   'device_process_samples', 'device_recovery_keys', 'device_registry_state',
   'agent_rollback_events', 'agent_rollback_directives',
   'device_reliability', 'device_reliability_history', 'device_sessions', 'device_software_inventory_state',
+  'device_time_daily',
+  'device_time_status',
   'device_vulnerabilities', 'device_warranty',
   'dns_event_aggregations', 'dns_security_events',
   'elevation_requests',
@@ -529,6 +543,16 @@ const CORE_DEVICE_CASCADE_DELETE_TABLES = [
   // recovery_tokens & backup_chains FK to backup_snapshots (no cascade),
   // so delete them first, then restore_jobs → backup_snapshots → backup_jobs
   'recovery_tokens', 'backup_chains',
+  // Brokered storage sessions reference the snapshot, the command and the
+  // device (executing = device_id; the snapshot's source device cascades by FK).
+  // A write session's multipart upload rows go first, then the session, then
+  // the snapshot id reservations it names (deleting a reservation tombstones
+  // its id).
+  'backup_storage_session_uploads',
+  'backup_storage_sessions',
+  // Snapshot attestations reference the snapshot, the job and the device.
+  'backup_snapshot_attestations',
+  'backup_snapshot_id_reservations',
   'restore_jobs', 'backup_verifications', 'backup_snapshots', 'backup_jobs', 'backup_snapshot_retirements',
   // Application backup & DR
   'sql_instances', 'local_vaults', 'hyperv_vms',
@@ -547,7 +571,9 @@ const CORE_DEVICE_CASCADE_DELETE_TABLES = [
   'device_hardware_components',
   'device_hardware_events',
   'device_hardware_health',
-  'device_network', 'device_ip_history', 'device_disks',
+  'device_time_daily',
+  'device_time_status',
+  'device_network', 'device_ip_history', 'device_disks', 'device_memory_modules',
   'device_metrics', 'device_software', 'device_registry_state', 'device_config_state',
   'device_commands', 'device_connections', 'device_boot_metrics',
   'device_sessions', 'device_change_log', 'device_warranty', 'device_vulnerabilities',
@@ -610,6 +636,10 @@ const CORE_DEVICE_CASCADE_DELETE_TABLES = [
   // company here — that table has no device_id column at all (org_id +
   // agent_id only), so it needs no entry in this device-cascade list.
   'ai_agent_fix_watches',
+  // AI Suggested Fixes W1 — attempt history for a deleted device goes with it
+  // (no device FK; leaf table). The org-cascade + rebuild keeps partner memory
+  // consistent on the next rebuild.
+  'fix_outcomes',
   // Analytics & reliability
   'device_reliability_history', 'device_reliability',
   'playbook_executions', 'time_series_metrics', 'capacity_predictions',
@@ -678,6 +708,9 @@ const ENROLL_TOKEN_MAX_TTL_MINUTES = 525_600; // 365 days
 const onboardingTokenSchema = z.object({
   count: z.unknown().optional(),
   ttlMinutes: z.number().int().min(1).max(ENROLL_TOKEN_MAX_TTL_MINUTES).optional(),
+  // #7035: the site the operator picked in the Add Device modal. Omitted →
+  // the org's oldest accessible site (deterministic; see below).
+  siteId: z.string().guid().optional(),
 }).strict();
 
 // POST /devices/onboarding-token - Generate a short-lived enrollment key.
@@ -754,25 +787,53 @@ coreRoutes.post(
     const capError = await assertTtlWithinCap(orgId, explicitTtlMinutes);
     if (capError) return c.json({ error: capError }, 400);
 
-    // Pick a site in the org for the enrollment key, intersecting the
-    // automatic choice with the caller's site ceiling. Partner/system callers
-    // and unrestricted organization callers have `allowedSiteIds` undefined.
-    const [site] = await db
-      .select({ id: sites.id })
-      .from(sites)
-      .where(and(
-        eq(sites.orgId, orgId),
-        permissions.allowedSiteIds
-          ? inArray(sites.id, permissions.allowedSiteIds)
-          : undefined,
-      ))
-      .limit(1);
-
-    if (!site) {
-      if (permissions.allowedSiteIds) {
-        return c.json({ error: 'No accessible site is available for onboarding.' }, 403);
+    // #7035: an explicitly requested site wins. Mirrors POST /enrollment-keys:
+    // a restricted caller gets an opaque 403 for any site outside its
+    // allowlist (checked before the lookup, so a sibling-site UUID can't be
+    // probed), and the site must belong to the resolved org.
+    let siteId: string;
+    if (data.siteId) {
+      if (permissions.allowedSiteIds && !permissions.allowedSiteIds.includes(data.siteId)) {
+        return c.json({ error: 'Access to this site denied' }, 403);
       }
-      return c.json({ error: 'No site found for this organization. Create a site first.' }, 400);
+      const [site] = await db
+        .select({ id: sites.id })
+        .from(sites)
+        .where(and(eq(sites.id, data.siteId), eq(sites.orgId, orgId)))
+        .limit(1);
+      if (!site) {
+        if (permissions.allowedSiteIds) {
+          return c.json({ error: 'Access to this site denied' }, 403);
+        }
+        return c.json({ error: 'siteId does not belong to the specified org' }, 400);
+      }
+      siteId = site.id;
+    } else {
+      // No site requested (first-run setup, script clients): fall back to the
+      // org's OLDEST site the caller may use — created_at, then id as a
+      // tiebreak — the same default mintChildEnrollmentKey applies. Before
+      // #7035 this had no ORDER BY, so a multi-site org's key landed on
+      // whatever row Postgres returned first. Partner/system callers and
+      // unrestricted organization callers have `allowedSiteIds` undefined.
+      const [site] = await db
+        .select({ id: sites.id })
+        .from(sites)
+        .where(and(
+          eq(sites.orgId, orgId),
+          permissions.allowedSiteIds
+            ? inArray(sites.id, permissions.allowedSiteIds)
+            : undefined,
+        ))
+        .orderBy(asc(sites.createdAt), asc(sites.id))
+        .limit(1);
+
+      if (!site) {
+        if (permissions.allowedSiteIds) {
+          return c.json({ error: 'No accessible site is available for onboarding.' }, 403);
+        }
+        return c.json({ error: 'No site found for this organization. Create a site first.' }, 400);
+      }
+      siteId = site.id;
     }
 
     const ttlMinutes = explicitTtlMinutes
@@ -784,7 +845,7 @@ coreRoutes.post(
 
     await db.insert(enrollmentKeys).values({
       orgId,
-      siteId: site.id,
+      siteId,
       name: `Onboarding token (${new Date().toISOString().slice(0, 10)})`,
       key: keyHash,
       maxUsage,
@@ -798,6 +859,8 @@ coreRoutes.post(
     return c.json({
       token: key,
       maxUsage,
+      // #7035: echo the bound site so the UI can say where devices will land.
+      siteId,
       expiresAt: expiresAt.toISOString(),
       enrollmentSecretMode: secretRequired ? 'global_env' : 'none',
       additionalSecretRequired: secretRequired,
@@ -869,7 +932,7 @@ coreRoutes.get(
     // Quick Support devices live in the partner's hidden 'quick_support' org,
     // which deliberately stays inside accessibleOrgIds so RLS lets a tech reach
     // their own session. Nothing filters them out for us — exclude explicitly.
-    conditions.push(eq(devices.isEphemeral, false));
+    conditions.push(eq(devices.isEphemeral, false), notParkedDeviceCondition());
 
     // Org access — uses pre-computed accessibleOrgIds from auth.
     const orgFilter = auth.orgCondition(devices.orgId);
@@ -953,9 +1016,6 @@ coreRoutes.get(
     if (query.search) {
       conditions.push(like(devices.hostname, `%${query.search}%`));
     }
-    if (query.hardwareHealth) {
-      conditions.push(eq(deviceHardwareHealth.health, query.hardwareHealth));
-    }
 
     // Exclude decommissioned by default unless explicitly requested.
     if (!query.status && query.includeDecommissioned !== 'true') {
@@ -981,7 +1041,6 @@ coreRoutes.get(
       const countResult = await db
         .select({ count: sql<number>`count(*)` })
         .from(devices)
-        .leftJoin(deviceHardwareHealth, eq(devices.id, deviceHardwareHealth.deviceId))
         .where(whereCondition);
       total = Number(countResult[0]?.count ?? 0);
     }
@@ -1077,7 +1136,21 @@ coreRoutes.get(
         // RDS per-session helpers (plan 2 heartbeat ingest) — UI hint only,
         // see the truthy-guard comment in heartbeat.ts. Tasks 13/14 gate the
         // session picker on this being 'on-demand' at the list-row level.
-        helperLifecycleMode: devices.helperLifecycleMode
+        helperLifecycleMode: devices.helperLifecycleMode,
+        // #6449 — why the server is withholding update offers from this
+        // device; drives the "update withheld" list badge.
+        updateOfferWithheldReason: devices.updateOfferWithheldReason,
+        // #4073 — the agent self-update currently being attempted; drives
+        // the "update stuck" list badge (#7068).
+        updateAttemptTargetVersion: devices.updateAttemptTargetVersion,
+        updateAttemptStartedAt: devices.updateAttemptStartedAt,
+        updateAttemptLastAt: devices.updateAttemptLastAt,
+        // #6925 — agent-reported Breeze Assist install problem; drives the
+        // "Assist enabled but not installed" list badge (#7023).
+        helperInstallIssue: devices.helperInstallIssue,
+        // #7067 — latest agent-logs ingest time; drives the "logs silent"
+        // list badge.
+        lastLogAt: devices.lastLogAt
       })
       .from(devices)
       .leftJoin(deviceHardware, eq(devices.id, deviceHardware.deviceId))
@@ -1279,6 +1352,16 @@ coreRoutes.get(
         hardwareHealth: d.hardwareHealth ?? null,
         hardwareHealthSummary: d.hardwareHealthSummary ?? null,
         helperLifecycleMode: d.helperLifecycleMode ?? null,
+        // Selected above but historically the mapper is where list fields
+        // get silently dropped (#800/#1273/#2138/#5701) — the #7068 stuck-
+        // update and #7023 Assist-install-issue list badges hit the same
+        // failure mode.
+        updateOfferWithheldReason: d.updateOfferWithheldReason ?? null,
+        updateAttemptTargetVersion: d.updateAttemptTargetVersion ?? null,
+        updateAttemptStartedAt: d.updateAttemptStartedAt ?? null,
+        updateAttemptLastAt: d.updateAttemptLastAt ?? null,
+        helperInstallIssue: d.helperInstallIssue ?? null,
+        lastLogAt: d.lastLogAt ?? null,
         metrics: latestMetrics
           ? {
             cpuPercent: latestMetrics.cpuPercent,
@@ -1565,16 +1648,33 @@ export async function checkRemoteAccessLauncherAvailabilityForDevice(
   return checkRemoteAccessLaunchAvailability({ customFields, enrolledRustDeskId }, providers, preferredProviderId);
 }
 
+/** Thrown by the launcher issuance for a device parked in a holding org. */
+export class RemoteAccessLaunchParkedDeviceError extends Error {
+  readonly code = PARKED_DEVICE_COMMAND_REFUSAL_CODE;
+  constructor(readonly deviceId: string) {
+    super('This device is waiting to be assigned to an organization; remote access is unavailable until then');
+    this.name = 'RemoteAccessLaunchParkedDeviceError';
+  }
+}
+
 /**
  * Issuance: resolves (and returns) the substituted, credential-bearing
  * launch URL. Only POST /devices/:id/remote-access-launch may call this.
+ *
+ * Refuses a device parked in its partner's holding org before any provider
+ * settings are read or any password decrypted (throws
+ * RemoteAccessLaunchParkedDeviceError). Exported for the real-DB proof.
  */
-async function resolveRemoteAccessLauncherForDevice(
+export async function resolveRemoteAccessLauncherForDevice(
+  deviceId: string,
   orgId: string,
   customFields: Record<string, unknown> | null,
   auth?: AuthContext,
   deviceId?: string,
 ): Promise<RemoteAccessLaunchResult> {
+  if (await isParkedDevice(db, deviceId)) {
+    throw new RemoteAccessLaunchParkedDeviceError(deviceId);
+  }
   const { providers, preferredProviderId } = await loadRemoteAccessLauncherContext(orgId, auth);
   const enrolledRustDeskId = await readEnrolledRustDeskId(deviceId, orgId, providers);
   return resolveRemoteAccessLaunch({ customFields, enrolledRustDeskId }, providers, preferredProviderId);
@@ -1612,12 +1712,16 @@ coreRoutes.post(
     let launcher: RemoteAccessLaunchResult;
     try {
       launcher = await resolveRemoteAccessLauncherForDevice(
+        deviceId,
         device.orgId,
         device.customFields as Record<string, unknown> | null,
         auth,
         deviceId,
       );
     } catch (err) {
+      if (err instanceof RemoteAccessLaunchParkedDeviceError) {
+        return c.json({ error: err.message, code: err.code }, 403);
+      }
       captureException(err, c);
       console.error(`[RemoteAccessLaunch] Failed to resolve launcher for ${deviceId}:`, err);
       return c.json({ error: 'Failed to resolve remote-access launcher', code: 'config_error' }, 500);
@@ -1900,6 +2004,16 @@ coreRoutes.post(
       device.agentTokenHash,
       device.previousTokenHash,
       device.pendingTokenHash,
+      // The route comment (and #2621's design) call this the incident-response
+      // revocation path: it ends every credential the device holds. A device's
+      // watchdog and helper roles authenticate with their OWN live hashes
+      // (independent of agentTokenHash), so they are revoked here too — watchdog
+      // heartbeat/commands/logs and the helper surface stop accepting the old
+      // tokens along with the agent's.
+      device.watchdogTokenHash,
+      device.previousWatchdogTokenHash,
+      device.helperTokenHash,
+      device.previousHelperTokenHash,
     ].filter((hash): hash is string => typeof hash === 'string');
 
     const [updated] = await db
@@ -1917,6 +2031,19 @@ coreRoutes.post(
         pendingWatchdogTokenHash: null,
         pendingHelperTokenHash: null,
         pendingTokenExpiresAt: null,
+        // Null (not re-key) the watchdog/helper roles: they have no admin-
+        // facing "new token" to hand back, and the agent's own periodic
+        // rotation (agentTokenPromotion.ts / routes/agents/token.ts) mints and
+        // stages fresh ones for both roles the next time the main agent
+        // authenticates with its new credential.
+        watchdogTokenHash: null,
+        watchdogTokenIssuedAt: null,
+        previousWatchdogTokenHash: null,
+        previousWatchdogTokenExpiresAt: null,
+        helperTokenHash: null,
+        helperTokenIssuedAt: null,
+        previousHelperTokenHash: null,
+        previousHelperTokenExpiresAt: null,
         updatedAt: new Date()
       })
       .where(eq(devices.id, deviceId))
@@ -1950,7 +2077,19 @@ coreRoutes.post(
     return c.json({
       deviceId,
       agentId: updated?.agentId ?? device.agentId,
-      authToken: newToken
+      authToken: newToken,
+      // Watchdog/helper credentials are revoked here but not replaced in this
+      // response — the device has no admin-facing "new token" for either
+      // role. Both are only re-issued when the main agent next reconnects
+      // with its new token and the server's existing self-heal rotation runs
+      // (heartbeat -> rotate-token -> confirm/implicit promotion). Surface
+      // that plainly so an operator doesn't read watchdog failover or Helper
+      // access as broken.
+      watchdogHelperRecovery: {
+        status: 'pending_agent_reconnect',
+        message:
+          'Watchdog and Helper access are revoked immediately, but recovery is unavailable until the main agent reconnects and completes its next credential rotation.',
+      },
     });
   }
 );
@@ -1992,85 +2131,13 @@ coreRoutes.delete(
     let updated: typeof devices.$inferSelect | undefined;
     let uninstallQueued = false;
     await db.transaction(async (tx) => {
-      const [row] = await tx
-        .update(devices)
-        .set({
-          status: 'decommissioned',
-          // #2787 item 4 — the window the `device_lifecycle` retention policy
-          // measures ("purge removed devices after N days") starts HERE.
-          // `updatedAt` cannot serve: every unrelated write to the row
-          // afterwards would push the purge date out. Cleared again on Restore.
-          decommissionedAt: new Date(),
-          updatedAt: new Date()
-        })
-        .where(eq(devices.id, deviceId))
-        .returning();
-      updated = row;
-
-      // #5128 — cancel this device's ordinary queued work in the SAME
-      // transaction as the status write. `self_uninstall` is explicitly
-      // EXCLUDED: the uninstall drain's whole purpose is to survive
-      // decommission and deliver when the machine next checks in, and
-      // `queueDeviceUninstall` below may be about to write exactly such a row.
-      // Claim-time eligibility refuses to deliver ordinary work to a
-      // decommissioned device anyway; this is what stops those rows sitting
-      // `pending` until their deadline.
-      // Read id/type/payload BEFORE the erasing UPDATE: the propagation below
-      // keys on `payload.executionId`, which `terminalPayloadErasureSet()` strips.
-      const cancelledOnDecommission = await tx
-        .select({
-          id: deviceCommands.id,
-          type: deviceCommands.type,
-          payload: deviceCommands.payload,
-        })
-        .from(deviceCommands)
-        .where(
-          and(
-            eq(deviceCommands.deviceId, deviceId),
-            eq(deviceCommands.status, 'pending'),
-            ne(deviceCommands.type, 'self_uninstall'),
-          ),
-        );
-
-      const decommissionCancelledAt = new Date();
-      await tx
-        .update(deviceCommands)
-        .set({
-          status: 'cancelled',
-          completedAt: decommissionCancelledAt,
-          result: {
-            status: 'cancelled',
-            reason: 'device_decommissioned',
-            cancelledBy: 'device_decommission',
-          },
-          ...terminalPayloadErasureSet(),
-        })
-        .where(
-          and(
-            eq(deviceCommands.deviceId, deviceId),
-            eq(deviceCommands.status, 'pending'),
-            ne(deviceCommands.type, 'self_uninstall'),
-          ),
-        );
-
-      // Terminalise the OWNING records in the same transaction — otherwise a
-      // cancelled command strands its script_executions / deployment_results
-      // row `pending` forever (the command reaper only scans pending/sent
-      // COMMANDS, and this one is already terminal).
-      await propagateCancelledDeviceCommands(
-        cancelledOnDecommission.map((row) => ({
-          id: row.id,
-          type: row.type,
-          payload: row.payload as Record<string, unknown> | null,
-        })),
-        decommissionCancelledAt,
-        tx,
-      );
-
-      if (uninstallAgent) {
-        const queueResult = await queueDeviceUninstall(tx, deviceId, auth.user.id);
-        uninstallQueued = queueResult.queued || queueResult.mergedIntoExisting;
-      }
+      const outcome = await decommissionDeviceInTransaction(tx, {
+        deviceId,
+        queueUninstall: uninstallAgent,
+        actorUserId: auth.user.id,
+      });
+      updated = outcome.updated;
+      uninstallQueued = outcome.uninstallQueued;
     });
 
     // Resolve any "possible replacement of THIS device" linkage now that the
@@ -2239,6 +2306,7 @@ coreRoutes.delete(
     // #2787 review — omits the whole spread while the dissolve ran anyway.
     let linkGroupId: string | null = null;
     let linkGroupDissolved = false;
+    let removedTopologyAlerts = 0;
 
     // Delegated to `purgeRemovedDevice` (services/deviceLifecycle.ts) since
     // #2787 — one implementation shared with POST /devices/bulk/permanent-delete
@@ -2300,6 +2368,7 @@ coreRoutes.delete(
       );
       linkGroupId = purge.linkGroupId;
       linkGroupDissolved = purge.linkGroupDissolved;
+      removedTopologyAlerts = purge.removedTopologyAlerts;
     } catch (err: unknown) {
       if (err instanceof DeviceLifecycleError) {
         return c.json({ error: err.message, code: err.code }, err.status);
@@ -2369,6 +2438,9 @@ coreRoutes.delete(
         // trail would show only "device deleted" while sibling devices
         // silently lost their grouping.
         ...(linkGroupId ? { linkGroupId, linkGroupDissolved } : {}),
+        // Site-owned topology alerts this device originated (M3-D6) — after a
+        // move-org they belong to ANOTHER org, so record that they went.
+        ...(removedTopologyAlerts > 0 ? { removedTopologyAlerts } : {}),
       }
     });
 

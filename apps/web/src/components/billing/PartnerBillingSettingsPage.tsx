@@ -6,7 +6,10 @@ import { runAction, handleActionError } from '../../lib/runAction';
 import { pctFromFraction } from './invoiceTypes';
 import { isHttpUrl, parseCompanyContact, parseCompanyAddress, isCompanyAddressBlank } from '@breeze/shared';
 import { resetPartnerCurrencyCache } from '@/lib/partnerCurrencyCache';
+import { usePermissions } from '../../lib/permissions';
 import { useHashTab } from '../../lib/useHashState';
+import { OverflowTabs, overflowPanelId, overflowTabId, type OverflowTab } from '../shared/OverflowTabs';
+import AccessDenied from '../shared/AccessDenied';
 import BillingDefaultsTab from './BillingDefaultsTab';
 import BillingDocumentsTab from './BillingDocumentsTab';
 import BillingConnectionsTab from './BillingConnectionsTab';
@@ -36,7 +39,11 @@ export default function PartnerBillingSettingsPage() {
   const { t } = useTranslation('billing');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
+  const [denied, setDenied] = useState(false);
   const [saving, setSaving] = useState(false);
+  // Same grant the PATCH /partner/billing-settings route requires (invoices:write).
+  const { can } = usePermissions();
+  const canWrite = can('invoices', 'write');
   const [activeTab, setActiveTab] = useHashTab<BillingTab>(BILLING_TABS, 'defaults');
 
   const [currencyCode, setCurrencyCode] = useState('USD');
@@ -69,9 +76,11 @@ export default function PartnerBillingSettingsPage() {
   const load = useCallback(async () => {
     setLoading(true);
     setLoadError(false);
+    setDenied(false);
     try {
       const res = await fetchWithAuth('/orgs/partners/me');
       if (res.status === 401) return UNAUTHORIZED();
+      if (res.status === 403) { setDenied(true); return; }
       if (!res.ok) throw new Error('load failed');
       const p = (await res.json()) as PartnerBilling;
       setCurrencyCode(p.currencyCode ?? 'USD');
@@ -114,7 +123,7 @@ export default function PartnerBillingSettingsPage() {
   const websiteInvalid = websiteTrimmed !== '' && !isHttpUrl(websiteTrimmed);
 
   const save = useCallback(async () => {
-    if (saving || websiteInvalid) return;
+    if (saving || websiteInvalid || !canWrite) return;
     setSaving(true);
     try {
       const pct = taxPercent.trim();
@@ -156,10 +165,12 @@ export default function PartnerBillingSettingsPage() {
     } finally {
       setSaving(false);
     }
-  }, [saving, websiteInvalid, currencyCode, taxPercent, prefix, termsDays, autoEmailInvoice, notifyOnBehalfAcceptance, deviceAppendix,
+  }, [saving, websiteInvalid, canWrite, currencyCode, taxPercent, prefix, termsDays, autoEmailInvoice, notifyOnBehalfAcceptance, deviceAppendix,
       footer, documentTheme, documentPageSize, companyName, phone, website, addr1, addr2, city, region, postal, country, terms, load, t]);
 
   if (loading) return <p className="text-sm text-muted-foreground">{t('partnerBillingSettings.loading')}</p>;
+  // A 403 is a permission state, not a transient failure — no Retry.
+  if (denied) return <AccessDenied testId="partner-billing-denied" />;
   if (loadError) {
     return (
       <div className="rounded-lg border bg-card p-6 text-sm text-muted-foreground" data-testid="partner-billing-load-error">
@@ -177,31 +188,49 @@ export default function PartnerBillingSettingsPage() {
     { id: 'connections', labelKey: 'partnerBillingSettingsTabs.connections' },
   ];
   const renderedTabs = TABS.filter((tab) => !tab.reserved);
+  const overflowTabs: OverflowTab[] = renderedTabs.map((tab) => ({
+    id: tab.id,
+    label: t(/* i18n-dynamic */ tab.labelKey),
+    icon: null,
+  }));
 
   return (
     <div className="space-y-6" data-testid="partner-billing-settings">
-      <div role="tablist" className="flex gap-1 border-b" data-testid="billing-settings-tabs">
-        {renderedTabs.map((tab) => (
-          <button
-            key={tab.id} type="button" role="tab" aria-selected={activeTab === tab.id}
-            onClick={() => { window.location.hash = tab.id; setActiveTab(tab.id); }}
-            data-testid={`billing-settings-tab-${tab.id}`}
-            className={activeTab === tab.id ? 'border-b-2 border-primary px-4 py-2 text-sm font-medium -mb-px' : 'border-b-2 border-transparent px-4 py-2 text-sm font-medium text-muted-foreground -mb-px'}
-          >
-            {t(/* i18n-dynamic */ tab.labelKey)}
-          </button>
-        ))}
+      <div data-testid="billing-settings-tabs">
+        <OverflowTabs
+          tabs={overflowTabs}
+          activeTab={activeTab}
+          onTabChange={(id) => { window.location.hash = id; setActiveTab(id as BillingTab); }}
+          testIdPrefix="billing-settings-tab-"
+        />
       </div>
 
+      {/* Exactly one tab block renders at a time, so a single wrapper always
+          matches the active tab button's aria-controls (axe: aria-valid-attr-value). */}
+      <div
+        role="tabpanel"
+        id={overflowPanelId(activeTab, 'billing-settings-tab-')}
+        aria-labelledby={overflowTabId(activeTab, 'billing-settings-tab-')}
+        tabIndex={-1}
+        className="space-y-6"
+      >
+      {!canWrite && (activeTab === 'defaults' || activeTab === 'documents') && (
+        <p className="rounded-md border bg-muted/40 px-3 py-2 text-sm text-muted-foreground" data-testid="partner-billing-readonly">
+          {t('partnerBillingSettings.readOnlyNotice')}
+        </p>
+      )}
       {activeTab === 'defaults' && (
+        <fieldset disabled={!canWrite} className="min-w-0 border-0 p-0 m-0">
         <BillingDefaultsTab
           currencyCode={currencyCode} setCurrencyCode={setCurrencyCode}
           taxPercent={taxPercent} setTaxPercent={setTaxPercent}
           prefix={prefix} setPrefix={setPrefix}
           termsDays={termsDays} setTermsDays={setTermsDays}
         />
+        </fieldset>
       )}
       {activeTab === 'documents' && (
+        <fieldset disabled={!canWrite} className="min-w-0 border-0 p-0 m-0">
         <BillingDocumentsTab
           autoEmailInvoice={autoEmailInvoice} setAutoEmailInvoice={setAutoEmailInvoice}
           notifyOnBehalfAcceptance={notifyOnBehalfAcceptance} setNotifyOnBehalfAcceptance={setNotifyOnBehalfAcceptance}
@@ -219,11 +248,13 @@ export default function PartnerBillingSettingsPage() {
           inheritedCompanyName={inheritedCompanyName}
           inheritedPhone={inheritedPhone} inheritedWebsite={inheritedWebsite} inheritedAddress={inheritedAddress}
         />
+        </fieldset>
       )}
       {activeTab === 'rates' && <BillingRatesTab currencyCode={currencyCode} />}
       {activeTab === 'connections' && <BillingConnectionsTab />}
+      </div>
 
-      {activeTab !== 'rates' && activeTab !== 'connections' && <div className="flex justify-end">
+      {canWrite && activeTab !== 'rates' && activeTab !== 'connections' && <div className="flex justify-end">
         <button
           type="button" onClick={() => void save()} disabled={saving || websiteInvalid}
           data-testid="partner-billing-save"

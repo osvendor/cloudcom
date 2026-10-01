@@ -306,6 +306,11 @@
     "indexPlaceholder": "breeze-logs",
     "description": "Cuando esté habilitado, todas las organizaciones secundarias enviarán registros de eventos al punto final configurado. Funciona con cualquier tienda <bulk>_bulk</bulk> compatible con Elasticsearch/OpenSearch (Elasticsearch, OpenSearch, indexador Wazuh, AWS OpenSearch Service). Déjelo deshabilitado para permitir que cada organización se configure individualmente."
   },
+  "savedSecret": {
+    "savedPlaceholder": "Guardado: déjelo en blanco para conservarlo",
+    "removedPlaceholder": "Se eliminará al guardar",
+    "remove": "Quitar"
+  },
   "agentVersionPins": {
     "title": "Actualizar destinos de versión",
     "description": "Fije el agente y el perro guardián a una versión registrada específica, o déjelo en <strong>Latest promocionado</strong> para realizar un seguimiento de la versión promocionada globalmente. El agente y el organismo de control son independientes.",
@@ -534,7 +539,7 @@
       "saveFailed": "No se pudo cambiar esta configuración",
       "remediation": {
         "title": "Correcciones sugeridas",
-        "description": "Sugerencias de corrección generadas por IA en la página de detalle de la alerta. Es el valor predeterminado para cada organización; una organización puede anularlo en su propia pestaña de IA.",
+        "description": "Sugerencias de corrección en la página de detalle de la alerta, basadas en sus scripts, plantillas y playbooks. Es el valor predeterminado para cada organización; una organización puede anularlo en su propia pestaña de IA.",
         "enabled": "Generar correcciones sugeridas",
         "enabledDescription": "Permite a los técnicos generar correcciones sugeridas para una alerta desde su página de detalle."
       }
@@ -853,6 +858,7 @@
     "hideExpired": "Ocultar caducado",
     "deleteExpired": "Eliminar caducado",
     "shortCode": "código corto",
+    "shortCodeHidden": "Oculto: requiere permiso de inscripción",
     "installerUsage": "Dispositivos del instalador {{consumed}} / {{max}}",
     "installerUsageExpired": "Dispositivos del instalador {{consumed}} / {{max}} (expirado)",
     "installerUsageMixed": "Dispositivos del instalador {{liveConsumed}} / {{liveMax}} activos · {{expired}} expirados",
@@ -1073,8 +1079,19 @@
       "3": "L3 — biométrico + PIN",
       "4": "L4 — llave de hardware + PIN"
     },
+    "unreachableLevelHint": "Los niveles que un dispositivo de aprobación no puede alcanzar para un nivel de riesgo no están disponibles.",
     "requireEnrollment": "Requerir un dispositivo de aprobación inscrito (aplicar: bloquear aprobaciones no aseguradas)",
+    "enforcement": {
+      "inherit": "Predeterminado de la plataforma",
+      "required": "Obligatorio",
+      "notRequired": "No obligatorio",
+      "inheritedValue": "Predeterminado de la plataforma: se requiere un dispositivo de aprobación para las aprobaciones de riesgo alto y crítico a partir del {{date}}.",
+      "inheritedSource": "Lo establece la plataforma porque aquí no se guardó ninguna opción. Elija Obligatorio o No obligatorio para reemplazarlo.",
+      "requiredHint": "Obligatorio se aplica a todos los niveles de riesgo a partir de la fecha indicada abajo.",
+      "notRequiredHint": "Las aprobaciones por debajo del mínimo se permiten y se registran como degradadas."
+    },
     "enforceFrom": "Aplicar desde (corte de ventana de gracia)",
+    "enforceFromHint": "Déjelo en blanco para aplicarlo de inmediato.",
     "toasts": {
       "saved": "Política de seguridad de aprobación guardada."
     },
@@ -1272,6 +1289,7 @@
       "usernamePlaceholder": "elástico",
       "password": "Contraseña",
       "passwordPlaceholder": "Ingrese la contraseña",
+      "savedSecretPlaceholder": "Guardado: déjelo en blanco para conservarlo",
       "credentialsDescription": "Las credenciales se almacenan cifradas. Las credenciales existentes se enmascaran cuando se cargan."
     },
     "collection": {
@@ -1318,7 +1336,8 @@
     "webhooks": {
       "title": "Notificaciones de webhook",
       "placeholder": "https://api.example.com/alerts",
-      "empty": "No hay webhooks configurados."
+      "empty": "No hay webhooks configurados.",
+      "savedEntry": "Webhook guardado (URL oculta)"
     },
     "preferences": {
       "title": "Preferencias de notificación",
@@ -3418,7 +3437,8 @@
     "tryAdjustingYourSearchOrFilters": "Intente ajustar su búsqueda o filtros.",
     "active": "Activo",
     "revoked": "Revocado",
-    "expired": "Vencido"
+    "expired": "Vencido",
+    "statusFilterLabel": "Estado de la clave"
   },
   "apiKeysPage": {
     "loadingAPIKeys": "Cargando claves API...",
@@ -3822,7 +3842,9 @@
     "verifyYourIdentity": "Verifica tu identidad",
     "thisAccountSignsInThroughAnIdentityProviderAndHasNoPassw": "Esta cuenta inicia sesión mediante un proveedor de identidad y no tiene contraseña. Vuelve a verificarte con tu proveedor para comenzar a configurar una aplicación de autenticación.",
     "verifyWithYourIdentityProvider": "Verificar con tu proveedor de identidad",
-    "ssoReauthProofExpired": "Tu verificación con el proveedor de identidad venció. Verifícate de nuevo para terminar de configurar tu aplicación de autenticación."
+    "ssoReauthProofExpired": "Tu verificación con el proveedor de identidad venció. Verifícate de nuevo para terminar de configurar tu aplicación de autenticación.",
+    "ssoReauthManageHint": "Esta cuenta inicia sesión mediante un proveedor de identidad y no tiene contraseña. Verifícate con tu proveedor para confirmar este cambio.",
+    "ssoReauthManageVerified": "Identidad verificada con tu proveedor. Completa el paso siguiente para confirmar este cambio."
   },
   "pax8CatalogDrawer": {
     "importFromPax8": "Importar desde Pax8",
@@ -3939,7 +3961,11 @@
     "passkeyStepUpVerificationExpired": "La verificación expiró. Vuelve a verificar.",
     "passkeyRegistrationServerError": "No se pudo registrar la clave de acceso. Vuelve a intentarlo.",
     "deletePasskeyVerifyHeading": "Verificar para eliminar una clave de acceso",
-    "deletePasskeyVerifyHint": "Ingresa aquí un código MFA actual antes de eliminar una de las claves de acceso anteriores. Este código no afecta la adición de una nueva clave de acceso."
+    "deletePasskeyVerifyHint": "Ingresa aquí un código MFA actual antes de eliminar una de las claves de acceso anteriores. Este código no afecta la adición de una nueva clave de acceso.",
+    "ssoReauthManageProofExpired": "La verificación con tu proveedor de identidad expiró. Vuelve a verificarte para confirmar este cambio.",
+    "verifyWithIdpToDeletePasskey": "Esta cuenta no tiene contraseña. Verifícate con tu proveedor de identidad antes de quitar una clave de acceso.",
+    "deletePasskeySsoReauth": "Verificar identidad para quitar una clave de acceso",
+    "deletePasskeySsoVerified": "Identidad verificada. Elige Eliminar en la clave de acceso que quieres quitar."
   },
   "roleManager": {
     "roles": "Roles",
@@ -4007,13 +4033,18 @@
     "createANewCustomRoleBasedOnThisOne": "Cree un nuevo rol personalizado basado en este.",
     "saving": "Guardando...",
     "cloneRole2": "Función de clonación",
+    "mfaRequired": "MFA obligatoria",
+    "mfaRequiredTooltip": "Los miembros de este rol deben configurar la autenticación multifactor.",
+    "requireMfaForThisRole": "Exigir MFA para este rol",
+    "requireMfaForThisRoleHelp": "Los miembros con este rol deben configurar la autenticación multifactor antes de poder usar Breeze.",
     "saveChanges": "Guardar cambios",
     "deleting": "Eliminando...",
     "networkErrorLoadingPermissions": "Error de red al cargar permisos",
     "cannotDeleteAssignedRole": "No se puede eliminar el rol con usuarios asignados",
     "inheritedFromParentRole": "Heredado del rol de padre",
     "waitingForPermissionCatalog": "Esperando a que se cargue el catálogo de permisos",
-    "summary": "{{filtered}} de {{total}} roles"
+    "summary": "{{filtered}} de {{total}} roles",
+    "typeFilterLabel": "Tipo de rol"
   },
   "roleSelector": {
     "currentRole": "Rol actual",
@@ -4062,6 +4093,9 @@
     "thisOrganization": "esta organización",
     "partnerTechnicianLogin": "Socio (inicio de sesión de técnico)",
     "yourOwnTeamSignsInWithThis": "(su propio equipo inicia sesión con esto)",
+    "selectAnOrganizationToCreateAnOrgProvider": "Selecciona una organización en el selector de organizaciones para crear un proveedor para esa organización.",
+    "partnerProviderRequiresFullPartnerAccess": "Los proveedores para todo el socio requieren acceso a todas las organizaciones.",
+    "selectAnOrganizationBeforeCreatingAProvider": "Selecciona una organización en el selector de organizaciones antes de crear un proveedor.",
     "basicInformation": "Información básica",
     "providerName": "Nombre del proveedor",
     "eGOktaProduction": "por ejemplo, Okta Production",
@@ -4138,7 +4172,8 @@
     "delete": "Eliminar",
     "allStatuses": "Todos los estados",
     "deactivate": "Desactivar",
-    "activate": "Activar"
+    "activate": "Activar",
+    "statusFilterLabel": "Estado del proveedor"
   },
   "ssoProvidersPage": {
     "failedToFetchSSOProviders": "No se pudieron recuperar los proveedores SSO",
@@ -4168,6 +4203,7 @@
     "failedToDeleteProvider": "No se pudo eliminar el proveedor",
     "anErrorOccurred": "Se produjo un error",
     "failedToSaveProvider": "No se pudo guardar el proveedor",
+    "providerNeedsOrganization": "Selecciona una organización en el selector de organizaciones, o configura «Se aplica a» como «Socio (inicio de sesión de técnico)» para crear un proveedor para todo el socio.",
     "addSSOProvider": "Agregar proveedor SSO",
     "editSSOProvider": "Editar proveedor SSO",
     "configureANewSSOProviderForYourOrganization": "Configure un nuevo proveedor SSO para su organización.",
@@ -4696,7 +4732,7 @@
         "killSwitch": "El operador desactivó la detección de anomalías para toda la plataforma. Esta configuración tendrá efecto cuando se vuelva a activar.",
         "remediation": {
           "title": "Correcciones sugeridas",
-          "description": "Sugerencias de corrección generadas por IA para las alertas de esta organización. En blanco significa que se aplica el valor predeterminado del partner.",
+          "description": "Sugerencias de corrección para las alertas de esta organización, basadas en sus scripts, plantillas y playbooks. En blanco significa que se aplica el valor predeterminado del partner.",
           "enabled": "Generar correcciones sugeridas",
           "enabledDescription": "Permite a los técnicos generar correcciones sugeridas para una alerta desde su página de detalle.",
           "killSwitch": "El operador desactivó las correcciones sugeridas para toda la plataforma. Esta configuración entrará en vigor cuando se vuelvan a activar."
@@ -5364,7 +5400,8 @@
       "title": "Eliminar campo personalizado",
       "messagePrefix": "¿Está seguro de que desea eliminar?",
       "messageSuffix": "Esto eliminará la definición del campo y todos los valores almacenados en los dispositivos."
-    }
+    },
+    "typeFilterLabel": "Tipo de campo"
   },
   "knownGuestsSettings": {
     "title": "Invitados conocidos",
@@ -5476,6 +5513,7 @@
       "sendInvite": "No se pudo enviar la invitación",
       "updateUser": "No se pudo actualizar el usuario",
       "updateRole": "No se pudo actualizar el rol",
+      "updateOrgAccess": "No se pudo actualizar el acceso a organizaciones",
       "removeUser": "No se pudo eliminar el usuario",
       "resetMfa": "No se pudo restablecer MFA"
     },
@@ -5503,7 +5541,9 @@
       "inviteSent": "Invitación enviada a {{email}}",
       "copied": "¡Copiado!",
       "copyLink": "Copiar enlace",
-      "mfaReset": "MFA restablecido para {{email}}"
+      "mfaReset": "MFA restablecido para {{email}}",
+      "roleUpdated": "Rol actualizado",
+      "orgAccessUpdated": "Acceso a organizaciones actualizado"
     },
     "resetMfa": {
       "title": "¿Restablecer MFA?",

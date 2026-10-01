@@ -66,6 +66,14 @@
     },
     "launching": "Iniciando...",
     "launchingViewer": "Lanzando visor...",
+    "loginWindow": {
+      "connectVnc": "Conectar con VNC Relay",
+      "description": "macOS bloquea la entrada remota de teclado y mouse en la ventana de inicio de sesión, por lo que no se inició Escritorio remoto.",
+      "enableVncRelay": "Habilite VNC Relay en la política de configuración de este dispositivo para iniciar sesión en la pantalla de inicio de sesión, o vuelva a conectarse después de que un usuario inicie sesión.",
+      "title": "Esta Mac está en la ventana de inicio de sesión",
+      "unavailableTitle": "Escritorio remoto no disponible",
+      "useVncRelay": "Use VNC Relay para iniciar sesión en la pantalla de inicio de sesión."
+    },
     "openInBrowser": "Abrir en el navegador",
     "policyDisabled": "El escritorio remoto está deshabilitado por la política",
     "policyDisabledNamed": "El escritorio remoto está deshabilitado por la política \"{{name}}\"",
@@ -84,6 +92,10 @@
         "default": "La sesión fue finalizada por una política de seguridad. Vuelva a intentarlo."
       }
     },
+    "startFailed": {
+      "description": "El agente no pudo iniciar la sesión. Inténtalo de nuevo o revisa los registros de diagnóstico del dispositivo.",
+      "title": "No se pudo iniciar Escritorio remoto"
+    },
     "unavailable": {
       "default": "El escritorio no está disponible en este dispositivo",
       "headless": "Este dispositivo no tiene pantalla: el escritorio remoto no está disponible",
@@ -92,7 +104,7 @@
       "missingEntitlement": "El escritorio de la ventana de inicio de sesión está bloqueado hasta que se apruebe el derecho de Apple requerido",
       "missingPermission": "Todavía faltan los permisos macOS necesarios para el acceso al escritorio desatendido",
       "noDisplaySession": "No hay una sesión gráfica activa — inicie sesión primero mediante RDP o la consola",
-      "unsupportedOs": "El escritorio con ventana de inicio de sesión requiere macOS 14 (Sonoma) o posterior. Habilite VNC Relay en la política de configuración del dispositivo para conectarse en la pantalla de inicio de sesión.",
+      "unsupportedOs": "macOS bloquea la entrada remota de teclado y mouse en la ventana de inicio de sesión, por lo que Escritorio remoto no puede controlar esta Mac allí. Habilite VNC Relay en la política de configuración del dispositivo para conectarse en la pantalla de inicio de sesión.",
       "virtualDisplay": "No hay ninguna pantalla capturable disponible para esta Mac. Habilite el relé VNC para conectarse a través de macOS Screen Sharing.",
       "waylandUnsupported": "Este es un escritorio Wayland — el escritorio remoto requiere un agente más reciente",
       "x11AuthFailed": "No se pudo autenticar en el servidor de pantalla (autoridad X)",
@@ -282,7 +294,7 @@
       "threads": "Hilos"
     },
     "errors": {
-      "handlerNotConfigured": "El controlador no está configurado",
+      "handlerNotConfigured": "El controlador para finalizar procesos no está configurado",
       "killFailed": "No se pudo finalizar el proceso"
     },
     "killConfirm": "Confirmar finalización",
@@ -310,8 +322,8 @@
   "proxyTunnelPage": {
     "errors": {
       "invalidTicket": "Este enlace no es válido o ha vencido.",
-      "obtainTicket": "No se pudo obtener el ticket",
-      "prepareConnection": "No se pudo preparar la conexión",
+      "obtainTicket": "No se pudo obtener el ticket del túnel",
+      "prepareConnection": "No se pudo preparar la conexión del proxy",
       "tlsUntrusted": "Este dispositivo presentó un certificado autofirmado o que no es de confianza.",
       "tunnelFailed": "El túnel no se pudo abrir"
     },
@@ -353,25 +365,25 @@
     "enterStrings": "Introducir cadenas",
     "enterValueName": "Introduzca el nombre del valor",
     "errors": {
-      "createKey": "No se pudo crear la clave",
+      "createKey": "No se pudo crear la clave del registro",
       "createKeyDetail": "No se pudo crear la clave de registro: {{message}}",
-      "deleteKey": "No se pudo eliminar la clave",
+      "deleteKey": "No se pudo eliminar la clave del registro",
       "deleteKeyDetail": "No se pudo eliminar la clave de registro: {{message}}",
-      "deleteValue": "No se pudo eliminar el valor",
+      "deleteValue": "No se pudo eliminar el valor del registro",
       "deleteValueDetail": "No se pudo eliminar el valor del registro: {{message}}",
-      "invalidFormat": "Error al formato no válido",
-      "invalidNumber": "Error al número no válido",
-      "keyNameBackslash": "No se pudo introducir la barra invertida del nombre de la clave",
-      "keyNameRequired": "No se pudo ingresar el nombre de clave requerido",
-      "keyProvider": "No se pudo acceder al proveedor de claves",
-      "loadKeys": "No se pudieron cargar las claves",
+      "invalidFormat": "Formato de valor no válido",
+      "invalidNumber": "Valor numérico no válido",
+      "keyNameBackslash": "El nombre de la clave no puede contener una barra invertida",
+      "keyNameRequired": "El nombre de la clave es obligatorio",
+      "keyProvider": "El proveedor de claves del registro no está configurado",
+      "loadKeys": "No se pudieron cargar las claves del registro",
       "loadKeysDetail": "No se pudieron cargar las claves de registro: {{message}}",
-      "loadValues": "No se pudieron cargar los valores",
+      "loadValues": "No se pudieron cargar los valores del registro",
       "loadValuesDetail": "No se pudieron cargar los valores del registro: {{message}}",
-      "saveValue": "No se pudo guardar el valor",
+      "saveValue": "No se pudo guardar el valor del registro",
       "saveValueDetail": "No se pudo guardar el valor del registro: {{message}}",
-      "valueNameRequired": "No se pudo valorar el nombre requerido",
-      "valueProvider": "No se pudo valorar al proveedor"
+      "valueNameRequired": "El nombre del valor es obligatorio",
+      "valueProvider": "El proveedor de valores del registro no está configurado"
     },
     "hexadecimal": "hexadecimal",
     "key": "Clave",
@@ -442,14 +454,14 @@
     "disconnect": "Desconectar",
     "errorMessage": "Error: {{message}}",
     "errors": {
-      "closedUnexpectedly": "No se pudo cerrar inesperadamente",
-      "connection": "No se pudo conectar",
+      "closedUnexpectedly": "La conexión se cerró inesperadamente",
+      "connection": "Error de conexión",
       "createSession": "No se pudo crear la sesión",
-      "createTicket": "No se pudo crear el ticket",
-      "failed": "No falló",
+      "createTicket": "No se pudo crear el ticket de conexión",
+      "failed": "Conexión fallida",
       "initialize": "No se pudo inicializar",
-      "invalidTicket": "No se pudo obtener el ticket no válido",
-      "webSocket": "No se pudo acceder al socket web"
+      "invalidTicket": "Respuesta de ticket de conexión no válida",
+      "webSocket": "Error de conexión de WebSocket"
     },
     "exitFullscreen": "Salir de pantalla completa",
     "fullscreen": "Pantalla completa",
@@ -485,23 +497,23 @@
       "deleteRegistryValue": "No se pudo eliminar el valor del registro",
       "disableTask": "No se pudo deshabilitar la tarea",
       "enableTask": "No se pudo habilitar la tarea",
-      "eventDetails": "No se pudieron acceder a los detalles del evento",
+      "eventDetails": "No se pudieron obtener los detalles del evento",
       "fetchEventLogs": "No se pudieron recuperar los registros de eventos",
       "fetchProcesses": "No se pudieron recuperar los procesos",
       "fetchServices": "No se pudieron recuperar los servicios",
       "fetchTasks": "No se pudieron recuperar las tareas",
       "killProcess": "No se pudo finalizar el proceso",
-      "processDetails": "No se pudieron procesar los detalles",
+      "processDetails": "No se pudieron obtener los detalles del proceso",
       "queryEvents": "No se pudieron consultar los eventos",
-      "registryKeys": "Error al registrar las claves",
-      "registryValues": "No se pudieron registrar los valores",
+      "registryKeys": "No se pudieron cargar las claves del registro",
+      "registryValues": "No se pudieron cargar los valores del registro",
       "restartService": "No se pudo reiniciar el servicio",
       "runTask": "No se pudo ejecutar la tarea",
       "setRegistryValue": "No se pudo establecer el valor del registro",
       "startService": "No se pudo iniciar el servicio",
       "stopService": "No se pudo detener el servicio",
-      "taskDetails": "No se pudieron completar los detalles de la tarea",
-      "taskHistory": "No se pudo realizar el historial de tareas"
+      "taskDetails": "No se pudieron cargar los detalles de la tarea",
+      "taskHistory": "No se pudo cargar el historial de la tarea"
     },
     "policyDisabled": "Una política de configuración ha deshabilitado las herramientas del sistema remoto.",
     "policyDisabledNamed": "La política de configuración \"{{name}}\" ha deshabilitado las herramientas del sistema remoto.",
@@ -604,7 +616,7 @@
     "displayName": "Nombre para mostrar",
     "executablePath": "Ruta ejecutable",
     "loading": "Cargando",
-    "noDescription": "Sin descripción",
+    "noDescription": "No hay descripción disponible",
     "noServicesAvailable": "No hay servicios disponibles",
     "noServicesFound": "No se encontraron servicios",
     "ok": "De acuerdo",
@@ -639,7 +651,10 @@
       "lastSevenDays": "Últimos siete días",
       "lastThirtyDays": "Últimos treinta días",
       "today": "Hoy",
-      "yesterday": "Ayer"
+      "yesterday": "Ayer",
+      "typeFilterLabel": "Tipo de sesión",
+      "userFilterLabel": "Usuario",
+      "dateFilterLabel": "Rango de fechas"
     },
     "noSessions": "Sin sesiones",
     "page": "Página {{current}} de {{total}}",
@@ -673,7 +688,7 @@
   "sessionHistoryPage": {
     "detailsTitle": "Detalles Título",
     "errors": {
-      "exportFetch": "No se pudo exportar la recuperación"
+      "exportFetch": "No se pudieron obtener las sesiones para exportar"
     },
     "fields": {
       "dataTransferred": "Datos transferidos",
@@ -738,12 +753,12 @@
     },
     "disconnect": "Desconectar",
     "errors": {
-      "authenticationDetail": "No se pudo acceder al detalle de autenticación",
-      "authenticationFailed": "Error al autenticar",
-      "connectionLost": "No se pudo perder la conexión",
-      "loadViewer": "No se pudo cargar el visor",
-      "securityFailure": "Error por error de seguridad",
-      "securityType": "Error al tipo de seguridad"
+      "authenticationDetail": "Error de autenticación: {{reason}}. Verifica tu contraseña de VNC.",
+      "authenticationFailed": "Error de autenticación",
+      "connectionLost": "Conexión perdida inesperadamente",
+      "loadViewer": "No se pudo cargar el visor de VNC",
+      "securityFailure": "Error de seguridad: {{reason}}",
+      "securityType": "Tipo de seguridad no compatible: {{reason}}"
     },
     "exitFullscreen": "Salir de pantalla completa",
     "fullscreen": "Pantalla completa",
@@ -764,8 +779,8 @@
     "disconnect": "Desconectar",
     "errors": {
       "connect": "No se pudo conectar",
-      "invalidTicket": "No se pudo obtener el ticket no válido",
-      "obtainTicket": "No se pudo obtener el ticket"
+      "invalidTicket": "Respuesta de ticket de túnel no válida",
+      "obtainTicket": "No se pudo obtener el ticket del túnel de VNC"
     },
     "sessionTitle": "Título de la sesión"
   },

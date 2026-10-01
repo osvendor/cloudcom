@@ -3,7 +3,7 @@ import { zValidator } from '../../lib/validation';
 import { z } from 'zod';
 import { eq, and, desc, inArray } from 'drizzle-orm';
 import { db } from '../../db';
-import { backupConfigs, backupSnapshotFiles, backupSnapshots } from '../../db/schema';
+import { backupConfigs, backupSnapshotFiles, backupSnapshots, organizations } from '../../db/schema';
 import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
 import { writeRouteAudit } from '../../services/auditEvents';
 import {
@@ -11,6 +11,7 @@ import {
   backupLayoutManifestKey,
   checkBackupProviderCapabilities,
 } from '../../services/backupSnapshotStorage';
+import { resolveSnapshotPlatform } from '../../services/bareMetalRebuildSchemas';
 import { PERMISSIONS } from '../../services/permissions';
 import { resolveScopedOrgId } from './helpers';
 import {
@@ -19,6 +20,8 @@ import {
   snapshotProtectionReasonSchema,
 } from './schemas';
 import type { SnapshotTreeItem } from './types';
+import { attachDeviceNames } from './deviceNames';
+import { normalizeSnapshotPath } from '../../services/backupSelectedPaths';
 import {
   authorizeRouteResilienceResources,
   resolveRouteAuthorizedDeviceIds,
@@ -27,6 +30,26 @@ import {
 export const snapshotsRoutes = new Hono();
 
 const snapshotIdParamSchema = z.object({ id: z.string().guid() });
+
+/**
+ * True once this org's erasure cascade has been handed to the worker
+ * (`organizations.status = 'purging'` — the same marker
+ * `jobs/tenantErasure.ts`'s status guard and `routes/orgs.ts`'s lifecycle
+ * freeze read). A hold accepted after that point cannot retroactively protect
+ * anything: the cascade's own `backup_snapshots` step re-checks for an active
+ * hold immediately before deleting (`services/tenantCascade.ts`), so a hold
+ * placed here either loses that race outright or gives the requester a false
+ * sense that the snapshot is now safe. Refuse up front instead of letting the
+ * write silently do nothing useful.
+ */
+async function isOrgErasureInProgress(orgId: string): Promise<boolean> {
+  const [org] = await db
+    .select({ status: organizations.status })
+    .from(organizations)
+    .where(eq(organizations.id, orgId))
+    .limit(1);
+  return org?.status === 'purging';
+}
 
 type SnapshotProtectionState = {
   legalHold: boolean;
@@ -46,10 +69,6 @@ type SnapshotFileRow = {
   modifiedAt: Date | null;
 };
 
-function normalizeSourcePath(value: string): string {
-  return value.replaceAll('\\', '/');
-}
-
 function buildSnapshotTree(files: SnapshotFileRow[]): SnapshotTreeItem[] {
   const root: SnapshotTreeItem[] = [];
 
@@ -62,7 +81,7 @@ function buildSnapshotTree(files: SnapshotFileRow[]): SnapshotTreeItem[] {
   };
 
   for (const file of files) {
-    const normalizedPath = normalizeSourcePath(file.sourcePath);
+    const normalizedPath = normalizeSnapshotPath(file.sourcePath);
     const parts = normalizedPath.split('/').filter(Boolean);
     if (parts.length === 0) continue;
 
@@ -236,7 +255,7 @@ snapshotsRoutes.get(
       .where(and(...conditions))
       .orderBy(desc(backupSnapshots.timestamp));
 
-    return c.json({ data: rows.map(toSnapshotResponse) });
+    return c.json({ data: await attachDeviceNames(orgId, rows.map(toSnapshotResponse)) });
   }
 );
 
@@ -338,6 +357,13 @@ snapshotsRoutes.post(
       { kind: 'snapshot', id: snapshotId, role: 'source' },
     ], 'verify');
     if (!authorization.ok) return authorization.response;
+
+    if (await isOrgErasureInProgress(orgId)) {
+      return c.json(
+        { error: 'This organization is being erased; a new legal hold cannot be placed.' },
+        409,
+      );
+    }
 
     const [before] = await db
       .select()
@@ -666,6 +692,36 @@ snapshotsRoutes.post(
   },
 );
 
+type SnapshotHardwareSizing = {
+  cpuCores: number | null;
+  totalMemoryMB: number | null;
+  disks: { sizeBytes: number }[];
+};
+
+/**
+ * Restore-as-VM snapshot cards show CPU / memory / disk chips. The stored
+ * profile (the agent's systemstate.HardwareProfile) also carries NICs with MAC
+ * addresses, BIOS and board strings the list has no use for, so only the
+ * sizing fields ride, under their stored names. Null when none was captured.
+ */
+function toHardwareSizing(profile: unknown): SnapshotHardwareSizing | null {
+  if (!profile || typeof profile !== 'object' || Array.isArray(profile)) return null;
+  const stored = profile as Record<string, unknown>;
+  const positive = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+  const disks = Array.isArray(stored.disks)
+    ? stored.disks.flatMap((disk) => {
+        const sizeBytes = disk && typeof disk === 'object' ? positive((disk as Record<string, unknown>).sizeBytes) : null;
+        return sizeBytes === null ? [] : [{ sizeBytes }];
+      })
+    : [];
+  return {
+    cpuCores: positive(stored.cpuCores),
+    totalMemoryMB: positive(stored.totalMemoryMB),
+    disks,
+  };
+}
+
 function toSnapshotResponse(row: typeof backupSnapshots.$inferSelect) {
   return {
     id: row.id,
@@ -680,6 +736,11 @@ function toSnapshotResponse(row: typeof backupSnapshots.$inferSelect) {
     // run captured none. Restore-as-VM offers the rebuild engine only for
     // snapshots that carry one (W05a); the manifest body stays off the list.
     layoutManifestKey: row.layoutManifest ? backupLayoutManifestKey(row.snapshotId) : null,
+    // W06d: the layout's platform ('linux' | 'windows', null when absent or
+    // unknown). The rebuild engine is platform-matched, so Restore-as-VM
+    // filters rebuild hosts by it; a null platform cannot be rebuilt.
+    layoutPlatform: resolveSnapshotPlatform(row.layoutManifest),
+    hardwareProfile: toHardwareSizing(row.hardwareProfile),
     sizeBytes: row.size ?? null,
     fileCount: row.fileCount ?? null,
     label: row.label ?? null,

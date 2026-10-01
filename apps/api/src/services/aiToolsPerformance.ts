@@ -25,6 +25,8 @@ import {
   resolveStartupItem,
 } from './startupItems';
 import { aiExecuteCommand } from './aiDispatch';
+import { requestsLiveDeviceRead } from './aiLiveDeviceReads';
+import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 
 type AiToolTier = 1 | 2 | 3 | 4;
 type MetricPoint = {
@@ -78,7 +80,7 @@ async function verifyDeviceAccess(
   if (auth.allowedDeviceIds && !auth.allowedDeviceIds.includes(deviceId)) {
     return { error: 'Device not found or access denied' };
   }
-  const conditions: SQL[] = [eq(devices.id, deviceId)];
+  const conditions: SQL[] = [eq(devices.id, deviceId), notParkedDeviceCondition()];
   const orgCond = auth.orgCondition(devices.orgId);
   if (orgCond) conditions.push(orgCond);
   const [device] = await db.select().from(devices).where(and(...conditions)).limit(1);
@@ -286,6 +288,7 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
     tier: 1 as AiToolTier,
     domain: 'devices',
     searchHint: 'device CPU, RAM, disk and network metrics over time, time ranges and aggregation',
+    alwaysLoad: true,
     deviceArgs: ['deviceId'],
     definition: {
       name: 'analyze_metrics',
@@ -869,7 +872,9 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
   });
 
   // ============================================
-  // analyze_boot_performance - Tier 1 (auto-execute)
+  // analyze_boot_performance - Tier 1 stored boot history; `triggerCollection:
+  // true` collects live from the device (Tier 2 read-only, devices:execute —
+  // aiLiveDeviceReads.ts)
   // ============================================
 
   registerTool({
@@ -894,7 +899,8 @@ export function registerPerformanceTools(aiTools: Map<string, AiTool>): void {
     handler: async (input, auth) => {
       const deviceId = input.deviceId as string;
       const bootsBack = Math.min(Number(input.bootsBack) || 10, 30);
-      const triggerCollection = Boolean(input.triggerCollection);
+      // The same predicate the guardrails classify on (permission + tier).
+      const triggerCollection = requestsLiveDeviceRead('analyze_boot_performance', input);
       const includePaths = input.includePaths === true;
 
       const access = await verifyDeviceAccess(deviceId, auth, false);

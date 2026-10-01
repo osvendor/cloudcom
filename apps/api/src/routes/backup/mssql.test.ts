@@ -9,6 +9,16 @@ const SNAPSHOT_DB_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 vi.mock('../../services', () => ({}));
 
 const executeCommandMock = vi.fn();
+// The depth-0 dispatch entry point: recorded separately, answered by the same
+// mock so every case can script the device's reply in one place.
+const executeCommandWithSystemPrecheckSpy = vi.fn();
+// Models withAuthDbAccessContext as a fresh transaction that COMMITS when its
+// callback resolves: `stack` is the contexts open right now, `committed` the
+// ids whose callback has finished.
+const authDbContexts = { seq: 0, stack: [] as number[], committed: new Set<number>() };
+function openAuthContext(): number | null {
+  return authDbContexts.stack[authDbContexts.stack.length - 1] ?? null;
+}
 const queueCommandForExecutionMock = vi.fn();
 const dispatchTrackedDbRestoreMock = vi.fn();
 vi.mock('./dbRestoreJob', () => ({
@@ -117,6 +127,10 @@ vi.mock('../../db/schema/applicationBackup', () => ({
 
 vi.mock('../../services/commandQueue', () => ({
   executeCommand: (...args: unknown[]) => executeCommandMock(...(args as [])),
+  executeCommandWithSystemPrecheck: (...args: unknown[]) => {
+    executeCommandWithSystemPrecheckSpy(...args);
+    return executeCommandMock(...(args as []));
+  },
   queueCommandForExecution: (...args: unknown[]) => queueCommandForExecutionMock(...(args as [])),
   CommandTypes: {
     MSSQL_DISCOVER: 'MSSQL_DISCOVER',
@@ -134,6 +148,16 @@ vi.mock('../../middleware/auth', () => ({
   requirePermission: vi.fn(() => (c: any, next: any) => next()),
   requireMfa: vi.fn(() => (c: any, next: any) => next()),
   requireScope: vi.fn(() => (c: any, next: any) => next()),
+  withAuthDbAccessContext: vi.fn(async (_auth: any, fn: any) => {
+    const id = ++authDbContexts.seq;
+    authDbContexts.stack.push(id);
+    try {
+      return await fn();
+    } finally {
+      authDbContexts.stack.pop();
+      authDbContexts.committed.add(id);
+    }
+  }),
 }));
 
 vi.mock('../../services/featureConfigResolver', () => ({
@@ -172,6 +196,7 @@ vi.mock('../../services/resilienceSiteAuthorization', async (importOriginal) => 
 
 import { authMiddleware } from '../../middleware/auth';
 import { ResilienceAuthorizationError } from '../../services/resilienceSiteAuthorization';
+import { BACKUP_HELPER_UPDATE_REQUIRED_MESSAGE } from '../../services/backupReadHelperGate';
 
 describe('mssql routes', () => {
   let app: Hono;
@@ -181,6 +206,10 @@ describe('mssql routes', () => {
     selectMock.mockReset();
     insertMock.mockReset();
     executeCommandMock.mockReset();
+    executeCommandWithSystemPrecheckSpy.mockReset();
+    authDbContexts.seq = 0;
+    authDbContexts.stack = [];
+    authDbContexts.committed = new Set();
     queueCommandForExecutionMock.mockReset();
     dispatchTrackedDbRestoreMock.mockReset();
     resolveBackupConfigForDeviceMock.mockReset();
@@ -436,6 +465,7 @@ describe('mssql routes', () => {
 
     expect(res.status).toBe(200);
     expect(resolveBackupConfigForDeviceMock).toHaveBeenCalledWith(DEVICE_ID);
+    expect(executeCommandMock.mock.calls[0]?.[2]).not.toHaveProperty('providerConfig');
     expect(executeCommandMock).toHaveBeenCalledWith(
       DEVICE_ID,
       'MSSQL_BACKUP',
@@ -453,7 +483,7 @@ describe('mssql routes', () => {
         // policy-managed device.
         configId: 'config-1',
         provider: 'local',
-        providerConfig: { path: '/tmp/backups' },
+        providerConfigRef: { configId: 'config-1', orgId: ORG_ID },
         storageEncryption: { required: false, mode: 'disabled' },
         instance: 'MSSQLSERVER',
         database: 'AppDb',
@@ -471,6 +501,93 @@ describe('mssql routes', () => {
     const body = await res.json();
     expect(body.data.snapshotDbId).toBe('snapshot-db-1');
     expect(body.data.snapshotId).toBe('provider-snapshot-1');
+  });
+
+  // The helper's write session is minted when the command is DELIVERED, on
+  // the delivery path's own connection, and only for a backup job that
+  // connection can see. A job inserted in the request transaction is still
+  // uncommitted when executeCommand pushes the command, so delivery found no
+  // live job and sent the storage destination instead of a write session.
+  it('commits the backup job before dispatching the backup, and dispatches holding no context', async () => {
+    let insertedIn: number | null = null;
+    insertMock.mockImplementationOnce(() => {
+      insertedIn = openAuthContext();
+      return chainMock([{ id: 'job-1' }]);
+    });
+    resolveBackupConfigForDeviceMock.mockResolvedValueOnce({ configId: 'config-1', featureLinkId: 'feature-1' });
+    queueDestinationConfigSelect({ provider: 's3', providerConfig: { endpoint: 'https://storage.example.com', bucket: 'b', accessKeyId: 'AKIA', secretAccessKey: 'secret' } });
+    let dispatchState: { open: number | null; jobCommitted: boolean } | null = null;
+    executeCommandMock.mockImplementationOnce(async () => {
+      dispatchState = { open: openAuthContext(), jobCommitted: insertedIn !== null && authDbContexts.committed.has(insertedIn) };
+      return { status: 'completed', stdout: JSON.stringify({ queued: true }) };
+    });
+    let ackIn: number | null = null;
+    applyBackupStartedAckMock.mockImplementationOnce(async () => { ackIn = openAuthContext(); });
+
+    const res = await app.request('/backup/mssql/backup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, instance: 'MSSQLSERVER', database: 'AppDb' }),
+    });
+
+    expect(res.status).toBe(202);
+    // The job row was written inside a short context of its own...
+    expect(insertedIn).not.toBeNull();
+    // ...that had committed by the time the command was dispatched, and the
+    // dispatch (which waits on the device) held no context at all.
+    expect(dispatchState).toEqual({ open: null, jobCommitted: true });
+    // No context is held across the wait, so the precheck opens its own and
+    // must be told which organization the request decided under.
+    expect(executeCommandWithSystemPrecheckSpy).toHaveBeenCalledWith(
+      DEVICE_ID,
+      'MSSQL_BACKUP',
+      expect.objectContaining({ jobId: 'job-1' }),
+      expect.objectContaining({ userId: 'user-123', expectedOrgId: ORG_ID }),
+    );
+    // Recording the device's reply writes the job again, in a fresh context.
+    expect(ackIn).not.toBeNull();
+    expect(ackIn).not.toBe(insertedIn);
+  });
+
+  it('writes a failed result into a context of its own after the dispatch', async () => {
+    insertMock.mockReturnValueOnce(chainMock([{ id: 'job-1' }]));
+    resolveBackupConfigForDeviceMock.mockResolvedValueOnce({ configId: 'config-1', featureLinkId: 'feature-1' });
+    queueDestinationConfigSelect();
+    executeCommandMock.mockResolvedValueOnce({ status: 'failed', error: 'helper crashed', stdout: 'not json' });
+    let markedIn: number | null = null;
+    markBackupJobFailedIfInFlightMock.mockImplementationOnce(async () => { markedIn = openAuthContext(); });
+
+    const res = await app.request('/backup/mssql/backup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, instance: 'MSSQLSERVER', database: 'AppDb' }),
+    });
+
+    expect(res.status).toBe(500);
+    expect(markBackupJobFailedIfInFlightMock).toHaveBeenCalledWith('job-1', expect.any(String));
+    expect(markedIn).not.toBeNull();
+  });
+
+  it('records the destination storage identity on the on-demand job it creates', async () => {
+    const jobInsert = chainMock([{ id: 'job-1' }]);
+    insertMock.mockReturnValueOnce(jobInsert);
+    resolveBackupConfigForDeviceMock.mockResolvedValueOnce({ configId: 'config-1', featureLinkId: 'feature-1' });
+    queueDestinationConfigSelect({ provider: 's3', providerConfig: { endpoint: 'https://Storage.Example.com:9443', bucket: 'Backups', accessKeyId: 'AKIA', secretAccessKey: 'secret' } });
+    executeCommandMock.mockResolvedValueOnce({ status: 'completed', stdout: JSON.stringify({ queued: true }) });
+
+    const res = await app.request('/backup/mssql/backup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({ deviceId: DEVICE_ID, instance: 'MSSQLSERVER', database: 'AppDb' }),
+    });
+
+    expect(res.status).toBe(202);
+    // The snapshot persisted from this job copies the job's identity; without
+    // it, restores of the snapshot cannot be served through a storage session.
+    expect(jobInsert.values).toHaveBeenCalledWith(expect.objectContaining({
+      backupType: 'database',
+      storageIdentity: 's3::storage.example.com:9443::Backups',
+    }));
   });
 
   // D20b item A: a resolved config id whose backup_configs row has since
@@ -660,8 +777,9 @@ describe('mssql routes', () => {
       backupFileName: 'AppDb_full_20260331.bak',
       targetDatabase: 'AppDb_Restore',
       provider: 'local',
-      providerConfig: { path: '/tmp/backups' },
+      providerConfigRef: { configId: 'config-1', orgId: ORG_ID },
     }));
+    expect(opts.buildPayload('restore-job-1')).not.toHaveProperty('providerConfig');
   });
 
   it('reports a 502 when MSSQL restore fails to dispatch for a non-offline reason', async () => {
@@ -724,6 +842,37 @@ describe('mssql routes', () => {
 
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual({ error: 'Device is offline, cannot execute command' });
+  });
+
+  it('reports a 409 with the update instruction when the device backup helper is too old', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{
+        id: 'snapshot-db-1',
+        providerSnapshotId: 'provider-snapshot-1',
+        metadata: {
+          backupKind: 'mssql_database',
+          instance: 'MSSQLSERVER',
+          backupFileName: 'AppDb_full_20260331.bak',
+        },
+        configId: 'config-1',
+    }]));
+    queueDestinationConfigSelect();
+    dispatchTrackedDbRestoreMock.mockResolvedValueOnce({
+      ok: false,
+      error: BACKUP_HELPER_UPDATE_REQUIRED_MESSAGE,
+    });
+
+    const res = await app.request('/backup/mssql/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+      body: JSON.stringify({
+        deviceId: DEVICE_ID,
+        snapshotId: SNAPSHOT_DB_ID,
+        targetDatabase: 'AppDb_Restore',
+      }),
+    });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: BACKUP_HELPER_UPDATE_REQUIRED_MESSAGE });
   });
 
   // D20b item D: a snapshot that predates destination tracking (configId
@@ -790,10 +939,31 @@ describe('mssql routes', () => {
         snapshotId: 'provider-snapshot-1',
         backupFileName: 'AppDb_full_20260331.bak',
         provider: 'local',
-        providerConfig: { path: '/tmp/backups' },
+        providerConfigRef: { configId: 'config-1', orgId: ORG_ID },
       }),
       expect.objectContaining({ userId: 'user-123' })
     );
+    expect(executeCommandMock.mock.lastCall?.[2]).not.toHaveProperty('providerConfig');
+  });
+
+  it('answers 409 with the update instruction when the device backup helper cannot verify', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: SNAPSHOT_DB_ID,
+      deviceId: DEVICE_ID,
+      providerSnapshotId: 'provider-snapshot-1',
+      metadata: { backupKind: 'mssql_database', instance: 'MSSQLSERVER', backupFileName: 'AppDb_full_20260331.bak' },
+      configId: 'config-1',
+    }]));
+    queueDestinationConfigSelect();
+    executeCommandMock.mockResolvedValueOnce({ status: 'failed', error: BACKUP_HELPER_UPDATE_REQUIRED_MESSAGE });
+
+    const res = await app.request(`/backup/mssql/verify/${SNAPSHOT_DB_ID}`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer token' },
+    });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: BACKUP_HELPER_UPDATE_REQUIRED_MESSAGE });
   });
 
   it('rejects cross-org device discovery', async () => {

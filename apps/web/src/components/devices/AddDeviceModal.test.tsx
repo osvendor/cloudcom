@@ -326,7 +326,7 @@ describe('AddDeviceModal', () => {
       if (url === '/enrollment-keys') {
         return makeJsonResponse({ id: 'key-456', key: 'raw-key-def' }, true, 201);
       }
-      if (url === '/enrollment-keys/key-456/installer-link') {
+      if (url === '/enrollment-keys/key-456/installer-link?discardKeyOnFailure=1') {
         return makeJsonResponse({
           url: 'https://api.example.com/api/v1/enrollment-keys/public-download/windows?h=dlh_abc123',
           expiresAt: '2026-04-14T00:00:00Z',
@@ -357,7 +357,7 @@ describe('AddDeviceModal', () => {
     // parent — max_usage is an enforced enrollment budget, not a display label.
     expect(createBody.maxUsage).toBeUndefined();
     const linkCall = fetchWithAuthMock.mock.calls[1];
-    expect(String(linkCall[0])).toBe('/enrollment-keys/key-456/installer-link');
+    expect(String(linkCall[0])).toBe('/enrollment-keys/key-456/installer-link?discardKeyOnFailure=1');
     expect(JSON.parse((linkCall[1] as RequestInit).body as string).ttlMinutes)
       .toBe(43200);
   });
@@ -392,6 +392,55 @@ describe('AddDeviceModal', () => {
         expect.stringContaining('public-download')
       );
     });
+  });
+
+  // #7422: the 2s "copied" reset must not outlive the component — it fired
+  // after jsdom teardown ("window is not defined") and set state post-unmount.
+  it('clears the copy-link reset timer on unmount (#7422)', async () => {
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/enrollment-keys') {
+        return makeJsonResponse({ id: 'key-456' }, true, 201);
+      }
+      if (url.includes('/installer-link')) {
+        return makeJsonResponse({
+          url: 'https://api.example.com/public-download/windows?h=dlh_abc',
+          expiresAt: null,
+          maxUsage: 1,
+          platform: 'windows',
+          childKeyId: 'child-1',
+        });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    const resetTimers = new Set<unknown>();
+    const realSetTimeout = globalThis.setTimeout;
+    const setSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+      fn: TimerHandler,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      const id = realSetTimeout(fn as () => void, ms, ...args);
+      if (ms === 2000) resetTimers.add(id);
+      return id;
+    }) as typeof setTimeout);
+    const clearSpy = vi.spyOn(globalThis, 'clearTimeout');
+
+    try {
+      const { unmount } = render(<AddDeviceModal isOpen onClose={vi.fn()} />);
+      fireEvent.click(screen.getByText('Generate Link'));
+      fireEvent.click(await screen.findByText('Copy'));
+      await waitFor(() => expect(resetTimers.size).toBe(1));
+
+      unmount();
+
+      const cleared = clearSpy.mock.calls.map((c) => c[0]);
+      for (const id of resetTimers) expect(cleared).toContain(id);
+    } finally {
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
   });
 
   it('shows error when download fails', async () => {
@@ -469,6 +518,7 @@ describe('AddDeviceModal', () => {
       );
       render(<AddDeviceModal isOpen onClose={vi.fn()} />);
       fireEvent.click(screen.getByText('CLI Commands'));
+      fireEvent.click(screen.getByTestId('cli-regenerate-token'));
 
       const banner = await screen.findByTestId('token-mfa-required');
       expect(banner.textContent).toContain('required to generate installation tokens');
@@ -519,16 +569,65 @@ describe('AddDeviceModal', () => {
     });
   });
 
-  it('fetches onboarding token when CLI tab is clicked', async () => {
+  // #7035: opening the tab used to POST /devices/onboarding-token on its own,
+  // leaving a live multi-use key behind for every look at the tab.
+  it('does not mint a CLI token just because the CLI tab is opened (#7035)', async () => {
+    render(<AddDeviceModal isOpen onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId('tab-cli'));
+
+    expect(screen.getByTestId('cli-regenerate-token').textContent).toContain('Generate token');
+    // Let any effect-driven request settle before asserting none happened.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fetchWithAuthMock).not.toHaveBeenCalled();
+  });
+
+  it('shows the no-sites notice on the CLI tab and cannot mint without a site (#7035)', () => {
+    setOrgStore({ sites: [] });
+    render(<AddDeviceModal isOpen onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId('tab-cli'));
+
+    expect(screen.getByText(/No sites available/)).toBeDefined();
+    expect(screen.queryByTestId('cli-site')).toBeNull();
+    const generate = screen.getByTestId('cli-regenerate-token') as HTMLButtonElement;
+    expect(generate.disabled).toBe(true);
+    fireEvent.click(generate);
+    expect(fetchWithAuthMock).not.toHaveBeenCalled();
+  });
+
+  it('mints the CLI token for the site chosen in the modal (#7035)', async () => {
+    fetchWithAuthMock.mockResolvedValueOnce(
+      makeJsonResponse({ token: 'site-token', maxUsage: 50, siteId: SITE_B.id })
+    );
+
+    render(<AddDeviceModal isOpen onClose={vi.fn()} />);
+    fireEvent.click(screen.getByTestId('tab-cli'));
+    fireEvent.change(screen.getByTestId('cli-site'), { target: { value: SITE_B.id } });
+    fireEvent.click(screen.getByTestId('cli-regenerate-token'));
+
+    await waitFor(() => {
+      expect(screen.getByText('site-token')).toBeDefined();
+    });
+    expect(fetchWithAuthMock).toHaveBeenCalledTimes(1);
+    const init = fetchWithAuthMock.mock.calls[0]![1] as RequestInit;
+    expect(JSON.parse(init.body as string)).toEqual({
+      count: 50,
+      ttlMinutes: 43200,
+      siteId: SITE_B.id,
+    });
+    expect(screen.getByTestId('cli-token-site').textContent).toContain('Branch Office');
+  });
+
+  it('fetches onboarding token when Generate is clicked on the CLI tab', async () => {
     fetchWithAuthMock.mockResolvedValueOnce(
       makeJsonResponse({ token: 'test-token-xyz', enrollmentSecret: 'secret-abc' })
     );
 
     render(<AddDeviceModal isOpen onClose={vi.fn()} />);
 
-    // Installer tab is active by default (jsdom UA "darwin" contains "win")
-    // Click CLI Commands tab to trigger lazy-load
+    // Installer tab is active by default (jsdom UA "darwin" contains "win").
+    // Opening the CLI tab no longer mints anything (#7035) — Generate does.
     fireEvent.click(screen.getByText('CLI Commands'));
+    fireEvent.click(screen.getByTestId('cli-regenerate-token'));
 
     await waitFor(() => {
       expect(fetchWithAuthMock).toHaveBeenCalledWith(
@@ -539,7 +638,7 @@ describe('AddDeviceModal', () => {
         expect.objectContaining({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ count: 50, ttlMinutes: 43200 }),
+          body: JSON.stringify({ count: 50, ttlMinutes: 43200, siteId: SITE_A.id }),
         })
       );
     });
@@ -557,6 +656,7 @@ describe('AddDeviceModal', () => {
     render(<AddDeviceModal isOpen onClose={vi.fn()} />);
 
     fireEvent.click(screen.getByText('CLI Commands'));
+    fireEvent.click(screen.getByTestId('cli-regenerate-token'));
 
     await waitFor(() => {
       expect(screen.getByText('test-token-xyz')).toBeDefined();
@@ -575,13 +675,14 @@ describe('AddDeviceModal', () => {
   });
 
   it('requests a multi-use token after the operator raises the device count (#1108)', async () => {
-    // Initial single-device fetch on tab open.
+    // Initial single-device mint on the first Generate click.
     fetchWithAuthMock.mockResolvedValueOnce(
       makeJsonResponse({ token: 'token-single', maxUsage: 1, expiresAt: new Date(Date.now() + 3600_000).toISOString() })
     );
 
     render(<AddDeviceModal isOpen onClose={vi.fn()} />);
     fireEvent.click(screen.getByText('CLI Commands'));
+    fireEvent.click(screen.getByTestId('cli-regenerate-token'));
 
     await waitFor(() => {
       expect(screen.getByText('token-single')).toBeDefined();
@@ -602,7 +703,7 @@ describe('AddDeviceModal', () => {
         expect.objectContaining({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ count: 5, ttlMinutes: 43200 }),
+          body: JSON.stringify({ count: 5, ttlMinutes: 43200, siteId: SITE_A.id }),
         })
       );
     });
@@ -625,6 +726,7 @@ describe('AddDeviceModal', () => {
 
     render(<AddDeviceModal isOpen onClose={vi.fn()} />);
     fireEvent.click(screen.getByText('CLI Commands'));
+    fireEvent.click(screen.getByTestId('cli-regenerate-token'));
 
     await waitFor(() => {
       expect(screen.getByText('token-exp')).toBeDefined();
@@ -647,6 +749,7 @@ describe('AddDeviceModal', () => {
 
     render(<AddDeviceModal isOpen onClose={() => {}} />);
     await userEvent.click(screen.getByTestId('tab-cli'));
+    await userEvent.click(screen.getByTestId('cli-regenerate-token'));
     await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalled());
     fetchWithAuthMock.mockClear();
 
@@ -748,6 +851,7 @@ describe('AddDeviceModal — resolved enrollment defaults (#2776)', () => {
 
     render(<AddDeviceModal isOpen onClose={vi.fn()} />);
     fireEvent.click(screen.getByTestId('tab-cli'));
+    fireEvent.click(screen.getByTestId('cli-regenerate-token'));
 
     await waitFor(() => {
       expect(screen.getByText('cli-token')).toBeDefined();
@@ -760,7 +864,7 @@ describe('AddDeviceModal — resolved enrollment defaults (#2776)', () => {
     expect(fetchWithAuthMock).toHaveBeenCalledWith(
       '/devices/onboarding-token',
       expect.objectContaining({
-        body: JSON.stringify({ count: 25, ttlMinutes: 10080 }),
+        body: JSON.stringify({ count: 25, ttlMinutes: 10080, siteId: SITE_A.id }),
       }),
     );
 
@@ -815,5 +919,128 @@ describe('AddDeviceModal — resolved enrollment defaults (#2776)', () => {
       expect((screen.getByTestId('link-ttl') as HTMLSelectElement).value).toBe('30');
     });
     expect(optionLabels('link-ttl')).toEqual(['in about 30 minutes']);
+  });
+});
+
+// #7217 — every Download / Generate Link click mints a parent key first. A
+// failed attempt must not leave that key live: the server discards it on an
+// HTTP failure (the request carries ?discardKeyOnFailure=1), and the modal
+// deletes it itself when the request never got an answer.
+describe('AddDeviceModal — failed attempts leave no live key (#7217)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    setOrgStore();
+    authState.user = { hasPassword: true };
+  });
+
+  function deleteCalls() {
+    return fetchWithAuthMock.mock.calls.filter(
+      ([, init]) => (init as RequestInit | undefined)?.method === 'DELETE',
+    );
+  }
+
+  it('asks the installer route to discard the key on failure', async () => {
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/enrollment-keys') return makeJsonResponse({ id: 'key-d1' }, true, 201);
+      if (url.startsWith('/enrollment-keys/key-d1/installer/')) {
+        return makeJsonResponse({ error: 'MSI not available' }, false, 503);
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<AddDeviceModal isOpen onClose={vi.fn()} />);
+    fireEvent.click(getDownloadButton());
+
+    await waitFor(() => expect(screen.getByText(/MSI not available/)).toBeDefined());
+    const dlUrl = String(fetchWithAuthMock.mock.calls[1][0]);
+    expect(dlUrl).toContain('discardKeyOnFailure=1');
+    // The server discarded it; the modal must not send a second delete.
+    expect(deleteCalls()).toHaveLength(0);
+  });
+
+  it('asks the link route to discard the key on failure', async () => {
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/enrollment-keys') return makeJsonResponse({ id: 'key-d2' }, true, 201);
+      if (url.startsWith('/enrollment-keys/key-d2/installer-link')) {
+        return makeJsonResponse({ error: 'macOS PKG not reachable' }, false, 503);
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<AddDeviceModal isOpen onClose={vi.fn()} />);
+    fireEvent.click(screen.getByText('Generate Link'));
+
+    await waitFor(() => expect(screen.getByText(/macOS PKG not reachable/)).toBeDefined());
+    expect(String(fetchWithAuthMock.mock.calls[1][0])).toBe(
+      '/enrollment-keys/key-d2/installer-link?discardKeyOnFailure=1',
+    );
+    expect(deleteCalls()).toHaveLength(0);
+  });
+
+  it('deletes the key itself when the installer request never gets an answer', async () => {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === '/enrollment-keys') return makeJsonResponse({ id: 'key-d3' }, true, 201);
+      if (url.startsWith('/enrollment-keys/key-d3/installer/')) {
+        throw new TypeError('Failed to fetch');
+      }
+      if (url === '/enrollment-keys/key-d3' && init?.method === 'DELETE') {
+        return makeJsonResponse({ success: true });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<AddDeviceModal isOpen onClose={vi.fn()} />);
+    fireEvent.click(getDownloadButton());
+
+    await waitFor(() => expect(screen.getByText(/Failed to fetch/)).toBeDefined());
+    await waitFor(() => expect(deleteCalls()).toHaveLength(1));
+    expect(String(deleteCalls()[0][0])).toBe('/enrollment-keys/key-d3');
+  });
+
+  it('deletes the key itself when the link request never gets an answer', async () => {
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === '/enrollment-keys') return makeJsonResponse({ id: 'key-d4' }, true, 201);
+      if (url.startsWith('/enrollment-keys/key-d4/installer-link')) {
+        throw new TypeError('Failed to fetch');
+      }
+      if (url === '/enrollment-keys/key-d4' && init?.method === 'DELETE') {
+        return makeJsonResponse({ success: true });
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<AddDeviceModal isOpen onClose={vi.fn()} />);
+    fireEvent.click(screen.getByText('Generate Link'));
+
+    await waitFor(() => expect(deleteCalls()).toHaveLength(1));
+    expect(String(deleteCalls()[0][0])).toBe('/enrollment-keys/key-d4');
+  });
+
+  it('logs a key it could not delete instead of dropping it silently', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    fetchWithAuthMock.mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === '/enrollment-keys') return makeJsonResponse({ id: 'key-d5' }, true, 201);
+      if (url.startsWith('/enrollment-keys/key-d5/installer/')) {
+        throw new TypeError('Failed to fetch');
+      }
+      if (init?.method === 'DELETE') return makeJsonResponse({ error: 'nope' }, false, 500);
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<AddDeviceModal isOpen onClose={vi.fn()} />);
+    fireEvent.click(getDownloadButton());
+
+    await waitFor(() =>
+      expect(errSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/could not delete/i),
+        expect.objectContaining({ keyId: 'key-d5' }),
+      ),
+    );
+    errSpy.mockRestore();
   });
 });

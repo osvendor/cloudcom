@@ -9,10 +9,12 @@ import ExecutionDetails from './ExecutionDetails';
 import type { ScriptExecution } from './ExecutionHistory';
 import type { ScriptParameter } from './ScriptForm';
 import { fetchWithAuth, useAuthStore } from '../../stores/auth';
+import { usePermissions } from '@/lib/permissions';
 import { fetchAllScripts } from '@/lib/scriptsFetch';
 import { useJwtClaims } from '@/lib/authScope';
 import { useOrgStore } from '../../stores/orgStore';
 import { showToast } from '../shared/Toast';
+import { PageHeader } from '../shared/PageHeader';
 import { cn } from '@/lib/utils';
 import { navigateTo } from '@/lib/navigation';
 import { asList } from '@/lib/asList';
@@ -51,6 +53,8 @@ type SystemScript = {
 
 export default function ScriptsPage() {
   const { t } = useTranslation('scripts');
+  const { can } = usePermissions();
+  const canWrite = can('scripts', 'write'); // UX gate; API enforces scripts.write
   const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [scripts, setScripts] = useState<ScriptWithDetails[]>([]);
   const [sites, setSites] = useState<Site[]>([]);
@@ -351,48 +355,55 @@ export default function ScriptsPage() {
 
   return (
     <div className="space-y-6" data-testid="scripts-page">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-xl font-semibold tracking-tight" data-testid="scripts-heading">{t('scriptsPage.title')}</h1>
-          <p className="text-muted-foreground">{t('scriptsPage.description')}</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setModalMode('bundle-import')}
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted"
-            data-testid="bundle-import-open"
-          >
-            <Upload className="h-4 w-4" />
-            {t('bundle.importButton')}
-          </button>
-          <button
-            type="button"
-            onClick={() => setModalMode('bundle-export')}
-            disabled={scripts.length === 0}
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
-            data-testid="bundle-export-open"
-          >
-            <Download className="h-4 w-4" />
-            {t('bundle.exportButton')}
-          </button>
-          <button
-            type="button"
-            onClick={handleOpenLibrary}
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted"
-          >
-            <Download className="h-4 w-4" />
-            {t('scriptsPage.actions.importFromLibrary')}
-          </button>
-          <a
-            href="/scripts/new"
-            className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:bg-primary/90"
-          >
-            <Plus className="h-4 w-4" />
-            {t('scriptsPage.actions.newScript')}
-          </a>
-        </div>
-      </div>
+      <PageHeader
+        title={t('scriptsPage.title')}
+        description={t('scriptsPage.description')}
+        headingTestId="scripts-heading"
+        actions={
+          <>
+            {canWrite && (
+            <button
+              type="button"
+              onClick={() => setModalMode('bundle-import')}
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted"
+              data-testid="bundle-import-open"
+            >
+              <Upload className="h-4 w-4" />
+              {t('bundle.importButton')}
+            </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setModalMode('bundle-export')}
+              disabled={scripts.length === 0}
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted disabled:cursor-not-allowed disabled:opacity-60"
+              data-testid="bundle-export-open"
+            >
+              <Download className="h-4 w-4" />
+              {t('bundle.exportButton')}
+            </button>
+            {canWrite && (
+            <button
+              type="button"
+              onClick={handleOpenLibrary}
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-medium transition hover:bg-muted"
+            >
+              <Download className="h-4 w-4" />
+              {t('scriptsPage.actions.importFromLibrary')}
+            </button>
+            )}
+            {canWrite && (
+            <a
+              href="/scripts/new"
+              className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition hover:bg-primary/90"
+            >
+              <Plus className="h-4 w-4" />
+              {t('scriptsPage.actions.newScript')}
+            </a>
+            )}
+          </>
+        }
+      />
 
       {error && (
         <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
@@ -409,10 +420,12 @@ export default function ScriptsPage() {
           <p className="text-sm text-muted-foreground max-w-md mb-6">
             {t('scriptsPage.empty.description')}
           </p>
+{canWrite && (
           <a href="/scripts/new" className="inline-flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors">
             {t('scriptsPage.actions.createScript')}
             <ArrowRight className="h-4 w-4" />
           </a>
+          )}
         </div>
       ) : (
         <ScriptList

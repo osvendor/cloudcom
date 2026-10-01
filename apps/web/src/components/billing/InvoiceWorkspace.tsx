@@ -5,6 +5,7 @@ import { fetchWithAuth } from '../../stores/auth';
 import { navigateTo } from '@/lib/navigation';
 import { DocumentWorkspace, type DocumentTab } from './shared/DocumentWorkspace';
 import { StatusPill } from './shared/StatusPill';
+import AccessDenied from '../shared/AccessDenied';
 import { MarginToggle, useShowMargin } from './billingUi';
 import InvoiceEditor from './InvoiceEditor';
 import InvoiceDetail from './InvoiceDetail';
@@ -12,6 +13,7 @@ import InvoiceDocumentPreview from './InvoiceDocument';
 import InvoiceActions from './InvoiceActions';
 import { type InvoiceDetail as InvoiceDetailData, STATUS_ROLES } from './invoiceTypes';
 import { useStableT } from '@/lib/i18n/useStableT';
+import { usePageItemName } from '../layout/usePageItemName';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -49,6 +51,7 @@ export default function InvoiceWorkspace({ id }: Props) {
   const { t } = useTranslation('billing');
   const stableT = useStableT(t); // #3632: effect-safe translator; JSX keeps `t`
   const [detail, setDetail] = useState<InvoiceDetailData | null>(null);
+  usePageItemName(detail?.invoice.invoiceNumber);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
   const [tab, setTab] = useState<Tab>('editor');
@@ -83,6 +86,7 @@ export default function InvoiceWorkspace({ id }: Props) {
     pendingDeleteFlushRef.current?.();
   }, []);
 
+  const [denied, setDenied] = useState(false);
   // A `quiet` reload (after an inline edit) refetches without flipping `loading`,
   // so the editor stays mounted — a full-page spinner would remount the form and
   // discard the user's in-progress local state and cursor position. Only the
@@ -92,8 +96,10 @@ export default function InvoiceWorkspace({ id }: Props) {
     try {
       if (!quiet) setLoading(true);
       setError(undefined);
+      setDenied(false);
       const res = await fetchWithAuth(`/invoices/${id}`);
       if (res.status === 401) return UNAUTHORIZED();
+      if (res.status === 403) { if (!quiet) setDenied(true); return; }
       if (res.status === 404) { if (!quiet) setError(stableT('invoiceWorkspace.errors.notFound')); return; }
       if (!res.ok) throw new Error(stableT('invoiceWorkspace.errors.loadFailed'));
       const body = (await res.json()) as { data: InvoiceDetailData };
@@ -149,6 +155,9 @@ export default function InvoiceWorkspace({ id }: Props) {
       </div>
     );
   }
+
+  // A 403 is a permission state, not a transient failure — no error card / retry.
+  if (denied) return <AccessDenied testId="invoice-workspace-denied" />;
 
   if (error || !detail) {
     return (

@@ -37,6 +37,7 @@ $installerPath = Join-Path $PSScriptRoot "breeze.wxs"
 $taskXmlPath = Join-Path $repoRoot "service\\windows\\breeze-agent-user-task.xml"
 $installUserHelperScriptPath = Join-Path $repoRoot "scripts\\install\\install-windows.ps1"
 $removeUserHelperScriptPath = Join-Path $PSScriptRoot "remove-windows-task.ps1"
+$enrollAgentScriptPath = Join-Path $PSScriptRoot "scripts\\enroll-agent.vbs"
 
 if ([string]::IsNullOrWhiteSpace($AgentExePath)) {
     $AgentExePath = Join-Path $repoRoot "breeze-agent-windows-amd64.exe"
@@ -82,6 +83,9 @@ if (-not (Test-Path $installUserHelperScriptPath)) {
 if (-not (Test-Path $removeUserHelperScriptPath)) {
     throw "User helper uninstall script not found: $removeUserHelperScriptPath"
 }
+if (-not (Test-Path $enrollAgentScriptPath)) {
+    throw "Enroll-agent custom action script not found: $enrollAgentScriptPath"
+}
 
 $msiVersion = ($Version -replace '-.*$', '')
 if ($msiVersion -notmatch '^\d+\.\d+\.\d+(\.\d+)?$') {
@@ -117,10 +121,35 @@ else {
     $editionOtherUpgradeCode = $selfHostUpgradeCode
 }
 
+# breeze.wxs runs KillBreezeProcesses through WixQuietExec (no console
+# window on the user's desktop, #3624), whose CA DLL (Wix4UtilCA_*) ships in
+# the WiX Util extension. An extension must match the wix CLI's version, so
+# pin it to the CLI's own version rather than floating to the newest one.
+# Installing it here (idempotent) means every caller of this script, including
+# the release and signing pipelines in other repos, needs no extra setup step.
+# Capture all output before picking a line: piping a native command into
+# Select-Object -First stops the pipeline early and can leave $LASTEXITCODE -1.
+$wixVersionOutput = @(& wix --version)
+$wixVersionExit = $LASTEXITCODE
+$wixVersionLine = ($wixVersionOutput | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+if ($wixVersionExit -ne 0 -or [string]::IsNullOrWhiteSpace($wixVersionLine)) {
+    throw "could not read the wix CLI version (wix --version exit code $wixVersionExit, output: $($wixVersionOutput -join ' '))"
+}
+$wixVersion = ([string]$wixVersionLine).Trim() -replace '\+.*$', ''
+if ($wixVersion -notmatch '^\d+\.\d+\.\d+') {
+    throw "unexpected wix --version output '$wixVersionLine'; cannot pick a matching WixToolset.Util.wixext version"
+}
+$utilExtension = "WixToolset.Util.wixext/$wixVersion"
+& wix extension add -g $utilExtension
+if ($LASTEXITCODE -ne 0) {
+    throw "wix extension add $utilExtension failed with exit code $LASTEXITCODE"
+}
+
 $wixArgs = @(
     "build",
     "$installerPath",
     "-arch", "x64",
+    "-ext", "$utilExtension",
     "-d", "Version=$msiVersion",
     "-d", "ProductName=$editionProductName",
     "-d", "UpgradeCode=$editionUpgradeCode",
@@ -132,6 +161,7 @@ $wixArgs = @(
     "-d", "UserTaskXmlPath=$taskXmlPath",
     "-d", "InstallUserHelperScriptPath=$installUserHelperScriptPath",
     "-d", "RemoveUserHelperScriptPath=$removeUserHelperScriptPath",
+    "-d", "EnrollAgentScriptPath=$enrollAgentScriptPath",
     "-o", "$OutputPath"
 )
 

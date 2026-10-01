@@ -41,7 +41,6 @@ import {
 } from '../db/schema/maintenance';
 import {
   alertRules,
-  alertTemplates,
   alerts,
   notificationChannels,
 } from '../db/schema/alerts';
@@ -54,6 +53,12 @@ import {
   SERVICE_MONITOR_LIST_DEVICE_CAP,
 } from './monitors/listServiceMonitors';
 import {
+  AGGREGATED_EFFECTIVE_PATCH_CATEGORY_SQL,
+  AGGREGATED_EFFECTIVE_PATCH_SEVERITY_SQL,
+  EFFECTIVE_PATCH_CATEGORY_SQL,
+  EFFECTIVE_PATCH_SEVERITY_SQL,
+} from './patchSeverityOverlay';
+import {
   addFeatureLink,
   updateFeatureLink,
   policyAccessCondition,
@@ -64,7 +69,9 @@ import {
 } from '../db/schema/reports';
 import { devices, sites } from '../db/schema';
 import { schedulePeripheralPolicyDevice } from '../jobs/peripheralJobs';
-import { eq, and, desc, sql, inArray, gte, lte, isNull, or, SQL } from 'drizzle-orm';
+import { seriesManagedRefusal } from './reportSeries/types';
+import { eq, and, desc, sql, inArray, gte, lte, isNull, isNotNull, or, SQL } from 'drizzle-orm';
+import { alertSiteScopeByDeviceIds, alertSiteScopeCondition } from '../routes/alerts/helpers';
 import type { AuthContext } from '../middleware/auth';
 import { isAiAgentPrincipal } from '../middleware/auth';
 
@@ -548,12 +555,10 @@ function siteScopePerms(auth: AuthContext): UserPermissions | undefined {
 // alerts.deviceId; zero-site callers then see only device-less (org-wide) alerts.
 function alertSiteCondition(auth: AuthContext): SQL | null {
   const parts: SQL[] = [];
-  const allowed = auth.allowedSiteIds;
-  if (allowed) {
-    parts.push(allowed.length === 0
-      ? isNull(alerts.deviceId)
-      : (or(isNull(alerts.deviceId), inArray(devices.siteId, allowed)) as SQL));
-  }
+  // Site axis on the alert's OWNING site: a topology policy alert follows its
+  // topology site (M3-D6), never its origin device's current site.
+  const siteScope = alertSiteScopeCondition(auth.allowedSiteIds);
+  if (siteScope) parts.push(siteScope);
   // Exact-device axis (#6096) — ANDed on top, and independent of the site axis
   // (a device-LESS analysis run carries only this one). It also overrides the
   // `isNull(deviceId)` escape hatch above: a device-less org-wide alert is not
@@ -1060,6 +1065,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
     tier: 1,
     domain: 'patching',
     searchHint: 'missing patches, KB approval, not CVEs: list, compliance, scan, approve, decline, defer, bulk approve, install, rollback',
+    alwaysLoad: true,
     deviceArgs: ['deviceIds', 'deviceId'],
     definition: {
       name: 'manage_patches',
@@ -1147,20 +1153,21 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (!page.ok) return JSON.stringify({ error: page.error, code: page.code });
         const { limit, offset, fingerprint } = page;
 
+        // Effective severity/category (patchSeverityOverlay.ts): the trusted
+        // shared classification when known, else this device's (or, org-wide,
+        // any of this org's devices') own reported value. `patches.severity`/
+        // `.category` alone stay 'unknown'/NULL forever for
+        // microsoft/apple/linux/custom sources — an AI query like "list
+        // critical outstanding patches" would otherwise silently omit or
+        // mis-bucket most of a Windows-heavy fleet's patch volume, and would
+        // disagree with what patchEligibility.ts's auto-approval check sees
+        // for the same patch. Every query below is already pinned to
+        // `devicePatches.orgId = orgId` (and, for the device-scoped branch,
+        // also `devicePatches.deviceId = deviceId`), so this never crosses a
+        // tenant boundary.
         const catalogConds: SQL[] = [];
         if (typeof input.source === 'string') catalogConds.push(eq(patches.source, input.source as any));
-        if (typeof input.severity === 'string') catalogConds.push(eq(patches.severity, input.severity as any));
-
-        const patchCols = {
-          id: patches.id,
-          source: patches.source,
-          externalId: patches.externalId,
-          title: patches.title,
-          severity: patches.severity,
-          category: patches.category,
-          releaseDate: patches.releaseDate,
-          requiresReboot: patches.requiresReboot,
-        };
+        if (typeof input.severity === 'string') catalogConds.push(sql`${EFFECTIVE_PATCH_SEVERITY_SQL} = ${input.severity}`);
 
         // Both axes, independent of each other: a site-restricted human sees
         // their sites' patch inventory, a device-bound or device-LESS agent run
@@ -1173,6 +1180,18 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
         if (deviceId) {
           // Per-device: patches on this specific device, with install status.
+          // One device_patches row per patch here, so the per-row effective
+          // fragment applies directly — no aggregation needed.
+          const patchCols = {
+            id: patches.id,
+            source: patches.source,
+            externalId: patches.externalId,
+            title: patches.title,
+            severity: EFFECTIVE_PATCH_SEVERITY_SQL,
+            category: EFFECTIVE_PATCH_CATEGORY_SQL,
+            releaseDate: patches.releaseDate,
+            requiresReboot: patches.requiresReboot,
+          };
           const rows = await db.select({ ...patchCols, status: devicePatches.status })
             .from(devicePatches)
             .innerJoin(patches, eq(devicePatches.patchId, patches.id))
@@ -1183,14 +1202,30 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           return JSON.stringify({ ...pageEnvelope({ key: 'patches', items: rows, limit, offset, fingerprint }), scope: { deviceId } });
         }
 
-        // Org-wide: distinct catalog entries present on any of the org's
-        // devices. selectDistinct collapses the per-device fan-out to one row
-        // per patch; createdAt is in the projection so the DISTINCT + ORDER BY
-        // is valid in Postgres.
-        const rows = await db.selectDistinct({ ...patchCols, createdAt: patches.createdAt })
+        // Org-wide: one row per catalog entry present on any of the org's
+        // devices. A plain per-row severity/category column can't be shown
+        // here — several of the org's devices can report different values for
+        // the same shared patch row — so this collapses via GROUP BY (instead
+        // of the previous selectDistinct) and shows the most severe effective
+        // value seen across the org's own devices reporting this patch (worst
+        // case wins, never under-reports risk). Aggregated within this org's
+        // own device_patches rows only (`devicePatches.orgId = orgId`),
+        // never across orgs.
+        const rows = await db.select({
+          id: patches.id,
+          source: patches.source,
+          externalId: patches.externalId,
+          title: patches.title,
+          severity: AGGREGATED_EFFECTIVE_PATCH_SEVERITY_SQL,
+          category: AGGREGATED_EFFECTIVE_PATCH_CATEGORY_SQL,
+          releaseDate: patches.releaseDate,
+          requiresReboot: patches.requiresReboot,
+          createdAt: patches.createdAt,
+        })
           .from(patches)
           .innerJoin(devicePatches, eq(devicePatches.patchId, patches.id))
           .where(and(eq(devicePatches.orgId, orgId), ...patchListScope, ...catalogConds))
+          .groupBy(patches.id, patches.source, patches.externalId, patches.title, patches.releaseDate, patches.requiresReboot, patches.createdAt)
           .orderBy(desc(patches.createdAt), desc(patches.id))
           .limit(limit + 1)
           .offset(offset);
@@ -1593,7 +1628,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           // early-returns as disabled above (patch policies are managed through
           // configuration policies). The two fixes below are defense-in-depth,
           // kept correct so the block is not a trap if the gate is ever lifted
-          // — same convention as the disabled `manage_alert_rules` branch.
+          // — configuration policies own these writes.
           //
           // `policyAccessCondition`, not a bare org-equality (#3493): a
           // partner-wide policy stores `org_id NULL`, so the org form would tell
@@ -2637,17 +2672,16 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
   registerTool({
     tier: 1,
     domain: 'monitoring',
-    searchHint: 'alert rules: list templates, list rules, get rule, test rule, list channels, alert summary',
+    searchHint: 'alert rules: list rules, get rule, test rule, list channels, alert summary',
     definition: {
       name: 'manage_alert_rules',
-      description: 'Read alert rules, templates and channels. Actions: list_templates, list_rules, get_rule, test_rule, list_channels, alert_summary, create_rule (disabled), update_rule (disabled), delete_rule (disabled). For writes, use manage_policy_feature_link with featureType "alert_rule".',
+      description: 'Read compiled alert rules and channels. list_rules returns monitorId. Author conditions with manage_monitor_definitions. Actions: list_rules, get_rule, test_rule, list_channels, alert_summary.',
       input_schema: {
         type: 'object' as const,
         properties: {
-          action: { type: 'string', enum: ['list_templates', 'list_rules', 'get_rule', 'test_rule', 'list_channels', 'alert_summary'], description: 'The action to perform. This tool is read-only — to create/modify alert rules, use manage_policy_feature_link with featureType "alert_rule".' },
+          action: { type: 'string', enum: ['list_rules', 'get_rule', 'test_rule', 'list_channels', 'alert_summary'], description: 'The action to perform. This tool is read-only — to create/modify alert conditions, use manage_monitor_definitions.' },
           ruleId: { type: 'string', description: 'Alert rule UUID (required for get_rule/test_rule)' },
-          category: { type: 'string', description: 'Filter templates by category (for list_templates)' },
-          severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low', 'info'], description: 'Filter by severity (for list_templates/alert_summary)' },
+          severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low', 'info'], description: 'Filter by severity (for alert_summary)' },
           limit: { type: 'number', description: 'Max results (default 25, max 100)' },
         },
         required: ['action'],
@@ -2657,52 +2691,15 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
       const action = input.action as string;
       const orgId = getOrgId(auth);
 
-      if (action === 'list_templates') {
-        const conditions: SQL[] = [];
-        // Show built-in templates (orgId IS NULL) + custom templates for accessible orgs
-        const oc = orgWhere(auth, alertTemplates.orgId);
-        if (oc) {
-          // Org/partner scope: built-in OR belonging to accessible org(s)
-          // `is_built_in AND org_id IS NULL` — policyAlertBridge creates
-          // ORG-OWNED built-in rows, so a bare is_built_in disjunct would show
-          // another org's template (security review 2026-08-16 §1.5, same class).
-          conditions.push(sql`((${alertTemplates.isBuiltIn} = true AND ${alertTemplates.orgId} IS NULL) OR ${oc})`);
-        }
-        // System scope (oc undefined): no filter — show all templates
-        if (typeof input.category === 'string') conditions.push(eq(alertTemplates.category, input.category as string));
-        if (typeof input.severity === 'string') conditions.push(eq(alertTemplates.severity, input.severity as any));
-
-        const limit = Math.min(Math.max(1, Number(input.limit) || 50), 100);
-        const rows = await db.select({
-          id: alertTemplates.id,
-          name: alertTemplates.name,
-          description: alertTemplates.description,
-          category: alertTemplates.category,
-          severity: alertTemplates.severity,
-          conditions: alertTemplates.conditions,
-          isBuiltIn: alertTemplates.isBuiltIn,
-          autoResolve: alertTemplates.autoResolve,
-          cooldownMinutes: alertTemplates.cooldownMinutes,
-        }).from(alertTemplates)
-          .where(conditions.length > 0 ? and(...conditions) : undefined)
-          .orderBy(desc(alertTemplates.isBuiltIn), alertTemplates.name)
-          .limit(limit);
-
-        return JSON.stringify({
-          templates: rows,
-          showing: rows.length,
-          hint: 'Alert rules are managed through configuration policies. Use manage_policy_feature_link with featureType "alert_rule" and inlineSettings to add alert rules to a policy.',
-        });
-      }
-
       if (action === 'list_rules') {
-        const conditions: SQL[] = [];
+        const conditions: SQL[] = [isNotNull(alertRules.managedByMonitorId)];
         const oc = alertRuleWhere(auth);
         if (oc) conditions.push(oc);
 
         const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
         const rows = await db.select({
           id: alertRules.id,
+          monitorId: alertRules.managedByMonitorId,
           name: alertRules.name,
           templateId: alertRules.templateId,
           targetType: alertRules.targetType,
@@ -2723,7 +2720,11 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           visibleRules = rows.filter((_, i) => !denied[i]);
         }
 
-        return JSON.stringify({ rules: visibleRules, showing: visibleRules.length });
+        return JSON.stringify({
+          rules: visibleRules,
+          showing: visibleRules.length,
+          note: 'Only monitor-managed rules are listed. Feature-engine rules (patch, compliance/policy bridge, automation) are not listed; use get_rule with an alert\'s ruleId to read them.',
+        });
       }
 
       if (action === 'get_rule') {
@@ -2760,12 +2761,6 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           .limit(5);
 
         return JSON.stringify({ rule, recentAlerts });
-      }
-
-      if (action === 'create_rule' || action === 'update_rule' || action === 'delete_rule') {
-        return JSON.stringify({
-          error: `Action "${action}" is disabled. Alert rules must be managed through configuration policies. Use manage_policy_feature_link with featureType "alert_rule" to add, update, or remove alert rules on a configuration policy.`,
-        });
       }
 
       if (action === 'test_rule') {
@@ -3140,10 +3135,18 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           // scope, which must zero the response rather than widen it.
           {
             const allowed = await aiAuthorityDeviceIds(orgId, executionAuthority, auth);
-            if (allowed && allowed.length === 0) {
+            const allowedSites = executionAuthority.scope.kind === 'restricted' ? executionAuthority.scope.siteIds : undefined;
+            if (allowed && allowed.length === 0 && (allowedSites === undefined || allowedSites.length === 0)) {
               return JSON.stringify({ reportType, data: { total: 0, active: 0, critical: 0, high: 0, resolved24h: 0 } });
             }
-            if (allowed) summaryConditions.push(inArray(alerts.deviceId, allowed));
+            // Device alerts by in-scope device; a site-owned topology alert by
+            // its OWNING topology site (M3-D6) — and, for a device-bound run,
+            // also bound to its allowlisted device.
+            if (allowed) {
+              summaryConditions.push(alertSiteScopeByDeviceIds({
+                allowedSiteIds: allowedSites, allowedDeviceIds: allowed, deviceAxis: auth.allowedDeviceIds !== undefined,
+              })!);
+            }
           }
           const [summary] = await db.select({
             total: sql<number>`count(*)`,
@@ -3229,6 +3232,9 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         );
         if (!access) return JSON.stringify({ error: 'Report not found or access denied' });
         const existing = access.report;
+        // Multi-org report series W02: a child's shared fields belong to its
+        // series (spec §3.3 "Child writers").
+        if (existing.seriesId) return JSON.stringify(seriesManagedRefusal(existing.seriesId));
 
         const updates: Record<string, unknown> = { updatedAt: new Date() };
         if (typeof input.name === 'string') updates.name = input.name;
@@ -3239,6 +3245,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const updated = await db.update(reports).set(updates).where(and(
           eq(reports.id, existing.id),
           eq(reports.orgId, existing.orgId),
+          isNull(reports.seriesId),
           access.predicate,
         )).returning({ id: reports.id });
         if (updated.length !== 1) {
@@ -3256,12 +3263,14 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         );
         if (!access) return JSON.stringify({ error: 'Report not found or access denied' });
         const existing = access.report;
+        if (existing.seriesId) return JSON.stringify(seriesManagedRefusal(existing.seriesId));
 
         const deleted = await db.transaction(async (tx) => {
           await tx.delete(reportRuns).where(eq(reportRuns.reportId, existing.id));
           const deletedRows = await tx.delete(reports).where(and(
             eq(reports.id, existing.id),
             eq(reports.orgId, existing.orgId),
+            isNull(reports.seriesId),
             access.predicate,
           )).returning({ id: reports.id });
           if (deletedRows.length !== 1) {

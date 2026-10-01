@@ -1,6 +1,7 @@
 import type { InheritableEventLogSettings } from '@breeze/shared';
 import { Trans, useTranslation } from 'react-i18next';
 import '@/lib/i18n';
+import SavedSecretInput from './SavedSecretInput';
 
 type Props = {
   data: InheritableEventLogSettings;
@@ -48,16 +49,13 @@ export default function PartnerEventLogsTab({ data, onChange }: Props) {
             />
           </div>
 
-          <div className="space-y-2">
-            <label className="text-sm font-medium">{t('partnerEventLogs.apiKey')}</label>
-            <input
-              type="password"
-              value={data.elasticsearchApiKey ?? ''}
-              onChange={e => set({ elasticsearchApiKey: e.target.value || undefined })}
-              placeholder={t('partnerEventLogs.notSet')}
-              className="h-10 w-full rounded-md border bg-background px-3 text-sm"
-            />
-          </div>
+          <SavedSecretInput
+            value={data.elasticsearchApiKey}
+            onChange={elasticsearchApiKey => set({ elasticsearchApiKey })}
+            label={t('partnerEventLogs.apiKey')}
+            testId="partner-event-logs-api-key"
+            notSetPlaceholder={t('partnerEventLogs.notSet')}
+          />
 
           <div className="space-y-2">
             <label className="text-sm font-medium">{t('partnerEventLogs.username')}</label>
@@ -70,16 +68,13 @@ export default function PartnerEventLogsTab({ data, onChange }: Props) {
             />
           </div>
 
-          <div className="space-y-2">
-            <label className="text-sm font-medium">{t('partnerEventLogs.password')}</label>
-            <input
-              type="password"
-              value={data.elasticsearchPassword ?? ''}
-              onChange={e => set({ elasticsearchPassword: e.target.value || undefined })}
-              placeholder={t('partnerEventLogs.notSet')}
-              className="h-10 w-full rounded-md border bg-background px-3 text-sm"
-            />
-          </div>
+          <SavedSecretInput
+            value={data.elasticsearchPassword}
+            onChange={elasticsearchPassword => set({ elasticsearchPassword })}
+            label={t('partnerEventLogs.password')}
+            testId="partner-event-logs-password"
+            notSetPlaceholder={t('partnerEventLogs.notSet')}
+          />
         </div>
       )}
 

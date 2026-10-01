@@ -97,7 +97,8 @@
       "create": "Create monitor",
       "test": "Test on a device",
       "deploy": "Deploy to…",
-      "delete": "Delete"
+      "delete": "Delete",
+      "backToMonitors": "Back to Monitors"
     },
     "errors": {
       "load": "Failed to load monitor",
@@ -154,12 +155,20 @@
     },
     "composite": {
       "children": "Child conditions",
-      "add": "Add condition"
+      "add": "Add condition",
+      "matchLabel": "Match"
     },
     "restart": {
       "label": "Restart service on the device",
       "maxAttempts": "Maximum restart attempts",
       "cooldownSeconds": "Restart cooldown (seconds)"
+    },
+    "networkCheckAsset": {
+      "label": "Asset",
+      "unbound": "No asset binding",
+      "failed": "Could not load assets",
+      "orgRequired": "Select organization ownership to bind an asset.",
+      "pingName": "Ping {{label}}"
     }
   },
   "kinds": {
@@ -173,7 +182,7 @@
     "service": "Service stopped",
     "process": "Process stopped",
     "process_resource": "Process resource",
-    "cert_expiry": "Certificate expiry",
+    "cert_expiry": "Agent mTLS certificate expiry",
     "bandwidth": "Bandwidth",
     "disk_io": "Disk I/O",
     "network_errors": "Network errors",
@@ -182,7 +191,8 @@
     "backup_continuity": "Backup continuity",
     "script": "Script check",
     "network_check": "Network check",
-    "hardware_health": "Hardware health"
+    "hardware_health": "Hardware health",
+    "time_sync": "Time synchronization"
   },
   "fields": {
     "operator": "Comparison",
@@ -223,7 +233,18 @@
     "port": "Port",
     "expectStatus": "Expected status code",
     "pollingIntervalSeconds": "Poll every (seconds)",
-    "match": "Match"
+    "match": "Match",
+    "pingCount": "Echo requests",
+    "expectBanner": "Expected banner",
+    "httpMethod": "HTTP method",
+    "expectedBody": "Response must contain",
+    "followRedirects": "Follow redirects",
+    "verifySsl": "Verify TLS certificate",
+    "recordType": "Record type",
+    "expectedValue": "Expected value",
+    "nameserver": "Nameserver",
+    "degradedIsFailure": "Treat degraded as failure",
+    "maxResponseMs": "Fail when slower than (ms)"
   },
   "operators": {
     "gt": "greater than",
@@ -279,7 +300,8 @@
   },
   "backupChecks": {
     "no_successful_backup": "No successful backup",
-    "consecutive_failures": "Consecutive failures"
+    "consecutive_failures": "Consecutive failures",
+    "completed_with_errors": "Completed with file errors"
   },
   "checkTypes": {
     "icmp_ping": "ICMP ping",
@@ -348,6 +370,7 @@
     "convert": "Convert to monitor",
     "converted": "Converted",
     "notConvertible": "This rule's conditions cannot be expressed as a single monitor.",
+    "systemManaged": "System-managed rule. Breeze raises this alert itself, so there is nothing to convert.",
     "errors": {
       "fetch": "Failed to load alert rules",
       "convert": "Failed to convert rule"
@@ -420,9 +443,9 @@
       "review": "Review",
       "convertEverything": "Convert everything…",
       "confirmTitle": "Convert every legacy rule, watch and alert-triggered automation across all your policies?",
-      "confirmBody": "{{rows}} in {{policies}} across the whole partner. Converted rows retire in place. Unconvertible rows remain for review or manual retirement in W05c; W05d converts leftovers and retires those it cannot convert.",
+      "confirmBody": "{{rows}} in {{policies}} across the whole partner. Converted rows retire in place. Unconvertible rows remain for review or manual retirement now; a future release converts leftovers and retires those it cannot convert.",
       "confirmRun": "Convert everything",
-      "convertedAll": "Converted {{converted}} rows across {{policies}} policies; {{unconvertible}} could not be converted.",
+      "convertedAll": "Converted {{rows}} across {{policies}}; {{unconvertible}} could not be converted.",
       "errors": {
         "convertAll": "Failed to convert everything"
       }
@@ -493,7 +516,7 @@
       "empty": "No conversion history.",
       "system": "System",
       "reverted": "Reverted",
-      "deadline": "Undo is unavailable after W05d removes the source runtime."
+      "deadline": "Undo is unavailable after the legacy alerting retirement removes the source runtime."
     },
     "errorCodes": {
       "preview_stale": "The policy changed since this preview. Preview again before converting.",
@@ -509,6 +532,46 @@
       "conversion_revert_unavailable": "This conversion can no longer be undone.",
       "invalid_reason": "That retirement reason is not valid.",
       "unknown": "The conversion failed. Try again."
+    },
+    "retirement": {
+      "summary_one": "{{count}} legacy rule could not be converted to a monitor — review it.",
+      "summary_other": "{{count}} legacy rules could not be converted to monitors — review them.",
+      "review": "Review",
+      "dismiss": "Dismiss",
+      "openAlertsNote": "These rules no longer fire. Their open alerts stay open until someone resolves them; recreate the condition as a monitor if it is still needed.",
+      "reasons": {
+        "custom_condition": "custom condition",
+        "nested_group": "nested condition group",
+        "no_condition": "no evaluable condition",
+        "equivalence_delta": "conversion would change what fires on some devices",
+        "escalation_policy_axis": "escalation policy belongs to a single organization",
+        "parent_unconverted": "parent policy was not converted",
+        "policy_inactive": "policy is inactive or archived",
+        "prerequisite_missing": "a prerequisite fix is missing on this server",
+        "metric_without_kind": "metric has no monitor kind",
+        "child_kind_not_composable": "condition cannot be part of a composite monitor",
+        "too_many_conditions": "too many conditions",
+        "too_many_responses": "more than ten responses would be required",
+        "auto_resolve_conditions": "custom resolution conditions cannot be preserved",
+        "target_unconvertible": "the response target cannot be converted",
+        "already_managed": "already managed by a monitor",
+        "no_org": "check does not belong to an organization",
+        "asset_missing": "the linked discovered asset no longer exists",
+        "condition_invalid": "check settings do not form a valid monitor condition",
+        "no_active_rules": "check has no active alert rule",
+        "multiple_network_rules": "check has more than one active alert rule",
+        "network_predicate_unsupported": "alert condition has no monitor equivalent",
+        "network_threshold_out_of_range": "failure threshold is out of range (at most 100 consecutive failures)",
+        "site_binding_unrepresentable": "site-bound check is not linked to a discovered asset",
+        "config_override_unrepresentable": "custom target or timeout override cannot be preserved",
+        "built_in": "built-in system rule; it keeps alerting on its own",
+        "no_rules": "template has no rules to convert",
+        "target_or_owner": "a rule's target or owner differs from its template",
+        "blocked": "conversion is blocked",
+        "disabled_response_automation": "response automation is disabled",
+        "alert_workflow_kept": "alert workflow kept as is",
+        "unknown": "conversion was refused; review the source"
+      }
     }
   },
   "device": {
@@ -541,7 +604,41 @@
           "warning": "Warning",
           "critical": "Critical"
         }
+      },
+      "time_sync": {
+        "findings": "Findings",
+        "consecutiveSnapshots": "Consecutive snapshots",
+        "findingOptions": {
+          "pdc_no_external_source": "Forest root PDC has no external source",
+          "source_local_clock": "Using the local clock",
+          "dc_vm_host_sync": "DC is syncing with the VM host",
+          "ntp_server_unresolvable": "NTP server name is invalid or unresolved",
+          "ntp_peer_unreachable": "NTP peer is unreachable",
+          "domain_source_unavailable": "Domain time source unavailable",
+          "member_not_on_hierarchy": "Not using the domain hierarchy",
+          "sync_disabled": "Time synchronization is disabled",
+          "sync_stale": "No recent successful synchronization",
+          "correction_refused": "Time correction was refused",
+          "timezone_mismatch": "Timezone differs from expected",
+          "policy_not_applied": "Time policy was not applied",
+          "policy_conflict_gpo": "Group Policy controls time settings"
+        }
       }
     }
+  },
+  "httpMethods": {
+    "GET": "GET (retrieve)",
+    "HEAD": "HEAD (headers only)",
+    "POST": "POST (submit)",
+    "PUT": "PUT (replace)",
+    "OPTIONS": "OPTIONS (capabilities)"
+  },
+  "dnsRecordTypes": {
+    "A": "A (IPv4 address)",
+    "AAAA": "AAAA (IPv6 address)",
+    "MX": "MX (mail server)",
+    "CNAME": "CNAME (alias)",
+    "TXT": "TXT (text)",
+    "NS": "NS (nameserver)"
   }
 }

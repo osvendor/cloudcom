@@ -22,9 +22,12 @@ import { authMiddleware, requireMfa, requirePermission, requireScope, type AuthC
 import { writeRouteAudit } from '../services/auditEvents';
 import { captureException } from '../services/sentry';
 import { PERMISSIONS, canAccessSite, type UserPermissions } from '../services/permissions';
+import { normalizeSiteAllowlist } from '../services/siteAllowlist';
 import { slaDefinitionOutOfScope, slaScopeNarrowed, type SlaTargetShape } from '../services/slaSiteScope';
 import { METRIC_ANOMALY_V1_SHADOW_VERSION } from '../services/metricAnomalies';
 
+import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
+import { dateFromSqlValue } from '../services/portal/sqlTimestamp';
 export const analyticsRoutes = new Hono();
 const requireAnalyticsRead = requirePermission(
   PERMISSIONS.DEVICES_READ.resource,
@@ -90,7 +93,7 @@ async function resolveSiteAllowedDeviceIds(
     // Ephemeral Quick Support devices live in the hidden 'quick_support' org that
     // stays inside accessibleOrgIds for RLS, so nothing excludes them for us —
     // every analytics enumeration in this file has to say so explicitly.
-    .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false)));
+    .where(and(eq(devices.orgId, orgId), eq(devices.isEphemeral, false), notParkedDeviceCondition()));
   return orgDevices
     .filter((d) => typeof d.siteId === 'string' && canAccessSite(perms, d.siteId))
     .map((d) => d.id);
@@ -565,7 +568,7 @@ analyticsRoutes.post(
         aggregation: data.aggregation,
         interval: data.interval,
         data: rows.map((row) => ({
-          timestamp: row.bucket instanceof Date ? row.bucket.toISOString() : new Date(String(row.bucket)).toISOString(),
+          timestamp: row.bucket instanceof Date ? row.bucket.toISOString() : dateFromSqlValue(String(row.bucket)).toISOString(),
           value: row.value === null ? null : Number(row.value)
         }))
       });
@@ -1652,7 +1655,7 @@ analyticsRoutes.get(
       trend: clampPercent(intercept + slope * index)
     }));
 
-    const baselineDate = pointCount > 0 ? new Date(actuals[pointCount - 1]!.timestamp) : new Date();
+    const baselineDate = pointCount > 0 ? dateFromSqlValue(actuals[pointCount - 1]!.timestamp) : new Date();
     const forecastSeries = Array.from({ length: 14 }, (_, index) => {
       const projectedDate = new Date(baselineDate);
       projectedDate.setUTCDate(projectedDate.getUTCDate() + index + 1);
@@ -1870,7 +1873,7 @@ analyticsRoutes.get(
       .where(
         and(
           eq(devices.orgId, sla.orgId),
-          eq(devices.isEphemeral, false),
+          eq(devices.isEphemeral, false), notParkedDeviceCondition(),
           eq(devices.status, 'online'),
           gte(devices.lastSeenAt, since)
         )
@@ -1882,7 +1885,7 @@ analyticsRoutes.get(
       .where(
         and(
           eq(devices.orgId, sla.orgId),
-          eq(devices.isEphemeral, false),
+          eq(devices.isEphemeral, false), notParkedDeviceCondition(),
           ne(devices.status, 'decommissioned')
         )
       );
@@ -1919,15 +1922,24 @@ analyticsRoutes.get(
         : auth?.orgId
           ? eq(devices.orgId, auth.orgId)
           : undefined;
+    // Site is an app-layer axis (RLS defends only the org), so a restricted
+    // caller's site list is applied in SQL before anything is counted or
+    // grouped. `undefined` = unrestricted; an empty (or malformed) list sees
+    // no device, so both queries are skipped and the summary reports zeros.
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const allowedSiteIds = normalizeSiteAllowlist(perms?.allowedSiteIds);
+    const siteCondition = allowedSiteIds ? inArray(devices.siteId, [...allowedSiteIds]) : undefined;
+    const seesNoSites = allowedSiteIds?.length === 0;
 
     try {
       // Device counts by status (exclude decommissioned)
       const statusCondition = and(
         ne(devices.status, 'decommissioned'),
-        eq(devices.isEphemeral, false),
+        eq(devices.isEphemeral, false), notParkedDeviceCondition(),
         orgCondition,
+        siteCondition,
       );
-      const statusCounts = await db
+      const statusCounts = seesNoSites ? [] : await db
         .select({
           status: devices.status,
           count: sql<number>`count(*)`,
@@ -1948,14 +1960,16 @@ analyticsRoutes.get(
         if (row.status === 'pending') pending = n;
       }
 
-      // Weekly enrollment trend (last 12 weeks)
+      // Weekly enrollment trend (last 12 weeks). Deliberately keeps
+      // decommissioned devices: this is enrollment history, not the live fleet.
       const twelveWeeksAgo = new Date(Date.now() - 12 * 7 * 24 * 60 * 60 * 1000);
       const weeklyTrendCondition = and(
         gte(devices.enrolledAt, twelveWeeksAgo),
-        eq(devices.isEphemeral, false),
+        eq(devices.isEphemeral, false), notParkedDeviceCondition(),
         orgCondition,
+        siteCondition,
       );
-      const weeklyTrend = await db
+      const weeklyTrend = seesNoSites ? [] : await db
         .select({
           week: sql<string>`date_trunc('week', ${devices.enrolledAt})`.as('week'),
           count: sql<number>`count(*)`,
@@ -2011,15 +2025,22 @@ analyticsRoutes.get(
         : auth?.orgId
           ? eq(devices.orgId, auth.orgId)
           : undefined;
+    // Same site narrowing as /executive-summary: applied before grouping, and
+    // an empty (or malformed) site list skips the query entirely.
+    const perms = c.get('permissions') as UserPermissions | undefined;
+    const allowedSiteIds = normalizeSiteAllowlist(perms?.allowedSiteIds);
+    const siteCondition = allowedSiteIds ? inArray(devices.siteId, [...allowedSiteIds]) : undefined;
+    const seesNoSites = allowedSiteIds?.length === 0;
 
     try {
       // Group by osType + osVersion for granularity
       const osDistributionCondition = and(
         ne(devices.status, 'decommissioned'),
-        eq(devices.isEphemeral, false),
+        eq(devices.isEphemeral, false), notParkedDeviceCondition(),
         orgCondition,
+        siteCondition,
       );
-      const rows = await db
+      const rows = seesNoSites ? [] : await db
         .select({
           osType: devices.osType,
           osVersion: devices.osVersion,

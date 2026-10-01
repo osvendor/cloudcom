@@ -29,9 +29,12 @@ import {
   sites,
   tickets,
 } from '../db/schema';
+import type { orgTypeEnum } from '../db/schema/orgs';
 import { INVOICE_OPEN_STATUSES, TICKET_OPEN_STATUSES, sqlStatusList } from './openWorkStatuses';
 
-export type OrgType = 'customer' | 'internal' | 'quick_support';
+import { notHiddenOrgType } from './unassignedPool/visibility';
+/** Tracks the org_type enum so a new label cannot drift out of this union. */
+export type OrgType = (typeof orgTypeEnum.enumValues)[number];
 
 export interface AcceptedOrg {
   id: string;
@@ -85,7 +88,7 @@ export async function resolveAcceptedOrgs(input: ResolveAcceptedOrgsInput): Prom
         isNull(organizations.deletedAt),
         // Inside accessibleOrgIds by design (RLS lets a tech reach their own
         // support session) but never enumerated — same rule as GET /orgs.
-        ne(organizations.type, 'quick_support'),
+        notHiddenOrgType(),
         input.accessibleOrgIds === null ? undefined : inArray(organizations.id, input.accessibleOrgIds),
       ),
     );
@@ -286,7 +289,10 @@ function queryContactSignals(ids: string[]) {
       primaryEmail: sql<string | null>`max(${contacts.email}) ${primary}`,
       primaryPhone: sql<string | null>`max(${contacts.phone}) ${primary}`,
       primaryMobile: sql<string | null>`max(${contacts.mobile}) ${primary}`,
-      billingRole: sql<boolean>`bool_or(${contacts.roles} @> ARRAY['billing']::text[])`,
+      // ORG-level only, matching what invoices use: organizations.billing_contact
+      // projects the org-level contact holding the role (contacts/compat.ts
+      // projectBillingContact), so a site-level billing contact receives nothing.
+      billingRole: sql<boolean>`bool_or(${contacts.siteId} IS NULL AND ${contacts.roles} @> ARRAY['billing']::text[])`,
     })
     .from(contacts)
     .where(inArray(contacts.orgId, ids))

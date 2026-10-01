@@ -167,17 +167,21 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 	}
 	result.StagingDir = stagingDir
 
-	// 4. Load resume state if it exists
-	resumeState, err := LoadResumeState(stagingDir)
-	if err != nil {
-		slog.Warn("failed to load resume state, starting fresh", "error", err.Error())
-	}
-	if resumeState == nil {
-		resumeState = &ResumeState{
-			SnapshotID:     cfg.SnapshotID,
-			CompletedFiles: make(map[string]bool),
+	// 4. Load resume state (snapshot + journal) if it exists. Progress is
+	// journaled per file and compacted when the run ends without completing
+	// (restore_resume.go, #7333); a completed run discards it below.
+	resume := openResumeTracker(stagingDir, cfg.SnapshotID)
+	defer resume.close()
+
+	// Tell a batching provider which objects are coming, in order, so it
+	// can authorize them a window at a time rather than one per download.
+	pending := make([]SnapshotFile, 0, len(files))
+	for _, f := range files {
+		if !resume.completed(f.BackupPath) {
+			pending = append(pending, f)
 		}
 	}
+	providers.PrepareDownloads(provider, contentKeys(pending))
 
 	if progressFn != nil {
 		progressFn("starting", 0, total, fmt.Sprintf("restoring %d files", total))
@@ -201,7 +205,7 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 		targetPath := filepath.Join(targetBase, relativeTarget)
 
 		// Skip already-completed files (resume)
-		if resumeState.CompletedFiles[file.BackupPath] {
+		if resume.completed(file.BackupPath) {
 			if info, statErr := securefs.StatFile(targetBase, relativeTarget); statErr == nil && info.Size() == file.Size {
 				result.FilesRestored++
 				result.BytesRestored += file.Size
@@ -211,7 +215,7 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 				}
 				continue
 			}
-			delete(resumeState.CompletedFiles, file.BackupPath)
+			resume.forget(file.BackupPath)
 		}
 
 		// Download to staging
@@ -327,13 +331,8 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 
 		result.FilesRestored++
 		result.BytesRestored += file.Size
-		resumeState.CompletedFiles[file.BackupPath] = true
-		resumeState.BytesRestored += file.Size
-
-		// Save resume state after each successful file
-		if saveErr := SaveResumeState(stagingDir, resumeState); saveErr != nil {
-			slog.Warn("failed to save resume state", "error", saveErr.Error())
-		}
+		// One journal append per file — not a rewrite of the whole state.
+		resume.markCompleted(file.BackupPath, file.Size)
 
 		if progressFn != nil {
 			progressFn("restoring", current, total,
@@ -354,6 +353,7 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 		sd                []byte
 	}
 	var dirSecurity []dirSD
+	var dirAttrs []pendingDirAttrs
 	for _, entry := range append(links, dirs...) {
 		if checkCancelled() {
 			return result, nil
@@ -409,16 +409,11 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 				}
 				entryErr = securefs.InstallDir(targetBase, relativeEntry, mode, entry.ModeBits != 0, entryOwner(entry, applyOwnership), entry.ModTime)
 				if entryErr == nil {
-					// The walker records a Windows directory entry when the
-					// directory is empty, and for EVERY directory when
-					// security-descriptor capture is on (W06a). A Hidden or
-					// System folder must come back Hidden/System rather than
-					// plain (#5407, review finding). Applied best-effort:
-					// losing a directory attribute is a fidelity warning,
-					// never a failed restore.
-					if attrErr := applyWinAttrs(filepath.Join(targetBase, relativeEntry), entry.WinAttrs); attrErr != nil {
-						result.Warnings = append(result.Warnings,
-							fmt.Sprintf("recreated %s with reduced fidelity: could not reapply windows attributes: %v", displayPath, attrErr))
+					// A Hidden or System folder must come back Hidden/System
+					// rather than plain (#5407, #6506). Deferred to a
+					// post-pass below, after every entry is in place.
+					if entry.WinAttrs != 0 {
+						dirAttrs = append(dirAttrs, pendingDirAttrs{relative: relativeEntry, display: displayPath, attrs: entry.WinAttrs})
 					}
 					if sd := secDescs.forEntry(entry); sd != nil {
 						dirSecurity = append(dirSecurity, dirSD{relative: relativeEntry, display: displayPath, sd: sd})
@@ -439,6 +434,8 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 		}
 		result.FilesRestored++
 	}
+
+	result.Warnings = append(result.Warnings, applyDirWinAttrs(targetBase, dirAttrs)...)
 
 	// Directory security descriptors, now that every file, symlink and
 	// directory is in place. Deepest first, so a parent's DACL can never
@@ -476,6 +473,9 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 
 	// 7. Clean up staging on success
 	if result.Status == "completed" {
+		// Nothing left to resume. Release the journal handle first: an open
+		// handle would block removing the staging dir on Windows.
+		resume.discard()
 		if err := os.RemoveAll(stagingDir); err != nil {
 			slog.Warn("failed to clean up staging dir", "dir", stagingDir, "error", err.Error())
 		} else {
@@ -484,6 +484,18 @@ func RestoreFromSnapshotContext(ctx context.Context, provider providers.BackupPr
 	}
 
 	return result, nil
+}
+
+// contentKeys returns the object keys of the entries that carry content,
+// in manifest order, for providers.PrepareDownloads.
+func contentKeys(files []SnapshotFile) []string {
+	keys := make([]string, 0, len(files))
+	for _, f := range files {
+		if f.HasContent() && f.BackupPath != "" {
+			keys = append(keys, f.BackupPath)
+		}
+	}
+	return keys
 }
 
 // downloadManifest fetches and parses the manifest for a snapshot.
@@ -837,7 +849,7 @@ func validateSnapshotID(snapshotID string) error {
 // hex chars + ".gz" = 67, comfortably under any filesystem limit) and
 // collision-resistant, so distinct BackupPaths never share a staging file.
 // The ".gz" suffix is cosmetic only — nothing parses this name back into a
-// BackupPath; resume state (ResumeState.CompletedFiles, restore_resume.go)
+// BackupPath; resume state (resumeTracker, restore_resume.go)
 // and every restore-loop lookup key off file.BackupPath directly, never off
 // the staging filename, so this stays consistent with resume behavior.
 func stagingFileName(backupPath string) string {
@@ -885,38 +897,6 @@ func EnsureNoSymlinkAncestor(base, target string) error {
 		}
 	}
 	return nil
-}
-
-// applyEntryMetadata reapplies mode bits (full ModeBits when known, else the
-// perm-only Mode), owner (root only) and mtime to a restored regular file.
-func applyEntryMetadata(targetPath string, entry SnapshotFile, applyOwnership bool) []string {
-	var warnings []string
-	switch {
-	case entry.ModeBits != 0:
-		if err := os.Chmod(targetPath, os.FileMode(entry.ModeBits)); err != nil {
-			warnings = append(warnings, fmt.Sprintf("could not reapply mode %o to %s: %v", entry.ModeBits, entry.SourcePath, err))
-		}
-	case entry.Mode != 0:
-		if err := os.Chmod(targetPath, os.FileMode(entry.Mode).Perm()); err != nil {
-			warnings = append(warnings, fmt.Sprintf("could not reapply mode %o to %s: %v", os.FileMode(entry.Mode).Perm(), entry.SourcePath, err))
-		}
-	}
-	if applyOwnership {
-		if err := applyOwner(targetPath, entry.Owner); err != nil {
-			warnings = append(warnings, fmt.Sprintf("could not reapply owner to %s: %v", entry.SourcePath, err))
-		}
-	}
-	if !entry.ModTime.IsZero() {
-		if err := os.Chtimes(targetPath, entry.ModTime, entry.ModTime); err != nil {
-			warnings = append(warnings, fmt.Sprintf("could not reapply mtime to %s: %v", entry.SourcePath, err))
-		}
-	}
-	// Windows attributes go LAST (#5407): FILE_ATTRIBUTE_READONLY makes the
-	// chmod/chtimes above fail, so they must already have run.
-	if err := applyWinAttrs(targetPath, entry.WinAttrs); err != nil {
-		warnings = append(warnings, fmt.Sprintf("could not reapply windows attributes to %s: %v", entry.SourcePath, err))
-	}
-	return warnings
 }
 
 // RestoreContentlessEntry recreates a symlink or directory entry at
@@ -985,7 +965,7 @@ func RestoreContentlessEntry(targetPath string, entry SnapshotFile, applyOwnersh
 			return err
 		}
 	default:
-		return fmt.Errorf("entry %s has content; use the file path", entry.SourcePath)
+		return fmt.Errorf("entry %s has content; use the file path", restoreSourcePath(entry))
 	}
 	if applyOwnership {
 		if err := applyOwner(targetPath, entry.Owner); err != nil {

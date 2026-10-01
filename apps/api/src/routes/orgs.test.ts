@@ -1,5 +1,8 @@
 const { ensureDefaultProfile } = vi.hoisted(() => ({ ensureDefaultProfile: vi.fn(async () => ({ id: 'default-profile' })) }));
 vi.mock('../services/billingProfileService', () => ({ ensureDefaultProfile }));
+import { deleteSiteOwnedTopologyAlerts, lockSiteForDelete } from '../services/siteOwnedAlerts';
+const { isHoldingOrg } = vi.hoisted(() => ({ isHoldingOrg: vi.fn(async (_orgId: string) => false) }));
+vi.mock('../services/unassignedPool/protectedOrg', () => ({ isHoldingOrg }));
 import { countMfaPolicyLockouts, lockMfaPolicySettings } from '../services/mfaPolicyActivation';
 vi.mock('../services/mfaPolicyActivation', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../services/mfaPolicyActivation')>()),
@@ -47,6 +50,14 @@ vi.mock('../services/enrollmentDefaults', () => ({
     deviceCount: 25,
     maxTtlMinutes: 43200
   }))
+}));
+
+// PR #7117 T3 — site delete removes the site's owned topology alerts under a
+// site row lock first; the SQL itself is proven against real Postgres in
+// __tests__/integration/siteDeleteTopologyAlerts.integration.test.ts.
+vi.mock('../services/siteOwnedAlerts', () => ({
+  lockSiteForDelete: vi.fn(async () => true),
+  deleteSiteOwnedTopologyAlerts: vi.fn(async () => 0),
 }));
 
 // #6475 — GET /organizations/:id/effective-settings folds in the interactive
@@ -215,7 +226,14 @@ vi.mock('../db', () => ({
           values: vi.fn(() => ({
             returning: vi.fn(() => Promise.resolve([]))
           }))
-        }))
+        })),
+        // Site delete (#6000): the topology-investigation cleanup reads the
+        // site's pinned sessions (none here) before deleting the site row.
+        select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => Promise.resolve([])) })) })),
+        delete: vi.fn(() => ({
+          where: vi.fn(() => Promise.resolve())
+        })),
+        execute: vi.fn(() => Promise.resolve([]))
       };
       return fn(tx);
     })
@@ -249,6 +267,8 @@ vi.mock('../services/orgImport', () => ({
 
 vi.mock('../db/schema', () => ({
   partners: {},
+  // Site delete's topology-investigation cleanup (#6000) names these tables.
+  aiSessions: {}, aiMessages: {}, aiToolExecutions: {}, aiActionPlans: {}, aiScreenshots: {},
   // #2879 — sentinel columns (same pattern as sites.id below) so the
   // suspended-org override tests can assert the UPDATE's WHERE re-asserts
   // eq(organizations.status,'suspended') / eq(organizations.partnerId,...)
@@ -445,9 +465,59 @@ describe('org routes', () => {
     permissionMockState.granted = true;
     permissionMockState.denied.clear();
     selectedOrgIds.current = [];
+    isHoldingOrg.mockReset().mockResolvedValue(false);
     setAuthContext();
+    siteDeleteTransaction();
     app = new Hono();
     app.route('/orgs', orgRoutes);
+  });
+
+  /**
+   * Site delete (#6000 + PR #7117 T3) runs the owned-alert cleanup, the pinned
+   * topology-session cleanup and the site delete in ONE db.transaction. Routes
+   * a test's transaction through its own db doubles, except the session read,
+   * which finds no pinned investigations.
+   */
+  const siteDeleteTxOver = (base: any) => ({
+    ...base,
+    select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => Promise.resolve([])) })) })),
+  });
+
+  /** Site delete (#6000) runs its cleanup + delete in db.transaction; earlier tests override that mock. */
+  const siteDeleteTransaction = () => vi.mocked(db.transaction).mockImplementation(async (fn: (tx: any) => any) => fn({
+    insert: vi.fn(() => ({ values: vi.fn(() => ({ returning: vi.fn(() => Promise.resolve([])) })) })),
+    select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => Promise.resolve([])) })) })),
+    delete: vi.fn(() => ({ where: vi.fn(() => Promise.resolve()) })),
+  }));
+
+  describe('unassigned-pool holding org is protected', () => {
+    beforeEach(() => { isHoldingOrg.mockReset(); isHoldingOrg.mockResolvedValue(true); });
+
+    it.each([
+      ['PATCH', '/orgs/organizations/pool-1', { name: 'x' }],
+      ['PATCH', '/orgs/organizations/pool-1', { type: 'customer' }],
+      ['PATCH', '/orgs/organizations/pool-1', { status: 'churned' }],
+      ['PUT', '/orgs/organizations/pool-1', { name: 'x' }],
+      ['DELETE', '/orgs/organizations/pool-1', undefined],
+      ['POST', '/orgs/sites', { orgId: '11111111-1111-4111-8111-111111111111', name: 'x', timezone: 'UTC' }],
+      ['PATCH', '/orgs/sites/site-1', { name: 'x' }],
+      ['DELETE', '/orgs/sites/site-1', undefined],
+    ])('%s %s → 409 ORG_PROTECTED with no write (system scope)', async (method, path, body) => {
+      setAuthContext({ scope: 'system', partnerId: null });
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{ id: 'site-1', orgId: 'pool-1', name: 's' }]) }) }),
+      } as any);
+      const res = await app.request(path, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ code: 'ORG_PROTECTED' });
+      expect(db.update).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+      expect(db.delete).not.toHaveBeenCalled();
+    });
   });
 
   describe('MFA policy activation safety', () => {
@@ -3166,11 +3236,94 @@ describe('org routes', () => {
       })
     }) as any;
 
-    const queueCreateSelects = (clashRows: unknown[] = []) => {
-      vi.mocked(db.select)
-        .mockReturnValueOnce(selectRows([{ currencyCode: 'USD' }]))
-        .mockReturnValueOnce(selectRows(clashRows));
+    const queueCreateSelects = (clashRows: unknown[] = [], maxOrganizations: number | null = null) => {
+      const mocked = vi.mocked(db.select).mockReturnValueOnce(
+        selectRows([{ currencyCode: 'USD', maxOrganizations }]),
+      );
+      if (maxOrganizations !== null) {
+        // countPartnerOrganizations' pre-check select: `.from().where()`
+        // resolves directly, no `.limit()` — a different chain shape than
+        // `selectRows` above.
+        mocked.mockReturnValueOnce(selectCount(0) as any);
+      }
+      mocked.mockReturnValueOnce(selectRows(clashRows));
+      if (maxOrganizations !== null) {
+        // Race-safety post-insert recount, run inside insertOrganization's
+        // own system-scoped transaction — still under the cap after the one
+        // row this call just inserted.
+        mocked.mockReturnValueOnce(selectCount(1) as any);
+      }
     };
+
+    // countPartnerOrganizations' shape: `.select({value}).from().where()`
+    // resolves directly (COUNT query, no `.limit()`).
+    const selectCount = (value: number) => ({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue([{ value }]),
+      }),
+    });
+
+    // Finding: this route had no per-partner org quota at all (unlike
+    // POST /partner-api/organizations, which already enforces
+    // partners.maxOrganizations) — an org-access-all partner/caller could
+    // create orgs without limit, and each one adds to the shared per-process
+    // event-WS Redis fan-out this same wave bounds separately.
+    describe('per-partner organization quota (partners.maxOrganizations)', () => {
+      it('returns 409 and does not insert when the partner is already at its cap', async () => {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        vi.mocked(db.select)
+          .mockReturnValueOnce(selectRows([{ currencyCode: 'USD', maxOrganizations: 2 }]))
+          .mockReturnValueOnce(selectCount(2) as any); // already at the cap
+
+        const res = await app.request('/orgs/organizations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'Org', slug: 'org-over-cap' })
+        });
+
+        expect(res.status).toBe(409);
+        const body = await res.json();
+        expect(body.error).toMatch(/quota/i);
+        expect(db.insert).not.toHaveBeenCalled();
+      });
+
+      it('allows create when the partner is under its cap', async () => {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        queueCreateSelects([], 5); // cap of 5, countPartnerOrganizations mocked to 0
+        vi.mocked(db.insert).mockReturnValue({
+          values: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([{ id: 'org-under-cap', name: 'Org' }])
+          })
+        } as any);
+
+        const res = await app.request('/orgs/organizations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'Org', slug: 'org-under-cap' })
+        });
+
+        expect(res.status).toBe(201);
+        expect(db.insert).toHaveBeenCalledTimes(1);
+      });
+
+      it('does not enforce a quota when maxOrganizations is null (unlimited, the default)', async () => {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        queueCreateSelects(); // maxOrganizations defaults to null in the helper
+        vi.mocked(db.insert).mockReturnValue({
+          values: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([{ id: 'org-unlimited', name: 'Org' }])
+          })
+        } as any);
+
+        const res = await app.request('/orgs/organizations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'Org', slug: 'org-unlimited' })
+        });
+
+        expect(res.status).toBe(201);
+      });
+    });
 
     it('should create an organization', async () => {
       setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
@@ -3707,10 +3860,14 @@ describe('org routes', () => {
     describe('lifecycle-internal settings keys', () => {
       const patchSettings = async (settings: Record<string, unknown>) => {
         setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
-        // assertNotLocked('defaults', ...) resolves with no locks.
+        // assertNotLocked('defaults', ...) resolves with no locks; the handler's
+        // stored-settings read (`.limit`) finds nothing stored.
         vi.mocked(db.select).mockReturnValue({
           from: vi.fn().mockReturnValue({
-            where: vi.fn().mockResolvedValue([{ partnerId: 'partner-123', settings: {} }])
+            where: vi.fn().mockImplementation(() => Object.assign(
+              Promise.resolve([{ partnerId: 'partner-123', settings: {} }]),
+              { limit: vi.fn().mockResolvedValue([]) },
+            ))
           })
         } as any);
         const captured: Record<string, unknown>[] = [];
@@ -3767,6 +3924,147 @@ describe('org routes', () => {
 
         expect(res.status).toBe(200);
         expect(written).toEqual({ branding: { primaryColor: '#abc' } });
+      });
+    });
+
+    // Same origin-binding contract as credentialOriginBinding.ts:
+    // the settings editor round-trips the stored `eventLogs.elasticsearchApiKey`
+    // ciphertext unchanged on a save that only edits `elasticsearchUrl`, so a
+    // wholesale-blob write must not carry that stored ciphertext forward to a
+    // new destination origin without the credential being re-entered.
+    describe('eventLogs.elasticsearchUrl origin binding (log forwarding)', () => {
+      const priorKey = process.env.APP_ENCRYPTION_KEY;
+      const priorKeyId = process.env.APP_ENCRYPTION_KEY_ID;
+
+      beforeEach(() => {
+        process.env.APP_ENCRYPTION_KEY = 'orgs-route-test-key-material';
+        process.env.APP_ENCRYPTION_KEY_ID = 'orgs-route-test';
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+      });
+
+      afterEach(() => {
+        if (priorKey === undefined) delete process.env.APP_ENCRYPTION_KEY;
+        else process.env.APP_ENCRYPTION_KEY = priorKey;
+        if (priorKeyId === undefined) delete process.env.APP_ENCRYPTION_KEY_ID;
+        else process.env.APP_ENCRYPTION_KEY_ID = priorKeyId;
+        // Reinstate the factory default so later tests in this file don't
+        // inherit this block's 3-call select sequencing.
+        vi.mocked(db.select).mockImplementation((() => ({
+          from: vi.fn(() => ({
+            where: vi.fn(() => ({
+              orderBy: vi.fn(() => ({ limit: vi.fn(() => Promise.resolve([])) })),
+              limit: vi.fn(() => Promise.resolve([]))
+            }))
+          }))
+        })) as any);
+      });
+
+      function noLockSelect(rows: Record<string, unknown>[]) {
+        return { from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(rows) }) };
+      }
+
+      function currentOrgSettingsSelect(rows: Record<string, unknown>[]) {
+        return { from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue(rows) }) }) };
+      }
+
+      function queueSelects(storedEventLogs: Record<string, unknown> | undefined) {
+        vi.mocked(db.select)
+          .mockReturnValueOnce(noLockSelect([{ partnerId: 'partner-123' }]) as any) // assertNotLocked: org.partnerId
+          .mockReturnValueOnce(noLockSelect([{ settings: {} }]) as any) // assertNotLocked: partner settings (no locks)
+          .mockReturnValueOnce(currentOrgSettingsSelect([{ settings: { eventLogs: storedEventLogs } }]) as any); // current org settings
+      }
+
+      it('refuses a URL change that would carry the stored API key ciphertext to a new origin', async () => {
+        queueSelects({
+          enabled: true,
+          elasticsearchUrl: 'https://es.trusted-vendor.example',
+          elasticsearchApiKey: 'enc:v1:stored-ciphertext-blob',
+        });
+
+        const res = await app.request('/orgs/organizations/org-1', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            settings: {
+              eventLogs: {
+                enabled: true,
+                elasticsearchUrl: 'https://es.other-origin.example',
+                elasticsearchApiKey: 'enc:v1:stored-ciphertext-blob',
+              },
+            },
+          }),
+        });
+
+        expect(res.status).toBe(400);
+        expect(db.update).not.toHaveBeenCalled();
+      });
+
+      it('allows a URL change when a fresh plaintext API key is supplied in the same request', async () => {
+        queueSelects({
+          enabled: true,
+          elasticsearchUrl: 'https://es.trusted-vendor.example',
+          elasticsearchApiKey: 'enc:v1:stored-ciphertext-blob',
+        });
+        vi.mocked(db.update).mockReturnValue({
+          set: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              returning: vi.fn().mockResolvedValue([{ id: 'org-1', name: 'O' }])
+            })
+          })
+        } as any);
+
+        const res = await app.request('/orgs/organizations/org-1', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            settings: {
+              eventLogs: {
+                enabled: true,
+                elasticsearchUrl: 'https://es.new-vendor.example',
+                elasticsearchApiKey: 'freshly-typed-key',
+              },
+            },
+          }),
+        });
+
+        expect(res.status).toBe(200);
+        expect(db.update).toHaveBeenCalled();
+      });
+
+      it('allows a URL change that keeps the same origin without re-entering the key', async () => {
+        // Real ciphertext (not a fixture string): the write path re-encrypts
+        // an already-sealed value it round-trips, so it must actually decrypt.
+        const { encryptSecret } = await import('../services/secretCrypto');
+        const realCiphertext = encryptSecret('stored-real-key')!;
+        queueSelects({
+          enabled: true,
+          elasticsearchUrl: 'https://es.trusted-vendor.example/old-path',
+          elasticsearchApiKey: realCiphertext,
+        });
+        vi.mocked(db.update).mockReturnValue({
+          set: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              returning: vi.fn().mockResolvedValue([{ id: 'org-1', name: 'O' }])
+            })
+          })
+        } as any);
+
+        const res = await app.request('/orgs/organizations/org-1', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            settings: {
+              eventLogs: {
+                enabled: true,
+                elasticsearchUrl: 'https://es.trusted-vendor.example',
+                elasticsearchApiKey: realCiphertext,
+              },
+            },
+          }),
+        });
+
+        expect(res.status).toBe(200);
+        expect(db.update).toHaveBeenCalled();
       });
     });
 
@@ -4608,7 +4906,10 @@ describe('org routes', () => {
       setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
       vi.mocked(db.select).mockReturnValue({
         from: vi.fn().mockReturnValue({
-          where: vi.fn().mockResolvedValue([{ partnerId: 'partner-123', settings: {} }])
+          where: vi.fn().mockImplementation(() => Object.assign(
+            Promise.resolve([{ partnerId: 'partner-123', settings: {} }]),
+            { limit: vi.fn().mockResolvedValue([]) },
+          ))
         })
       } as any);
       vi.mocked(db.update).mockReturnValue({
@@ -4892,7 +5193,10 @@ describe('org routes', () => {
       // settings object means nothing is locked.
       vi.mocked(db.select).mockReturnValue({
         from: vi.fn().mockReturnValue({
-          where: vi.fn().mockReturnValue(Promise.resolve([{ partnerId: 'partner-123', settings: {} }]))
+          where: vi.fn().mockImplementation(() => Object.assign(
+            Promise.resolve([{ partnerId: 'partner-123', settings: {} }]),
+            { limit: vi.fn().mockResolvedValue([]) },
+          ))
         })
       } as any);
 
@@ -5601,6 +5905,9 @@ describe('org routes', () => {
           })
         })
       } as any);
+      // Earlier suites install a persistent transaction double without
+      // delete; route this one through the db mock.
+      vi.mocked(db.transaction).mockImplementationOnce(async (fn: any) => fn(siteDeleteTxOver(db)));
 
       const res = await app.request('/orgs/sites/site-1', {
         method: 'DELETE'
@@ -5609,6 +5916,9 @@ describe('org routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.success).toBe(true);
+      // The site's owned topology alerts are removed first, under its row lock.
+      expect(lockSiteForDelete).toHaveBeenCalledWith(expect.anything(), 'site-1');
+      expect(deleteSiteOwnedTopologyAlerts).toHaveBeenCalledWith(expect.anything(), '11111111-1111-1111-1111-111111111111', 'site-1');
     });
   });
 
@@ -5729,6 +6039,7 @@ describe('org routes', () => {
         const deleteSpy = vi.mocked(db.delete).mockReturnValue({
           where: vi.fn().mockResolvedValue(undefined)
         } as any);
+ vi.mocked(db.transaction).mockImplementationOnce(async (fn: any) => fn(siteDeleteTxOver(db)));
 
         const res = await app.request('/orgs/sites/site-y', { method: 'DELETE' });
 
@@ -5742,6 +6053,7 @@ describe('org routes', () => {
         vi.mocked(db.delete).mockReturnValue({
           where: vi.fn().mockResolvedValue(undefined)
         } as any);
+        vi.mocked(db.transaction).mockImplementationOnce(async (fn: any) => fn(siteDeleteTxOver(db)));
 
         const res = await app.request('/orgs/sites/site-x', { method: 'DELETE' });
 
@@ -5754,6 +6066,7 @@ describe('org routes', () => {
         vi.mocked(db.delete).mockReturnValue({
           where: vi.fn().mockResolvedValue(undefined)
         } as any);
+        vi.mocked(db.transaction).mockImplementationOnce(async (fn: any) => fn(siteDeleteTxOver(db)));
 
         const res = await app.request('/orgs/sites/site-y', { method: 'DELETE' });
 
@@ -7912,9 +8225,18 @@ describe('org routes', () => {
     // whether to 403.
     it('does not run assertNotLocked for aiApprovals — an org override succeeds with no lock-check select wired', async () => {
       mockUpdateCapture();
+      // assertNotLocked awaits `.where()` directly; the handler's own
+      // stored-settings read goes through `.limit()`. Only the former fails.
+      const lockReads = vi.fn();
       const selectSpy = vi.fn(() => ({
         from: vi.fn(() => ({
-          where: vi.fn(() => Promise.reject(new Error('assertNotLocked should not run for aiApprovals'))),
+          where: vi.fn(() => ({
+            limit: vi.fn(() => Promise.resolve([])),
+            then: (resolve: unknown, reject: (err: unknown) => unknown) => {
+              lockReads();
+              return Promise.reject(new Error('assertNotLocked should not run for aiApprovals')).then(resolve as any, reject);
+            },
+          })),
         })),
       }));
       vi.mocked(db.select).mockImplementation(selectSpy as any);
@@ -7922,7 +8244,7 @@ describe('org routes', () => {
       const res = await patchOrg({ settings: { aiApprovals: { interactiveTimeoutMinutes: 45 } } });
 
       expect(res.status).toBe(200);
-      expect(selectSpy).not.toHaveBeenCalled();
+      expect(lockReads).not.toHaveBeenCalled();
     });
   });
 
@@ -7982,6 +8304,582 @@ describe('org routes', () => {
         inheritedSource: 'default',
       });
       expect(getAiApprovalTimeout).toHaveBeenCalledWith('org-1');
+    });
+  });
+
+  // Organization and partner `settings` hold log-forwarding credentials sealed
+  // at rest. Responses report that a secret is set (the masked marker) instead
+  // of returning the sealed value, and a save that echoes the marker keeps the
+  // stored secret.
+  describe('settings secrets in organization and partner responses', () => {
+    const ORG_ID = '44444444-4444-4444-8444-444444444444';
+    const SEALED_KEY = 'enc:v1:sealed-org-api-key';
+    const SEALED_PASSWORD = 'enc:v1:sealed-org-password';
+    const priorKey = process.env.APP_ENCRYPTION_KEY;
+    const priorKeyId = process.env.APP_ENCRYPTION_KEY_ID;
+
+    beforeEach(() => {
+      process.env.APP_ENCRYPTION_KEY = 'orgs-route-test-key-material';
+      process.env.APP_ENCRYPTION_KEY_ID = 'orgs-route-test';
+    });
+
+    afterEach(() => {
+      if (priorKey === undefined) delete process.env.APP_ENCRYPTION_KEY;
+      else process.env.APP_ENCRYPTION_KEY = priorKey;
+      if (priorKeyId === undefined) delete process.env.APP_ENCRYPTION_KEY_ID;
+      else process.env.APP_ENCRYPTION_KEY_ID = priorKeyId;
+      vi.mocked(db.select).mockImplementation((() => ({
+        from: vi.fn(() => ({
+          where: vi.fn(() => ({
+            orderBy: vi.fn(() => ({ limit: vi.fn(() => Promise.resolve([])) })),
+            limit: vi.fn(() => Promise.resolve([]))
+          }))
+        }))
+      })) as any);
+    });
+
+    const storedOrgSettings = () => ({
+      eventLogs: {
+        enabled: true,
+        elasticsearchUrl: 'https://es.trusted-vendor.example',
+        elasticsearchApiKey: SEALED_KEY,
+      },
+      logForwarding: {
+        enabled: true,
+        elasticsearchUrl: 'https://logs.trusted-vendor.example',
+        elasticsearchUsername: 'svc',
+        elasticsearchPassword: SEALED_PASSWORD,
+      },
+      branding: { primaryColor: '#123456' },
+    });
+
+    function limitSelect(rows: Record<string, unknown>[]) {
+      return { from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue(rows) }) }) };
+    }
+
+    function thenableSelect(rows: Record<string, unknown>[]) {
+      return { from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(rows) }) };
+    }
+
+    function expectNoSealedValue(body: unknown) {
+      expect(JSON.stringify(body)).not.toContain('enc:');
+    }
+
+    it('GET /orgs/organizations/:id reports a set secret with the masked marker', async () => {
+      setAuthContext({ scope: 'partner', partnerId: 'partner-123', accessibleOrgIds: [ORG_ID] });
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([{ id: ORG_ID, name: 'Org', partnerId: 'partner-123', settings: storedOrgSettings() }]) as any)
+        .mockReturnValueOnce(limitSelect([{ defaultTaxRate: null, invoiceTermsDays: null }]) as any);
+
+      const res = await app.request(`/orgs/organizations/${ORG_ID}`);
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expectNoSealedValue(body);
+      expect(body.settings.eventLogs.elasticsearchApiKey).toBe('********');
+      expect(body.settings.logForwarding.elasticsearchPassword).toBe('********');
+      expect(body.settings.eventLogs.elasticsearchUrl).toBe('https://es.trusted-vendor.example');
+      expect(body.settings.branding).toEqual({ primaryColor: '#123456' });
+    });
+
+    it('GET /orgs lists organizations with masked settings secrets', async () => {
+      setAuthContext({ scope: 'partner', partnerId: 'partner-123', accessibleOrgIds: [ORG_ID] });
+      vi.mocked(db.select).mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockResolvedValue([{ id: ORG_ID, name: 'Org', settings: storedOrgSettings() }])
+          })
+        })
+      } as any);
+
+      const res = await app.request('/orgs');
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expectNoSealedValue(body);
+      expect(body.data[0].settings.eventLogs.elasticsearchApiKey).toBe('********');
+    });
+
+    it('GET /orgs/organizations/:id/effective-settings masks inherited partner secrets', async () => {
+      setAuthContext({ scope: 'partner', partnerId: 'partner-123', accessibleOrgIds: [ORG_ID] });
+      vi.mocked(db.select)
+        .mockReturnValueOnce(thenableSelect([{ settings: storedOrgSettings(), partnerId: 'partner-123' }]) as any)
+        .mockReturnValueOnce(thenableSelect([{
+          settings: { eventLogs: { enabled: true, elasticsearchUrl: 'https://es.partner.example', elasticsearchPassword: 'enc:v1:partner-password' } }
+        }]) as any)
+        .mockReturnValueOnce(thenableSelect([]) as any);
+
+      const res = await app.request(`/orgs/organizations/${ORG_ID}/effective-settings`);
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expectNoSealedValue(body);
+      expect(body.effective.eventLogs.elasticsearchPassword).toBe('********');
+      expect(body.effective.eventLogs.elasticsearchApiKey).toBe('********');
+      expect(body.locked).toContain('eventLogs.elasticsearchPassword');
+    });
+
+    describe('PATCH /orgs/organizations/:id', () => {
+      beforeEach(() => {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123', accessibleOrgIds: [ORG_ID] });
+      });
+
+      // assertNotLocked (org partnerId, partner settings) runs for eventLogs,
+      // then the handler reads the org's stored settings.
+      function queueSelects(stored: Record<string, unknown>) {
+        vi.mocked(db.select)
+          .mockReturnValueOnce(thenableSelect([{ partnerId: 'partner-123' }]) as any)
+          .mockReturnValueOnce(thenableSelect([{ settings: {} }]) as any)
+          .mockReturnValueOnce(limitSelect([{ settings: stored }]) as any);
+      }
+
+      function captureUpdate() {
+        const captured: { settings?: any } = {};
+        vi.mocked(db.update).mockReturnValue({
+          set: vi.fn().mockImplementation((data: any) => {
+            captured.settings = data.settings;
+            return {
+              where: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([{ id: ORG_ID, name: 'Org', settings: data.settings }])
+              })
+            };
+          })
+        } as any);
+        return captured;
+      }
+
+      function patchOrg(settings: Record<string, unknown>) {
+        return app.request(`/orgs/organizations/${ORG_ID}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ settings }),
+        });
+      }
+
+      it('keeps the stored secret when the masked marker is echoed back, and masks the response', async () => {
+        const { encryptSecret, decryptSecret } = await import('../services/secretCrypto');
+        const sealed = encryptSecret('stored-real-key')!;
+        const sealedPassword = encryptSecret('stored-real-password')!;
+        const stored = {
+          ...storedOrgSettings(),
+          eventLogs: { ...storedOrgSettings().eventLogs, elasticsearchApiKey: sealed },
+          logForwarding: { ...storedOrgSettings().logForwarding, elasticsearchPassword: sealedPassword },
+        };
+        queueSelects(stored);
+        const captured = captureUpdate();
+
+        const res = await patchOrg({
+          eventLogs: { enabled: false, elasticsearchUrl: 'https://es.trusted-vendor.example', elasticsearchApiKey: '********' },
+          logForwarding: { ...storedOrgSettings().logForwarding, elasticsearchPassword: '********' },
+        });
+
+        expect(res.status).toBe(200);
+        expect(decryptSecret(captured.settings.eventLogs.elasticsearchApiKey)).toBe('stored-real-key');
+        expect(captured.settings.eventLogs.enabled).toBe(false);
+        expect(decryptSecret(captured.settings.logForwarding.elasticsearchPassword)).toBe('stored-real-password');
+        const body = await res.json();
+        expectNoSealedValue(body);
+        expect(body.settings.eventLogs.elasticsearchApiKey).toBe('********');
+      });
+
+      it('keeps org notification secrets behind echoed markers even where the partner sets the same field', async () => {
+        const { encryptSecret, decryptSecret } = await import('../services/secretCrypto');
+        const stored = {
+          notifications: {
+            slackWebhookUrl: encryptSecret('https://hooks.slack.example/services/org-secret')!,
+            webhooks: [encryptSecret('https://hooks.example.com/org-secret')!],
+          },
+        };
+        // assertNotLocked('notifications') sees a partner-set Slack URL.
+        vi.mocked(db.select)
+          .mockReturnValueOnce(thenableSelect([{ partnerId: 'partner-123' }]) as any)
+          .mockReturnValueOnce(thenableSelect([{
+            settings: { notifications: { slackWebhookUrl: encryptSecret('https://hooks.slack.example/services/partner')! } },
+          }]) as any)
+          .mockReturnValueOnce(limitSelect([{ settings: stored }]) as any);
+        const captured = captureUpdate();
+
+        const { maskSettingsSecrets } = await import('../services/settingsSecretMasking');
+        const echoed = (maskSettingsSecrets(stored) as { notifications: { webhooks: string[] } }).notifications.webhooks;
+
+        const res = await patchOrg({
+          notifications: { slackWebhookUrl: '********', slackChannel: '#ops', webhooks: echoed },
+        });
+
+        expect(res.status).toBe(200);
+        const n = captured.settings.notifications;
+        expect(decryptSecret(n.slackWebhookUrl)).toBe('https://hooks.slack.example/services/org-secret');
+        expect(n.webhooks).toEqual(stored.notifications.webhooks);
+        const body = await res.json();
+        expect(JSON.stringify(body)).not.toContain('org-secret');
+        expect(body.settings.notifications.webhooks).toEqual(echoed);
+      });
+
+      it('replaces the stored secret with a freshly typed value', async () => {
+        const { decryptSecret } = await import('../services/secretCrypto');
+        queueSelects(storedOrgSettings());
+        const captured = captureUpdate();
+
+        const res = await patchOrg({
+          eventLogs: { enabled: true, elasticsearchUrl: 'https://es.trusted-vendor.example', elasticsearchApiKey: 'typed-new-key' },
+        });
+
+        expect(res.status).toBe(200);
+        expect(decryptSecret(captured.settings.eventLogs.elasticsearchApiKey)).toBe('typed-new-key');
+      });
+
+      it('clears the stored secret on an explicit empty string', async () => {
+        queueSelects(storedOrgSettings());
+        const captured = captureUpdate();
+
+        const res = await patchOrg({
+          eventLogs: { enabled: true, elasticsearchUrl: 'https://es.trusted-vendor.example', elasticsearchApiKey: '' },
+        });
+
+        expect(res.status).toBe(200);
+        expect(captured.settings.eventLogs.elasticsearchApiKey).toBe('');
+      });
+
+      it('refuses a destination origin change when the masked marker would keep the stored key', async () => {
+        queueSelects(storedOrgSettings());
+
+        const res = await patchOrg({
+          eventLogs: { enabled: true, elasticsearchUrl: 'https://es.other-origin.example', elasticsearchApiKey: '********' },
+        });
+
+        expect(res.status).toBe(400);
+        expect(db.update).not.toHaveBeenCalled();
+      });
+
+      it('refuses a destination origin change when the key is omitted and so kept', async () => {
+        queueSelects(storedOrgSettings());
+
+        const res = await patchOrg({
+          eventLogs: { enabled: true, elasticsearchUrl: 'https://es.other-origin.example' },
+        });
+
+        expect(res.status).toBe(400);
+        expect(db.update).not.toHaveBeenCalled();
+      });
+
+      it('refuses a logForwarding destination origin change that keeps the stored password', async () => {
+        // logForwarding is not a partner-lockable category, so no assertNotLocked reads.
+        vi.mocked(db.select).mockReturnValueOnce(limitSelect([{ settings: storedOrgSettings() }]) as any);
+
+        const res = await patchOrg({
+          logForwarding: {
+            enabled: true,
+            elasticsearchUrl: 'https://logs.other-origin.example',
+            elasticsearchUsername: 'svc',
+            elasticsearchPassword: '********',
+          },
+        });
+
+        expect(res.status).toBe(400);
+        expect(db.update).not.toHaveBeenCalled();
+      });
+
+      it('refuses a sealed value that is not the one stored for the organization', async () => {
+        queueSelects(storedOrgSettings());
+
+        const res = await patchOrg({
+          eventLogs: { enabled: true, elasticsearchUrl: 'https://es.trusted-vendor.example', elasticsearchApiKey: 'enc:v1:value-from-another-row' },
+        });
+
+        expect(res.status).toBe(400);
+        expect(db.update).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('site settings', () => {
+      const SITE_ORG = '11111111-1111-1111-1111-111111111111';
+
+      function siteSelect(settings: Record<string, unknown>) {
+        return limitSelect([{ id: 'site-1', orgId: SITE_ORG, name: 'HQ', settings }]);
+      }
+
+      it('GET /orgs/sites/:id masks settings secrets', async () => {
+        setAuthContext({ scope: 'organization', orgId: SITE_ORG });
+        vi.mocked(db.select).mockReturnValue(siteSelect({ overrides: { apiKey: 'enc:v1:site-api-key' } }) as any);
+
+        const res = await app.request('/orgs/sites/site-1');
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expectNoSealedValue(body);
+        expect(body.settings.overrides.apiKey).toBe('********');
+      });
+
+      it('PATCH /orgs/sites/:id keeps a stored secret echoed as the marker, and masks the response', async () => {
+        const { encryptSecret, decryptSecret } = await import('../services/secretCrypto');
+        setAuthContext({ scope: 'organization', orgId: SITE_ORG });
+        vi.mocked(db.select).mockReturnValue(siteSelect({ overrides: { apiKey: encryptSecret('site-real-key')! } }) as any);
+        let written: any;
+        vi.mocked(db.update).mockReturnValue({
+          set: vi.fn().mockImplementation((data: any) => {
+            written = data.settings;
+            return { where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ id: 'site-1', orgId: SITE_ORG, settings: data.settings }]) }) };
+          })
+        } as any);
+
+        const res = await app.request('/orgs/sites/site-1', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ settings: { overrides: { apiKey: '********' } } }),
+        });
+
+        expect(res.status).toBe(200);
+        expect(decryptSecret(written.overrides.apiKey)).toBe('site-real-key');
+        expectNoSealedValue(await res.json());
+      });
+    });
+
+    it('POST /orgs/organizations seals a secret supplied on create and masks the response', async () => {
+      setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+      vi.mocked(db.select)
+        .mockReturnValueOnce(limitSelect([{ currencyCode: 'USD', maxOrganizations: null }]) as any)
+        .mockReturnValueOnce(limitSelect([]) as any);
+      let inserted: any;
+      vi.mocked(db.insert).mockReturnValue({
+        values: vi.fn().mockImplementation((values: any) => {
+          inserted = values;
+          return { returning: vi.fn().mockResolvedValue([{ id: ORG_ID, name: 'Org', settings: values.settings }]) };
+        })
+      } as any);
+
+      const res = await app.request('/orgs/organizations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Org',
+          slug: 'org-with-forwarding',
+          settings: { logForwarding: { enabled: true, elasticsearchUrl: 'https://logs.example', elasticsearchApiKey: 'typed-on-create' } },
+        }),
+      });
+
+      expect(res.status).toBe(201);
+      expect(inserted.settings.logForwarding.elasticsearchApiKey).toMatch(/^enc:/);
+      const body = await res.json();
+      expectNoSealedValue(body);
+      expect(body.settings.logForwarding.elasticsearchApiKey).toBe('********');
+    });
+
+    describe('partner settings', () => {
+      const storedPartnerSettings = () => ({
+        eventLogs: {
+          enabled: true,
+          elasticsearchUrl: 'https://es.partner.example',
+          elasticsearchApiKey: 'enc:v1:partner-api-key',
+        },
+        remoteAccessProviders: {
+          providers: [{
+            id: 'rustdesk',
+            name: 'RustDesk',
+            urlTemplate: 'rustdesk://{id}?password={password}',
+            customFieldKey: 'rustdesk_id',
+            password: 'enc:v1:partner-launcher-password',
+            enabled: true,
+          }],
+        },
+      });
+
+      function partnerRowSelect(settings: Record<string, unknown>) {
+        return {
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) }),
+              limit: vi.fn().mockResolvedValue([{ id: 'partner-123', name: 'P', settings }])
+            })
+          })
+        };
+      }
+
+      function patchMe(body: unknown) {
+        return app.request('/orgs/partners/me', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+      }
+
+      function captureUpdate() {
+        const captured: { settings?: any } = {};
+        vi.mocked(db.update).mockReturnValue({
+          set: vi.fn().mockImplementation((data: any) => {
+            captured.settings = data.settings;
+            return {
+              where: vi.fn().mockReturnValue({
+                returning: vi.fn().mockResolvedValue([{ id: 'partner-123', name: 'P', settings: data.settings }])
+              })
+            };
+          })
+        } as any);
+        return captured;
+      }
+
+      it('GET /orgs/partners/me masks event-log and launcher secrets', async () => {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        vi.mocked(db.select).mockReturnValue(partnerRowSelect(storedPartnerSettings()) as any);
+
+        const res = await app.request('/orgs/partners/me');
+
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expectNoSealedValue(body);
+        expect(body.settings.eventLogs.elasticsearchApiKey).toBe('********');
+        expect(body.settings.remoteAccessProviders.providers[0].password).toBe('********');
+      });
+
+      it('GET /orgs/partners/:id masks settings secrets for system scope', async () => {
+        setAuthContext({ scope: 'system' });
+        vi.mocked(db.select).mockReturnValue(partnerRowSelect(storedPartnerSettings()) as any);
+
+        const res = await app.request('/orgs/partners/partner-123');
+
+        expect(res.status).toBe(200);
+        expectNoSealedValue(await res.json());
+      });
+
+      it('PATCH /orgs/partners/me keeps stored secrets when the markers are echoed, and masks the response', async () => {
+        const { encryptSecret, decryptSecret } = await import('../services/secretCrypto');
+        const stored = storedPartnerSettings();
+        stored.eventLogs.elasticsearchApiKey = encryptSecret('partner-real-key')!;
+        stored.remoteAccessProviders.providers[0]!.password = encryptSecret('launcher-real-password')!;
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        vi.mocked(db.select).mockReturnValue(partnerRowSelect(stored) as any);
+        const captured = captureUpdate();
+
+        const masked = storedPartnerSettings();
+        masked.eventLogs.elasticsearchApiKey = '********';
+        masked.remoteAccessProviders.providers[0]!.password = '********';
+        const res = await patchMe({ settings: masked });
+
+        expect(res.status).toBe(200);
+        expect(decryptSecret(captured.settings.eventLogs.elasticsearchApiKey)).toBe('partner-real-key');
+        expect(decryptSecret(captured.settings.remoteAccessProviders.providers[0].password)).toBe('launcher-real-password');
+        expectNoSealedValue(await res.json());
+      });
+
+      it('PATCH /orgs/partners/me refuses a destination origin change that keeps the stored key', async () => {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        vi.mocked(db.select).mockReturnValue(partnerRowSelect(storedPartnerSettings()) as any);
+        const setSpy = vi.fn();
+        vi.mocked(db.update).mockReturnValue({ set: setSpy } as any);
+
+        const res = await patchMe({
+          settings: { eventLogs: { enabled: true, elasticsearchUrl: 'https://es.elsewhere.example', elasticsearchApiKey: '********' } },
+        });
+
+        expect(res.status).toBe(400);
+        expect(setSpy).not.toHaveBeenCalled();
+      });
+
+      describe('notification channel secrets', () => {
+        const SLACK = 'https://hooks.slack.example/services/T000/B000/partner-secret';
+        const EXTRA = 'https://hooks.example.com/incoming/partner?token=partner-secret';
+
+        async function storedNotifications() {
+          const { encryptSecret } = await import('../services/secretCrypto');
+          return {
+            notifications: {
+              slackWebhookUrl: encryptSecret(SLACK)!,
+              slackChannel: '#ops-alerts',
+              pushoverAppToken: encryptSecret('azGDORePK8gMaC0QOYAMyEEuzJnyUi')!,
+              pushoverDefaultUser: encryptSecret('uQiRzpo4DXghDmr9QzzfQu27cmVRsG')!,
+              webhooks: [encryptSecret(EXTRA)!],
+            },
+          };
+        }
+
+        it('GET /orgs/partners/me never returns the stored values, plaintext or sealed', async () => {
+          setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+          vi.mocked(db.select).mockReturnValue(partnerRowSelect({
+            notifications: {
+              slackWebhookUrl: SLACK,
+              slackChannel: '#ops-alerts',
+              pushoverAppToken: 'azGDORePK8gMaC0QOYAMyEEuzJnyUi',
+              pushoverDefaultUser: 'uQiRzpo4DXghDmr9QzzfQu27cmVRsG',
+              webhooks: [EXTRA],
+            },
+          }) as any);
+
+          const res = await app.request('/orgs/partners/me');
+
+          expect(res.status).toBe(200);
+          const body = await res.json();
+          const text = JSON.stringify(body);
+          expect(text).not.toContain('partner-secret');
+          expect(text).not.toContain('azGDORePK8gMaC0QOYAMyEEuzJnyUi');
+          expect(text).not.toContain('uQiRzpo4DXghDmr9QzzfQu27cmVRsG');
+          expect(body.settings.notifications).toEqual({
+            slackWebhookUrl: '********',
+            slackChannel: '#ops-alerts',
+            pushoverAppToken: '********',
+            pushoverDefaultUser: '********',
+            webhooks: [expect.stringMatching(/^\*{8}:[0-9a-f]{16}$/)],
+          });
+        });
+
+        it('PATCH /orgs/partners/me accepts the echoed markers, keeps every stored value, and masks the response', async () => {
+          const { decryptSecret } = await import('../services/secretCrypto');
+          setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+          const stored = await storedNotifications();
+          vi.mocked(db.select).mockReturnValue(partnerRowSelect(stored) as any);
+          const captured = captureUpdate();
+          // Exactly what GET returns, sent straight back.
+          const { maskSettingsSecrets } = await import('../services/settingsSecretMasking');
+
+          const res = await patchMe({ settings: maskSettingsSecrets(stored) });
+
+          expect(res.status).toBe(200);
+          const n = captured.settings.notifications;
+          expect(decryptSecret(n.slackWebhookUrl)).toBe(SLACK);
+          expect(decryptSecret(n.pushoverAppToken)).toBe('azGDORePK8gMaC0QOYAMyEEuzJnyUi');
+          expect(decryptSecret(n.pushoverDefaultUser)).toBe('uQiRzpo4DXghDmr9QzzfQu27cmVRsG');
+          expect(n.webhooks.map((v: string) => decryptSecret(v))).toEqual([EXTRA]);
+          const text = JSON.stringify(await res.json());
+          expect(text).not.toContain('enc:');
+          expect(text).not.toContain('partner-secret');
+        });
+
+        it('PATCH /orgs/partners/me stores a newly typed value sealed, and an empty string clears it', async () => {
+          const { decryptSecret } = await import('../services/secretCrypto');
+          setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+          vi.mocked(db.select).mockReturnValue(partnerRowSelect(await storedNotifications()) as any);
+          const captured = captureUpdate();
+
+          const res = await patchMe({
+            settings: {
+              notifications: {
+                slackWebhookUrl: 'https://hooks.slack.example/services/new',
+                pushoverAppToken: '',
+                pushoverDefaultUser: '********',
+                webhooks: ['', 'https://hooks.example.com/new'],
+              },
+            },
+          });
+
+          expect(res.status).toBe(200);
+          const n = captured.settings.notifications;
+          expect(n.slackWebhookUrl).toMatch(/^enc:/);
+          expect(decryptSecret(n.slackWebhookUrl)).toBe('https://hooks.slack.example/services/new');
+          expect(n.pushoverAppToken).toBe('');
+          expect(n.webhooks).toHaveLength(1);
+          expect(decryptSecret(n.webhooks[0])).toBe('https://hooks.example.com/new');
+        });
+
+        it('PATCH /orgs/partners/me still rejects a dangerous scheme typed into a webhook field', async () => {
+          setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+          vi.mocked(db.select).mockReturnValue(partnerRowSelect(await storedNotifications()) as any);
+          const setSpy = vi.fn();
+          vi.mocked(db.update).mockReturnValue({ set: setSpy } as any);
+
+          const res = await patchMe({ settings: { notifications: { webhooks: ['javascript:alert(1)'] } } });
+
+          expect(res.status).toBe(400);
+          expect(setSpy).not.toHaveBeenCalled();
+        });
+      });
     });
   });
 });

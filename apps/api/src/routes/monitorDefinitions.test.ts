@@ -172,6 +172,7 @@ import {
   updateFeatureLink as updateFeatureLinkMock,
 } from '../services/configurationPolicy';
 import { PARTNER_WIDE_WRITE_DENIED_MESSAGE } from '../services/partnerWideAccess';
+import { SITE_CEILING_WRITE_DENIED_MESSAGE } from '../services/siteCeilingAccess';
 import { resolveMonitorsForDevice as resolveMonitorsForDeviceMock } from '../services/monitors/monitorResolver';
 import { evaluateConditions as evaluateConditionsMock } from '../services/alertConditions';
 import { PgDialect } from 'drizzle-orm/pg-core';
@@ -273,6 +274,9 @@ describe('GET /monitor-definitions', () => {
     expect(body.data).toHaveLength(2);
     expect(body.data.find((r) => r.id === MONITOR_ID)).toMatchObject({ attachmentCount: 3 });
     expect(body.data.find((r) => r.id === 'other-id')).toMatchObject({ attachmentCount: 0 });
+    // The REST list is unpaged: no page argument reaches the service (#6735).
+    expect(listMonitorDefinitionsMock).toHaveBeenCalledTimes(1);
+    expect(listMonitorDefinitionsMock.mock.calls[0]).toHaveLength(2);
   });
 
   it('skips the count query and returns an empty list when there are no monitors', async () => {
@@ -287,14 +291,14 @@ describe('GET /monitor-definitions', () => {
 });
 
 describe('GET /monitor-definitions/kinds', () => {
-  it('returns twenty monitor kinds with kind/overridableKeys/defaultSeverity/agentDelivered', async () => {
+  it('returns twenty-one monitor kinds with kind/overridableKeys/defaultSeverity/agentDelivered', async () => {
     const res = await jsonRequest(buildApp(), 'GET', '/kinds');
 
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       data: Array<{ kind: string; overridableKeys: string[]; defaultSeverity: string; agentDelivered: boolean }>;
     };
-    expect(body.data).toHaveLength(20);
+    expect(body.data).toHaveLength(21);
     expect(body.data).toHaveLength(MONITOR_KINDS.length);
     expect(new Set(body.data.map((d) => d.kind))).toEqual(new Set(MONITOR_KINDS));
     for (const entry of body.data) {
@@ -826,6 +830,120 @@ describe('site scope on device-reading monitor routes', () => {
   });
 });
 
+/**
+ * Site-ceiling write gate (bind monitor-definition writes to a caller's
+ * site ceiling like every sibling org-wide governance object). A
+ * site-restricted org caller (`auth.allowedSiteIds` set, including `[]`)
+ * must be refused before any write, on every writer: create, update,
+ * delete, attach and detach — a monitor's compiled responses run as SYSTEM
+ * on every device the attaching policy reaches, with no site axis of its
+ * own to narrow that reach.
+ */
+describe('site-ceiling write gate on monitor-definition writers', () => {
+  const SITE_A = '88888888-8888-4888-8888-888888888888';
+  const ATTACHMENT_ID = '66666666-6666-4666-8666-666666666666';
+
+  it.each([
+    ['restricted to one site', [SITE_A]],
+    ['restricted to zero sites', []],
+  ])('POST /monitor-definitions denied 403, no create (%s)', async (_label, allowedSiteIds) => {
+    const res = await jsonRequest(
+      buildApp({ allowedSiteIds }),
+      'POST',
+      '',
+      validCreateBody(),
+    );
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(createMonitorDefinitionMock).not.toHaveBeenCalled();
+  });
+
+  it('PATCH /monitor-definitions/:id denied 403, no update', async () => {
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+
+    const res = await jsonRequest(
+      buildApp({ allowedSiteIds: [SITE_A] }),
+      'PATCH',
+      `/${MONITOR_ID}`,
+      { name: 'Renamed' },
+    );
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(updateMonitorDefinitionMock).not.toHaveBeenCalled();
+  });
+
+  it('DELETE /monitor-definitions/:id denied 403, no delete', async () => {
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+
+    const res = await jsonRequest(buildApp({ allowedSiteIds: [SITE_A] }), 'DELETE', `/${MONITOR_ID}`);
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(deleteMonitorDefinitionMock).not.toHaveBeenCalled();
+  });
+
+  it('POST /monitor-definitions/:id/attachments denied 403, no attach', async () => {
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+
+    const res = await jsonRequest(
+      buildApp({ allowedSiteIds: [SITE_A] }),
+      'POST',
+      `/${MONITOR_ID}/attachments`,
+      { configPolicyId: POLICY_ID },
+    );
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(addFeatureLinkMock).not.toHaveBeenCalled();
+    expect(updateFeatureLinkMock).not.toHaveBeenCalled();
+    expect(getConfigPolicyMock).not.toHaveBeenCalled();
+  });
+
+  it('POST /monitor-definitions/:id/attachments createPolicyFor branch denied 403 too', async () => {
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+
+    const res = await jsonRequest(
+      buildApp({ allowedSiteIds: [SITE_A] }),
+      'POST',
+      `/${MONITOR_ID}/attachments`,
+      { createPolicyFor: { level: 'site', targetId: SITE_A } },
+    );
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(createConfigPolicyMock).not.toHaveBeenCalled();
+    expect(assignPolicyMock).not.toHaveBeenCalled();
+  });
+
+  it('DELETE /monitor-definitions/:id/attachments/:attachmentId denied 403, no detach', async () => {
+    getMonitorDefinitionMock.mockResolvedValue(monitorRow());
+
+    const res = await jsonRequest(
+      buildApp({ allowedSiteIds: [SITE_A] }),
+      'DELETE',
+      `/${MONITOR_ID}/attachments/${ATTACHMENT_ID}`,
+    );
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+    expect(removeFeatureLinkMock).not.toHaveBeenCalled();
+    expect(updateFeatureLinkMock).not.toHaveBeenCalled();
+    expect(getConfigPolicyMock).not.toHaveBeenCalled();
+  });
+
+  it('an unrestricted org caller still succeeds (control)', async () => {
+    const created = monitorRow();
+    createMonitorDefinitionMock.mockResolvedValue(created);
+
+    const res = await jsonRequest(buildApp(), 'POST', '', validCreateBody());
+
+    expect(res.status).toBe(201);
+    expect(createMonitorDefinitionMock).toHaveBeenCalledTimes(1);
+  });
+});
+
 vi.mock('./monitorDefinitions.conversion', async () => {
   const { Hono } = await import('hono');
   return { monitorConversionRoutes: new Hono().get('/pending', (c) => c.json({ data: { policies: 0, rows: 0 } })) };
@@ -835,4 +953,55 @@ it('mounts the literal conversion resource before monitor ids', async () => {
   expect(response.status).toBe(200);
   expect(await response.json()).toEqual({ data: { policies: 0, rows: 0 } });
   expect(getMonitorDefinitionMock).not.toHaveBeenCalled();
+});
+
+// #7206: a built-in system anchor rule ("Reboot pending too long", "Patch job
+// failure") is refused with a specific, readable outcome — never the old
+// misleading "Alert template not found" 404.
+describe('POST /monitor-definitions/convert-from-rule/:ruleId', () => {
+  it('maps system_managed to 409 RULE_SYSTEM_MANAGED with a readable message', async () => {
+    const { convertRuleToMonitor } = await import('../services/monitors/ruleConversionService');
+    vi.mocked(convertRuleToMonitor).mockResolvedValueOnce({ ok: false, failure: { kind: 'system_managed' } });
+
+    const res = await jsonRequest(buildApp(), 'POST', '/convert-from-rule/rule-1');
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: 'System-managed rule — it keeps alerting on its own and needs no conversion',
+      code: 'RULE_SYSTEM_MANAGED',
+    });
+    expect(writeRouteAuditMock).not.toHaveBeenCalled();
+  });
+
+  it('maps governance_denied (site-restricted caller) to 403', async () => {
+    const { convertRuleToMonitor } = await import('../services/monitors/ruleConversionService');
+    vi.mocked(convertRuleToMonitor).mockResolvedValueOnce({ ok: false, failure: { kind: 'governance_denied' } });
+
+    const res = await jsonRequest(buildApp(), 'POST', '/convert-from-rule/rule-1');
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: expect.stringMatching(/Site-restricted/) });
+  });
+
+  it('maps a conversion refusal raised inside the group transaction to its status, not a 500', async () => {
+    const { convertRuleToMonitor } = await import('../services/monitors/ruleConversionService');
+    const { ConversionError } = await import('../services/monitors/conversion/errors');
+    vi.mocked(convertRuleToMonitor).mockRejectedValueOnce(new ConversionError('preview_stale', 'Template group changed'));
+
+    const res = await jsonRequest(buildApp(), 'POST', '/convert-from-rule/rule-1');
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: 'preview_stale' });
+    expect(writeRouteAuditMock).not.toHaveBeenCalled();
+  });
+
+  it('still maps template_not_found to 404', async () => {
+    const { convertRuleToMonitor } = await import('../services/monitors/ruleConversionService');
+    vi.mocked(convertRuleToMonitor).mockResolvedValueOnce({ ok: false, failure: { kind: 'template_not_found' } });
+
+    const res = await jsonRequest(buildApp(), 'POST', '/convert-from-rule/rule-1');
+
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'Alert template not found' });
+  });
 });

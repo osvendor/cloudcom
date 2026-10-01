@@ -56,13 +56,8 @@ const namespaceDuplicateBaselines = {
     // necessarily identical in every catalog.
     // +1: contracts.currencyMismatches.columns.status — "Status" is spelled
     // identically in pt-BR.
-    // +2: invoiceDetail.payments.quickbooks / .viaQuickbooks (QuickBooks
-    // payment pull-back, Phase D) — the badge value IS the proper noun, and
-    // this locale already renders the parallel `viaStripe` as "via Stripe",
-    // so "via QuickBooks" is the correct wording here, not an untranslated
-    // string.
     // +1 W05: quotes.document.deviceSet.badge "Est." is intentionally identical.
-    'billing.json': 61, // +1 W03: site sub-label "Site: {{name}}" is intentionally identical in pt-BR; +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal; +1 (#6648): quotes.editor.footer.counter "{{count}} / {{max}}" is pure interpolation
+    'billing.json': 59, // +1 W03: site sub-label "Site: {{name}}" is intentionally identical in pt-BR; +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal; +1 (#6648): quotes.editor.footer.counter "{{count}} / {{max}}" is pure interpolation
     // #5808 W01 (ticket checklists): card.progress "{{done}} / {{total}}" is pure
     // interpolation; card.title "Checklist" and source.manual "Manual" are
     // identical cognates in pt-BR.
@@ -87,9 +82,12 @@ const namespaceDuplicateBaselines = {
     'deliverables.json': 3,
     // +1: deviceInfoTab.functionSource.manual (Fleet Designer W02, #5652) — "Manual" is the identical cognate in pt-BR.
     // +2 W05 (#5993): reachability.source preserves the names "UniFi" and "SNMP".
-    'devices.json': 177,
+    // +1: timeSync.fields.pdc — PDC is the locale-invariant Windows Active Directory role acronym.
+    'devices.json': 178,
     'discovery.json': 17,
     // errors namespace (Task 3 of #3859): pt-BR fully translated, no cognates.
+    // Wave E2b (DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND, PATH_CONFLICT,
+    // AGENT_COMMAND_REJECTED) translated too — still 0 cognates.
     'errors.json': 0,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +1 W04 (#5654): legacy.columns.script — "Script" is the identical loanword in pt-BR.
@@ -110,7 +108,7 @@ const namespaceDuplicateBaselines = {
     // badgeLabelWithReason are pure-interpolation literals ("{{orgName}}: {{system}}, {{state}}").
     // +1 #5288: titles.jobs — "Jobs" is the same loanword in pt-BR.
     'pages.json': 11, // Cognates: Backup, Webhooks (x2), OneDrive, Scripts, Logs, EDR, Software (x2), and one settings-card title (Sites).
-    'patches.json': 23,
+    'patches.json': 29,
     'peripherals.json': 4,
     'policies.json': 357,
     'portal.json': 3,
@@ -118,7 +116,7 @@ const namespaceDuplicateBaselines = {
     // wording — it is intentionally identical in every catalog.
     'quick.json': 1,
     'remote.json': 12,
-    'reports.json': 39,
+    'reports.json': 40, // +1: reports.series.recipients.ccPlaceholder (name@example.com, locale-invariant)
     // +2: automationRunHistory.scriptOutput — "stderr" is a stream name, not
     // wording, and "Script" is the standard loanword in this locale (#3162).
     // +1: scriptProposalDetail.statusLabel — "Status" is the same cognate in
@@ -167,8 +165,12 @@ const namespaceDuplicateBaselines = {
     // per-locale note where it is not obvious.
     'toolSources.json': 1,
     // Topology (#5997): 'Site' is the identical pt-BR cognate.
-    'topology.json': 1,
-    'vulnerabilities.json': 13,
+    // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
+    'topology.json': 2,
+    // +1 (#2262 softwareGroupTable devices-affected rework): cves_one/cves_other
+    // ('{{count}} CVE'/'{{count}} CVEs') keep the acronym untranslated, same as
+    // the existing CVEs-namespace duplicates above.
+    'vulnerabilities.json': 14,
   },
   'es-419': {
     // +5: llmProviderCatalog admin UI (#3922 W1) — "Slug" is kept as the
@@ -208,11 +210,8 @@ const namespaceDuplicateBaselines = {
     // +1: contracts.currencyMismatches.currencyPair — the value is pure
     // interpolation ("{{contractCurrency}} → {{orgCurrency}}"), so it is
     // necessarily identical in every catalog.
-    // +1: invoiceDetail.payments.quickbooks (QuickBooks payment pull-back,
-    // Phase D) — the badge value IS the proper noun, so it is identical in
-    // every catalog. `.viaQuickbooks` IS translated in this locale.
     // +1 W05: quotes.document.deviceSet.badge "Est." is intentionally identical.
-    'billing.json': 47, // +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal; +1 (#6648): quotes.editor.footer.counter "{{count}} / {{max}}" is pure interpolation
+    'billing.json': 46, // +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal; +1 (#6648): quotes.editor.footer.counter "{{count}} / {{max}}" is pure interpolation
     // #5808 W01 (ticket checklists): card.progress "{{done}} / {{total}}" is pure
     // interpolation; source.manual "Manual" is an identical cognate in es-419.
     'checklists.json': 2,
@@ -238,13 +237,16 @@ const namespaceDuplicateBaselines = {
     'deliverables.json': 2,
     // +1: deviceInfoTab.functionSource.manual (Fleet Designer W02, #5652) — "Manual" is the identical cognate in es-419.
     // +2 W05 (#5993): reachability.source preserves the names "UniFi" and "SNMP".
-    'devices.json': 128,
+    // +1: timeSync.fields.pdc — PDC is the locale-invariant Windows Active Directory role acronym.
+    'devices.json': 129,
     'discovery.json': 17,
     // errors namespace (Task 3 of #3859): seeded as English copies pending
     // native review, so all 9 codes are exact-English cognates for now.
     // +2 (Part of #3859, Wave E2a): AGENT_EXECUTION_FAILED and DEVICE_UNREACHABLE
     // added as English placeholders, same as the rest of this namespace.
-    'errors.json': 11,
+    // +5 (Part of #3859, Wave E2b): DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND,
+    // PATH_CONFLICT and AGENT_COMMAND_REJECTED added as English placeholders too.
+    'errors.json': 16,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +1 W04 (#5654): legacy.columns.script — "Script" is the identical loanword in es-419.
     'fleetDesign.json': 2,
@@ -262,7 +264,7 @@ const namespaceDuplicateBaselines = {
     // +3 W03 account board: "PSA" is a locale-invariant acronym; orgBoard.integrations.badgeLabel /
     // badgeLabelWithReason are pure-interpolation literals ("{{orgName}}: {{system}}, {{state}}").
     'pages.json': 12, // Cognates: CIS Benchmarks, Webhooks (x2), OneDrive, Scripts, EDR, Roles, Variables, Software (x2), Tickets, and Ticket (singular).
-    'patches.json': 16,
+    'patches.json': 18,
     'peripherals.json': 4,
     'policies.json': 241,
     'portal.json': 4,
@@ -270,7 +272,7 @@ const namespaceDuplicateBaselines = {
     // wording — it is intentionally identical in every catalog.
     'quick.json': 1,
     'remote.json': 12,
-    'reports.json': 32,
+    'reports.json': 33, // +1: reports.series.recipients.ccPlaceholder (name@example.com, locale-invariant)
     // +2: automationRunHistory.scriptOutput — "stderr" is a stream name, not
     // wording, and "Script" is the standard loanword in this locale (#3162).
     // +1: scriptForm.variables.button — "Variables" is the same word in Spanish
@@ -311,8 +313,10 @@ const namespaceDuplicateBaselines = {
     // interpolations plus the SI hour symbol — no wording to translate (#3776).
     'tickets.json': 15,
     'toolSources.json': 1,
-    'topology.json': 0,
-    'vulnerabilities.json': 16,
+    // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
+    'topology.json': 1,
+    // +1 (#2262): softwareGroupTable.cves_one/_other keep 'CVE'/'CVEs' untranslated.
+    'vulnerabilities.json': 17,
   },
   'fr-FR': {
     // +7: llmProviderCatalog admin UI (#3922 W1) — "Slug", "Actions", "Notes"
@@ -354,13 +358,8 @@ const namespaceDuplicateBaselines = {
     // +1: contracts.currencyMismatches.currencyPair — the value is pure
     // interpolation ("{{contractCurrency}} → {{orgCurrency}}"), so it is
     // necessarily identical in every catalog.
-    // +2: invoiceDetail.payments.quickbooks / .viaQuickbooks (QuickBooks
-    // payment pull-back, Phase D) — the badge value IS the proper noun, and
-    // this locale already renders the parallel `viaStripe` as "via Stripe",
-    // so "via QuickBooks" is the correct wording here, not an untranslated
-    // string.
     // +1 W05: quotes.document.deviceSet.badge "Est." is intentionally identical.
-    'billing.json': 59, // +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal
+    'billing.json': 57, // +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal
     // #5808 W01 (ticket checklists): card.progress "{{done}} / {{total}}" is pure interpolation.
     // +1 W02: templates.description — "Description" is also the French word.
     'checklists.json': 2,
@@ -392,13 +391,16 @@ const namespaceDuplicateBaselines = {
     // +1 (network asset site move, #6766): networkSettings.details.site "Site" is the identical cognate in fr-FR.
     // +2 (#6496, backup UI raw values): cleanupHistory.historyActions_one/_other
     // — "action"/"actions" are identical cognates in fr-FR.
-    'devices.json': 157,
+    // +1: timeSync.fields.pdc — PDC is the locale-invariant Windows Active Directory role acronym.
+    'devices.json': 158,
     'discovery.json': 15,
     // errors namespace (Task 3 of #3859): seeded as English copies pending
     // native review, so all 9 codes are exact-English cognates for now.
     // +2 (Part of #3859, Wave E2a): AGENT_EXECUTION_FAILED and DEVICE_UNREACHABLE
     // added as English placeholders, same as the rest of this namespace.
-    'errors.json': 11,
+    // +5 (Part of #3859, Wave E2b): DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND,
+    // PATH_CONFLICT and AGENT_COMMAND_REJECTED added as English placeholders too.
+    'errors.json': 16,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +2 W04 (#5654): legacy.columns.script — "Script" — and legacy.columns.notes —
     // "Notes" — both spell identically in fr-FR.
@@ -418,7 +420,7 @@ const namespaceDuplicateBaselines = {
     // scripts.json made titles.scripts an intentional cognate ("Script" is the
     // standard fr-FR loanword) on top of the pre-existing ones.
     'pages.json': 12, // Cognates: CIS Benchmarks, Extension, Incidents, Webhooks (x2), OneDrive, EDR, Variables, Ticket(s) (x2), Scripts, and one settings-card title (Sites).
-    'patches.json': 20,
+    'patches.json': 23,
     'peripherals.json': 9,
     'policies.json': 204,
     'portal.json': 4,
@@ -426,7 +428,7 @@ const namespaceDuplicateBaselines = {
     // wording — it is intentionally identical in every catalog.
     'quick.json': 1,
     'remote.json': 18,
-    'reports.json': 43,
+    'reports.json': 48, // +5: reports.series ccPlaceholder + drilldown.columns.actions, drilldown.states.active, child.summary.type, child.summary.format (identical French cognates)
     // +2: automationRunHistory.scriptOutput — "stderr" is a stream name, not
     // wording, and "Script" is the standard loanword in this locale (#3162).
     // +1: scriptForm.variables.button — "Variables" is identical in French
@@ -486,8 +488,12 @@ const namespaceDuplicateBaselines = {
     'toolSources.json': 1,
     // Topology (#5997): 'Configuration', 'Diagnostics', 'Site' and
     // targetFields.port 'Port' are identical fr-FR cognates.
-    'topology.json': 4,
-    'vulnerabilities.json': 15,
+    // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
+    'topology.json': 5,
+    // +2 (#2262): softwareGroupTable.cves_one/_other keep 'CVE'/'CVEs' untranslated
+    // (fr-FR's old table.cves was "CVE", not a duplicate of English "CVEs", so
+    // both new plural forms are net-new duplicates here).
+    'vulnerabilities.json': 17,
   },
   'fr-CA': {
     // +7: llmProviderCatalog admin UI (#3922 W1) — "Slug", "Actions", "Notes"
@@ -523,13 +529,8 @@ const namespaceDuplicateBaselines = {
     // +1: contracts.currencyMismatches.currencyPair — the value is pure
     // interpolation ("{{contractCurrency}} → {{orgCurrency}}"), so it is
     // necessarily identical in every catalog.
-    // +2: invoiceDetail.payments.quickbooks / .viaQuickbooks (QuickBooks
-    // payment pull-back, Phase D) — the badge value IS the proper noun, and
-    // this locale already renders the parallel `viaStripe` as "via Stripe",
-    // so "via QuickBooks" is the correct wording here, not an untranslated
-    // string.
     // +1 W05: quotes.document.deviceSet.badge "Est." is intentionally identical.
-    'billing.json': 59, // +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal
+    'billing.json': 57, // +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal
     // #5808 W01 (ticket checklists): card.progress "{{done}} / {{total}}" is pure interpolation.
     // +1 W02: templates.description — "Description" is also the French word.
     'checklists.json': 2,
@@ -561,13 +562,16 @@ const namespaceDuplicateBaselines = {
     // +1 (network asset site move, #6766): networkSettings.details.site "Site" is the identical cognate in fr-CA.
     // +2 (#6496, backup UI raw values): cleanupHistory.historyActions_one/_other
     // — "action"/"actions" are identical cognates in fr-CA.
-    'devices.json': 157,
+    // +1: timeSync.fields.pdc — PDC is the locale-invariant Windows Active Directory role acronym.
+    'devices.json': 158,
     'discovery.json': 15,
     // errors namespace (Task 3 of #3859): seeded as English copies pending
     // native review, so all 9 codes are exact-English cognates for now.
     // +2 (Part of #3859, Wave E2a): AGENT_EXECUTION_FAILED and DEVICE_UNREACHABLE
     // added as English placeholders, same as the rest of this namespace.
-    'errors.json': 11,
+    // +5 (Part of #3859, Wave E2b): DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND,
+    // PATH_CONFLICT and AGENT_COMMAND_REJECTED added as English placeholders too.
+    'errors.json': 16,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +2 W04 (#5654): legacy.columns.script — "Script" — and legacy.columns.notes —
     // "Notes" — both spell identically in fr-CA.
@@ -587,7 +591,7 @@ const namespaceDuplicateBaselines = {
     // here) made titles.scripts an intentional cognate ("Script" is the
     // standard loanword) on top of the pre-existing ones.
     'pages.json': 12, // Cognates: CIS Benchmarks, Extension, Incidents, Webhooks (x2), OneDrive, EDR, Variables, Ticket(s) (x2), Scripts, and one settings-card title (Sites).
-    'patches.json': 20,
+    'patches.json': 23,
     'peripherals.json': 9,
     'policies.json': 204,
     'portal.json': 4,
@@ -595,7 +599,7 @@ const namespaceDuplicateBaselines = {
     // wording — it is intentionally identical in every catalog.
     'quick.json': 1,
     'remote.json': 17,
-    'reports.json': 43,
+    'reports.json': 48, // +5: reports.series ccPlaceholder + drilldown.columns.actions, drilldown.states.active, child.summary.type, child.summary.format (identical French cognates)
     // +2: automationRunHistory.scriptOutput — "stderr" is a stream name, not
     // wording, and "Script" is the standard loanword in this locale (#3162).
     // +1: scriptForm.variables.button — "Variables" is identical in French
@@ -657,8 +661,12 @@ const namespaceDuplicateBaselines = {
     'toolSources.json': 1,
     // Topology (#5997): 'Configuration', 'Diagnostics', 'Site' and
     // targetFields.port 'Port' are identical fr-CA cognates.
-    'topology.json': 4,
-    'vulnerabilities.json': 15,
+    // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
+    'topology.json': 5,
+    // +2 (#2262): softwareGroupTable.cves_one/_other keep 'CVE'/'CVEs' untranslated
+    // (fr-CA's old table.cves was "CVE", not a duplicate of English "CVEs", so
+    // both new plural forms are net-new duplicates here).
+    'vulnerabilities.json': 17,
   },
   'de-DE': {
     // +8: llmProviderCatalog admin UI (#3922 W1) — "Slug", "Name", "Status"
@@ -702,11 +710,8 @@ const namespaceDuplicateBaselines = {
     // necessarily identical in every catalog.
     // +1: contracts.currencyMismatches.columns.status — "Status" is spelled
     // identically in de-DE.
-    // +1: invoiceDetail.payments.quickbooks (QuickBooks payment pull-back,
-    // Phase D) — the badge value IS the proper noun, so it is identical in
-    // every catalog. `.viaQuickbooks` IS translated in this locale.
     // +1 W07: invoiceDetail.devices.hostname — "Hostname" is also the German word.
-    'billing.json': 46, // +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal; +1 (#6648): quotes.editor.footer.counter "{{count}} / {{max}}" is pure interpolation
+    'billing.json': 45, // +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal; +1 (#6648): quotes.editor.footer.counter "{{count}} / {{max}}" is pure interpolation
     // #5808 W01 (ticket checklists): card.progress "{{done}} / {{total}}" is pure interpolation.
     // +1 W02: templates.name — "Name" is also the German word.
     'checklists.json': 2,
@@ -743,7 +748,8 @@ const namespaceDuplicateBaselines = {
     // +1 #5808 W03: drawer.checklistProgress "{{done}} / {{total}}" is pure interpolation, same as checklists.json card.progress.
     'deliverables.json': 5,
     // +2 W05 (#5993): reachability.source preserves the names "UniFi" and "SNMP".
-    'devices.json': 166,
+    // +1: timeSync.fields.pdc — PDC is the locale-invariant Windows Active Directory role acronym.
+    'devices.json': 167,
     // +1 (#5213 W03): assetTypes.website — "Website" is the German word.
     // +1 (#5433): tabs.baselines — "Baselines" is the identical loanword in
     // German, matching networkBaselinesPanel.title's existing "Netzwerk-Baselines".
@@ -752,7 +758,9 @@ const namespaceDuplicateBaselines = {
     // native review, so all 9 codes are exact-English cognates for now.
     // +2 (Part of #3859, Wave E2a): AGENT_EXECUTION_FAILED and DEVICE_UNREACHABLE
     // added as English placeholders, same as the rest of this namespace.
-    'errors.json': 11,
+    // +5 (Part of #3859, Wave E2b): DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND,
+    // PATH_CONFLICT and AGENT_COMMAND_REJECTED added as English placeholders too.
+    'errors.json': 16,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     'fleetDesign.json': 1,
     // +1 (W03 #6011): backupProviders.cove is a protected proper noun pinned
@@ -769,7 +777,7 @@ const namespaceDuplicateBaselines = {
     // +3 W03 account board: "PSA" is a locale-invariant acronym; orgBoard.integrations.badgeLabel /
     // badgeLabelWithReason are pure-interpolation literals ("{{orgName}}: {{system}}, {{state}}").
     'pages.json': 15, // Cognates: Backup, CIS Benchmarks, Dashboard, Webhooks (x2), OneDrive, Patches, EDR, Software (x2), Tickets, Ticket (singular), and two settings-card titles (Ticketing, Single Sign-On); +1 system page W02: titles.adminSystem "System".
-    'patches.json': 23,
+    'patches.json': 32,
     'peripherals.json': 4,
     'policies.json': 205,
     'portal.json': 4,
@@ -824,8 +832,10 @@ const namespaceDuplicateBaselines = {
     'toolSources.json': 1,
     // Topology (#5997): 'Name', 'Revision' and targetFields.hostname/port
     // ('Hostname'/'Port') are identical de-DE cognates.
-    'topology.json': 4,
-    'vulnerabilities.json': 20,
+    // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
+    'topology.json': 5,
+    // +1 (#2262): softwareGroupTable.cves_one/_other keep 'CVE'/'CVEs' untranslated.
+    'vulnerabilities.json': 21,
   },
   'it-IT': {
     // +7: llmProviderCatalog admin UI (#3922 W1) — "Slug", "Input", "Output"
@@ -859,10 +869,7 @@ const namespaceDuplicateBaselines = {
     // +1: contracts.currencyMismatches.currencyPair — the value is pure
     // interpolation ("{{contractCurrency}} → {{orgCurrency}}"), so it is
     // necessarily identical in every catalog.
-    // +1: invoiceDetail.payments.quickbooks (QuickBooks payment pull-back,
-    // Phase D) — the badge value IS the proper noun, so it is identical in
-    // every catalog. `.viaQuickbooks` IS translated in this locale.
-    'billing.json': 38, // +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal; +1 (#6648): quotes.editor.footer.counter "{{count}} / {{max}}" is pure interpolation
+    'billing.json': 37, // +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal; +1 (#6648): quotes.editor.footer.counter "{{count}} / {{max}}" is pure interpolation
     // #5808 W01 (ticket checklists): card.progress "{{done}} / {{total}}" is pure
     // interpolation; card.title "Checklist" and source.deliverable "Deliverable"
     // are the same loanwords deliverables.json already keeps untranslated in it-IT.
@@ -881,13 +888,16 @@ const namespaceDuplicateBaselines = {
     // +1 #5808 W03: drawer.checklistProgress "{{done}} / {{total}}" is pure interpolation, same as checklists.json card.progress.
     'deliverables.json': 3,
     // +2 W05 (#5993): reachability.source preserves the names "UniFi" and "SNMP".
-    'devices.json': 146,
+    // +1: timeSync.fields.pdc — PDC is the locale-invariant Windows Active Directory role acronym.
+    'devices.json': 147,
     'discovery.json': 22,
     // errors namespace (Task 3 of #3859): seeded as English copies pending
     // native review, so all 9 codes are exact-English cognates for now.
     // +2 (Part of #3859, Wave E2a): AGENT_EXECUTION_FAILED and DEVICE_UNREACHABLE
     // added as English placeholders, same as the rest of this namespace.
-    'errors.json': 11,
+    // +5 (Part of #3859, Wave E2b): DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND,
+    // PATH_CONFLICT and AGENT_COMMAND_REJECTED added as English placeholders too.
+    'errors.json': 16,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +1 W04 (#5654): legacy.columns.script — "Script" is the identical loanword in it-IT.
     'fleetDesign.json': 2,
@@ -906,7 +916,7 @@ const namespaceDuplicateBaselines = {
     // +3 W03 account board: "PSA" is a locale-invariant acronym; orgBoard.integrations.badgeLabel /
     // badgeLabelWithReason are pure-interpolation literals ("{{orgName}}: {{system}}, {{state}}").
     'pages.json': 10, // Cognates: Backup, CIS Benchmarks, Dashboard, OneDrive, EDR, Software (x2), Ticket, and two settings-card titles (Ticketing, SSO) — proper nouns/acronyms/loanwords.
-    'patches.json': 18,
+    'patches.json': 22,
     'peripherals.json': 4,
     'policies.json': 363,
     'portal.json': 9,
@@ -949,8 +959,11 @@ const namespaceDuplicateBaselines = {
     // interpolations plus the SI hour symbol — no wording to translate (#3776).
     'tickets.json': 8,
     'toolSources.json': 1,
-    'topology.json': 0,
-    'vulnerabilities.json': 17,
+    // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
+    'topology.json': 1,
+    // +1 (#2262): softwareGroupTable.cves_one keeps 'CVE' untranslated (cves_other
+    // is 'CVE' too, since Italian does not inflect the acronym).
+    'vulnerabilities.json': 18,
   },
   'tr-TR': {
     // +5: llmProviderCatalog admin UI (#3922 W1) — "Slug" is kept as the
@@ -982,10 +995,7 @@ const namespaceDuplicateBaselines = {
     // +1: contracts.currencyMismatches.currencyPair — the value is pure
     // interpolation ("{{contractCurrency}} → {{orgCurrency}}"), so it is
     // necessarily identical in every catalog.
-    // +1: invoiceDetail.payments.quickbooks (QuickBooks payment pull-back,
-    // Phase D) — the badge value IS the proper noun, so it is identical in
-    // every catalog. `.viaQuickbooks` IS translated in this locale.
-    'billing.json': 23, // +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal; +1 (#6648): quotes.editor.footer.counter "{{count}} / {{max}}" is pure interpolation
+    'billing.json': 22, // +1 W06: roleBucket "{{count}} {{role}}" is a pure-interpolation literal; +1 (#6648): quotes.editor.footer.counter "{{count}} / {{max}}" is pure interpolation
     // #5808 W01 (ticket checklists): card.progress "{{done}} / {{total}}" is pure interpolation.
     'checklists.json': 1,
     'common.json': 49, // +1 W06: lists.separator ", " is punctuation
@@ -998,13 +1008,16 @@ const namespaceDuplicateBaselines = {
     // +1 #5808 W03: drawer.checklistProgress "{{done}} / {{total}}" is pure interpolation, same as checklists.json card.progress.
     'deliverables.json': 2,
     // +2 W05 (#5993): reachability.source preserves the names "UniFi" and "SNMP".
-    'devices.json': 90,
+    // +1: timeSync.fields.pdc — PDC is the locale-invariant Windows Active Directory role acronym.
+    'devices.json': 91,
     'discovery.json': 9,
     // errors namespace (Task 3 of #3859): seeded as English copies pending
     // native review, so all 9 codes are exact-English cognates for now.
     // +2 (Part of #3859, Wave E2a): AGENT_EXECUTION_FAILED and DEVICE_UNREACHABLE
     // added as English placeholders, same as the rest of this namespace.
-    'errors.json': 11,
+    // +5 (Part of #3859, Wave E2b): DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND,
+    // PATH_CONFLICT and AGENT_COMMAND_REJECTED added as English placeholders too.
+    'errors.json': 16,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     'fleetDesign.json': 1,
     // +2 (W03 #6011): backupProviders.cove and backupProviders.namePlaceholder
@@ -1017,7 +1030,7 @@ const namespaceDuplicateBaselines = {
     // +3 W03 account board: "PSA" is a locale-invariant acronym; orgBoard.integrations.badgeLabel /
     // badgeLabelWithReason are pure-interpolation literals ("{{orgName}}: {{system}}, {{state}}").
     'pages.json': 3, // Cognates: CIS Benchmarks, OneDrive, EDR — proper nouns/acronyms.
-    'patches.json': 11,
+    'patches.json': 13,
     'peripherals.json': 4,
     // +8: package-manager software library — OS names ("Windows", "macOS",
     // "Linux" in both addPackageModal and deploymentWizard) and package-manager
@@ -1028,7 +1041,7 @@ const namespaceDuplicateBaselines = {
     'portal.json': 2,
     'quick.json': 1,
     'remote.json': 4,
-    'reports.json': 31,
+    'reports.json': 32, // +1: reports.series.recipients.ccPlaceholder (name@example.com, locale-invariant)
     'scripts.json': 38,
     'security.json': 86,
     // +1: pre-existing 1-duplicate baseline drift from before wave 6.1 Task 4
@@ -1052,8 +1065,10 @@ const namespaceDuplicateBaselines = {
     'tickets.json': 12,
     'toolSources.json': 1,
     // Topology (#5997): 'Site' is the identical tr-TR cognate.
-    'topology.json': 1,
-    'vulnerabilities.json': 11,
+    // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
+    'topology.json': 2,
+    // +1 (#2262): softwareGroupTable.cves_one keeps 'CVE' untranslated.
+    'vulnerabilities.json': 12,
   },
 } satisfies Record<TranslatedLocale, Record<string, number>>;
 

@@ -66,6 +66,18 @@ const agentRelayMock = {
   isAgentConnectedAnywhere: vi.fn(async () => true),
   dispatchCommandToAgent: vi.fn(async (): Promise<DispatchOutcome> => ({ status: 'sent', via: 'local' })),
 };
+// Brokered write delivery is covered by backupStorageWriteDelivery.test.ts and
+// the write-session integration suites; here the helper never reports it
+// unless a test says otherwise.
+const writeDeliveryMock = vi.hoisted(() => ({
+  broker: vi.fn(async (input: { provider: string; payload: Record<string, unknown> }) => ({
+    mode: input.provider === 'local' ? 'local' : 'legacy',
+    reason: input.provider === 'local' ? 'no_credential' : 'helper_unsupported',
+    payload: input.payload,
+  })),
+}));
+vi.mock('../services/backupStorageWriteDelivery', () => ({ brokerWorkerBackupPayload: writeDeliveryMock.broker }));
+
 vi.mock('../services/agentCommandRelay', () => ({
   isAgentConnectedAnywhere: agentRelayMock.isAgentConnectedAnywhere,
   dispatchCommandToAgent: agentRelayMock.dispatchCommandToAgent,
@@ -73,8 +85,35 @@ vi.mock('../services/agentCommandRelay', () => ({
 
 vi.mock('../services/auditService', () => ({ createAuditLogAsync: vi.fn() }));
 
+const isParkedDeviceMock = vi.fn(async (_reader: unknown, _deviceId: string) => false);
+vi.mock('../services/unassignedPool/deliveryEligibility', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/unassignedPool/deliveryEligibility')>()),
+  isParkedDevice: isParkedDeviceMock,
+}));
+
+// The capability-wait re-enqueue is the one queue write the dispatch makes;
+// every other export of the module stays real.
+const enqueueCapabilityWaitMock = vi.hoisted(() => vi.fn(async () => 'backup-dispatch-wait'));
+vi.mock('./backupEnqueue', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./backupEnqueue')>()),
+  enqueueBackupDispatchCapabilityWait: enqueueCapabilityWaitMock,
+}));
+
+/** Helper protocols as a device with an older backup helper reports them. */
+const REPORTED_OLD_HELPER = { backupWriteProtocolVersion: 0, backupIntegrityProtocolVersion: 0 };
+/** A device that has not reported its helper protocols yet (just enrolled). */
+const UNREPORTED_HELPER = { backupWriteProtocolVersion: null, backupIntegrityProtocolVersion: null };
+
 // Must import AFTER mock so the module-level destructure picks up our mock
-const { resolveBackupTargets, processCleanupExpiredSnapshots, EmptyBackupPathsError, __testOnly } = await import('./backupWorker');
+const {
+  resolveBackupTargets,
+  processCleanupExpiredSnapshots,
+  EmptyBackupPathsError,
+  __testOnly,
+  BACKUP_CAPABILITY_WAIT_POLL_MS,
+} = await import('./backupWorker');
+const { BACKUP_CAPABILITY_WAIT_MAX_ATTEMPTS } = await import('./backupEnqueue');
+const { BACKUP_HELPER_UNREPORTED_MESSAGE } = await import('../services/backupHelperProtocols');
 
 describe('resolveBackupTargets', () => {
   beforeEach(() => {
@@ -770,30 +809,35 @@ describe('processDispatchBackup (wave 3.5b #4084 — dispatch via facade)', () =
   const DATA = { type: 'dispatch-backup' as const, jobId: 'job-1', configId: 'config-1', orgId: 'org-1', deviceId: 'device-1' };
   const CONFIG_ROW = { id: 'config-1', provider: 'local', providerConfig: {}, encryption: false };
   const updateLog: Array<{ table: unknown; payload: Record<string, unknown> }> = [];
+  let helperProtocols: { backupWriteProtocolVersion: number | null; backupIntegrityProtocolVersion: number | null } = REPORTED_OLD_HELPER;
+  let jobStatusRows: Array<{ status: string }> = [];
 
   // Route every db.select() call by the shape of its column-selector argument
   // (all these queries hit different tables/columns, real schema refs — not
   // stringly-typed, so we key off which fields were requested).
-  function wireSelects(currentOrgId = 'org-1') {
+  function wireSelects(currentOrgId = 'org-1', jobRowVisible = true) {
     mockDb.select.mockImplementation(((cols?: Record<string, unknown>) => {
       const keys = cols ? Object.keys(cols) : [];
       let rows: unknown[];
       if (keys.length === 0) {
         rows = [CONFIG_ROW]; // config load: db.select() with no arg
       } else if (keys.length === 1 && keys[0] === 'status') {
-        rows = []; // isBackupJobCancelled: never cancelled
+        rows = jobStatusRows; // job status reads: never cancelled by default
       } else if (keys.length === 1 && keys[0] === 'orgId') {
         rows = [{ orgId: currentOrgId }];
-      } else if (keys.length === 1 && keys[0] === 'agentId') {
-        rows = [{ agentId: 'agent-1' }]; // device -> agent lookup
+      } else if (keys[0] === 'agentId') {
+        rows = [{ agentId: 'agent-1', ...helperProtocols }]; // device -> agent lookup + reported helper protocols
       } else if (keys.includes('featureLinkId')) {
-        rows = [{ featureLinkId: null, backupMode: 'file', modeTargets: { paths: ['/data'] } }]; // job mode lookup
+        // job mode lookup
+        rows = jobRowVisible ? [{ featureLinkId: null, backupMode: 'file', modeTargets: { paths: ['/data'] } }] : [];
       } else if (keys.length === 2 && keys.includes('id') && keys.includes('snapshotId')) {
         rows = []; // D18 W01: stampDispatchPinAndIdentity's base-candidate lookup — no eligible base by default
       } else if (keys.includes('retirementId')) {
         // #6351: stampDispatchPinAndIdentity's fallback-reason probe — runs
         // only when no base was selected, and only feeds the log line.
         rows = [];
+      } else if (keys.length === 1 && keys[0] === 'integrityVersion') {
+        rows = []; // helper-capability read: an older helper (legacy base selection)
       } else {
         throw new Error(`unexpected select shape: ${JSON.stringify(keys)}`);
       }
@@ -830,10 +874,127 @@ describe('processDispatchBackup (wave 3.5b #4084 — dispatch via facade)', () =
   beforeEach(() => {
     vi.clearAllMocks();
     updateLog.length = 0;
+    helperProtocols = REPORTED_OLD_HELPER;
+    jobStatusRows = [];
     wireSelects();
     wireUpdates();
     agentRelayMock.isAgentConnectedAnywhere.mockResolvedValue(true);
     agentRelayMock.dispatchCommandToAgent.mockResolvedValue({ status: 'sent', via: 'local' });
+  });
+
+  describe('a device that has not reported its backup helper protocols yet', () => {
+    const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
+
+    it('sends nothing, leaves the job pending and checks again shortly', async () => {
+      helperProtocols = UNREPORTED_HELPER;
+      const before = Date.now();
+
+      const result = await __testOnly.processDispatchBackup(DATA as any);
+
+      expect(result).toEqual({ dispatched: false });
+      expect(writeDeliveryMock.broker).not.toHaveBeenCalled();
+      expect(recordDispatchedExpectationMock).not.toHaveBeenCalled();
+      expect(agentRelayMock.dispatchCommandToAgent).not.toHaveBeenCalled();
+      expect(updateLog).toEqual([]);
+      expect(enqueueCapabilityWaitMock).toHaveBeenCalledTimes(1);
+      const [data, wait, delay] = enqueueCapabilityWaitMock.mock.calls[0] as unknown as [
+        typeof DATA, { attempt: number; since: string }, number,
+      ];
+      expect(data).toEqual(DATA);
+      expect(wait.attempt).toBe(1);
+      expect(Date.parse(wait.since)).toBeGreaterThanOrEqual(before);
+      expect(delay).toBe(BACKUP_CAPABILITY_WAIT_POLL_MS);
+    });
+
+    it('keeps the original wait start on every later check', async () => {
+      helperProtocols = UNREPORTED_HELPER;
+      jobStatusRows = [{ status: 'pending' }];
+      const since = minutesAgo(2);
+
+      await __testOnly.processDispatchBackup({ ...DATA, capabilityWaitAttempt: 3, capabilityWaitSince: since } as any);
+
+      expect(enqueueCapabilityWaitMock).toHaveBeenCalledWith(
+        expect.objectContaining({ jobId: DATA.jobId }),
+        { attempt: 4, since },
+        BACKUP_CAPABILITY_WAIT_POLL_MS,
+      );
+      expect(agentRelayMock.dispatchCommandToAgent).not.toHaveBeenCalled();
+    });
+
+    it('fails the job with an actionable reason once the wait window has passed', async () => {
+      helperProtocols = UNREPORTED_HELPER;
+      jobStatusRows = [{ status: 'pending' }];
+
+      const result = await __testOnly.processDispatchBackup(
+        { ...DATA, capabilityWaitAttempt: 5, capabilityWaitSince: minutesAgo(11) } as any,
+      );
+
+      expect(result).toEqual({ dispatched: false });
+      expect(enqueueCapabilityWaitMock).not.toHaveBeenCalled();
+      expect(agentRelayMock.dispatchCommandToAgent).not.toHaveBeenCalled();
+      expect(updateLog.some((u) => u.payload.status === 'failed' && u.payload.errorLog === BACKUP_HELPER_UNREPORTED_MESSAGE)).toBe(true);
+    });
+
+    it('also stops at the attempt ceiling, whatever the clock says', async () => {
+      helperProtocols = UNREPORTED_HELPER;
+      jobStatusRows = [{ status: 'pending' }];
+
+      await __testOnly.processDispatchBackup(
+        { ...DATA, capabilityWaitAttempt: BACKUP_CAPABILITY_WAIT_MAX_ATTEMPTS, capabilityWaitSince: minutesAgo(0) } as any,
+      );
+
+      expect(enqueueCapabilityWaitMock).not.toHaveBeenCalled();
+      expect(updateLog.some((u) => u.payload.errorLog === BACKUP_HELPER_UNREPORTED_MESSAGE)).toBe(true);
+    });
+
+    it('does nothing when a later check finds the job no longer pending (cancelled, reaped or failed)', async () => {
+      helperProtocols = REPORTED_OLD_HELPER;
+      jobStatusRows = [{ status: 'failed' }];
+
+      const result = await __testOnly.processDispatchBackup(
+        { ...DATA, capabilityWaitAttempt: 2, capabilityWaitSince: minutesAgo(1) } as any,
+      );
+
+      expect(result).toEqual({ dispatched: false });
+      expect(writeDeliveryMock.broker).not.toHaveBeenCalled();
+      expect(agentRelayMock.dispatchCommandToAgent).not.toHaveBeenCalled();
+      expect(enqueueCapabilityWaitMock).not.toHaveBeenCalled();
+      expect(updateLog).toEqual([]);
+    });
+
+    it('dispatches once the report has arrived', async () => {
+      helperProtocols = REPORTED_OLD_HELPER;
+      jobStatusRows = [{ status: 'pending' }];
+
+      const result = await __testOnly.processDispatchBackup(
+        { ...DATA, capabilityWaitAttempt: 2, capabilityWaitSince: minutesAgo(1) } as any,
+      );
+
+      expect(result).toEqual({ dispatched: true });
+      expect(agentRelayMock.dispatchCommandToAgent).toHaveBeenCalledTimes(1);
+      expect(enqueueCapabilityWaitMock).not.toHaveBeenCalled();
+    });
+
+    it('checks connectivity first, as before', async () => {
+      helperProtocols = UNREPORTED_HELPER;
+      agentRelayMock.isAgentConnectedAnywhere.mockResolvedValue(false);
+
+      await __testOnly.processDispatchBackup(DATA as any);
+
+      expect(enqueueCapabilityWaitMock).not.toHaveBeenCalled();
+      expect(updateLog.some((u) => u.payload.errorLog === 'Agent not connected')).toBe(true);
+    });
+
+    it('fails a target, never sending it, when the report is withdrawn between the check and the payload', async () => {
+      writeDeliveryMock.broker.mockResolvedValueOnce({ mode: 'held', reason: 'helper_unreported' } as never);
+
+      const result = await __testOnly.processDispatchBackup(DATA as any);
+
+      expect(result).toEqual({ dispatched: false });
+      expect(recordDispatchedExpectationMock).not.toHaveBeenCalled();
+      expect(agentRelayMock.dispatchCommandToAgent).not.toHaveBeenCalled();
+      expect(updateLog.some((u) => u.payload.status === 'failed' && u.payload.errorLog === BACKUP_HELPER_UNREPORTED_MESSAGE)).toBe(true);
+    });
   });
 
   it('marks the job failed with "Agent not connected" (byte-identical to today) when no agent is connected anywhere, without calling dispatch', async () => {
@@ -844,6 +1005,25 @@ describe('processDispatchBackup (wave 3.5b #4084 — dispatch via facade)', () =
     expect(result).toEqual({ dispatched: false });
     expect(agentRelayMock.dispatchCommandToAgent).not.toHaveBeenCalled();
     expect(updateLog.some((u) => u.payload.errorLog === 'Agent not connected')).toBe(true);
+  });
+
+  it('fails a job for a device parked in a holding org before building any payload', async () => {
+    isParkedDeviceMock.mockResolvedValueOnce(true);
+    const result = await __testOnly.processDispatchBackup(DATA as any);
+    expect(result).toEqual({ dispatched: false });
+    expect(isParkedDeviceMock).toHaveBeenCalledWith(expect.anything(), DATA.deviceId);
+    expect(agentRelayMock.isAgentConnectedAnywhere).not.toHaveBeenCalled();
+    expect(recordDispatchedExpectationMock).not.toHaveBeenCalled();
+    expect(agentRelayMock.dispatchCommandToAgent).not.toHaveBeenCalled();
+    expect(updateLog.some((u) => u.payload.status === 'failed' && u.payload.errorLog === 'device_pending_assignment')).toBe(true);
+  });
+
+  it('refuses at the final pre-send recheck when the device is parked by then', async () => {
+    isParkedDeviceMock.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const result = await __testOnly.processDispatchBackup(DATA as any);
+    expect(result).toEqual({ dispatched: false });
+    expect(agentRelayMock.dispatchCommandToAgent).not.toHaveBeenCalled();
+    expect(updateLog.some((u) => u.payload.status === 'failed' && u.payload.errorLog === 'device_pending_assignment')).toBe(true);
   });
 
   it('refuses dispatch after a device moves org and records the failure reason', async () => {
@@ -898,6 +1078,34 @@ describe('processDispatchBackup (wave 3.5b #4084 — dispatch via facade)', () =
     warn.mockRestore();
   });
 
+  // #6597: a dispatch whose job row is not visible (enqueued before the
+  // creating transaction committed) used to be resolved as a pathless FILE
+  // backup — whatever the job's real mode — and "failed" with a 0-row UPDATE
+  // the committed row never saw, stranding it `pending` for the stale reaper
+  // with no trace of why. It must refuse loudly and name the condition.
+  it('refuses loudly, without resolving a default file backup, when the job row is not visible', async () => {
+    wireSelects('org-1', false);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await __testOnly.processDispatchBackup(DATA as any);
+
+    expect(result).toEqual({ dispatched: false });
+    expect(agentRelayMock.dispatchCommandToAgent).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/Backup job job-1 .*not visible/));
+    expect(captureExceptionMock).toHaveBeenCalledWith(
+      expect.any(Error),
+      undefined,
+      { backup_dispatch_issue: 'job-row-not-visible' },
+    );
+    // Never the misleading "no paths configured" resolution of a job whose
+    // mode was never read.
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringMatching(/target resolution refused/));
+    expect(updateLog.some((u) => String(u.payload.errorLog ?? '').includes('no paths'))).toBe(false);
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
   it('calls recordDispatchedExpectation BEFORE dispatchCommandToAgent (expectation-first, backupWorker.ts:645-651)', async () => {
     await __testOnly.processDispatchBackup(DATA as any);
 
@@ -936,7 +1144,7 @@ describe('prepareBackupDispatchTargets — base pin + storage identity (D18 W01)
       let rows: unknown[] = [];
       if (keys.length === 0) rows = [CONFIG_ROW];
       else if (keys.length === 1 && keys[0] === 'status') rows = [];
-      else if (keys.length === 1 && keys[0] === 'agentId') rows = [{ agentId: 'agent-1' }];
+      else if (keys[0] === 'agentId') rows = [{ agentId: 'agent-1', ...REPORTED_OLD_HELPER }];
       else if (keys.includes('featureLinkId')) rows = [{ featureLinkId: null, backupMode: 'file', modeTargets: { paths: ['/data'] } }];
       else if (keys.length === 2 && keys.includes('id') && keys.includes('snapshotId')) rows = candidateRows;
       else if (keys.length === 1 && keys[0] === 'id') rows = candidateRows; // locked row mirrors the candidate (same row, just re-selected under FOR SHARE)
@@ -1035,7 +1243,7 @@ describe('prepareBackupDispatchTargets — base pin + storage identity (D18 W01)
       if (keys.length === 1 && keys[0] === 'orgId') return { from: () => ({ where: () => ({ limit: async () => [{ orgId: 'org-1' }] }) }) };
       if (keys.length === 0) return { from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([CONFIG_ROW]) }) }) };
       if (keys.length === 1 && keys[0] === 'status') return { from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) }) }) };
-      if (keys.length === 1 && keys[0] === 'agentId') return { from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{ agentId: 'agent-1' }]) }) }) };
+      if (keys[0] === 'agentId') return { from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{ agentId: 'agent-1', ...REPORTED_OLD_HELPER }]) }) }) };
       if (keys.includes('featureLinkId')) return { from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([{ featureLinkId: null, backupMode: 'hyperv', modeTargets: {} }]) }) }) };
       if (keys.length === 1 && keys[0] === 'vmName') return { from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([{ vmName: 'DC-01' }]) }) };
       throw new Error(`unexpected select shape: ${JSON.stringify(keys)}`);
@@ -1065,8 +1273,8 @@ describe('processDispatchBackup — approval_generation mismatch (site-ceiling g
         rows = [configRow];
       } else if (keys.length === 1 && keys[0] === 'status') {
         rows = [];
-      } else if (keys.length === 1 && keys[0] === 'agentId') {
-        rows = [{ agentId: 'agent-1' }];
+      } else if (keys[0] === 'agentId') {
+        rows = [{ agentId: 'agent-1', ...REPORTED_OLD_HELPER }];
       } else if (keys.includes('featureLinkId')) {
         rows = [{ featureLinkId: null, backupMode: 'file', modeTargets: { paths: ['/data'] } }];
       } else if (keys.length === 2 && keys.includes('id') && keys.includes('snapshotId')) {
@@ -1080,6 +1288,8 @@ describe('processDispatchBackup — approval_generation mismatch (site-ceiling g
         rows = [];
       } else if (keys.length === 1 && keys[0] === 'id') {
         rows = [];
+      } else if (keys.length === 1 && keys[0] === 'integrityVersion') {
+        rows = []; // helper-capability read: an older helper (legacy base selection)
       } else {
         throw new Error(`unexpected select shape: ${JSON.stringify(keys)}`);
       }

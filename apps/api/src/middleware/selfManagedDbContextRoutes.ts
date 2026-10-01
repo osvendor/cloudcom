@@ -63,12 +63,20 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
 
   // Only the entry points that open their OWN isolated transaction. /ledger and
   // /pending are ordinary reads and must keep the request's context.
+  { method: 'GET', pattern: /^\/api\/v1\/monitor-definitions\/conversion\/network-checks\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/monitor-definitions\/conversion\/network-checks\/convert\/?$/ },
   { method: 'GET', pattern: /^\/api\/v1\/monitor-definitions\/conversion\/policies\/[^/]+\/preview\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/monitor-definitions\/conversion\/partner\/preview\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/monitor-definitions\/conversion\/partner\/convert-all\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/monitor-definitions\/conversion\/policies\/[^/]+\/convert\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/monitor-definitions\/conversion\/retire\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/monitor-definitions\/conversion\/[^/]+\/revert\/?$/ },
+  // Per-rule "Convert to monitor" (#5289): convertRuleToMonitor runs the same
+  // template-group preview + convert, each in its own serializable
+  // inCallerTransaction. Under the ambient request transaction every call was
+  // refused by assertIsolationNotNested (a 500); its pre-reads take their own
+  // short caller-scoped context instead (ruleConversionService.ts).
+  { method: 'POST', pattern: /^\/api\/v1\/monitor-definitions\/convert-from-rule\/[^/]+\/?$/ },
   // Partner-initiated "Send payment link" — createInvoicePayLink.
   { method: 'POST', pattern: /^\/api\/v1\/invoices\/[^/]+\/pay-link\/?$/ },
   // Customer-portal "Pay invoice online".
@@ -78,6 +86,12 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // when the route shipped, so the portal request tx was pinned across Stripe
   // (#3777 review F2).
   { method: 'POST', pattern: /^\/api\/v1\/portal\/quotes\/[^/]+\/pay\/?$/ },
+  // Customer-portal verify-on-return (#7065) — settleCheckoutSession retrieves
+  // the Checkout session from Stripe and then records the capture in its own
+  // transaction. Under the portal request transaction the handler escaped to a
+  // SECOND pooled connection for that (the #6671 double-hold) while the first
+  // sat idle-in-transaction across the Stripe round-trip.
+  { method: 'POST', pattern: /^\/api\/v1\/portal\/invoices\/[^/]+\/settle\/?$/ },
   // #6175 Network Visibility overview. Portal auth has already resolved the
   // owning partner, so the handler opens one org-scoped context with
   // currentPartnerId populated for SELECT-only partner-wide network_monitors
@@ -126,6 +140,18 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // manages its own short DB access contexts around it — the same treatment as
   // the mapping routes above.
   { method: 'POST', pattern: /^\/api\/v1\/accounting\/[^/]+\/settings\/refresh\/?$/ },
+  // Xero W02 — the organisation picker (GET .../tenants lists this sign-in's
+  // links at Xero identity; POST .../tenants/select claims one, captures its
+  // settings and releases the rest), cancel (best-effort cleanup of this
+  // sign-in's links), and the settings pickers (live Accounting API reads) all
+  // call the provider; disconnect makes a best-effort DELETE /connections/{id}
+  // before deleting the row. Each takes a runInDbContext runner (same treatment
+  // as the mapping routes above). routes/accounting/connectionSetupRoutes.ts.
+  { method: 'GET', pattern: /^\/api\/v1\/accounting\/[^/]+\/tenants\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/accounting\/[^/]+\/tenants\/select\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/accounting\/[^/]+\/tenants\/cancel\/?$/ },
+  { method: 'GET', pattern: /^\/api\/v1\/accounting\/[^/]+\/settings\/options\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/accounting\/[^/]+\/disconnect\/?$/ },
   // Phase C Task 5 (2026-09-01-quickbooks-phase-c-invoice-push) — manual
   // invoice push and remote-candidate search. `pushInvoiceToAccounting`
   // (accountingInvoicePush.ts) and `resolveConnectionAndToken` +
@@ -167,6 +193,19 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // enqueues, so it keeps the ambient transaction (same call as
   // `quotes/bulk-send`).
   { method: 'POST', pattern: /^\/api\/v1\/devices\/bulk\/restore\/?$/ },
+  // Parked-device assignment. Each assignment runs in its own short system
+  // transaction (one per device for a bulk batch of up to 50), and the list
+  // opens its own system read. Under the ambient request transaction every one
+  // of those would take a SECOND pooled connection while the request's sat
+  // idle-in-transaction (#1105). The handlers hold no context of their own;
+  // the service and the audit writer open and close theirs.
+  { method: 'GET', pattern: /^\/api\/v1\/pre-assignment\/devices\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/pre-assignment\/devices\/[^/]+\/assign\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/pre-assignment\/devices\/assign-bulk\/?$/ },
+  // Incident actions: the switch write and the per-device expiry
+  // transactions each open their own system context.
+  { method: 'POST', pattern: /^\/api\/v1\/pre-assignment\/switch\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/pre-assignment\/deploy-keys\/[^/]+\/expire-devices\/?$/ },
   // PR3 (SSO/OIDC) — the three provider routes that run OIDC discovery
   // (`discoverOIDCConfig` → `safeFetch`, up to OIDC_FETCH_TIMEOUT_MS = 10s
   // against a TENANT-CONTROLLED issuer host). Held inside the request
@@ -219,6 +258,60 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // RECONCILE_MAX_LIMIT, and still far better than the whole-handler
   // transaction this registration replaces. Hoisting it out is a follow-up.
   { method: 'POST', pattern: /^\/api\/v1\/backup\/reconcile\/?$/ },
+  // #7103 — manual Run Script (up to 500 devices). Under the ambient request
+  // transaction each device's command went out over the agent WebSocket while
+  // its rows (and every later device's) were still uncommitted, so a fast
+  // agent's result found no device_commands row and was dropped as an orphan.
+  // The handler now creates every row in a short withAuthDbAccessContext block
+  // and sends only after it commits (executeScriptOnDevices' runInDbContext).
+  { method: 'POST', pattern: /^\/api\/v1\/scripts\/[^/]+\/execute\/?$/ },
+  // #7109 — the same race on the two single-device Run Script callers. Both
+  // pass executeScriptOnDevices the runInDbContext runner and wrap their own
+  // reads and writes in short withAuthDbAccessContext blocks. The mobile
+  // registration covers EVERY quick action the route handles (reboot, wake,
+  // run_script): the non-script actions run their whole body in one
+  // withAuthDbAccessContext, so they keep the single-transaction behaviour
+  // they had under the request tx.
+  { method: 'POST', pattern: /^\/api\/v1\/mobile\/devices\/[^/]+\/actions\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/remediation-suggestions\/[^/]+\/execute\/?$/ },
+  // #7347 — manual automation trigger (both spellings). The handler inserts the
+  // automation_runs row and enqueues `execute-run`, which the automation worker
+  // loads on its own connection. Under the ambient request transaction a fast
+  // worker found no run and threw `Automation run not found`. The handler now
+  // creates the run in a short withAuthDbAccessContext block and enqueues only
+  // after it commits.
+  { method: 'POST', pattern: /^\/api\/v1\/automations\/[^/]+\/(trigger|run)\/?$/ },
+  // #7347 — software deployment create (both routes) and retry. Each writes
+  // deployment rows and `device_commands` rows, then pushes `software_install`
+  // to live agents; the agent result path reads `device_commands` on its own
+  // connection, so under the ambient request transaction a fast agent's result
+  // was dropped as an orphan. The handlers write every row in one short
+  // withAuthDbAccessContext block with the push deferred (`deferDelivery`) and
+  // call `deliver()` after it commits.
+  { method: 'POST', pattern: /^\/api\/v1\/software\/(deployments|deploy)\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/software\/deployments\/[^/]+\/retry\/?$/ },
+  // #6597 — manual backup runs (single device and run-all). Each creates
+  // backup_jobs rows and enqueues a dispatch the backup worker picks up on its
+  // own connection within milliseconds. Under the ambient request transaction
+  // the worker could not see the uncommitted row: it resolved the job as a
+  // pathless file backup, failed a row it could not see (0 rows), and the row
+  // that committed afterwards sat `pending` until the stale reaper failed it
+  // with "Backup dispatch never completed". The handlers now create the rows
+  // in a short withAuthDbAccessContext block and enqueue strictly after it
+  // commits — the same shape as the #6849 patch-job route.
+  { method: 'POST', pattern: /^\/api\/v1\/backup\/jobs\/run\/[^/]+\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/backup\/jobs\/run-all\/?$/ },
+  // On-demand MSSQL / Hyper-V backups. Each creates a backup_jobs row and
+  // dispatches a backup write whose storage access is resolved at delivery,
+  // on the delivery path's own connection: a helper that reports brokered
+  // writes gets a write session only for a job that connection can see.
+  // Under the ambient request transaction the job was still uncommitted when
+  // the command was pushed, so the helper was sent the storage destination
+  // instead — and the handler then held the transaction across a device wait
+  // of up to 10 minutes. The handlers create the job in a short
+  // withAuthDbAccessContext block and dispatch strictly after it commits.
+  { method: 'POST', pattern: /^\/api\/v1\/backup\/mssql\/backup\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/backup\/hyperv\/backup\/?$/ },
   // PSA connection "Test connection" — constructs a real PSA adapter and calls
   // the remote PSA API (psaFetch, 20s timeout) against a TENANT-CONTROLLED
   // baseUrl; a blackholed host would otherwise pin a pooled connection
@@ -394,12 +487,27 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // at connect time; the Microsoft /connect builds a consent URL with no server-side
   // Graph call, so it is not listed.)
   { method: 'POST', pattern: /^\/api\/v1\/tickets\/mailbox\/connect\/gmail\/?$/ },
+  // #3127 — the four chat message-send routes. When a session's turn is
+  // blocked only on approval waits, the handler settles those waits and then
+  // waits (bounded, TURN_SETTLE_WAIT_MS) for the turn to conclude — no DB work,
+  // but under the ambient request transaction it pinned one pooled connection
+  // idle-in-transaction per resent message for the whole wait. Each handler now
+  // runs its read phase and its dispatch phase in two short contexts and does
+  // the settle wait — and the AI budget reservation, which opens its own system
+  // transaction — between them, with no context held. clientAiAuth and
+  // helperAuth consult this registry too; only the send POST opts out.
+  { method: 'POST', pattern: /^\/api\/v1\/ai\/sessions\/[^/]+\/messages\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/ai\/script-builder\/sessions\/[^/]+\/messages\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/client-ai\/sessions\/[^/]+\/messages\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/helper\/chat\/sessions\/[^/]+\/messages\/?$/ },
 ];
 
 /**
  * True when the given request opts out of the auth middleware's auto
  * request-transaction (it manages its own short DB access contexts so a slow
- * outbound HTTP call isn't made inside a held transaction — #1448).
+ * outbound HTTP call isn't made inside a held transaction — #1448). Consulted by
+ * every middleware that opens one: auth.ts, portal/auth.ts, clientAiAuth.ts and
+ * helperAuth.ts.
  */
 export function isSelfManagedDbContextRoute(method: string, path: string): boolean {
   const upper = method.toUpperCase();

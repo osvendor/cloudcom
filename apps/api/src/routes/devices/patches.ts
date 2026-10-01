@@ -10,6 +10,8 @@ import { getDeviceWithOrgAndSiteCheck, SITE_ACCESS_DENIED } from './helpers';
 import { queueCommandForExecution } from '../../services/commandQueue';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { resolvePartnerIdForOrg } from '../patches/helpers';
+import { loadPatchInstallFailures } from '../../services/patchInstallFailures';
+import { EFFECTIVE_PATCH_CATEGORY_SQL, EFFECTIVE_PATCH_SEVERITY_SQL } from '../../services/patchSeverityOverlay';
 
 export const patchesRoutes = new Hono();
 
@@ -318,8 +320,12 @@ patchesRoutes.get(
         title: patches.title,
         externalId: patches.externalId,
         description: patches.description,
-        severity: patches.severity,
-        category: patches.category,
+        // Effective values: shared trusted classification when known, else
+        // this device's own reported severity/category — see
+        // services/patchSeverityOverlay.ts. Scoped by the deviceId WHERE
+        // below, so this can never surface another tenant's report.
+        severity: EFFECTIVE_PATCH_SEVERITY_SQL,
+        category: EFFECTIVE_PATCH_CATEGORY_SQL,
         source: patches.source,
         packageId: patches.packageId,
         releaseDate: patches.releaseDate,
@@ -383,6 +389,14 @@ patchesRoutes.get(
       ? await getApprovedPatchIdsForPartner(partnerId, patchIds)
       : new Set<string>();
 
+    // #4223: surface the latest failed install attempt (and its reason, e.g.
+    // the agent's battery preflight) on each outstanding patch, so the tab no
+    // longer reads "Pending approval" for a patch whose install actually failed.
+    const installFailures = await loadPatchInstallFailures(
+      devicePatchList.filter((p) => p.status === 'pending').map((p) => p.patchId),
+      { deviceId }
+    );
+
     // Separate actionable pending updates from stale missing records.
     const pending = devicePatchList
       .filter(p => p.status === 'pending')
@@ -400,7 +414,8 @@ patchesRoutes.get(
         source: p.source,
         requiresReboot: p.requiresReboot,
         scope: p.scope,
-        approvalStatus: approvedPatchIds.has(p.patchId) ? 'approved' : 'pending'
+        approvalStatus: approvedPatchIds.has(p.patchId) ? 'approved' : 'pending',
+        installFailure: installFailures.get(p.patchId) ?? null
       }));
 
     const missing = devicePatchList

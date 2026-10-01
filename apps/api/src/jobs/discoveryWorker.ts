@@ -29,7 +29,6 @@ import { attachWorkerObservability } from './workerObservability';
 import { dispatchCommandToAgent, isAgentConnectedAnywhere } from '../services/agentCommandRelay';
 import type { AgentCommand } from '../routes/agentWs';
 import { isCronDue } from '../services/cronDue';
-import { utcMsFromOffsetlessDbTimestamp } from '../utils/offsetlessTimestamp';
 import { lookupMacVendor, inferAssetTypeFromVendor } from '../services/macVendorLookup';
 import { resolveAssetIdentity, type ResolvedAssetIdentity } from '../services/assetIdentity';
 import {
@@ -51,6 +50,10 @@ import {
   withQueueMeta,
 } from './queueSchemas';
 import { reconcileTopology } from './reconcileTopology';
+import { withLegacyCollectorAbsence } from '../services/topology/legacyDeleteCause';
+import { markTopologyIdentityDirty } from '../services/topology/identityDirty';
+import { prepareDiscoveryTopologyDispatch, type DiscoveryTopologyCommandBlock } from '../services/topology/discoveryDispatch';
+import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -272,7 +275,9 @@ async function validateRequestedAgentForDiscovery(
       status: devices.status
     })
     .from(devices)
-    .where(eq(devices.agentId, requestedAgentId))
+    // A device parked in its partner's holding org never runs a scan (the
+    // command would carry SNMP credentials): it resolves as not found.
+    .where(and(eq(devices.agentId, requestedAgentId), notParkedDeviceCondition()))
     .limit(1);
 
   if (!agentDevice) {
@@ -428,17 +433,9 @@ async function expireStaleRunningJobs(): Promise<number> {
  * Whether an interval-scheduled discovery profile is due, given the most
  * recent job's run timestamp.
  *
- * `discovery_jobs.scheduled_at` / `.created_at` are `timestamp(...)` columns
- * with no `withTimezone: true` (`db/schema/discovery.ts:132,139`), so the
- * driver hands back the UTC wall clock re-read as this process's LOCAL time
- * and `getTime()` is wrong by the host's offset (#4059 gap 2 — see
- * `utils/offsetlessTimestamp.ts`). Subtracting that from a true-instant `now`
- * skews the elapsed interval by the same amount: on a host west of UTC the
- * last run reads as more recent than it was, so interval discovery silently
- * stops firing for up to the host's offset; east of UTC it fires early.
- *
- * Exported as a pure seam so this is assertable without a database — see
- * `discoveryWorker.intervalDue.test.ts`, registered in `vitest.config.tz.ts`.
+ * `discovery_jobs.scheduled_at` / `.created_at` are offsetless `timestamp`
+ * columns; Drizzle decodes them as UTC, so `latestRunAt` is the stored instant
+ * on any host and the elapsed interval is a plain subtraction.
  */
 export function isIntervalScheduleDue(
   latestRunAt: Date | null,
@@ -446,7 +443,7 @@ export function isIntervalScheduleDue(
   thresholdMs: number,
 ): boolean {
   if (!latestRunAt) return true;
-  return now.getTime() - utcMsFromOffsetlessDbTimestamp(latestRunAt) >= thresholdMs;
+  return now.getTime() - latestRunAt.getTime() >= thresholdMs;
 }
 
 async function processScheduleProfiles(): Promise<{ enqueued: number }> {
@@ -549,12 +546,14 @@ type DispatchScanInputs =
   | { status: 'profile-missing' }
   | { status: 'invalid-agent' }
   | { status: 'no-agent' }
+  | { status: 'not-scheduled' }
   | {
       status: 'ok';
       profile: typeof discoveryProfiles.$inferSelect;
       agentId: string;
       requestedAgentId: string | null;
       selectionSource: 'requested' | 'site-auto';
+      topology: DiscoveryTopologyCommandBlock | null;
     };
 
 /**
@@ -567,6 +566,21 @@ type DispatchScanInputs =
  * held (#1105).
  */
 async function loadDispatchScanInputs(data: DispatchScanJobData): Promise<DispatchScanInputs> {
+  // The cancel route (routes/discovery.ts) can only best-effort remove the
+  // queued BullMQ job; a job already picked up for processing when cancel ran
+  // still reaches here. Re-read the row's live status instead of trusting the
+  // queue payload, so a cancelled job neither decrypts SNMP credentials nor
+  // dispatches to the agent, and its 'cancelled' status is not overwritten.
+  const [job] = await db
+    .select({ status: discoveryJobs.status })
+    .from(discoveryJobs)
+    .where(eq(discoveryJobs.id, data.jobId))
+    .limit(1);
+  if (!job || job.status !== 'scheduled') {
+    console.log(`[DiscoveryWorker] Skipping dispatch for job ${data.jobId}: status is ${job?.status ?? 'missing'}, not 'scheduled'`);
+    return { status: 'not-scheduled' };
+  }
+
   const [profile] = await db
     .select()
     .from(discoveryProfiles)
@@ -605,6 +619,7 @@ async function loadDispatchScanInputs(data: DispatchScanJobData): Promise<Dispat
         and(
           eq(devices.orgId, data.orgId),
           eq(devices.isEphemeral, false),
+          notParkedDeviceCondition(),
           eq(devices.siteId, data.siteId),
           eq(devices.status, 'online')
         )
@@ -622,7 +637,18 @@ async function loadDispatchScanInputs(data: DispatchScanJobData): Promise<Dispat
     return { status: 'no-agent' };
   }
 
-  return { status: 'ok', profile, agentId, requestedAgentId, selectionSource };
+  // M2 D7: persist the topology dispatch authorization snapshot in this same
+  // short context, BEFORE the command can leave the server. A failure here
+  // degrades to a legacy-only dispatch; it never blocks discovery.
+  let topology: DiscoveryTopologyCommandBlock | null = null;
+  try {
+    topology = await prepareDiscoveryTopologyDispatch({ jobId: data.jobId, orgId: data.orgId, siteId: data.siteId, profile, agentId });
+  } catch (err) {
+    console.error(`[DiscoveryWorker] Topology dispatch snapshot failed for job ${data.jobId}; dispatching legacy-only:`, err);
+    captureException(err);
+  }
+
+  return { status: 'ok', profile, agentId, requestedAgentId, selectionSource, topology };
 }
 
 /**
@@ -644,7 +670,7 @@ async function processDispatchScan(data: DispatchScanJobData): Promise<{
     return { dispatched: false, agentId: null, durationMs: Date.now() - startTime };
   }
 
-  const { profile, agentId, requestedAgentId, selectionSource: initialSelectionSource } = inputs;
+  const { profile, agentId, requestedAgentId, selectionSource: initialSelectionSource, topology } = inputs;
 
   // Phase 2 — connectivity check with NO DB context open (#1105).
   if (!(await isAgentConnectedAnywhere(agentId))) {
@@ -676,7 +702,9 @@ async function processDispatchScan(data: DispatchScanJobData): Promise<{
       identifyOS: profile.identifyOS ?? false,
       resolveHostnames: profile.resolveHostnames ?? false,
       timeout: profile.timeout ?? 2,
-      concurrency: profile.concurrency ?? 128
+      concurrency: profile.concurrency ?? 128,
+      // Advertised only when the authorization snapshot was persisted above.
+      ...(topology ? { topology } : {}),
     }
   };
 
@@ -695,6 +723,9 @@ async function processDispatchScan(data: DispatchScanJobData): Promise<{
   }
 
   // Phase 4 — job status flip to running: its own short system DB context.
+  // Conditional on 'scheduled' for the same reason as loadDispatchScanInputs'
+  // re-check above: a cancel that lands between that check and here must not
+  // be overwritten back to 'running' by this dispatch that already fired.
   await runWithSystemDbAccess(() =>
     db
       .update(discoveryJobs)
@@ -704,7 +735,7 @@ async function processDispatchScan(data: DispatchScanJobData): Promise<{
         startedAt: new Date(),
         updatedAt: new Date()
       })
-      .where(eq(discoveryJobs.id, data.jobId))
+      .where(and(eq(discoveryJobs.id, data.jobId), eq(discoveryJobs.status, 'scheduled')))
   );
 
   console.log(`[DiscoveryWorker] Scan dispatched to agent ${agentId} for job ${data.jobId}`);
@@ -1504,6 +1535,19 @@ export async function processResults(data: ProcessResultsJobData): Promise<{
     console.error(`[DiscoveryWorker] Topology reconciliation failed for job ${data.jobId}:`, err);
   }
 
+  // M2 D15.2: a new discovered asset can become the subject of an SNMP target
+  // (`snmp:<ip>` resolves to the scoped asset at that address), so the physical
+  // publisher must re-resolve. Refreshes of existing rows keep the IP (the
+  // lookup key) and change no identity the publisher uses.
+  if (newCount > 0) {
+    try {
+      await markTopologyIdentityDirty(db, { orgId: data.orgId, siteId: data.siteId });
+    } catch (err) {
+      console.error(`[DiscoveryWorker] Topology identity dirty mark failed for job ${data.jobId}:`, err);
+      captureException(err);
+    }
+  }
+
   // Update the job record
   await db
     .update(discoveryJobs)
@@ -1597,7 +1641,8 @@ export async function cleanupSpeculativeTopologyLinks(
   orgId: string,
   siteId: string
 ): Promise<number> {
-  const deleted = await db
+  // M2 D5: collector-absence cleanup, not a user/inventory delete.
+  const deleted = await withLegacyCollectorAbsence(() => db
     .delete(networkTopology)
     .where(
       and(
@@ -1611,12 +1656,16 @@ export async function cleanupSpeculativeTopologyLinks(
         )!
       )
     )
-    .returning({ id: networkTopology.id });
+    .returning({ id: networkTopology.id }));
 
   return deleted.length;
 }
 
 async function markJobFailed(jobId: string, error: string): Promise<void> {
+  // Conditional on status: a job the operator already cancelled (or one a
+  // concurrent worker attempt already resolved) must not be overwritten with
+  // 'failed' — that regression made an explicit cancel invisible in the UI
+  // and audit trail.
   await db
     .update(discoveryJobs)
     .set({
@@ -1625,7 +1674,7 @@ async function markJobFailed(jobId: string, error: string): Promise<void> {
       errors: { message: error },
       updatedAt: new Date()
     })
-    .where(eq(discoveryJobs.id, jobId));
+    .where(and(eq(discoveryJobs.id, jobId), inArray(discoveryJobs.status, ['scheduled', 'running'])));
 }
 
 /**

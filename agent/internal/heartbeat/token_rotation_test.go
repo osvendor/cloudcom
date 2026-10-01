@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -228,16 +229,33 @@ func TestTokenRotationUpdatesHelperTokenInAgentYAML(t *testing.T) {
 
 	h.handleTokenRotation()
 
-	agentYAML, err := os.ReadFile(cfgPath)
+	// On Windows the Helper still reads agent.yaml directly (no narrower
+	// delivery exists there yet — see agent/internal/config/helpertoken_windows.go);
+	// on Unix the rotated token instead lands in the sibling, group-scoped
+	// helper_token.yaml (agent/internal/config/helpertoken_unix.go).
+	readPath := cfgPath
+	if runtime.GOOS != "windows" {
+		readPath = filepath.Join(filepath.Dir(cfgPath), "helper_token.yaml")
+	}
+	helperYAML, err := os.ReadFile(readPath)
 	if err != nil {
-		t.Fatalf("read agent.yaml: %v", err)
+		t.Fatalf("read %s: %v", readPath, err)
 	}
-	if !strings.Contains(string(agentYAML), "brz_staged_helper") {
-		t.Errorf("agent.yaml does not carry the rotated helper token — the Breeze Helper "+
-			"reads it from here and would 401 after the grace window:\n%s", agentYAML)
+	if !strings.Contains(string(helperYAML), "brz_staged_helper") {
+		t.Errorf("%s does not carry the rotated helper token — the Breeze Helper "+
+			"reads it from here and would 401 after the grace window:\n%s", readPath, helperYAML)
 	}
-	if strings.Contains(string(agentYAML), "brz_current_helper") {
-		t.Errorf("agent.yaml still carries the superseded helper token:\n%s", agentYAML)
+	if strings.Contains(string(helperYAML), "brz_current_helper") {
+		t.Errorf("%s still carries the superseded helper token:\n%s", readPath, helperYAML)
+	}
+	if runtime.GOOS != "windows" {
+		agentYAML, err := os.ReadFile(cfgPath)
+		if err != nil {
+			t.Fatalf("read agent.yaml: %v", err)
+		}
+		if strings.Contains(string(agentYAML), "helper_auth_token") {
+			t.Errorf("agent.yaml must not carry the helper token on this platform:\n%s", agentYAML)
+		}
 	}
 }
 
@@ -434,6 +452,9 @@ func TestConfirmRotationDiscardsOnlyTerminalConflicts(t *testing.T) {
 		rawBody string
 		// true => the staged credentials must be gone from disk afterwards.
 		wantDiscarded bool
+		// Defaults to 1. A staged-token 401 adds a second call: the probe of
+		// the CURRENT credential (#2773).
+		wantConfirmCalls int
 	}{
 		{
 			name:          "expired staged set is terminal",
@@ -448,12 +469,16 @@ func TestConfirmRotationDiscardsOnlyTerminalConflicts(t *testing.T) {
 			wantDiscarded: true,
 		},
 		{
-			name:   "staged token rejected outright is terminal",
-			status: http.StatusUnauthorized,
-			body:   map[string]any{"error": "unauthorized"},
-			// A 401 means the server would not accept the staged token at all, so
-			// it can never be promoted.
-			wantDiscarded: true,
+			// #2773 — this stub 401s EVERY token, current included, so nothing
+			// proves the current credential is live (a suspended device or an
+			// inactive tenant looks exactly like this). The staged copy may be
+			// the server's current credential; keep it. The discard-after-proof
+			// cases are in TestConfirmRotationStagedTokenRejected.
+			name:             "staged token rejected while the current token is also rejected is retryable",
+			status:           http.StatusUnauthorized,
+			body:             map[string]any{"error": "unauthorized"},
+			wantDiscarded:    false,
+			wantConfirmCalls: 2,
 		},
 		{
 			name:   "compare-and-swap conflict is retryable",
@@ -520,8 +545,12 @@ func TestConfirmRotationDiscardsOnlyTerminalConflicts(t *testing.T) {
 
 			h.reconcilePendingRotation()
 
-			if confirmCalls != 1 {
-				t.Fatalf("confirm calls = %d, want 1", confirmCalls)
+			wantCalls := tc.wantConfirmCalls
+			if wantCalls == 0 {
+				wantCalls = 1
+			}
+			if confirmCalls != wantCalls {
+				t.Fatalf("confirm calls = %d, want %d", confirmCalls, wantCalls)
 			}
 
 			persisted, err := config.ReadPersistedCredentials()

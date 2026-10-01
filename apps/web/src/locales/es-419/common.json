@@ -28,7 +28,7 @@
     "vulnerabilities": "Vulnerabilidades",
     "oneDrive": "OneDrive",
     "aiForOffice": "AI para Office",
-    "networkMonitor": "Monitor de red",
+    "networkMonitor": "Red",
     "jobs": "Trabajos",
     "monitoring": "Monitoreo",
     "networkDiscovery": "Descubrimiento de red",
@@ -47,6 +47,7 @@
     "timesheets": "Hojas de tiempo",
     "productCatalog": "Catálogo de productos",
     "deviceGroups": "Grupos de dispositivos",
+    "unassignedDevices": "Dispositivos sin asignar",
     "configPolicies": "Políticas de configuración",
     "integrations": "Integraciones",
     "cloudBackup": "Copia de seguridad en la nube",
@@ -92,6 +93,8 @@
     "fleetOrchestration": "Orquestación de flota",
     "aiAssistant": "Asistente de IA",
     "software": "Software",
+    "softwareInventory": "Inventario de software",
+    "softwarePolicies": "Políticas de software",
     "securityOverview": "Resumen",
     "aiRisk": "Riesgo de IA",
     "deviceBackup": "Respaldo de dispositivos",
@@ -101,7 +104,8 @@
     "deliverableTemplates": "Plantillas de entregables",
     "securityScans": "Escaneos de IOC",
     "system": "Sistema",
-    "monitorConversion": "Conversión de monitores"
+    "monitorConversion": "Conversión de monitores",
+    "timeSync": "Sincronización de hora"
   },
   "documentTitles": {
     "dashboard": "Panel",
@@ -747,7 +751,8 @@
         "alertRulesDescription": "Administrar alertas en Políticas de configuración",
         "keyboardShortcuts": "Atajos de teclado",
         "keyboardShortcutsDescription": "Todas las teclas y combinaciones en una tarjeta"
-      }
+      },
+      "numberHint": "{{mod}}1–9 para abrir"
     },
     "notifications": {
       "title": "Notificaciones",
@@ -813,7 +818,17 @@
       "help": "Abrir el panel de ayuda",
       "showThis": "Mostrar esta tarjeta",
       "close": "Cerrar un diálogo o menú",
-      "typingNote": "Los atajos de una sola tecla se pausan mientras escribes en un campo."
+      "typingNote": "Los atajos de una sola tecla se pausan mientras escribes en un campo.",
+      "create": "Crear",
+      "createHint": "Presiona c, suelta y luego la tecla.",
+      "paletteNumber": "Abrir un resultado de búsqueda por su número",
+      "newItems": {
+        "ticket": "Nuevo ticket",
+        "quote": "Nueva cotización",
+        "invoice": "Nueva factura",
+        "contract": "Nuevo contrato",
+        "script": "Nuevo script"
+      }
     }
   },
   "migrationBanner": {
@@ -874,97 +889,18 @@
       }
     },
     "monitors": {
-      "CreateMonitorForm": {
-        "actions": {
-          "createMonitor": "Crear monitor",
-          "creating": "Creando..."
-        },
-        "errors": {
-          "createMonitor": "No se pudo crear el monitor",
-          "generic": "Se produjo un error",
-          "nameRequired": "El nombre es obligatorio",
-          "targetRequired": "Se requiere objetivo"
-        },
-        "fields": {
-          "expectedBanner": "Banner esperado (opcional)",
-          "expectedBody": "Contenido corporal esperado (opcional)",
-          "expectedStatus": "Estado esperado",
-          "expectedValue": "Valor esperado (opcional)",
-          "followRedirects": "Seguir redirecciones",
-          "hostname": "Nombre de host para resolver",
-          "method": "Método",
-          "monitorType": "Tipo de monitor",
-          "nameserver": "Servidor de nombres personalizado (opcional)",
-          "pingCount": "Conteo de pings",
-          "pollingInterval": "Intervalo de sondeo (segundos)",
-          "port": "Puerto",
-          "recordType": "Tipo de registro",
-          "target": "Destino (IP/Nombre de host)",
-          "timeout": "Tiempo de espera (segundos)",
-          "url": "URL",
-          "verifySsl": "Verificar SSL"
-        },
-        "monitorTypes": {
-          "dnsCheck": {
-            "description": "Verifique que los registros DNS se resuelvan correctamente",
-            "label": "DNS Comprobar"
-          },
-          "httpCheck": {
-            "description": "Monitorear puntos finales HTTP/HTTPS",
-            "label": "HTTP Comprobar"
-          },
-          "icmpPing": {
-            "description": "Compruebe si se puede acceder a un host mediante ping",
-            "label": "ICMP Ping"
-          },
-          "tcpPort": {
-            "description": "Compruebe si un puerto TCP está abierto y responde",
-            "label": "Puerto TCP"
-          }
-        },
-        "placeholders": {
-          "expectedBanner": "p. ej. SSH-",
-          "expectedBody": "p.ej. \"estado\": \"bien\"",
-          "expectedValue": "p.ej. 93.184.216.34",
-          "hostname": "example.com",
-          "name": "p.ej. Servidor web de producción",
-          "nameserver": "8.8.8.8",
-          "target": "192.168.1.1 or server.example.com",
-          "url": "https://example.com/health"
-        },
-        "subtitle": "Configure una nueva verificación de monitoreo para un objetivo de red.",
-        "title": "Crear monitor de red"
-      },
       "MonitorDetailModal": {
         "actions": {
-          "cancelEdit": "Cancelar Editar",
-          "checkNow": "Comprobar ahora",
-          "deleteMonitor": "Eliminar monitor",
-          "deleting": "Eliminando...",
-          "yesDelete": "Si, borrar"
-        },
-        "alertRules": {
-          "disabled": "(desactivado)",
-          "title": "Reglas de alerta"
+          "checkNow": "Comprobar ahora"
         },
         "consecutiveFailures": "{{count}} falla consecutiva",
         "consecutiveFailures_plural": "{{count}} fallos consecutivos",
-        "delete": {
-          "confirmShort": "¿Está seguro?"
-        },
         "errors": {
-          "deleteMonitor": "No se pudo eliminar el monitor",
           "generic": "Se produjo un error",
           "loadDetails": "No se pudieron cargar los detalles del monitor",
-          "triggerCheck": "No se pudo activar la verificación",
-          "updateMonitor": "No se pudo actualizar el monitor"
+          "triggerCheck": "No se pudo activar la verificación"
         },
         "fallbackTitle": "Monitor",
-        "fields": {
-          "interval": "Intervalo(s)",
-          "timeout": "Tiempos de espera",
-          "target": "URL de destino"
-        },
         "labels": {
           "lastChecked": "Última comprobación: {{time}}",
           "response": "Respuesta: {{response}}",
@@ -992,8 +928,6 @@
           "icmpPing": "ICMP Ping",
           "tcpPort": "Puerto TCP"
         },
-        "targetResetNote": "Cambiar la URL restablece la observación TLS.",
-        "saved": "Monitor actualizado",
         "certificate": {
           "title": "Certificado",
           "issuer": "Emisor",
@@ -1005,27 +939,22 @@
             "handshakeFailed": "Falló la negociación TLS",
             "notTls": "Sin TLS"
           }
-        }
+        },
+        "openMonitor": "Abrir el monitor de esta verificación",
+        "notConverted": "Revisa la conversión en Resultados."
       },
       "NetworkMonitorList": {
         "actions": {
-          "addMonitor": "Agregar monitor",
-          "deleteMonitor": "Eliminar monitor",
           "runCheckNow": "Ejecutar comprobar ahora",
-          "viewDetails": "Ver detalles"
+          "viewDetails": "Ver detalles",
+          "newCheck": "Nueva verificación"
         },
         "assetFilter": "Filtrado de monitores para el activo seleccionado.",
-        "delete": {
-          "confirmLabel": "Eliminar monitor",
-          "message": "¿Está seguro de que desea eliminar este monitor? Esto también eliminará todos los resultados y reglas de alerta. Esta acción no se puede deshacer.",
-          "title": "Eliminar monitor de red"
-        },
         "empty": {
-          "action": "Cree uno ahora.",
-          "prefix": "No hay monitores de red configurados."
+          "action": "Crear un monitor.",
+          "prefix": "Aún no hay verificaciones de red."
         },
         "errors": {
-          "deleteMonitor": "No se pudo eliminar el monitor",
           "fetchMonitors": "No se pudieron recuperar los monitores",
           "generic": "Se produjo un error",
           "triggerCheck": "No se pudo activar la verificación"
@@ -1038,11 +967,13 @@
           "interval": "Intervalo",
           "lastChecked": "Última comprobación",
           "response": "Respuesta",
-          "target": "Objetivo"
+          "target": "Objetivo",
+          "monitor": "Monitor",
+          "openMonitor": "Abrir monitor"
         },
         "loading": "Cargando monitores...",
         "messages": {
-          "monitorDeleted": "Monitor eliminado"
+          "checkQueued": "Verificación de red en cola"
         },
         "status": {
           "degraded": "Degradado"
@@ -1059,6 +990,21 @@
           "httpCheck": "HTTP Comprobar",
           "icmpPing": "ICMP Ping",
           "tcpPort": "Puerto TCP"
+        },
+        "notConverted": "Sin convertir"
+      },
+      "NetworkCheckConversionBanner": {
+        "pending_one": "{{count}} verificación de red requiere revisión.",
+        "pending_other": "{{count}} verificaciones de red requieren revisión.",
+        "review": "Revisar conversión",
+        "title": "Conversión de verificaciones de red",
+        "convert": "Convertir {{count}}",
+        "converted_one": "Se convirtió {{count}} verificación de red",
+        "converted_other": "Se convirtieron {{count}} verificaciones de red",
+        "failed": "No se pudieron convertir las verificaciones de red",
+        "outcome": {
+          "convertible": "Convertible",
+          "unconvertible": "No se puede convertir"
         }
       }
     },
@@ -1205,7 +1151,8 @@
           "title": "No hay conexiones PSA configuradas"
         },
         "filters": {
-          "allStatuses": "Todos los estados"
+          "allStatuses": "Todos los estados",
+          "statusFilterLabel": "Estado de la conexión"
         },
         "headers": {
           "connection": "Conexión",
@@ -1274,7 +1221,8 @@
           "title": "No hay tickets PSA sincronizados"
         },
         "filters": {
-          "allStatuses": "Todos los estados"
+          "allStatuses": "Todos los estados",
+          "statusFilterLabel": "Estado del ticket"
         },
         "headers": {
           "linkedAlert": "Alerta vinculada",
@@ -1410,7 +1358,8 @@
         "empty": "No se encontraron webhooks.",
         "failedCount": "{{count}} falló",
         "filters": {
-          "allStatuses": "Todos los estados"
+          "allStatuses": "Todos los estados",
+          "statusFilterLabel": "Estado del webhook"
         },
         "headers": {
           "events": "Eventos",
@@ -1847,7 +1796,7 @@
         "configureMonitoring": "Configurar monitoreo",
         "pauseSnmpPolling": "Pausar el sondeo SNMP",
         "resumeSnmpPolling": "Reanudar el sondeo SNMP",
-        "disableAllActiveMonitoring": "Deshabilitar todo el monitoreo activo para este activo",
+        "disableSnmpMonitoring": "Deshabilitar monitoreo SNMP",
         "needsOrgSelection": "Los activos de monitoreo de red pertenecen a una sola organización.",
         "loadingAssets": "Cargando recursos de monitoreo...",
         "showingAllDiscoveredAssets": "Mostrando todos los activos descubiertos",
@@ -1943,11 +1892,12 @@
       "MonitoringPage": {
         "tabs": {
           "assets": "Activos",
-          "checks": "Comprobaciones de red",
-          "templates": "Plantillas SNMP"
+          "templates": "Plantillas SNMP",
+          "results": "Resultados"
         },
-        "title": "Monitoreo",
-        "description": "SNMP sondeo y comprobaciones de red. El descubrimiento puede contribuir al seguimiento, pero el seguimiento se gestiona aquí."
+        "title": "Red",
+        "description": "Activos, plantillas SNMP y resultados de verificaciones de red. Las verificaciones se crean como monitores en Alertas.",
+        "newCheck": "Nueva verificación"
       }
     },
     "fleet": {
@@ -2187,7 +2137,8 @@
         "description": "Seguimiento de incidentes y hallazgos de EDR en todas sus organizaciones.",
         "filters": {
           "tracked": "Rastreado",
-          "findings": "Hallazgos"
+          "findings": "Hallazgos",
+          "kindLabel": "Tipo"
         },
         "emptyTitle": "No se encontraron incidentes",
         "emptyFiltered": "Ningún incidente coincide con los filtros actuales.",
@@ -2410,7 +2361,9 @@
           "unknown": "Desconocido"
         },
         "lastSeen": "visto por última vez",
-        "noDeviceInventory": "Aún no hay inventario de dispositivos disponible de los clientes."
+        "noDeviceInventory": "Aún no hay inventario de dispositivos disponible de los clientes.",
+        "healthFilterLabel": "Estado de salud",
+        "sortFilterLabel": "Ordenar por"
       }
     },
     "remediation": {
@@ -2497,7 +2450,36 @@
         "requesting": "Solicitando...",
         "requestApproval": "Solicitar aprobación",
         "waitingApprovalTitle": "Esperando la aprobación de PAM",
-        "approvalPending": "Aprobación pendiente"
+        "approvalPending": "Aprobación pendiente",
+        "proven": {
+          "badge": "Solución comprobada",
+          "trackAllClients": "Funcionó {{verified}} de {{attempts}} veces en sus clientes",
+          "trackThisClient": "Funcionó {{verified}} de {{attempts}} veces en este cliente"
+        },
+        "feedback": {
+          "worked": "Funcionó",
+          "didNotWork": "No funcionó",
+          "recorded": "Comentario registrado",
+          "failed": "No se pudo registrar el comentario"
+        },
+        "done": {
+          "button": "Hecho",
+          "recorded": "Marcado como hecho — observando la recuperación",
+          "failed": "No se pudo marcar como hecho"
+        },
+        "outcome": {
+          "label": "Resultado: {{state}}",
+          "state": {
+            "pending": "en ejecución",
+            "awaitingRecovery": "observando la recuperación",
+            "holding": "recuperado — confirmando que se mantiene",
+            "verified": "corrección verificada",
+            "failed": "no lo corrigió",
+            "recurred": "volvió a ocurrir",
+            "inconclusive": "no concluyente",
+            "cancelled": "cancelado"
+          }
+        }
       }
     },
     "support": {

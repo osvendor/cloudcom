@@ -306,6 +306,11 @@
     "indexPlaceholder": "breeze-logs",
     "description": "When enabled, all child organizations will ship event logs to the configured endpoint. Works with any Elasticsearch/OpenSearch-compatible <bulk>_bulk</bulk> store (Elasticsearch, OpenSearch, Wazuh indexer, AWS OpenSearch Service). Leave disabled to let each organization configure individually."
   },
+  "savedSecret": {
+    "savedPlaceholder": "Saved — leave blank to keep",
+    "removedPlaceholder": "Will be removed when you save",
+    "remove": "Remove"
+  },
   "agentVersionPins": {
     "title": "Update version targets",
     "description": "Pin the agent and watchdog to a specific registered version, or leave on <strong>Latest promoted</strong> to track the globally promoted release. Agent and watchdog are independent.",
@@ -534,7 +539,7 @@
       "saveFailed": "Could not change this setting",
       "remediation": {
         "title": "Suggested fixes",
-        "description": "AI-generated fix suggestions on the alert detail page. This is the default for every organization; an organization can override it on its own AI tab.",
+        "description": "Fix suggestions on the alert detail page, matched from your scripts, templates and playbooks. This is the default for every organization; an organization can override it on its own AI tab.",
         "enabled": "Generate suggested fixes",
         "enabledDescription": "Allow technicians to generate suggested fixes for an alert from its detail page."
       }
@@ -853,6 +858,7 @@
     "hideExpired": "Hide expired",
     "deleteExpired": "Delete expired",
     "shortCode": "Short code",
+    "shortCodeHidden": "Hidden — requires enrollment permission",
     "installerUsage": "Installer devices {{consumed}} / {{max}}",
     "installerUsageExpired": "Installer devices {{consumed}} / {{max}} (expired)",
     "installerUsageMixed": "Installer devices {{liveConsumed}} / {{liveMax}} live · {{expired}} expired",
@@ -1073,8 +1079,19 @@
       "3": "L3 — biometric + PIN",
       "4": "L4 — hardware key + PIN"
     },
+    "unreachableLevelHint": "Levels an approver device cannot reach for a tier are unavailable.",
     "requireEnrollment": "Require an enrolled approver device (enforce — block under-assured approvals)",
+    "enforcement": {
+      "inherit": "Platform default",
+      "required": "Required",
+      "notRequired": "Not required",
+      "inheritedValue": "Platform default: an approver device is required for high- and critical-risk approvals from {{date}}.",
+      "inheritedSource": "Set by the platform because no choice has been saved here. Choose Required or Not required to override it.",
+      "requiredHint": "Required applies to every risk tier from the date below.",
+      "notRequiredHint": "Approvals below the floor are allowed and recorded as downgraded."
+    },
     "enforceFrom": "Enforce from (grace window cutoff)",
+    "enforceFromHint": "Leave blank to enforce immediately.",
     "toasts": {
       "saved": "Approval-security policy saved."
     },
@@ -1272,6 +1289,7 @@
       "usernamePlaceholder": "elastic",
       "password": "Password",
       "passwordPlaceholder": "Enter password",
+      "savedSecretPlaceholder": "Saved — leave blank to keep",
       "credentialsDescription": "Credentials are stored encrypted. Existing credentials are masked when loaded."
     },
     "collection": {
@@ -1318,7 +1336,8 @@
     "webhooks": {
       "title": "Webhook notifications",
       "placeholder": "https://api.example.com/alerts",
-      "empty": "No webhooks configured."
+      "empty": "No webhooks configured.",
+      "savedEntry": "Saved webhook (URL hidden)"
     },
     "preferences": {
       "title": "Notification preferences",
@@ -3418,7 +3437,8 @@
     "tryAdjustingYourSearchOrFilters": "Try adjusting your search or filters.",
     "active": "Active",
     "revoked": "Revoked",
-    "expired": "Expired"
+    "expired": "Expired",
+    "statusFilterLabel": "Status"
   },
   "apiKeysPage": {
     "loadingAPIKeys": "Loading API keys...",
@@ -3822,7 +3842,9 @@
     "verifyYourIdentity": "Verify your identity",
     "thisAccountSignsInThroughAnIdentityProviderAndHasNoPassw": "This account signs in through an identity provider and has no password. Re-verify with your provider to start setting up an authenticator app.",
     "verifyWithYourIdentityProvider": "Verify with your identity provider",
-    "ssoReauthProofExpired": "Your identity provider verification has expired. Verify again to finish setting up your authenticator app."
+    "ssoReauthProofExpired": "Your identity provider verification has expired. Verify again to finish setting up your authenticator app.",
+    "ssoReauthManageHint": "This account signs in through an identity provider and has no password. Verify with your provider to confirm this change.",
+    "ssoReauthManageVerified": "Identity verified with your provider. Finish the step below to confirm this change."
   },
   "pax8CatalogDrawer": {
     "importFromPax8": "Import from Pax8",
@@ -3939,7 +3961,11 @@
     "passkeyStepUpVerificationExpired": "Verification expired. Please verify again.",
     "passkeyRegistrationServerError": "Passkey registration failed. Please try again.",
     "deletePasskeyVerifyHeading": "Verify to delete a passkey",
-    "deletePasskeyVerifyHint": "Enter a current MFA code here before removing one of the passkeys above. This code has no effect on adding a new passkey."
+    "deletePasskeyVerifyHint": "Enter a current MFA code here before removing one of the passkeys above. This code has no effect on adding a new passkey.",
+    "ssoReauthManageProofExpired": "Your identity provider verification has expired. Verify again to confirm this change.",
+    "verifyWithIdpToDeletePasskey": "This account has no password. Verify with your identity provider before removing a passkey.",
+    "deletePasskeySsoReauth": "Verify identity to remove a passkey",
+    "deletePasskeySsoVerified": "Identity verified. Choose Delete on the passkey you want to remove."
   },
   "roleManager": {
     "roles": "Roles",
@@ -4007,13 +4033,18 @@
     "createANewCustomRoleBasedOnThisOne": "Create a new custom role based on this one.",
     "saving": "Saving...",
     "cloneRole2": "Clone Role",
+    "mfaRequired": "MFA required",
+    "mfaRequiredTooltip": "Members of this role must enroll in multi-factor authentication.",
+    "requireMfaForThisRole": "Require MFA for this role",
+    "requireMfaForThisRoleHelp": "Members assigned this role must enroll in multi-factor authentication before they can use Breeze.",
     "saveChanges": "Save Changes",
     "deleting": "Deleting...",
     "networkErrorLoadingPermissions": "Network error while loading permissions",
     "cannotDeleteAssignedRole": "Cannot delete role with assigned users",
     "inheritedFromParentRole": "Inherited from parent role",
     "waitingForPermissionCatalog": "Waiting for permission catalog to load",
-    "summary": "{{filtered}} of {{total}} roles"
+    "summary": "{{filtered}} of {{total}} roles",
+    "typeFilterLabel": "Role type"
   },
   "roleSelector": {
     "currentRole": "Current role",
@@ -4062,6 +4093,9 @@
     "thisOrganization": "This organization",
     "partnerTechnicianLogin": "Partner (technician login)",
     "yourOwnTeamSignsInWithThis": "(your own team signs in with this)",
+    "selectAnOrganizationToCreateAnOrgProvider": "Select an organization in the organization switcher to create a provider for that organization.",
+    "partnerProviderRequiresFullPartnerAccess": "Partner-wide providers require access to all organizations.",
+    "selectAnOrganizationBeforeCreatingAProvider": "Select an organization in the organization switcher before creating a provider.",
     "basicInformation": "Basic Information",
     "providerName": "Provider name",
     "eGOktaProduction": "e.g., Okta Production",
@@ -4138,7 +4172,8 @@
     "delete": "Delete",
     "allStatuses": "All statuses",
     "deactivate": "Deactivate",
-    "activate": "Activate"
+    "activate": "Activate",
+    "statusFilterLabel": "Status"
   },
   "ssoProvidersPage": {
     "failedToFetchSSOProviders": "Failed to fetch SSO providers",
@@ -4168,6 +4203,7 @@
     "failedToDeleteProvider": "Failed to delete provider",
     "anErrorOccurred": "An error occurred",
     "failedToSaveProvider": "Failed to save provider",
+    "providerNeedsOrganization": "Select an organization in the organization switcher, or set “Applies to” to Partner (technician login) to create a partner-wide provider.",
     "addSSOProvider": "Add SSO Provider",
     "editSSOProvider": "Edit SSO Provider",
     "configureANewSSOProviderForYourOrganization": "Configure a new SSO provider for your organization.",
@@ -4744,7 +4780,7 @@
         "killSwitch": "Anomaly detection is switched off for the whole platform by the operator. These settings take effect when it is turned back on.",
         "remediation": {
           "title": "Suggested fixes",
-          "description": "AI-generated fix suggestions on this organization's alerts. Blank means the partner default applies.",
+          "description": "Fix suggestions on this organization's alerts, matched from your scripts, templates and playbooks. Blank means the partner default applies.",
           "enabled": "Generate suggested fixes",
           "enabledDescription": "Allow technicians to generate suggested fixes for an alert from its detail page.",
           "killSwitch": "Suggested fixes are switched off for the whole platform by the operator. This setting takes effect when they are turned back on."
@@ -5412,7 +5448,8 @@
       "title": "Delete Custom Field",
       "messagePrefix": "Are you sure you want to delete",
       "messageSuffix": " This will remove the field definition and all stored values on devices."
-    }
+    },
+    "typeFilterLabel": "Field type"
   },
   "knownGuestsSettings": {
     "title": "Known Guests",
@@ -5524,6 +5561,7 @@
       "sendInvite": "Failed to send invitation",
       "updateUser": "Failed to update user",
       "updateRole": "Failed to update role",
+      "updateOrgAccess": "Failed to update organization access",
       "removeUser": "Failed to remove user",
       "resetMfa": "Failed to reset MFA"
     },
@@ -5551,7 +5589,9 @@
       "inviteSent": "Invitation sent to {{email}}",
       "copied": "Copied!",
       "copyLink": "Copy link",
-      "mfaReset": "MFA reset for {{email}}"
+      "mfaReset": "MFA reset for {{email}}",
+      "roleUpdated": "Role updated",
+      "orgAccessUpdated": "Organization access updated"
     },
     "resetMfa": {
       "title": "Reset MFA?",

@@ -72,6 +72,18 @@ function captureTx(lockedRowCount = 1) {
 }
 
 describe('deleteDeviceCascade lock ordering', () => {
+  it('deletes time status once before the device through the central cascade', async () => {
+    const { tx, statements } = captureTx();
+    await deleteDeviceCascade(tx, 'device-1');
+    const matches = statements.filter((s) => s.includes('device_time_status'));
+    expect(matches).toHaveLength(1);
+    expect(statements.indexOf(matches[0]!)).toBeLessThan(
+      statements.indexOf('__DELETE_DEVICES_ROW__'),
+    );
+    expect(statements.findIndex((s) => s.includes('FOR UPDATE'))).toBeLessThan(
+      statements.indexOf(matches[0]!),
+    );
+  });
   it('locks the devices row BEFORE touching any child table (40P01, cf. #3739)', async () => {
     // FK constraints force children-before-parent for the DELETEs, so the
     // order cannot be inverted to match the rest of the codebase. Every other
@@ -188,7 +200,7 @@ describe('deleteDeviceCascade lock ordering', () => {
     };
 
     sentry.captureMessage.mockClear();
-    await expect(deleteDeviceCascade(tx, 'device-1')).resolves.toBeUndefined();
+    await expect(deleteDeviceCascade(tx, 'device-1')).resolves.toEqual({ removedTopologyAlerts: 0 });
 
     expect(sentry.captureMessage).toHaveBeenCalledTimes(1);
     expect(String(sentry.captureMessage.mock.calls[0]?.[0])).toContain('lock_timeout');
@@ -397,7 +409,7 @@ describe('deleteDeviceCascade when the parent lock is not acquired', () => {
     sentry.captureMessage.mockClear();
     const { tx, statements } = captureTx(0);
 
-    await expect(deleteDeviceCascade(tx, 'device-gone')).resolves.toBeUndefined();
+    await expect(deleteDeviceCascade(tx, 'device-gone')).resolves.toEqual({ removedTopologyAlerts: 0 });
 
     expect(sentry.captureMessage).toHaveBeenCalledTimes(1);
     expect(String(sentry.captureMessage.mock.calls[0]?.[0])).toContain('without holding');

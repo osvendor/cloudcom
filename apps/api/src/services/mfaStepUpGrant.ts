@@ -38,6 +38,16 @@ export type StepUpOperation =
   | 'register_approver_device'
   | 'agent_rollback'
   | 'enroll_first_factor'
+  // #4045: the SSO re-auth callback's OTHER output. A passwordless account
+  // that already holds a factor proves "user at the keyboard" through a fresh,
+  // forced IdP round-trip instead of the password it does not have. It
+  // replaces ONLY the password leg of recovery-code rotation, passkey deletion
+  // and MFA disable — each of which still demands its own existing-factor
+  // proof (an operation-bound step-up grant, or a live MFA code). Minted only
+  // by GET /sso/callback (reauth mode) for an MFA-protected account, and
+  // compiler-excluded from the client-requestable STEP_UP_OPERATIONS in
+  // routes/auth/schemas.ts exactly like `enroll_first_factor`.
+  | 'sso_reauth_manage_factor'
   // RMM-QA-176: entering or EXTENDING device maintenance mode. Bound by
   // resourceDigest to the exact { deviceIds, reason, durationHours } the
   // technician was shown, so a grant can never be replayed against a
@@ -50,11 +60,29 @@ export type StepUpOperation =
   // operator was shown, so a grant can never be replayed against a different
   // device, destination, or billing acknowledgement.
   | 'device_move_org'
+  // Parked-device assignment: moving a device out of the partner's holding
+  // area into a customer org. Single: bound to { deviceId, targetOrgId,
+  // targetSiteId }. Bulk: ONE grant bound to the whole sorted batch — a
+  // single-device grant never covers a batch, and a batch grant never covers
+  // a different batch.
+  | 'parked_device_assign'
+  | 'parked_device_assign_bulk'
+  // Turning ON deploy-key enrollment for a partner (a new way for devices to
+  // enroll into its holding area). Bound to the partner; the resource schema
+  // only accepts enabled=true. Turning it OFF is a kill switch and needs no
+  // step-up.
+  | 'pre_assignment_enable'
   // AI script authoring W04 (#5612): enabling the unattended lane on an org
   // is the same class of action as enabling agent act mode — a fresh MFA
   // proof, bound to the org AND to the value being set, so a grant minted to
   // turn the lane ON cannot be replayed to widen something else.
   | 'ai_script_lane_grant'
+  // Partner-wide sibling of `ai_script_lane_grant`: raising the PARTNER
+  // ceiling (`unattended_allowed` and, while it is already true, any
+  // widening of tier/classes/rate/protected-resources/reviewerModel) fans
+  // out to every org under the partner that has opted in, so it gets the
+  // same fresh-MFA-plus-resource-binding treatment as the org-scope grant.
+  | 'ai_partner_script_ceiling_grant'
   // #5601: a "recent ceremony" credential for consecutive approval decides.
   // THE ONLY MULTI-USE OPERATION IN THIS MODULE — redeemed with the
   // non-consuming `readStepUpGrant`/`validateStepUpGrant` (GET), never
@@ -74,7 +102,13 @@ export type StepUpOperation =
   // STEP_UP_OPERATIONS in routes/auth/schemas.ts, by the compiler. Letting a
   // client mint one would turn an ordinary TOTP step-up into a bypass of the
   // enforcing-partner L3 passkey floor on supervised rows.
-  | 'approval_decide';
+  | 'approval_decide'
+  // Topology M3 (#5999, amendments M3-D2/D3): arming a recurring monitoring
+  // policy or a standing interface-telemetry poll hands unattended, repeating
+  // execution on customer machines to a stored frozen actor. Bound by
+  // resourceDigest to the exact { siteId, action, subjectId } the operator saw,
+  // so a grant for one policy/target can never arm another.
+  | 'topology_arm';
 
 export interface StepUpGrant {
   id: string;
@@ -206,21 +240,115 @@ export function moveOrgResourceDigest(input: {
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
 
+export interface ParkedAssignResource {
+  deviceId: string;
+  targetOrgId: string;
+  targetSiteId: string;
+}
+
+/** Binding for a single parked-device assignment. */
+export function parkedAssignResourceDigest(input: ParkedAssignResource): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    kind: 'parked_device_assign',
+    deviceId: input.deviceId,
+    targetOrgId: input.targetOrgId,
+    targetSiteId: input.targetSiteId,
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Binding for a bulk parked-device assignment: the whole batch, sorted by
+ * deviceId so item order does not matter, while adding, removing or changing
+ * any item changes the digest.
+ */
+export function parkedBulkAssignResourceDigest(items: readonly ParkedAssignResource[]): `sha256:${string}` {
+  const sorted = [...items]
+    .map((item) => ({ deviceId: item.deviceId, targetOrgId: item.targetOrgId, targetSiteId: item.targetSiteId }))
+    .sort((a, b) => (a.deviceId < b.deviceId ? -1 : a.deviceId > b.deviceId ? 1 : 0));
+  const canonical = JSON.stringify({ kind: 'parked_device_assign_bulk', items: sorted });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/** Binding for turning ON deploy-key enrollment for one partner. */
+export function preAssignmentEnableResourceDigest(input: { partnerId: string }): `sha256:${string}` {
+  const canonical = JSON.stringify({ kind: 'pre_assignment_enable', partnerId: input.partnerId, enabled: true });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * The exact set of values a WIDENING transition on an already-enabled/-opted
+ * -in unattended lane touches. Bound into the resource digest so a grant
+ * minted to widen one set of fields cannot be replayed to save a DIFFERENT,
+ * wider set the operator never saw. `unattendedAllowedClasses` is sorted by
+ * the caller before hashing so member order never changes the digest.
+ */
+export interface ScriptLaneWideningDelta {
+  maxUnattendedRiskTier: string;
+  unattendedAllowedClasses: string[];
+  maxUnattendedPerHour: number;
+  protectedResourcesEmptied: boolean;
+  reviewerModel: string | null;
+  proposingEnabled: boolean;
+}
+
 /** Bind a factor-removal grant to one exact server-side passkey row. */
 /**
  * W04 (#5612): binds an `ai_script_lane_grant` to the org and the requested
  * value (`unattendedEnabled`), and to the lane-reset action when `reset` is
- * set. Same one-org-one-value shape as the maintenance digest.
+ * set. Same one-org-one-value shape as the maintenance digest. `widening`
+ * additionally binds a grant minted for a WIDENING save (tier/classes/rate/
+ * emptied protectedResources/reviewerModel/proposingEnabled changed while the
+ * lane is already enabled) to the exact wider values being persisted.
  */
 export function scriptLanePolicyResourceDigest(input: {
   orgId: string;
   unattendedEnabled: boolean;
   reset?: boolean;
+  widening?: ScriptLaneWideningDelta;
 }): `sha256:${string}` {
   const canonical = JSON.stringify({
     orgId: input.orgId,
     unattendedEnabled: input.unattendedEnabled,
     reset: input.reset === true,
+    widening: input.widening
+      ? { ...input.widening, unattendedAllowedClasses: [...input.widening.unattendedAllowedClasses].sort() }
+      : null,
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Partner-wide sibling of {@link scriptLanePolicyResourceDigest}: binds an
+ * `ai_partner_script_ceiling_grant` to the partner and the requested
+ * `unattendedAllowed` value, plus the same widening-delta shape when the
+ * ceiling is already allowed and the save raises it further.
+ */
+export function partnerScriptCeilingResourceDigest(input: {
+  partnerId: string;
+  unattendedAllowed: boolean;
+  widening?: ScriptLaneWideningDelta;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    partnerId: input.partnerId,
+    unattendedAllowed: input.unattendedAllowed,
+    widening: input.widening
+      ? { ...input.widening, unattendedAllowedClasses: [...input.widening.unattendedAllowedClasses].sort() }
+      : null,
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/** Topology arm step-up binding (M3-D2/D3): one site, one action, one subject. */
+export function topologyArmResourceDigest(input: {
+  siteId: string;
+  action: 'arm_policy' | 'arm_telemetry';
+  subjectId: string;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    action: input.action,
+    siteId: input.siteId.toLowerCase(),
+    subjectId: input.subjectId.toLowerCase(),
   });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }

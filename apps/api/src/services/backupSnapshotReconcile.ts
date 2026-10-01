@@ -5,6 +5,7 @@ import { backupConfigs, backupJobs, backupSnapshots, backupSnapshotRetirements }
 import { normalizeStorageIdentity } from '../jobs/backupRetention';
 import type { ParsedBackupCommandResult } from '../routes/backup/resultSchemas';
 import { applyBackupCommandResultToJob, LATE_RESULT_FENCE_REASON_PATTERN } from './backupResultPersistence';
+import { loadSnapshotIdClaims } from './backupSnapshotIdReservations';
 import { captureException, captureMessage } from './sentry';
 import {
   BACKUP_SNAPSHOT_MANIFEST_KEY,
@@ -13,6 +14,7 @@ import {
   backupSnapshotRootPrefix,
   fetchBackupObjectText,
   iterateBackupObjectsUnderPrefix,
+  MANIFEST_FETCH_MAX_BYTES,
 } from './backupSnapshotStorage';
 
 /**
@@ -72,10 +74,15 @@ import {
  * loop), which is precisely that half-written state; the write itself is an
  * upsert keyed on (jobId, snapshotId), so re-running is idempotent.
  *
+ * `completed_with_errors` (#5396) is a `completed` run that counted file
+ * failures; it can be half-written the same way and is adoptable on the same
+ * terms (persistence keeps its status rather than laundering it to
+ * `completed`).
+ *
  * `cancelled` and `partial` are deliberately absent: a user cancel is a
  * decision to respect, and a `partial` job already recorded its own outcome.
  */
-const ADOPTABLE_JOB_STATUSES = ['pending', 'running', 'failed', 'completed'] as const;
+const ADOPTABLE_JOB_STATUSES = ['pending', 'running', 'failed', 'completed', 'completed_with_errors'] as const;
 
 /**
  * Job statuses eligible for the WEAKER time-window matcher.
@@ -166,6 +173,8 @@ export type ReconcileSkipReason =
   /** D18 §3.4: the manifest is older than half the orphan window — leave it
    *  for the sweep instead of racing it. */
   | 'orphan-too-old-for-adoption'
+  /** The id is reserved to a backup that is still writing (brokered write). */
+  | 'reserved-for-active-backup'
   /** D18 §3.1/§3.4: the manifest declares a baseSnapshotId with no live,
    *  unretired backup_snapshots row — its references may already dangle. */
   | 'base-missing'
@@ -237,6 +246,12 @@ type SnapshotClaims = {
    * Any foreign claim refuses the snapshot outright.
    */
   foreignClaimed: Set<string>;
+  /**
+   * Snapshot ids whose reservation (backup_snapshot_id_reservations) is still
+   * being written or sealed by a live backup job. Their objects may still
+   * change, so they are never adopted; the job's own result publishes them.
+   */
+  liveReserved: Set<string>;
 };
 
 type AdoptableJob = {
@@ -408,6 +423,7 @@ async function loadClaimsAndSharing(params: {
       const restorable = new Map<string, string>();
       const jobs = new Map<string, ClaimingJob>();
       const foreignClaimed = new Set<string>();
+      const liveReserved = new Set<string>();
 
       // Rank for the dedupe below: a claim on THIS destination beats one on a
       // sibling config (a customer who deleted and recreated a config against
@@ -434,6 +450,18 @@ async function loadClaimsAndSharing(params: {
         for (const row of snapshotRows) {
           restorable.set(row.snapshotId, row.orgId);
         }
+
+        // The id's owner, whatever destination or endpoint spelling it was
+        // reserved under. Another organization's reservation refuses the id;
+        // one still being written by a live job is left to that job.
+        const reservationClaims = await loadSnapshotIdClaims(batch, orgId);
+        for (const id of reservationClaims.foreign) foreignClaimed.add(id);
+        for (const id of reservationClaims.live) liveReserved.add(id);
+        // A server-issued id is published only by the job its reservation
+        // currently names: that job wins the dedupe below whatever the rank
+        // of the others (after a takeover, earlier jobs still carry the id).
+        const holder = (snapshotId: string, jobId: string) =>
+          reservationClaims.currentJobs.get(snapshotId) === jobId;
 
         // NOT filtered by config or org: seeing ANOTHER tenant's claim is the
         // entire point (a filtered query would make their snapshot look
@@ -470,7 +498,9 @@ async function loadClaimsAndSharing(params: {
           // records it on both. Rank deterministically rather than letting
           // scan order decide which run owns the objects.
           const existing = jobs.get(row.snapshotId);
-          if (!existing || outranks(claim, existing)) {
+          const claimHolds = holder(row.snapshotId, claim.jobId);
+          const existingHolds = !!existing && holder(row.snapshotId, existing.jobId);
+          if (!existing || (claimHolds && !existingHolds) || (claimHolds === existingHolds && outranks(claim, existing))) {
             jobs.set(row.snapshotId, claim);
           }
         }
@@ -493,7 +523,7 @@ async function loadClaimsAndSharing(params: {
         );
       });
 
-      return { claims: { restorable, jobs, foreignClaimed }, sharedDestination };
+      return { claims: { restorable, jobs, foreignClaimed, liveReserved }, sharedDestination };
     })
   );
 }
@@ -830,6 +860,11 @@ export async function reconcileOrphanedBackupSnapshots(params: {
       continue;
     }
 
+    if (claims.liveReserved.has(snapshotId)) {
+      skip('reserved-for-active-backup');
+      continue;
+    }
+
     const restorableOwner = claims.restorable.get(snapshotId);
     if (restorableOwner) {
       skip(restorableOwner === params.orgId ? 'already-restorable' : 'claimed-by-another-organization');
@@ -990,6 +1025,7 @@ export async function reconcileOrphanedBackupSnapshots(params: {
         provider: config.provider,
         providerConfig: config.providerConfig,
         key: backupSnapshotManifestKey(entry.snapshotId),
+        maxBytes: MANIFEST_FETCH_MAX_BYTES,
       });
       result = manifestToCommandResult({
         snapshotId: entry.snapshotId,

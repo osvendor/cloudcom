@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import type { SQL } from 'drizzle-orm';
 
@@ -91,7 +91,16 @@ function countOccurrences(haystack: string, needle: string): number {
 }
 
 describe('metric rollups service', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   beforeEach(() => {
+    // The fixtures below are dated 2026-06-18. Pin the clock the day after, so
+    // the #7531 5-minute retention floor (now - 90 days, month-aligned) sits
+    // well before them and every raw pass runs.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-06-19T00:00:00.000Z'));
     contextTrace.length = 0;
     executedByLabel.clear();
     openContext.label = undefined;
@@ -278,6 +287,55 @@ describe('metric rollups service', () => {
   // managed DB's single vCPU, 900+GB of shared buffer reads) and was the top DB
   // load by a wide margin. Each source window is now scanned once and every
   // series is derived from that single pass.
+  describe('#7531 5-minute retention floor', () => {
+    const ORG = '11111111-1111-1111-1111-111111111111';
+    // Default 5-minute retention is 90 days: with now = 2026-09-29 the cutoff is
+    // 2026-07-01T00:00Z, so the floor (start of the cutoff's month) is 2026-07-01.
+    const NOW = new Date('2026-09-29T12:00:00.000Z');
+
+    it('skips the raw passes for a window entirely below the floor (its 5m leaf may already be dropped)', async () => {
+      const result = await rollupDeviceMetricsRange({
+        orgId: ORG,
+        from: new Date('2026-06-18T12:00:00.000Z'),
+        to: new Date('2026-06-18T13:00:00.000Z'),
+        now: NOW,
+      });
+
+      expect(executedByLabel.get('metricRollups.raw.device_metrics')).toBeUndefined();
+      expect(executedByLabel.get('metricRollups.raw.device_process_samples')).toBeUndefined();
+      expect(executedByLabel.get('metricRollups.raw.snmp_metrics')).toBeUndefined();
+      // The derived passes still run: they only read 5m rows, and write nothing
+      // when those rows are gone.
+      expect(result).toMatchObject({ statements: 6, skipped: false, rawFrom: null });
+    });
+
+    it('starts the raw passes at the month-aligned floor when the window straddles it', async () => {
+      const result = await rollupDeviceMetricsRange({
+        orgId: ORG,
+        from: new Date('2026-06-30T23:00:00.000Z'),
+        to: new Date('2026-07-01T01:00:00.000Z'),
+        now: NOW,
+      });
+
+      expect(result).toMatchObject({ statements: 9, rawFrom: '2026-07-01T00:00:00.000Z' });
+      const deviceSql = JSON.stringify(executedByLabel.get('metricRollups.raw.device_metrics'));
+      expect(deviceSql).toContain('2026-07-01T00:00:00.000Z');
+      expect(deviceSql).not.toContain('2026-06-30T23:00:00.000Z');
+    });
+
+    it('leaves a window inside retention untouched and reports no clamp', async () => {
+      const result = await rollupDeviceMetricsRange({
+        orgId: ORG,
+        from: new Date('2026-09-29T11:00:00.000Z'),
+        to: new Date('2026-09-29T11:15:00.000Z'),
+        now: NOW,
+      });
+
+      expect(result).toMatchObject({ statements: 9 });
+      expect(result).not.toHaveProperty('rawFrom');
+    });
+  });
+
   describe('#4341 single-pass raw rollups', () => {
     const DEVICE_METRIC_SERIES: ReadonlyArray<readonly [string, string]> = [
       ['cpu', 'cpu_percent'],
@@ -508,6 +566,91 @@ describe('metric rollups service', () => {
       expect(executeMock).toHaveBeenCalledTimes(5);
       expect(openedLabels()).toHaveLength(6);
       expect(contextTrace.filter((event) => event.type === 'close')).toHaveLength(6);
+    });
+  });
+
+  // #4276 direction 1 — the hour→day passes re-aggregate a whole UTC day of
+  // hourly rows, so on the 5-minute path they cost O(hours elapsed today) per
+  // device×series and blew the 2s held-context budget by late afternoon. The
+  // scheduler now runs them once an hour with a catch-up lookback; every other
+  // caller (backfills, the script) keeps "days touched by the window".
+  describe('#4276 bounded day-level derived rollups', () => {
+    const ORG = '11111111-1111-1111-1111-111111111111';
+    const DAY_LABELS = [
+      'metricRollups.derived.device_metrics.86400',
+      'metricRollups.derived.device_process_samples.86400',
+      'metricRollups.derived.snmp_metrics.86400',
+    ];
+    const HOUR_LABELS = [
+      'metricRollups.derived.device_metrics.3600',
+      'metricRollups.derived.device_process_samples.3600',
+      'metricRollups.derived.snmp_metrics.3600',
+    ];
+
+    /** The `[from, to)` bucket_start bounds a derived statement scans (its last two params). */
+    function sourceRangeFor(label: string): unknown[] {
+      return onlyStatementParamsFor(label).slice(-2);
+    }
+
+    it('skips every hour→day pass when told to, and still runs the raw and hour passes', async () => {
+      const result = await rollupDeviceMetricsRange({
+        orgId: ORG,
+        from: new Date('2026-06-18T16:50:00.000Z'),
+        to: new Date('2026-06-18T17:05:00.000Z'),
+        dayRollups: 'skip',
+      });
+
+      expect(result).toMatchObject({ statements: 6, skipped: false });
+      expect(executeMock).toHaveBeenCalledTimes(6);
+      for (const label of DAY_LABELS) expect(executedByLabel.has(label)).toBe(false);
+      for (const label of HOUR_LABELS) {
+        // The hour pass stays bounded to the window's own hours — this window
+        // straddles 17:00, so exactly hours 16 and 17.
+        expect(sourceRangeFor(label)).toEqual(['2026-06-18T16:00:00.000Z', '2026-06-18T18:00:00.000Z']);
+      }
+    });
+
+    it('derives the days touched by an explicit day window, reaching back past midnight for late data', async () => {
+      // The 00:15 run: its raw window is [00:00, 00:15) on the 19th, but hour 23
+      // of the 18th took its last raw update on the 00:10 run. The day window
+      // must fold the 18th in again, not only the 19th.
+      await rollupDeviceMetricsRange({
+        orgId: ORG,
+        from: new Date('2026-06-19T00:00:00.000Z'),
+        to: new Date('2026-06-19T00:15:00.000Z'),
+        dayRollups: { from: new Date('2026-06-18T21:00:00.000Z') },
+      });
+
+      for (const label of DAY_LABELS) {
+        expect(sourceRangeFor(label)).toEqual(['2026-06-18T00:00:00.000Z', '2026-06-20T00:00:00.000Z']);
+      }
+      for (const label of HOUR_LABELS) {
+        expect(sourceRangeFor(label)).toEqual(['2026-06-19T00:00:00.000Z', '2026-06-19T01:00:00.000Z']);
+      }
+    });
+
+    it('defaults to the days touched by the rollup window itself (backfills keep their old shape)', async () => {
+      await rollupDeviceMetricsRange({
+        orgId: ORG,
+        from: new Date('2026-06-18T12:00:00.000Z'),
+        to: new Date('2026-06-18T12:15:00.000Z'),
+      });
+
+      for (const label of DAY_LABELS) {
+        expect(sourceRangeFor(label)).toEqual(['2026-06-18T00:00:00.000Z', '2026-06-19T00:00:00.000Z']);
+      }
+    });
+
+    it('rejects a day window that does not start before the rollup window ends, before any write', async () => {
+      await expect(
+        rollupDeviceMetricsRange({
+          orgId: ORG,
+          from: new Date('2026-06-18T12:00:00.000Z'),
+          to: new Date('2026-06-18T12:15:00.000Z'),
+          dayRollups: { from: new Date('2026-06-18T12:15:00.000Z') },
+        }),
+      ).rejects.toThrow('from < to');
+      expect(executeMock).not.toHaveBeenCalled();
     });
   });
 

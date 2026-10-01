@@ -18,9 +18,13 @@ import {
   bareMetalRecoveries,
 } from '../../db/schema';
 import { hashRecoveryNonce } from '../../services/bareMetalRecoveryCodes';
-import type { BatteryStatus, DesktopAccessState } from '@breeze/shared';
-import { promotePendingAgentCredentials } from '../../services/agentTokenPromotion';
+import type { BatteryStatus, DesktopAccessState, TCCPermissions } from '@breeze/shared';
 import { writeAuditEvent } from '../../services/auditEvents';
+import { recordBackupCapabilityRegressed, type BackupHelperCapability } from '../../services/backupMetrics';
+import {
+  normalizeBackupIntegrityProtocolVersion,
+  normalizeBackupWriteProtocolVersion,
+} from '../../services/backupHelperProtocols';
 import { heartbeatSchema } from './schemas';
 import type { PolicyProbeConfigUpdate } from './schemas';
 import {
@@ -30,6 +34,7 @@ import {
   compareAgentVersions,
   buildEventLogConfigUpdate,
   buildHardwareMonitoringConfigUpdate,
+  buildTimeSyncConfigUpdate,
   buildMonitoringConfigUpdate,
   buildHelperConfigUpdate,
   buildPamConfigUpdate,
@@ -39,6 +44,7 @@ import {
   getOrgAgentUpdateConfig,
   resolvePinnedUpgradeTarget,
   agentAcceptsServedEdition,
+  shouldAutoApplyAgentReportedDeviceRole,
   type AgentVersionPins,
   type OnedriveConfigUpdate,
   type HelperSettings,
@@ -48,7 +54,9 @@ import { processDeviceIPHistoryUpdate } from '../../services/deviceIpHistory';
 import { requestDeviceGroupReevaluation } from '../../jobs/deviceGroupJobs';
 import { claimPendingCommandsForDevice } from '../../services/commandDispatch';
 import { publishEvent } from '../../services/eventBus';
-import { DRAIN_CLAIM_TYPE_ALLOWLIST, isAgentTokenRotationDue } from '../../middleware/agentAuth';
+import { DRAIN_CLAIM_TYPE_ALLOWLIST } from '../../middleware/agentAuth';
+import { computeCredentialMaintenance } from './heartbeatCredentialMaintenance';
+import { respondParkedHeartbeat } from './heartbeatParked';
 import type { AgentAuthContext } from '../../middleware/agentAuth';
 import { captureException } from '../../services/sentry';
 import { resolveRemoteAccessForDevice } from '../../services/remoteAccessPolicy';
@@ -272,6 +280,37 @@ export function normalizeDesktopFenceProtocolVersion(value: unknown): 0 | 1 {
   return value === 1 ? 1 : 0;
 }
 
+/**
+ * Normalize the only consent/notification prompt protocol version
+ * implemented here. Same tolerance contract as the fence/lease versions:
+ * absent, malformed, or a future version this server does not speak is 0,
+ * and any dispatch site resolving a policy that requires consent or
+ * notification must refuse to start rather than send a `prompt` block a
+ * capability-0 agent will silently ignore.
+ */
+export function normalizeConsentPromptProtocolVersion(value: unknown): 0 | 1 {
+  return value === 1 ? 1 : 0;
+}
+
+/**
+ * Normalize the backup helper's brokered storage-read protocol. Only the
+ * version this server implements (1) is recorded; absent, malformed or a
+ * future version is 0, and restore-shaped commands are then delivered with
+ * the storage destination as before (services/backupStorageSessions.ts).
+ */
+export function normalizeBackupReadProtocolVersion(value: unknown): 0 | 1 {
+  return value === 1 ? 1 : 0;
+}
+
+/** Backup-helper protocols reported in the heartbeat, by device column. */
+const BACKUP_HELPER_CAPABILITY_FIELDS: ReadonlyArray<
+  readonly [BackupHelperCapability, 'backupReadProtocolVersion' | 'backupIntegrityProtocolVersion' | 'backupWriteProtocolVersion']
+> = [
+  ['read', 'backupReadProtocolVersion'],
+  ['integrity', 'backupIntegrityProtocolVersion'],
+  ['write', 'backupWriteProtocolVersion'],
+];
+
 // #5250 — the agent recomputes `checkedAt` (and, on macOS/Linux, the whole
 // DesktopAccessState) fresh on EVERY heartbeat regardless of whether access
 // actually changed (agent/internal/heartbeat/desktop_access_{darwin,linux}.go
@@ -293,6 +332,23 @@ export function desktopAccessMeaningfullyChanged(
     before.virtualDisplayReady !== after.virtualDisplayReady ||
     (before.reason ?? null) !== (after.reason ?? null) ||
     (before.remoteDesktopPermission ?? null) !== (after.remoteDesktopPermission ?? null)
+  );
+}
+
+// #4340 — same `checkedAt` trap as desktopAccess above: the agent stamps a
+// fresh `checkedAt` on its TCC snapshot, so a raw JSON diff reads as a change
+// on every macOS heartbeat. Compare only the permission bits.
+export function tccPermissionsMeaningfullyChanged(
+  before: TCCPermissions | null | undefined,
+  after: TCCPermissions | null | undefined,
+): boolean {
+  if (!before && !after) return false;
+  if (!before || !after) return true;
+  return (
+    before.screenRecording !== after.screenRecording ||
+    before.accessibility !== after.accessibility ||
+    before.fullDiskAccess !== after.fullDiskAccess ||
+    (before.remoteDesktop ?? null) !== (after.remoteDesktop ?? null)
   );
 }
 
@@ -414,6 +470,17 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     );
 
     return c.json({ commands: drainCommands });
+  }
+
+  // Pre-assignment — a device parked in its partner's
+  // holding org gets the minimal parked beat: liveness, credential rotation and
+  // lifecycle removal only. Before the watchdog branch, so both credential roles
+  // take it. See ./heartbeatParked.ts.
+  if (agent.isPreAssignment) {
+    return respondParkedHeartbeat(c, agent, data, {
+      authenticatedWithPreviousToken: c.get('agentTokenRotationRequired') === true,
+      pendingTokenPresented: c.get('agentPendingTokenPresented') === true,
+    });
   }
 
   // #1121 — observability for the #1065 tolerance trade-off. watchdogState is
@@ -904,6 +971,20 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     desktopFenceProtocolVersion: normalizeDesktopFenceProtocolVersion(
       data.securityCapabilities?.desktopFenceProtocolVersion,
     ),
+    // Consent/notification prompt capability, same non-sticky contract: an
+    // agent that stops reporting it self-heals back to 0 so a policy
+    // requiring consent is refused again rather than trusting a stale claim.
+    consentPromptProtocolVersion: normalizeConsentPromptProtocolVersion(
+      data.securityCapabilities?.consentPromptProtocolVersion,
+    ),
+    // Backup helper brokered-read protocol, same non-sticky contract: a helper
+    // downgrade (or an agent that stops reporting it) reads as 0 on the next
+    // beat, so restore commands stop receiving storage sessions.
+    backupReadProtocolVersion: normalizeBackupReadProtocolVersion(data.backupReadProtocolVersion),
+    // Snapshot integrity and storage write protocols of the same installed
+    // helper: same non-sticky contract, only versions this server implements.
+    backupIntegrityProtocolVersion: normalizeBackupIntegrityProtocolVersion(data.backupIntegrityProtocolVersion),
+    backupWriteProtocolVersion: normalizeBackupWriteProtocolVersion(data.backupWriteProtocolVersion),
     // Migration-banner Task 2 — self-reported install edition + migration
     // flag. Written UNCONDITIONALLY every heartbeat, mirroring
     // outboundNetworkPolicyVersion above: an agent that stops reporting these
@@ -938,6 +1019,34 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     deviceUpdates.updateOfferWithheldSince = withholdReason ? new Date() : null;
   }
 
+  // #4073 — close the update-attempt record (stamped by the WS update_status
+  // message before every self-update attempt) once this beat reports the
+  // target version or newer. Written only when a record is open, so healthy
+  // devices add no column write. A record left open is the stuck-update
+  // signal (isAgentUpdateStuck); an unparseable version compares equal and
+  // closes it, so the signal never fires on a version we cannot judge.
+  if (
+    device.updateAttemptTargetVersion &&
+    compareAgentVersions(data.agentVersion, device.updateAttemptTargetVersion) >= 0
+  ) {
+    deviceUpdates.updateAttemptTargetVersion = null;
+    deviceUpdates.updateAttemptStartedAt = null;
+    deviceUpdates.updateAttemptLastAt = null;
+    deviceUpdates.updateAttemptCount = null;
+  }
+
+  // #6925 — persist the agent's Breeze Assist install problem ("enabled but
+  // not installed, no server offer", or an abandoned install) so it shows on
+  // the device page and device list instead of one agent-side log line.
+  // Absent = no problem (the agent omits the field when healthy, and older
+  // agents never send it), so a stale value self-clears. Same state-change-only
+  // write as #6449 above: steady-state beats add no column write.
+  const helperInstallIssue = data.helperInstallIssue ?? null;
+  if ((device.helperInstallIssue ?? null) !== helperInstallIssue) {
+    deviceUpdates.helperInstallIssue = helperInstallIssue;
+    deviceUpdates.helperInstallIssueSince = helperInstallIssue ? new Date() : null;
+  }
+
   // #800 Layer C — recovery side. If the asymmetry detector previously
   // set mainAgentSilentSince (watchdog kept reporting while we went
   // dark), clear it now that the main agent is heartbeating again. No
@@ -952,8 +1061,25 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // 'auto' is the fleet-wide default, so without the inequality check every
   // steady-state heartbeat would look like a filterable change and trigger a
   // dynamic-group re-evaluation (#4630 review).
+  //
+  // A flip INTO a privileged role (server/DC-style dynamic-group targeting)
+  // is agent-reported and server-unverified, so it is not auto-applied: the
+  // stored role is left as-is and the claim is audit-logged for review
+  // instead of silently granted the group memberships that role targets.
   if (data.deviceRole && device.deviceRoleSource === 'auto' && data.deviceRole !== device.deviceRole) {
-    deviceUpdates.deviceRole = data.deviceRole;
+    if (shouldAutoApplyAgentReportedDeviceRole(device.deviceRole, data.deviceRole)) {
+      deviceUpdates.deviceRole = data.deviceRole;
+    } else {
+      writeAuditEvent(c, {
+        orgId: agent.orgId,
+        action: 'device.role.self_reported_privileged_flip_blocked',
+        resourceType: 'device',
+        resourceId: device.id,
+        result: 'success',
+        actorType: 'agent',
+        details: { from: device.deviceRole, reported: data.deviceRole },
+      });
+    }
   }
 
   // Keep devices.watchdog_version fresh from the main agent's heartbeat (#1802).
@@ -1226,19 +1352,21 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     }
     // agentServerUrl / tccPermissions / desktopAccess are written unconditionally
     // when reported, so compare against the pre-update snapshot to avoid auditing
-    // an unchanged re-report.
+    // an unchanged re-report. tcc/desktop MUST use the semantic comparators, not
+    // a JSON diff: their `checkedAt` moves on every beat, and a raw diff chained
+    // one audit row per macOS/Linux device per heartbeat (#4340).
     if (deviceUpdates.agentServerUrl !== undefined && deviceUpdates.agentServerUrl !== device.agentServerUrl) {
       changes.push({ field: 'agentServerUrl', before: device.agentServerUrl ?? null, after: deviceUpdates.agentServerUrl });
     }
     if (
       deviceUpdates.tccPermissions !== undefined &&
-      JSON.stringify(deviceUpdates.tccPermissions) !== JSON.stringify(device.tccPermissions ?? null)
+      tccPermissionsMeaningfullyChanged(device.tccPermissions, deviceUpdates.tccPermissions as TCCPermissions)
     ) {
       changes.push({ field: 'tccPermissions', before: device.tccPermissions ?? null, after: deviceUpdates.tccPermissions });
     }
     if (
       deviceUpdates.desktopAccess !== undefined &&
-      JSON.stringify(deviceUpdates.desktopAccess) !== JSON.stringify(device.desktopAccess ?? null)
+      desktopAccessMeaningfullyChanged(device.desktopAccess, deviceUpdates.desktopAccess as DesktopAccessState)
     ) {
       changes.push({ field: 'desktopAccess', before: device.desktopAccess ?? null, after: deviceUpdates.desktopAccess });
     }
@@ -1258,6 +1386,39 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       const nowSet = (deviceUpdates.mainAgentSilentSince ?? null) !== null;
       if (wasSet !== nowSet) {
         changes.push({ field: 'mainAgentSilent', before: wasSet, after: nowSet });
+      }
+    }
+
+    // Backup helper protocols dropping below the stored value (a helper
+    // downgrade or reinstall, or an agent that stopped reporting them). Each
+    // drop is recorded per device (the metrics have no device dimension) as a
+    // state change AND a dedicated capability-regression audit event, so an
+    // unexpected downgrade can be found and followed. The stored value is
+    // rewritten by this same guarded write, so a steady report afterwards is
+    // not a drop and is not audited again.
+    for (const [capability, field] of BACKUP_HELPER_CAPABILITY_FIELDS) {
+      const before = Number(device[field] ?? 0);
+      const after = Number(deviceUpdates[field] ?? 0);
+      if (!(after < before)) continue;
+      changes.push({ field, before, after });
+      writeAuditEvent(c, {
+        orgId: device.orgId,
+        actorType: 'agent',
+        actorId: agentId,
+        action: 'device.backup_capability.regressed',
+        resourceType: 'device',
+        resourceId: device.id,
+        result: 'success',
+        details: { capability, before, after },
+      });
+      recordBackupCapabilityRegressed(capability);
+      if (capability === 'read') {
+        console.warn('[heartbeat] backup read protocol dropped; restore commands for this device are refused until its backup helper is updated', {
+          deviceId: device.id,
+          orgId: device.orgId,
+          before,
+          after,
+        });
       }
     }
 
@@ -1313,8 +1474,8 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // recovery / drop without requiring a remount. Mirrors the agentVersion
   // publish above; guarded on deviceUpdates.desktopAccess (only set when the
   // agent actually reported the field) diffed against the pre-update
-  // snapshot with desktopAccessMeaningfullyChanged — a raw JSON.stringify
-  // diff (as the state-change audit above uses) would fire on every
+  // snapshot with desktopAccessMeaningfullyChanged (as the state-change audit
+  // above also does, #4340) — a raw JSON.stringify diff would fire on every
   // heartbeat because `checkedAt` is refreshed unconditionally by the agent.
   //
   // `deviceUpdates` is a loosely-typed `Record<string, unknown>`, so TS
@@ -1556,33 +1717,33 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     if (
       shouldConsiderEditionMigration({ device, normalizedArch, updateGateAllows })
     ) {
-      // runOutsideDbContext + system context is load-bearing, not defensive:
-      // this promise is detached, and the surrounding org-scoped
-      // withDbAccessContext TRANSACTION commits when the handler returns — a
-      // detached query on the ambient context would run against the dead tx
-      // handle (same reason as the manifest-trust keyset at the top of this
-      // handler, #1105). System context is safe: everything dispatched was
-      // validated in the org-scoped block, the claim re-binds to the device's
-      // org and liveness, and dispatchScriptToDevice's org-equality invariant
-      // still applies.
+      // runOutsideDbContext is load-bearing, not defensive: this promise is
+      // detached, and the surrounding org-scoped withDbAccessContext
+      // TRANSACTION commits when the handler returns — a detached query on the
+      // ambient context would run against the dead tx handle (same reason as
+      // the manifest-trust keyset at the top of this handler, #1105). The
+      // service opens its OWN system context for the claim and the command
+      // rows and sends only after it commits (#7103) — wrapping it in one here
+      // would make the send precede that commit again. System context is safe:
+      // everything dispatched was validated in the org-scoped block, the claim
+      // re-binds to the device's org and liveness, and dispatchScriptToDevice's
+      // org-equality invariant still applies.
       runOutsideDbContext(() =>
-        withSystemDbAccessContext(() =>
-          maybeDispatchEditionMigration({
-            device,
-            reportedAgentVersion: data.agentVersion,
-            normalizedArch,
-            updateGateAllows,
-            pin: versionPins.agent,
-            resolveTarget: () =>
-              resolvePinnedUpgradeTarget({
-                component: 'agent',
-                platform: device.osType,
-                architecture: normalizedArch,
-                pin: versionPins.agent,
-                agentId,
-              }),
-          }),
-        ),
+        maybeDispatchEditionMigration({
+          device,
+          reportedAgentVersion: data.agentVersion,
+          normalizedArch,
+          updateGateAllows,
+          pin: versionPins.agent,
+          resolveTarget: () =>
+            resolvePinnedUpgradeTarget({
+              component: 'agent',
+              platform: device.osType,
+              architecture: normalizedArch,
+              pin: versionPins.agent,
+              agentId,
+            }),
+        }),
         // The service catches everything itself; this catch only exists so a
         // future regression there can never surface as an unhandled rejection
         // on the heartbeat hot path.
@@ -1717,17 +1878,6 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     }
   }
 
-  let renewCert = false;
-  if (device.mtlsCertExpiresAt && device.mtlsCertIssuedAt) {
-    const now = Date.now();
-    const issuedMs = device.mtlsCertIssuedAt.getTime();
-    const expiresMs = device.mtlsCertExpiresAt.getTime();
-    const renewalThreshold = issuedMs + ((expiresMs - issuedMs) * 2) / 3;
-    if (now >= renewalThreshold) {
-      renewCert = true;
-    }
-  }
-
   // Helper settings are resolved AFTER this org-scoped block closes (#1105
   // pattern — see below): a partner-wide helper policy (org_id NULL) is
   // invisible under this context's RLS (accessiblePartnerIds: [] above), so
@@ -1795,68 +1945,17 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   mergedConfigUpdate.require_manifest_signing_key_id =
     (process.env.AGENT_REQUIRE_MANIFEST_SIGNING_KEY_ID ?? '').trim().toLowerCase() === 'true';
 
-  const authenticatedWithPreviousToken = c.get('agentTokenRotationRequired') === true;
-
-  // Issue #2621 — a staged rotation is still outstanding. Don't ask for another
-  // one (that would churn the staged set and re-open the divergence window);
-  // ask the agent to finish the one it has. This is also the recovery path for
-  // an agent that persisted the new credentials and then crashed before
-  // confirming: it reconnects on the staged token and gets told to confirm.
-  let pendingRotationLive =
-    !!device.pendingTokenHash &&
-    !!device.pendingTokenExpiresAt &&
-    device.pendingTokenExpiresAt > new Date();
-
-  // Issue #2621 — IMPLICIT PROMOTION. The agent is authenticating with the
-  // staged credential, which is the same proof of durable possession that
-  // /rotate-token/confirm requires, so promote it here too.
-  //
-  // This is what keeps PRE-#2621 agents alive. An old agent overwrites its own
-  // token file on rotation and never calls confirm; without this it would run on
-  // the pending hash until the staging window closed and then be locked out
-  // permanently, with no way to self-heal (rotateToken is suppressed while a
-  // rotation is staged, and after expiry it can no longer authenticate at all).
-  // It also backstops a current agent whose confirm response was lost in flight.
-  if (pendingRotationLive && c.get('agentPendingTokenPresented') === true && device.agentTokenHash) {
-    try {
-      const promoted = await promotePendingAgentCredentials({
-        deviceId: device.id,
-        pendingTokenHash: device.pendingTokenHash!,
-        expectedAgentTokenHash: device.agentTokenHash,
-        pendingWatchdogTokenHash: device.pendingWatchdogTokenHash,
-        pendingHelperTokenHash: device.pendingHelperTokenHash,
-        watchdogTokenHash: device.watchdogTokenHash,
-        helperTokenHash: device.helperTokenHash,
-      });
-      if (promoted) {
-        pendingRotationLive = false;
-      }
-    } catch (err) {
-      // Best-effort: the staged credential still authenticates for the rest of
-      // its window, and confirm/the next heartbeat will retry the promotion.
-      console.error('[heartbeat] implicit pending-rotation promotion failed:', err);
-    }
-  }
-
-  // #3997 — do not ASK for a rotation the mint route will now refuse.
-  // `rotate-token` is off the tenant drain surface (agentAuth's
-  // TENANT_DRAIN_ALLOWED_ACTIONS) and the route itself fails closed on a
-  // drain, so signalling it here would have every agent in an offboarding
-  // tenant attempt a mint it cannot complete on EVERY heartbeat for the whole
-  // window (OFFBOARDING_DRAIN_WINDOW_HOURS, 72h by default), logging a rotation
-  // failure each time. Suppressing the signal changes nothing about safety —
-  // `handleTokenRotation` in agent/internal/heartbeat logs and returns, never
-  // gating the heartbeat or touching on-disk credentials — it only stops a
-  // guaranteed-useless round trip and its error noise.
-  //
-  // Only the TENANT drain is checked: `deviceUninstallDraining` returns from
-  // the minimal drain beat at the top of this handler and never reaches here,
-  // so testing it too would be unreachable code.
-  const rotateToken =
-    !agent?.tenantDraining &&
-    !authenticatedWithPreviousToken &&
-    !pendingRotationLive &&
-    (!device.watchdogTokenHash || isAgentTokenRotationDue(device.tokenIssuedAt));
+  // Certificate renewal, token rotation and staged-rotation confirmation —
+  // computed once, the same way the parked beat computes them
+  // (./heartbeatCredentialMaintenance.ts). Runs inside this org context
+  // because the implicit staged-rotation promotion writes the device row.
+  const credentialMaintenance = await computeCredentialMaintenance({
+    device,
+    tenantDraining: agent?.tenantDraining === true,
+    authenticatedWithPreviousToken: c.get('agentTokenRotationRequired') === true,
+    pendingTokenPresented: c.get('agentPendingTokenPresented') === true,
+    presentedTokenHash: agent.authTokenHash,
+  });
 
   let manageRemoteManagement = false;
   try {
@@ -1879,6 +1978,11 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     reportedScriptSecretEnvVersion: normalizeReportedScriptSecretEnvVersion(
       data.securityCapabilities?.scriptSecretEnvVersion,
     ),
+    // Same reasoning for the backup helper's protocols: this beat's report
+    // is authoritative over the (guarded) device write.
+    reportedBackupReadProtocolVersion: normalizeBackupReadProtocolVersion(data.backupReadProtocolVersion),
+    reportedBackupIntegrityProtocolVersion: normalizeBackupIntegrityProtocolVersion(data.backupIntegrityProtocolVersion),
+    reportedBackupWriteProtocolVersion: normalizeBackupWriteProtocolVersion(data.backupWriteProtocolVersion),
   });
 
   let networkContextReceipt;
@@ -1915,13 +2019,10 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       upgradeTo,
       helperUpgradeTo: helperUpgradeTo ?? undefined,
       watchdogUpgradeTo: watchdogUpgradeTo ?? undefined,
-      renewCert: renewCert || undefined,
-      rotateToken: rotateToken || undefined,
-      // Issue #2621 — set when the caller authenticated with the STAGED
-      // credential, i.e. it demonstrably holds the new token but never
-      // confirmed. Tells the agent to call /rotate-token/confirm and finish.
-      confirmTokenRotation:
-        (pendingRotationLive && c.get('agentPendingTokenPresented') === true) || undefined,
+      renewCert: credentialMaintenance.renewCert,
+      rotateToken: credentialMaintenance.rotateToken,
+      // Issue #2621 — see heartbeatCredentialMaintenance.ts.
+      confirmTokenRotation: credentialMaintenance.confirmTokenRotation,
       // helperEnabled/helperSettings are merged in AFTER this org-scoped block
       // closes — see the #1105 comment below. uacInterceptionEnabled likewise
       // (#2930): the pam resolver moved out with the other policy readers.
@@ -2105,6 +2206,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     patchSourceSettings: { exclusiveWindowsUpdate: boolean } | null;
     warrantySettings: { hpCmslEnabled: boolean } | null;
     hardwareMonitoringSettings: Awaited<ReturnType<typeof buildHardwareMonitoringConfigUpdate>> | null;
+    timeSyncSettings: Awaited<ReturnType<typeof buildTimeSyncConfigUpdate>> | null;
   };
   let policyConfigs: PolicyConfigUpdates = {
     eventLogSettings: null,
@@ -2113,6 +2215,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     patchSourceSettings: null,
     warrantySettings: null,
     hardwareMonitoringSettings: null,
+    timeSyncSettings: null,
   };
   try {
     policyConfigs = await withSystemDbAccessContext(async (): Promise<PolicyConfigUpdates> => {
@@ -2122,6 +2225,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       let patchSourceSettings: { exclusiveWindowsUpdate: boolean } | null = null;
       let warrantySettings: { hpCmslEnabled: boolean } | null = null;
       let hardwareMonitoringSettings: Awaited<ReturnType<typeof buildHardwareMonitoringConfigUpdate>> | null = null;
+      let timeSyncSettings: Awaited<ReturnType<typeof buildTimeSyncConfigUpdate>> | null = null;
 
       // Sentry on all four, not just pam/patch_source. Losing an event_log or
       // monitoring policy is precisely the invisible failure #2930 is about:
@@ -2189,7 +2293,27 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         captureException(err);
       }
 
-      return { eventLogSettings, monitoringSettings, pamSettings, patchSourceSettings, warrantySettings, hardwareMonitoringSettings };
+      // Time sync (index §F.2). After warranty for the same reason warranty is
+      // late: a resolver error here only ever omits time_sync_settings (the
+      // agent keeps its last applied settings), and placing it after pam means
+      // its SQL error can never abort the shared transaction before pam
+      // resolves and drop uacInterceptionEnabled to false.
+      try {
+        timeSyncSettings = await buildTimeSyncConfigUpdate(scoped.deviceId);
+      } catch (err) {
+        console.error(`[agents] failed to build time sync config update for ${agentId}:`, err);
+        captureException(err);
+      }
+
+      return {
+        eventLogSettings,
+        monitoringSettings,
+        pamSettings,
+        patchSourceSettings,
+        warrantySettings,
+        hardwareMonitoringSettings,
+        timeSyncSettings,
+      };
     });
   } catch (err) {
     // Transaction setup/commit failure — see the note above. Every resolver's
@@ -2198,7 +2322,15 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     console.error(`[agents] policy config context failed for ${agentId} — omitting config updates this heartbeat:`, err);
     captureException(err);
   }
-  const { eventLogSettings, monitoringSettings, pamSettings, patchSourceSettings, warrantySettings, hardwareMonitoringSettings } = policyConfigs;
+  const {
+    eventLogSettings,
+    monitoringSettings,
+    pamSettings,
+    patchSourceSettings,
+    warrantySettings,
+    hardwareMonitoringSettings,
+    timeSyncSettings,
+  } = policyConfigs;
 
   const policyConfigUpdate: Record<string, unknown> = {};
   if (eventLogSettings) {
@@ -2206,6 +2338,9 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   }
   if (hardwareMonitoringSettings) {
     policyConfigUpdate.hardware_monitoring_settings = hardwareMonitoringSettings;
+  }
+  if (timeSyncSettings) {
+    policyConfigUpdate.time_sync_settings = timeSyncSettings;
   }
   // null = couldn't resolve this cycle (device vanished mid-resolution, #5677,
   // or the resolver threw) → omit, and the agent keeps its watches. "No
@@ -2275,19 +2410,38 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   });
 });
 
+/**
+ * Upper bound on check results accepted in one monitoring-results submit. The
+ * agent sends one result per configured watch per check cycle; a policy holds
+ * at most 200 watches (monitoringInlineSettingsSchema) and monitor-derived
+ * watches are unioned on top, so this leaves generous headroom while bounding
+ * the per-request insert and the per-result Redis/event work below.
+ */
+export const MAX_MONITORING_RESULTS_PER_REQUEST = 1000;
+
 // Receive service/process monitoring check results from agent
 heartbeatRoutes.put('/:id/monitoring-results', bodyLimit({ maxSize: 1024 * 1024, onError: (c) => c.json({ error: 'Request body too large' }, 413) }), async (c) => {
   const agentId = c.req.param('id');
+  const agent = c.get('agent') as { orgId?: string; partnerId?: string | null } | undefined;
 
-  const [device] = await db
-    .select()
-    .from(devices)
-    .where(eq(devices.agentId, agentId))
-    .limit(1);
-
-  if (!device) {
-    return c.json({ error: 'Device not found' }, 404);
+  // `monitoring-results` is in SELF_MANAGED_DB_CONTEXT_ACTIONS (agentAuth.ts):
+  // the middleware opens no request-long transaction here, so this handler
+  // builds its own org-scoped context from the authenticated agent. Fail fast
+  // rather than build a vacuous context that would RLS-deny every read.
+  if (!agent?.orgId) {
+    console.error(`[monitoring] monitoring-results submit with no org context agent=${agentId}`);
+    return c.json({ error: 'Agent context missing organization' }, 401);
   }
+  const dbContext = {
+    scope: 'organization' as const,
+    orgId: agent.orgId,
+    accessibleOrgIds: [agent.orgId],
+    // Partner-AXIS access (breeze_has_partner_access → writes) stays empty.
+    accessiblePartnerIds: [],
+    // Self-managed context: carry the partner id across explicitly, exactly
+    // as the heartbeat / eventlogs handlers do.
+    currentPartnerId: agent.partnerId ?? null,
+  };
 
   let body: { results: Array<Record<string, unknown>> };
   try {
@@ -2299,77 +2453,130 @@ heartbeatRoutes.put('/:id/monitoring-results', bodyLimit({ maxSize: 1024 * 1024,
   if (!Array.isArray(body?.results) || body.results.length === 0) {
     return c.json({ error: 'results array required' }, 400);
   }
+  if (body.results.length > MAX_MONITORING_RESULTS_PER_REQUEST) {
+    return c.json({
+      error: 'Too many results in one request',
+      maxResults: MAX_MONITORING_RESULTS_PER_REQUEST,
+    }, 413);
+  }
 
   const { serviceProcessCheckResults } = await import('../../db/schema');
   const { getRedis } = await import('../../services/redis');
   const { publishEvent } = await import('../../services/eventBus');
 
-  const insertValues = body.results.map((r) => ({
-    orgId: device.orgId,
-    deviceId: device.id,
-    watchType: (r.watchType === 'service' ? 'service' : 'process') as 'service' | 'process',
-    name: String(r.name ?? ''),
-    status: (['running', 'stopped', 'not_found', 'error'].includes(r.status as string) ? r.status : 'error') as 'running' | 'stopped' | 'not_found' | 'error',
-    cpuPercent: typeof r.cpuPercent === 'number' ? r.cpuPercent : null,
-    memoryMb: typeof r.memoryMb === 'number' ? r.memoryMb : null,
-    pid: typeof r.pid === 'number' ? r.pid : null,
-    // #2434: details is an agent-supplied free-form blob surfaced in the
-    // service-monitoring UI — redact secret-shaped strings before persistence.
-    details: (r.details && typeof r.details === 'object') ? redactSecretsDeep(r.details) : null,
-    autoRestartAttempted: r.autoRestartAttempted === true,
-    autoRestartSucceeded: typeof r.autoRestartSucceeded === 'boolean' ? r.autoRestartSucceeded : null,
-  }));
+  // Phase 1 (one short org-scoped context): resolve the device and persist
+  // the batch. Nothing but DB work runs while this transaction is open.
+  type StoreOutcome =
+    | { kind: 'not_found' }
+    | { kind: 'insert_failed' }
+    | {
+        kind: 'stored';
+        device: { id: string; orgId: string; siteId: typeof devices.$inferSelect['siteId'] };
+        insertValues: Array<{ name: string; watchType: 'service' | 'process'; status: 'running' | 'stopped' | 'not_found' | 'error' }>;
+      };
+  const outcome = await withDbAccessContext(dbContext, async (): Promise<StoreOutcome> => {
+    const [device] = await db
+      .select()
+      .from(devices)
+      .where(eq(devices.agentId, agentId))
+      .limit(1);
 
-  // Batch insert results
-  try {
-    await db.insert(serviceProcessCheckResults).values(insertValues);
-  } catch (err) {
-    console.error(`[monitoring] failed to insert check results for device ${device.id}:`, err);
+    if (!device) {
+      return { kind: 'not_found' };
+    }
+
+    const insertValues = body.results.map((r) => ({
+      orgId: device.orgId,
+      deviceId: device.id,
+      watchType: (r.watchType === 'service' ? 'service' : 'process') as 'service' | 'process',
+      name: String(r.name ?? ''),
+      status: (['running', 'stopped', 'not_found', 'error'].includes(r.status as string) ? r.status : 'error') as 'running' | 'stopped' | 'not_found' | 'error',
+      cpuPercent: typeof r.cpuPercent === 'number' ? r.cpuPercent : null,
+      memoryMb: typeof r.memoryMb === 'number' ? r.memoryMb : null,
+      pid: typeof r.pid === 'number' ? r.pid : null,
+      // #2434: details is an agent-supplied free-form blob surfaced in the
+      // service-monitoring UI — redact secret-shaped strings before persistence.
+      details: (r.details && typeof r.details === 'object') ? redactSecretsDeep(r.details) : null,
+      autoRestartAttempted: r.autoRestartAttempted === true,
+      autoRestartSucceeded: typeof r.autoRestartSucceeded === 'boolean' ? r.autoRestartSucceeded : null,
+    }));
+
+    // Batch insert results
+    try {
+      await db.insert(serviceProcessCheckResults).values(insertValues);
+    } catch (err) {
+      console.error(`[monitoring] failed to insert check results for device ${device.id}:`, err);
+      return { kind: 'insert_failed' };
+    }
+
+    return {
+      kind: 'stored',
+      device: { id: device.id, orgId: device.orgId, siteId: device.siteId },
+      insertValues: insertValues.map(({ name, watchType, status }) => ({ name, watchType, status })),
+    };
+  });
+
+  if (outcome.kind === 'not_found') {
+    return c.json({ error: 'Device not found' }, 404);
+  }
+  if (outcome.kind === 'insert_failed') {
     return c.json({ error: 'Failed to store results' }, 500);
   }
+  const { device, insertValues } = outcome;
 
-  // Track consecutive failures in Redis and manage alerts
+  // Phase 2 (no DB context held): track consecutive failures in Redis and
+  // publish the real-time events. One pipelined round trip for the whole
+  // batch instead of one-to-two sequential round trips per result.
   const redis = getRedis();
-  for (const result of insertValues) {
-    const failureKey = `svc-mon:${device.id}:${result.name}:failures`;
+  if (redis) {
+    const keyFor = (name: string) => `svc-mon:${device.id}:${name}:failures`;
+    const pipeline = redis.pipeline();
+    for (const result of insertValues) {
+      const failureKey = keyFor(result.name);
+      if (result.status !== 'running') {
+        pipeline.incr(failureKey);
+        pipeline.expire(failureKey, 3600); // TTL 1h
+      } else {
+        pipeline.get(failureKey);
+        pipeline.del(failureKey);
+      }
+    }
 
-    if (result.status !== 'running') {
-      // Increment consecutive failure counter
-      if (redis) {
-        try {
-          const count = await redis.incr(failureKey);
-          await redis.expire(failureKey, 3600); // TTL 1h
+    let replies: Array<[Error | null, unknown]> | null = null;
+    try {
+      replies = (await pipeline.exec()) as Array<[Error | null, unknown]> | null;
+    } catch (err) {
+      console.warn(`[monitoring] Redis failure counter pipeline error for ${device.id}:`, err);
+    }
+
+    if (replies) {
+      // Each result queued exactly two commands, in order; the first reply of
+      // each pair carries the value the event needs.
+      insertValues.forEach((result, i) => {
+        const [err, value] = replies![i * 2] ?? [new Error('missing reply'), null];
+        if (err) {
+          console.warn(`[monitoring] Redis failure counter error for ${device.id}/${result.name}:`, err);
+          return;
+        }
+        if (result.status !== 'running') {
           // Publish event for real-time UI updates
           publishEvent(
             'monitoring.check_failed',
             device.orgId,
-            { deviceId: device.id, name: result.name, watchType: result.watchType, status: result.status, consecutiveFailures: count },
+            { deviceId: device.id, name: result.name, watchType: result.watchType, status: result.status, consecutiveFailures: Number(value) },
             'agent-monitoring',
             { siteId: device.siteId }
           );
-        } catch (err) {
-          console.warn(`[monitoring] Redis failure counter error for ${device.id}/${result.name}:`, err);
+        } else if (value && Number(value) > 0) {
+          publishEvent(
+            'monitoring.check_recovered',
+            device.orgId,
+            { deviceId: device.id, name: result.name, watchType: result.watchType, previousFailures: Number(value) },
+            'agent-monitoring',
+            { siteId: device.siteId }
+          );
         }
-      }
-    } else {
-      // Reset failure counter on recovery
-      if (redis) {
-        try {
-          const prevCount = await redis.get(failureKey);
-          await redis.del(failureKey);
-          if (prevCount && Number(prevCount) > 0) {
-            publishEvent(
-              'monitoring.check_recovered',
-              device.orgId,
-              { deviceId: device.id, name: result.name, watchType: result.watchType, previousFailures: Number(prevCount) },
-              'agent-monitoring',
-              { siteId: device.siteId }
-            );
-          }
-        } catch (err) {
-          console.warn(`[monitoring] Redis failure reset error for ${device.id}/${result.name}:`, err);
-        }
-      }
+      });
     }
   }
 

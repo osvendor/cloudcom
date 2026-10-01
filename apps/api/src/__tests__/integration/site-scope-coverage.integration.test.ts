@@ -184,6 +184,13 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   // `eq(…, device.id)` for the agent authenticated by agentBearerAuthMiddleware.
   // Surfaced by #4019 — the writes sit well past the old 4000-byte window.
   'routes/agents/mtls.ts:POST /renew-cert',
+  // Agent-token security-status ingest (requireAgentRole + agentAuthMiddleware
+  // on agentRoutes '/:id/*'). #4340's change-only audit added a pre-read of
+  // `securityStatus` keyed on `device.id`, where `device` is resolved from the
+  // authenticated agent's own `:id` (token hash bound to that agentId). No
+  // user session, no caller-supplied device selector, so allowedSiteIds never
+  // applies.
+  'routes/agents/security.ts:PUT /:id/security/status',
   'routes/agents/sessions.ts:PUT /:id/sessions',
   'routes/agents/state.ts:PUT /:id/config-state',
   'routes/agents/state.ts:PUT /:id/registry-state',
@@ -194,6 +201,11 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   // helperAuth device-token path; query pinned to the caller's own device via
   // eq(aiSessions.deviceId, device.id) (#2637 client-declared tool results).
   'routes/helper/index.ts:POST /chat/sessions/:id/tool-results',
+  // helperAuth device-token path: the optional sessionId ownership check is
+  // pinned to the token's own device (eq(aiSessions.deviceId, device.id)) and
+  // the screenshot is stored against device.id from the token, never a
+  // caller-supplied device selector.
+  'routes/helper/index.ts:POST /screenshots',
   'routes/tunnels.ts:GET /desktop-access',
   'routes/tunnels.ts:POST /downgrade-to-vnc',
   'routes/tunnels.ts:POST /upgrade-to-webrtc',
@@ -240,12 +252,13 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   // apply site scope directly (RMM-QA-221), as do the earlier metrics fixes.
   'routes/huntress.ts:GET /status',
   'routes/updateRings.ts:GET /:id/compliance',
-  // Org-scoped compliance list, identical posture to its sibling routes
-  // (/firewall, /trends) which resolve rows through the same org-scoped
-  // listStatusRows helper. Flagged only because the recovery-key escrow
-  // enrichment references deviceRecoveryKeys.deviceId inline — and that
-  // lookup is constrained (inArray) to the device ids listStatusRows already
-  // resolved, so it discloses no device beyond the caller's accessible orgs.
+  // Compliance list, identical posture to its sibling routes (/firewall,
+  // /password-policy) which resolve rows through the same listStatusRows
+  // helper — org-scoped and narrowed in SQL to the caller's allowed sites.
+  // Flagged only because the recovery-key escrow enrichment references
+  // deviceRecoveryKeys.deviceId inline — and that lookup is constrained
+  // (inArray) to the device ids listStatusRows already resolved, so it
+  // discloses no device beyond the caller's accessible orgs and sites.
   'routes/security/compliance.ts:GET /encryption',
   // ---- Newly VISIBLE to the widened detector (#4019); posture unchanged.
   // Public bare-metal-recovery bootstrap (mounted on `bmrPublicRoutes`, BEFORE
@@ -306,9 +319,9 @@ const SITE_SCOPE_INPUT_EXEMPT_USER_SESSION_OK: ReadonlySet<string> = new Set<str
   'routes/backup/bmr.ts:POST /bmr/recover/authenticate',
   'routes/orgSummary.ts:GET /organizations/:id/summary',
   'routes/updateRings.ts:GET /:id/compliance',
-  // Org-scoped compliance list (see note in SITE_SCOPE_INPUT_EXEMPT). Reached
-  // via user auth (requireScope) but exempt because the escrow enrichment is
-  // constrained to the org-scoped device set listStatusRows already resolved.
+  // Compliance list (see note in SITE_SCOPE_INPUT_EXEMPT). Reached via user
+  // auth (requireScope) but exempt because the escrow enrichment is constrained
+  // to the org- and site-scoped device set listStatusRows already resolved.
   'routes/security/compliance.ts:GET /encryption',
 ]);
 

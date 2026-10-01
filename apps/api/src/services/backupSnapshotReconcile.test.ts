@@ -40,6 +40,15 @@ function chainMock(resolvedValue: unknown = []) {
 
 const selectMock = vi.fn(() => chainMock([]));
 
+const snapshotIdClaims = vi.hoisted(() => ({ foreign: new Set<string>(), live: new Set<string>(), currentJobs: new Map<string, string>() }));
+vi.mock('./backupSnapshotIdReservations', () => ({
+  loadSnapshotIdClaims: vi.fn(async () => ({
+    foreign: new Set(snapshotIdClaims.foreign),
+    live: new Set(snapshotIdClaims.live),
+    currentJobs: new Map(snapshotIdClaims.currentJobs),
+  })),
+}));
+
 vi.mock('../db', () => ({
   db: { select: (...args: unknown[]) => selectMock(...(args as [])) },
   runOutsideDbContext: (fn: () => unknown) => fn(),
@@ -120,6 +129,7 @@ vi.mock('./backupSnapshotStorage', () => ({
     })();
   },
   fetchBackupObjectText: (...args: unknown[]) => fetchBackupObjectTextMock(...(args as [])),
+  MANIFEST_FETCH_MAX_BYTES: 200 * 1024 * 1024,
 }));
 
 const applyBackupCommandResultToJobMock = vi.fn();
@@ -254,6 +264,31 @@ describe('reconcileOrphanedBackupSnapshots', () => {
       reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID })
     ).rejects.toBeInstanceOf(BackupReconcileError);
     expect(listBackupObjectsUnderPrefixMock).not.toHaveBeenCalled();
+  });
+
+  it('never adopts an id still reserved to a live backup, and refuses one reserved to another org', async () => {
+    oneManifest('snap-1');
+    fetchBackupObjectTextMock.mockResolvedValue(manifest('snap-1'));
+    queueSelects(baseSelects([claimingJob({ status: 'running' })]));
+    snapshotIdClaims.live.add('snap-1');
+    try {
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+      expect(result.adopted).toBe(0);
+      expect(result.candidates[0]).toMatchObject({ snapshotId: 'snap-1', skipReason: 'reserved-for-active-backup' });
+    } finally {
+      snapshotIdClaims.live.clear();
+    }
+
+    oneManifest('snap-1');
+    queueSelects(baseSelects([claimingJob()]));
+    snapshotIdClaims.foreign.add('snap-1');
+    try {
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+      expect(result.candidates[0]).toMatchObject({ skipReason: 'claimed-by-another-organization' });
+    } finally {
+      snapshotIdClaims.foreign.clear();
+    }
+    expect(applyBackupCommandResultToJobMock).not.toHaveBeenCalled();
   });
 
   it('adopts a snapshot the job already recorded mid-run', async () => {
@@ -489,6 +524,27 @@ describe('reconcileOrphanedBackupSnapshots', () => {
     expect(applyBackupCommandResultToJobMock.mock.calls[0]![0].jobId).toBe('job-newer');
   });
 
+  it('prefers the job a server-issued id is currently reserved to over a higher-ranked one', async () => {
+    // After another job took an unfinished id over, the earlier job still
+    // carries the id but may no longer publish it.
+    oneManifest();
+    fetchBackupObjectTextMock.mockResolvedValue(manifest('snap-1'));
+    snapshotIdClaims.currentJobs.set('snap-1', 'job-older');
+    try {
+      queueSelects(
+        baseSelects([
+          claimingJob({ id: 'job-newer', createdAt: new Date('2026-08-01T09:00:00Z') }),
+          claimingJob({ id: 'job-older', createdAt: new Date('2026-08-01T07:00:00Z') }),
+        ])
+      );
+      const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+      expect(result.adopted).toBe(1);
+      expect(applyBackupCommandResultToJobMock.mock.calls[0]![0].jobId).toBe('job-older');
+    } finally {
+      snapshotIdClaims.currentJobs.clear();
+    }
+  });
+
   it('refuses a snapshot ANOTHER org also claims, even when one of our own jobs claims it too', async () => {
     // The dedupe keeps one winner per snapshot id. Consulting only the winner
     // would let a same-org job mask a foreign claim and hand another tenant's
@@ -545,6 +601,17 @@ describe('reconcileOrphanedBackupSnapshots', () => {
     oneManifest();
     fetchBackupObjectTextMock.mockResolvedValue(manifest('snap-1'));
     queueSelects(baseSelects([claimingJob({ status: 'completed' })]));
+
+    const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
+
+    expect(result.adopted).toBe(1);
+    expect(applyBackupCommandResultToJobMock.mock.calls[0]![0].source).toBe('reconcile');
+  });
+
+  it('adopts a half-written completed_with_errors job the same way (#5396)', async () => {
+    oneManifest();
+    fetchBackupObjectTextMock.mockResolvedValue(manifest('snap-1'));
+    queueSelects(baseSelects([claimingJob({ status: 'completed_with_errors' })]));
 
     const result = await reconcileOrphanedBackupSnapshots({ orgId: ORG_ID, configId: CONFIG_ID });
 

@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// The holding-org refusal reads the org; the db mocks below do not model it.
+vi.mock('../services/unassignedPool/protectedOrg', () => ({ isHoldingOrg: vi.fn(async () => false) }));
 import { Hono } from 'hono';
 
 // Site-ceiling gate (§2) on PAM org config + signer groups. PAM *rules* keep
@@ -72,6 +75,7 @@ vi.mock('../services/permissions', () => ({
     DEVICES_EXECUTE: { resource: 'devices', action: 'execute' },
     PAM_APPROVE: { resource: 'pam', action: 'approve' },
     PAM_MANAGE_POLICY: { resource: 'pam', action: 'manage_policy' },
+    AUDIT_EXPORT: { resource: 'audit', action: 'export' },
   },
   canAccessSite: () => true,
 }));

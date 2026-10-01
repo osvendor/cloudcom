@@ -36,6 +36,7 @@ import {
 import { sanitizeErrorForClient } from './aiAgent';
 import { captureException, captureMessage } from './sentry';
 import { createBreezeMcpServer, BREEZE_MCP_TOOL_NAMES } from './aiAgentSdkTools';
+import type { TopologyTurnRuntime } from './topology/aiInvestigation';
 import { createSessionPreToolUse, createSessionPostToolUse, settleApprovalWaits } from './aiAgentSdk';
 import type { RequestLike } from './auditEvents';
 import { getTrustedClientIpOrUndefined } from './clientIp';
@@ -43,12 +44,15 @@ import { redactAiToolOutputText, redactSensitiveToolInput } from './aiToolOutput
 import { isRecognizedSelfHostSignal } from '../config/env';
 import { resolveWireModel, type ResolvedLlmEndpoint, type UsableLlmConfig } from './llm/llmConfigResolver';
 import { getLlmEgressProxy } from './llm/llmEgressProxy';
+import { PLATFORM_LLM_CREDENTIAL_ENV_KEYS } from './llm/llmAvailability';
 import { recordLlmEgressEvent } from './llm/llmEgressRecorder';
 import { markAiBudgetReservationIndeterminate } from './aiBudgetReservations';
 import { getEffectiveAiBudget } from './effectiveSettings';
 import { DEFAULT_APPROVAL_WAIT_BUDGET_MS, loadApprovalWaitBudgetMs } from './aiApprovalTimeout';
 import { resolveTenantTools, type TenantToolDescriptor } from './toolSources/resolver';
 import { buildTenantSdkTools, tenantMcpToolNames } from './toolSources/sdkBridge';
+import { isSdkBuiltinToolUse, resolveToolSearchPolicy } from './aiToolSearchPolicy';
+import { SDK_CHILD_HOST_CONTEXT_GUARDS } from './llm/sdkChildEnvGuards';
 
 const SESSION_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2h idle eviction (aligned with pre-flight check)
 const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24h hard limit
@@ -179,11 +183,9 @@ const SDK_CHILD_ENV_ALLOWLIST = [
   'COMSPEC',
 ] as const;
 
-const SDK_CHILD_ENV_CREDENTIAL_KEYS = new Set<string>([
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_AUTH_TOKEN',
-  'CLAUDE_CODE_OAUTH_TOKEN',
-]);
+// The platform credentials — the same set `isPlatformLlmConfigured` counts as
+// "a model provider is configured", so readiness and the subprocess agree.
+const SDK_CHILD_ENV_CREDENTIAL_KEYS = new Set<string>(PLATFORM_LLM_CREDENTIAL_ENV_KEYS);
 
 /**
  * Proxy configuration the parent process may carry. Forwarded as-is for
@@ -221,6 +223,10 @@ export function buildClaudeSdkChildEnv(
   const env: Record<string, string> = {
     CI: 'true',
     CLAUDE_AGENT_SDK_CLIENT_APP: source.CLAUDE_AGENT_SDK_CLIENT_APP ?? 'breeze-api/ai-agent',
+    // HOME is forwarded below; without these the CLI prepends the host's
+    // Claude Code auto-memory to every request (#7444). Shared by every return
+    // path because they all return this object.
+    ...SDK_CHILD_HOST_CONTEXT_GUARDS,
   };
 
   for (const key of SDK_CHILD_ENV_ALLOWLIST) {
@@ -538,8 +544,10 @@ export interface ActiveSession {
   /**
    * Effective AuthContext for TOOL EXECUTION (MCP handlers + their RLS DB
    * context). For device-bound sessions this is `auth` narrowed to the
-   * session (device) org via `buildDeviceBoundSessionAuth` (#3087); otherwise
-   * it is `auth` itself. Refreshed alongside `auth` on every request.
+   * session (device) org via `buildDeviceBoundSessionAuth` (#3087). For a
+   * device-PAGE session it is `auth` plus `aiWriteDefaultOrgId` (#6675), with
+   * no narrowing. Otherwise it is `auth` itself. Built by
+   * `buildChatSessionToolAuth`, refreshed alongside `auth` on every request.
    */
   toolAuth: AuthContext;
   /** Immutable audit data extracted from the latest request (avoids holding stale Hono context) */
@@ -608,6 +616,28 @@ export interface ActiveSession {
   approvalWaitBudgetMs: number;
   /** Optional MCP allowlist for restricted sessions such as helper chat. */
   allowedTools?: string[];
+  /**
+   * Topology M4 Task 3 (#6000): the host-owned investigation runtime for the
+   * CURRENT turn of a topology session (bound by the route through
+   * `tryTransitionToProcessing` — only when it wins the slot — and cleared
+   * when the turn ends). While set, provider text goes into
+   * its output gate instead of the event bus, tool events are replaced by
+   * fixed `topology_progress` phases, raw assistant content is never
+   * persisted, and the turn ends with one validated `topology_explanation`.
+   * Client page context is never authority for it.
+   */
+  topologyInvestigation?: TopologyTurnRuntime;
+  /** Set when a topology token cap stopped the turn; the result then ends in a fixed error. */
+  topologyStopped?: boolean;
+  /**
+   * Set (and never cleared) when a topology turn timed out. The timeout tears
+   * the session down — SDK aborted, query closed — and this seal keeps the
+   * output gate shut for anything the provider still emits for that turn:
+   * the processor loop drops it and the tool hooks refuse/skip it, so late,
+   * unvalidated prose can never reach the event bus, replay or ai_messages
+   * via the generic (non-topology) paths once `topologyInvestigation` is gone.
+   */
+  topologyTurnSealed?: boolean;
   /** True when admin has paused auto-approve — falls back to per_step */
   isPaused: boolean;
   /** ID of the currently active action plan (if any) */
@@ -710,6 +740,27 @@ export function buildDeviceBoundSessionAuth(auth: AuthContext, sessionOrgId: str
   };
 }
 
+/**
+ * Tool auth for a chat session (#3087, #6675).
+ *
+ * - Device-bound session (`ai_sessions.device_id`): pinned to the session org.
+ * - Device-PAGE session (org anchored by the page it was opened from): full
+ *   read scope, plus `aiWriteDefaultOrgId` so an org-scoped write with no
+ *   `orgId` lands in the page's org instead of being refused as ambiguous.
+ *   `resolveWritableToolOrgId` re-checks access to it on every call.
+ * - Anything else: the session auth itself.
+ */
+export function buildChatSessionToolAuth(
+  auth: AuthContext,
+  sessionOrgId: string,
+  deviceId: string | null | undefined,
+  writeDefaultOrgId: string | null | undefined,
+): AuthContext {
+  if (deviceId) return buildDeviceBoundSessionAuth(auth, sessionOrgId);
+  if (writeDefaultOrgId) return { ...auth, aiWriteDefaultOrgId: writeDefaultOrgId };
+  return auth;
+}
+
 // ============================================
 // StreamingSessionManager (singleton)
 // ============================================
@@ -787,13 +838,25 @@ export class StreamingSessionManager {
    * slot attaches their own reservation, and every loser releases a reservation
    * that was never attached to anything.
    */
-  tryTransitionToProcessing(session: ActiveSession, budgetReservationId?: string): boolean {
+  tryTransitionToProcessing(
+    session: ActiveSession,
+    budgetReservationId?: string,
+    turn?: { topologyInvestigation?: TopologyTurnRuntime },
+  ): boolean {
     if (session.state === 'processing' || session.state === 'closing' || session.state === 'closed') {
       return false;
     }
     session.state = 'processing';
     if (budgetReservationId !== undefined) {
       session.budgetReservationId = budgetReservationId;
+    }
+    // Same claim-then-attach rule for the topology runtime (PR #7147 F1): only
+    // the caller that takes the slot binds its turn's runtime (or clears a
+    // previous one) and resets the cap stop. A loser binds nothing, so the
+    // running turn keeps streaming into its OWN gate and its cap stop holds.
+    if (turn) {
+      session.topologyInvestigation = turn.topologyInvestigation;
+      session.topologyStopped = false;
     }
     // The state and its staleness clock move together: eviction reads
     // lastActivityAt to tell a live turn from a wedged one, and before this the
@@ -824,6 +887,13 @@ export class StreamingSessionManager {
        * may omit it — narrowing would be a no-op there.
        */
       deviceId?: string | null;
+      /**
+       * Device-page write default (#6675): the session org when it was
+       * anchored by the page the chat was opened from
+       * (`pageContextWriteDefaultOrgId`). Never narrows reads; ignored for a
+       * device-bound session. Omitted by every other chat surface.
+       */
+      writeDefaultOrgId?: string | null;
     },
     auth: AuthContext,
     requestContext: RequestLike | undefined,
@@ -837,7 +907,18 @@ export class StreamingSessionManager {
       onPostToolUse: ReturnType<typeof createSessionPostToolUse>,
       getSession: () => ActiveSession,
     ) => { server: McpSdkServerConfigWithInstance; name: string },
-    options?: { injectApprovalModeInstructions?: boolean; budgetReservationId?: string },
+    options?: {
+      injectApprovalModeInstructions?: boolean;
+      budgetReservationId?: string;
+      topologyInvestigation?: TopologyTurnRuntime;
+      /**
+       * A-W04 (#6151): this surface registers the full Breeze registry and may
+       * defer it behind the SDK's ToolSearch built-in. Only web chat opts in;
+       * `resolveToolSearchPolicy` still decides per host, budget and operator
+       * override. Static-subset surfaces leave it unset.
+       */
+      toolSearch?: boolean;
+    },
   ): Promise<ActiveSession> {
     const snapshot: AuditSnapshot = {
       ip: requestContext ? getTrustedClientIpOrUndefined(requestContext) : undefined,
@@ -886,11 +967,19 @@ export class StreamingSessionManager {
         // the request auth handed in here is built fresh per request.
         const refreshedAuthWithOrigin = withChatAiOrigin(auth, breezeSessionId);
         reusable.auth = refreshedAuthWithOrigin;
-        reusable.toolAuth = reusable.deviceId
-          ? buildDeviceBoundSessionAuth(refreshedAuthWithOrigin, dbSession.orgId)
-          : refreshedAuthWithOrigin;
+        reusable.toolAuth = buildChatSessionToolAuth(
+          refreshedAuthWithOrigin,
+          dbSession.orgId,
+          reusable.deviceId,
+          dbSession.writeDefaultOrgId,
+        );
         reusable.auditSnapshot = snapshot;
         reusable.allowedTools = allowedTools;
+        // Topology fields are NOT touched here (PR #7147 F1): this session may
+        // be processing another request's turn, which this caller is about to
+        // lose with a 409. Rebinding here streamed the running turn into the
+        // loser's (then aborted) runtime and cleared a cap stop mid-turn. The
+        // winner of `tryTransitionToProcessing` binds its runtime there.
         // Re-resolve the approval mode so a settings change applies to the NEXT
         // message rather than only to a brand-new in-memory session (#5593).
         // Skipped while a turn is in flight: the route answers a concurrent
@@ -947,9 +1036,12 @@ export class StreamingSessionManager {
     // the act/verify bypass lanes read the carrier off `auth`, while every
     // MCP tool handler reads `toolAuth`.
     const authWithOrigin = withChatAiOrigin(auth, breezeSessionId);
-    const toolAuth = deviceId
-      ? buildDeviceBoundSessionAuth(authWithOrigin, dbSession.orgId)
-      : authWithOrigin;
+    const toolAuth = buildChatSessionToolAuth(
+      authWithOrigin,
+      dbSession.orgId,
+      deviceId,
+      dbSession.writeDefaultOrgId,
+    );
 
     // Tenant (BYO MCP) tools — Task A10. Script-builder / client-AI sessions
     // supply their own `mcpServerFactory` and keep their own (non-Breeze)
@@ -1024,6 +1116,10 @@ export class StreamingSessionManager {
       approvalMode,
       approvalWaitBudgetMs,
       allowedTools,
+      // Seeds a brand-new session only; a reused session is never rebound
+      // here (see the reuse branch and tryTransitionToProcessing).
+      topologyInvestigation: options?.topologyInvestigation,
+      topologyStopped: false,
       isPaused: false,
       activePlanId: null,
       approvedPlanSteps: new Map(),
@@ -1190,6 +1286,12 @@ export class StreamingSessionManager {
     // request completes and the transaction commits.
     try {
       runOutsideDbContextSafe(() => {
+        const childEnv = buildClaudeSdkChildEnv(resolved, process.env, { egressProxyUrl });
+        const toolSearchPolicy = resolveToolSearchPolicy({
+          surfaceSearch: options?.toolSearch === true,
+          childEnv,
+          remainingTurns: maxTurns,
+        });
         const sdkQuery = query({
           prompt: inputController.getInputStream(),
           options: {
@@ -1202,12 +1304,12 @@ export class StreamingSessionManager {
             model: wire.model,
             maxTurns,
             maxBudgetUsd,
-            tools: [],
+            tools: toolSearchPolicy.tools,
             allowedTools: allowedTools ?? [...BREEZE_MCP_TOOL_NAMES, ...tenantMcpToolNames(tenantDescriptors)],
             mcpServers: { [mcpServerName]: mcpServer },
             includePartialMessages: true,
             abortController,
-            env: buildClaudeSdkChildEnv(resolved, process.env, { egressProxyUrl }),
+            env: { ...childEnv, ...toolSearchPolicy.env },
             resume: dbSession.sdkSessionId ?? undefined,
             persistSession: true,
             settingSources: [],
@@ -1264,6 +1366,8 @@ export class StreamingSessionManager {
       clearTimeout(session.turnTimeoutId);
       session.turnTimeoutId = null;
     }
+    // Topology M4: a torn-down session never keeps unvalidated output or a lease.
+    void this.abortTopologyTurn(session);
     try { session.inputController.close(); } catch (err) {
       captureException(err); console.error('[StreamingSessionManager] Failed to close input controller:', sessionId, err);
     }
@@ -1357,11 +1461,81 @@ export class StreamingSessionManager {
         // in the background instead of holding the subprocess for the rest of
         // the 5-minute wait (#3089).
         settleApprovalWaits(session);
+        if (session.topologyInvestigation) {
+          // Topology M4 (C1): a timed-out investigation must not keep running
+          // behind a cleared gate. Seal first (so nothing the provider still
+          // emits takes a generic path), then tear the session down, which
+          // discards the runtime and its lease, aborts in-flight tool
+          // handlers and closes the SDK query. The next message rebuilds the
+          // session from its row.
+          session.topologyTurnSealed = true;
+          session.eventBus.publish({ type: 'error', message: 'AI request timed out. Please try again.' });
+          session.eventBus.publish({ type: 'done' });
+          this.remove(session.breezeSessionId);
+          return;
+        }
         session.eventBus.publish({ type: 'error', message: 'AI request timed out. Please try again.' });
         session.eventBus.publish({ type: 'done' });
         session.state = 'idle';
       }
     }, turnTimeoutMsFor(session.approvalWaitBudgetMs ?? DEFAULT_APPROVAL_WAIT_BUDGET_MS));
+  }
+
+  /**
+   * Topology M4 Task 3: end a topology turn. Only a validated (or the fixed
+   * fallback / scope-changed) explanation is published, and only an
+   * `explanation`/`fallback` outcome is persisted — as the structured answer,
+   * never raw text. Failure, cancellation and cap paths discard.
+   */
+  private async finishTopologyTurn(session: ActiveSession, succeeded: boolean): Promise<void> {
+    const runtime = session.topologyInvestigation;
+    if (!runtime) return;
+    session.topologyInvestigation = undefined;
+    if (!succeeded || session.topologyStopped) {
+      await runtime.abort().catch((err) => captureException(err));
+      session.eventBus.publish({
+        type: 'error',
+        message: session.topologyStopped
+          ? 'This investigation reached its limit. Start a new investigation to continue.'
+          : 'The topology explanation could not be completed.',
+      });
+      session.topologyStopped = false;
+      return;
+    }
+    session.eventBus.publish({ type: 'topology_progress', phase: 'validating' });
+    let result;
+    try {
+      result = await runtime.complete();
+    } catch (err) {
+      captureException(err);
+      session.eventBus.publish({ type: 'error', message: 'The topology explanation could not be completed.' });
+      return;
+    }
+    session.eventBus.publish({ type: 'topology_explanation', explanation: result.explanation });
+    if (result.outcome === 'scope_changed') return;
+    try {
+      await withDbAccessContext(
+        { scope: 'organization', orgId: session.orgId, accessibleOrgIds: [session.orgId] },
+        () => db.insert(aiMessages).values({
+          sessionId: session.breezeSessionId,
+          role: 'assistant',
+          content: JSON.stringify(result.explanation),
+          contentBlocks: [{ type: 'topology_explanation', explanation: result.explanation }] as unknown as Record<string, unknown>[],
+        }),
+      );
+    } catch (err) {
+      captureException(err);
+      console.error('[StreamingSessionManager] Failed to save topology explanation:', err);
+    }
+  }
+
+  /** Discard an unfinished topology turn (idempotent). */
+  private async abortTopologyTurn(session: ActiveSession): Promise<void> {
+    const runtime = session.topologyInvestigation;
+    if (!runtime) return;
+    session.topologyInvestigation = undefined;
+    session.topologyStopped = false;
+    await runtime.abort().catch((err) => captureException(err));
   }
 
   /** Clear the per-turn timeout (called when 'result' arrives) */
@@ -1391,6 +1565,8 @@ export class StreamingSessionManager {
       for await (const message of session.query) {
         // Stop publishing if session is being torn down
         if (session.state === 'closing' || session.state === 'closed') break;
+        // A sealed topology turn (timed out) never publishes or persists again.
+        if (session.topologyTurnSealed) break;
 
         switch (message.type) {
           case 'system': {
@@ -1433,7 +1609,10 @@ export class StreamingSessionManager {
               if ('delta' in event && event.delta.type === 'text_delta') {
                 // Stream progress keeps the turn alive for eviction purposes.
                 session.lastActivityAt = Date.now();
-                session.eventBus.publish({ type: 'content_delta', delta: event.delta.text });
+                // Topology M4: raw provider text goes to the server-only output
+                // gate at THIS publish point — never onto the bus/replay ring.
+                if (session.topologyInvestigation) session.topologyInvestigation.append(event.delta.text);
+                else session.eventBus.publish({ type: 'content_delta', delta: event.delta.text });
               }
             } else if (event.type === 'content_block_start') {
               if ('content_block' in event && event.content_block.type === 'text') {
@@ -1444,11 +1623,22 @@ export class StreamingSessionManager {
                 // them raw; `assistantContent` below joins with the SAME
                 // separator so persisted history matches the stream
                 // byte-for-byte.
-                if (sawTextBlockThisMessage) {
+                if (session.topologyInvestigation) {
+                  // Topology M4: narration blocks are never the answer; only the
+                  // final text block is parsed, and no separator is published.
+                  session.topologyInvestigation.startBlock();
+                } else if (sawTextBlockThisMessage) {
                   session.eventBus.publish({ type: 'content_delta', delta: '\n\n' });
                 }
                 sawTextBlockThisMessage = true;
-              } else if ('content_block' in event && event.content_block.type === 'tool_use') {
+              } else if (
+                'content_block' in event
+                && event.content_block.type === 'tool_use'
+                // A-W04: ToolSearch never reaches the MCP hooks — queueing it
+                // would misattribute the next postToolUse and turn its result
+                // into a #3094 "rejected before execution" drop.
+                && !isSdkBuiltinToolUse(event.content_block.name)
+              ) {
                 const block = event.content_block;
 
                 // Track toolUseId for postToolUse correlation.
@@ -1463,12 +1653,15 @@ export class StreamingSessionManager {
                 // orphaned tool_result only carries the id, not the name.
                 session.toolUseNames?.set(block.id, bareStreamToolName);
 
-                session.eventBus.publish({
-                  type: 'tool_use_start',
-                  toolName: bareStreamToolName,
-                  toolUseId: block.id,
-                  input: {},
-                });
+                // Topology M4: a fixed phase, never the model's tool name/arguments.
+                session.eventBus.publish(session.topologyInvestigation
+                  ? { type: 'topology_progress', phase: 'gathering_evidence' }
+                  : {
+                    type: 'tool_use_start',
+                    toolName: bareStreamToolName,
+                    toolUseId: block.id,
+                    input: {},
+                  });
               }
             } else if (event.type === 'message_delta') {
               if (messageStarted) {
@@ -1500,6 +1693,21 @@ export class StreamingSessionManager {
               session.pendingTurnUsage.outputTokens += apiUsage.output_tokens ?? 0;
               session.pendingTurnUsage.cacheReadInputTokens += apiUsage.cache_read_input_tokens ?? 0;
               session.pendingTurnUsage.cacheCreationInputTokens += apiUsage.cache_creation_input_tokens ?? 0;
+            }
+
+            // Topology M4: bounded per-call input and cumulative output; the
+            // raw assistant content and tool_use rows are NEVER persisted or
+            // republished — only the validated answer is, at `result`.
+            if (session.topologyInvestigation) {
+              const withinBudget = session.topologyInvestigation.noteUsage({
+                inputTokens: (apiUsage?.input_tokens ?? 0) + (apiUsage?.cache_read_input_tokens ?? 0) + (apiUsage?.cache_creation_input_tokens ?? 0),
+                outputTokens: apiUsage?.output_tokens ?? 0,
+              });
+              if (!withinBudget && !session.topologyStopped) {
+                session.topologyStopped = true;
+                void Promise.resolve().then(() => session.query.interrupt()).catch(() => undefined);
+              }
+              break;
             }
 
             // #5106: joined with the SAME "\n\n" separator the stream emits
@@ -1537,7 +1745,9 @@ export class StreamingSessionManager {
             }
 
             for (const block of message.message.content) {
-              if (block.type === 'tool_use') {
+              // ToolSearch stays in the assistant row's contentBlocks above but
+              // gets no tool row or tool card (A-W04).
+              if (block.type === 'tool_use' && !isSdkBuiltinToolUse(block.name)) {
                 const bareName = block.name.startsWith(session.mcpPrefix)
                   ? block.name.slice(session.mcpPrefix.length)
                   : block.name;
@@ -1617,6 +1827,11 @@ export class StreamingSessionManager {
           case 'result': {
             // Clear per-turn timeout on result
             this.clearTurnTimeout(session);
+            // Topology M4: validate BEFORE anything is persisted or streamed.
+            const topologyTurn = Boolean(session.topologyInvestigation);
+            if (topologyTurn) {
+              await this.finishTopologyTurn(session, (message as SDKResultMessage).subtype === 'success');
+            }
 
             const resultMsg = message as SDKResultMessage;
             // #3095: use the session's canonical org id (from the aiSessions DB
@@ -1750,7 +1965,9 @@ export class StreamingSessionManager {
               const errors = 'errors' in resultMsg ? resultMsg.errors : [];
               const errorMsg = errors.length > 0 ? errors[0] : `AI query ended: ${resultMsg.subtype}`;
 
-              if (resultMsg.subtype === 'error_max_budget_usd') {
+              if (topologyTurn) {
+                // A fixed error was already published; provider error text never reaches a topology turn.
+              } else if (resultMsg.subtype === 'error_max_budget_usd') {
                 session.eventBus.publish({ type: 'error', message: 'AI budget limit reached for this query.' });
               } else if (resultMsg.subtype === 'error_max_turns') {
                 session.eventBus.publish({ type: 'error', message: 'Maximum conversation turns reached.' });
@@ -1802,9 +2019,13 @@ export class StreamingSessionManager {
     } catch (err) {
       captureException(err);
       console.error('[StreamingSessionManager] Query error:', err);
+      await this.abortTopologyTurn(session);
       session.eventBus.publish({ type: 'error', message: sanitizeErrorForClient(err) });
       session.eventBus.publish({ type: 'done' });
     } finally {
+      // A turn that ended without a `result` (teardown, crash) discards any
+      // unvalidated topology output and releases its lease.
+      await this.abortTopologyTurn(session);
       // Flush usage from a turn that never produced a `result` message
       // (teardown mid-turn, subprocess crash, iterator error) so the tokens
       // already spent on model API calls still land in the session counters

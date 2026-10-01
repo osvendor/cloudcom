@@ -30,6 +30,8 @@ export type WorkerInitializerClassification =
         | 'topologyTemplateApplyWorker'
         | 'topologyDiagnosticWorker'
         | 'topologyDiagnosticSweeper'
+        | 'topologyMonitoringWorker'
+        | 'topologyTelemetryMaintenance'
         | 'incidentCorrelationWorker'
         | 'incidentTimelineEnricher'
         | 'incidentSlaMonitor';
@@ -81,8 +83,12 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('backupVerificationJobs', ['backupVerificationWorker']),
   consumers('eventLogRetention'),
   consumers('hardwareHealthRetention'),
+  consumers('timeSyncRetention'),
   consumers('logCorrelationWorker'),
   consumers('agentLogRetention'),
+  // One Worker, no flag gate; attaches under 'helperScreenshotRetention',
+  // which differs from its registry key.
+  consumers('helperScreenshotRetentionWorker', ['helperScreenshotRetention']),
   consumers('ipHistoryRetention'),
   consumers('reliabilityRetention'),
   consumers('processSampleRetention'),
@@ -119,6 +125,8 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   { kind: 'non_consumer', initializer: 'topologyTemplateApplyWorker' },
   { kind: 'non_consumer', initializer: 'topologyDiagnosticWorker' },
   { kind: 'non_consumer', initializer: 'topologyDiagnosticSweeper' },
+  { kind: 'non_consumer', initializer: 'topologyMonitoringWorker' },
+  { kind: 'non_consumer', initializer: 'topologyTelemetryMaintenance' },
   consumers('networkBaselineWorker'),
   consumers('snmpWorker'),
   consumers('monitorWorker'),
@@ -149,6 +157,8 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('maintenanceRebootWorker'),
   consumers('backupWorker'),
   consumers('backupSnapshotFileIndexWorker'),
+  consumers('backupSnapshotAttestationWorker'),
+  consumers('backupWriteSessionJanitor'),
   consumers('sensitiveDataWorker'),
   consumers('securityScanWorker'),
   consumers('peripheralJobs', ['peripheralAnomalyWorker', 'peripheralPolicyDistributionWorker']),
@@ -266,6 +276,10 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   // attachWorkerObservability hook in this merge-forward.
   consumers('deviceBulkPurge'),
   consumers('removedDevicePurge'),
+  // Pre-assignment holding area — one Worker each, unconditional, attached
+  // under its registry name.
+  consumers('parkedDeviceExpiry'),
+  consumers('parkedDevicePurge'),
   consumers('deviceGroupJobs', ['deviceGroupReevaluationWorker']),
   // Started outside WORKER_REGISTRY, role-gated in index.ts / worker.ts.
   // D3a: the dispatch consumer is constructed only when EVENT_DISPATCH_MODE is
@@ -292,6 +306,8 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   // every self-hosted install and on hosted until W05 — so a plain-required row
   // would leave every api/all process permanently not-ready. Same shape and
   // same reason as aiAgentRunner above.
+  // AI Suggested Fixes W1 — attachWorkerObservability name == registry name.
+  consumers('fixOutcomeWorker'),
   consumers('sendingDomainsWorker', ['sendingDomainsWorker'], 'sending_domains_configured'),
 ] as const;
 

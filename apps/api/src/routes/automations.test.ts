@@ -3,6 +3,16 @@ import { Hono } from 'hono';
 import { createHmac } from 'crypto';
 import { automationRoutes, automationWebhookRoutes } from './automations';
 
+// #7347: models withAuthDbAccessContext as a fresh transaction that COMMITS
+// when its callback resolves (or throws "commit failed" when `failNextCommit`).
+// `stack` is the currently-open contexts, `committed` the ids that committed.
+const authDbContexts = vi.hoisted(() => ({
+  seq: 0,
+  stack: [] as number[],
+  committed: new Set<number>(),
+  failNextCommit: false,
+}));
+
 const {
   resolveAutomationReferencesForOwnerMock,
   replaceAutomationResourceBindingsMock,
@@ -23,6 +33,9 @@ vi.mock('../services/automationReadProjection', () => ({
 vi.mock('../jobs/automationWorker', () => ({
   enqueueAutomationRun: vi.fn(async () => ({ enqueued: true, jobId: 'job-1' }))
 }));
+
+const captureExceptionMock = vi.hoisted(() => vi.fn());
+vi.mock('../services/sentry', () => ({ captureException: captureExceptionMock }));
 
 vi.mock('../services/redis', () => ({
   getRedis: vi.fn(() => null)
@@ -109,6 +122,7 @@ vi.mock('../db/schema', () => ({
   automations: {},
   automationRuns: {},
   automationRunDeviceResults: {},
+  automationActionResults: {},
   configurationPolicies: {},
   policies: {},
   policyCompliance: {},
@@ -156,6 +170,26 @@ function scriptExecutionsSelectMock(rows: any[]) {
   } as any;
 }
 
+/**
+ * The run's `execute_command` action results (#3188) — the agent's real
+ * stdout for ad-hoc commands, which have no script_executions row. Issued
+ * third inside the same Promise.all. Captures WHERE so a test can prove the
+ * query is keyed on the run AND the action type.
+ */
+const capturedCommandResultsWhere: unknown[] = [];
+function commandResultsSelectMock(rows: any[]) {
+  return {
+    from: vi.fn().mockReturnValue({
+      innerJoin: vi.fn().mockReturnValue({
+        where: vi.fn((condition: unknown) => {
+          capturedCommandResultsWhere.push(condition);
+          return { orderBy: vi.fn().mockResolvedValue(rows) };
+        }),
+      }),
+    }),
+  } as any;
+}
+
 // #3525 W05 — the cancel route delegates every state decision to the service.
 const cancelAutomationRunMock = vi.hoisted(() => vi.fn());
 vi.mock('../services/automationRunCancellation', () => ({
@@ -191,10 +225,26 @@ vi.mock('../middleware/auth', () => ({
   }),
   requireMfa: vi.fn(() => async (_c: any, next: any) => next()),
   requirePermission: vi.fn(() => async (_c: any, next: any) => next()),
-  requireScope: vi.fn(() => async (_c: any, next: any) => next())
+  requireScope: vi.fn(() => async (_c: any, next: any) => next()),
+  withAuthDbAccessContext: vi.fn(async (_auth: any, fn: () => Promise<unknown>) => {
+    const id = ++authDbContexts.seq;
+    authDbContexts.stack.push(id);
+    try {
+      const result = await fn();
+      if (authDbContexts.failNextCommit) {
+        authDbContexts.failNextCommit = false;
+        throw new Error('commit failed');
+      }
+      authDbContexts.committed.add(id);
+      return result;
+    } finally {
+      authDbContexts.stack.pop();
+    }
+  }),
 }));
 
 import { db } from '../db';
+import { enqueueAutomationRun } from '../jobs/automationWorker';
 import { getRedis } from '../services/redis';
 import { writeAuditEvent, writeRouteAudit } from '../services/auditEvents';
 import { checkAutomationTargetsWithinSiteScope, createAutomationRunRecord } from '../services/automationRuntime';
@@ -204,7 +254,11 @@ describe('automations routes', () => {
 
 	  beforeEach(() => {
 	    vi.clearAllMocks();
+	    authDbContexts.stack.length = 0;
+	    authDbContexts.committed.clear();
+	    authDbContexts.failNextCommit = false;
 	    capturedScriptExecWhere.length = 0;
+	    capturedCommandResultsWhere.length = 0;
 	    mockState.permissions = undefined;
 	    mockState.auth = undefined;
 	    vi.mocked(checkAutomationTargetsWithinSiteScope).mockResolvedValue({
@@ -483,7 +537,8 @@ describe('automations routes', () => {
         deviceId: 'device-visible', status: 'success', output: 'visible-output',
         hostname: 'visible-host', displayName: null, startedAt: safeRun.startedAt, completedAt: safeRun.completedAt,
       }]))
-      .mockReturnValueOnce(scriptExecutionsSelectMock([]));
+      .mockReturnValueOnce(scriptExecutionsSelectMock([]))
+      .mockReturnValueOnce(commandResultsSelectMock([]));
     projectAutomationRunsToSitesMock.mockResolvedValueOnce([safeRun]);
 
     const res = await app.request(`/automations/runs/${runId}`, {
@@ -1127,6 +1182,102 @@ describe('automations routes', () => {
     expect(body.run.devicesTargeted).toBe(2);
   });
 
+  describe('#7347 — manual trigger enqueues only after the run row commits', () => {
+    const AUTOMATION_ROW = {
+      id: '11111111-1111-4111-8111-111111111111',
+      name: 'Automation One',
+      orgId: 'org-123',
+      enabled: true,
+      runCount: 0,
+      trigger: { type: 'manual' },
+    };
+
+    function mockAutomationRow() {
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([AUTOMATION_ROW]) }),
+        }),
+      } as any);
+    }
+
+    /** Records which auth context created the run and whether it had committed at enqueue. */
+    function trackRunAndEnqueue() {
+      const seen: { createdIn?: number; openAtEnqueue?: number; committedAtEnqueue?: boolean } = {};
+      vi.mocked(createAutomationRunRecord).mockImplementationOnce(async () => {
+        seen.createdIn = authDbContexts.stack.at(-1);
+        return {
+          run: { id: 'run-1', status: 'running', devicesTargeted: 2, startedAt: new Date() },
+          targetDeviceIds: ['device-1', 'device-2'],
+          reused: false,
+        } as any;
+      });
+      vi.mocked(enqueueAutomationRun).mockImplementationOnce(async () => {
+        seen.openAtEnqueue = authDbContexts.stack.length;
+        seen.committedAtEnqueue = seen.createdIn !== undefined && authDbContexts.committed.has(seen.createdIn);
+        return { enqueued: true, jobId: 'job-1' };
+      });
+      return seen;
+    }
+
+    it.each(['trigger', 'run'])('POST /:id/%s creates the run in a committed context, then enqueues with none open', async (path) => {
+      mockAutomationRow();
+      const seen = trackRunAndEnqueue();
+
+      const res = await app.request(`/automations/11111111-1111-4111-8111-111111111111/${path}`, {
+        method: 'POST',
+        headers: { Authorization: 'Bearer valid-token' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(seen.createdIn, 'the run was not created in its own auth context').toBeDefined();
+      expect(seen.committedAtEnqueue, 'execute-run was enqueued before the run committed').toBe(true);
+      expect(seen.openAtEnqueue).toBe(0);
+      expect(vi.mocked(enqueueAutomationRun)).toHaveBeenCalledWith('run-1', ['device-1', 'device-2']);
+    });
+
+    it('a run transaction that rolls back enqueues nothing', async () => {
+      mockAutomationRow();
+      trackRunAndEnqueue();
+      authDbContexts.failNextCommit = true;
+
+      const res = await app.request('/automations/11111111-1111-4111-8111-111111111111/trigger', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer valid-token' },
+      });
+
+      expect(res.status).toBe(500);
+      expect(vi.mocked(createAutomationRunRecord)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(enqueueAutomationRun)).not.toHaveBeenCalled();
+    });
+
+    it('an enqueue that fails after commit fails the committed run and reports it', async () => {
+      mockAutomationRow();
+      trackRunAndEnqueue();
+      vi.mocked(enqueueAutomationRun).mockReset().mockRejectedValueOnce(new Error('redis down'));
+      const setSpy = vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) }));
+      vi.mocked(db.update).mockReturnValue({ set: setSpy } as any);
+
+      const res = await app.request('/automations/11111111-1111-4111-8111-111111111111/trigger', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer valid-token' },
+      });
+
+      expect(res.status).toBe(500);
+      expect(await res.json()).toMatchObject({ error: expect.any(String), runId: 'run-1' });
+      // The committed run would otherwise sit `running` with no job, forever.
+      expect(setSpy).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed' }));
+      expect(captureExceptionMock).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'redis down' }),
+        undefined,
+        { runId: 'run-1', automationId: '11111111-1111-4111-8111-111111111111' },
+      );
+      expect(vi.mocked(writeRouteAudit)).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ action: 'automation.trigger', result: 'failure' }),
+      );
+    });
+  });
+
   it('rejects manual triggering of a managed automation before creating a run', async () => {
     const agentId = '33333333-3333-4333-8333-333333333333';
     vi.mocked(db.select).mockReturnValue({
@@ -1498,6 +1649,40 @@ describe('automations routes', () => {
 	    expect((await request()).status).toBe(409);
 	  });
 
+	  it('rejects a byte-identical signed webhook resend carrying a different event-id header', async () => {
+	    vi.mocked(db.select).mockReturnValue({
+	      from: vi.fn().mockReturnValue({
+	        where: vi.fn().mockReturnValue({
+	          limit: vi.fn().mockResolvedValue([{
+	            id: '11111111-1111-4111-8111-111111111111',
+	            name: 'Webhook Automation',
+	            orgId: 'org-123',
+	            enabled: true,
+	            trigger: { type: 'webhook', secret: 'secret-123' }
+	          }])
+	        })
+	      })
+	    } as any);
+	    const rawBody = JSON.stringify({ ping: true, id: 'resend-different-event-id' });
+	    const timestamp = String(Math.floor(Date.now() / 1000));
+	    const signature = `sha256=${createHmac('sha256', 'secret-123').update(`${timestamp}.${rawBody}`).digest('hex')}`;
+	    const requestWith = (eventId: string) => app.request('/automations/webhooks/11111111-1111-4111-8111-111111111111', {
+	      method: 'POST',
+	      headers: {
+	        'Content-Type': 'application/json',
+	        'x-breeze-timestamp': timestamp,
+	        'x-breeze-signature': signature,
+	        'x-breeze-event-id': eventId,
+	      },
+	      body: rawBody
+	    });
+
+	    expect((await requestWith('event-original')).status).toBe(202);
+	    // Same signed request, resent with only the unsigned event-id header changed,
+	    // must still be caught as a duplicate delivery.
+	    expect((await requestWith('event-foreign-resend')).status).toBe(409);
+	  });
+
 	  it('returns 404 without querying the database for a malformed webhook automation id', async () => {
 	    const res = await app.request('/automations/webhooks/not-a-uuid', {
 	      method: 'POST',
@@ -1539,8 +1724,9 @@ describe('automations routes', () => {
 	  it('stores signed automation webhook replay nonces in Redis when available', async () => {
 	    const redis = {
 	      set: vi.fn()
-	        .mockResolvedValueOnce('OK')
-	        .mockResolvedValueOnce(null)
+	        .mockResolvedValueOnce('OK') // first request: signature-derived key
+	        .mockResolvedValueOnce('OK') // first request: event-id-derived key
+	        .mockResolvedValueOnce(null) // second request: signature-derived key (duplicate)
 	    };
 	    vi.mocked(getRedis).mockReturnValue(redis as any);
 	    vi.mocked(db.select).mockReturnValue({
@@ -1786,7 +1972,8 @@ describe('automations routes', () => {
       // Third select: per-device results (#2023).
       .mockReturnValueOnce(deviceResultsSelectMock([]))
       // Fourth select: the run's script executions (#3162).
-      .mockReturnValueOnce(scriptExecutionsSelectMock([]));
+      .mockReturnValueOnce(scriptExecutionsSelectMock([]))
+      .mockReturnValueOnce(commandResultsSelectMock([]));
 
     const res = await app.request('/automations/runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', {
       method: 'GET',
@@ -1924,7 +2111,8 @@ describe('automations routes', () => {
           errorMessage: 'script exited non-zero',
           createdAt: '2026-07-08T00:00:01.000Z',
         },
-      ]));
+      ]))
+      .mockReturnValueOnce(commandResultsSelectMock([]));
 
     const res = await app.request('/automations/runs/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', {
       method: 'GET',
@@ -2039,7 +2227,8 @@ describe('automations routes', () => {
           errorMessage: null,
           createdAt: '2026-07-08T00:00:00.000Z',
         },
-      ]));
+      ]))
+      .mockReturnValueOnce(commandResultsSelectMock([]));
 
     const res = await app.request('/automations/runs/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', {
       method: 'GET',
@@ -2053,6 +2242,111 @@ describe('automations routes', () => {
     // stdout is accepted up to 5MB per execution — it must not ship whole.
     expect(script.stdout.length).toBe(16_384);
     expect(script.stdoutTruncated).toBe(true);
+  });
+
+  it('returns execute_command output per device as commandResults (#3188)', async () => {
+    const longOutput = 'y'.repeat(20_000);
+    vi.mocked(db.select)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{
+              id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+              automationId: '11111111-1111-4111-8111-111111111111',
+              status: 'completed',
+              logs: [],
+            }])
+          })
+        })
+      } as any)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{
+              id: '11111111-1111-4111-8111-111111111111',
+              name: 'Automation One',
+              orgId: 'org-123',
+            }])
+          })
+        })
+      } as any)
+      .mockReturnValueOnce(deviceResultsSelectMock([
+        {
+          deviceId: 'device-1',
+          status: 'success',
+          startedAt: '2026-07-08T00:00:00.000Z',
+          completedAt: '2026-07-08T00:00:03.000Z',
+          output: null,
+          error: null,
+          hostname: 'HOST-1',
+          displayName: null,
+        },
+        {
+          deviceId: 'device-2',
+          status: 'running',
+          startedAt: '2026-07-08T00:00:00.000Z',
+          completedAt: null,
+          output: null,
+          error: null,
+          hostname: 'HOST-2',
+          displayName: null,
+        },
+      ]))
+      .mockReturnValueOnce(scriptExecutionsSelectMock([]))
+      .mockReturnValueOnce(commandResultsSelectMock([
+        {
+          deviceId: 'device-1',
+          actionIndex: 0,
+          status: 'succeeded',
+          output: 'ipconfig says hi',
+          error: null,
+          message: null,
+        },
+        // A second execute_command on the same device groups, in action order.
+        {
+          deviceId: 'device-1',
+          actionIndex: 2,
+          status: 'failed',
+          // SQL selects left(col, N+1); anything longer than N overflowed.
+          output: longOutput,
+          error: 'e'.repeat(9_000),
+          message: null,
+        },
+        {
+          deviceId: 'device-2',
+          actionIndex: 0,
+          status: 'queued',
+          output: null,
+          error: null,
+          message: 'Queued — device offline',
+        },
+      ]));
+
+    const res = await app.request('/automations/runs/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer valid-token' }
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const first = body.deviceResults[0].commandResults;
+    expect(first).toHaveLength(2);
+    expect(first[0]).toMatchObject({ actionIndex: 0, status: 'succeeded', output: 'ipconfig says hi' });
+    expect(first[0].outputTruncated).toBeUndefined();
+    expect(first[1]).toMatchObject({ actionIndex: 2, status: 'failed', outputTruncated: true, errorTruncated: true });
+    expect(first[1].output.length).toBe(16_384);
+    expect(first[1].error.length).toBe(8_192);
+    expect(body.deviceResults[1].commandResults).toEqual([
+      { actionIndex: 0, status: 'queued', message: 'Queued — device offline' },
+    ]);
+    expect(body.deviceResults[0].scriptResults).toBeUndefined();
+
+    // Keyed on the run and restricted to execute_command actions — dropping
+    // either predicate would return every action result the caller can see.
+    expect(capturedCommandResultsWhere).toHaveLength(1);
+    const where = JSON.stringify(capturedCommandResultsWhere[0]);
+    expect(where).toContain('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb');
+    expect(where).toContain('execute_command');
   });
 
   // ============================================
@@ -2074,7 +2368,7 @@ describe('automations routes', () => {
         })
       })
     } as any);
-    const rawBody = JSON.stringify({ ping: true });
+    const rawBody = JSON.stringify({ ping: true, id: 'audit-1' });
     const timestamp = String(Math.floor(Date.now() / 1000));
     const signature = `sha256=${createHmac('sha256', 'secret-123').update(`${timestamp}.${rawBody}`).digest('hex')}`;
 

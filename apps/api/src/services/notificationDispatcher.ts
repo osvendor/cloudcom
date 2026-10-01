@@ -11,14 +11,15 @@ import {
   alerts,
   alertRules,
   notificationChannels,
+  notificationChannelConfigs,
   alertNotifications,
   escalationPolicies,
   devices,
   organizations,
-  partners,
-  configPolicyAlertRules
+  partners
 } from '../db/schema';
-import { eq, and, ne, inArray, isNull, or, gt, type SQL } from 'drizzle-orm';
+import { getNotificationChannelWithConfig, type NotificationChannelWithConfig } from './notificationChannelConfig';
+import { eq, and, ne, inArray, isNull, isNotNull, or, gt, type SQL } from 'drizzle-orm';
 import { getRedis, getBullMQConnection, isRedisAvailable } from './redis';
 import { rateLimiter } from './rate-limit';
 import { checkNotificationThrottle } from './notificationThrottle';
@@ -35,16 +36,17 @@ import {
   type WebhookConfig,
   type PagerDutyConfig,
   type PushoverConfig,
-  type PushoverPriority,
   type AlertSeverity
 } from './notificationSenders';
 import { sendSmsNotification, type SmsChannelConfig } from './notificationSenders/smsSender';
 import type { BreezeEvent } from './eventBus';
 import { decryptNotificationChannelConfig } from './notificationChannelSecrets';
+import { applyPartnerPushoverDefaults, readPartnerPushoverDefaults } from './partnerPushoverDefaults';
 import { attachWorkerObservability } from '../jobs/workerObservability';
 import { escalationStepSchema, type EscalationStep } from './delivery/escalationSteps';
 import { escalationOccurrences, listEscalationUsers, processUserEscalation, type UserEscalationJob } from './delivery/escalationExecution';
 import { resolveDelivery } from './delivery/resolveDelivery';
+import { alertOwningSiteId } from './alertOwnership';
 import { partnerIdForOrg, railOwnershipCondition } from './delivery/railOwnership';
 
 const { db } = dbModule;
@@ -209,12 +211,15 @@ export async function processAlertNotifications(data: ProcessAlertJobData): Prom
     return { queued: 0, inAppSent: false, durationMs: Date.now() - startTime };
   }
 
-  // Get device info for in-app notification
-  const [device] = await db
+  // Get device info for in-app notification. Only a device in the ALERT's org
+  // is attributable: a site-owned topology alert (M3-D6) stays in its site's
+  // org after its origin device moves org, and must not disclose that device.
+  const [deviceRow] = await db
     .select()
     .from(devices)
     .where(eq(devices.id, alert.deviceId))
     .limit(1);
+  const device = deviceRow && deviceRow.orgId === alert.orgId ? deviceRow : undefined;
 
   // Always send in-app notifications first (baseline notification)
   let inAppSent = false;
@@ -242,59 +247,20 @@ export async function processAlertNotifications(data: ProcessAlertJobData): Prom
   // previews is what fires here. The all-enabled-channels fallback is gone: the
   // "Everything else" routing row is the default a technician can read.
   let monitorId: string | null = alert.monitorId ?? null;
-  let legacyOverride: { channelIds?: string[] | null; escalationPolicyId?: string | null } | null = null;
-
-  // Conversion re-keys open alerts to their monitor in the same transaction as
-  // the retirement (W05c1 convert), so a converted source needs no special
-  // case here. `retireSource` is the other path: an UNCONVERTIBLE source has no
-  // monitor to carry its open alerts to, so a retired row must still answer for
-  // alerts that fired BEFORE it was retired — otherwise those alerts fall to
-  // default routing and silently lose their channels and escalation policy.
-  // Newer alerts never reach a retired source. W05d deletes both branches.
-  if (alert.ruleId) {
+  // A queued alert may only carry the compiled rule identity. Read that
+  // monitor pointer alone; legacy channel and escalation settings no longer
+  // participate in active delivery, including alerts queued before retirement.
+  if (alert.ruleId && !monitorId) {
     const [rule] = await db
-      .select({ overrideSettings: alertRules.overrideSettings, managedByMonitorId: alertRules.managedByMonitorId })
+      .select({ managedByMonitorId: alertRules.managedByMonitorId })
       .from(alertRules)
       .where(and(
         eq(alertRules.id, alert.ruleId),
+        isNotNull(alertRules.managedByMonitorId),
         or(isNull(alertRules.retiredAt), gt(alertRules.retiredAt, alert.createdAt)),
       ))
       .limit(1);
-    if (rule) {
-      monitorId = monitorId ?? rule.managedByMonitorId ?? null;
-      if (!rule.managedByMonitorId) {
-        // Transitional (spec §Delivery resolution "Transitional", W05b → W05d):
-        // an UNMANAGED legacy rule keeps its own channel/escalation overrides
-        // until it is converted. Retired sources are excluded; queued alerts
-        // depend on the transactional carry-over described above.
-        // W05d deletes the branch. A MANAGED (monitor-compiled) rule is never
-        // read for delivery — the monitor definition is the source of truth.
-        const overrides = (rule.overrideSettings ?? {}) as Record<string, unknown>;
-        legacyOverride = {
-          channelIds: Array.isArray(overrides.notificationChannelIds) ? (overrides.notificationChannelIds as string[]) : null,
-          escalationPolicyId: typeof overrides.escalationPolicyId === 'string' ? overrides.escalationPolicyId : null,
-        };
-      }
-    }
-  } else if (alert.configPolicyId) {
-    // Config-policy inline rule (#5289 Task 9): `configPolicyId` holds the
-    // config_policy_alert_rules row id (historical column name). Same
-    // transitional treatment as an unmanaged alert_rules row, including the
-    // retired-but-older-than-the-alert case described above.
-    const [cpRule] = await db
-      .select({
-        escalationPolicyId: configPolicyAlertRules.escalationPolicyId,
-        notificationChannelIds: configPolicyAlertRules.notificationChannelIds
-      })
-      .from(configPolicyAlertRules)
-      .where(and(
-        eq(configPolicyAlertRules.id, alert.configPolicyId),
-        or(isNull(configPolicyAlertRules.retiredAt), gt(configPolicyAlertRules.retiredAt, alert.createdAt)),
-      ))
-      .limit(1);
-    if (cpRule) {
-      legacyOverride = { channelIds: cpRule.notificationChannelIds ?? null, escalationPolicyId: cpRule.escalationPolicyId ?? null };
-    }
+    monitorId = rule?.managedByMonitorId ?? null;
   }
 
   // Dual-axis rail resolution (#2130): the alert org's partner, for the
@@ -305,8 +271,9 @@ export async function processAlertNotifications(data: ProcessAlertJobData): Prom
     orgId: alert.orgId,
     severity: alert.severity as AlertSeverity,
     monitorId,
-    siteId: device?.siteId ?? null,
-    legacyOverride
+    // Route by the alert's OWNING site: a topology policy alert's topology
+    // site (M3-D6), else its device's current site.
+    siteId: alertOwningSiteId(alert, device?.siteId)
   });
 
   // Escalation resolves independently of channels (spec): "inbox now, page
@@ -334,8 +301,12 @@ export async function processAlertNotifications(data: ProcessAlertJobData): Prom
     return inboxOnly();
   }
 
-  const channelOptions = await db.select({ id: notificationChannels.id, type: notificationChannels.type, config: notificationChannels.config })
-    .from(notificationChannels).where(inArray(notificationChannels.id, channelIds));
+  // Config lives in notification_channel_configs (#6379); this runs under
+  // system scope, so inherited partner-wide channels get theirs too.
+  const channelOptions = await db.select({ id: notificationChannels.id, type: notificationChannels.type, config: notificationChannelConfigs.config })
+    .from(notificationChannels)
+    .leftJoin(notificationChannelConfigs, eq(notificationChannelConfigs.channelId, notificationChannels.id))
+    .where(inArray(notificationChannels.id, channelIds));
   const optionsById = new Map(channelOptions.map(channel => [channel.id, channel]));
   const missingChannelIds = channelIds.filter(id => !optionsById.has(id));
   if (missingChannelIds.length > 0) {
@@ -407,7 +378,7 @@ type PrepareSendResult =
   | {
       send: true;
       alert: typeof alerts.$inferSelect;
-      channel: typeof notificationChannels.$inferSelect;
+      channel: NotificationChannelWithConfig;
       notificationRecord: typeof alertNotifications.$inferSelect;
       device: typeof devices.$inferSelect | undefined;
       org: typeof organizations.$inferSelect | undefined;
@@ -505,17 +476,14 @@ export async function processSendNotification(data: SendNotificationJobData): Pr
     // Get channel — the alert org's own, or a partner-wide channel owned by
     // that org's partner (#2130).
     const sendOrgPartnerId = await partnerIdForOrg(alert.orgId);
-    const [channel] = await db
-      .select()
-      .from(notificationChannels)
-      .where(
-        and(
-          eq(notificationChannels.id, data.channelId),
-          railOwnershipCondition(notificationChannels.orgId, notificationChannels.partnerId, alert.orgId, sendOrgPartnerId),
-          eq(notificationChannels.enabled, true)
-        )
-      )
-      .limit(1);
+    // Joined with its config row (#6379) — read under system scope, so an
+    // inherited partner-wide channel's config is present.
+    const channel = await getNotificationChannelWithConfig(data.channelId, {
+      where: and(
+        railOwnershipCondition(notificationChannels.orgId, notificationChannels.partnerId, alert.orgId, sendOrgPartnerId),
+        eq(notificationChannels.enabled, true)
+      ),
+    });
 
     if (!channel) {
       // A resolved {success:false} completes the BullMQ job (no 'failed' event)
@@ -529,6 +497,19 @@ export async function processSendNotification(data: SendNotificationJobData): Pr
       return {
         send: false,
         result: { success: false, channelType: 'unknown', error: 'Channel not found for alert organization or its partner' }
+      } satisfies PrepareSendResult;
+    }
+
+    // System scope reads every config row, so a null here means the channel
+    // was written without its notification_channel_configs row (#6379) — a
+    // data bug. Refuse loudly rather than send to an empty destination.
+    if (channel.config === null || channel.config === undefined) {
+      console.error(
+        `[NotificationDispatcher] Channel ${channel.id} has no config row (notification_channel_configs) — send for alert ${data.alertId} dropped`
+      );
+      return {
+        send: false,
+        result: { success: false, channelType: channel.type, error: 'Notification channel has no stored configuration' }
       } satisfies PrepareSendResult;
     }
 
@@ -607,12 +588,14 @@ export async function processSendNotification(data: SendNotificationJobData): Pr
       } satisfies PrepareSendResult;
     }
 
-    // Get device info for context
-    const [device] = await db
+    // Get device info for context — only a device in the ALERT's org (a
+    // site-owned topology alert outlives its origin device's org move, M3-D6).
+    const [deviceRow] = await db
       .select()
       .from(devices)
       .where(eq(devices.id, alert.deviceId))
       .limit(1);
+    const device = deviceRow && deviceRow.orgId === alert.orgId ? deviceRow : undefined;
 
     // Get org info
     const [org] = await db
@@ -1115,51 +1098,31 @@ async function sendPagerDutyChannelNotification(
  * Send notification via Pushover channel.
  *
  * Per-org channels may leave any field blank; in that case we fall back to
- * the partner-level `pushoverAppToken` / `pushoverDefaultUser` /
- * `pushoverDefaultSound` / `pushoverDefaultPriority` from
- * `partners.settings.notifications`. This mirrors the Slack-webhook-URL
- * inheritance pattern.
+ * the partner-level Pushover defaults in `partners.settings.notifications`
+ * (partnerPushoverDefaults.ts, which opens the sealed token and user key).
  */
-async function sendPushoverChannelNotification(
+export async function sendPushoverChannelNotification(
   config: PushoverConfig,
   alert: typeof alerts.$inferSelect,
   device: typeof devices.$inferSelect | undefined,
   org: typeof organizations.$inferSelect | undefined
 ): Promise<{ success: boolean; error?: string }> {
-  const merged: PushoverConfig = { ...config };
+  let merged: PushoverConfig = { ...config };
 
   const tokenBlank = !merged.token || merged.token.trim().length === 0;
   const userBlank = !merged.user || merged.user.trim().length === 0;
   const needsInherit = tokenBlank || userBlank || merged.sound === undefined || merged.priority === undefined;
 
   if (needsInherit && org?.partnerId) {
-    const inherited = await runWithSystemDbAccess(async () => {
+    const partnerSettings = await runWithSystemDbAccess(async () => {
       const [partner] = await db
         .select({ settings: partners.settings })
         .from(partners)
         .where(eq(partners.id, org.partnerId))
         .limit(1);
-      const notifications = (partner?.settings as { notifications?: Record<string, unknown> } | null)?.notifications;
-      return {
-        pushoverAppToken: typeof notifications?.pushoverAppToken === 'string' ? notifications.pushoverAppToken : undefined,
-        pushoverDefaultUser: typeof notifications?.pushoverDefaultUser === 'string' ? notifications.pushoverDefaultUser : undefined,
-        pushoverDefaultSound: typeof notifications?.pushoverDefaultSound === 'string' ? notifications.pushoverDefaultSound : undefined,
-        pushoverDefaultPriority: typeof notifications?.pushoverDefaultPriority === 'number' ? notifications.pushoverDefaultPriority as PushoverPriority : undefined,
-      };
+      return partner?.settings;
     });
-
-    if (tokenBlank && inherited.pushoverAppToken) {
-      merged.token = inherited.pushoverAppToken;
-    }
-    if (userBlank && inherited.pushoverDefaultUser) {
-      merged.user = inherited.pushoverDefaultUser;
-    }
-    if (merged.sound === undefined && inherited.pushoverDefaultSound) {
-      merged.sound = inherited.pushoverDefaultSound;
-    }
-    if (merged.priority === undefined && inherited.pushoverDefaultPriority !== undefined) {
-      merged.priority = inherited.pushoverDefaultPriority;
-    }
+    merged = applyPartnerPushoverDefaults(merged, readPartnerPushoverDefaults(partnerSettings));
   }
 
   const dashboardUrl = process.env.DASHBOARD_URL
@@ -1240,8 +1203,9 @@ async function scheduleEscalation(alertId: string, policyId: string, orgId: stri
   )];
   const validChannels = requestedChannelIds.length > 0
     ? await db
-      .select({ id: notificationChannels.id, type: notificationChannels.type, config: notificationChannels.config })
+      .select({ id: notificationChannels.id, type: notificationChannels.type, config: notificationChannelConfigs.config })
       .from(notificationChannels)
+      .leftJoin(notificationChannelConfigs, eq(notificationChannelConfigs.channelId, notificationChannels.id))
       .where(
         and(
           railOwnershipCondition(notificationChannels.orgId, notificationChannels.partnerId, orgId, orgPartnerId),

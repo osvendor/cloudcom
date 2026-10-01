@@ -1,16 +1,17 @@
-import { and, desc, eq, isNull, or, type SQL } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 
 import { db } from '../db';
 import {
   alertCorrelationGroups,
   alerts,
-  devices,
   metricAnomalies,
-  playbookDefinitions,
   remediationSuggestions,
-  scripts,
-  scriptTemplates,
 } from '../db/schema';
+import { attachProvenFixes } from './fixMemory/attach';
+import {
+  listCatalogPlaybooks, listCatalogScripts, listCatalogTemplates, NON_REMEDIATION_SYSTEM_SCRIPT_NAMES,
+  resolveDeviceOs, resolveOrgPartnerId, TEMPLATE_LANGUAGES_BY_OS,
+} from './fixMemory/catalog';
 import { shouldProduceMlOutput } from './mlFeatureFlags';
 
 export const REMEDIATION_SUGGESTION_VERSION = 'remediation-suggestions-v1';
@@ -107,8 +108,14 @@ function termsForSource(ctx: SourceContext): string[] {
   return [...terms];
 }
 
+function matchesTerm(searchable: string, term: string): boolean {
+  // Word-start match: "ram" must not hit "programdata", "update" still hits "updates".
+  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[^a-z0-9])${escaped}`).test(searchable);
+}
+
 function scoreCandidate(searchable: string, terms: string[]): { score: number; matchedTerms: string[] } {
-  const matchedTerms = terms.filter((term) => searchable.includes(term));
+  const matchedTerms = terms.filter((term) => matchesTerm(searchable, term));
   if (matchedTerms.length === 0) return { score: 0, matchedTerms };
   const score = matchedTerms.length / Math.max(terms.length, 1);
   return { score, matchedTerms };
@@ -220,38 +227,21 @@ async function resolveSourceContext(input: GenerateRemediationSuggestionsInput):
 
 async function listCandidates(ctx: SourceContext, limit: number): Promise<Candidate[]> {
   const terms = termsForSource(ctx);
-  const scriptConditions: SQL[] = [isNull(scripts.deletedAt)];
-  scriptConditions.push(or(eq(scripts.isSystem, true), eq(scripts.orgId, ctx.orgId))!);
-
+  // Without a single target device (e.g. a correlation group) there is no OS to
+  // filter on; every per-device execution path re-checks OS at dispatch.
+  const deviceOs = await resolveDeviceOs(ctx.deviceId);
+  const catalogCtx = { orgId: ctx.orgId, partnerId: await resolveOrgPartnerId(ctx.orgId), deviceOs };
   const [scriptRows, templateRows, playbookRows] = await Promise.all([
-    db.select({
-      id: scripts.id,
-      name: scripts.name,
-      description: scripts.description,
-      category: scripts.category,
-      runAs: scripts.runAs,
-    }).from(scripts).where(and(...scriptConditions)).orderBy(desc(scripts.updatedAt)).limit(100),
-    db.select({
-      id: scriptTemplates.id,
-      name: scriptTemplates.name,
-      description: scriptTemplates.description,
-      category: scriptTemplates.category,
-      rating: scriptTemplates.rating,
-    }).from(scriptTemplates).orderBy(desc(scriptTemplates.downloads)).limit(100),
-    db.select({
-      id: playbookDefinitions.id,
-      name: playbookDefinitions.name,
-      description: playbookDefinitions.description,
-      category: playbookDefinitions.category,
-      isBuiltIn: playbookDefinitions.isBuiltIn,
-    }).from(playbookDefinitions)
-      .where(and(eq(playbookDefinitions.isActive, true), or(eq(playbookDefinitions.isBuiltIn, true), eq(playbookDefinitions.orgId, ctx.orgId))!))
-      .orderBy(playbookDefinitions.category, playbookDefinitions.name)
-      .limit(100),
+    listCatalogScripts(catalogCtx),
+    listCatalogTemplates(catalogCtx),
+    listCatalogPlaybooks(catalogCtx),
   ]);
 
   const candidates: Candidate[] = [];
   for (const row of scriptRows) {
+    // Mirrors the SQL filters above so a widened query can never leak these through.
+    if (row.isSystem && NON_REMEDIATION_SYSTEM_SCRIPT_NAMES.includes(row.name)) continue;
+    if (deviceOs && !row.osTypes.includes(deviceOs)) continue;
     const searchable = sourceTextParts(row.name, row.description, row.category, row.runAs);
     const scored = scoreCandidate(searchable, terms);
     if (scored.score <= 0) continue;
@@ -286,6 +276,7 @@ async function listCandidates(ctx: SourceContext, limit: number): Promise<Candid
   }
 
   for (const row of templateRows) {
+    if (deviceOs && row.language && !TEMPLATE_LANGUAGES_BY_OS[deviceOs].has(row.language)) continue;
     const searchable = sourceTextParts(row.name, row.description, row.category);
     const scored = scoreCandidate(searchable, terms);
     if (scored.score <= 0) continue;
@@ -347,6 +338,10 @@ export async function generateRemediationSuggestions(
     };
   }
 
+  // AI Suggested Fixes W1 — proven memory first; free, and the catalog loop
+  // below then reuses (never duplicates) a script memory already attached.
+  const memoryAttached = await attachProvenFixes({ sourceType: input.sourceType, sourceId: input.sourceId, orgId: ctx.orgId });
+
   const existing = await db
     .select()
     .from(remediationSuggestions)
@@ -404,13 +399,22 @@ export async function generateRemediationSuggestions(
     if (inserted) created.push(inserted);
   }
 
+  // AI Suggested Fixes W1 — a memory row the catalog loop above never touched
+  // (no keyword-matched candidate for that script) still belongs in the
+  // result; `existing` was queried after attachProvenFixes, so it already
+  // reflects anything just attached.
+  const createdIds = new Set(created.map((row) => row.id));
+  const memoryRows = memoryAttached > 0
+    ? existing.filter((row) => row.origin === 'memory' && !createdIds.has(row.id))
+    : [];
+
   return {
     sourceType: input.sourceType,
     sourceId: input.sourceId,
     orgId: ctx.orgId,
     skipped: false,
     usedFallback,
-    suggestions: created,
+    suggestions: [...memoryRows, ...created],
   };
 }
 

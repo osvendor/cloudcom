@@ -52,23 +52,43 @@ func NewScreenCapturer(config CaptureConfig) (ScreenCapturer, error) {
 	return newPlatformCapturer(config)
 }
 
-// ProbeCaptureAccess performs a single real capture attempt using the
-// platform backend selected by config.
+// ProbeCaptureAccess performs a real capture attempt and reports whether a
+// frame came back.
+//
+// By default that is a single attempt with the backend NewScreenCapturer
+// selects. A platform can install platformCaptureProbePlan to add retries and
+// a fallback backend: macOS does, because a ScreenCaptureKit capture that times
+// out after a successful init used to report false with no second attempt and
+// no CoreGraphics try, leaving the helper Desktop Unavailable (#6105).
 func ProbeCaptureAccess(config CaptureConfig) (bool, error) {
-	capturer, err := NewScreenCapturer(config)
+	plan := defaultCaptureProbePlan(config)
+	if platformCaptureProbePlan != nil {
+		plan = platformCaptureProbePlan(config)
+	}
+	res, err := probeCaptureBackends(plan)
 	if err != nil {
 		return false, err
 	}
-	defer capturer.Close()
-
-	img, err := capturer.Capture()
-	if err != nil {
-		return false, err
-	}
-	if img == nil || img.Rect.Empty() {
-		return false, fmt.Errorf("capture probe returned no frame")
+	if plan.onSuccess != nil {
+		plan.onSuccess(res)
 	}
 	return true, nil
+}
+
+// platformCaptureProbePlan, when non-nil, supplies the backend ordering for
+// ProbeCaptureAccess. Installed from init() by platforms that need more than
+// one attempt (capture_darwin.go).
+var platformCaptureProbePlan func(CaptureConfig) captureProbePlan
+
+// defaultCaptureProbePlan is the historical probe: one attempt, no fallback.
+func defaultCaptureProbePlan(config CaptureConfig) captureProbePlan {
+	return captureProbePlan{
+		primary: captureProbeBackend{
+			name: "platform",
+			open: func() (ScreenCapturer, error) { return NewScreenCapturer(config) },
+		},
+		primaryAttempts: 1,
+	}
 }
 
 // BGRAProvider is implemented by capturers that produce BGRA pixel data
@@ -86,6 +106,16 @@ type BGRAProvider interface {
 // mode (e.g. DXGI capturer falling back to GDI) to avoid busy loops.
 type TightLoopHint interface {
 	TightLoop() bool
+}
+
+// LatestFrameProvider is implemented by capturers whose Capture() reports an
+// unchanged screen as (nil, nil) and so cannot serve a one-shot consumer that
+// shares the capturer with the streaming loop (the loop may already have taken
+// the frame). CaptureLatest always returns the current frame, changed or not,
+// and does not affect what the next Capture() returns. The macOS SCStream
+// capturer implements it (#5928).
+type LatestFrameProvider interface {
+	CaptureLatest() (*image.RGBA, error)
 }
 
 // FrameChangeHint is implemented by capturers that can report whether new

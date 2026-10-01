@@ -21,7 +21,7 @@ func withInstallRecorder(t *testing.T) *installRecorder {
 	rec := &installRecorder{}
 	orig := installPackageFunc
 	t.Cleanup(func() { installPackageFunc = orig })
-	installPackageFunc = func(pkgPath, binaryPath string) error {
+	installPackageFunc = func(pkgPath, binaryPath, _ string) error {
 		rec.called++
 		rec.paths = append(rec.paths, pkgPath)
 		return nil
@@ -31,7 +31,7 @@ func withInstallRecorder(t *testing.T) *installRecorder {
 
 func newInstallTestManager(t *testing.T, tmpDir string) *Manager {
 	t.Helper()
-	mgr := New(context.Background(), func() string { return "https://control.example.test" }, secmem.NewSecureString("tok"), "agent-1")
+	mgr := New(context.Background(), func() string { return "https://control.example.test" }, secmem.NewSecureString("tok"), "agent-1", WithMachineInstallOwner(true))
 	mgr.baseDir = tmpDir
 	mgr.binaryPath = filepath.Join(tmpDir, "missing-helper") // isInstalled() == false
 	mgr.sessionEnumerator = &mockEnumerator{}
@@ -268,7 +268,7 @@ func TestApplyPendingUpdateRetriesAfterTransientUnreadableVersion(t *testing.T) 
 	}
 	installs := 0
 	orig := installPackageFunc
-	installPackageFunc = func(string, string) error { installs++; return nil }
+	installPackageFunc = func(string, string, string) error { installs++; return nil }
 	t.Cleanup(func() { installPackageFunc = orig })
 	// Readable-old before any install; unreadable right after the 1st
 	// install; readable-new after the 2nd.

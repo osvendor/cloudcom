@@ -8,7 +8,7 @@
 import { Queue, Worker, Job } from 'bullmq';
 import * as dbModule from '../db';
 import { networkMonitors, networkMonitorResults, devices, networkMonitorAlertRules, alerts, organizations } from '../db/schema';
-import { eq, and, sql, inArray } from 'drizzle-orm';
+import { eq, and, sql, inArray, isNull } from 'drizzle-orm';
 import { getBullMQConnection } from '../services/redis';
 import { createInstrumentedQueue } from '../services/bullmqQueue';
 import { isReusableState } from '../services/bullmqUtils';
@@ -17,6 +17,7 @@ import { buildMonitorCommand } from '../services/monitorCommands';
 import { isCooldownActive, setCooldown } from '../services/alertCooldown';
 import { resolveAlert, createSourcedAlert } from '../services/alertService';
 import { assertQueueJobName, parseQueueJobData } from '../services/bullmqValidation';
+import { excludeQuickSupportOrgs } from '../services/quickSupportOrg';
 import {
   monitorQueueJobDataSchema,
   type MonitorQueueJobData,
@@ -28,6 +29,7 @@ import { redactOptionalSecretText, redactSecretsDeep } from '../services/secretR
 import { monitorRequestUrl, readTlsObservation, tlsObservationUpdate } from '../services/monitors/tlsObservation';
 import { selectMonitorExecutor } from '../services/networkExecutorSelection';
 import { resolveNetworkCheckAlertDevice } from '../services/monitors/networkCheckAlertDevice';
+import { notHoldingOrgCondition } from '../services/unassignedPool/selectorPredicate';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -343,7 +345,8 @@ async function evaluateMonitorAlertRules(
     .from(networkMonitorAlertRules)
     .where(and(
       eq(networkMonitorAlertRules.monitorId, monitor.id),
-      eq(networkMonitorAlertRules.isActive, true)
+      eq(networkMonitorAlertRules.isActive, true),
+      isNull(networkMonitorAlertRules.retiredAt)
     ));
 
   if (rules.length === 0) return;
@@ -378,7 +381,10 @@ async function evaluateMonitorAlertRules(
       for (const existingAlert of matchingAlerts) {
         await resolveAlert(
           existingAlert.id,
-          `Auto-resolved after monitor ${monitor.name} recovered from ${rule.condition}`
+          `Auto-resolved after monitor ${monitor.name} recovered from ${rule.condition}`,
+          undefined,
+          false,
+          'condition_cleared',
         );
       }
       continue;
@@ -410,6 +416,7 @@ async function evaluateMonitorAlertRules(
       context: {
         source: 'network_monitor',
         monitorId: monitor.id,
+        legacyNetworkMonitorId: monitor.id,
         alertRuleId: rule.id,
         monitorType: monitor.monitorType,
         target: monitor.target,
@@ -422,7 +429,7 @@ async function evaluateMonitorAlertRules(
       publisher: 'monitor-worker',
       // `source` is supplied by createSourcedAlert from `context.source`.
       eventPayload: {
-        monitorId: monitor.id,
+        legacyNetworkMonitorId: monitor.id,
         alertRuleId: rule.id,
         monitorType: monitor.monitorType,
         target: monitor.target
@@ -655,7 +662,11 @@ export async function selectDueMonitorJobs(
       db
         .select({ id: organizations.id, partnerId: organizations.partnerId })
         .from(organizations)
-        .where(inArray(organizations.partnerId, partnerIds))
+        // Exclude the hidden per-partner 'quick_support' org: its devices are
+        // a stranger's own machine mid support session, not fleet the
+        // partner authored partner-wide network monitors against. Same
+        // exclusion as monitorScriptWorker.ts's partner-wide fan-out.
+        .where(and(inArray(organizations.partnerId, partnerIds), excludeQuickSupportOrgs(), notHoldingOrgCondition()))
     );
     for (const row of rows) {
       if (!row.partnerId) continue;

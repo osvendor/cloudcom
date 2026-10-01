@@ -359,6 +359,35 @@ describe('renderQuotePdf', () => {
     expect(text).toContain('IoT devices, NAS devices');
   });
 
+  it('omits a device-group/site stamp from the customer PDF once the line has drifted off its scoping org (id cleared, name kept for the internal editor)', async () => {
+    const pdf = await renderQuotePdf(
+      {
+        id: 'q-drift', quoteNumber: 'Q-DRIFT', currencyCode: 'USD', subtotal: '40.00', taxTotal: '0.00',
+        oneTimeTotal: '0.00', monthlyRecurringTotal: '40.00', annualRecurringTotal: '0.00',
+        dueOnAcceptanceTotal: '0.00', total: '40.00',
+      },
+      [{ id: 'b1', blockType: 'line_items', sortOrder: 0, content: {} }],
+      [
+        {
+          id: 'servers', blockId: 'b1', name: 'Servers', description: null, quantity: '1', unitPrice: '40',
+          lineTotal: '40.00', recurrence: 'monthly', contractLineType: 'per_device_group',
+          // Drifted stamp: deviceGroupId/siteId cleared by a retarget (org move),
+          // but the name columns are deliberately kept for the internal
+          // "re-select for this organization" chip — they must not reach the
+          // customer-facing document once the id is gone.
+          deviceGroupId: null, deviceGroupName: 'Old Org Servers', siteId: null, siteName: 'Old Org HQ',
+          includedQuantity: null, overageMode: null, overageUnitPrice: null,
+        },
+      ],
+      async () => null,
+      {},
+    );
+    const text = extractPdfText(pdf);
+    expect(text).toContain('Estimated quantity');
+    expect(text).not.toContain('Old Org Servers');
+    expect(text).not.toContain('Old Org HQ');
+  });
+
   it('produces a PDF buffer (heading + line_items block)', async () => {
     const buf = await renderQuotePdf(
       { id: 'q1', quoteNumber: 'Q-1', oneTimeTotal: '100.00', monthlyRecurringTotal: '0.00', annualRecurringTotal: '0.00', total: '100.00', currencyCode: 'USD' },
@@ -945,6 +974,84 @@ describe('renderQuotePdf', () => {
       expect(text).toContain('Signed NDA');
       expect(text).toContain('attached below');
       expect(contractUploadedMarker('Signed NDA')).toBe('Signed NDA — attached below');
+    });
+
+    // #7040: agreements used to draw inline, in block order — an agreement
+    // placed before the pricing pushed the totals pages down the document.
+    // They now follow the price: totals and the closing terms end the proposal,
+    // authored agreements start on a fresh page, then the T&C.
+    describe('agreements come after the price', () => {
+      const quote = {
+        ...baseQuote,
+        dueOnAcceptanceTotal: '100.00',
+        terms: 'Closing note from the MSP.',
+        termsAndConditions: 'Standard conditions text.',
+      };
+      const blocks = [
+        // Authored FIRST in block order: it must still land after the totals.
+        { id: 'k1', blockType: 'contract', sortOrder: 0, content: { templateId: 't1', templateVersionId: 'v1', variableValues: {} } },
+        { id: 'li', blockType: 'line_items', sortOrder: 1, content: {} },
+        { id: 'k2', blockType: 'contract', sortOrder: 2, content: { templateId: 't2', templateVersionId: 'v2', variableValues: {} } },
+      ];
+      const lines = [
+        { id: 'l1', blockId: 'li', description: 'Onboarding work', quantity: '1', unitPrice: '100', lineTotal: '100.00', recurrence: 'one_time' },
+      ];
+      const contractRenderData = new Map([
+        ['k1', { html: '<p>Agreement body clause.</p>', templateName: 'Master Services Agreement' }],
+        ['k2', { html: null, templateName: 'Signed NDA' }],
+      ]);
+      const render = () => renderQuotePdf(quote as never, blocks as never, lines as never, async () => null, {}, async () => null, contractRenderData as never);
+      // One content stream per page; the footer band stamps "Page i of N" on each.
+      const pagesOf = (buf: Buffer) => extractPdfTextByStream(buf).filter((t) => /Page \d+ of \d+/.test(t));
+      const pageOf = (pages: string[], needle: string) => pages.findIndex((t) => t.includes(needle));
+
+      it('ends the proposal with the price and the closing terms, then starts the agreement on its own page', async () => {
+        const pages = pagesOf(await render());
+        const pricePage = pageOf(pages, 'Due on acceptance');
+        expect(pricePage).toBeGreaterThanOrEqual(0);
+        expect(pageOf(pages, 'Onboarding work')).toBe(pricePage);
+        expect(pageOf(pages, 'Closing note from the MSP.')).toBe(pricePage);
+        const agreementPage = pageOf(pages, 'Agreement body clause.');
+        expect(agreementPage).toBeGreaterThan(pricePage);
+        expect(pages[agreementPage]).toContain('Master Services Agreement');
+        expect(pages[agreementPage]).not.toContain('Onboarding work');
+      });
+
+      // The uploaded agreement's pages are appended after the whole document,
+      // so its marker is a pointer that belongs with the proposal, not under
+      // another agreement's heading.
+      it('lists an uploaded agreement on the price page, after the closing terms', async () => {
+        const buf = await render();
+        const pages = pagesOf(buf);
+        expect(pageOf(pages, 'attached below')).toBe(pageOf(pages, 'Due on acceptance'));
+        const text = extractPdfText(buf);
+        expect(text.indexOf('Closing note from the MSP.')).toBeLessThan(text.indexOf('attached below'));
+      });
+
+      // T&C drawn on an agreement's last page read as part of that agreement.
+      it('starts the T&C on its own page after an authored agreement', async () => {
+        const pages = pagesOf(await render());
+        const termsPage = pageOf(pages, 'Standard conditions text.');
+        expect(termsPage).toBeGreaterThan(pageOf(pages, 'Agreement body clause.'));
+        expect(pages[termsPage]).not.toContain('Master Services Agreement');
+      });
+
+      it('keeps the T&C on the price page when there is no authored agreement', async () => {
+        const buf = await renderQuotePdf(
+          quote as never, blocks.filter((b) => b.id !== 'k1') as never, lines as never,
+          async () => null, {}, async () => null, contractRenderData as never,
+        );
+        const pages = pagesOf(buf);
+        expect(pageOf(pages, 'Standard conditions text.')).toBe(pageOf(pages, 'Due on acceptance'));
+      });
+
+      it('adds no page break when the only agreement is an uploaded one', async () => {
+        const buf = await renderQuotePdf(
+          quote as never, blocks.filter((b) => b.id !== 'k1') as never, lines as never,
+          async () => null, {}, async () => null, contractRenderData as never,
+        );
+        expect((await PDFDocument.load(buf)).getPageCount()).toBe(1);
+      });
     });
 
     it('a contract block with no matching contractRenderData entry does not throw', async () => {

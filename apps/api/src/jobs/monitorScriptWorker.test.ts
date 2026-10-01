@@ -1,14 +1,54 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { mockDb, dispatchMock, resolveMonitorsMock } = vi.hoisted(() => ({
+const { mockDb, dispatchMock, resolveMonitorsMock, txState, neSpy, eqSpy } = vi.hoisted(() => ({
   mockDb: { select: vi.fn() },
   dispatchMock: vi.fn(),
   resolveMonitorsMock: vi.fn(),
+  // How many system transactions are open right now (#3445).
+  txState: { depth: 0 },
+  neSpy: vi.fn(),
+  eqSpy: vi.fn(),
 }));
+
+// Plain-string mocked schema columns below cannot round-trip through a real
+// drizzle SQL compiler (no Column/Table shape for PgDialect to read), so the
+// only way to prove a predicate like `ne(organizations.type, 'quick_support')`
+// is actually emitted is to spy on the drizzle-orm helper call itself rather
+// than inspect the resulting SQL tree.
+vi.mock('drizzle-orm', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('drizzle-orm')>();
+  return {
+    ...actual,
+    ne: ((...args: Parameters<typeof actual.ne>) => {
+      neSpy(...args);
+      return actual.ne(...args);
+    }) as typeof actual.ne,
+    eq: ((...args: Parameters<typeof actual.eq>) => {
+      eqSpy(...args);
+      return actual.eq(...args);
+    }) as typeof actual.eq,
+  };
+});
 
 vi.mock('../db', () => ({
   db: mockDb,
-  withSystemDbAccessContext: async (fn: () => unknown) => fn(),
+  withSystemDbAccessContext: async (fn: () => unknown) => {
+    txState.depth += 1;
+    try {
+      return await fn();
+    } finally {
+      txState.depth -= 1;
+    }
+  },
+  runOutsideDbContext: async (fn: () => unknown) => {
+    const saved = txState.depth;
+    txState.depth = 0;
+    try {
+      return await fn();
+    } finally {
+      txState.depth = saved;
+    }
+  },
 }));
 
 vi.mock('../db/schema', () => ({
@@ -23,6 +63,7 @@ vi.mock('../db/schema', () => ({
   organizations: {
     id: 'organizations.id',
     partnerId: 'organizations.partnerId',
+    type: 'organizations.type',
   },
   devices: {
     id: 'devices.id',
@@ -33,6 +74,7 @@ vi.mock('../db/schema', () => ({
     hostname: 'devices.hostname',
     siteId: 'devices.siteId',
     customFields: 'devices.customFields',
+    isEphemeral: 'devices.isEphemeral',
   },
   scriptExecutions: {
     monitorId: 'scriptExecutions.monitorId',
@@ -47,6 +89,8 @@ vi.mock('../db/schema', () => ({
 vi.mock('../services/scriptDispatch', () => ({
   dispatchScriptToDevice: dispatchMock,
 }));
+
+vi.mock('../services/sentry', () => ({ captureException: vi.fn() }));
 
 vi.mock('../services/monitors/monitorResolver', () => ({
   resolveMonitorsForDevice: resolveMonitorsMock,
@@ -281,6 +325,82 @@ describe('processScriptMonitorTick', () => {
     expect(call.timeoutSeconds).toBe(300);
   });
 
+  // #3445: the tick runs in ONE system transaction and the probe's
+  // script_executions + device_commands rows are written in it. Sending inside
+  // that transaction lets a fast agent answer before the rows are visible to
+  // the result path, which then drops the result and strands the execution
+  // until the stale reaper times it out.
+  it('writes the probe rows inside the tick transaction and sends only after it commits (#3445)', async () => {
+    setupDb(
+      new Map<TableRef, unknown[]>([
+        [monitorDefinitions, [makeMonitorRow()]],
+        [devices, [makeDeviceRow()]],
+        [scriptExecutions, []],
+        [scripts, [makeScriptRow()]],
+      ]),
+    );
+    const events: Array<{ event: string; depth: number }> = [];
+    const base = {
+      ok: true,
+      commandId: 'cmd-1',
+      executionId: 'exec-1',
+      deliverBy: null,
+      ignoredParameters: [],
+      runAs: 'system',
+      targetSessionId: null,
+    };
+    dispatchMock.mockImplementation(async (input: { deferDelivery?: boolean }) => {
+      events.push({ event: 'rows_created', depth: txState.depth });
+      const send = () => {
+        events.push({ event: 'sent', depth: txState.depth });
+        return { ...base, delivered: true, deliveryOutcome: 'sent', executedAt: NOW };
+      };
+      if (input.deferDelivery) {
+        return { ...base, delivered: false, deliveryOutcome: 'deferred', executedAt: null, deliver: async () => send() };
+      }
+      return send();
+    });
+
+    const result = await processScriptMonitorTick();
+
+    expect(result.dispatched).toBe(1);
+    expect(events).toEqual([
+      { event: 'rows_created', depth: 1 },
+      { event: 'sent', depth: 0 },
+    ]);
+  });
+
+  it('a throwing deferred delivery does not fail the tick — the committed command waits for the heartbeat (#3445)', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    setupDb(
+      new Map<TableRef, unknown[]>([
+        [monitorDefinitions, [makeMonitorRow()]],
+        [devices, [makeDeviceRow()]],
+        [scriptExecutions, []],
+        [scripts, [makeScriptRow()]],
+      ]),
+    );
+    dispatchMock.mockResolvedValue({
+      ok: true,
+      commandId: 'cmd-1',
+      executionId: 'exec-1',
+      deliverBy: null,
+      ignoredParameters: [],
+      runAs: 'system',
+      targetSessionId: null,
+      delivered: false,
+      deliveryOutcome: 'deferred',
+      executedAt: null,
+      deliver: async () => { throw new Error('socket closed'); },
+    });
+
+    const result = await processScriptMonitorTick();
+
+    expect(result.dispatched).toBe(1);
+    expect(consoleErrorSpy).toHaveBeenCalled();
+    consoleErrorSpy.mockRestore();
+  });
+
   it('never dispatches when no monitor rows are due for consideration', async () => {
     setupDb(
       new Map<TableRef, unknown[]>([
@@ -295,5 +415,38 @@ describe('processScriptMonitorTick', () => {
 
     expect(dispatchMock).not.toHaveBeenCalled();
     expect(result).toEqual({ monitorsConsidered: 0, devicesConsidered: 0, dispatched: 0, skipped: 0, errors: 0 });
+  });
+
+  it('excludes the hidden quick_support org from a partner-wide script monitor fan-out', async () => {
+    neSpy.mockClear();
+    setupDb(
+      new Map<TableRef, unknown[]>([
+        [monitorDefinitions, [makeMonitorRow({ orgId: null, partnerId: 'partner-1' })]],
+        [organizations, [{ id: ORG_ID }]],
+        [devices, [makeDeviceRow()]],
+        [scriptExecutions, []],
+        [scripts, [makeScriptRow()]],
+      ]),
+    );
+
+    await processScriptMonitorTick();
+
+    expect(neSpy).toHaveBeenCalledWith(organizations.type, 'quick_support');
+  });
+
+  it('excludes ephemeral (Quick Support) devices from the candidate device query', async () => {
+    eqSpy.mockClear();
+    setupDb(
+      new Map<TableRef, unknown[]>([
+        [monitorDefinitions, [makeMonitorRow()]],
+        [devices, [makeDeviceRow()]],
+        [scriptExecutions, []],
+        [scripts, [makeScriptRow()]],
+      ]),
+    );
+
+    await processScriptMonitorTick();
+
+    expect(eqSpy).toHaveBeenCalledWith(devices.isEphemeral, false);
   });
 });

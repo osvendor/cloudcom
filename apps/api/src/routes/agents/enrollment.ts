@@ -22,6 +22,7 @@ import { rateLimiter } from '../../services/rate-limit';
 import { invalidateOrgDeviceCount } from '../../services/agentOrgRateLimit';
 import { enrollSchema } from './schemas';
 import { generateAgentId, generateApiKey, issueMtlsCertForDevice } from './helpers';
+import { buildEnrollmentResponseBody } from './enrollmentResponse';
 import { recordAgentEnrollment } from '../../services/anomalyMetrics';
 import { queueWarrantySyncForDevice } from '../../services/warrantyWorker';
 import { dispatchHook } from '../../services/partnerHooks';
@@ -49,6 +50,7 @@ import {
   admitPartnerDeviceCapacity,
   PartnerDeviceCapacityError,
 } from '../../services/partnerDeviceCapacity';
+import { markTopologyIdentityDirty } from '../../services/topology/identityDirty';
 
 export const enrollmentRoutes = new Hono();
 const ENROLLMENT_RATE_LIMIT = 10;
@@ -853,6 +855,12 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
             deviceRoleSource: 'auto',
             isVirtual: data.isVirtual ?? false,
             virtualizationPlatform: data.virtualizationPlatform ?? null,
+            // A new install: what the previous one reported about its backup
+            // helper no longer holds. Backups and restores for this device
+            // wait for the new install's first heartbeat, as for a new device.
+            backupReadProtocolVersion: null,
+            backupIntegrityProtocolVersion: null,
+            backupWriteProtocolVersion: null,
             status: 'pending',
             updatedAt: new Date(),
           })
@@ -970,6 +978,11 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
               isPrimary: nic.isPrimary ?? false
             });
         }
+        // M2 D15.2/D16: NIC MACs are the physical topology publisher's trusted
+        // MAC binding source. A re-enrolled (in-place) device may have new NICs
+        // that the next inventory report will then see as unchanged, so mark
+        // here; a fresh row has no topology binding yet.
+        if (!insertFreshRow) await markTopologyIdentityDirty(tx, { orgId: dev.orgId, siteId: dev.siteId });
       }
 
       // #946: consume the enrollment key ONLY after the device row has
@@ -1168,23 +1181,28 @@ enrollmentRoutes.post('/enroll', zValidator('json', enrollSchema), async (c) => 
               collidingDeviceIds: collidingDevices.map((candidate) => candidate.id),
             }
           : undefined,
-      responseBody: {
-        agentId: agentId,
-        deviceId: device.id,
-        authToken: apiKey,
-        watchdogAuthToken: watchdogApiKey,
-        helperAuthToken: helperApiKey,
-        orgId: key.orgId,
-        siteId: key.siteId,
-        backupServerUrl: (process.env.AGENT_BACKUP_SERVER_URL ?? '').trim() || undefined,
-        config: {
-          heartbeatIntervalSeconds: 60,
-          metricsCollectionIntervalSeconds: 30
+      // Built by enrollmentResponse.ts so a pre-assignment enrollment can
+      // omit backup and trust material. Per-org enrollment: unchanged.
+      responseBody: buildEnrollmentResponseBody(
+        {
+          agentId: agentId,
+          deviceId: device.id,
+          authToken: apiKey,
+          watchdogAuthToken: watchdogApiKey,
+          helperAuthToken: helperApiKey,
+          orgId: key.orgId,
+          siteId: key.siteId,
+          backupServerUrl: (process.env.AGENT_BACKUP_SERVER_URL ?? '').trim() || undefined,
+          config: {
+            heartbeatIntervalSeconds: 60,
+            metricsCollectionIntervalSeconds: 30
+          },
+          mtls: mtlsCert,
+          manifestTrustKeys,
+          manifestKeyDelegations,
         },
-        mtls: mtlsCert,
-        manifestTrustKeys,
-        manifestKeyDelegations,
-      },
+        { preAssignment: false },
+      ),
     };
   });
 

@@ -64,11 +64,11 @@ var ErrPublishLeaseExpired = errors.New("backup publish lease expired before man
 // resume attempt, so publishing is refused.
 var ErrJournalExpiredAtPublish = errors.New("checkpoint journal expired before manifest could be published")
 
-// collectSystemState is a seam over systemstate.CollectSystemState so tests can
+// collectSystemState is a seam over systemstate.CollectSystemStateWithOptions so tests can
 // exercise the failure and partial-collection paths deterministically — the
 // real collector shells out to OS tools and succeeds on any CI host, which
 // would otherwise leave the system-state fail-loud/warning branches uncovered.
-var collectSystemState = systemstate.CollectSystemState
+var collectSystemState = systemstate.CollectSystemStateWithOptions
 
 // collectLayout is the seam over layout.Collect (disk layout for bare-metal
 // rebuilds, spec §5.2). Same rationale as collectSystemState above.
@@ -167,6 +167,25 @@ type BackupConfig struct {
 	// behavior: publish whenever ready). There is no renewal — this is
 	// exactly what the server chose at dispatch time.
 	PublishLeaseExpiresAt time.Time
+
+	// JobID is the dispatched backup job (the backup_run payload's jobId).
+	// A snapshot attestation names it; empty means the run has no dispatched
+	// job to attest for (e.g. an agent.yaml-configured run) and none is made.
+	JobID string
+
+	// BaseAttestation is the server's record of the dispatched base's
+	// manifest (payload baseAttestation). A server-owned run with a base
+	// reuses it only when the downloaded manifest matches this record — see
+	// fetchServerOwnedBase.
+	BaseAttestation *BaseAttestation
+}
+
+// BaseAttestation is the attested key, SHA-256 and size of an incremental
+// base's manifest, as the server verified it.
+type BaseAttestation struct {
+	ManifestKey    string `json:"manifestKey"`
+	ManifestSHA256 string `json:"manifestSha256"`
+	ManifestSize   int64  `json:"manifestSize"`
 }
 
 // BackupJob tracks the state of a backup run.
@@ -233,6 +252,11 @@ type BackupJob struct {
 	// manifest was usable) or any run predating incremental backups.
 	ReferencedFiles int   `json:"referencedFiles,omitempty"`
 	ReferencedBytes int64 `json:"referencedBytes,omitempty"`
+	// Attestation is the snapshot attestation statement over the control
+	// objects this run published (see attestation.go). Omitted when the run
+	// published no manifest, has no dispatched job, or could not vouch for
+	// every control object in the snapshot (a Warning then says why).
+	Attestation *AttestationEnvelope `json:"attestation,omitempty"`
 }
 
 // BackupManager orchestrates on-demand backups. Backup scheduling is owned by
@@ -305,6 +329,18 @@ func (m *BackupManager) GetRetention() int {
 // explicit full run, a pointer to a snapshot id otherwise.
 func (m *BackupManager) GetBaseSnapshotID() *string {
 	return m.config.BaseSnapshotID
+}
+
+// GetJobID returns the dispatched backup job this manager runs for ("" when
+// none was dispatched).
+func (m *BackupManager) GetJobID() string {
+	return m.config.JobID
+}
+
+// GetBaseAttestation returns the server's attestation of the dispatched
+// base's manifest, or nil.
+func (m *BackupManager) GetBaseAttestation() *BaseAttestation {
+	return m.config.BaseAttestation
 }
 
 // GetPublishLeaseExpiresAt returns the deadline this run must publish its
@@ -527,13 +563,16 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 	// visits shadow-copy paths, never the literal ones — see that block's
 	// comment). Left nil only when resolveJournalDir found nowhere secure
 	// to journal at all, matching "no journal, nothing to exclude".
+	// Staged upload copies an interrupted run left behind.
+	sweepStaleStagedCopies(m.config.StagingDir, staleStagingAge)
+
 	var journalDirsForExclude []string
 	if journalDir, ok := resolveJournalDir(m.GetStagingDir()); !ok {
 		log.Warn("no secure checkpoint journal directory available, proceeding without resume support")
 	} else {
 		journalDirsForExclude = append(journalDirsForExclude, journalDir)
 		var journalErr error
-		journal, resumedJournal, journalErr = openSnapshotJournal(journalDir, backupIdentity(m.config.Provider, m.config.Paths), journalMaxAge)
+		journal, resumedJournal, journalErr = openSnapshotJournal(journalDir, journalIdentity(m.config.Provider, m.config.Paths), journalMaxAge)
 		if journalErr != nil {
 			// A journal is a best-effort checkpoint, never a correctness
 			// requirement: degrade to a journal-less run rather than failing
@@ -561,7 +600,49 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 			}
 		}()
 	}
+	// readOnlyCompletion: a brokered writer resumed a journaled snapshot the
+	// control plane has already published — this run may only report it.
+	readOnlyCompletion := false
 	if journal != nil {
+		dispatched := ""
+		if m.config.BaseSnapshotID != nil {
+			dispatched = *m.config.BaseSnapshotID
+		}
+		if issuer, brokered := snapshotIDIssuerOf(m.config.Provider); brokered {
+			readOnly, bindErr := m.bindBrokeredJournal(runCtx, journal, issuer, dispatched)
+			switch {
+			case errors.Is(bindErr, errJournalUnusable):
+				log.Warn("checkpoint journal unusable for this brokered run, proceeding without resume support", "error", bindErr.Error())
+				journal.Abandon()
+				journal = nil
+			case bindErr != nil:
+				job.Status = jobStatusFailed
+				job.CompletedAt = time.Now().UTC()
+				job.Error = bindErr
+				return job, job.Error
+			default:
+				readOnlyCompletion = readOnly
+			}
+		} else if err := journal.BindRun(m.config.JobID, dispatched); err != nil {
+			log.Warn("failed to bind checkpoint journal to this run", "error", err.Error())
+		}
+	}
+	if journal != nil {
+		resumedJournal = journal.resumed
+		if resumedJournal {
+			// Temporary upload files an interrupted attempt left under this
+			// snapshot's prefix (local destinations write one per upload).
+			if sw, ok := m.config.Provider.(providers.StaleUploadSweeper); ok {
+				if n, err := sw.SweepStaleUploads(path.Join(snapshotRootDir, journal.snapshotID), staleStagingAge); err != nil {
+					log.Warn("could not sweep stale temporary upload files", "snapshotId", journal.snapshotID, "error", err.Error())
+				} else if n > 0 {
+					log.Info("removed stale temporary upload files", "snapshotId", journal.snapshotID, "count", n)
+				}
+			}
+		}
+		if what := journal.DiscardedOtherRun(); what != "" {
+			appendWarning(job, warnJournalDiscardedOtherRun+": an interrupted run's checkpoint for a different "+what+" was discarded; this run started a new snapshot")
+		}
 		if staleID, ok := journal.StaleSnapshotID(); ok {
 			// StaleSnapshotID covers both an actually-stale (>journalMaxAge)
 			// journal and the (near-impossible) identity-mismatch case — see
@@ -577,6 +658,9 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 				"snapshotId", staleID,
 				"maxAge", journalMaxAge.String(),
 			)
+		}
+		if journal.DiscardedOldFormat() {
+			appendWarning(job, warnJournalDiscardedOldFormat+": an interrupted run's checkpoint from an earlier helper version was discarded; this run started a new snapshot")
 		}
 		if resumedJournal {
 			log.Info("resuming interrupted backup from checkpoint journal",
@@ -594,9 +678,9 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 	// first. See fetchPublishedManifest's three-state contract: only a
 	// CONFIRMED-absent result falls through to a normal run; any other
 	// error fails the job closed right here.
-	if journal != nil && resumedJournal {
+	if journal != nil && resumedJournal && !journal.ContinuedFromOtherJob() {
 		resumePrefix := path.Join(snapshotRootDir, journal.snapshotID)
-		existing, fetchErr := fetchPublishedManifest(runCtx, m.config.Provider, resumePrefix)
+		existing, existingDigest, fetchErr := fetchPublishedManifestWithDigest(runCtx, m.config.Provider, resumePrefix)
 		if fetchErr != nil {
 			job.Status = jobStatusFailed
 			job.CompletedAt = time.Now().UTC()
@@ -627,14 +711,47 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 					job.ReferencedBytes += f.Size
 				}
 			}
+			// The checkpoint's header stays readable in memory after
+			// Complete removed the file.
+			m.attestAdoptedSnapshot(runCtx, job, journal, existing, existingDigest)
 			return job, nil
 		}
 		// existing == nil, fetchErr == nil: confirmed absent — proceed to
 		// VSS/scan/upload normally, reusing this SAME journal (no second
 		// open) all the way down to createSnapshotWithProgress's call site.
 	}
+	if readOnlyCompletion {
+		// The control plane holds this snapshot as published, but its
+		// manifest was not found; nothing may be written to it.
+		job.Status = jobStatusFailed
+		job.CompletedAt = time.Now().UTC()
+		job.Error = errors.New("the interrupted snapshot this backup continued is already published, but its manifest could not be read")
+		return job, job.Error
+	}
+	if fence, ok := writerFenceOf(m.config.Provider); ok {
+		// An earlier writer of this snapshot (a redelivered or continued
+		// job) is waited out once, here, before any file's own deadline
+		// starts — not inside the first file's upload.
+		if err := fence.AwaitWriteAccess(runCtx); err != nil {
+			if runCtx.Err() != nil {
+				return stopBackupRun()
+			}
+			job.Status = jobStatusFailed
+			job.CompletedAt = time.Now().UTC()
+			job.Error = fmt.Errorf("%w: %w", errWriterStillActive, err)
+			return job, job.Error
+		}
+	}
+	if journal != nil {
+		// Best effort, like every journal write.
+		_ = journal.StartAttempt()
+	}
 	// VSS: create shadow copy on Windows for application-consistent backup
 	var vssSession *vss.VSSSession
+	// vssFailed records that this run asked for VSS and did not get it, so
+	// system-state collection does not ask the same VSS subsystem again for
+	// its own system-volume snapshot (systemstate.CollectOptions).
+	vssFailed := false
 	if provider, useVSS := m.resolveVSSProvider(); useVSS {
 		if err := runCtx.Err(); err != nil {
 			return stopBackupRun()
@@ -653,6 +770,7 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 			vssErr = errors.New("vss provider returned no session and no error")
 		}
 		if vssErr != nil {
+			vssFailed = true
 			log.Warn("VSS shadow copy failed, proceeding without VSS",
 				"elapsedMs", time.Since(vssStart).Milliseconds(),
 				"error", vssErr.Error(),
@@ -703,7 +821,23 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 		if err := runCtx.Err(); err != nil {
 			return stopBackupRun()
 		}
-		manifest, stagingDir, ssErr := collectSystemState()
+		// The shadow copy (when this run has one) was taken above, so hand
+		// its roots to the collector: on Windows the registry hive files are
+		// then copied out of the shadow copy instead of `reg.exe save`, which
+		// Microsoft Defender blocks for SAM/SECURITY as
+		// Trojan:Win32/Commando.A!ml (#5397).
+		// Without a session covering the system volume (a system_image run
+		// with no paths never requests one) the Windows collector takes its
+		// own short-lived snapshot of that volume — unless VSS just failed
+		// here, in which case it goes straight to its reg.exe fallback.
+		ssOpts := systemstate.CollectOptions{
+			AcquireBackupPrivilege:   acquireBackupReadPrivilege,
+			SkipSystemVolumeSnapshot: vssFailed,
+		}
+		if vssSession != nil {
+			ssOpts.ShadowPaths = vssSession.ShadowPaths
+		}
+		manifest, stagingDir, ssErr := collectSystemState(ssOpts)
 		if ssErr != nil {
 			systemStateErr = ssErr
 			log.Warn("system state collection failed, proceeding without", "error", ssErr.Error())
@@ -877,13 +1011,23 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 	// timing in snapshot.go (#2790).
 	log.Info("scanning backup paths", "jobId", job.ID, "pathCount", len(backupPaths))
 	scanStart := time.Now()
-	files, scanErr := m.collectBackupFilesFromPaths(runCtx, backupPaths, newExcludeMatcher(excludes), journalDirsForExclude)
+	files, reparseSkipped, scanErr := m.collectBackupFilesWithSkips(runCtx, backupPaths, newExcludeMatcher(excludes), journalDirsForExclude)
 	if scanErr != nil {
 		if errors.Is(scanErr, errBackupStopped) {
 			return stopBackupRun()
 		}
 		log.Warn("backup file scan completed with errors", "error", scanErr.Error())
 	}
+	// Junctions and mount points the walk skipped (#7051). Reported right
+	// after a completed scan, so the Warning is on the job however the rest
+	// of the run ends. A run stopped mid-scan (above) produces no snapshot
+	// and reports none.
+	if vssSession != nil {
+		for i := range reparseSkipped.sample {
+			reparseSkipped.sample[i].path = livePathForVSS(reparseSkipped.sample[i].path, vssSession.ShadowPaths)
+		}
+	}
+	reportSkippedReparsePoints(job, reparseSkipped)
 	log.Info("scan complete",
 		"jobId", job.ID,
 		"files", len(files),
@@ -987,7 +1131,7 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 			// A publish failure here is a hard job failure, not `completed`
 			// — there is no ordinary-files fallback for this snapshot.
 			snapshot := &Snapshot{
-				ID:        newSnapshotID(),
+				ID:        runSnapshotID(uploadProvider),
 				Timestamp: time.Now().UTC(),
 				// Files must be a non-nil empty slice, not the zero value: the
 				// field has no `omitempty` (a genuine empty-files manifest
@@ -999,22 +1143,23 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 				Files:          []SnapshotFile{},
 				BackupIdentity: m.runBackupIdentity(),
 			}
-			prefix := path.Join(snapshotRootDir, snapshot.ID)
-			if pubErr := publishSystemState(runCtx, uploadProvider, snapshot.ID, systemStateStagingDir, job.SystemStateManifest); pubErr != nil {
+			rec := newControlRecorder(nil)
+			snapshot.PublishedObjects = rec.objects
+			if _, pubErr := publishSystemState(runCtx, uploadProvider, m.config.StagingDir, rec, snapshot.ID, systemStateStagingDir, job.SystemStateManifest); pubErr != nil {
 				job.Status = jobStatusFailed
 				job.CompletedAt = time.Now().UTC()
 				job.Error = fmt.Errorf("system state publish failed: %w", pubErr)
 				return job, job.Error
 			}
 			if job.LayoutManifest != nil {
-				if pubErr := publishLayoutManifest(runCtx, uploadProvider, snapshot.ID, job.LayoutManifest); pubErr != nil {
+				if _, pubErr := publishLayoutManifest(runCtx, uploadProvider, m.config.StagingDir, rec, snapshot.ID, job.LayoutManifest); pubErr != nil {
 					job.Status = jobStatusFailed
 					job.CompletedAt = time.Now().UTC()
 					job.Error = fmt.Errorf("layout manifest publish failed: %w", pubErr)
 					return job, job.Error
 				}
 			}
-			if pubErr := publishSnapshotManifest(runCtx, uploadProvider, snapshot, prefix); pubErr != nil {
+			if _, pubErr := publishSnapshotManifest(runCtx, uploadProvider, m.config.StagingDir, rec, snapshot); pubErr != nil {
 				job.Status = jobStatusFailed
 				job.CompletedAt = time.Now().UTC()
 				job.Error = fmt.Errorf("system state publish failed: %w", pubErr)
@@ -1024,6 +1169,8 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 			job.BytesBackedUp = 0
 			job.CompletedAt = time.Now().UTC()
 			job.Status = jobStatusCompleted
+			// A fresh snapshot id with no file entries: always a full run.
+			m.attestPublishedSnapshot(job, snapshot, nil)
 			log.Info("backup run finished with state artifacts but zero walked files",
 				"status", job.Status,
 				"jobId", job.ID,
@@ -1069,7 +1216,11 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 			// of baseSnapshotId in the backup_run payload (see
 			// exec_backup.go). The agent never lists the bucket to choose a
 			// base in this mode.
-			prev, reason := fetchServerOwnedBase(runCtx, m.config.Provider, *m.config.BaseSnapshotID, runIdentity)
+			prev, reason := fetchServerOwnedBase(runCtx, m.config.Provider, *m.config.BaseSnapshotID, runIdentity, m.config.BaseAttestation)
+			if prev == nil && isBaseAttestationFallback(reason) {
+				// The run still completes, as a full one; say why.
+				appendWarning(job, reason)
+			}
 			if prev == nil {
 				log.Info("running full backup, no reference dedupe",
 					"mode", "server-owned",
@@ -1093,6 +1244,21 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 				prevSnapshot = prev
 			}
 		}
+	}
+
+	// Checkpoint the base this run actually uses before anything that
+	// references it is published (a resumed run's attestation needs it).
+	var parentSnapshotID *string
+	if prevSnapshot != nil {
+		id := prevSnapshot.ID
+		parentSnapshotID = &id
+	}
+	if journal != nil {
+		parent := ""
+		if parentSnapshotID != nil {
+			parent = *parentSnapshotID
+		}
+		_ = journal.RecordBaseDecision(parent)
 	}
 
 	// Hand off from the whole-run keepalive to the upload loop's own
@@ -1120,7 +1286,7 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 	// cleanup entirely (D18 §3.5) — see that block earlier in this
 	// function. D15's snapshotOpts/withSystemState wiring is independent of
 	// that and slots in here unchanged.
-	snapshotOpts := []createSnapshotOption{withRunIdentity(runIdentity)}
+	snapshotOpts := []createSnapshotOption{withRunIdentity(runIdentity), withUploadStagingDir(m.config.StagingDir)}
 	if m.config.SystemStateEnabled && systemStateStagingDir != "" && job.SystemStateManifest != nil && len(job.SystemStateManifest.Artifacts) > 0 {
 		// Publish system state under this call's own snapshot ID, BEFORE its
 		// ordinary manifest.json — see withSystemState's doc comment. This
@@ -1174,6 +1340,8 @@ func (m *BackupManager) RunBackupContext(ctx context.Context, excludes []string)
 		job.Error = combinedErr
 		return job, combinedErr
 	}
+
+	m.attestPublishedSnapshot(job, snapshot, parentSnapshotID)
 
 	// A run with BOTH configured file paths and system state (SystemStateEnabled
 	// with len(m.config.Paths) > 0 — the state-only case above already handled
@@ -1560,19 +1728,27 @@ func (m *BackupManager) captureSD(path string) []byte {
 	return sd
 }
 
+// windowsDirNeedsEntry is dirNeedsEntry's decision for a NON-empty Windows
+// directory, where mode/owner carry nothing a restore would lose. It needs
+// an entry when security-descriptor capture is on (sdCapture: EVERY
+// directory gets one, so its descriptor has an entry to attach SDIndex to)
+// or when it carries a preserved attribute such as Hidden or System
+// (winAttrs, #6506) — without an entry nothing on the restore side can put
+// the attribute back, and a hidden %APPDATA%-style tree comes back visible.
+func windowsDirNeedsEntry(sdCapture bool, winAttrs uint32) bool {
+	return sdCapture || winAttrs != 0
+}
+
 // dirNeedsEntry decides whether a directory gets its own manifest entry:
 // empty directories always (nothing else recreates them); otherwise only
 // when mode/owner differ from the MkdirAll default the restore would apply.
-// On Windows with security-descriptor capture on (sdCapture), EVERY
-// directory gets one, so its descriptor has an entry to attach SDIndex to.
+// On Windows see windowsDirNeedsEntry.
 func dirNeedsEntry(info os.FileInfo, owner *FileOwner, empty, sdCapture bool) bool {
 	if empty {
 		return true
 	}
 	if runtime.GOOS == "windows" {
-		// Without SD capture, Windows directories keep today's behavior:
-		// only empty ones get an entry.
-		return sdCapture
+		return windowsDirNeedsEntry(sdCapture, winFileAttrs(info))
 	}
 	if fullModeBits(info.Mode()) != 0o755 {
 		return true
@@ -1640,6 +1816,48 @@ func isWithinAnyDir(path string, dirs []string) bool {
 	return false
 }
 
+// shadowDevicePrefix is the Win32 form every VSS shadow-copy device root takes
+// (vss.CreateShadowCopy returns VSS_SNAPSHOT_PROP.SnapshotDeviceObject
+// verbatim, e.g. `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy26`).
+const shadowDevicePrefix = `\\?\GLOBALROOT\Device\`
+
+// shadowDeviceRoot reports whether p names a shadow-copy DEVICE ROOT — the
+// device object itself, with or without trailing separators, and nothing
+// below it — and returns it with every trailing separator removed. A path
+// UNDER the device (`...ShadowCopy26\Windows`) is not a root. Pure string
+// logic, no filepath calls, so it behaves identically on every GOOS.
+func shadowDeviceRoot(p string) (string, bool) {
+	t := strings.TrimRight(p, `\/`)
+	if len(t) <= len(shadowDevicePrefix) || !strings.EqualFold(t[:len(shadowDevicePrefix)], shadowDevicePrefix) {
+		return "", false
+	}
+	if strings.ContainsAny(t[len(shadowDevicePrefix):], `\/`) {
+		return "", false
+	}
+	return t, true
+}
+
+// cleanBackupRoot is filepath.Clean for a configured (or VSS-rewritten)
+// backup root, except that a shadow-copy device root keeps exactly one
+// trailing separator.
+//
+// A whole-machine Windows run backs up `C:\` under VSS, which
+// rewritePathsForVSS turns into `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN\`.
+// filepath.Clean strips that trailing separator (Windows treats
+// `\\?\GLOBALROOT` as the volume and the device name as an ordinary
+// component), and the bare device name is a device object, not a directory:
+// os.Stat on it fails with "Incorrect function", so every whole-machine VSS
+// backup failed before walking a single file. With the separator it names
+// the shadow volume's root directory, which stats, walks and reads like any
+// other directory. Only the ROOT needs this — every path below it is a normal
+// directory path, and filepath.Join/Clean on those is correct.
+func cleanBackupRoot(root string) string {
+	if dev, ok := shadowDeviceRoot(root); ok {
+		return dev + `\`
+	}
+	return filepath.Clean(root)
+}
+
 // journalDirs, when non-empty, are every path form that identifies this
 // run's own checkpoint-journal directory: the literal directory (see
 // resolveJournalDir) and, on a VSS run, its shadow-copy-rewritten form —
@@ -1651,7 +1869,21 @@ func isWithinAnyDir(path string, dirs []string) bool {
 // another run's, in the same directory) as ordinary backup content. Empty
 // for callers with no journal context (the collectBackupFiles() test/legacy
 // helper above).
+//
+// It discards the skipped-reparse-point record; runBackup uses
+// collectBackupFilesWithSkips so that record reaches the job's Warning.
 func (m *BackupManager) collectBackupFilesFromPaths(ctx context.Context, paths []string, excl *excludeMatcher, journalDirs []string) ([]backupFile, error) {
+	files, _, err := m.collectBackupFilesWithSkips(ctx, paths, excl, journalDirs)
+	return files, err
+}
+
+// collectBackupFilesWithSkips is collectBackupFilesFromPaths plus a record of
+// every reparse point the walk skipped (#7051): junctions, volume mount points
+// and other reparse points Go reports as os.ModeIrregular. Those are neither
+// traversed nor captured, but no longer silently. The returned *reparseSkips
+// is never nil.
+func (m *BackupManager) collectBackupFilesWithSkips(ctx context.Context, paths []string, excl *excludeMatcher, journalDirs []string) ([]backupFile, *reparseSkips, error) {
+	skips := newReparseSkips()
 	if m.config.CaptureSecurityDescriptors {
 		// Scoped to this walk: SeBackupPrivilege/SeSecurityPrivilege are
 		// disabled again on return, never left enabled process-wide.
@@ -1664,13 +1896,13 @@ func (m *BackupManager) collectBackupFilesFromPaths(ctx context.Context, paths [
 
 	for idx, root := range paths {
 		if err := ctx.Err(); err != nil {
-			return files, errBackupStopped
+			return files, skips, errBackupStopped
 		}
 		if root == "" {
 			errs = append(errs, fmt.Errorf("backup path at index %d is empty", idx))
 			continue
 		}
-		cleanRoot := filepath.Clean(root)
+		cleanRoot := cleanBackupRoot(root)
 		info, err := os.Stat(cleanRoot)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("failed to stat backup path %s: %w", cleanRoot, err))
@@ -1823,6 +2055,18 @@ func (m *BackupManager) collectBackupFilesFromPaths(ctx context.Context, paths [
 				return nil
 			}
 			if !info.Mode().IsRegular() {
+				// Neither a directory, a regular file nor a symlink: on
+				// Windows that includes junctions and volume mount points,
+				// which Go reports as ModeIrregular and WalkDir therefore
+				// never descends into. Not captured, but recorded so the
+				// run's Warning names it (#7051). Either way the entry is
+				// not in the backup, so it must not count as a child: a
+				// directory whose only child was skipped is empty and
+				// needs its own entry to be recreated on restore.
+				childCount[filepath.Dir(path)]--
+				if sp, ok := skippedReparsePointFor(path, info); ok {
+					skips.add(sp)
+				}
 				return nil
 			}
 			seen[snapshotPath] = struct{}{}
@@ -1841,7 +2085,7 @@ func (m *BackupManager) collectBackupFilesFromPaths(ctx context.Context, paths [
 		})
 		if err != nil {
 			if errors.Is(err, errBackupStopped) {
-				return files, errBackupStopped
+				return files, skips, errBackupStopped
 			}
 			errs = append(errs, fmt.Errorf("backup walk failed for %s: %w", cleanRoot, err))
 		}
@@ -1884,9 +2128,9 @@ func (m *BackupManager) collectBackupFilesFromPaths(ctx context.Context, paths [
 	})
 
 	if len(files) == 0 && len(errs) > 0 {
-		return nil, errors.Join(errs...)
+		return nil, skips, errors.Join(errs...)
 	}
-	return files, errors.Join(errs...)
+	return files, skips, errors.Join(errs...)
 }
 
 // extractVolumes returns unique volume roots from a list of paths.
@@ -2013,6 +2257,13 @@ func rewritePathsForVSS(paths []string, shadowPaths map[string]string, stagingId
 	for i, p := range paths {
 		vol := filepath.VolumeName(p)
 		shadow, ok := shadowPaths[vol]
+		// A drive-relative path (`C:foo`, relative to C:'s current
+		// directory) has no separator after the volume; appending it to the
+		// device root would name a different device. Leave it live and
+		// reported, like any other path with no shadow root.
+		if rest := p[len(vol):]; rest != "" && rest[0] != '\\' && rest[0] != '/' {
+			ok = false
+		}
 		if !ok || i == stagingIdx {
 			rewritten[i] = p // fallback: use original path
 			unmapped = append(unmapped, i)

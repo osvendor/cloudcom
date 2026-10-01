@@ -25,12 +25,14 @@ import { type BreezeEvent } from '../services/eventBus';
 import {
   type AutomationTrigger,
   type AutomationTriggerContext,
+  checkAutomationTargetsWithinSiteScope,
   createAutomationRunRecord,
   executeAutomationRun,
   executeConfigPolicyAutomationRun,
   formatScheduleTriggerKey,
   isCronDue,
   normalizeAutomationTrigger,
+  resolveAutomationTargetDeviceIds,
 } from '../services/automationRuntime';
 import {
   scanScheduledAutomations,
@@ -48,6 +50,11 @@ import { attachWorkerObservability } from './workerObservability';
 import { policyWorkflowApplies } from '../services/monitors/conversion/workflows';
 import { recordEpisodeResponse } from '../services/monitors/episodeService';
 import { admitSubjectResponse, drainSubjectResponseOutbox } from '../services/subjectResponseOutbox';
+import { getUserPermissions, canAccessSite } from '../services/permissions';
+import { writeAuditEvent, requestLikeFromSnapshot } from '../services/auditEvents';
+import { resolveExecutionSafeGroupIds, auditRefusedExecutionGroups } from '../services/executionTargetGating';
+import { notHoldingOrgCondition } from '../services/unassignedPool/selectorPredicate';
+import { isUnassignedPoolOrgType } from '../services/unassignedPool/orgType';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -452,7 +459,40 @@ async function processScanSchedules(_scanAt: string): Promise<{ due: number }> {
   return { due };
 }
 
-async function processTriggerSchedule(data: TriggerScheduleJobData): Promise<{ runId?: string; skipped?: string }> {
+/**
+ * #7187 — what a trigger handler decided inside its transaction. `afterCommit`
+ * (the #3445 continuation shape) carries the `execute-run` enqueue: the run row
+ * is INSERTed in the handler's transaction, and the execute-run worker reads it
+ * on its own connection, so the job must not exist until that row commits.
+ * Enqueued inside the transaction, a fast worker finds no run and throws
+ * `Automation run not found`, and a rollback leaves a job for a run that never
+ * existed.
+ */
+type TriggerAdmission<R extends object> = R & { afterCommit?: () => Promise<void> };
+
+/**
+ * Runs a trigger handler in its own system transaction, then — only once that
+ * transaction has committed — runs the enqueue it deferred. A transaction that
+ * throws (including a failed commit) propagates before `afterCommit` runs, so a
+ * rolled-back run is never enqueued. The worker calls these under
+ * `runOutsideDbAccess`, so this transaction is the outermost one and really
+ * commits when it returns.
+ */
+async function commitThenEnqueue<R extends object>(
+  admit: () => Promise<TriggerAdmission<R>>,
+): Promise<R> {
+  const { afterCommit, ...result } = await runWithSystemDbAccess(admit);
+  if (afterCommit) await afterCommit();
+  return result as unknown as R;
+}
+
+function processTriggerSchedule(data: TriggerScheduleJobData): Promise<{ runId?: string; skipped?: string }> {
+  return commitThenEnqueue(() => admitTriggerSchedule(data));
+}
+
+async function admitTriggerSchedule(
+  data: TriggerScheduleJobData,
+): Promise<TriggerAdmission<{ runId?: string; skipped?: string }>> {
   const [automation] = await db
     .select()
     .from(automations)
@@ -479,6 +519,64 @@ async function processTriggerSchedule(data: TriggerScheduleJobData): Promise<{ r
     return { skipped: 'not_due' };
   }
 
+  // Unattended cron dispatch: checkAutomationTargetsWithinSiteScope otherwise
+  // only runs at create/update time and at manual-trigger time (both have a
+  // caller in the request), against the target set resolved THEN. A `groups`
+  // target that resolved to 0 (or fewer) devices at that time passes cleanly;
+  // members added to the group since — including ones outside the creator's
+  // site allowlist — are targeted by this schedule run with no recheck at
+  // all. Re-derive the creator's CURRENT site allowlist and re-resolve the
+  // CURRENT target set here, dropping anything outside it, before the run is
+  // created. An unrestricted creator (no allowedSiteIds) is unaffected.
+  let boundDeviceIds: string[] | undefined;
+  if (automation.createdBy) {
+    const perms = await getUserPermissions(automation.createdBy, {
+      orgId: automation.orgId ?? undefined,
+      partnerId: automation.partnerId ?? undefined,
+    });
+    if (perms?.allowedSiteIds) {
+      const check = await checkAutomationTargetsWithinSiteScope(automation, perms);
+      if (!check.ok) {
+        if (check.unbounded) {
+          console.warn(
+            `[AutomationWorker] Skipping automation ${automation.id}: schedule_target_unbounded_outside_site_ceiling`,
+          );
+          return { skipped: 'schedule_target_unbounded_outside_site_ceiling' };
+        }
+
+        // Reuse the target set `checkAutomationTargetsWithinSiteScope` already
+        // resolved instead of re-resolving here: group/filter membership (and
+        // Field-provenance exclusions, which are computed fresh on every
+        // resolution) can change between two independent calls, so a second
+        // resolution is not guaranteed to agree with the one the site-scope
+        // decision above was actually based on.
+        const outOfScope = new Set(check.outOfScopeDeviceIds);
+        boundDeviceIds = check.targetDeviceIds.filter((id) => !outOfScope.has(id));
+
+        writeAuditEvent(requestLikeFromSnapshot({}), {
+          orgId: automation.orgId ?? null,
+          action: 'automation.schedule_run_targets_dropped_outside_site_ceiling',
+          resourceType: 'automation',
+          resourceId: automation.id,
+          result: 'success',
+          actorType: 'system',
+          details: {
+            droppedDeviceIds: check.outOfScopeDeviceIds,
+            slotKey: data.slotKey,
+          },
+        });
+
+        if (boundDeviceIds.length === 0) {
+          return { skipped: 'schedule_targets_all_outside_site_ceiling' };
+        }
+      }
+    }
+  }
+
+  // #3189 — the slot is the occurrence. A replay of this job (stalled-job
+  // recovery) gets the run the first attempt minted back, and the enqueue
+  // below then either dedupes on the stable `automation-run-<runId>` job id,
+  // resumes a half-dispatched run, or short-circuits a finished one.
   const { run, targetDeviceIds } = await createAutomationRunRecord({
     automation,
     triggeredBy: `schedule:${data.slotKey}`,
@@ -486,11 +584,17 @@ async function processTriggerSchedule(data: TriggerScheduleJobData): Promise<{ r
       slotKey: data.slotKey,
       scanAt: data.scanAt,
     },
+    ...(boundDeviceIds ? { boundDeviceIds } : {}),
+    occurrenceKey: `schedule:${data.slotKey}`,
   });
 
-  await enqueueAutomationRun(run.id, targetDeviceIds);
-
-  return { runId: run.id };
+  return {
+    runId: run.id,
+    // #7187 — enqueued only after this transaction commits (commitThenEnqueue).
+    afterCommit: async () => {
+      await enqueueAutomationRun(run.id, targetDeviceIds);
+    },
+  };
 }
 
 /** Recheck maintenance at both boundaries; a failed lookup must not run a workflow. */
@@ -506,7 +610,13 @@ async function policyWorkflowMaintenanceSuppressed(deviceId: string): Promise<bo
   }
 }
 
-async function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?: string; skipped?: string }> {
+function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?: string; skipped?: string }> {
+  return commitThenEnqueue(() => admitTriggerEvent(data));
+}
+
+async function admitTriggerEvent(
+  data: TriggerEventJobData,
+): Promise<TriggerAdmission<{ runId?: string; skipped?: string }>> {
   const [automation] = await db
     .select()
     .from(automations)
@@ -612,7 +722,7 @@ async function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?:
     // Event targets must not fall back to the static fleet-wide conditions.
     // Recheck current ownership: the device/org may have moved since publication.
     const [device] = await db
-      .select({ orgId: devices.orgId, partnerId: organizations.partnerId })
+      .select({ orgId: devices.orgId, partnerId: organizations.partnerId, siteId: devices.siteId })
       .from(devices)
       .innerJoin(organizations, eq(devices.orgId, organizations.id))
       .where(eq(devices.id, payload.deviceId))
@@ -624,6 +734,26 @@ async function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?:
       console.warn(`[AutomationWorker] Skipping automation ${automation.id}: event_device_outside_automation_scope (device ${payload.deviceId})`);
       return { skipped: 'event_device_outside_automation_scope' };
     }
+
+    // Event triggers bind straight to the triggering device with no site
+    // check — checkAutomationTargetsWithinSiteScope only runs at create/update
+    // time, against the resolved STATIC target set. A site-restricted creator
+    // could therefore end up with an automation whose event trigger fires on
+    // devices at sites outside their allowlist, whenever that device raises
+    // the subscribed event. Re-derive the creator's CURRENT site ceiling here
+    // (it may have narrowed since creation) and re-check the actual device.
+    if (automation.createdBy) {
+      const perms = await getUserPermissions(automation.createdBy, {
+        orgId: automation.orgId ?? undefined,
+        partnerId: automation.partnerId ?? undefined,
+      });
+      const ceiling = perms?.allowedSiteIds;
+      if (ceiling && !(typeof device.siteId === 'string' && canAccessSite(perms!, device.siteId))) {
+        console.warn(`[AutomationWorker] Skipping automation ${automation.id}: event_device_outside_automation_site_ceiling (device ${payload.deviceId})`);
+        return { skipped: 'event_device_outside_automation_site_ceiling' };
+      }
+    }
+
     boundDeviceIds = [payload.deviceId];
   }
 
@@ -660,13 +790,10 @@ async function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?:
       eventTimestamp: data.eventTimestamp,
     },
     ...(boundDeviceIds ? { boundDeviceIds } : {}),
+    // #3189 — one run per (automation, event). Without an event id there is no
+    // occurrence identity to deduplicate on.
+    ...(data.eventId ? { occurrenceKey: `event:${data.eventId}` } : {}),
   });
-
-  if (triggerContext) {
-    await enqueueAutomationRun(run.id, targetDeviceIds, triggerContext);
-  } else {
-    await enqueueAutomationRun(run.id, targetDeviceIds);
-  }
 
   // #5290 — record the response attempt on the OPEN episode for the pair. The
   // outcome walks forward only: automationActionResults terminalises it to
@@ -681,7 +808,17 @@ async function processTriggerEvent(data: TriggerEventJobData): Promise<{ runId?:
     });
   }
 
-  return { runId: run.id };
+  return {
+    runId: run.id,
+    // #7187 — enqueued only after this transaction commits (commitThenEnqueue).
+    afterCommit: async () => {
+      if (triggerContext) {
+        await enqueueAutomationRun(run.id, targetDeviceIds, triggerContext);
+      } else {
+        await enqueueAutomationRun(run.id, targetDeviceIds);
+      }
+    },
+  };
 }
 
 async function processExecuteRun(data: ExecuteRunJobData): Promise<{ runId: string }> {
@@ -731,6 +868,8 @@ async function resolveDeviceIdsForAssignment(
     const conditions = [
       eq(organizations.partnerId, assignmentTargetId),
       eq(devices.isEphemeral, false),
+      // Never a device parked in the partner's holding org.
+      notHoldingOrgCondition(),
     ];
     if (policyOrgId) conditions.push(eq(devices.orgId, policyOrgId));
     const partnerDevices = await db
@@ -793,6 +932,20 @@ async function resolveDeviceIdsForAssignment(
       // Requiring group.org_id = membership.org_id = device.org_id makes the
       // query reject it independently of the constraint. This worker runs under
       // a system DB context, so there is no RLS behind it to catch a miss.
+      // Execution-target field-provenance tiering — a device_group-level assignment
+      // resolved here feeds `processTriggerConfigPolicySchedule`, which
+      // dispatches an automation run: always execution-bearing, unlike the
+      // config-policy resolver's per-feature-type tiering. Gate before
+      // resolving membership, same as the deployment-target resolver,
+      // update-ring expansion and patch scheduling.
+      const { allowedGroupIds, refusedGroups } = await resolveExecutionSafeGroupIds([assignmentTargetId]);
+      if (refusedGroups.length > 0) {
+        auditRefusedExecutionGroups(policyOrgId, 'automation_schedule.execution_target_refused_agent_reported_fields', refusedGroups);
+      }
+      if (allowedGroupIds.length === 0) {
+        return [];
+      }
+
       if (needsPartnerClamp) {
         const members = await db
           .select({ deviceId: deviceGroupMemberships.deviceId })
@@ -1076,6 +1229,7 @@ async function processTriggerConfigPolicySchedule(
       configPolicyId: assignedPolicyId,
       targetDeviceIds: winners.sort(),
       triggeredBy: `schedule:${data.slotKey}`,
+      occurrenceKey: `${cpAutomation.id}:schedule:${data.slotKey}`,
     },
     `cp-automation-run-${cpAutomation.id}-${assignedPolicyId}-${data.slotKey}`,
   );
@@ -1119,6 +1273,7 @@ async function processExecuteConfigPolicyRun(
     data.configPolicyId,
     data.targetDeviceIds,
     data.triggeredBy,
+    data.occurrenceKey ? { occurrenceKey: data.occurrenceKey } : {},
   );
 
   return { runId: result.runId };
@@ -1171,20 +1326,26 @@ export function createAutomationWorker(): Worker<AutomationJobData> {
       // throws. scan-schedules drains too so a crash between a prior
       // admission's commit and its dispatch retries on the next minute tick
       // even without another alert event.
+      //
+      // #7187 — both trigger handlers own their transaction (commitThenEnqueue)
+      // and enqueue `execute-run` only after it commits, so they run with NO
+      // ambient context here: wrapped in a worker transaction, theirs would
+      // join it and the enqueue would again precede the commit.
       if (data.type === 'trigger-event') {
         assertQueueJobName(AUTOMATION_QUEUE, job, 'trigger-event');
-        const result = await runWithSystemDbAccess(() => processTriggerEvent(data));
+        const result = await runOutsideDbAccess(() => processTriggerEvent(data));
         await drainCommittedSubjectResponses();
         return result;
+      }
+      if (data.type === 'trigger-schedule') {
+        assertQueueJobName(AUTOMATION_QUEUE, job, 'trigger-schedule');
+        return runOutsideDbAccess(() => processTriggerSchedule(data));
       }
       const result = await runWithSystemDbAccess(async () => {
         switch (data.type) {
           case 'scan-schedules':
             assertQueueJobName(AUTOMATION_QUEUE, job, 'scan-schedules');
             return processScanSchedules(data.scanAt);
-          case 'trigger-schedule':
-            assertQueueJobName(AUTOMATION_QUEUE, job, 'trigger-schedule');
-            return processTriggerSchedule(data);
           case 'trigger-config-policy-schedule':
             assertQueueJobName(AUTOMATION_QUEUE, job, 'trigger-config-policy-schedule');
             return processTriggerConfigPolicySchedule(data);
@@ -1250,6 +1411,11 @@ export async function queueEventTriggers(event: BreezeEvent<Record<string, unkno
   // against payload.deviceId — i.e. run the MSP's automation library on a
   // stranger's home PC. Drop the whole event.
   if (eventOrg?.type === 'quick_support') {
+    return;
+  }
+  // Same for an event raised for a device parked in its partner's holding
+  // org: nothing partner-wide runs against a device that is not managed yet.
+  if (isUnassignedPoolOrgType(eventOrg?.type)) {
     return;
   }
 
@@ -1352,6 +1518,7 @@ export async function queueEventTriggers(event: BreezeEvent<Record<string, unkno
             configPolicyId: cpAssignedPolicyId,
             targetDeviceIds: [deviceId],
             triggeredBy: `config-policy-event:${event.type}`,
+            occurrenceKey: `${cpAutomation.id}:event:${deviceId}:${event.id}`,
           },
           `cp-automation-event-${cpAutomation.id}-${cpAssignedPolicyId}-${deviceId}-${event.id}`,
         );
@@ -1427,5 +1594,6 @@ export const __testOnly = {
   processScanSchedules,
   processTriggerConfigPolicySchedule,
   processTriggerEvent,
+  processTriggerSchedule,
   processExecuteRun,
 };

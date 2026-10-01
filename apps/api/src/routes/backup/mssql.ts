@@ -4,10 +4,11 @@ import { zValidator } from '../../lib/validation';
 import { eq, and, inArray } from 'drizzle-orm';
 import { db } from '../../db';
 import { backupJobs, backupSnapshots, devices } from '../../db/schema';
-import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
+import { requireMfa, requirePermission, requireScope, withAuthDbAccessContext } from '../../middleware/auth';
 import { sqlInstances, backupChains } from '../../db/schema/applicationBackup';
 import {
   executeCommand,
+  executeCommandWithSystemPrecheck,
   CommandTypes,
 } from '../../services/commandQueue';
 import { PERMISSIONS } from '../../services/permissions';
@@ -24,13 +25,20 @@ import {
   resolveBackupWriteCommandDestination,
   resolveBackupProviderConfig,
   resolveBackupDestinationError,
+  type BackupWriteCommandDestination,
 } from '../../services/backupProviderConfig';
+import {
+  backupReadCredentialPayload,
+  backupWriteCredentialPayload,
+} from '../../services/backupCommandCredentials';
 import {
   authorizeRouteResilienceResources,
   resolveRouteAuthorizedDeviceIds,
 } from './resilienceAuthorization';
 import { parseAgentJsonStdout } from '../../services/agentCommandStdout';
 import { applyBackupStartedAck, isBackupQueuedAck, isBackupStartedAck } from '../../services/backupProgress';
+import { normalizeStorageIdentity } from '../../jobs/backupRetention';
+import { isBackupHelperUpdateRequiredError } from '../../services/backupReadHelperGate';
 
 export const mssqlRoutes = new Hono();
 
@@ -272,6 +280,15 @@ mssqlRoutes.post(
 
 // ── POST /mssql/backup — trigger MSSQL backup ──
 
+// Registered in middleware/selfManagedDbContextRoutes.ts: this handler runs
+// with NO ambient request transaction. The backup job it creates must be
+// COMMITTED before the command is dispatched — the helper's storage access is
+// resolved when the command is delivered, on the delivery path's own
+// connection, and a helper that reports brokered writes is only given a write
+// session for a backup job that connection can see. Under the request
+// transaction the job was invisible there, so the helper was sent the storage
+// destination instead. The dispatch also waits on the device (up to 10 min)
+// and must not hold a pooled connection while it does (#1105).
 mssqlRoutes.post(
   '/mssql/backup',
   requireScope('organization', 'partner', 'system'),
@@ -286,52 +303,72 @@ mssqlRoutes.post(
     }
 
     const payload = c.req.valid('json');
-    const authorization = await authorizeRouteResilienceResources(c, orgId, [
-      { kind: 'device', id: payload.deviceId, role: 'source' },
-    ], 'verify');
-    if (!authorization.ok) return authorization.response;
 
-    const resolvedConfig = await resolveBackupConfigForDevice(payload.deviceId);
-    if (!resolvedConfig?.configId) {
-      return c.json({ error: 'A provider-backed backup configuration is required on this device' }, 400);
-    }
+    // Phase 1 — authorize, resolve the destination and create the job. This
+    // context commits when it returns, before anything is dispatched.
+    const phase1 = await withAuthDbAccessContext(auth, async (): Promise<
+      | { response: Response }
+      | { backupJob: { id: string }; configId: string; destination: BackupWriteCommandDestination }
+    > => {
+      const authorization = await authorizeRouteResilienceResources(c, orgId, [
+        { kind: 'device', id: payload.deviceId, role: 'source' },
+      ], 'verify');
+      if (!authorization.ok) return { response: authorization.response };
 
-    // D20b item A: the helper only builds a manager from the command payload
-    // when it has no agent.yaml backup config (mgr == nil — the normal state
-    // for every policy-managed device); without provider/providerConfig here
-    // the helper fails every on-demand mssql_backup with "backup not
-    // configured on this device", even though a provider-backed config
-    // resolved just above. Same builder backupWorker.ts's
-    // prepareBackupDispatchTargets uses for a profile-scheduled run.
-    const destinationResult = await resolveBackupWriteCommandDestination(resolvedConfig.configId, orgId);
-    if (!destinationResult.ok) {
-      return c.json(
-        { error: destinationResult.message, reason: destinationResult.reason },
-        destinationResult.reason === 'encryption_unsupported' ? 422 : 400
-      );
-    }
-    const { destination } = destinationResult;
+      const resolvedConfig = await resolveBackupConfigForDevice(payload.deviceId);
+      if (!resolvedConfig?.configId) {
+        return { response: c.json({ error: 'A provider-backed backup configuration is required on this device' }, 400) };
+      }
 
-    const [backupJob] = await db
-      .insert(backupJobs)
-      .values({
-        orgId,
-        configId: resolvedConfig.configId,
-        featureLinkId: resolvedConfig.featureLinkId,
-        deviceId: payload.deviceId,
-        status: 'pending',
-        type: 'manual',
-        backupType: 'database',
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .returning();
+      // D20b item A: the helper only builds a manager from the command payload
+      // when it has no agent.yaml backup config (mgr == nil — the normal state
+      // for every policy-managed device); without provider/providerConfig here
+      // the helper fails every on-demand mssql_backup with "backup not
+      // configured on this device", even though a provider-backed config
+      // resolved just above. Same builder backupWorker.ts's
+      // prepareBackupDispatchTargets uses for a profile-scheduled run.
+      const destinationResult = await resolveBackupWriteCommandDestination(resolvedConfig.configId, orgId);
+      if (!destinationResult.ok) {
+        return {
+          response: c.json(
+            { error: destinationResult.message, reason: destinationResult.reason },
+            destinationResult.reason === 'encryption_unsupported' ? 422 : 400
+          ),
+        };
+      }
+      const { destination } = destinationResult;
 
-    if (!backupJob) {
-      return c.json({ error: 'Failed to create backup job' }, 500);
-    }
+      const [backupJob] = await db
+        .insert(backupJobs)
+        .values({
+          orgId,
+          configId: resolvedConfig.configId,
+          featureLinkId: resolvedConfig.featureLinkId,
+          deviceId: payload.deviceId,
+          status: 'pending',
+          type: 'manual',
+          backupType: 'database',
+          // Stamped at creation, as the backup worker does at dispatch: the snapshot
+          // persisted from this job copies it, and restores of that snapshot are
+          // only served through a storage session when it is present.
+          storageIdentity: normalizeStorageIdentity(destination.provider, destination.providerConfig),
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .returning();
 
-    const result = await executeCommand(
+      if (!backupJob) {
+        return { response: c.json({ error: 'Failed to create backup job' }, 500) };
+      }
+      return { backupJob, configId: resolvedConfig.configId, destination };
+    });
+    if ('response' in phase1) return phase1.response;
+    const { backupJob, configId, destination } = phase1;
+
+    // Phase 2 — dispatch the now-committed job, holding no context. The
+    // precheck opens its own short one, so it is told which organization this
+    // request authorized the device under.
+    const result = await executeCommandWithSystemPrecheck(
       payload.deviceId,
       CommandTypes.MSSQL_BACKUP,
       {
@@ -340,17 +377,18 @@ mssqlRoutes.post(
         // result — which arrives as a second, unsolicited command_result
         // frame after a queue-admission ack — back to this backup_jobs row.
         jobId: backupJob.id,
-        configId: resolvedConfig.configId,
-        provider: destination.provider,
-        providerConfig: destination.providerConfig,
-        storageEncryption: destination.storageEncryption,
+        configId,
+        // Provider + encryption plan + a reference: the destination itself is
+        // resolved when the command is delivered, never stored on the row.
+        ...backupWriteCredentialPayload(configId, orgId, destination),
         instance: payload.instance,
         database: payload.database,
         backupType: payload.backupType,
       },
-      { userId: auth?.user?.id, timeoutMs: 600000 }
+      { userId: auth?.user?.id, timeoutMs: 600000, expectedOrgId: orgId }
     );
 
+    // Phase 3 — record the reply, each write in a short context of its own.
     let parsedData: unknown = null;
     let snapshotDbId: string | null = null;
     let providerSnapshotId: string | null = null;
@@ -366,7 +404,8 @@ mssqlRoutes.post(
       // (agentWs.ts processCommandResult / handleProviderBackedBackupResult).
       if (isBackupQueuedAck(parsedData) || isBackupStartedAck(parsedData)) {
         const queued = isBackupQueuedAck(parsedData);
-        await applyBackupStartedAck({ jobId: backupJob.id, deviceId: payload.deviceId, queued });
+        await withAuthDbAccessContext(auth, () =>
+          applyBackupStartedAck({ jobId: backupJob.id, deviceId: payload.deviceId, queued }));
         return c.json({
           data: { backupJobId: backupJob.id, status: 'running', queued },
         }, 202);
@@ -377,7 +416,7 @@ mssqlRoutes.post(
         throw new Error(describeZodIssues(parsedBackup.error));
       }
 
-      const persisted = await applyBackupCommandResultToJob({
+      const persisted = await withAuthDbAccessContext(auth, () => applyBackupCommandResultToJob({
         jobId: backupJob.id,
         orgId,
         deviceId: payload.deviceId,
@@ -389,14 +428,16 @@ mssqlRoutes.post(
           ...parsedBackup.data,
           error: result.error,
         },
-      });
+        // The reply to the command this route dispatched to this device.
+        dispatchExpectationVerified: true,
+      }));
       snapshotDbId = persisted.snapshotDbId;
       providerSnapshotId = persisted.providerSnapshotId;
     } catch (error) {
-      await markBackupJobFailedIfInFlight(
+      await withAuthDbAccessContext(auth, () => markBackupJobFailedIfInFlight(
         backupJob.id,
         error instanceof Error ? error.message : 'Failed to persist MSSQL backup result',
-      );
+      ));
       if (result.status === 'completed') {
         return c.json(
           { error: error instanceof Error ? error.message : 'Failed to persist MSSQL backup result' },
@@ -450,7 +491,9 @@ mssqlRoutes.get('/mssql/chains', requirePermission(PERMISSIONS.ORGS_READ.resourc
 // reject-on-offline restore command, not an infra failure — surface it as
 // 409 so callers/monitoring can distinguish it from a genuine enqueue error.
 function mapDispatchErrorStatus(error: string): number {
-  return error.startsWith('Device is ') ? 409 : 502;
+  // Both are states of the target device the operator can act on, not
+  // dispatch failures.
+  return error.startsWith('Device is ') || isBackupHelperUpdateRequiredError(error) ? 409 : 502;
 }
 
 // ── POST /mssql/restore — trigger MSSQL restore ──
@@ -565,8 +608,7 @@ mssqlRoutes.post(
         backupFileName,
         targetDatabase: payload.targetDatabase,
         noRecovery: payload.noRecovery,
-        provider: backupProviderConfig.provider,
-        providerConfig: backupProviderConfig.providerConfig,
+        ...backupReadCredentialPayload(snapshot.configId!, orgId, backupProviderConfig.provider),
       }),
     });
 
@@ -672,8 +714,7 @@ mssqlRoutes.post(
         instance,
         snapshotId: snapshot.providerSnapshotId,
         backupFileName,
-        provider: backupProviderConfig.provider,
-        providerConfig: backupProviderConfig.providerConfig,
+        ...backupReadCredentialPayload(snapshot.configId!, orgId, backupProviderConfig.provider),
       },
       { userId: auth?.user?.id, timeoutMs: 120000 }
     );
@@ -681,7 +722,7 @@ mssqlRoutes.post(
     if (result.status === 'failed') {
       return c.json(
         { error: result.error || 'MSSQL verify failed' },
-        500
+        isBackupHelperUpdateRequiredError(result.error) ? 409 : 500
       );
     }
 

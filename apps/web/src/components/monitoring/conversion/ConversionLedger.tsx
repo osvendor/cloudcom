@@ -5,8 +5,8 @@ import { ActionError, runAction } from '@/lib/runAction';
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import { showToast } from '../../shared/Toast';
 import { conversionFriendly, conversionPaths, fetchLedgerPage, type ConversionLedgerEntry } from './conversionApi';
-export default function ConversionLedger({ orgId, policyId, revision = 0, onChanged }: {
-  orgId?: string; policyId?: string; revision?: number; onChanged?: () => void;
+export default function ConversionLedger({ orgId, policyId, sourceTable, revision = 0, onChanged }: {
+  orgId?: string; policyId?: string; sourceTable?: ConversionLedgerEntry['sourceTable']; revision?: number; onChanged?: () => void;
 }) {
   const { t } = useTranslation(['monitoring', 'common']);
   const [rows, setRows] = useState<ConversionLedgerEntry[]>([]);
@@ -19,13 +19,13 @@ export default function ConversionLedger({ orgId, policyId, revision = 0, onChan
     const current = ++generation.current;
     setLoading(true); setError(false);
     try {
-      const page = await fetchLedgerPage({ orgId, policyId, cursor: next, limit: 25 });
+      const page = await fetchLedgerPage({ orgId, policyId, sourceTable, cursor: next, limit: 25 });
       if (current !== generation.current) return;
       const items = page.items ?? [];
       setRows((old) => next ? [...old, ...items] : items); setCursor(page.nextCursor ?? null);
     } catch { if (current === generation.current) setError(true); }
     finally { if (current === generation.current) setLoading(false); }
-  }, [orgId, policyId]);
+  }, [orgId, policyId, sourceTable]);
   useEffect(() => { setRows([]); void load(); return () => { generation.current++; }; }, [load, revision]);
   const undo = async (row: ConversionLedgerEntry) => {
     if (!row.revertable || row.revertedAt || busy) return;
@@ -41,7 +41,6 @@ export default function ConversionLedger({ orgId, policyId, revision = 0, onChan
   };
   return <section data-testid="conversion-ledger" className="space-y-3 rounded border p-4">
     <h3>{t('monitoring:conversion.ledger.title')}</h3>
-    <p>{t('monitoring:conversion.ledger.deadline')}</p>
     {loading && <p>{t('common:states.loading')}</p>}
     {error && <button onClick={() => void load()}>{t('common:actions.retry')}</button>}
     {!loading && !error && rows.length === 0 && <p>{t('monitoring:conversion.ledger.empty')}</p>}
@@ -50,6 +49,7 @@ export default function ConversionLedger({ orgId, policyId, revision = 0, onChan
       <ul>{row.outputs.map((output) => <li key={`${output.monitorId}:${output.role}`}>
         <a href={`/alerts/monitors/${output.monitorId}`}>{output.monitorName ?? output.monitorId}</a> · {output.role}
       </li>)}</ul>
+      {row.sourceTable !== 'network_monitors' && <p>{t('monitoring:conversion.ledger.deadline')}</p>}
       {row.revertedAt && <span data-testid={`ledger-reverted-${row.id}`}>{t('monitoring:conversion.ledger.reverted')}</span>}
       <button data-testid={`ledger-undo-${row.id}`} disabled={loading || error || busy || !row.revertable || !!row.revertedAt}
         onClick={() => void undo(row)}>{t('monitoring:conversion.ledger.undo')}</button>

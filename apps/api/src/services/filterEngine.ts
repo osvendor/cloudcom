@@ -2,7 +2,7 @@ import { and, eq, or, not, gt, gte, lt, lte, like, ilike, inArray, isNull, isNot
 import { db } from '../db';
 import { sqlValue } from '../db/sqlValues';
 import { pgErrorCode } from '../utils/pgErrors';
-import { devices, deviceCustomFieldValues, deviceHardware, deviceNetwork, deviceMetrics, deviceSoftware, deviceGroups, deviceGroupMemberships, softwareInventory } from '../db/schema';
+import { devices, deviceCustomFieldValues, deviceHardware, deviceHardwareHealth, deviceNetwork, deviceMetrics, deviceSoftware, deviceGroups, deviceGroupMemberships, softwareInventory } from '../db/schema';
 import type {
   FilterOperator,
   FilterFieldCategory,
@@ -108,6 +108,7 @@ export const FILTER_FIELDS: FilterFieldDefinition[] = [
   { key: 'hardware.ramTotalMb', label: 'RAM (MB)', category: 'hardware', type: 'number', operators: OPERATORS_BY_TYPE.number },
   { key: 'hardware.diskTotalGb', label: 'Disk Size (GB)', category: 'hardware', type: 'number', operators: OPERATORS_BY_TYPE.number },
   { key: 'hardware.gpuModel', label: 'GPU Model', category: 'hardware', type: 'string', operators: OPERATORS_BY_TYPE.string },
+  { key: 'hardware.health', label: 'Hardware Health', category: 'hardware', type: 'enum', operators: OPERATORS_BY_TYPE.enum, enumValues: ['ok', 'warning', 'critical', 'unknown'], description: 'Storage/RAID health rollup; devices with no hardware report match none' },
 
   // Network fields
   { key: 'network.ipAddress', label: 'IP Address', category: 'network', type: 'string', operators: OPERATORS_BY_TYPE.string },
@@ -162,12 +163,141 @@ export function getAllFilterableFields(): FilterFieldDefinition[] {
 }
 
 // ============================================
+// Field provenance (server-controlled vs. agent-reported vs. execution-refused)
+// ============================================
+//
+// Field-provenance tiering (denylist): a device's own agent sets the value
+// of most filter fields on its next heartbeat/enrollment/scan report.
+// Refusing every agent-reported field as an execution-target rule (the
+// earlier default-deny-all pass) is over-broad: it silently breaks ordinary,
+// documented dynamic groups such as "Windows Servers with >90% disk"
+// (`apps/docs/src/content/docs/features/device-groups.mdx`), whose fields
+// (`osType`, `metrics.diskPercent`) there is nothing to gain by misreporting —
+// the device already runs that OS and reports its own real disk usage.
+//
+// So field provenance is tiered:
+//   1. SERVER-CONTROLLED — never set by the device's own agent at all
+//      (admin/hierarchy assignment, or a server-stamped timestamp).
+//   2. AGENT-REPORTED, LOW TARGETING VALUE — the agent sets these, but they
+//      describe the device's own observed state (what OS it runs, its
+//      hardware/network facts, current metrics, software inventory). Misreporting
+//      these moves the device into no group that grants it more than it
+//      already has on itself. ALLOWED as execution-target rules.
+//   3. AGENT-REPORTED, HIGH TARGETING VALUE — free-text identity/labeling
+//      fields (hostname, self-reported version strings) and structured
+//      fields real fleets commonly use to grant elevated targeting
+//      (deviceRole/tags-style naming-convention filters, `custom.*` values,
+//      which are also writable by device-run scripts — see
+//      `services/customFields/scriptWriteBack.ts`). The device's own report
+//      sets these to any string, so they do not decide execution targeting.
+//      REFUSED by default as execution-target rules.
+//
+// The table below is the record of each field's real write path, checked
+// against the current route/heartbeat code (not assumed from the field name):
+//
+// | Field                         | Write path checked                                             | Tier              |
+// |--------------------------------|-----------------------------------------------------------------|-------------------|
+// | orgId/siteId/groupId           | admin assignment only                                            | server-controlled |
+// | enrolledAt/lastSeenAt/          | server-stamped on request receipt                                | server-controlled |
+// | quarantinedAt/daysSince*        |                                                                   |                   |
+// | hostname                       | `routes/agents/heartbeat.ts` writes `data.hostname` unconditionally | refused        |
+// | displayName                    | not set by any agent-authenticated route today (admin-only field-set) — refused anyway: any future agent write path lands closed by default | refused |
+// | tags                           | no agent-authenticated route writes `devices.tags` today (admin `routes/tags.ts` / session `PATCH devices` only), but it is reachable through the general `devices:write` API-key surface a device-run script can hold | refused |
+// | deviceRole                     | `heartbeat.ts` writes agent-reported `data.deviceRole` (privileged-role flips are separately gated by `shouldAutoApplyAgentReportedDeviceRole`; non-privileged transitions are still agent-set) | refused |
+// | deviceFunction                 | only written by `services/fleetDesign/apply.ts`, reachable solely via `routes/fleetDesign.ts` behind `requireDevicesWrite` + `requireMfa()` — an admin-approved apply action, not an agent write path | allowed (admin-gated, not agent-set) |
+// | custom.*                       | `routes/devices/customFieldValues.ts` (`devices:write` API key) and `services/customFields/scriptWriteBack.ts` (device-run script write-back) both write per-definition custom field values | refused |
+// | lastUser/helperVersion/agentVersion | free-text strings the agent reports every heartbeat            | refused           |
+// | osType/osVersion/osBuild/architecture | agent-reported OS facts (`heartbeat.ts`)                    | allowed           |
+// | hardware.*/network.*           | agent-reported inventory/network facts                          | allowed           |
+// | metrics.*                      | agent-reported metrics                                          | allowed           |
+// | software.installed/notInstalled | agent inventory scan (`software_inventory`) — self-reported; the agent supplies every entry (same shape as custom.*), unlike an OS/hardware fact the device cannot simply choose to misreport | refused |
+// | status/watchdogStatus/isHeadless/uptimeSeconds/lastSeenIp | agent-reported device state         | allowed           |
+// | patches.pending/alerts.critical/system.rebootRequired | derived server-side signals, not a raw agent string | allowed |
+//
+// A per-group acknowledged override (letting an admin explicitly accept a
+// self-reported field for one specific group) is intentionally NOT built
+// here.
+
+const SERVER_CONTROLLED_FILTER_FIELDS: ReadonlySet<string> = new Set([
+  // Hierarchy — assigned by an admin action (org/site assignment, static
+  // group membership), never by the device itself.
+  'orgId',
+  'siteId',
+  'groupId',
+  // Enrollment/lifecycle timestamps recorded by the server the moment it
+  // observes the event; the device controls WHEN it contacts the server, not
+  // the content of what gets stamped.
+  'enrolledAt',
+  'lastSeenAt',
+  'quarantinedAt',
+  'daysSinceEnrolled',
+  'daysSinceLastSeen',
+]);
+
+/** Agent-reported fields with real targeting value — see the table above. */
+const EXECUTION_REFUSED_AGENT_FIELDS: ReadonlySet<string> = new Set([
+  'hostname',
+  'displayName',
+  'tags',
+  'deviceRole',
+  'lastUser',
+  'helperVersion',
+  'agentVersion',
+  // self-reported inventory scan (an "approved software installed"
+  // execution-target group depends on the device's own report, the same way a
+  // custom.* value does).
+  'software.installed',
+  'software.notInstalled',
+]);
+
+export function isAgentReportedFilterField(fieldKey: string): boolean {
+  return !SERVER_CONTROLLED_FILTER_FIELDS.has(fieldKey);
+}
+
+/** The subset of `fieldsUsed` that a device's own agent can set the value of (any tier). */
+export function getAgentReportedFieldsUsed(fieldsUsed: readonly string[]): string[] {
+  return fieldsUsed.filter(isAgentReportedFilterField);
+}
+
+/**
+ * True when this field's value comes from the device's own report and carries
+ * execution-targeting value (tier 3, "refused"). `custom.*` is
+ * always refused regardless of key, since any custom field can be marked
+ * script-writable. Every other field not explicitly named here is treated as
+ * low-targeting-value agent-reported (tier 2, "allowed") or server-controlled
+ * (tier 1) — this is a denylist, not an allowlist: a field
+ * added to `FILTER_FIELDS` later defaults to ALLOWED unless deliberately
+ * added to `EXECUTION_REFUSED_AGENT_FIELDS` above.
+ */
+export function isExecutionRefusedFilterField(fieldKey: string): boolean {
+  if (getCustomFieldKey(fieldKey)) return true;
+  return EXECUTION_REFUSED_AGENT_FIELDS.has(fieldKey);
+}
+
+/** The subset of `fieldsUsed` that make a dynamic group's rules unsafe as an execution target. */
+export function getExecutionRefusedFieldsUsed(fieldsUsed: readonly string[]): string[] {
+  return fieldsUsed.filter(isExecutionRefusedFilterField);
+}
+
+// ============================================
 // SQL Query Builder
 // ============================================
 
 type ColumnRef = ReturnType<typeof devices.id.getSQL> | SQL<unknown>;
 
 function getColumnForField(field: string): { table: 'devices' | 'hardware' | 'network' | 'metrics' | 'software' | 'groups'; column: string; computed?: SQL<unknown> } {
+  // #6854: the health rollup lives in device_hardware_health, not
+  // device_hardware, so it must be claimed before the `hardware.` prefix.
+  // Scalar subquery: device_id is that table's PK, and a device with no report
+  // yields NULL, which no enum comparison matches.
+  if (field === 'hardware.health') {
+    return {
+      table: 'hardware',
+      column: 'health',
+      computed: sql`(SELECT ${deviceHardwareHealth.health}::text FROM ${deviceHardwareHealth} WHERE ${deviceHardwareHealth.deviceId} = ${devices.id})`
+    };
+  }
+
   // Handle prefixed fields
   if (field.startsWith('hardware.')) {
     return { table: 'hardware', column: field.replace('hardware.', '') };

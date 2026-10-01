@@ -7,6 +7,10 @@ import type { InvoiceDetail as InvoiceDetailData } from './invoiceTypes';
 import { _resetShowMarginMemoryForTests } from './billingUi';
 import { fetchWithAuth } from '../../stores/auth';
 
+const authPerms = vi.hoisted(() => ({
+  permissions: [{ resource: '*', action: '*' }] as { resource: string; action: string }[],
+}));
+
 vi.mock('../../stores/auth', () => ({
   fetchWithAuth: vi.fn(),
   // usePermissions() (billing-RBAC UI gating) reads grants off the store; grant
@@ -14,7 +18,7 @@ vi.mock('../../stores/auth', () => ({
   // full functionality.
   useAuthStore: Object.assign(
     (selector: (s: { user: { permissions: { resource: string; action: string }[] } }) => unknown) =>
-      selector({ user: { permissions: [{ resource: '*', action: '*' }] } }),
+      selector({ user: { permissions: authPerms.permissions } }),
     { getState: () => ({ tokens: null }) },
   ),
 }));
@@ -40,6 +44,19 @@ const lines: InvoiceDetailData['lines'] = [
     workedMinutes: null,
   },
 ];
+
+// The one active-connection response shared by every test whose payment-row
+// sync badge names a provider (e.g. "In QuickBooks") but doesn't otherwise
+// give the invoice its own `accountingSync` — the real app resolves this
+// through GET /accounting/providers, and the badge must not guess a brand
+// when that call hasn't been mocked (R10/finding 4).
+const activeQuickbooksProviders = {
+  data: [{
+    id: 'quickbooks', displayName: 'QuickBooks', configured: true,
+    capabilities: { connect: true, mapping: true, customerImport: true, invoicePush: true, paymentPull: true, paymentPush: true },
+  }],
+  activeConnection: { provider: 'quickbooks', status: 'connected' },
+};
 
 const issued: InvoiceDetailData = {
   invoice: {
@@ -101,6 +118,21 @@ describe('InvoiceDetail', () => {
     // The preference persists under the SAME key the quote surfaces use, so
     // "hide cost & margin" holds across the whole billing area.
     expect(localStorage.getItem('breeze:quote-editor-show-margin')).toBe('1');
+  });
+
+  it('shows the void state instead of a BALANCE DUE for a void invoice', async () => {
+    const voided: InvoiceDetailData = { ...issued, invoice: { ...issued.invoice, status: 'void', balance: '120.00' } };
+    render(<InvoiceDetail detail={voided} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+    expect(screen.queryByText('Balance due')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-detail-balance')).not.toBeInTheDocument();
+    expect(screen.getByTestId('invoice-detail-void-state')).toHaveTextContent('Void');
+  });
+
+  it('still shows Balance due for an issued invoice', async () => {
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-detail-balance')).toHaveTextContent('$120.00'));
+    expect(screen.queryByTestId('invoice-detail-void-state')).not.toBeInTheDocument();
   });
 
   // sweep F9: the frozen `ticketLabel` (#6940) already reaches Preview, the
@@ -234,10 +266,30 @@ describe('InvoiceDetail', () => {
     expect(JSON.parse((postCall![1] as RequestInit).body as string)).toMatchObject({ amount: 50, method: 'check' });
   });
 
-  it.each([true, false])('warns about a QuickBooks reversal only when the record is untouched (%s)', async (quickbooksRecordUntouched) => {
+  it('blocks recording a payment larger than the balance before the confirm dialog', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-payment-form')).toBeInTheDocument());
+
+    fireEvent.change(screen.getByTestId('invoice-payment-amount'), { target: { value: '120.01' } });
+    expect(screen.getByTestId('invoice-payment-overpayment')).toHaveTextContent('$120.00');
+    expect(screen.getByTestId('invoice-payment-submit')).toBeDisabled();
+    fireEvent.click(screen.getByTestId('invoice-payment-submit'));
+    expect(screen.queryByTestId('invoice-payment-confirm')).not.toBeInTheDocument();
+
+    // Exactly the balance is allowed.
+    fireEvent.change(screen.getByTestId('invoice-payment-amount'), { target: { value: '120.00' } });
+    expect(screen.queryByTestId('invoice-payment-overpayment')).not.toBeInTheDocument();
+    expect(screen.getByTestId('invoice-payment-submit')).toBeEnabled();
+  });
+
+  it.each([true, false])('warns about a QuickBooks reversal only when the record is untouched (%s)', async (providerRecordUntouched) => {
     const onChanged = vi.fn();
     fetchMock.mockImplementation(async (input: string, opts?: RequestInit) => {
-      if (opts?.method === 'DELETE') return json({ data: issued.invoice, quickbooksRecordUntouched });
+      if (opts?.method === 'DELETE') return json({ data: issued.invoice, providerRecordUntouched });
       if (input.endsWith('/payments')) return json({ data: [
         { id: 'p-qb', invoiceId: 'inv-1', amount: '40.00', method: 'check', reference: null, receivedAt: '2026-06-11', note: null, createdAt: '', source: 'quickbooks' },
       ] });
@@ -248,7 +300,7 @@ describe('InvoiceDetail', () => {
     fireEvent.click(screen.getByTestId('invoice-payment-reverse-confirm'));
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
     expect(fetchMock).toHaveBeenCalledWith('/invoices/inv-1/payments/p-qb', { method: 'DELETE' });
-    if (quickbooksRecordUntouched) {
+    if (providerRecordUntouched) {
       expect(showToast).toHaveBeenCalledWith({ type: 'warning', message: 'Reverse this in QuickBooks too' });
       expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
     } else {
@@ -257,10 +309,30 @@ describe('InvoiceDetail', () => {
     }
   });
 
+  // Stale-server compatibility: a browser tab loaded before the provider-neutral
+  // field shipped still gets a server response carrying only the deprecated
+  // `quickbooksRecordUntouched` alias. The warning must still show.
+  it('falls back to the deprecated quickbooksRecordUntouched alias from a stale server', async () => {
+    const onChanged = vi.fn();
+    fetchMock.mockImplementation(async (input: string, opts?: RequestInit) => {
+      if (opts?.method === 'DELETE') return json({ data: issued.invoice, quickbooksRecordUntouched: true });
+      if (input.endsWith('/payments')) return json({ data: [
+        { id: 'p-qb', invoiceId: 'inv-1', amount: '40.00', method: 'check', reference: null, receivedAt: '2026-06-11', note: null, createdAt: '', source: 'quickbooks' },
+      ] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={issued} onChanged={onChanged} />);
+    fireEvent.click(await screen.findByTestId('invoice-payment-void-p-qb'));
+    fireEvent.click(screen.getByTestId('invoice-payment-reverse-confirm'));
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    expect(showToast).toHaveBeenCalledWith({ type: 'warning', message: 'Reverse this in QuickBooks too' });
+    expect(showToast).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'success' }));
+  });
+
   it('surfaces the server refusal when QuickBooks pull would re-import a reversed payment', async () => {
     const onChanged = vi.fn();
     fetchMock.mockImplementation(async (input: string, opts?: RequestInit) => {
-      if (opts?.method === 'DELETE') return json({ error: 'Reverse in QuickBooks instead', code: 'QUICKBOOKS_OWNED_PAYMENT' }, false, 409);
+      if (opts?.method === 'DELETE') return json({ error: 'Reverse in QuickBooks instead', code: 'PROVIDER_OWNED_PAYMENT' }, false, 409);
       if (input.endsWith('/payments')) return json({ data: [
         { id: 'p-qb', invoiceId: 'inv-1', amount: '40.00', method: 'check', reference: null, receivedAt: '2026-06-11', note: null, createdAt: '', source: 'quickbooks' },
       ] });
@@ -390,6 +462,20 @@ describe('InvoiceDetail', () => {
     expect(screen.queryByTestId('invoice-payment-online-p2')).not.toBeInTheDocument();
   });
 
+  it('badges a payment pulled from any accounting provider with that provider\'s brand name', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [
+        { id: 'p9', invoiceId: 'inv-1', amount: '120.00', method: 'check', reference: 'XR-1', receivedAt: '2026-06-11', note: null, createdAt: '', source: 'xero' },
+      ] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={issued} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-payment-p9')).toBeInTheDocument());
+
+    expect(screen.getByTestId('invoice-payment-xero-p9')).toHaveTextContent('Xero');
+    expect(screen.queryByTestId('invoice-payment-quickbooks-p9')).not.toBeInTheDocument();
+  });
+
   it('keeps the void affordance and adds no badge on operator-recorded payments', async () => {
     fetchMock.mockImplementation(async (input: string) => {
       if (input.endsWith('/payments')) return json({ data: [
@@ -411,6 +497,7 @@ describe('InvoiceDetail', () => {
   // above, where a Breeze-side reverse would never touch the books).
   it('badges a synced Breeze-origin payment and STILL offers the void button', async () => {
     fetchMock.mockImplementation(async (input: string) => {
+      if (input === '/accounting/providers') return json(activeQuickbooksProviders);
       if (input.endsWith('/payments')) return json({ data: [
         { id: 'p4', invoiceId: 'inv-1', amount: '120.00', method: 'cash', reference: null, receivedAt: '2026-06-13', note: null, createdAt: '', source: 'manual', accountingSync: { status: 'synced', lastError: null } },
       ] });
@@ -438,6 +525,7 @@ describe('InvoiceDetail', () => {
 
   it('surfaces the sync error text and reason on a failed push', async () => {
     fetchMock.mockImplementation(async (input: string) => {
+      if (input === '/accounting/providers') return json(activeQuickbooksProviders);
       if (input.endsWith('/payments')) return json({ data: [
         { id: 'p6', invoiceId: 'inv-1', amount: '120.00', method: 'card', reference: 'pi_y', receivedAt: '2026-06-15', note: null, createdAt: '', source: 'stripe', accountingSync: { status: 'error', lastError: 'QuickBooks rejected the payment sync (HTTP 400)' } },
       ] });
@@ -477,6 +565,22 @@ describe('InvoiceDetail', () => {
     expect(screen.getByTestId('invoice-payment-quickbooks-p8')).toBeInTheDocument();
     expect(screen.getByTestId('invoice-payment-void-p8')).toBeInTheDocument();
     expect(screen.queryByTestId('invoice-payment-qbosync-p8')).not.toBeInTheDocument();
+  });
+
+  // W01d deferral "Invoice badge": the invoice-level sync read can fail
+  // transiently (the API returns accountingSync: null), and a user without
+  // accounting:manage never resolves a push provider — the badge used to read "In ".
+  it('names the payment\'s own provider when the invoice-level provider is unknown (Xero W04)', async () => {
+    fetchMock.mockImplementation(async (input: string) => {
+      if (input.endsWith('/payments')) return json({ data: [
+        { id: 'p9', invoiceId: 'inv-1', amount: '120.00', method: 'cash', reference: null, receivedAt: '2026-06-18', note: null, createdAt: '', source: 'manual', accountingSync: { status: 'synced', lastError: null, provider: 'xero' } },
+      ] });
+      return json({ data: {} });
+    });
+    render(<InvoiceDetail detail={{ ...issued, accountingSync: null }} onChanged={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId('invoice-payment-p9')).toBeInTheDocument());
+
+    expect(screen.getByTestId('invoice-payment-qbosync-p9')).toHaveTextContent('In Xero');
   });
 });
 
@@ -589,6 +693,39 @@ describe('InvoiceDetail — QuickBooks accounting sync rail card', () => {
     await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
     expect(screen.queryByTestId('invoice-detail-accounting-sync')).not.toBeInTheDocument();
   });
+
+  // Ruling R9: the card's post-Issue watch is what refetches the invoice until
+  // the auto-push lands the mapping row. A user with invoices:write but no
+  // accounting grants can never resolve a push provider (GET
+  // /accounting/providers would 403), and must still get that live status.
+  it('keeps the post-Issue sync watch for a user without accounting grants (no push provider)', async () => {
+    authPerms.permissions = [
+      { resource: 'invoices', action: 'read' },
+      { resource: 'invoices', action: 'write' },
+    ];
+    try {
+      fetchMock.mockImplementation(async (input: string) => {
+        if (input === '/accounting/providers') return json({ error: 'Forbidden' }, false, 403);
+        if (input.endsWith('/payments')) return json({ data: [] });
+        return json({ data: {} });
+      });
+      const onChanged = vi.fn();
+      render(
+        <InvoiceDetail
+          detail={{ ...issued, invoice: { ...issued.invoice, updatedAt: new Date().toISOString() }, accountingSync: null }}
+          onChanged={onChanged}
+        />,
+      );
+      await waitFor(() => expect(screen.getByTestId('invoice-detail')).toBeInTheDocument());
+      // No mapping row yet: nothing rendered, but the watch polls the refetch.
+      expect(screen.queryByTestId('invoice-detail-accounting-sync')).not.toBeInTheDocument();
+      await waitFor(() => expect(onChanged).toHaveBeenCalled(), { timeout: 5000 });
+      // The push provider is not even asked for without accounting:manage.
+      expect(fetchMock).not.toHaveBeenCalledWith('/accounting/providers');
+    } finally {
+      authPerms.permissions = [{ resource: '*', action: '*' }];
+    }
+  }, 10000);
 
   it('renders the card in the rail when accountingSync is present', async () => {
     render(

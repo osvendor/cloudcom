@@ -15,6 +15,22 @@ const partnerPreview = { partnerId: 'p1', previewHash: 'h1', rows: 5, policies: 
   unconvertible: [{ sourceTable: 'alert_templates', sourceId: 's1', name: 'Nested rule', reason: 'unconvertible:nested_group', policyId: null, policyName: null }] };
 beforeEach(() => { request.mockReset(); vi.mocked(showToast).mockReset(); });
 
+it('never shows an internal wave name (W05c/W05d) to the operator', async () => {
+  request.mockResolvedValueOnce(json(backlog)).mockResolvedValueOnce(json(partnerPreview));
+  render(<MonitorConversionAdmin />);
+  fireEvent.click(await screen.findByTestId('admin-preview-p1'));
+  const confirm = await screen.findByTestId('admin-conversion-confirm');
+  expect(confirm.textContent).not.toMatch(/W05/);
+});
+
+// #7212: a preview with nothing convertible must not offer a no-op conversion.
+it('disables "Convert reviewed scope" when the preview has no convertible rows', async () => {
+  request.mockResolvedValueOnce(json(backlog)).mockResolvedValueOnce(json({ ...partnerPreview, convertible: 0 }));
+  render(<MonitorConversionAdmin />);
+  fireEvent.click(await screen.findByTestId('admin-preview-p1'));
+  expect(await screen.findByTestId('admin-conversion-run')).toBeDisabled();
+});
+
 it('requires a full preview before confirming and submits its hash', async () => {
   request.mockResolvedValueOnce(json(backlog))
     .mockResolvedValueOnce(json(partnerPreview))

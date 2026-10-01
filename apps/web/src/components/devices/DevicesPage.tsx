@@ -5,6 +5,7 @@ import { useAdvancedFilterIds } from '../../hooks/useAdvancedFilterIds';
 import { List, Grid, Plus, AlertCircle, ChevronDown, RefreshCw } from 'lucide-react';
 import { showToast } from '../shared/Toast';
 import { formatDateTime } from '@/lib/dateTimeFormat';
+import { usePermissions } from '@/lib/permissions';
 import type { FilterConditionGroup } from '@breeze/shared';
 import DeviceList, { type Device, type DeviceClass, type DeviceStatus, type OSType } from './DeviceList';
 import type { DeviceRole } from '@/lib/deviceRoles';
@@ -178,6 +179,12 @@ function AddAssetMenu({
   testIdPrefix: string;
 }) {
   const { t } = useTranslation('devices');
+  // Installing an agent mints an enrollment key, which the API gates on
+  // organizations:write. A role without it (Org Viewer, Partner Technician)
+  // used to get the menu item, then "Permission denied" on every button in
+  // the modal (#7217). UX only — the API still enforces the grant.
+  const { can } = usePermissions();
+  const canInstallAgent = can('organizations', 'write');
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -221,18 +228,20 @@ function AddAssetMenu({
           data-testid={testIdPrefix}
           className="absolute right-0 z-20 mt-1 w-56 rounded-md border bg-card shadow-lg"
         >
-          <button
-            type="button"
-            role="menuitem"
-            data-testid={`${testIdPrefix}-install-agent`}
-            onClick={() => {
-              setOpen(false);
-              onInstallAgent();
-            }}
-            className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
-          >
-            {t('devicesPage.addMenu.installAgent')}
-          </button>
+          {canInstallAgent && (
+            <button
+              type="button"
+              role="menuitem"
+              data-testid={`${testIdPrefix}-install-agent`}
+              onClick={() => {
+                setOpen(false);
+                onInstallAgent();
+              }}
+              className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted"
+            >
+              {t('devicesPage.addMenu.installAgent')}
+            </button>
+          )}
           <button
             type="button"
             role="menuitem"
@@ -397,13 +406,11 @@ export default function DevicesPage() {
   // source of truth. This is the hybrid model's client half; the group above is
   // its server half.
   const [listFilters, setListFilters] = useState<ListFilters>(DEFAULT_LIST_FILTERS);
-  // Server-side hardware health rollup filter (#6854 W04). Not persisted to
-  // the URL hash — this is a fleet-wide server predicate, not view state.
-  const [hardwareHealth, setHardwareHealth] = useState<'' | 'warning' | 'critical' | 'unknown'>('');
   // Bumped on every fetchDevices invocation and on unmount, so a late-landing
-  // fetch started before a filter change (e.g. the background refresh timer
-  // racing a hardwareHealth edit) can detect it is stale and skip its
-  // setState calls rather than clobbering a newer, more-filtered result.
+  // fetch — typically a header Refresh (which carries no abort signal) still in
+  // flight when an org switch or a post-mutation refreshDevices() starts a
+  // newer one — can detect it is stale and skip its setState calls rather than
+  // clobbering the newer result.
   const deviceFetchGeneration = useRef(0);
   useEffect(() => () => { deviceFetchGeneration.current += 1; }, []);
   const filtersV2 = typeof window !== 'undefined' ? isFiltersV2Enabled() : false;
@@ -656,7 +663,6 @@ export default function DevicesPage() {
       const [devicesResult, networkResult, manualResult, orgsResponse, sitesResult, groupsResponse] = await Promise.all([
         fetchAllDevices({
           includeDecommissioned: true,
-          hardwareHealth: hardwareHealth || undefined,
           signal,
           // Surface the silent-cap case (#778 review). Without this, hitting
           // the safety ceiling would render an incomplete device list and
@@ -743,8 +749,12 @@ export default function DevicesPage() {
           siteName: '', // Will be resolved from sites
           agentVersion: (d.agentVersion ?? '') as string,
           updateOfferWithheldReason: (d.updateOfferWithheldReason ?? null) as string | null,
+          updateAttemptTargetVersion: (d.updateAttemptTargetVersion ?? null) as string | null,
+          updateAttemptStartedAt: (d.updateAttemptStartedAt ?? null) as string | null,
+          updateAttemptLastAt: (d.updateAttemptLastAt ?? null) as string | null,
           watchdogVersion: (d.watchdogVersion ?? null) as string | null,
           helperVersion: (d.helperVersion ?? null) as string | null,
+          helperInstallIssue: (d.helperInstallIssue ?? null) as string | null,
           agentServerUrl: (d.agentServerUrl ?? null) as string | null,
           // Opt-in WAN/LAN IP columns (#2503). Both are string-or-null on the
           // wire; anything else degrades to null so a malformed value renders
@@ -786,6 +796,7 @@ export default function DevicesPage() {
           // (warned once per value — see normalizeLinkGroupRole).
           linkGroupRole: normalizeLinkGroupRole(d.linkGroupRole),
           enrolledAt: d.enrolledAt as string | undefined,
+          lastLogAt: (d.lastLogAt ?? null) as string | null,
           desktopAccess: (d.desktopAccess as Device['desktopAccess']) ?? null,
           hardware: hardware ? {
             cpuModel: hardware.cpuModel as string | undefined,
@@ -867,6 +878,7 @@ export default function DevicesPage() {
         responseTimeMs: typeof d.responseTimeMs === 'number' ? d.responseTimeMs : null,
         monitoringEnabled: d.monitoringEnabled === true,
         enrolledAt: d.enrolledAt as string | undefined,
+        lastLogAt: (d.lastLogAt ?? null) as string | null,
         // #5213 — provenance (scan | unifi | manual) and the website/service
         // identity. Anything else degrades to null rather than leaking an
         // unexpected API value through the type.
@@ -914,15 +926,10 @@ export default function DevicesPage() {
         notes: (d.notes ?? null) as string | null,
         monitoringEnabled: false,
         enrolledAt: d.enrolledAt as string | undefined,
+        lastLogAt: (d.lastLogAt ?? null) as string | null,
       }));
 
-      // A hardware filter is agent-only (network/manual rows carry no
-      // hardware rollup); the server already filtered transformedDevices, but
-      // the merged view must not let unfiltered network/manual rows leak back
-      // in as false negatives for the selected filter.
-      const allTransformed = hardwareHealth
-        ? transformedDevices.filter(d => d.hardwareHealth === hardwareHealth)
-        : [...transformedDevices, ...transformedNetworkDevices, ...transformedManualAssets];
+      const allTransformed = [...transformedDevices, ...transformedNetworkDevices, ...transformedManualAssets];
 
       // Fetch orgs for org name lookup
       let orgsList: Org[] = [];
@@ -1020,7 +1027,7 @@ export default function DevicesPage() {
         else setLoading(false);
       }
     }
-  }, [stableT, hardwareHealth]);
+  }, [stableT]);
 
   /**
    * The post-change refresh — use this, not `fetchDevices`, anywhere something
@@ -2312,21 +2319,6 @@ export default function DevicesPage() {
           />
         </div>
       </div>
-
-      <label className="flex items-center gap-2 text-sm">
-        <span>{t('hardwareHealth.hardware')}</span>
-        <select data-testid="hardware-health-filter" value={hardwareHealth}
-          className="rounded-md border bg-background px-3 py-2"
-          onChange={event => {
-            const next = event.target.value;
-            if (next === '' || next === 'warning' || next === 'critical' || next === 'unknown') setHardwareHealth(next);
-          }}>
-          <option value="">{t('hardwareHealth.all')}</option>
-          <option value="warning">{t('hardwareHealth.warning')}</option>
-          <option value="critical">{t('hardwareHealth.critical')}</option>
-          <option value="unknown">{t('hardwareHealth.unknown')}</option>
-        </select>
-      </label>
 
       {filtersV2 ? (
         <DeviceFilterToolbar

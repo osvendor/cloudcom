@@ -9,6 +9,13 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 
+// A device parked in a holding org is covered in backupWorker.test.ts; here
+// every device is an ordinary customer device.
+vi.mock('../services/unassignedPool/deliveryEligibility', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/unassignedPool/deliveryEligibility')>()),
+  isParkedDevice: vi.fn(async () => false),
+}));
+
 vi.mock('../db', () => ({
   db: {},
   runOutsideDbContext: <T>(fn: () => T): T => fn(),
@@ -105,6 +112,20 @@ describe('classifyMissingBaseReason', () => {
         now,
       }),
     ).toBe('base_job_not_completed');
+  });
+
+  // #5396: a run with a few unreadable files is `completed_with_errors`. It is
+  // a restore point and was a valid base while it was still called
+  // `completed`; excluding it would silently turn every run after one locked
+  // file into a full backup.
+  it('accepts a completed_with_errors job as an incremental base', () => {
+    expect(
+      classifyMissingBaseReason(probe({ jobStatus: 'completed_with_errors' }), {
+        storageIdentity: identity,
+        mode: 'file',
+        now,
+      }),
+    ).not.toBe('base_job_not_completed');
   });
 
   it('reports base_retired when a retirement tombstone exists', () => {

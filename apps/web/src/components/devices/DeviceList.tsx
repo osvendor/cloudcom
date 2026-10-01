@@ -1,4 +1,5 @@
 import { Fragment, useMemo, useState, useEffect, useRef } from "react";
+import { usePermissions } from "../../lib/permissions";
 import { createPortal } from "react-dom";
 import {
   ChevronLeft,
@@ -35,7 +36,7 @@ import type {
   FilterConditionGroup,
   HardwareHealth,
 } from "@breeze/shared";
-import { HARDWARE_HEALTH_RANK } from "@breeze/shared";
+import { HARDWARE_HEALTH_RANK, isAgentUpdateStuck, isDeviceLogSilent } from "@breeze/shared";
 import ComponentStatePill from "./hardware/ComponentStatePill";
 import {
   matchesMergedListFilters,
@@ -202,9 +203,17 @@ export type Device = {
   agentVersion: string;
   /** Why the server withholds update offers from this device (#6449); null/absent = offers flowing. */
   updateOfferWithheldReason?: string | null;
+  /** Open self-update attempt record (#4073); drives the stuck-update badge. */
+  updateAttemptTargetVersion?: string | null;
+  updateAttemptStartedAt?: string | null;
+  updateAttemptLastAt?: string | null;
+  /** Latest agent-logs ingest time (#7067); drives the logs-silent badge. */
+  lastLogAt?: string | null;
   watchdogVersion?: string | null;
   /** Installed Breeze Assist helper version (devices.helper_version, #6751). */
   helperVersion?: string | null;
+  /** Agent-reported Breeze Assist install problem (#6925); null/absent = none. */
+  helperInstallIssue?: string | null;
   /**
    * Control-plane URL the agent last heartbeated to (devices.agent_server_url,
    * #2288). The opt-in Server column renders only its hostname. Any current
@@ -822,6 +831,10 @@ export default function DeviceList({
   effectiveAgentVersionByOrgId,
 }: DeviceListProps) {
   const { t } = useTranslation("devices");
+  const { can } = usePermissions();
+  const canWake = can("devices", "execute"); // UX gate; POST /devices/:id/commands requires devices.execute
+  // UX gate; the terminal session (routes/remote) requires remote.access.
+  const canRemoteTerminal = can("remote", "access");
   // Use provided timezone or browser default
   const effectiveTimezone =
     timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -1554,6 +1567,13 @@ export default function DeviceList({
   // so don't imply 0/blank.
   const agentCell = (device: Device, node: React.ReactNode): React.ReactNode =>
     (device.deviceClass ?? "agent") !== "agent" ? dash : node;
+  // Static keys per known code (#6925); a code from a newer agent falls back.
+  const helperInstallIssueTooltip = (issue: string): string =>
+    issue === "awaiting_server_offer"
+      ? t("deviceList.helperInstallIssueTooltip.awaitingServerOffer")
+      : issue === "install_abandoned"
+        ? t("deviceList.helperInstallIssueTooltip.installAbandoned")
+        : t("deviceList.helperInstallIssueTooltip.unknown");
   const columnDefs: Record<
     ColumnId,
     { header: () => React.ReactNode; cell: (device: Device) => React.ReactNode }
@@ -1825,6 +1845,23 @@ export default function DeviceList({
                 {formatSilentDuration(device.mainAgentSilentSince!)}
               </span>
             )}
+            {/* #7067: a heartbeating device that has shipped no logs for over 6h —
+                distinct from agent-silent above (which fires on a dead main agent
+                with a live watchdog). This can fire even when the agent process
+                itself is healthy but its log-shipping channel is dead. */}
+            {isDeviceLogSilent({
+              status: device.status,
+              lastLogAt: device.lastLogAt,
+              enrolledAt: device.enrolledAt,
+            }) && (
+              <span
+                data-testid={`device-${device.id}-logs-silent-badge`}
+                title={t("deviceList.logsSilentTooltip")}
+                className="inline-flex items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-medium bg-warning/15 text-warning border-warning/30"
+              >
+                {t("deviceList.logsSilent")}
+              </span>
+            )}
             {/* Collision enrollment (#2764): this row may be replacing an
                 earlier device with the same hostname. Unlike pending-reboot
                 below it is NOT suppressed on an offline row — the duplicate
@@ -1850,6 +1887,43 @@ export default function DeviceList({
                 role="img"
                 className="inline-block h-2 w-2 shrink-0 rounded-full bg-warning"
               />
+            )}
+            {/* #7214 (paper cut #23): the agent-health badges below duplicate
+                the ones in the Agent Version / Helper Version columns, which
+                are opt-in and hidden by default — most users never saw them.
+                Status is default-visible, so mirror the same three badges
+                here as compact pills, matching the agent-silent/logs-silent
+                pattern above. */}
+            {device.updateOfferWithheldReason && (
+              <span
+                data-testid={`device-${device.id}-status-update-withheld`}
+                title={t("deviceList.updateWithheldTooltip")}
+                className="inline-flex items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-medium bg-warning/15 text-warning border-warning/30"
+              >
+                {t("deviceList.updateWithheld")}
+              </span>
+            )}
+            {isAgentUpdateStuck({
+              targetVersion: device.updateAttemptTargetVersion,
+              startedAt: device.updateAttemptStartedAt,
+              lastAttemptAt: device.updateAttemptLastAt,
+            }) && (
+              <span
+                data-testid={`device-${device.id}-status-update-stuck`}
+                title={t("deviceList.updateStuckTooltip", { target: device.updateAttemptTargetVersion })}
+                className="inline-flex items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-medium bg-warning/15 text-warning border-warning/30"
+              >
+                {t("deviceList.updateStuck")}
+              </span>
+            )}
+            {device.helperInstallIssue && (
+              <span
+                data-testid={`device-${device.id}-status-helper-install-issue`}
+                title={helperInstallIssueTooltip(device.helperInstallIssue)}
+                className="inline-flex items-center whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] font-medium bg-warning/15 text-warning border-warning/30"
+              >
+                {t("deviceList.helperNotInstalled")}
+              </span>
             )}
           </div>
         </td>
@@ -2045,6 +2119,22 @@ export default function DeviceList({
             {t("deviceList.updateWithheld")}
           </span>
         ) : null;
+        // #4073: the device has been retrying the same self-update past the
+        // stuck threshold without converging — surface it, since a wedged
+        // updater may ship no logs at all.
+        const stuckBadge = isAgentUpdateStuck({
+          targetVersion: device.updateAttemptTargetVersion,
+          startedAt: device.updateAttemptStartedAt,
+          lastAttemptAt: device.updateAttemptLastAt,
+        }) ? (
+          <span
+            data-testid={`device-${device.id}-update-stuck`}
+            title={t("deviceList.updateStuckTooltip", { target: device.updateAttemptTargetVersion })}
+            className="ml-1.5 rounded bg-warning/15 px-1.5 py-0.5 text-xs font-medium text-warning"
+          >
+            {t("deviceList.updateStuck")}
+          </span>
+        ) : null;
         if (relation === "unknown") {
           return (
             <td
@@ -2054,6 +2144,7 @@ export default function DeviceList({
             >
               {device.agentVersion || dash}
               {withheldBadge}
+              {stuckBadge}
             </td>
           );
         }
@@ -2077,6 +2168,7 @@ export default function DeviceList({
               {device.agentVersion}
             </span>
             {withheldBadge}
+            {stuckBadge}
           </td>
         );
       },
@@ -2111,6 +2203,17 @@ export default function DeviceList({
           className="px-3 py-3 text-sm text-muted-foreground whitespace-nowrap"
         >
           {agentCell(device, fmtOptionalVersion(device.helperVersion))}
+          {/* #6925: Assist is enabled but not installed — without this the
+              cell shows the same dash as a device with Assist turned off. */}
+          {device.helperInstallIssue ? (
+            <span
+              data-testid={`device-${device.id}-helper-install-issue`}
+              title={helperInstallIssueTooltip(device.helperInstallIssue)}
+              className="ml-1.5 rounded bg-warning/15 px-1.5 py-0.5 text-xs font-medium text-warning"
+            >
+              {t("deviceList.helperNotInstalled")}
+            </span>
+          ) : null}
         </td>
       ),
     },
@@ -2799,6 +2902,7 @@ export default function DeviceList({
                   {agentOnlySuffix}
                 </button>
                 <hr className="my-1" />
+                {canWake && (
                 <button
                   type="button"
                   onClick={() => handleBulkAction("wake")}
@@ -2809,6 +2913,7 @@ export default function DeviceList({
                   {t("deviceList.wakeSelected")}
                   {agentOnlySuffix}
                 </button>
+                )}
                 {/* Compare caps at 4 devices (DeviceCompare's selection limit).
                     Above the cap the item stays put but disabled with the cap
                     spelled out — it used to vanish silently (#5023). */}
@@ -3156,27 +3261,29 @@ export default function DeviceList({
                                   className="z-50 w-48 rounded-md border bg-card shadow-lg"
                                 >
                                   {/* Live session — needs a connected agent. */}
-                                  <button
-                                    type="button"
-                                    disabled={device.status !== "online"}
-                                    title={notOnlineTitle(
-                                      device.status,
-                                      t,
-                                    )}
-                                    aria-describedby={
-                                      device.status !== "online"
-                                        ? `device-${device.id}-action-gate-hint`
-                                        : undefined
-                                    }
-                                    onClick={() => {
-                                      onAction?.("terminal", device);
-                                      setRowMenuOpenId(null);
-                                    }}
-                                    className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-                                  >
-                                    <Terminal className="h-4 w-4" />
-                                    {t("deviceList.remoteTerminal")}{" "}
-                                  </button>
+                                  {canRemoteTerminal && (
+                                    <button
+                                      type="button"
+                                      disabled={device.status !== "online"}
+                                      title={notOnlineTitle(
+                                        device.status,
+                                        t,
+                                      )}
+                                      aria-describedby={
+                                        device.status !== "online"
+                                          ? `device-${device.id}-action-gate-hint`
+                                          : undefined
+                                      }
+                                      onClick={() => {
+                                        onAction?.("terminal", device);
+                                        setRowMenuOpenId(null);
+                                      }}
+                                      className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                                    >
+                                      <Terminal className="h-4 w-4" />
+                                      {t("deviceList.remoteTerminal")}{" "}
+                                    </button>
+                                  )}
                                   {/* Queued command — an offline device runs it
                                       on reconnect, so only a decommissioned
                                       (agent-less) device is refused. */}
@@ -3226,7 +3333,7 @@ export default function DeviceList({
                                     <RotateCcw className="h-4 w-4" />
                                     {t("deviceList.reboot")}{" "}
                                   </button>
-                                  {device.status === "offline" && (
+                                  {canWake && device.status === "offline" && (
                                     <button
                                       type="button"
                                       onClick={() => {

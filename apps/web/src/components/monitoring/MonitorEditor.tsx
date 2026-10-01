@@ -35,6 +35,7 @@ import ActionsEditor, {
   type SoftwareCatalogItem,
 } from '../automations/ActionsEditor';
 import MonitorConditionFields from './MonitorConditionFields';
+import NetworkCheckAssetBinding, { bindNetworkAsset, type NetworkAsset } from './NetworkCheckAssetBinding';
 import { RestartResponseFields } from './MonitorAuthoringFields';
 import DeployMonitorDialog from './DeployMonitorDialog';
 import MonitorDevicesTable from './MonitorDevicesTable';
@@ -47,6 +48,7 @@ import Breadcrumbs from '../layout/Breadcrumbs';
 // would otherwise render raw keys (and mismatch the SSR markup).
 import { i18n } from '../../lib/i18n';
 import { useStableT } from '@/lib/i18n/useStableT';
+import { usePageItemName } from '../layout/usePageItemName';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -199,7 +201,7 @@ export function tabFromHash(hash: string): EditorTab | undefined {
 }
 export function editorHashForTab(hash: string, tab: EditorTab): string {
   const params = editorHashParams(hash);
-  if (!params.has('policy')) return `#${tab}`;
+  if (!['policy', 'kind', 'assetId', 'checkType', 'target'].some(key => params.has(key))) return `#${tab}`;
   params.set('tab', tab);
   return `#${params.toString()}`;
 }
@@ -258,9 +260,13 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
   const [aiAgents, setAiAgents] = useState<AiAgent[]>([]);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [builtinKey, setBuiltinKey] = useState<string | null>(null);
+  const [loadedName, setLoadedName] = useState<string | undefined>();
   // Null for a partner-wide monitor — DeployMonitorDialog falls back to the
   // currently selected org from the org store in that case.
   const [monitorOrgId, setMonitorOrgId] = useState<string | null>(null);
+  const [prefillOrgId, setPrefillOrgId] = useState<string | null>(null);
+  const [assetPrefillError, setAssetPrefillError] = useState(false);
+  const [assetPrefillAttempt, setAssetPrefillAttempt] = useState(0);
   const [monitorPartnerId, setMonitorPartnerId] = useState<string | null>(null);
 
   const [hashTab, setHashTab] = useHashState<EditorTab>('settings', tabFromHash);
@@ -281,6 +287,7 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
     control,
     watch,
     setValue,
+    getValues,
     reset,
     formState: { errors, isSubmitting },
   } = methods;
@@ -294,7 +301,7 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
   const watchEscalationPolicyId = watch('escalationPolicyId');
   const isLoading = saving || isSubmitting;
   const isPartnerOwned = isNew ? watchOwnerScope === 'partner' : monitorPartnerId !== null;
-  const ownerOrgId = isNew ? currentOrgId : monitorOrgId;
+  const ownerOrgId = isNew ? prefillOrgId ?? currentOrgId : monitorOrgId;
   const deliveryChoiceOrgId = ownerOrgId ?? currentOrgId;
   const deliveryChoiceSuffix = deliveryChoiceOrgId ? `&orgId=${encodeURIComponent(deliveryChoiceOrgId)}` : '';
   const channelRail = useDeliveryResource<NotificationChannel>(`/alerts/delivery/rails?rail=channels${deliveryChoiceSuffix}`);
@@ -385,6 +392,7 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
       setBuiltinKey(typeof monitor.builtinKey === 'string' ? monitor.builtinKey : null);
       setMonitorOrgId(typeof monitor.orgId === 'string' ? monitor.orgId : null);
       setMonitorPartnerId(typeof monitor.partnerId === 'string' ? monitor.partnerId : null);
+      setLoadedName(typeof monitor.name === 'string' ? monitor.name : undefined);
       reset({
         name: monitor.name ?? '',
         description: monitor.description ?? '',
@@ -425,6 +433,65 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
     setValue('condition', defaultConditionFor(kind), { shouldDirty: true });
   };
 
+  useEffect(() => {
+    if (!isNew) return;
+    const params = editorHashParams(window.location.hash);
+    const kind = params.get('kind');
+    if (!kind || !(MONITOR_KINDS as readonly string[]).includes(kind)) return;
+    setValue('kind', kind as MonitorKind);
+    const condition = defaultConditionFor(kind as MonitorKind);
+    const checkType = params.get('checkType');
+    if (kind === 'network_check') {
+      if (['icmp_ping', 'tcp_port', 'http_check', 'dns_check'].includes(checkType ?? '')) condition.checkType = checkType;
+      if (params.get('target')) condition.target = params.get('target');
+    }
+    setValue('condition', condition);
+  }, [isNew, setValue]);
+
+  useEffect(() => {
+    if (!isNew) return;
+    const params = editorHashParams(window.location.hash);
+    const assetId = params.get('assetId');
+    if (params.get('kind') !== 'network_check' || !assetId
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(assetId)) return;
+    let cancelled = false;
+    setAssetPrefillError(false);
+    setValue('ownerScope', 'organization');
+    const initialCondition = getValues('condition');
+    const initialBinding = [initialCondition.checkType, initialCondition.target, initialCondition.assetId];
+    void (async () => {
+      try {
+        const res = await fetchWithAuth(`/discovery/assets/${encodeURIComponent(assetId)}`, { skipOrgIdInjection: true });
+        if (!res.ok) throw new Error('asset_read_failed');
+        const body = await res.json();
+        const asset = body.data as NetworkAsset & { orgId: string };
+        if (!asset || asset.id !== assetId || !asset.orgId) throw new Error('asset_response_invalid');
+        if (cancelled || getValues('kind') !== 'network_check' || getValues('ownerScope') !== 'organization'
+          || ['checkType', 'target', 'assetId'].some((key, index) => getValues('condition')[key] !== initialBinding[index])) return;
+        setPrefillOrgId(asset.orgId);
+        // A new asset handoff without a target should use the asset, not the
+        // condition's sample target. The guard above preserves any user edits.
+        const bound = bindNetworkAsset({ ...getValues('condition'), target: params.get('target') ?? '' }, asset);
+        setValue('condition', bound, { shouldDirty: true });
+        if (!getValues('name')) {
+          const label = asset.label ?? asset.hostname ?? asset.ipAddress ?? asset.id;
+          setValue('name', bound.checkType === 'icmp_ping'
+            ? stableT('monitoring:editor.networkCheckAsset.pingName', { label })
+            : `${stableT('monitoring:kinds.network_check')} ${label}`, { shouldDirty: true });
+        }
+      } catch {
+        if (!cancelled) setAssetPrefillError(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isNew, assetPrefillAttempt, getValues, setValue, stableT]);
+
+  useEffect(() => {
+    if (!isPartnerOwned || watchKind !== 'network_check') return;
+    const condition = getValues('condition');
+    if (condition.assetId) setValue('condition', bindNetworkAsset(condition, null), { shouldDirty: true });
+  }, [isPartnerOwned, watchKind, getValues, setValue]);
+
   const switchTab = (tab: EditorTab) => {
     window.location.hash = editorHashForTab(window.location.hash, tab);
     setHashTab(tab);
@@ -462,6 +529,8 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
       if (isNew && isPartnerScope && values.ownerScope) {
         payload.ownerScope = values.ownerScope;
       }
+
+      if (isNew && !isPartnerOwned && prefillOrgId) payload.orgId = prefillOrgId;
 
       const url = isNew ? '/monitor-definitions' : `/monitor-definitions/${monitorId}`;
       const method = isNew ? 'POST' : 'PATCH';
@@ -581,6 +650,8 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
     }
   };
 
+  usePageItemName(loadedName);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
@@ -600,7 +671,11 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
         />
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-4">
-            <a href="/alerts/monitors" className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted">
+            <a
+              href="/alerts/monitors"
+              className="flex h-10 w-10 items-center justify-center rounded-md border hover:bg-muted"
+              aria-label={t('monitoring:editor.actions.backToMonitors')}
+            >
               <ArrowLeft className="h-5 w-5" />
             </a>
             <h1 className="text-xl font-semibold tracking-tight">
@@ -777,6 +852,17 @@ export default function MonitorEditor({ monitorId }: MonitorEditorProps) {
               </select>
             </div>
             <MonitorConditionFields kind={watchKind} name="condition" />
+            {watchKind === 'network_check' && <>
+              <NetworkCheckAssetBinding
+                orgId={isPartnerOwned ? null : ownerOrgId}
+                assetId={(watch('condition').assetId as string | undefined) ?? null}
+                onSelect={asset => setValue('condition', bindNetworkAsset(getValues('condition'), asset), { shouldDirty: true })}
+              />
+              {assetPrefillError && <p role="alert" className="text-sm text-destructive">
+                {t('monitoring:editor.networkCheckAsset.failed')}{' '}
+                <button type="button" className="underline" onClick={() => setAssetPrefillAttempt(value => value + 1)}>{t('common:actions.retry')}</button>
+              </p>}
+            </>}
             {errors.condition && (
               <p role="alert" data-testid="monitor-editor-condition-error" className="text-sm text-destructive">
                 {t('monitoring:editor.errors.invalidCondition')}

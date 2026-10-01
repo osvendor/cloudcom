@@ -3,7 +3,8 @@ import { createHash } from 'node:crypto';
 import zlib from 'node:zlib';
 import PDFDocument from 'pdfkit';
 import { formatMoney } from '@breeze/shared';
-import { renderInvoiceHtml, renderInvoicePdfBuffer, buildInvoiceEmailAmounts, invoiceColumnsFor, resolveInvoiceFooter, resolveDraftBillTo, type InvoiceBranding } from './invoicePdf';
+import { renderInvoiceHtml, renderInvoicePdfBuffer, buildInvoiceEmailAmounts, invoiceColumnsFor, resolveDraftBillTo, type InvoiceBranding } from './invoicePdf';
+import { resolveDocumentFooter } from './documentFooter';
 import { invoices, invoiceLines } from '../db/schema';
 
 type InvoiceRow = typeof invoices.$inferSelect;
@@ -485,20 +486,6 @@ describe('Invoice ticket grouping and line labeling (#3319)', () => {
   });
 });
 
-// Settings consolidation W02-API (M11, audit finding 22): the ONE footer/terms
-// resolver, shared by the render path (loadInvoiceForRender) and the issue-time
-// snapshot (invoiceService.issueInvoice).
-describe('resolveInvoiceFooter', () => {
-  it.each<[string, { invoiceTerms: string | null; partnerFooter: string | null; brandingFooter: string | null }, string | null]>([
-    ['invoice terms set — wins over everything', { invoiceTerms: 'Net 30, invoice terms', partnerFooter: 'Partner footer', brandingFooter: 'Portal footer' }, 'Net 30, invoice terms'],
-    ['invoice terms null, partner footer set — partner wins over portal', { invoiceTerms: null, partnerFooter: 'Partner footer', brandingFooter: 'Portal footer' }, 'Partner footer'],
-    ['invoice terms null, partner footer null, portal footer set — portal is the last resort', { invoiceTerms: null, partnerFooter: null, brandingFooter: 'Portal footer' }, 'Portal footer'],
-    ['all three null — no footer at all', { invoiceTerms: null, partnerFooter: null, brandingFooter: null }, null],
-  ])('%s', (_name, input, expected) => {
-    expect(resolveInvoiceFooter(input)).toBe(expected);
-  });
-});
-
 // Sweep paper cut #16: a DRAFT invoice has no bill-to snapshot yet
 // (billToName/billToAddress/billToTaxId are stamped only at issue —
 // invoiceService.issueInvoice), so before issue the BILL TO block would
@@ -585,5 +572,34 @@ describe('invoiceTicketNumberSql', () => {
     for (const status of ['sent', 'partially_paid', 'overdue', 'paid', 'void']) {
       expect(dialect.sqlToQuery(invoiceLineTicketNumberSql(status)).sql).toBe('"invoice_lines"."ticket_label"');
     }
+  });
+});
+
+// #7216: an invoice issued with no footer at any level is stamped terms = ''
+// (freezeDocumentFooter). loadInvoiceForRender resolves branding.footerText
+// through resolveDocumentFooter exactly as below, so a footer configured AFTER
+// issue must not reach either renderer. The NULL (unfrozen draft/legacy) case
+// is the control: the same later footer DOES print, proving the assertion bites.
+describe('frozen "no footer" invoice render (#7216)', () => {
+  const LATER = 'Footer added after issue';
+  function renderInputs(terms: string | null) {
+    const invoice = makeInvoice({ terms });
+    const footerText = resolveDocumentFooter({ documentTerms: invoice.terms, partnerFooter: LATER, brandingFooter: 'Portal footer added later' });
+    return { invoice, branding: { ...branding, footerText } };
+  }
+  const pdfText = (pdf: Buffer) => extractPositionedPdfText(pdf).map((f) => f.text).join(' ');
+
+  it("HTML: terms '' prints no footer; terms NULL prints the live one", () => {
+    const frozen = renderInputs('');
+    expect(renderInvoiceHtml(frozen.invoice, [makeLine()], frozen.branding)).not.toContain(LATER);
+    const live = renderInputs(null);
+    expect(renderInvoiceHtml(live.invoice, [makeLine()], live.branding)).toContain(LATER);
+  });
+
+  it("PDF: terms '' prints no footer; terms NULL prints the live one", async () => {
+    const frozen = renderInputs('');
+    expect(pdfText(await renderInvoicePdfBuffer(frozen.invoice, [makeLine()], frozen.branding))).not.toContain(LATER);
+    const live = renderInputs(null);
+    expect(pdfText(await renderInvoicePdfBuffer(live.invoice, [makeLine()], live.branding))).toContain(LATER);
   });
 });

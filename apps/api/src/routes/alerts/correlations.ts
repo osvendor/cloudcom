@@ -5,17 +5,18 @@ import { and, desc, eq, gte, inArray, or, type SQL } from 'drizzle-orm';
 
 import { db } from '../../db';
 import { alertCorrelationGroups, alertCorrelationMembers, alertCorrelations, alerts, devices, mlFeedbackEvents } from '../../db/schema';
-import { requirePermission, requireScope } from '../../middleware/auth';
+import { requirePermission, requireScope, type AuthContext as FullAuthContext } from '../../middleware/auth';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { latestVerdictForGroup, projectAlertAiVerdictSummary } from '../../services/aiAgents/alertVerdicts';
 import { RESOLVABLE_ALERT_STATUSES } from '../../services/alertService';
 import { buildAlertCorrelationRca } from '../../services/alertCorrelationRca';
+import { canReadSensitiveEventLogCategory } from '../../services/eventLogSensitivity';
 import { publishEvent } from '../../services/eventBus';
 import { captureException } from '../../services/sentry';
 import { emitAlertStateFeedback, emitCorrelationFeedback, emitRcaFeedback } from '../../services/mlFeedbackEmitters';
 import { shouldProduceMlOutput } from '../../services/mlFeatureFlags';
 import { PERMISSIONS } from '../../services/permissions';
-import { deviceInSiteScope, filterAlertsBySiteScope } from '../tickets/siteScope';
+import { alertInSiteScope, filterAlertsBySiteScope } from '../tickets/siteScope';
 
 export const alertCorrelationRoutes = new Hono();
 
@@ -150,10 +151,11 @@ async function getAccessibleAlert(alertId: string, auth: AuthContext): Promise<A
     return null;
   }
 
-  // Site axis: a site-restricted caller must not see/act on an alert whose
-  // device is outside their allowed sites. Out-of-site → not found (no oracle),
-  // matching the alerts.ts by-id paths. Deviceless alerts stay visible.
-  if (alert.deviceId && !(await deviceInSiteScope(auth, alert.deviceId))) {
+  // Site axis: a site-restricted caller must not see/act on an alert outside
+  // their allowed sites. Out-of-site → not found (no oracle), matching the
+  // alerts.ts by-id paths. A site-owned topology alert follows its topology
+  // site (M3-D6); deviceless alerts stay visible.
+  if (!(await alertInSiteScope(auth, alert))) {
     return null;
   }
 
@@ -786,7 +788,7 @@ alertCorrelationRoutes.post(
   requireAlertRead,
   zValidator('param', groupIdParamSchema),
   async (c) => {
-    const auth = c.get('auth') as AuthContext;
+    const auth = c.get('auth') as FullAuthContext;
     const { groupId } = c.req.valid('param');
     const parsedBody = explainGroupSchema.safeParse(await parseOptionalExplainBody(c));
     if (!parsedBody.success) {
@@ -807,6 +809,7 @@ alertCorrelationRoutes.post(
       return c.json({ error: 'Correlation group not found' }, 404);
     }
 
+    const canReadSensitiveCategory = await canReadSensitiveEventLogCategory(auth);
     const rca = await buildAlertCorrelationRca({
       orgId: group.orgId,
       groupId: group.id,
@@ -814,6 +817,7 @@ alertCorrelationRoutes.post(
       alerts: groupAlerts,
       windowHours: body.windowHours,
       maxEvidenceItems: body.maxEvidenceItems,
+      canReadSensitiveCategory,
     });
 
     writeRouteAudit(c, {

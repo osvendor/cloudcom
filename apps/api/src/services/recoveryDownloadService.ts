@@ -1,13 +1,16 @@
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
+import { pipeline } from 'node:stream';
+import { createGunzip } from 'node:zlib';
 import { GetObjectCommand } from '@aws-sdk/client-s3';
 import { createGuardedS3Client } from './guardedS3Client';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { coerceS3EndpointUrl } from '@breeze/shared';
+import { coerceS3EndpointUrl, deriveS3RegionFromEndpoint } from '@breeze/shared';
 import { and, eq } from 'drizzle-orm';
 import { db } from '../db';
 import { backupSnapshotFiles, backupSnapshotOrigins, backupSnapshots, recoveryTokens } from '../db/schema';
+import { isSupportedKeyLayout } from './backupKeyLayout';
 import { classifyBackupObjectKey, hasMembershipCapability } from './backupObjectKey';
 import {
   asRecord,
@@ -134,9 +137,40 @@ function buildS3Client(config: {
   });
 }
 
+/**
+ * Presigned GET for ONE exact object key of an S3 backup destination, built
+ * with the same tenant-configuration client as the recovery download path.
+ * The key is used verbatim (the agent writes `snapshots/<id>/...` without any
+ * configured prefix; see backupSnapshotStorage.ts). The caller is responsible
+ * for authorizing the key and for bounding `expiresInSeconds` (clamped here to
+ * 1..300).
+ */
+export async function presignSnapshotObjectGet(args: {
+  providerConfig: Record<string, unknown>;
+  key: string;
+  expiresInSeconds: number;
+}): Promise<string> {
+  const providerConfig = asRecord(args.providerConfig);
+  const bucket = getStringValue(providerConfig, 'bucket') || getStringValue(providerConfig, 'bucketName');
+  const region =
+    getStringValue(providerConfig, 'region')?.trim() ||
+    deriveS3RegionFromEndpoint(getStringValue(providerConfig, 'endpoint'));
+  if (!bucket || !region) {
+    throw new Error('Snapshot storage is misconfigured.');
+  }
+  const client = buildS3Client({
+    region,
+    endpoint: getStringValue(providerConfig, 'endpoint') ?? undefined,
+    accessKeyId: getStringValue(providerConfig, 'accessKey') || getStringValue(providerConfig, 'accessKeyId') || undefined,
+    secretAccessKey: getStringValue(providerConfig, 'secretKey') || getStringValue(providerConfig, 'secretAccessKey') || undefined,
+    sessionToken: getStringValue(providerConfig, 'sessionToken') ?? undefined,
+  });
+  const expiresIn = Math.max(1, Math.min(300, Math.floor(args.expiresInSeconds)));
+  return (getSignedUrl as any)(client, new GetObjectCommand({ Bucket: bucket, Key: args.key }), { expiresIn });
+}
+
 function deriveRemoteStorageKey(
   normalizedRemotePath: string,
-  providerConfig: Record<string, unknown>,
   snapshotMetadata: Record<string, unknown>,
   originStoragePrefixOverride?: string | null
 ) {
@@ -162,8 +196,15 @@ function deriveRemoteStorageKey(
     }
   }
 
-  const prefix = getStringValue(providerConfig, 'prefix');
-  return prefix ? `${prefix.replace(/^\/+|\/+$/g, '')}/${normalizedRemotePath}` : normalizedRemotePath;
+  // #6398: the destination's configured `prefix` is deliberately NOT applied.
+  // The agent's storage providers never apply it — every snapshot object is
+  // written at `snapshots/<id>/...` verbatim — so presigning
+  // `<prefix>/snapshots/...` 404'd every token-mode recovery (bmr-recover,
+  // bare-metal / Restore-as-VM rebuild, DR) on a prefixed destination. GC
+  // (backupSnapshotStorage.ts backupSnapshotRootPrefix) already relies on the
+  // same fact. Only a per-snapshot recorded storagePrefix (above) relocates a
+  // snapshot's keys.
+  return normalizedRemotePath;
 }
 
 export async function getAuthenticatedRecoveryDownloadTarget(
@@ -194,7 +235,7 @@ export async function getAuthenticatedRecoveryDownloadTarget(
   }
 
   const [lineage] = await db
-    .select({ orgId: backupSnapshots.orgId, deviceId: backupSnapshots.deviceId })
+    .select({ orgId: backupSnapshots.orgId, deviceId: backupSnapshots.deviceId, keyLayout: backupSnapshots.keyLayout })
     .from(backupSnapshots)
     .where(and(
       eq(backupSnapshots.id, snapshotDbId),
@@ -203,6 +244,11 @@ export async function getAuthenticatedRecoveryDownloadTarget(
     .limit(1);
   if (!lineage || lineage.orgId !== tokenRow.orgId || lineage.deviceId !== tokenRow.deviceId) {
     return { unavailable: true, reason: 'Recovery snapshot lineage is unavailable.' } as const;
+  }
+  // Object keys are derived from the snapshot's layout; one this server does
+  // not understand is refused rather than guessed.
+  if (!isSupportedKeyLayout(lineage.keyLayout)) {
+    return { unavailable: true, reason: 'This backup was written in a storage format this server version cannot read.' } as const;
   }
 
   const resolved = await resolveSnapshotProviderConfig(snapshotDbId);
@@ -269,7 +315,7 @@ export async function getAuthenticatedRecoveryDownloadTarget(
       secretAccessKey: getStringValue(providerConfig, 'secretKey') || getStringValue(providerConfig, 'secretAccessKey') || undefined,
       sessionToken: getStringValue(providerConfig, 'sessionToken') ?? undefined,
     });
-    const key = deriveRemoteStorageKey(normalizedRemotePath, providerConfig, snapshotMetadata, originStoragePrefix);
+    const key = deriveRemoteStorageKey(normalizedRemotePath, snapshotMetadata, originStoragePrefix);
     const expiresInSeconds = Math.max(
       1,
       Math.min(300, Math.floor((downloadExpiry.getTime() - Date.now()) / 1000))
@@ -301,12 +347,51 @@ export async function getAuthenticatedRecoveryDownloadTarget(
       originStoragePrefix ? `${originStoragePrefix}/${normalizedRemotePath}` : normalizedRemotePath
     );
     const fileInfo = await stat(filePath);
+    const fileName = normalizedRemotePath.split('/').pop() || 'recovery-object';
+    const contentType = normalizedRemotePath.endsWith('.json') ? 'application/json' : 'application/octet-stream';
+
+    // #6489: agent/internal/backup/providers/local.go gzip-compresses on
+    // Upload and gunzips again on Download, keyed purely off a `.gz` key
+    // suffix — S3 keys, by contrast, hold raw bytes even when the recorded
+    // key ends in `.gz` (W09 plan Part 0, "never add or strip .gz": the
+    // suffix is just part of the manifest-recorded key there). Token-mode
+    // recovery reads local-provider storage directly rather than through the
+    // agent, so without mirroring the agent's gunzip here a bare-metal
+    // recovery against a local backend would count compressed bytes as
+    // "restored" bytes. Decision recorded on the issue: the SERVER gunzips.
+    // The decompressed length isn't knowable without decompressing the
+    // object, so this branch deliberately omits a fixed Content-Length and
+    // streams instead (see the route handler in routes/backup/bmr.ts, which
+    // only sets the header when contentLength is non-null).
+    if (normalizedRemotePath.endsWith('.gz')) {
+      const rawStream = createReadStream(filePath);
+      const gunzip = createGunzip();
+      // `pipeline` (not a bare `.pipe()`) so a failure on EITHER side closes
+      // the other: a corrupt/truncated gzip payload destroys `gunzip` but
+      // `.pipe()` alone never destroys its *source* in response, which would
+      // otherwise leak the open file descriptor from `createReadStream`
+      // until GC finalization — the exact case the "corrupt gzip" test
+      // below exercises. The callback below only needs to swallow the
+      // already-consumer-visible error (surfaced via `gunzip`'s own 'error'
+      // event, forwarded by the route handler's ReadableStream), not
+      // re-report it.
+      pipeline(rawStream, gunzip, () => {});
+      return {
+        unavailable: false,
+        type: 'stream' as const,
+        fileName,
+        contentLength: null,
+        contentType,
+        stream: gunzip,
+      };
+    }
+
     return {
       unavailable: false,
       type: 'stream' as const,
-      fileName: normalizedRemotePath.split('/').pop() || 'recovery-object',
+      fileName,
       contentLength: fileInfo.size,
-      contentType: normalizedRemotePath.endsWith('.json') ? 'application/json' : 'application/octet-stream',
+      contentType,
       stream: createReadStream(filePath),
     };
   }

@@ -275,7 +275,9 @@ const EXPECTED_NAMES = [
   'topologyOutboxWorker',
   'topologyTemplateApplyWorker',
   'topologyDiagnosticWorker',
+  'topologyMonitoringWorker',
   'topologyDiagnosticSweeper',
+  'topologyTelemetryMaintenance',
   'alertWorkers', 'monitorConversionPreviewWorker', 'alertCorrelationWorker', 'metricRollupsWorker', 'metricRollupMaintenance',
   'metricAnomaliesWorker', 'aiBudgetAlertDeliveryWorker', 'fleetFindingsWorker', 'fleetRemediationDispatchWorker', 'mlOutputRetention',
   'offlineDetector', 'notificationDispatcher', 'webhookDelivery', 'webhookDeliveryRecovery',
@@ -283,7 +285,7 @@ const EXPECTED_NAMES = [
   'agentNotifyRetry', 'fixWatchWorker',
   'auditBaselineJobs', 'cisJobs', 'automationWorker', 'securityPostureWorker',
   'reliabilityWorker', 'userRiskWorker', 'abuseSignalsWorker', 'userRiskRetention',
-  'backupVerificationJobs', 'eventLogRetention', 'hardwareHealthRetention', 'logCorrelationWorker', 'agentLogRetention',
+  'backupVerificationJobs', 'eventLogRetention', 'hardwareHealthRetention', 'timeSyncRetention', 'logCorrelationWorker', 'agentLogRetention',
   'ticketOutboxRetention', 'intentOutboxRetention', 'metricAnomalyIncidentRetention',
   'ipHistoryRetention', 'reliabilityRetention', 'processSampleRetention', 'deviceMetricsRetention',
   'm365SyncRetention', 'filesystemCleanupRunRetention',
@@ -291,7 +293,9 @@ const EXPECTED_NAMES = [
   'exchangeRateSync', 'oauthRevocationRetryWorker', 'mtlsCertificateRevocationWorker', 'authEmailWorker',
   'quoteSendWorker', 'enrollmentKeyCleanup', 'quickSupportReaper', 'softwareUploadSessionCleanup',
   'softwareRemediationRequestCleanup', 'auditRetention', 'auditChainVerify', 'auditChainAnchor',
-  'tenantErasure', 'orgMerge', 'deviceBulkPurge', 'removedDevicePurge', 'desktopSessionFinalization', 'desktopSessionOrphanRecovery', 'playbookRetention',
+  'tenantErasure', 'orgMerge', 'deviceBulkPurge', 'removedDevicePurge', 'parkedDeviceExpiry', 'parkedDevicePurge', 'desktopSessionFinalization', 'desktopSessionOrphanRecovery', 'playbookRetention',
+  // Helper-uploaded screenshot retention (per-device storage quota).
+  'helperScreenshotRetentionWorker',
   'discoveryWorker', 'networkBaselineWorker', 'snmpWorker', 'monitorWorker',
   // #5291 W04 — dispatches `script` monitors' diagnostic probes.
   'monitorScriptWorker',
@@ -302,7 +306,7 @@ const EXPECTED_NAMES = [
   'backupProviderSyncWorker',
   'cloudCommandM365SnapshotWorker', 'm365SyncWorker', 'pax8SyncWorker',
   'tdSynnexSftpSyncWorker', 'logForwardingWorker', 'patchJobWorker', 'patchSchedulerWorker',
-  'maintenanceRebootWorker', 'backupWorker', 'backupSnapshotFileIndexWorker', 'sensitiveDataWorker', 'securityScanWorker', 'peripheralJobs',
+  'maintenanceRebootWorker', 'backupWorker', 'backupSnapshotFileIndexWorker', 'backupSnapshotAttestationWorker', 'backupWriteSessionJanitor', 'sensitiveDataWorker', 'securityScanWorker', 'peripheralJobs',
   'deviceGroupJobs',
   'browserSecurityWorker', 'c2cBackupWorker', 'backupSlaWorker', 'drExecutionWorker',
   'recoveryMediaWorker', 'warrantyWorker', 'ssoDomainRecheckWorker',
@@ -327,6 +331,8 @@ const EXPECTED_NAMES = [
   'toolSourceDiscoveryWorker',
   // Partner sending domains W03 (#6183).
   'sendingDomainsWorker',
+  // AI Suggested Fixes W1.
+  'fixOutcomeWorker',
 ];
 
 // ---------------------------------------------------------------------------

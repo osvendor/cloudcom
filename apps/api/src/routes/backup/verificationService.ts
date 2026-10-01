@@ -9,6 +9,7 @@ import {
 import { createAuditLogAsync } from '../../services/auditService';
 import { recordBackupDispatchFailure } from '../../services/backupMetrics';
 import { resolveBackupProviderConfig, resolveBackupDestinationError, type BackupProviderConfig } from '../../services/backupProviderConfig';
+import { backupReadCredentialPayload } from '../../services/backupCommandCredentials';
 import { queueCommandForExecution } from '../../services/commandQueue';
 import { publishEvent } from '../../services/eventBus';
 import { BACKUP_LOW_READINESS_THRESHOLD } from './constants';
@@ -38,6 +39,7 @@ import {
   captureRecoveryAuthorizationSubject,
   type CapturedRecoveryAuthorizationSubject,
 } from '../../services/recoveryAuthorizationSubject';
+import { isBackupHelperUpdateRequiredError } from '../../services/backupReadHelperGate';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -48,9 +50,8 @@ const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
 const DAY_MS = 24 * 60 * 60 * 1000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-export { BACKUP_LOW_READINESS_THRESHOLD } from './constants';
+export { BACKUP_HIGH_READINESS_THRESHOLD, BACKUP_LOW_READINESS_THRESHOLD } from './constants';
 export const BACKUP_READINESS_RECOVERY_THRESHOLD = 75;
-export const BACKUP_HIGH_READINESS_THRESHOLD = 85;
 export const BACKUP_RECENT_COVERAGE_DAYS = 30;
 export const BACKUP_MAX_RECENT_VERIFICATIONS = 12;
 
@@ -720,8 +721,9 @@ async function runBackupVerificationInternal(
     {
       snapshotId: agentSnapshotId,
       verificationType: input.verificationType,
-      provider: providerConfig.provider,
-      providerConfig: providerConfig.providerConfig,
+      // A reference only: the destination is resolved when the command is
+      // delivered, so it is never written to the command row.
+      ...backupReadCredentialPayload(backupJob.configId, input.orgId, providerConfig.provider),
     },
     { userId: input.requestedBy || undefined, expectedOrgId: input.orgId }
   );
@@ -760,13 +762,16 @@ async function runBackupVerificationInternal(
       recordBackupDispatchFailure('backup_verification', reason);
       throw new BackupVerificationDispatchError(dispatchResult.error, 409);
     }
+    const helperUpdateRequired = isBackupHelperUpdateRequiredError(dispatchResult.error);
     recordBackupDispatchFailure(
       'backup_verification',
-      dispatchResult.error.startsWith('Device is ') ? 'device_offline' : 'enqueue_failed'
+      helperUpdateRequired
+        ? 'helper_update_required'
+        : dispatchResult.error.startsWith('Device is ') ? 'device_offline' : 'enqueue_failed'
     );
     throw new BackupVerificationDispatchError(
       dispatchResult.error,
-      dispatchResult.error.startsWith('Device is ') ? 409 : 502
+      helperUpdateRequired || dispatchResult.error.startsWith('Device is ') ? 409 : 502
     );
   }
 
