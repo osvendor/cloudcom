@@ -792,6 +792,8 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'sql_instances',
   'sso_providers',
   'sso_verified_domains',
+  // Runtime FK ordering deletes staff sessions before native targets and users.
+  'staff_native_sessions',
   'storage_encryption_keys',
   // support_sessions (Quick Support): rows live in the partner's hidden
   // 'quick_support' org. enrollment_keys carries an ON DELETE CASCADE FK to

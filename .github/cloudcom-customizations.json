@@ -499,6 +499,40 @@
           "contains": "pnpm --filter @breeze/api exec vitest run --config vitest.integration.config.ts src/__tests__/integration/unifiSyncLockOrder.integration.test.ts"
         }
       ]
+    },
+    {
+      "id": "staff-native-and-ticket-conversation",
+      "requiredFiles": [
+        "apps/api/migrations/2026-09-30-staff-native.sql",
+        "apps/api/src/services/staffNativeAdmission.ts",
+        "apps/api/src/services/staffNativeAuthority.ts",
+        "apps/api/src/services/staffNativeLogin.ts",
+        "apps/api/src/services/cloudcom/remoteAccessEnrollment.ts",
+        "apps/api/src/services/emailTemplates/ticketConversation.ts",
+        "apps/web/src/pages/remote/native.astro"
+      ],
+      "hooks": [
+        {
+          "file": "apps/api/src/index.ts",
+          "contains": "staffNativeRoutes"
+        },
+        {
+          "file": "apps/api/src/services/tenantCascade.ts",
+          "contains": "staff_native_sessions"
+        },
+        {
+          "file": "apps/api/src/services/orgMergeRegistry.ts",
+          "contains": "staff_native_sessions"
+        },
+        {
+          "file": "apps/api/src/services/tenantExportPolicyRegistry.ts",
+          "contains": "\"staff_native_sessions\""
+        },
+        {
+          "file": "apps/api/src/jobs/ticketNotifyWorker.ts",
+          "contains": "ticketConversation"
+        }
+      ]
     }
   ]
 }

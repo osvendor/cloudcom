@@ -130,6 +130,7 @@ function buildFollowsParentEntries(): Record<string, OrgMergePolicy> {
 }
 
 const SPECIAL: Record<string, OrgMergePolicy> = {
+  staff_native_sessions: { kind: 'blocks-merge', note: 'Staff native admission, operator ownership and session history must remain bound to their original organization and target.' },
   portal_native_targets: { kind: 'blocks-merge', note: 'Native enrollment belongs to the original device and organization; revoke and remove before merging.' },
   portal_native_admissions: { kind: 'blocks-merge', note: 'Native admission identity and session history must not move across organizations.' },
   portal_remote_settings: { kind: 'blocks-merge', note: 'Explicitly disable and remove remote access configuration before merging customer identities; assignments never transfer authority between organizations.' },

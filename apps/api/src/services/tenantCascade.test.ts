@@ -147,10 +147,27 @@ import {
   __testOnly,
 } from './tenantCascade';
 import { db } from '../db';
+import { getOrgMergePolicies } from './orgMergeRegistry';
+import { getTenantExportPolicyRegistry } from './tenantExportPolicyRegistry';
+import { getTableColumns } from 'drizzle-orm';
+import { staffNativeSessions } from '../db/schema/staffNative';
 
 const cascadeOrder = getOrgCascadeDeleteOrder();
 
 describe('getOrgCascadeDeleteOrder()', () => {
+  it('keeps staff native ownership fixed during merges and excludes admission material from exports', () => {
+    expect(cascadeOrder).toContain('staff_native_sessions');
+    expect(getOrgMergePolicies().get('staff_native_sessions')?.kind).toBe('blocks-merge');
+    const policy = getTenantExportPolicyRegistry().staff_native_sessions!;
+    expect(policy.organizationKey).toBe('org_id');
+    expect(Object.keys(policy.columns).sort()).toEqual(
+      Object.values(getTableColumns(staffNativeSessions)).map((column) => column.name).sort(),
+    );
+    for (const column of ['target_public_key', 'operator_public_key', 'operator_session_hash', 'ticket_hash', 'target_challenge', 'channel_binding', 'lease_hash']) {
+      expect(policy.columns[column]?.decision).toBe('exclude');
+    }
+    expect(policy.columns.status?.decision).toBe('include');
+  });
   it('has every entry as a safe identifier', () => {
     for (const t of cascadeOrder) {
       expect(t).toMatch(/^[a-z_][a-z0-9_]*$/);
@@ -253,6 +270,18 @@ describe('topologicalCascadeOrder', () => {
     const devicesIdx = order.indexOf('devices');
     const usersIdx = order.indexOf('users');
     expect(devicesIdx).toBeLessThan(usersIdx);
+  });
+
+  it('erases staff sessions before their native targets, staff users and organizations', async () => {
+    mockState.fkEdges = ['portal_native_targets', 'users', 'organizations'].map((parent_table) => ({
+      child_table: 'staff_native_sessions', parent_table,
+    }));
+    const order = await topologicalCascadeOrder();
+    const sessionIndex = order.indexOf('staff_native_sessions');
+    expect(sessionIndex).toBeGreaterThanOrEqual(0);
+    for (const parent of ['portal_native_targets', 'users', 'organizations']) {
+      expect(sessionIndex).toBeLessThan(order.indexOf(parent));
+    }
   });
 
   it('throws on FK cycles', async () => {

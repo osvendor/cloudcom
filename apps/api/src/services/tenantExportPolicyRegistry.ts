@@ -39,6 +39,12 @@ export function tablePolicy(
 }
 
 export const CORE_TENANT_EXPORT_POLICY: TenantExportPolicyRegistry = {
+  "staff_native_sessions": tablePolicy("org_id", {
+    included: ["id", "org_id", "device_id", "staff_user_id", "target_id", "target_generation", "status", "hard_deadline", "created_at", "ended_at", "ticket_expires_at", "consumed_at", "connection_id", "lease_revision", "lease_expires_at", "presence_until"],
+    reviewedIncluded: [],
+    excludedSensitive: ["target_public_key", "operator_public_key", "operator_session_hash", "ticket_hash", "target_challenge", "channel_binding", "lease_hash"],
+    excludedOpen: [],
+  }),
   "access_reviews": tablePolicy("org_id", {"included":["id","partner_id","org_id","name","description","status","reviewer_id","due_date","created_at","updated_at","completed_at"],"reviewedIncluded":[],"excludedSensitive":[],"excludedOpen":[]}),
   "account_deletion_requests": tablePolicy("org_id", {"included":["id","user_id","org_id","reason","status","requested_at","process_by","processed_at","processed_by","admin_note","created_at","updated_at"],"reviewedIncluded":[],"excludedSensitive":[],"excludedOpen":[]}),
   "action_intents": tablePolicy("org_id", {"included":["trigger_kind","trigger_ref_id","trigger_key","id","org_id","partner_id","requested_by_user_id","requesting_api_key_id","requesting_agent_run_id","source","requesting_client_label","action_name","action_version","argument_digest","target_summary","impact_summary","reason","risk_tier","connection_id","tenant_id","idempotency_key","correlation_id","status","task_id","task_step_key","operation_key","created_at","expires_at","decided_at","decided_by_user_id","decided_assurance_level","decided_via","execution_started_at","executed_at","error_code","approval_scope","classification_version","approval_expires_at","release_by","effect_digest","policy_decision_state","policy_snapshot_digest","policy_classification_version","policy_reservation_id","policy_kill_epoch","scope_kind","scope_device_id","scope_ticket_id","ai_origin_kind","ai_origin_session_id","ai_origin_agent_run_id","tool_source_tool_id","tool_revision"],"reviewedIncluded":["origin_principal_kind","origin_principal_id","policy_authorization_key"],"excludedSensitive":[],"excludedOpen":["arguments","result","script_reviewer_evidence"]}),

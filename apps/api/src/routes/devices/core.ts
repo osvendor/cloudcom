@@ -1670,7 +1670,6 @@ export async function resolveRemoteAccessLauncherForDevice(
   orgId: string,
   customFields: Record<string, unknown> | null,
   auth?: AuthContext,
-  deviceId?: string,
 ): Promise<RemoteAccessLaunchResult> {
   if (await isParkedDevice(db, deviceId)) {
     throw new RemoteAccessLaunchParkedDeviceError(deviceId);
@@ -1716,7 +1715,6 @@ coreRoutes.post(
         device.orgId,
         device.customFields as Record<string, unknown> | null,
         auth,
-        deviceId,
       );
     } catch (err) {
       if (err instanceof RemoteAccessLaunchParkedDeviceError) {
