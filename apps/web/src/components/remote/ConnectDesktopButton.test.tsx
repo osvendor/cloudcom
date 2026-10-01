@@ -28,11 +28,11 @@ vi.mock('../shared/Toast', async () => {
 const fetchMock = vi.mocked(fetchWithAuth);
 const toastMock = vi.mocked(showToast);
 
-const jsonRes = (body: unknown, ok = true): Response =>
+const jsonRes = (body: unknown, ok = true, status = ok ? 200 : 500): Response =>
   ({
     ok,
-    status: ok ? 200 : 500,
-    statusText: ok ? 'OK' : 'ERROR',
+    status,
+    statusText: status === 404 ? 'NOT FOUND' : ok ? 'OK' : 'ERROR',
     json: vi.fn().mockResolvedValue(body),
   }) as unknown as Response;
 
@@ -122,6 +122,7 @@ describe('ConnectDesktopButton — launcher skip-reason toast', () => {
       launchUrl: 'rustdesk://12345?password=x',
       scheme: 'rustdesk',
     }));
+    fetchMock.mockResolvedValueOnce(jsonRes({ error: 'not_found' }, false, 404));
 
     render(<ConnectDesktopButton viewerMode="native" deviceId="dev-4" />);
     fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
@@ -233,6 +234,9 @@ describe('ConnectDesktopButton — viewer-not-installed fallback card', () => {
   async function reachFallbackCard() {
     // Device lookup → no partner launcher, so the built-in WebRTC path runs.
     fetchMock.mockImplementation((path: string) => {
+      if (path.startsWith('/staff-native/launch/')) {
+        return Promise.resolve(jsonRes({ error: 'not_found' }, false, 404));
+      }
       if (path.startsWith('/devices/')) {
         return Promise.resolve(jsonRes({ desktopAccess: null, hasRemoteAccessLauncher: false }));
       }
@@ -500,5 +504,67 @@ describe('ConnectDesktopButton — session creation errors keep specific prose (
         expect.objectContaining({ type: 'error', message: expect.stringContaining('Access to this site denied') }),
       );
     });
+  });
+});
+
+describe('ConnectDesktopButton — staff native managed launch', () => {
+  beforeEach(() => {
+    _resetToastQueueForTests();
+    fetchMock.mockReset();
+    toastMock.mockReset();
+  });
+
+  it('hands a successful managed launch to the registered staff URI without starting WebRTC', async () => {
+    fetchMock.mockResolvedValueOnce(jsonRes({ desktopAccess: null, hasRemoteAccessLauncher: true }));
+    fetchMock.mockResolvedValueOnce(jsonRes({ launchUrl: 'rustdesk://12345?password=private', scheme: 'rustdesk' }));
+    fetchMock.mockResolvedValueOnce(jsonRes({ launchUrl: 'cloudcom-remote://staff/connect/dev-managed' }));
+    let launchedHref: string | undefined;
+    const anchorClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      launchedHref = this.href;
+    });
+
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-managed" />);
+    fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
+
+    await waitFor(() => expect(toastMock).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'success', message: expect.stringContaining('Continue in OS Consultants Remote Access'),
+    })));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/devices/dev-managed');
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/devices/dev-managed/remote-access-launch', { method: 'POST' });
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/staff-native/launch/dev-managed', { method: 'POST' });
+    expect(launchedHref).toBe('cloudcom-remote://staff/connect/dev-managed');
+    expect(launchedHref).not.toContain('private');
+    anchorClick.mockRestore();
+  });
+
+  it('surfaces staff authorization denial and does not fall back to the device/session flow', async () => {
+    fetchMock.mockResolvedValueOnce(jsonRes({ desktopAccess: null, hasRemoteAccessLauncher: true }));
+    fetchMock.mockResolvedValueOnce(jsonRes({ launchUrl: 'rustdesk://12345?password=private', scheme: 'rustdesk' }));
+    fetchMock.mockResolvedValueOnce(jsonRes({ error: 'staff access denied' }, false, 403));
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-denied" />);
+    fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
+
+    await waitFor(() => expect(toastMock).toHaveBeenCalledWith(expect.objectContaining({ type: 'error' })));
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/staff-native/launch/dev-denied', { method: 'POST' });
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      '/devices/dev-denied', '/devices/dev-denied/remote-access-launch', '/staff-native/launch/dev-denied',
+    ]);
+  });
+
+  it('fails closed on an unexpected managed-launch response instead of continuing to WebRTC', async () => {
+    fetchMock.mockResolvedValueOnce(jsonRes({ desktopAccess: null, hasRemoteAccessLauncher: true }));
+    fetchMock.mockResolvedValueOnce(jsonRes({ launchUrl: 'rustdesk://12345?password=private', scheme: 'rustdesk' }));
+    fetchMock.mockResolvedValueOnce(jsonRes({ error: 'temporarily unavailable' }, false, 503));
+    render(<ConnectDesktopButton viewerMode="native" deviceId="dev-unavailable" />);
+    fireEvent.click(screen.getByRole('button', { name: /connect desktop/i }));
+
+    expect(await screen.findByRole('button', { name: /connection failed/i })).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/staff-native/launch/dev-unavailable', { method: 'POST' });
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual([
+      '/devices/dev-unavailable', '/devices/dev-unavailable/remote-access-launch', '/staff-native/launch/dev-unavailable',
+    ]);
   });
 });

@@ -69,6 +69,9 @@ $xml = @"
   <StandardDirectory Id="DesktopFolder" />
   <Component Id="ViewerShortcuts" Directory="INSTALLFOLDER" Guid="*" Bitness="always64">
    <RegistryValue Root="HKLM" Key="Software\CloudCom\RemoteAccessViewer" Name="Installed" Type="integer" Value="1" KeyPath="yes" />
+   <RegistryValue Root="HKLM" Key="Software\Classes\cloudcom-remote" Type="string" Value="URL:OS Consultants Remote Access" />
+   <RegistryValue Root="HKLM" Key="Software\Classes\cloudcom-remote" Name="URL Protocol" Type="string" Value="" />
+   <RegistryValue Root="HKLM" Key="Software\Classes\cloudcom-remote\shell\open\command" Type="string" Value="&quot;[INSTALLFOLDER]OSConsultantsRemote.exe&quot; &quot;%1&quot;" />
    <Shortcut Id="StartMenuShortcut" Directory="MenuFolder" Name="OS Consultants - Remote Access" Target="[INSTALLFOLDER]OSConsultantsRemote.exe" WorkingDirectory="INSTALLFOLDER" Icon="ViewerIcon" />
    <Shortcut Id="DesktopShortcut" Directory="DesktopFolder" Name="OS Consultants - Remote Access" Target="[INSTALLFOLDER]OSConsultantsRemote.exe" WorkingDirectory="INSTALLFOLDER" Icon="ViewerIcon" />
    <RemoveFolder Id="RemoveMenuFolder" Directory="MenuFolder" On="uninstall" />

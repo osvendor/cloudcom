@@ -205,7 +205,7 @@ describe('Exchange shared mailbox creation', () => {
 describe('Exchange message trace read attachment', () => {
   const end = new Date(Date.now() - 60000).toISOString(), start = new Date(Date.now() - 86400000).toISOString();
   const search = { start, end, sender: null, recipient: 'recipient@example.com', status: null, cursor: null };
-  const row = { messageTraceId: '66666666-6666-4666-8666-666666666666', received: end,
+  const row = { messageTraceId: '66666666-6666-4666-f666-666666666666', received: end,
     sender: 'sender@example.com', recipient: 'recipient@example.com', subject: 'Private subject', status: 'Delivered' };
   it('fences a fixed read and audits counts without message content', async () => {
     const s = setup(); s.worker.dispatch.mockImplementation(async request => ({ requestId: request.requestId, ok: true,

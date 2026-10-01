@@ -181,6 +181,7 @@ export * from './emailSendingDomains';
 export * from './portalRemote';
 
 export * from './portalNative';
+export * from './staffNative';
 export * from './backupProviders';
 export * from './callerVerification';
 export * from './hardwareAlertRetirementOutbox';

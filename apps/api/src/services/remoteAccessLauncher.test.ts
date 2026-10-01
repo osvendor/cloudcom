@@ -520,3 +520,14 @@ describe('checkRemoteAccessLaunchAvailability — parity with issuance', () => {
     expect(availability).toEqual({ available: true, providerId: 'rustdesk', skipReason: null });
   });
 });
+
+describe('enrolled RustDesk targets', () => {
+  it('resolves the enrolled identity even without a duplicate custom field', () => {
+    const device = { customFields: { rustdesk_id: 'stale' }, enrolledRustDeskId: '503234560' };
+    expect(checkRemoteAccessLaunchAvailability(device, rustdeskSettings).available).toBe(true);
+    expect(resolveRemoteAccessLaunch(device, rustdeskSettings).launchUrl).toBe('rustdesk://503234560?password=plain');
+    const other = { ...baseProvider, id: 'other', urlTemplate: 'https://remote.example/{id}' };
+    expect(resolveRemoteAccessLaunch(device, { defaultProviderId: 'other', providers: [baseProvider, other] }).launchUrl).toBe('https://remote.example/stale');
+    expect(resolveRemoteAccessLaunch(device, { ...rustdeskSettings, providers: [{ ...baseProvider, enabled: false }] }).skipReason).toBe('provider_disabled');
+  });
+});

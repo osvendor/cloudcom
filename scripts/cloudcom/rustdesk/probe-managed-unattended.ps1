@@ -24,6 +24,7 @@ $enrollment=Join-Path $env:ProgramData 'Breeze\data\rustdesk\native-admission.dp
 if(!(Test-Path -LiteralPath $enrollment -PathType Leaf)){$issues.Add('native_enrollment_missing')}
 if(!(Get-Printer -Name 'RustDesk Printer' -ErrorAction SilentlyContinue)){$issues.Add('printer_missing')}
 if(!(Get-PrinterDriver -Name 'RustDesk v4 Printer Driver' -ErrorAction SilentlyContinue)){$issues.Add('printer_driver_missing')}
+if(!(Test-CloudComRustDeskFirewall $exe)){$issues.Add('direct_firewall_missing_or_address_pinned')}
 $state=if($issues.Count){'breach'}else{'ok'}
 $detail=if($issues.Count){$issues -join ', '}else{'Managed RustDesk target and printer verified.'}
 Write-Output ('::breeze:monitor:: '+(@{state=$state;detail=$detail}|ConvertTo-Json -Compress))

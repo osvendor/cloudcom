@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 
 const uuid = z.string().uuid().transform(value => value.toLowerCase());
+// Exchange trace GUIDs do not guarantee RFC UUID version/variant bits.
+export const exchangeTraceIdSchema = z.string().regex(/^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$/).transform(value => value.toLowerCase());
 const credentialVersion = z.string().min(1).max(128).regex(/^[A-Za-z0-9._-]+$/);
 const inventoryCursor = z.string().regex(/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}:[1-9][0-9]{0,4}$/);
 const inventoryParameters = z.object({ pageSize: z.number().int().min(1).max(200).default(200), cursor: inventoryCursor.optional() }).strict();
@@ -11,7 +13,7 @@ const forwardingSetParameters = z.object({ mailboxId: uuid, smtpAddress: forward
 const autoReplyState = z.enum(['Disabled', 'Enabled', 'Scheduled']);
 const autoReplyGetParameters = z.object({ mailboxId: uuid }).strict();
 const autoReplySetParameters = z.object({ mailboxId: uuid, state: autoReplyState,
-  message: z.string().max(8192), start: z.string().datetime({ offset: true }).nullable(), end: z.string().datetime({ offset: true }).nullable() }).strict()
+  message: z.string().max(8192), externalMessage: z.string().max(8192).optional(), externalAudience: z.enum(['None', 'Known', 'All']).optional(), start: z.string().datetime({ offset: true }).nullable(), end: z.string().datetime({ offset: true }).nullable() }).strict()
   .superRefine((value, issue) => {
     if (value.state === 'Scheduled' && (!value.start || !value.end || Date.parse(value.end) <= Date.parse(value.start)))
       issue.addIssue({ code: 'custom', message: 'A scheduled reply needs an end after its start.' });
@@ -37,7 +39,10 @@ const traceCursor = z.object({ received: z.string().datetime({ offset: true }), 
 const traceSearchParameters = z.object({ start: z.string().datetime({ offset: true }), end: z.string().datetime({ offset: true }),
   sender: z.string().email().max(320).nullable(), recipient: z.string().email().max(320).nullable(),
   status: traceStatus.nullable(), cursor: traceCursor.nullable() }).strict();
-const traceDetailParameters = z.object({ messageTraceId: uuid, recipient: z.string().email().max(320) }).strict();
+const traceDetailParameters = z.object({ messageTraceId: exchangeTraceIdSchema, recipient: z.string().email().max(320) }).strict();
+export const quarantineLookupParameters = z.object({ messageTraceId: exchangeTraceIdSchema,
+  recipient: z.string().email().max(320), received: z.string().datetime({ offset: true }) }).strict();
+export const quarantineReleaseParameters = quarantineLookupParameters.extend({ identity: z.string().regex(/^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\\[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$/) }).strict();
 const bindingSchema = z.object({
   organizationId: uuid,
   tenantId: uuid,
@@ -95,13 +100,19 @@ const distributionNameSetRequest = z.object({ requestId: uuid, ...bindingSchema.
   operation: z.literal('distribution.name.set'), parameters: distributionNameSetParameters }).strict();
 const groupPrimarySetRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
   operation: z.literal('group.primary.set'), parameters: groupPrimarySetParameters }).strict();
+const groupAliasAddRequest = z.object({ requestId: uuid, ...bindingSchema.shape, operation: z.literal('group.alias.add'), parameters: groupPrimarySetParameters }).strict();
+const groupAliasRemoveRequest = z.object({ requestId: uuid, ...bindingSchema.shape, operation: z.literal('group.alias.remove'), parameters: groupPrimarySetParameters }).strict();
 const traceSearchRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
   operation: z.literal('trace.search'), parameters: traceSearchParameters }).strict();
 const traceDetailRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
   operation: z.literal('trace.detail'), parameters: traceDetailParameters }).strict();
+const quarantineLookupRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
+  operation: z.literal('quarantine.lookup'), parameters: quarantineLookupParameters }).strict();
+const quarantineReleaseRequest = z.object({ requestId: uuid, ...bindingSchema.shape,
+  operation: z.literal('quarantine.release.set'), parameters: quarantineReleaseParameters }).strict();
 const request = z.discriminatedUnion('operation', [inventoryRequest, statisticsGetRequest, preservationGetRequest, convertSharedRequest, forwardingGetRequest, forwardingSetRequest, autoReplyGetRequest, autoReplySetRequest,
   addressesGetRequest, primarySetRequest, aliasAddRequest, aliasRemoveRequest, delegationGetRequest, delegationListRequest, delegationSetRequest,
-  distributionCreateRequest, sharedCreateRequest, distributionMemberSetRequest, distributionMembersGetRequest, groupSettingsGetRequest, groupExternalSetRequest, distributionNameSetRequest, groupPrimarySetRequest, traceSearchRequest, traceDetailRequest]);
+  distributionCreateRequest, sharedCreateRequest, distributionMemberSetRequest, distributionMembersGetRequest, groupSettingsGetRequest, groupExternalSetRequest, distributionNameSetRequest, groupPrimarySetRequest, groupAliasAddRequest, groupAliasRemoveRequest, traceSearchRequest, traceDetailRequest, quarantineLookupRequest, quarantineReleaseRequest]);
 
 const mailbox = z.object({
   id: uuid,
@@ -188,15 +199,33 @@ const distributionNameSetResponse = z.object({ requestId: uuid, ok: z.literal(tr
 const groupPrimarySetResponse = z.object({ requestId: uuid, ok: z.literal(true), data: z.object({
   groupId: uuid, primarySmtpAddress: z.string().email().max(320), accepted: z.literal(true), verified: z.boolean(), changed: z.boolean(),
 }).strict() }).strict();
-const traceRecord = z.object({ messageTraceId: uuid, received: z.string().datetime({ offset: true }),
+const traceRecord = z.object({ messageTraceId: exchangeTraceIdSchema, received: z.string().datetime({ offset: true }),
   sender: z.string().max(320), recipient: z.string().email().max(320), subject: z.string().max(1000), status: z.string().max(80) }).strict();
 const traceEvent = z.object({ date: z.string().datetime({ offset: true }).nullable(), event: z.string().max(120), detail: z.string().max(4000) }).strict();
 const traceSearchResponse = z.object({ requestId: uuid, ok: z.literal(true), data: z.object({
   rows: z.array(traceRecord).max(1000), next: traceCursor.nullable(), partial: z.boolean(), checkedAt: z.string().datetime({ offset: true }),
 }).strict() }).strict();
 const traceDetailResponse = z.object({ requestId: uuid, ok: z.literal(true), data: z.object({
-  messageTraceId: uuid, recipient: z.string().email().max(320), events: z.array(traceEvent).max(1000), partial: z.boolean(),
+  messageTraceId: exchangeTraceIdSchema, recipient: z.string().email().max(320), events: z.array(traceEvent).max(1000), partial: z.boolean(),
 }).strict() }).strict();
+
+const quarantineMatch = z.object({ identity: quarantineReleaseParameters.shape.identity, messageId: z.string().min(1).max(998),
+  subject: z.string().max(1000), sender: z.string().max(320), recipient: z.string().email().max(320), released: z.boolean() }).strict();
+const quarantineState = quarantineLookupParameters.extend({ match: quarantineMatch.nullable(), checkedAt: z.string().datetime({ offset: true }) }).strict();
+const quarantineLookupResponse = z.object({ requestId: uuid, ok: z.literal(true), data: quarantineState }).strict();
+const quarantineReleaseResponse = z.object({ requestId: uuid, ok: z.literal(true), data: quarantineState.extend({ accepted: z.literal(true), verified: z.boolean() }) }).strict();
+export function createExchangeQuarantineClient(port: ExchangeWorkerPort) {
+  return async (binding: ExchangeConnectionBinding, input: unknown, release: boolean) => {
+    const outbound = release ? quarantineReleaseRequest.parse({ ...bindingSchema.parse(binding), requestId: randomUUID(), operation: 'quarantine.release.set', parameters: input })
+      : quarantineLookupRequest.parse({ ...bindingSchema.parse(binding), requestId: randomUUID(), operation: 'quarantine.lookup', parameters: input });
+    const data = release ? await forwardingDispatch(port, outbound, quarantineReleaseResponse) : await forwardingDispatch(port, outbound, quarantineLookupResponse);
+    if (data.messageTraceId !== outbound.parameters.messageTraceId || data.recipient.toLowerCase() !== outbound.parameters.recipient.toLowerCase() ||
+        Date.parse(data.received) !== Date.parse(outbound.parameters.received) || (data.match && data.match.recipient.toLowerCase() !== outbound.parameters.recipient.toLowerCase()) ||
+        (outbound.operation === 'quarantine.release.set' && (!data.match || data.match.identity.toLowerCase() !== outbound.parameters.identity.toLowerCase() || ('verified' in data && data.verified && !data.match.released))))
+      throw new ExchangeWorkerError(release ? 'unknown_write_outcome' : 'provider_unreachable');
+    return data;
+  };
+}
 
 export type ExchangeConnectionBinding = z.infer<typeof bindingSchema>;
 export type ExchangeMailboxInventory = z.infer<typeof mailbox>;
@@ -369,6 +398,16 @@ export function createExchangeGroupPrimaryClient(port: ExchangeWorkerPort) {
       operation: 'group.primary.set', parameters: groupPrimarySetParameters.parse(input) });
     const data = await forwardingDispatch(port, outbound, groupPrimarySetResponse);
     if (data.groupId !== outbound.parameters.groupId || data.primarySmtpAddress.toLowerCase() !== outbound.parameters.address.toLowerCase() || !data.verified)
+      throw new ExchangeWorkerError('unknown_write_outcome');
+    return data;
+  };
+}
+export function createExchangeGroupAliasClient(port: ExchangeWorkerPort) {
+  return async (binding: ExchangeConnectionBinding, input: z.infer<typeof groupPrimarySetParameters>, action: 'group.alias.add' | 'group.alias.remove') => {
+    const outbound = (action === 'group.alias.add' ? groupAliasAddRequest : groupAliasRemoveRequest).parse({ ...bindingSchema.parse(binding), requestId: randomUUID(),
+      operation: action, parameters: groupPrimarySetParameters.parse(input) });
+    const data = await forwardingDispatch(port, outbound, groupPrimarySetResponse);
+    if (data.groupId !== outbound.parameters.groupId || !data.verified)
       throw new ExchangeWorkerError('unknown_write_outcome');
     return data;
   };

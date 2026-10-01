@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { bootstrapFromCfAccessRedirect, bootstrapFromSsoCode, markSsoExchangeFailed, restoreAccessTokenFromCookieDetailed, setThrottleMaskMounted, settleSsoLoginGate, SSO_EXCHANGE_FAILED_LOGIN_PATH, useAuthStore } from '../../stores/auth';
 import { Loader2 } from 'lucide-react';
@@ -118,6 +118,11 @@ async function redirectToSsoExchangeFailed(): Promise<void> {
 export default function AuthOverlay() {
   const { t } = useTranslation('auth');
   const { isAuthenticated, isLoading, tokens, sessionExpiredReason, authThrottledUntil } = useAuthStore();
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   const [isChecking, setIsChecking] = useState(true);
   const [isRecovering, setIsRecovering] = useState(false);
   const [recoverAttempted, setRecoverAttempted] = useState(false);
@@ -245,7 +250,8 @@ export default function AuthOverlay() {
         setCfBootstrapAttempted(true);
         setIsRecovering(true);
         void bootstrapFromCfAccessRedirect().then((ok) => {
-          if (cancelled) return;
+          // Local recovery state rerenders this effect before the request finishes.
+          if (!mounted.current) return;
           setIsRecovering(false);
           if (!ok) {
             void navigateTo('/login?error=cf-access', { replace: true });
@@ -265,7 +271,8 @@ export default function AuthOverlay() {
       setIsRecovering(true);
 
       void restoreAccessTokenFromCookieDetailed().then((outcome) => {
-        if (cancelled) return;
+        // Local recovery state rerenders this effect before the request finishes.
+          if (!mounted.current) return;
         setIsRecovering(false);
 
         // 'throttled' (#3696) is NOT a dead session — the server rate-limited

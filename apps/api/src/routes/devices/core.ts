@@ -1,3 +1,4 @@
+import { readEnrolledRustDeskId } from '../../services/cloudcom/remoteAccessEnrollment';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { optionalJsonValidator, zValidator } from '../../lib/validation';
@@ -1449,6 +1450,7 @@ coreRoutes.get(
         device.orgId,
         device.customFields as Record<string, unknown> | null,
         auth,
+        deviceId,
       );
       if (availability.available) {
         hasRemoteAccessLauncher = true;
@@ -1556,9 +1558,11 @@ export async function checkRemoteAccessLauncherAvailabilityForDevice(
   orgId: string,
   customFields: Record<string, unknown> | null,
   auth?: AuthContext,
+  deviceId?: string,
 ): Promise<RemoteAccessLaunchAvailability> {
   const { providers, preferredProviderId } = await loadRemoteAccessLauncherContext(orgId, auth);
-  return checkRemoteAccessLaunchAvailability({ customFields }, providers, preferredProviderId);
+  const enrolledRustDeskId = await readEnrolledRustDeskId(deviceId, orgId, providers);
+  return checkRemoteAccessLaunchAvailability({ customFields, enrolledRustDeskId }, providers, preferredProviderId);
 }
 
 /**
@@ -1569,9 +1573,11 @@ async function resolveRemoteAccessLauncherForDevice(
   orgId: string,
   customFields: Record<string, unknown> | null,
   auth?: AuthContext,
+  deviceId?: string,
 ): Promise<RemoteAccessLaunchResult> {
   const { providers, preferredProviderId } = await loadRemoteAccessLauncherContext(orgId, auth);
-  return resolveRemoteAccessLaunch({ customFields }, providers, preferredProviderId);
+  const enrolledRustDeskId = await readEnrolledRustDeskId(deviceId, orgId, providers);
+  return resolveRemoteAccessLaunch({ customFields, enrolledRustDeskId }, providers, preferredProviderId);
 }
 
 // POST /devices/:id/remote-access-launch - Issue a one-shot remote-access
@@ -1609,6 +1615,7 @@ coreRoutes.post(
         device.orgId,
         device.customFields as Record<string, unknown> | null,
         auth,
+        deviceId,
       );
     } catch (err) {
       captureException(err, c);

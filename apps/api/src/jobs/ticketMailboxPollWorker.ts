@@ -76,7 +76,18 @@ async function sweepOne(c: Awaited<ReturnType<typeof listConnectedMailboxes>>[nu
     // Graph I/O may outlive a reconnect/disable. Revalidate the exact generation
     // immediately before producing any external side effects.
     if (!await isConnectedMailboxSnapshotCurrent(c)) return;
+    // Keep the original connection floor across retries and expired cursors. A
+    // moving "now" baseline would lose mail received while consent/polling fails.
+    // Filter locally: Graph's date-filtered delta caps results at 5,000 and can
+    // still emit out-of-filter read-state changes. Never mark historical mail read.
+    const eligibleAfter = c.createdAt.getTime();
+    if (!Number.isFinite(eligibleAfter)) throw new Error('Invalid mailbox eligibility floor');
     for (const msg of page.messages) {
+      if (msg['@removed']) continue;
+      const receivedAt = msg.receivedDateTime ? Date.parse(msg.receivedDateTime) : NaN;
+      // Do not advance past an ambiguous message or invent a receipt timestamp.
+      if (!Number.isFinite(receivedAt)) throw new Error('Missing or invalid mailbox message received time');
+      if (receivedAt < eligibleAfter) continue;
       const normalized = normalizeGraphMessage(msg, c.partnerId, c.mailboxAddress);
       await enqueueInboundEmail(normalized, {
         provider: 'm365',

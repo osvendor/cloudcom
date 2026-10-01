@@ -2795,7 +2795,14 @@ export function createAgentWsHandlers(agentId: string, preValidatedAgent: AgentD
           }
           const { sessionId, data: termData, encoding } = parsed.data;
           const termSession = getActiveTerminalSession(sessionId);
-          if (!termSession || termSession.agentId !== agentId) {
+          // Output can already be in flight when a terminal is disconnected or
+          // its owning API instance restarts. Missing live state is not proof of
+          // a foreign session. Drop it without forwarding or suspending the agent,
+          // just as late terminal-start failures are handled below.
+          if (!termSession) {
+            return;
+          }
+          if (termSession.agentId !== agentId) {
             console.warn(`[AgentWs] Dropping terminal_output for unowned session ${sessionId} from agent ${agentId}`);
             recordCrossTenantDrop(agentId, authenticatedAgent?.deviceId, 'terminal_output');
             return;

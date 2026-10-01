@@ -29,6 +29,58 @@ class FakeProcess:
     def wait(self, timeout=None): pass
 
 class ExchangeBrokerTests(unittest.TestCase):
+    def test_quarantine_request_binding_and_write_classification(self):
+        params = {'messageTraceId': REQUEST['organizationId'], 'recipient': 'qa@example.test', 'received': worker.datetime.datetime.now(worker.datetime.timezone.utc).isoformat()}
+        identity = REQUEST['organizationId'] + '\\' + REQUEST['tenantId']
+        for operation, data in [('quarantine.lookup', params), ('quarantine.release.set', {**params, 'identity': identity})]:
+            request = {**REQUEST, 'operation': operation, 'parameters': data}
+            self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+            self.assertEqual(worker.is_write(operation), operation.endswith('.set'))
+            with self.assertRaises(ValueError):
+                worker.validate_request({**request, 'parameters': {**data, 'releaseToAll': True}}, {REQUEST['tenantId']: DESCRIPTOR})
+        with self.assertRaises(ValueError):
+            worker.validate_request({**REQUEST, 'operation': 'quarantine.release.set', 'parameters': {**params, 'identity': params['messageTraceId']}}, {REQUEST['tenantId']: DESCRIPTOR})
+
+
+    def test_group_alias_validation(self):
+        for action in ('group.alias.add', 'group.alias.remove'):
+            request = {**REQUEST, 'operation': action, 'parameters': {'groupId': REQUEST['organizationId'], 'address': 'alias@example.test'}}
+            self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+            self.assertTrue(worker.is_write(action))
+            with self.assertRaises(ValueError):
+                worker.validate_request({**request, 'parameters': {**request['parameters'], 'command': 'anything'}}, {REQUEST['tenantId']: DESCRIPTOR})
+
+    def test_distinct_external_autoreply_fields_and_legacy_payload(self):
+        params = {'mailboxId': REQUEST['organizationId'], 'state': 'Enabled', 'message': 'Internal', 'start': None, 'end': None}
+        for extra in ({}, {'externalMessage': 'External', 'externalAudience': 'Known'}):
+            request = {**REQUEST, 'operation': 'mailbox.autoreply.set', 'parameters': {**params, **extra}}
+            self.assertEqual(worker.validate_request(request, {REQUEST['tenantId']: DESCRIPTOR})[1], DESCRIPTOR)
+        for extra in ({'externalAudience': 'Everyone'}, {'externalMessage': None}, {'externalMessage': 'x' * 8193}, {'command': 'anything'}):
+            with self.assertRaises(ValueError):
+                worker.validate_request({**REQUEST, 'operation': 'mailbox.autoreply.set', 'parameters': {**params, **extra}}, {REQUEST['tenantId']: DESCRIPTOR})
+
+    def test_process_owns_and_cleans_exchange_temporary_modules(self):
+        process = FakeProcess(b'')
+        with patch.object(worker.subprocess, 'Popen', return_value=process) as launch:
+            persistent = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1')
+        directory = pathlib.Path(persistent.temp_directory.name)
+        (directory / 'tmpEXO_test').mkdir()
+        (directory / 'tmpEXO_test' / 'generated.psm1').write_text('module')
+        self.assertEqual(launch.call_args.kwargs['env']['TMPDIR'], str(directory))
+        persistent.close()
+        self.assertTrue(process.killed)
+        self.assertFalse(directory.exists())
+
+    def test_failed_session_is_retired_without_replaying_request(self):
+        result = {'requestId': REQUEST['requestId'], 'ok': False, 'code': 'provider_rejected'}
+        process = FakeProcess(json.dumps(result).encode() + b'\n')
+        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([0], [], [])), patch.object(worker.os, 'read', return_value=process.line):
+            persistent = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1')
+            directory = pathlib.Path(persistent.temp_directory.name)
+            self.assertEqual(persistent.run(REQUEST)['code'], 'provider_rejected')
+        self.assertTrue(process.killed)
+        self.assertFalse(directory.exists())
+
     def test_group_external_write_rejects_injected_fields_and_wrong_readback(self):
         group_id = '55555555-5555-4555-8555-555555555555'
         request = {**REQUEST, 'operation': 'group.external.set', 'parameters': {'groupId': group_id, 'allowExternalSenders': True}}

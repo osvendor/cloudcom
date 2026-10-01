@@ -79,7 +79,8 @@ import {
 const conn = (over: Partial<any> = {}) => ({
   id: 'c1', partnerId: 'p1', tenantId: '11111111-1111-1111-1111-111111111111',
   consentAttemptId: '22222222-2222-4222-8222-222222222222',
-  mailboxAddress: 'support@a.com', status: 'connected', deltaLink: null, ...over,
+  mailboxAddress: 'support@a.com', status: 'connected', deltaLink: null,
+  createdAt: new Date('2026-09-29T12:00:00Z'), ...over,
 });
 
 describe('runMailboxSweep', () => {
@@ -95,9 +96,50 @@ describe('runMailboxSweep', () => {
     expect(markRead).not.toHaveBeenCalled();
   });
 
+  it.each([null, 'existing-cursor'])('never tickets or marks historical messages read (cursor=%s)', async (deltaLink) => {
+    vi.mocked(listConnectedMailboxes).mockResolvedValue([conn({ deltaLink })] as any);
+    vi.mocked(listInboxDelta).mockResolvedValue({ messages: [
+      { id: 'old', receivedDateTime: '2026-09-29T11:59:59Z' },
+      { id: 'deleted', '@removed': { reason: 'deleted' } },
+      { id: 'boundary', receivedDateTime: '2026-09-29T12:00:00Z' },
+      { id: 'during-consent', receivedDateTime: '2026-09-29T12:01:00Z' },
+    ], deltaLink: 'next' });
+    await runMailboxSweep();
+    expect(vi.mocked(enqueueInboundEmail).mock.calls.map(([msg]) => msg.providerMessageId))
+      .toEqual(['boundary', 'during-consent']);
+    expect(vi.mocked(markRead).mock.calls.map((args) => args[2]))
+      .toEqual(['boundary', 'during-consent']);
+    expect(updateDeltaCursor).toHaveBeenCalledOnce();
+  });
+
+  it('reconciles from the same original floor after expiry instead of dropping the polling gap', async () => {
+    vi.mocked(listConnectedMailboxes).mockResolvedValueOnce([conn({ deltaLink: 'expired' })] as any)
+      .mockResolvedValueOnce([conn()] as any);
+    vi.mocked(listInboxDelta).mockRejectedValueOnce(Object.assign(new Error('expired'), { status: 410 }))
+      .mockResolvedValueOnce({ messages: [
+        { id: 'old', receivedDateTime: '2026-09-29T11:00:00Z' },
+        { id: 'gap', receivedDateTime: '2026-09-29T12:02:00Z' },
+      ], deltaLink: 'recovered' });
+    await runMailboxSweep();
+    await runMailboxSweep();
+    expect(resetDeltaCursor).toHaveBeenCalledOnce();
+    expect(enqueueInboundEmail).toHaveBeenCalledOnce();
+    expect(enqueueInboundEmail).toHaveBeenCalledWith(expect.objectContaining({ providerMessageId: 'gap' }), expect.anything());
+    expect(updateDeltaCursor).toHaveBeenCalledOnce();
+  });
+
+  it.each([undefined, 'invalid-date'])('does not silently consume a message with ambiguous receipt time (%s)', async (receivedDateTime) => {
+    vi.mocked(listConnectedMailboxes).mockResolvedValue([conn()] as any);
+    vi.mocked(listInboxDelta).mockResolvedValue({ messages: [{ id: 'ambiguous', receivedDateTime }], deltaLink: 'next' });
+    await runMailboxSweep();
+    expect(enqueueInboundEmail).not.toHaveBeenCalled();
+    expect(markRead).not.toHaveBeenCalled();
+    expect(updateDeltaCursor).not.toHaveBeenCalled();
+  });
+
   it('enqueues each new message, marks it read, then persists the new deltaLink', async () => {
     vi.mocked(listConnectedMailboxes).mockResolvedValue([conn()] as any);
-    vi.mocked(listInboxDelta).mockResolvedValue({ messages: [{ id: 'm1' }, { id: 'm2' }], deltaLink: 'delta-new' } as any);
+    vi.mocked(listInboxDelta).mockResolvedValue({ messages: [{ id: 'm1', receivedDateTime: '2026-09-29T12:01:00Z' }, { id: 'm2', receivedDateTime: '2026-09-29T12:01:00Z' }], deltaLink: 'delta-new' } as any);
 
     await runMailboxSweep();
 
@@ -125,7 +167,7 @@ describe('runMailboxSweep', () => {
 
   it('does not persist a cursor if enqueue throws (replay-safe)', async () => {
     vi.mocked(listConnectedMailboxes).mockResolvedValue([conn()] as any);
-    vi.mocked(listInboxDelta).mockResolvedValue({ messages: [{ id: 'm1' }], deltaLink: 'delta-new' } as any);
+    vi.mocked(listInboxDelta).mockResolvedValue({ messages: [{ id: 'm1', receivedDateTime: '2026-09-29T12:01:00Z' }], deltaLink: 'delta-new' } as any);
     vi.mocked(enqueueInboundEmail).mockRejectedValueOnce(new Error('redis down'));
 
     await runMailboxSweep();
@@ -172,7 +214,7 @@ describe('runMailboxSweep', () => {
     const sweep = runMailboxSweep();
     await vi.waitFor(() => expect(listInboxDelta).toHaveBeenCalledOnce());
     // A lifecycle disable rotates the connection generation before Graph returns.
-    releaseGraph({ messages: [{ id: 'stale-message' }], deltaLink: 'stale-delta' });
+    releaseGraph({ messages: [{ id: 'stale-message', receivedDateTime: '2026-09-29T12:01:00Z' }], deltaLink: 'stale-delta' });
     await sweep;
 
     expect(isConnectedMailboxSnapshotCurrent).toHaveBeenCalledWith(expect.objectContaining({
@@ -189,7 +231,7 @@ describe('runMailboxSweep', () => {
     const enqueuePaused = new Promise<void>((resolve) => { releaseEnqueue = resolve; });
     vi.mocked(listConnectedMailboxes).mockResolvedValue([conn()] as any);
     vi.mocked(listInboxDelta).mockResolvedValue({
-      messages: [{ id: 'm1' }, { id: 'm2' }],
+      messages: [{ id: 'm1', receivedDateTime: '2026-09-29T12:01:00Z' }, { id: 'm2', receivedDateTime: '2026-09-29T12:01:00Z' }],
       deltaLink: 'stale-delta',
     } as any);
     vi.mocked(enqueueInboundEmail).mockReturnValueOnce(enqueuePaused);

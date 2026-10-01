@@ -46,6 +46,18 @@ describe('unified administration onboarding', () => {
       expect(h.runtime.acquireToken).not.toHaveBeenCalled();
       expect(h.fetch).not.toHaveBeenCalled();
     });
+  it('labels a configured Exchange bridge honestly without a mailbox probe', async () => {
+    const h = setup();
+    store.load.mockResolvedValue({ id: client, orgId: org, tenantId: tenant, clientId: client, credentialVersion: 'cert-1', permissionManifestVersion: 'business-standard-v1', enabled: true, generation: 3, tenantName: 'Fixture', verifiedAt: null });
+    const worker = { dispatch: vi.fn() }; h.runtime.exchange.mockResolvedValue({ registry: {}, worker });
+    const result = await h.admin.status(request, false) as { capabilities: Array<{ id: string; status: string; message: string }> };
+    expect(result.capabilities.find(item => item.id === 'exchange')).toMatchObject({ status: 'configured', message: 'Exchange worker is configured. Mailbox panels verify access when opened.' });
+    expect(worker.dispatch).not.toHaveBeenCalled();
+    expect(h.fetch).not.toHaveBeenCalled();
+    h.runtime.exchange.mockResolvedValue(null);
+    const absent = await h.admin.status(request, false) as { capabilities: Array<{ id: string; status: string }> };
+    expect(absent.capabilities.find(item => item.id === 'exchange')?.status).toBe('unavailable');
+  });
   it('starts tenant discovery with one consent using encrypted PKCE state and server configuration', async () => {
     const h = setup();
     const result = await h.admin.start(request, { version: null }) as { authorizationUrl: string };
@@ -130,6 +142,43 @@ describe('unified administration onboarding', () => {
     store.disable.mockResolvedValue(true);
     await expect(h.admin.disconnect(request, { version: 3 })).resolves.toEqual({ success: true });
     expect(registry.revoke).toHaveBeenCalledWith(org);
+  });
+  it('routes trace reads through the full administration adapter without the UI discriminator', async () => {
+    const h = setup();
+    store.load.mockResolvedValue({ id: client, orgId: org, tenantId: tenant, clientId: client, credentialVersion: 'cert-1', permissionManifestVersion: 'business-standard-v1', enabled: true, generation: 3, tenantName: 'Fixture', verifiedAt: null });
+    const end = new Date(Date.now() - 60000).toISOString(), start = new Date(Date.now() - 86400000).toISOString();
+    const messageTraceId = '12345678-1234-4abc-f123-123456789abc', recipient = 'qa@example.com';
+    const registry = { provision: vi.fn(async () => {}), revoke: vi.fn(async () => {}) };
+    const worker = { dispatch: vi.fn(async value => ({ requestId: value.requestId, ok: true, data: value.operation === 'trace.search'
+      ? { rows: [{ messageTraceId, recipient, received: end, sender: 'sender@example.com', subject: 'QA', status: 'Delivered' }], next: null, partial: false, checkedAt: end }
+      : { messageTraceId, recipient, events: [], partial: false } })) };
+    h.runtime.exchange.mockResolvedValue({ registry, worker });
+    const parameters = { start, end, sender: null, recipient: null, status: null, cursor: null };
+    await expect(h.admin.execute(request, { type: 'trace.search', ...parameters })).resolves.toMatchObject({ rows: [{ messageTraceId }] });
+    expect(worker.dispatch).toHaveBeenCalledWith(expect.objectContaining({ operation: 'trace.search', parameters }));
+    await expect(h.admin.execute(request, { type: 'trace.detail', messageTraceId, recipient })).resolves.toMatchObject({ messageTraceId, events: [] });
+    expect(worker.dispatch).toHaveBeenLastCalledWith(expect.objectContaining({ operation: 'trace.detail', parameters: { messageTraceId, recipient } }));
+  });
+  it.each(['mailbox.forwarding.set', 'mailbox.autoreply.set', 'mailbox.primary.set', 'mailbox.alias.add', 'mailbox.alias.remove', 'mailbox.delegation.set'])('dispatches %s through the full adapter without UI-only fields', async type => {
+    const h = setup();
+    store.load.mockResolvedValue({ id: client, orgId: org, tenantId: tenant, clientId: client, credentialVersion: 'cert-1', permissionManifestVersion: 'business-standard-v1', enabled: true, generation: 3, tenantName: 'Fixture', verifiedAt: null });
+    const mailboxId = '66666666-6666-4666-8666-666666666666', delegateId = '77777777-7777-4777-8777-777777777777';
+    const parameters = type === 'mailbox.forwarding.set' ? { mailboxId, smtpAddress: null, keepCopy: false }
+      : type === 'mailbox.autoreply.set' ? { mailboxId, state: 'Disabled', message: 'Internal', externalMessage: 'External', externalAudience: 'Known', start: null, end: null }
+      : type === 'mailbox.delegation.set' ? { mailboxId, delegateId, right: 'SendAs', enabled: false }
+      : { mailboxId, address: 'alias@example.com' };
+    const state = type === 'mailbox.forwarding.set' ? { mailboxId, smtpAddress: null, keepCopy: false, internalRecipient: null }
+      : type === 'mailbox.autoreply.set' ? { mailboxId, state: 'Disabled', internalMessage: 'Internal', externalMessage: 'External', externalAudience: 'Known', start: null, end: null }
+      : type === 'mailbox.delegation.set' ? { mailboxId, delegateId, delegateAddress: 'delegate@example.com', fullAccess: false, sendAs: false, sendOnBehalf: false }
+      : { mailboxId, primarySmtpAddress: 'mailbox@example.com', aliases: ['alias@example.com'], policyEnabled: false };
+    const registry = { provision: vi.fn(async () => {}), revoke: vi.fn(async () => {}) };
+    const worker = { dispatch: vi.fn(async value => ({ requestId: value.requestId, ok: true, data: { ...state, accepted: true, verified: true } })) };
+    h.runtime.exchange.mockResolvedValue({ registry, worker });
+    await expect(h.admin.execute(request, { type, ...parameters, command: 'Injected' })).rejects.toBeDefined();
+    expect(worker.dispatch).not.toHaveBeenCalled();
+    await expect(h.admin.execute(request, { type, ...parameters })).resolves.toMatchObject({ verified: true });
+    expect(worker.dispatch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ operation: type, parameters }));
+    expect(h.fetch).not.toHaveBeenCalled();
   });
   it('routes only a strict distribution-create payload to the bound Exchange worker', async () => {
     const h = setup();

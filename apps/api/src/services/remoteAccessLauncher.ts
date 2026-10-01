@@ -79,7 +79,7 @@ function selectRemoteAccessProvider(
 // single source of truth for the pre-decrypt checks so availability and
 // issuance can't drift apart on skip-reason vocabulary.
 function evaluateRemoteAccessLaunchAvailability(
-  device: { customFields?: Record<string, unknown> | null },
+  device: { customFields?: Record<string, unknown> | null; enrolledRustDeskId?: string | null },
   remoteAccess: InheritableRemoteAccessSettings | undefined | null,
   preferredProviderId?: string | null,
 ): { provider: RemoteAccessProvider | null; idValue: string | null; skipReason: RemoteAccessLaunchSkipReason | null } {
@@ -93,7 +93,8 @@ function evaluateRemoteAccessLaunchAvailability(
 
   // Number/Boolean custom fields are stored as JSON primitives (#6191);
   // coerce them so a populated numeric identifier isn't treated as missing.
-  const raw = device.customFields?.[provider.customFieldKey];
+  const raw = /^rustdesk:\/\//i.test(provider.urlTemplate) && device.enrolledRustDeskId
+    ? device.enrolledRustDeskId : device.customFields?.[provider.customFieldKey];
   const idValue =
     typeof raw === 'string'
       ? raw
@@ -117,7 +118,7 @@ function evaluateRemoteAccessLaunchAvailability(
 // "should the Connect Desktop button render" without touching credentials.
 // See issue #3402.
 export function checkRemoteAccessLaunchAvailability(
-  device: { customFields?: Record<string, unknown> | null },
+  device: { customFields?: Record<string, unknown> | null; enrolledRustDeskId?: string | null },
   remoteAccess: InheritableRemoteAccessSettings | undefined | null,
   preferredProviderId?: string | null,
 ): RemoteAccessLaunchAvailability {
@@ -145,7 +146,7 @@ export function checkRemoteAccessLaunchAvailability(
 //   urlTemplate 'https://acme.screenconnect.com/Host#Access///{id}/Join'
 //     → 'https://acme.screenconnect.com/Host#Access///294064193/Join'
 export function buildRemoteAccessLaunchUrl(
-  device: { customFields?: Record<string, unknown> | null },
+  device: { customFields?: Record<string, unknown> | null; enrolledRustDeskId?: string | null },
   remoteAccess: InheritableRemoteAccessSettings | undefined | null,
 ): string | null {
   return resolveRemoteAccessLaunch(device, remoteAccess).launchUrl;
@@ -157,7 +158,7 @@ export function buildRemoteAccessLaunchUrl(
 // security event: the partner template was tampered to resolve to a
 // disallowed scheme only after substitution).
 export function resolveRemoteAccessLaunch(
-  device: { customFields?: Record<string, unknown> | null },
+  device: { customFields?: Record<string, unknown> | null; enrolledRustDeskId?: string | null },
   remoteAccess: InheritableRemoteAccessSettings | undefined | null,
   // A technician's own preferred provider (users.preferences.remoteAccessProviderId).
   // Deliberately an ID and nothing else: it SELECTS from the tenant's configured

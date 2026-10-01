@@ -1,3 +1,5 @@
+import { quarantineLookupParameters, quarantineReleaseParameters } from './exchange-contract';
+import { exchangeTraceIdSchema } from './exchange-contract';
 import { createHash, randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import type { ExtensionRuntimeContext } from '@breeze/extension-sdk';
@@ -66,7 +68,7 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
     smtpAddress: z.string().email().max(320).nullable(), keepCopy: z.boolean() }).strict();
   const autoReplyGet = z.object({ type: z.literal('mailbox.autoreply.get'), mailboxId: uuid }).strict();
   const autoReplySet = z.object({ type: z.literal('mailbox.autoreply.set'), mailboxId: uuid, state: z.enum(['Disabled', 'Enabled', 'Scheduled']),
-    message: z.string().max(8192), start: z.string().datetime({ offset: true }).nullable(), end: z.string().datetime({ offset: true }).nullable() }).strict();
+    message: z.string().max(8192), externalMessage: z.string().max(8192).optional(), externalAudience: z.enum(['None', 'Known', 'All']).optional(), start: z.string().datetime({ offset: true }).nullable(), end: z.string().datetime({ offset: true }).nullable() }).strict();
   const addressesGet = z.object({ type: z.literal('mailbox.addresses.get'), mailboxId: uuid }).strict();
   const primarySet = z.object({ type: z.literal('mailbox.primary.set'), mailboxId: uuid, address: z.string().email().max(320) }).strict();
   const aliasAdd = z.object({ type: z.literal('mailbox.alias.add'), mailboxId: uuid, address: z.string().email().max(320) }).strict();
@@ -86,13 +88,14 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
   const groupExternalSet = z.object({ type: z.literal('group.external.set'), groupId: uuid, allowExternalSenders: z.boolean() }).strict();
   const distributionNameSet = z.object({ type: z.literal('distribution.name.set'), groupId: uuid,
     displayName: z.string().trim().min(1).max(256) }).strict();
+  const groupAliasWrite = z.object({ type: z.enum(['group.alias.add', 'group.alias.remove']), groupId: uuid, address: z.string().trim().email().max(320) }).strict();
   const groupPrimarySet = z.object({ type: z.literal('group.primary.set'), groupId: uuid,
     address: z.string().trim().email().max(320) }).strict();
   const traceCursor = z.object({ received: z.string().datetime({ offset: true }), recipient: z.string().email().max(320) }).strict();
   const traceSearch = z.object({ type: z.literal('trace.search'), start: z.string().datetime({ offset: true }), end: z.string().datetime({ offset: true }),
     sender: z.string().email().max(320).nullable(), recipient: z.string().email().max(320).nullable(),
     status: z.enum(['Delivered', 'Expanded', 'Failed', 'FilteredAsSpam', 'GettingStatus', 'Pending', 'Quarantined']).nullable(), cursor: traceCursor.nullable() }).strict();
-  const traceDetail = z.object({ type: z.literal('trace.detail'), messageTraceId: uuid, recipient: z.string().email().max(320) }).strict();
+  const traceDetail = z.object({ type: z.literal('trace.detail'), messageTraceId: exchangeTraceIdSchema, recipient: z.string().email().max(320) }).strict();
   async function exchangeService() {
     const bridge = await runtime.exchange?.();
     if (!bridge) throw new AdministrationSetupError('exchange_unavailable');
@@ -167,7 +170,7 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
           capabilities: [
             { id: 'inventory', label: 'Directory inventory', status: connection.enabled ? 'ready' : 'pending', message: verified ? 'Tenant and application permissions verified.' : undefined },
             { id: 'administration', label: 'User and group administration', status: connection.enabled ? 'ready' : 'pending' },
-            { id: 'exchange', label: 'Exchange administration', status: 'pending', message: exchangeReady ? 'Worker configured; mailbox inventory requires a successful provider check.' : 'Exchange worker is not configured in this host.' },
+            { id: 'exchange', label: 'Exchange administration', status: exchangeReady ? 'configured' : 'unavailable', message: exchangeReady ? 'Exchange worker is configured. Mailbox panels verify access when opened.' : 'Exchange worker is not configured in this host.' },
             { id: 'collaboration', label: 'Teams, SharePoint and OneDrive', status: 'pending', message: 'Teams and SharePoint remain pending. OneDrive usage uses this enterprise app when Reports.Read.All is granted; verify its report response in the directory.' },
             { id: 'content-search', label: 'Basic content search and export', status: 'pending', message: 'Search and export API support is still being validated.' },
           ] };
@@ -233,23 +236,35 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
         const readForwarding = forwardingGet.safeParse(input);
         if (readForwarding.success) return (await exchangeService()).forwardingGet(request, request.orgId, readForwarding.data.mailboxId);
         const saveForwarding = forwardingSet.safeParse(input);
-        if (saveForwarding.success) return (await exchangeService()).forwardingSet(request, request.orgId, saveForwarding.data);
+        if (saveForwarding.success) {
+          const { type: _type, ...parameters } = saveForwarding.data;
+          return (await exchangeService()).forwardingSet(request, request.orgId, parameters);
+        }
         const readAutoReply = autoReplyGet.safeParse(input);
         if (readAutoReply.success) return (await exchangeService()).autoReplyGet(request, request.orgId, readAutoReply.data.mailboxId);
         const saveAutoReply = autoReplySet.safeParse(input);
-        if (saveAutoReply.success) return (await exchangeService()).autoReplySet(request, request.orgId, saveAutoReply.data);
+        if (saveAutoReply.success) {
+          const { type: _type, ...parameters } = saveAutoReply.data;
+          return (await exchangeService()).autoReplySet(request, request.orgId, parameters);
+        }
         const readAddresses = addressesGet.safeParse(input);
         if (readAddresses.success) return (await exchangeService()).addressesGet(request, request.orgId, readAddresses.data.mailboxId);
         for (const schema of [primarySet, aliasAdd, aliasRemove] as const) {
           const parsed = schema.safeParse(input);
-          if (parsed.success) return (await exchangeService()).addressWrite(request, request.orgId, parsed.data.type, parsed.data);
+          if (parsed.success) {
+            const { type, ...parameters } = parsed.data;
+            return (await exchangeService()).addressWrite(request, request.orgId, type, parameters);
+          }
         }
         const readDelegation = delegationGet.safeParse(input);
         if (readDelegation.success) return (await exchangeService()).delegationGet(request, request.orgId, readDelegation.data.mailboxId, readDelegation.data.delegateId);
         const listDelegation = delegationList.safeParse(input);
         if (listDelegation.success) return (await exchangeService()).delegationList(request, request.orgId, listDelegation.data.mailboxId);
         const saveDelegation = delegationSet.safeParse(input);
-        if (saveDelegation.success) return (await exchangeService()).delegationSet(request, request.orgId, saveDelegation.data);
+        if (saveDelegation.success) {
+          const { type: _type, ...parameters } = saveDelegation.data;
+          return (await exchangeService()).delegationSet(request, request.orgId, parameters);
+        }
         const createDistribution = distributionCreate.safeParse(input);
         if (createDistribution.success) return (await exchangeService()).distributionCreate(request, request.orgId,
           { name: createDistribution.data.name, primarySmtpAddress: createDistribution.data.primarySmtpAddress });
@@ -269,19 +284,31 @@ export function createAdministrationServices(context: ExtensionRuntimeContext, f
         const saveDistributionName = distributionNameSet.safeParse(input);
         if (saveDistributionName.success) return (await exchangeService()).distributionNameSet(request, request.orgId,
           { groupId: saveDistributionName.data.groupId, displayName: saveDistributionName.data.displayName });
+        const writeGroupAlias = groupAliasWrite.safeParse(input);
+        if (writeGroupAlias.success) return (await exchangeService()).groupAliasWrite(request, request.orgId, {groupId: writeGroupAlias.data.groupId, address: writeGroupAlias.data.address}, writeGroupAlias.data.type);
         const saveGroupPrimary = groupPrimarySet.safeParse(input);
         if (saveGroupPrimary.success) return (await exchangeService()).groupPrimarySet(request, request.orgId,
           { groupId: saveGroupPrimary.data.groupId, address: saveGroupPrimary.data.address });
         if (saveDistributionMember.success) return (await exchangeService()).distributionMemberSet(request, request.orgId,
           { groupId: saveDistributionMember.data.groupId, memberId: saveDistributionMember.data.memberId,
             enabled: saveDistributionMember.data.enabled });
+        const lookupQuarantine = quarantineLookupParameters.extend({ type: z.literal('quarantine.lookup') }).strict().safeParse(input);
+        const releaseQuarantine = quarantineReleaseParameters.extend({ type: z.literal('quarantine.release.set') }).strict().safeParse(input);
+        if (lookupQuarantine.success || releaseQuarantine.success) {
+          const { type: _type, ...parameters } = releaseQuarantine.success ? releaseQuarantine.data : lookupQuarantine.data!;
+          return (await exchangeService()).quarantine(request, request.orgId, parameters, releaseQuarantine.success);
+        }
         const searchTrace = traceSearch.safeParse(input);
-        if (searchTrace.success) return (await exchangeService()).traceSearch(request, request.orgId, searchTrace.data);
+        if (searchTrace.success) {
+          const { type: _type, ...parameters } = searchTrace.data;
+          return (await exchangeService()).traceSearch(request, request.orgId, parameters);
+        }
         const detailTrace = traceDetail.safeParse(input);
-        if (detailTrace.success) return (await exchangeService()).traceDetail(request, request.orgId, detailTrace.data);
+        if (detailTrace.success) return (await exchangeService()).traceDetail(request, request.orgId,
+          { messageTraceId: detailTrace.data.messageTraceId, recipient: detailTrace.data.recipient });
         if (typeof input === 'object' && input !== null && 'type' in input &&
           typeof input.type === 'string' && (input.type.startsWith('mailbox.statistics.') || input.type.startsWith('mailbox.forwarding.') || input.type.startsWith('mailbox.autoreply.') ||
-            input.type.startsWith('mailbox.addresses.') || input.type.startsWith('mailbox.primary.') || input.type.startsWith('mailbox.alias.') || input.type.startsWith('mailbox.delegation.') || input.type.startsWith('distribution.') || input.type.startsWith('group.settings.') || input.type.startsWith('group.external.') || input.type.startsWith('group.primary.') || input.type.startsWith('shared.') || input.type.startsWith('trace.')))
+            input.type.startsWith('mailbox.addresses.') || input.type.startsWith('mailbox.primary.') || input.type.startsWith('mailbox.alias.') || input.type.startsWith('mailbox.delegation.') || input.type.startsWith('distribution.') || input.type.startsWith('group.settings.') || input.type.startsWith('group.external.') || input.type.startsWith('group.primary.') || input.type.startsWith('group.alias.') || input.type.startsWith('shared.') || input.type.startsWith('trace.') || input.type.startsWith('quarantine.')))
           throw new AdministrationSetupError('invalid_operation');
         return execute(request, request.orgId, input);
       },

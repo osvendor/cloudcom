@@ -539,7 +539,7 @@ describe('ticket mailbox connection service', () => {
     ]);
     expect(Object.keys(dbMocks.selectedFields[0] ?? {})).toEqual([
       'id', 'partnerId', 'tenantId', 'mailboxAddress', 'deltaLink',
-      'consentAttemptId',
+      'consentAttemptId', 'createdAt',
     ]);
     expect(contextMocks.runOutside).toHaveBeenCalledOnce();
     expect(contextMocks.withSystem).toHaveBeenCalledOnce();

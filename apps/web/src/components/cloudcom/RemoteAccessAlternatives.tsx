@@ -130,6 +130,21 @@ export default function RemoteAccessAlternatives({ deviceId }: Props) {
         showToast({ type: 'error', message: 'The remote tool returned an unsafe launch address.' });
         return;
       }
+      if (/^rustdesk:\/\//i.test(result.launchUrl)) {
+        const managed = await fetchWithAuth(`/staff-native/launch/${deviceId}`, { method: 'POST' });
+        if (!mountedRef.current || deviceGeneration !== deviceGenerationRef.current) { popup?.close(); return; }
+        if (managed.status !== 404) {
+          const handoff = await runAction<{ launchUrl: string }>({ request: async () => managed,
+            errorFallback: 'Managed remote access is unavailable.',
+            parseSuccess: data => data as { launchUrl: string } });
+          if (!mountedRef.current || deviceGeneration !== deviceGenerationRef.current) { popup?.close(); return; }
+          if (handoff.launchUrl !== `cloudcom-remote://staff/connect/${deviceId}`) throw new Error('Invalid managed connection response.');
+          popup?.close();
+          launchCustomScheme(handoff.launchUrl);
+          showToast({ type: 'success', message: 'Continue in OS Consultants Remote Access. Sign in as staff and select Connect for the requested computer.' });
+          return;
+        }
+      }
       if (/^https?:\/\//i.test(result.launchUrl)) {
         if (!popup) {
           showToast({ type: 'error', message: 'Your browser blocked the remote-tool window. Allow popups and try again.' });

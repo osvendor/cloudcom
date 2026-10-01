@@ -544,6 +544,20 @@ describe('M365 mailbox lifecycle routes', () => {
     expect(JSON.stringify(mocks.writeAuditEvent.mock.calls)).not.toContain('platform-client-secret');
   });
 
+  it('keeps identity verification and tenant binding when the platform uses the Cloud Command certificate', async () => {
+    mocks.platformConfig.mockResolvedValueOnce({ clientId: 'cloud-command-app', credentialVersion: 'cert-1' });
+    const state = 'identity-state';
+    const response = await app.request(`/callback?state=${state}&code=authorization-code`, {
+      headers: { cookie: `ticket_mailbox_oauth_state=${cookieFor('identity_verification', state)}` },
+    });
+    expect(response.headers.get('location')).toContain('ticketMailbox=connected');
+    expect(mocks.exchangeMicrosoftAuthorizationCode).toHaveBeenCalledWith(expect.objectContaining({ clientId: 'cloud-command-app', credentialVersion: 'cert-1', codeVerifier: 'stored-code-verifier' }));
+    expect(mocks.exchangeMicrosoftAuthorizationCode.mock.calls[0]![0]).not.toHaveProperty('clientSecret');
+    expect(mocks.verifyMicrosoftAdminIdToken).toHaveBeenCalledWith('verified-id-token', { tenantHint: TENANT_ID, clientId: 'cloud-command-app', nonce: 'stored-nonce' });
+    expect(mocks.probeMailbox).toHaveBeenCalledWith(TENANT_ID, 'support@example.com');
+    expect(mocks.bindVerifiedTenant).toHaveBeenCalledTimes(1);
+  });
+
   it('cannot bind a completed callback after a newer connect attempt replaced its generation', async () => {
     mocks.bindVerifiedTenant.mockRejectedValue(new Error('Pending mailbox connection attempt is stale'));
     mocks.markPendingConsentFailed.mockResolvedValue(false);

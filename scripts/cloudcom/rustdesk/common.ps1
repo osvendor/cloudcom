@@ -19,6 +19,23 @@ function Test-CloudComRustDeskServicePath {
     return $PathName -match ('(?i)^"?' + [regex]::Escape($Exe) + '"?\s+--service\s*$')
 }
 
+function Test-CloudComRustDeskFirewall {
+    param([string]$Executable)
+    # Read the effective policy, not only locally configured rules. Fixed DHCP
+    # addresses are deliberately insufficient for durable local direct access.
+    $rules = @(Get-NetFirewallApplicationFilter -PolicyStore ActiveStore -ErrorAction Stop |
+        Where-Object { $_.Program -ieq $Executable } | Get-NetFirewallRule |
+        Where-Object { $_.Enabled -eq 'True' -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow' -and $_.Profile -eq 'Any' })
+    foreach ($rule in $rules) {
+        $address = $rule | Get-NetFirewallAddressFilter
+        $port = $rule | Get-NetFirewallPortFilter
+        if (@($address.RemoteAddress).Count -eq 1 -and @($address.RemoteAddress)[0] -in @('Any','LocalSubnet') -and
+            @($address.LocalAddress) -contains 'Any' -and $port.Protocol -in @('Any','TCP','6') -and
+            @($port.LocalPort) -contains 'Any' -and @($port.RemotePort) -contains 'Any') { return $true }
+    }
+    return $false
+}
+
 function Test-CloudComPrivatePath {
     param([string]$Path)
     if (!(Test-Path -LiteralPath $Path)) { return $false }

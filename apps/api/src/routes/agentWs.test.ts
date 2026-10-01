@@ -2377,6 +2377,26 @@ describe('agent websocket command results', () => {
     warnSpy.mockRestore();
   });
 
+  it('drops a burst of late output after terminal removal without suspending the agent', async () => {
+    __resetCrossTenantDropsForTest();
+    const handlers = createAgentWsHandlers('agent-late-output', {
+      deviceId: 'device-123', orgId: 'org-123', partnerId: 'partner-123',
+    });
+    const ws = wsMock();
+    await connectAgentSocket(handlers, ws);
+    vi.mocked(getActiveTerminalSession).mockReturnValue(undefined);
+    vi.mocked(handleTerminalOutput).mockClear();
+    vi.mocked(db.update).mockClear();
+    for (let i = 0; i < 20; i++) {
+      await handlers.onMessage({ data: JSON.stringify({
+        type: 'terminal_output', sessionId: '7bc25e73-7c7b-4587-a085-f75e1dd2a474', data: 'late output',
+      }) } as any, ws as any);
+    }
+    expect(handleTerminalOutput).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+    expect(ws.close).not.toHaveBeenCalled();
+  });
+
   // M-D1: 10 cross-tenant drops within 5 min triggers warn
   it('emits cross-tenant probe warning after threshold drops (M-D1)', async () => {
     __resetCrossTenantDropsForTest();

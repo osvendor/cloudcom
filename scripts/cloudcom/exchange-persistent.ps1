@@ -148,7 +148,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     $requestId = [string]$request.requestId
     if ($request.operation -notin @('mailbox.inventory','mailbox.statistics.get','mailbox.preservation.get','mailbox.convert.shared','mailbox.forwarding.get','mailbox.forwarding.set','mailbox.autoreply.get','mailbox.autoreply.set',
       'mailbox.addresses.get','mailbox.primary.set','mailbox.alias.add','mailbox.alias.remove',
-      'mailbox.delegation.get','mailbox.delegation.list','mailbox.delegation.set','distribution.create','shared.create','distribution.member.set','distribution.members.get','group.settings.get','group.external.set','distribution.name.set','group.primary.set','trace.search','trace.detail')) { throw 'invalid request' }
+      'mailbox.delegation.get','mailbox.delegation.list','mailbox.delegation.set','distribution.create','shared.create','distribution.member.set','distribution.members.get','group.settings.get','group.external.set','distribution.name.set','group.primary.set','group.alias.add','group.alias.remove','trace.search','trace.detail','quarantine.lookup','quarantine.release.set')) { throw 'invalid request' }
     if ($request.operation -eq 'mailbox.inventory') {
       if ($request.parameters.Keys.Count -notin @(1,2) -or -not $request.parameters.ContainsKey('pageSize') -or
         ($request.parameters.Keys.Count -eq 2 -and -not $request.parameters.ContainsKey('cursor'))) { throw 'invalid request' }
@@ -174,7 +174,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
       if ($p.Keys.Count -ne 2 -or -not $p.ContainsKey('groupId') -or -not $p.ContainsKey('displayName') -or
         [string]$p.groupId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or
         ([string]$p.displayName).Trim().Length -lt 1 -or ([string]$p.displayName).Trim().Length -gt 256) { throw 'invalid request' }
-    } elseif ($request.operation -eq 'group.primary.set') {
+    } elseif ($request.operation -in @('group.primary.set','group.alias.add','group.alias.remove')) {
       $p = $request.parameters
       if ($p.Keys.Count -ne 2 -or -not $p.ContainsKey('groupId') -or -not $p.ContainsKey('address') -or
         [string]$p.groupId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or
@@ -186,12 +186,12 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         [string]$p.groupId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or
         [string]$p.memberId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or
         [string]$p.groupId -ieq [string]$p.memberId) { throw 'invalid request' }
-    } elseif ($request.operation -notin @('trace.search','trace.detail')) {
+    } elseif ($request.operation -notin @('trace.search','trace.detail','quarantine.lookup','quarantine.release.set')) {
       $mailboxId = [string]$request.parameters.mailboxId
       if ($mailboxId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') { throw 'invalid request' }
       if ($request.operation -eq 'mailbox.convert.shared' -and ($request.parameters.Keys.Count -ne 1 -or -not $request.parameters.ContainsKey('mailboxId'))) { throw 'invalid request' }
       if ($request.operation -eq 'mailbox.forwarding.set' -and ($request.parameters.Keys.Count -ne 3 -or -not $request.parameters.ContainsKey('smtpAddress') -or -not $request.parameters.ContainsKey('keepCopy'))) { throw 'invalid request' }
-      if ($request.operation -eq 'mailbox.autoreply.set' -and ($request.parameters.Keys.Count -ne 5 -or -not $request.parameters.ContainsKey('state') -or -not $request.parameters.ContainsKey('message') -or -not $request.parameters.ContainsKey('start') -or -not $request.parameters.ContainsKey('end'))) { throw 'invalid request' }
+      if ($request.operation -eq 'mailbox.autoreply.set' -and (@($request.parameters.Keys | Where-Object { $_ -notin @('mailboxId','state','message','start','end','externalMessage','externalAudience') }).Count -gt 0 -or -not $request.parameters.ContainsKey('state') -or -not $request.parameters.ContainsKey('message') -or -not $request.parameters.ContainsKey('start') -or -not $request.parameters.ContainsKey('end'))) { throw 'invalid request' }
       if ($request.operation -in @('mailbox.primary.set','mailbox.alias.add','mailbox.alias.remove') -and ($request.parameters.Keys.Count -ne 2 -or -not $request.parameters.ContainsKey('address'))) { throw 'invalid request' }
       if ($request.operation -eq 'mailbox.delegation.get' -and ($request.parameters.Keys.Count -ne 2 -or -not $request.parameters.ContainsKey('delegateId'))) { throw 'invalid request' }
       if ($request.operation -eq 'mailbox.delegation.list' -and ($request.parameters.Keys.Count -ne 1 -or -not $request.parameters.ContainsKey('mailboxId'))) { throw 'invalid request' }
@@ -231,6 +231,48 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
       }
       Send-Forwarding $requestId @{ accepted = $true; verified = $true; id = $objectId;
         primarySmtpAddress = [string]$created.PrimarySmtpAddress }
+      continue
+    }
+    if ($request.operation -in @('group.alias.add','group.alias.remove')) {
+      $groupId = [string]$request.parameters.groupId
+      $address = ([string]$request.parameters.address).Trim().ToLowerInvariant()
+      $recipient = Get-EXORecipient -ExternalDirectoryObjectId $groupId -ErrorAction Stop
+      if (-not $recipient -or [string]$recipient.ExternalDirectoryObjectId -ine $groupId -or
+        [string]$recipient.RecipientTypeDetails -notin @('MailUniversalDistributionGroup','GroupMailbox')) { throw 'group identity mismatch' }
+      $primary = [string]$recipient.PrimarySmtpAddress
+      $unified = [string]$recipient.RecipientTypeDetails -eq 'GroupMailbox'
+      $group = $(if ($unified) { Get-UnifiedGroup -Identity $primary -ErrorAction Stop } else { Get-DistributionGroup -Identity $primary -ErrorAction Stop })
+      if (-not $group -or [string]$group.ExternalDirectoryObjectId -ine $groupId -or [string]$group.PrimarySmtpAddress -ine $primary -or
+        [string]$group.RecipientTypeDetails -ne [string]$recipient.RecipientTypeDetails) { throw 'group identity mismatch' }
+      if ($group.IsDirSynced -isnot [bool] -or $group.IsDirSynced) { throw 'group synchronization state prevents edit' }
+      if (-not $unified -and ($group.EmailAddressPolicyEnabled -isnot [bool] -or $group.EmailAddressPolicyEnabled)) { throw 'group address controlled by policy' }
+      $before = @($group.EmailAddresses | ForEach-Object { [string]$_ })
+      if ($before.Count -gt 501 -or "SMTP:$primary" -notin $before) { throw 'group aliases unavailable' }
+      $add = $request.operation -eq 'group.alias.add'
+      if (-not $add -and $address -ieq $primary) { throw 'cannot remove primary address' }
+      # Preserve Microsoft routing addresses; only optional customer aliases are removable.
+      if (-not $add -and $address -match '\.onmicrosoft\.com$') { throw 'cannot remove routing address' }
+      $present = "smtp:$address" -in $before
+      if ($add -and -not $present) {
+        $domain = $address.Split('@')[-1]
+        $acceptedDomain = Get-AcceptedDomain -Identity $domain -ErrorAction Stop
+        if (-not $acceptedDomain -or [string]$acceptedDomain.DomainName -ine $domain) { throw 'group address domain is not accepted' }
+        $collision = Get-Recipient -Identity $address -ErrorAction SilentlyContinue
+        if ($collision -and [string]$collision.ExternalDirectoryObjectId -ine $groupId) { throw 'group address already assigned' }
+      }
+      $changed = $add -ne $present
+      if ($changed) {
+        $delta = $(if ($add) { @{ Add = "smtp:$address" } } else { @{ Remove = "smtp:$address" } })
+        $writeDispatched = $true
+        if ($unified) { Set-UnifiedGroup -Identity $primary -EmailAddresses $delta -ErrorAction Stop | Out-Null }
+        else { Set-DistributionGroup -Identity $primary -EmailAddresses $delta -ErrorAction Stop | Out-Null }
+        $group = $(if ($unified) { Get-UnifiedGroup -Identity $primary -ErrorAction Stop } else { Get-DistributionGroup -Identity $primary -ErrorAction Stop })
+      }
+      $after = @($group.EmailAddresses | ForEach-Object { [string]$_ })
+      $expected = @($before | Where-Object { $add -or $_ -ine "smtp:$address" })
+      if (-not $group -or [string]$group.ExternalDirectoryObjectId -ine $groupId -or [string]$group.PrimarySmtpAddress -ine $primary -or
+        (("smtp:$address" -in $after) -ne $add) -or @($expected | Where-Object { $_ -notin $after }).Count -gt 0) { throw 'group alias readback mismatch' }
+      Send-Forwarding $requestId @{ groupId = $groupId.ToLowerInvariant(); primarySmtpAddress = [string]$group.PrimarySmtpAddress; accepted = $true; verified = $true; changed = [bool]$changed }
       continue
     }
     if ($request.operation -eq 'group.primary.set') {
@@ -397,6 +439,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
       $group = Get-DistributionGroup -Identity $groupAddress -ErrorAction Stop
       if (-not $group -or [string]$group.ExternalDirectoryObjectId -ine $groupId -or
         [string]$group.RecipientTypeDetails -ne 'MailUniversalDistributionGroup') { throw 'distribution identity mismatch' }
+      if ($group.IsDirSynced -isnot [bool] -or $group.IsDirSynced) { throw 'group synchronization state prevents edit' }
       $memberRecipient = Get-EXORecipient -ExternalDirectoryObjectId $memberId -ErrorAction Stop
       if (-not $memberRecipient -or [string]$memberRecipient.ExternalDirectoryObjectId -ine $memberId -or
         [string]$memberRecipient.RecipientTypeDetails -notin @('UserMailbox','SharedMailbox')) { throw 'member identity mismatch' }
@@ -417,6 +460,60 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
       if ($present -ne $enabled) { throw 'member readback mismatch' }
       Send-Forwarding $requestId @{ groupId = $groupId.ToLowerInvariant(); memberId = $memberId.ToLowerInvariant();
         enabled = $enabled; accepted = $true; verified = $true; changed = [bool]$changed }
+      continue
+    }
+    if ($request.operation -in @('quarantine.lookup','quarantine.release.set')) {
+      $p = $request.parameters
+      $release = $request.operation -eq 'quarantine.release.set'
+      $expected = @('messageTraceId','recipient','received'); if ($release) { $expected += 'identity' }
+      if ($p.Keys.Count -ne $expected.Count -or @($p.Keys | Where-Object { $_ -notin $expected }).Count -gt 0 -or
+          [string]$p.messageTraceId -notmatch '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or
+          [string]$p.recipient -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { throw 'invalid quarantine request' }
+      $at = ([DateTimeOffset]$p.received).ToUniversalTime()
+      if ($at -lt [DateTimeOffset]::UtcNow.AddDays(-90) -or $at -gt [DateTimeOffset]::UtcNow.AddMinutes(5)) { throw 'invalid quarantine date' }
+      $identityPattern = '^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\\[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
+      if ($release -and [string]$p.identity -notmatch $identityPattern) { throw 'invalid quarantine identity' }
+      # Resolve the Internet Message-ID from the bound trace, never substitute a trace GUID.
+      $traceRows = @(Get-MessageTraceV2 -MessageTraceId ([guid]$p.messageTraceId) -RecipientAddress ([string]$p.recipient) -StartDate $at.AddHours(-1).UtcDateTime -EndDate $at.AddHours(1).UtcDateTime -ResultSize 100 -ErrorAction Stop |
+        Where-Object { [string]$_.MessageTraceId -ieq [string]$p.messageTraceId -and [string]$_.RecipientAddress -ieq [string]$p.recipient -and
+          [Math]::Abs(([DateTimeOffset]::Parse([string]$_.Received).ToUniversalTime() - $at).TotalSeconds) -lt 1 })
+      if ($traceRows.Count -ne 1 -or -not $traceRows[0].MessageId) { throw 'trace identity not uniquely resolved' }
+      $messageId = [string]$traceRows[0].MessageId
+      if ($messageId.Length -gt 998 -or $messageId -match '[\r\n]') { throw 'invalid message identity' }
+      if (-not (Get-Command Get-QuarantineMessage -ErrorAction SilentlyContinue) -or ($release -and -not (Get-Command Release-QuarantineMessage -ErrorAction SilentlyContinue))) { Send-Failure $requestId 'provider_access_denied'; continue }
+      $candidates = @(Get-QuarantineMessage -MessageId $messageId -RecipientAddress ([string]$p.recipient) -PageSize 100 -ErrorAction Stop)
+      $quarantineItems = @()
+      if ($candidates.Count -lt 100) {
+        foreach ($candidate in $candidates) {
+          $identity = [string]$candidate.Identity
+          if ($identity -notmatch $identityPattern) { throw 'invalid provider identity' }
+          $items = @(Get-QuarantineMessage -Identity $identity -ErrorAction Stop)
+          if ($items.Count -ne 1) { throw 'ambiguous quarantine identity' }
+          $item = $items[0]
+          if ([string]$item.Identity -ine $identity -or [string]$item.MessageId -cne $messageId) { throw 'quarantine identity mismatch' }
+          if (@($item.RecipientAddress) -icontains [string]$p.recipient) { $quarantineItems += $item }
+        }
+      }
+      $result = @{ messageTraceId = ([string]$p.messageTraceId).ToLowerInvariant(); recipient = [string]$p.recipient; received = $at.ToString('o');
+        match = $null; checkedAt = [DateTime]::UtcNow.ToString('o') }
+      if ($quarantineItems.Count -eq 1) {
+        $item = $quarantineItems[0]; $identity = [string]$item.Identity
+        $released = @($item.ReleasedUser) -icontains [string]$p.recipient
+        if ($release) {
+          if ($identity -ine [string]$p.identity) { throw 'quarantine identity changed' }
+          if (-not $released) {
+            $writeDispatched = $true
+            Release-QuarantineMessage -Identity $identity -User ([string]$p.recipient) -Confirm:$false -ErrorAction Stop | Out-Null
+            $readback = @(Get-QuarantineMessage -Identity $identity -ErrorAction Stop)
+            if ($readback.Count -ne 1 -or [string]$readback[0].Identity -ine $identity -or [string]$readback[0].MessageId -cne $messageId -or @($readback[0].RecipientAddress) -inotcontains [string]$p.recipient) { throw 'quarantine readback mismatch' }
+            $released = @($readback[0].ReleasedUser) -icontains [string]$p.recipient
+          }
+          $result.accepted = $true; $result.verified = [bool]$released
+        }
+        $result.match = @{ identity = $identity; messageId = $messageId; recipient = [string]$p.recipient; sender = [string]$item.SenderAddress;
+          subject = ([string]$item.Subject).Substring(0,[Math]::Min(([string]$item.Subject).Length,1000)); released = [bool]$released }
+      } elseif ($release) { throw 'quarantine match unavailable or ambiguous' }
+      Send-Forwarding $requestId $result
       continue
     }
     if ($request.operation -eq 'trace.search') {
@@ -611,6 +708,9 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         if ($request.operation -eq 'mailbox.autoreply.get') { Send-Forwarding $requestId $before; continue }
         $state = [string]$request.parameters.state
         $message = [string]$request.parameters.message
+        $externalMessage = if ($request.parameters.ContainsKey('externalMessage')) { [string]$request.parameters.externalMessage } else { $message }
+        $externalAudience = if ($request.parameters.ContainsKey('externalAudience')) { [string]$request.parameters.externalAudience } else { 'All' }
+        if ($externalMessage.Length -gt 8192 -or $externalAudience -notin @('None','Known','All')) { throw 'invalid external reply' }
         if ($state -notin @('Disabled','Enabled','Scheduled') -or $message.Length -gt 8192) { throw 'invalid reply' }
         $start = $null; $end = $null
         if ($state -eq 'Scheduled') {
@@ -619,17 +719,17 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
           if ($end -le $start) { throw 'invalid schedule' }
         } elseif ($null -ne $request.parameters.start -or $null -ne $request.parameters.end) { throw 'invalid schedule' }
         $sameSchedule = $state -ne 'Scheduled' -or ($before.start -eq $start.ToString('o') -and $before.end -eq $end.ToString('o'))
-        if ($before.state -eq $state -and $before.internalMessage -ceq $message -and $before.externalMessage -ceq $message -and $before.externalAudience -eq 'All' -and $sameSchedule) {
+        if ($before.state -eq $state -and $before.internalMessage -ceq $message -and $before.externalMessage -ceq $externalMessage -and $before.externalAudience -eq $externalAudience -and $sameSchedule) {
           $before.accepted = $true; $before.verified = $true; Send-Forwarding $requestId $before; continue
         }
         $options = @{ Identity = [string]$mailbox.PrimarySmtpAddress; AutoReplyState = $state;
-          InternalMessage = $message; ExternalMessage = $message; ExternalAudience = 'All'; ErrorAction = 'Stop' }
+          InternalMessage = $message; ExternalMessage = $externalMessage; ExternalAudience = $externalAudience; ErrorAction = 'Stop' }
         if ($state -eq 'Scheduled') { $options.StartTime = $start.UtcDateTime; $options.EndTime = $end.UtcDateTime }
         $writeDispatched = $true
         Set-MailboxAutoReplyConfiguration @options
         $after = AutoReply-State $mailboxId (Get-MailboxAutoReplyConfiguration -Identity ([string]$mailbox.PrimarySmtpAddress) -ErrorAction Stop)
         $after.accepted = $true
-        $after.verified = ($after.state -eq $state -and $after.internalMessage -ceq $message -and $after.externalMessage -ceq $message -and $after.externalAudience -eq 'All' -and
+        $after.verified = ($after.state -eq $state -and $after.internalMessage -ceq $message -and $after.externalMessage -ceq $externalMessage -and $after.externalAudience -eq $externalAudience -and
           ($state -ne 'Scheduled' -or ($after.start -eq $start.ToString('o') -and $after.end -eq $end.ToString('o'))))
         Send-Forwarding $requestId $after
         continue

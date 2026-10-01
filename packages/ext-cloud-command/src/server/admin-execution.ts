@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { adminGroupCreateSchema, adminGroupUpdateSchema, adminLicenseAssignSchema, adminUserCreateSchema, adminUserUpdateSchema, AdminGraphError, createAdminGraphProvider } from './admin-graph-provider';
-import { AuthenticationMethodError, createAuthenticationMethodsProvider } from './admin-auth-methods';
+import { authenticationMethodRemovalSchema, authenticationMethodKindSchema, authenticationMethodIdSchema, type AuthenticationMethodRemoval, AuthenticationMethodError, createAuthenticationMethodsProvider } from './admin-auth-methods';
 import type { GuardedFetch } from './transport';
 
 const uuid = z.string().uuid().transform(value => value.toLowerCase());
@@ -17,6 +17,7 @@ const operation = z.discriminatedUnion('type', [
   z.object({ type: z.literal('group.update'), id: uuid, update: adminGroupUpdateSchema }).strict(),
   z.object({ type: z.literal('licenses.list') }).strict(),
   z.object({ type: z.literal('service.health.get') }).strict(),
+  z.object({ type: z.literal('user.groups.get'), id: uuid }).strict(),
   z.object({ type: z.literal('user.get'), id: uuid }).strict(),
   z.object({ type: z.literal('user.drive.usage.get'), id: uuid }).strict(),
   z.object({ type: z.literal('user.drive.link.get'), id: uuid }).strict(),
@@ -28,8 +29,8 @@ const operation = z.discriminatedUnion('type', [
   z.object({ type: z.literal('user.sessions.revoke'), id: uuid }).strict(),
   z.object({ type: z.literal('user.mfa.methods.list'), id: uuid }).strict(),
   z.object({ type: z.literal('user.mfa.method.remove'), id: uuid,
-    kind: z.enum(['phone', 'microsoftAuthenticator']), methodId: uuid,
-    confirmation: z.literal('REMOVE_AUTH_METHOD') }).strict(),
+    kind: authenticationMethodKindSchema, methodId: authenticationMethodIdSchema,
+    confirmation: z.literal('REMOVE_AUTH_METHOD') }).strict().refine(input => authenticationMethodRemovalSchema.safeParse({ kind: input.kind, methodId: input.methodId }).success),
   z.object({ type: z.literal('user.mfa.recoveryEmail.set'), id: uuid,
     emailAddress: z.string().trim().email().max(320), confirmation: z.literal('SET_RECOVERY_EMAIL') }).strict(),
   z.object({ type: z.literal('user.mfa.mobilePhone.set'), id: uuid,
@@ -54,7 +55,7 @@ type Audit = {
   executionId: string;
   orgId: string; actorId: string; connectionId: string; operation: AdministrationOperation['type'];
   phase: 'intent' | 'outcome'; outcome?: 'success' | 'rejected' | 'unknown';
-  targets: { userId?: string; groupId?: string; methodKind?: 'phone' | 'microsoftAuthenticator'; methodId?: string; licenseSkuId?: string };
+  targets: { userId?: string; groupId?: string; methodKind?: AuthenticationMethodRemoval['kind']; methodId?: string; licenseSkuId?: string };
   changedFields: string[];
 };
 export class AdministrationExecutionError extends Error {
@@ -180,6 +181,7 @@ export function createAdministrationExecutor<Request>(ports: {
         case 'group.update': result = await provider.updateGroup(op.id, op.update, fence); break;
         case 'licenses.list': result = await provider.listLicenses(); break;
         case 'service.health.get': result = await provider.serviceHealth(); break;
+        case 'user.groups.get': result = await provider.getUserGroups(op.id); break;
         case 'user.get': result = await provider.getUser(op.id); break;
         case 'user.drive.usage.get': result = await provider.getUserDriveUsage(op.id); break;
         case 'user.drive.link.get': result = await provider.getUserDriveLink(op.id); break;

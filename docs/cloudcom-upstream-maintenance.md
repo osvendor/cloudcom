@@ -13,6 +13,31 @@ This guide records how the CloudCom fork differs from LanternOps/Breeze and how 
 
 ## Change register
 
+### Staff native access (2026-09-30)
+
+`staffNativeAuthority`, `staffNativeLogin`, `staffNativeAdmission` and
+`staffNativeAvailability` provide separate staff authorization and v2 proof-bound
+admission. Preserve their route mount, native-target server-record dispatch,
+`staff_native_sessions` migration with forced org RLS/composite target foreign key,
+and default-off `CLOUDCOM_STAFF_NATIVE_ENABLED` switch. Only interactive partner
+staff can seed an opaque native session; live permissions, owning partner,
+organization scope, account/MFA policy and parent-session revocation are checked
+again at admission/renewal. Customer identities remain assignment-only.
+
+The browser authorization page uses S256 PKCE and exact loopback callbacks. The
+selected RustDesk provider path hands a UUID-only `cloudcom-remote` URI to the
+verified viewer launcher. Preserve its MSI protocol registration and strict URI
+translation without replacing the endpoint's RustDesk handler. Flutter exposes
+separate staff/customer sign-ins, bounded directory pagination, organization
+labels and requested-device highlighting; the hint never grants access itself.
+
+Validation: focused API/customer regressions115, web42 and Flutter6 passed;
+API/web/client builds passed. Transactional PostgreSQL checks proved same-org
+access, denied cross-org reads/updates and target FK mismatches, and forced RLS.
+Full API TypeScript checking remains unverified due memory limits. Runtime
+acceptance and private deployment evidence remain in the operational ledger;
+passing source tests alone are not a claim of accepted desktop connectivity.
+
 ### LanternOps v0.117.0 intake
 
 The intake pins upstream `880eaba02361001ecd6a5dc6863deab51d578e53` and retains

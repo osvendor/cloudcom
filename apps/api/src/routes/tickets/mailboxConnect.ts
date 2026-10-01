@@ -371,7 +371,7 @@ mailboxRoutes.get(
     // (#6935). Never the secret; null when the app is not configured.
     // redirectUri: the exact value to register on the Entra app, from the same
     // resolver the consent flow sends to Microsoft (#6936).
-    const appId = getMailboxPlatformConfig()?.clientId ?? null;
+    const appId = (await getMailboxPlatformConfig())?.clientId ?? null;
     return c.json({ connections: list, appId, redirectUri: getMailboxCallbackUri() });
   },
 );
@@ -390,7 +390,7 @@ mailboxRoutes.post(
     }
     const resolved = resolvePartnerId(auth);
     if ('error' in resolved) return c.json({ error: resolved.error }, resolved.status);
-    const platform = getMailboxPlatformConfig();
+    const platform = await getMailboxPlatformConfig();
     if (!platform) return c.json({ error: 'M365 ticket mailbox app is not configured' }, 400);
 
     const { mailboxAddress, displayName } = c.req.valid('json');
@@ -556,7 +556,7 @@ mailboxRoutes.get('/callback', zValidator('query', callbackQuery, (result, c) =>
 
   if (intent.kind === 'provider_error') return fail('invalid_identity', 'error', providerErrorDiag(query));
 
-  const platform = getMailboxPlatformConfig();
+  const platform = await getMailboxPlatformConfig();
   if (!platform) return fail('invalid_identity', 'error', { step: 'platform_not_configured' });
 
   try {
@@ -610,7 +610,9 @@ mailboxRoutes.get('/callback', zValidator('query', callbackQuery, (result, c) =>
     const exchanged = await exchangeMicrosoftAuthorizationCode({
       tenantHint,
       clientId: platform.clientId,
-      clientSecret: platform.clientSecret,
+      ...(platform.credentialVersion !== undefined
+        ? { credentialVersion: platform.credentialVersion }
+        : { clientSecret: platform.clientSecret }),
       redirectUri: getMailboxCallbackUri(),
       code: intent.code,
       codeVerifier: session.codeVerifier,

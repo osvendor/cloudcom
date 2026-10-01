@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Security.Cryptography;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 
 internal static class ManagedViewerLauncher
@@ -18,7 +19,10 @@ internal static class ManagedViewerLauncher
     {
         bool verifyOnly = args.Length == 1 && args[0] == "--verify";
         try {
-            if (args.Length != 0 && !verifyOnly) throw new Exception("Unsupported launcher arguments.");
+            string staffUri = null;
+            if (args.Length == 1 && Regex.IsMatch(args[0], @"\Acloudcom-remote://staff/connect/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z"))
+                staffUri = "rustdesk://" + args[0].Substring("cloudcom-remote://".Length);
+            if (args.Length != 0 && !verifyOnly && staffUri == null) throw new Exception("Unsupported launcher arguments.");
             string root = AppDomain.CurrentDomain.BaseDirectory;
             foreach (var entry in Files) {
                 string file = Path.Combine(root, entry.Key);
@@ -36,10 +40,13 @@ internal static class ManagedViewerLauncher
                 using (process) {
                     try { path = process.MainModule.FileName; } catch (System.ComponentModel.Win32Exception) { } catch (InvalidOperationException) { }
                 }
-                if (String.Equals(path, exe, StringComparison.OrdinalIgnoreCase))
+                if (staffUri == null && String.Equals(path, exe, StringComparison.OrdinalIgnoreCase))
                     throw new Exception("OS Consultants - Remote Access is already open. Close its window before starting it again.");
             }
             var start = new ProcessStartInfo(exe) { WorkingDirectory = root, UseShellExecute = false };
+            // Only the exact UUID-only hint above reaches the child. Existing
+            // instances receive it through RustDesk's normal URI IPC path.
+            if (staffUri != null) start.Arguments = "\"" + staffUri + "\"";
             start.EnvironmentVariables["RUSTDESK_APPNAME"] = Route;
             start.EnvironmentVariables["RUST_LOG"] = "info";
             using (var process = Process.Start(start)) { }

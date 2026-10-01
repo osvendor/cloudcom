@@ -71,7 +71,7 @@ export type MailboxConnectionSnapshot = Pick<
 
 type ConnectedMailbox = MailboxConnectionSnapshot & Pick<
   MailboxConnection,
-  'mailboxAddress' | 'deltaLink'
+  'mailboxAddress' | 'deltaLink' | 'createdAt'
 >;
 
 type Row = typeof ticketMailboxConnections.$inferSelect;
@@ -160,6 +160,7 @@ export async function listConnectedMailboxes(): Promise<ConnectedMailbox[]> {
       mailboxAddress: ticketMailboxConnections.mailboxAddress,
       deltaLink: ticketMailboxConnections.deltaLink,
       consentAttemptId: ticketMailboxConnections.consentAttemptId,
+      createdAt: ticketMailboxConnections.createdAt,
     }).from(ticketMailboxConnections)
       .innerJoin(
         ticketMailboxTenantOwnerships,
@@ -647,8 +648,9 @@ export async function disableConnection(id: string, partnerId: string): Promise<
   return rows.length === 1;
 }
 
-/** 410 Gone: Graph invalidated the delta token. Clear it so the next sweep restarts
- *  the delta from "now" (no history backfill). Stays 'connected'. Worker-only;
+/** 410 Gone: Graph invalidated the delta token. Clear it so the next sweep replays
+ *  eligible inbox mail from the original connection floor; durable ingestion dedup
+ *  prevents duplicate tickets. Stays 'connected'. Worker-only;
  *  self-wraps in system context (FORCE RLS — see updateDeltaCursor). */
 export async function resetDeltaCursor(snapshot: MailboxConnectionSnapshot): Promise<boolean> {
   return runOutsideDbContext(() => withSystemDbAccessContext(async () => {

@@ -28,6 +28,9 @@ $script:distributionPrimary = 'qa@example.test'
 $script:unifiedRequiresAuth = $false
 $script:unifiedPrimary = 'unified@example.test'
 function Get-DistributionGroup { param($Identity, $ErrorAction)
+  if ($Identity -eq 'syncgroup@example.test') { return [pscustomobject]@{
+    ExternalDirectoryObjectId = '16161616-1616-4616-8616-161616161616';
+    RecipientTypeDetails = 'MailUniversalDistributionGroup'; IsDirSynced = $true; PrimarySmtpAddress = $Identity } }
   if ($Identity -eq 'policy@example.test') { return [pscustomobject]@{
     ExternalDirectoryObjectId = 'abababab-abab-4bab-8bab-abababababab';
     RecipientTypeDetails = 'MailUniversalDistributionGroup'; PrimarySmtpAddress = $Identity;
@@ -35,7 +38,7 @@ function Get-DistributionGroup { param($Identity, $ErrorAction)
     EmailAddressPolicyEnabled = $true; EmailAddresses = @('SMTP:policy@example.test') } }
   if ($Identity -notin @('qa@example.test','qa-new@example.test')) { throw 'Wrong distribution lookup' }
   [pscustomobject]@{ ExternalDirectoryObjectId = '55555555-5555-4555-8555-555555555555';
-    RecipientTypeDetails = 'MailUniversalDistributionGroup'; PrimarySmtpAddress = $script:distributionPrimary;
+    RecipientTypeDetails = 'MailUniversalDistributionGroup'; IsDirSynced = $false; PrimarySmtpAddress = $script:distributionPrimary;
     DisplayName = $script:distributionName; RequireSenderAuthenticationEnabled = $script:distributionRequiresAuth;
     EmailAddressPolicyEnabled = $false; EmailAddresses = @("SMTP:$script:distributionPrimary",'smtp:qa@example.test','smtp:qa-old@example.test','X500:/o=legacy') }
 }
@@ -105,6 +108,9 @@ function Get-EXOMailboxStatistics { param($Identity, $ErrorAction)
 }
 $script:memberPresent = $false
 function Get-EXORecipient { param($ExternalDirectoryObjectId, $ErrorAction)
+  if ($ExternalDirectoryObjectId -eq '18181818-1818-4818-8818-181818181818') { [IO.File]::WriteAllText($env:CLOUDCOM_TEST_MEMBER_MARKER, 'unexpected lookup'); throw 'Unknown member' }
+  if ($ExternalDirectoryObjectId -eq '16161616-1616-4616-8616-161616161616') { return [pscustomobject]@{
+    ExternalDirectoryObjectId = $ExternalDirectoryObjectId; RecipientTypeDetails = 'MailUniversalDistributionGroup'; PrimarySmtpAddress = 'syncgroup@example.test' } }
   if ($ExternalDirectoryObjectId -eq 'abababab-abab-4bab-8bab-abababababab') { return [pscustomobject]@{
     ExternalDirectoryObjectId = $ExternalDirectoryObjectId; RecipientTypeDetails = 'MailUniversalDistributionGroup';
     PrimarySmtpAddress = 'policy@example.test' } }
@@ -143,6 +149,7 @@ try {
   $start.RedirectStandardInput = $true
   $start.RedirectStandardOutput = $true
   $start.RedirectStandardError = $true
+  $start.Environment['CLOUDCOM_TEST_MEMBER_MARKER'] = "$temp.member-lookup"
   $start.Environment['CLOUDCOM_EXCHANGE_CONFIG'] = '{}'
   $process = [Diagnostics.Process]::Start($start)
   $request = @{ requestId = '11111111-1111-4111-8111-111111111111'; tenantId = '33333333-3333-4333-8333-333333333333';
@@ -277,6 +284,17 @@ try {
   $result = $read.Result | ConvertFrom-Json
   if (-not $result.ok -or $result.data.enabled -or -not $result.data.changed -or -not $result.data.verified) {
     throw "Membership removal invalid: $($read.Result)" }
+  # This deliberately invalid member would cause identity lookup if synchronization protection were skipped.
+  # The guard must reject the group before any member lookup or write occurs.
+  $request.requestId = '17171717-1717-4717-8717-171717171717'
+  $request.parameters.groupId = '16161616-1616-4616-8616-161616161616'
+  $request.parameters.memberId = '18181818-1818-4818-8818-181818181818'
+  $process.StandardInput.WriteLine(($request | ConvertTo-Json -Depth 5 -Compress))
+  $read = $process.StandardOutput.ReadLineAsync()
+  if (-not $read.Wait([TimeSpan]::FromSeconds(20))) { throw 'Synced group preflight timed out.' }
+  $result = $read.Result | ConvertFrom-Json
+  if ($result.ok -or $result.code -ne 'provider_rejected' -or (Test-Path -LiteralPath "$temp.member-lookup")) {
+    throw 'Synced distribution group was not rejected before member lookup.' }
   $request.requestId = '66666666-6666-4666-8666-666666666666'
   $request.operation = 'shared.create'
   $request.parameters = @{ name = 'QA Shared'; primarySmtpAddress = 'shared@example.test' }
@@ -346,5 +364,5 @@ try {
   Write-Output 'Exchange creation, distribution membership, preservation inspection, and conversion passed.'
 } finally {
   if ($process) { if (-not $process.HasExited) { $process.Kill() }; $process.Dispose() }
-  Remove-Item -LiteralPath $temp -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $temp,"$temp.member-lookup" -ErrorAction SilentlyContinue
 }

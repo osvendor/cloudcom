@@ -99,7 +99,7 @@ describe('organization-bound Microsoft administration execution', () => {
     ]);
     expect(s.fetch.mock.calls.every(([, init]) => init.method === 'GET')).toBe(true);
   });
-  it('creates a user with manager authorization, audit fencing, and no password in audit events', async () => {
+  it.each([{}, { password: 'Chosen-Example9!', forceChangePasswordNextSignIn: false }])('creates a user with manager authorization, audit fencing, and no password in audit events: %j', async passwordOptions => {
     const s = setup();
     s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`);
     s.fetch.mockImplementation(async (url, init) => {
@@ -108,8 +108,8 @@ describe('organization-bound Microsoft administration execution', () => {
       if (url.endsWith('/users') && init.method === 'POST') return Response.json({ id, userPrincipalName: 'new@example.test' }, { status: 201 });
       throw new Error(`Unexpected ${url}`);
     });
-    const result = await s.run(request, orgId, { type: 'user.create', user: { displayName: 'New User', userPrincipalName: 'new@example.test' } });
-    expect(result).toMatchObject({ accepted: true, id, userPrincipalName: 'new@example.test', forceChangePasswordNextSignIn: true });
+    const result = await s.run(request, orgId, { type: 'user.create', user: { displayName: 'New User', userPrincipalName: 'new@example.test', ...passwordOptions } });
+    expect(result).toMatchObject({ accepted: true, id, userPrincipalName: 'new@example.test', forceChangePasswordNextSignIn: passwordOptions.forceChangePasswordNextSignIn ?? true });
     expect(s.authorize.mock.calls.every(([, , operation]) => operation === 'user.create')).toBe(true);
     expect(s.audit.mock.calls.map(([event]) => event)).toEqual([
       expect.objectContaining({ phase: 'intent', operation: 'user.create', changedFields: ['displayName', 'userPrincipalName', 'passwordProfile'] }),
@@ -255,22 +255,22 @@ describe('organization-bound Microsoft administration execution', () => {
     ]);
     expect(JSON.stringify(s.audit.mock.calls)).not.toMatch(/4567|secret/);
   });
-  it('fences and audits one typed MFA removal without recording method details', async () => {
+  it.each(['phone', 'fido2'] as const)('fences and audits one typed %s removal without recording method details', async kind => {
     const s = setup();
-    const methodId = actorId;
+    const methodId = kind === 'phone' ? actorId : '_jpuR-TGZtk6aQCLF3BQjA2';
     s.acquireToken.mockResolvedValue(`h.${Buffer.from(JSON.stringify({ roles: ['UserAuthenticationMethod.ReadWrite.All'] })).toString('base64url')}.s`);
     s.fetch.mockImplementation(async (url, init) => {
       if (init.method !== 'GET') return new Response(null, { status: 204 });
       if (url.includes('/organization?')) return Response.json({ value: [{ id: tenantId }] });
-      if (url.includes('/authentication/methods')) return Response.json({ value: [{ id: methodId, '@odata.type': '#microsoft.graph.phoneAuthenticationMethod', phoneType: 'mobile', phoneNumber: '+1 555 123 4567' }] });
+      if (url.includes('/authentication/methods')) return Response.json({ value: [{ id: methodId, '@odata.type': `#microsoft.graph.${kind}AuthenticationMethod`, phoneType: 'mobile', phoneNumber: '+1 555 123 4567' }] });
       throw new Error(`unexpected ${init.method} ${url}`);
     });
-    await expect(s.run(request, orgId, { type: 'user.mfa.method.remove', id, kind: 'phone', methodId, confirmation: 'REMOVE_AUTH_METHOD' }))
+    await expect(s.run(request, orgId, { type: 'user.mfa.method.remove', id, kind, methodId, confirmation: 'REMOVE_AUTH_METHOD' }))
       .resolves.toEqual({ accepted: true });
     expect(s.fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
     expect(s.audit.mock.calls.map(([event]) => event)).toEqual([
-      expect.objectContaining({ phase: 'intent', operation: 'user.mfa.method.remove', targets: { userId: id, methodKind: 'phone', methodId }, changedFields: ['authenticationMethod'] }),
-      expect.objectContaining({ phase: 'outcome', outcome: 'success', targets: { userId: id, methodKind: 'phone', methodId }, changedFields: ['authenticationMethod'] }),
+      expect.objectContaining({ phase: 'intent', operation: 'user.mfa.method.remove', targets: { userId: id, methodKind: kind, methodId }, changedFields: ['authenticationMethod'] }),
+      expect.objectContaining({ phase: 'outcome', outcome: 'success', targets: { userId: id, methodKind: kind, methodId }, changedFields: ['authenticationMethod'] }),
     ]);
     expect(JSON.stringify(s.audit.mock.calls)).not.toMatch(/4567|REMOVE_AUTH_METHOD/);
   });

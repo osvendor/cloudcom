@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createExchangeAddressesClient, createExchangeAutoReplyClient, createExchangeConvertSharedClient, createExchangeDelegationClient, createExchangeDistributionClient, createExchangeDistributionMemberClient, createExchangeDistributionMembersClient, createExchangeDistributionNameClient, createExchangeGroupPrimaryClient, createExchangeGroupSettingsClient, createExchangeGroupExternalClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, createExchangeMailboxStatisticsClient, createExchangePreservationInspectClient, createExchangeSharedClient, createExchangeTraceClient, ExchangeWorkerError } from './exchange-contract';
+import { createExchangeGroupAliasClient, createExchangeAddressesClient, createExchangeAutoReplyClient, createExchangeConvertSharedClient, createExchangeDelegationClient, createExchangeDistributionClient, createExchangeDistributionMemberClient, createExchangeDistributionMembersClient, createExchangeDistributionNameClient, createExchangeGroupPrimaryClient, createExchangeGroupSettingsClient, createExchangeGroupExternalClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, createExchangeMailboxStatisticsClient, createExchangePreservationInspectClient, createExchangeSharedClient, createExchangeTraceClient, ExchangeWorkerError } from './exchange-contract';
 
 describe('Exchange group primary SMTP contract', () => {
   const input = { groupId: '44444444-4444-4444-8444-444444444444', address: 'new@example.test' };
@@ -292,6 +292,12 @@ describe('Exchange forwarding contract', () => {
 });
 
 describe('Exchange automatic reply contract', () => {
+  it('preserves distinct external reply and audience through the typed request', async () => {
+    const dispatch = vi.fn(async request => ({requestId: request.requestId, ok: true, data: {mailboxId: mailbox.id, state: 'Enabled', internalMessage: 'Internal', externalMessage: 'External', externalAudience: 'Known', start: null, end: null, accepted: true, verified: true}}));
+    await createExchangeAutoReplyClient({dispatch}).set(binding, {mailboxId: mailbox.id, state: 'Enabled', message: 'Internal', externalMessage: 'External', externalAudience: 'Known', start: null, end: null});
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({parameters: expect.objectContaining({message: 'Internal', externalMessage: 'External', externalAudience: 'Known'})}));
+  });
+
   const mailboxId = mailbox.id;
   it('sends one bounded reply and validated schedule', async () => {
     const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: { mailboxId, state: 'Scheduled',
@@ -370,6 +376,18 @@ describe('Exchange message trace contract', () => {
     expect(dispatch.mock.calls.map(([request]) => request.operation)).toEqual(['trace.search', 'trace.detail']);
     expect(JSON.stringify(dispatch.mock.calls)).not.toContain('certificate');
   });
+  it('accepts Exchange trace GUIDs without RFC variant bits while rejecting malformed identifiers', async () => {
+    const exchangeId = '12345678-1234-4abc-f123-123456789abc';
+    const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true, data: request.operation === 'trace.search'
+      ? { rows: [{ ...row, messageTraceId: exchangeId }], next: null, partial: false, checkedAt: search.end }
+      : { messageTraceId: exchangeId, recipient: row.recipient, events: [], partial: false } }));
+    const client = createExchangeTraceClient({ dispatch });
+    await expect(client.search(binding, search)).resolves.toMatchObject({ rows: [{ messageTraceId: exchangeId }] });
+    await expect(client.detail(binding, { messageTraceId: exchangeId.toUpperCase(), recipient: row.recipient })).resolves.toMatchObject({ messageTraceId: exchangeId });
+    for (const messageTraceId of ['not-a-guid', exchangeId + ';Get-Mailbox', '{' + exchangeId + '}', exchangeId.replaceAll('-', '')])
+      await expect(client.detail(binding, { messageTraceId, recipient: row.recipient })).rejects.toThrow();
+    expect(dispatch).toHaveBeenCalledTimes(2);
+  });
   it('rejects injected parameters and a cursor not present in its page', async () => {
     const dispatch = vi.fn(async request => ({ requestId: request.requestId, ok: true,
       data: { rows: [row], next: { received: row.received, recipient: 'different@example.com' }, partial: true, checkedAt: search.end } }));
@@ -377,5 +395,21 @@ describe('Exchange message trace contract', () => {
     await expect(client.search(binding, { ...search, command: 'Remove-Mailbox' } as never)).rejects.toThrow();
     expect(dispatch).not.toHaveBeenCalled();
     await expect(client.search(binding, search)).rejects.toMatchObject({ code: 'provider_unreachable' });
+  });
+});
+
+
+describe('Group alias contract', () => {
+  it.each(['group.alias.add', 'group.alias.remove'] as const)('bounds %s without replay', async action => {
+    const input = {groupId: '44444444-4444-4444-8444-444444444444', address: 'alias@example.test'};
+    const dispatch = vi.fn(async request => ({requestId: request.requestId, ok: true, data: {groupId: input.groupId, primarySmtpAddress: 'primary@example.test', accepted: true, verified: true, changed: true}}));
+    const client = createExchangeGroupAliasClient({dispatch});
+    await expect(client(binding, input, action)).resolves.toMatchObject({verified: true});
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({operation: action, parameters: input}));
+    await expect(client(binding, {...input, command: 'evil'} as never, action)).rejects.toThrow();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    dispatch.mockRejectedValueOnce(new Error('lost'));
+    await expect(client(binding, input, action)).rejects.toMatchObject({code: 'unknown_write_outcome'});
+    expect(dispatch).toHaveBeenCalledTimes(2);
   });
 });

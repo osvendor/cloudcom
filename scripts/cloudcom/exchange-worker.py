@@ -5,7 +5,7 @@ Deployment owns the socket path, permitted API uid, config file and certificate 
 process deliberately never listens on TCP and never accepts PowerShell, certificate paths, or
 tenant configuration from a client. It is a service-side companion, not an API endpoint.
 """
-import argparse, datetime, json, os, re, select, socket, socketserver, stat, struct, subprocess, threading, time, uuid
+import argparse, datetime, json, os, re, select, socket, socketserver, stat, struct, subprocess, threading, time, uuid, tempfile
 from pathlib import Path
 try: import pwd
 except ModuleNotFoundError: pwd = None
@@ -16,7 +16,7 @@ MAX_PAGE_SIZE = 200
 COMMAND_TIMEOUT_SECONDS = 45
 ALLOWED_OPERATIONS = frozenset(('mailbox.inventory', 'mailbox.statistics.get', 'mailbox.preservation.get', 'mailbox.convert.shared', 'mailbox.forwarding.get', 'mailbox.forwarding.set',
     'mailbox.autoreply.get', 'mailbox.autoreply.set', 'mailbox.addresses.get', 'mailbox.primary.set',
-    'mailbox.alias.add', 'mailbox.alias.remove', 'mailbox.delegation.get', 'mailbox.delegation.list', 'mailbox.delegation.set', 'distribution.create', 'shared.create', 'distribution.member.set', 'distribution.members.get', 'group.settings.get', 'group.external.set', 'distribution.name.set', 'group.primary.set', 'trace.search', 'trace.detail'))
+    'mailbox.alias.add', 'mailbox.alias.remove', 'mailbox.delegation.get', 'mailbox.delegation.list', 'mailbox.delegation.set', 'distribution.create', 'shared.create', 'distribution.member.set', 'distribution.members.get', 'group.settings.get', 'group.external.set', 'distribution.name.set', 'group.primary.set', 'group.alias.add', 'group.alias.remove', 'trace.search', 'trace.detail', 'quarantine.lookup', 'quarantine.release.set'))
 TRACE_STATUSES = frozenset(('Delivered', 'Expanded', 'Failed', 'FilteredAsSpam', 'GettingStatus', 'Pending', 'Quarantined'))
 ADDRESS = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 def trace_address(value): return isinstance(value, str) and len(value) <= 320 and ADDRESS.fullmatch(value) is not None
@@ -120,11 +120,29 @@ def valid_success_response(result, request_id, operation):
         try: normalized_uuid(data['groupId'])
         except (TypeError, ValueError): return 'provider_unreachable'
         if data['accepted'] is not True or any(type(data[key]) is not bool for key in ('verified', 'changed')) or not isinstance(data['displayName'], str) or not 1 <= len(data['displayName'].strip()) <= 256: return 'provider_unreachable'
-    elif operation == 'group.primary.set':
+    elif operation in ('group.primary.set', 'group.alias.add', 'group.alias.remove'):
         if not isinstance(data, dict) or set(data) != {'groupId', 'primarySmtpAddress', 'accepted', 'verified', 'changed'}: return 'provider_unreachable'
         try: normalized_uuid(data['groupId'])
         except (TypeError, ValueError): return 'provider_unreachable'
         if data['accepted'] is not True or any(type(data[key]) is not bool for key in ('verified', 'changed')) or not trace_address(data['primarySmtpAddress']): return 'provider_unreachable'
+    elif operation.startswith('quarantine.'):
+        expected = {'messageTraceId', 'recipient', 'received', 'match', 'checkedAt'}
+        if is_write(operation): expected.update(('accepted', 'verified'))
+        if not isinstance(data, dict) or set(data) != expected: return 'provider_unreachable'
+        try: normalized_uuid(data['messageTraceId']); trace_time(data['received']); trace_time(data['checkedAt'])
+        except (TypeError, ValueError): return 'provider_unreachable'
+        if not trace_address(data['recipient']): return 'provider_unreachable'
+        item = data['match']
+        if item is not None:
+            if not isinstance(item, dict) or set(item) != {'identity','messageId','subject','sender','recipient','released'}: return 'provider_unreachable'
+            try:
+                parts = item['identity'].split('\\')
+                if len(parts) != 2: return 'provider_unreachable'
+                for part in parts: normalized_uuid(part)
+            except (TypeError, ValueError, AttributeError): return 'provider_unreachable'
+            if not trace_address(item['recipient']) or item['recipient'].lower() != data['recipient'].lower() or type(item['released']) is not bool: return 'provider_unreachable'
+            if not all(isinstance(item[key],str) and len(item[key]) <= size for key,size in [('messageId',998),('subject',1000),('sender',320)]) or not item['messageId']: return 'provider_unreachable'
+        if is_write(operation) and (data['accepted'] is not True or type(data['verified']) is not bool or item is None or (data['verified'] and not item['released'])): return 'provider_unreachable'
     elif operation == 'trace.search':
         if not isinstance(data, dict) or set(data) != {'rows', 'next', 'partial', 'checkedAt'} or type(data['partial']) is not bool: return 'provider_unreachable'
         if not isinstance(data['rows'], list) or len(data['rows']) > 1000: return 'response_too_large'
@@ -241,9 +259,20 @@ def validate_request(value, tenants):
     elif operation == 'distribution.name.set':
         if set(params) != {'groupId', 'displayName'} or not isinstance(params['displayName'], str) or not 1 <= len(params['displayName'].strip()) <= 256: raise ValueError()
         normalized_uuid(params['groupId'])
-    elif operation == 'group.primary.set':
+    elif operation in ('group.primary.set', 'group.alias.add', 'group.alias.remove'):
         if set(params) != {'groupId', 'address'} or not trace_address(params['address']): raise ValueError()
         normalized_uuid(params['groupId'])
+    elif operation.startswith('quarantine.'):
+        expected = {'messageTraceId', 'recipient', 'received'}
+        if operation == 'quarantine.release.set': expected.add('identity')
+        if set(params) != expected or not trace_address(params['recipient']): raise ValueError()
+        normalized_uuid(params['messageTraceId'])
+        at = trace_time(params['received']); now = datetime.datetime.now(datetime.timezone.utc)
+        if not now - datetime.timedelta(days=90) <= at <= now + datetime.timedelta(minutes=5): raise ValueError()
+        if operation == 'quarantine.release.set':
+            parts = params['identity'].split('\\')
+            if len(parts) != 2: raise ValueError()
+            for part in parts: normalized_uuid(part)
     elif operation == 'trace.search':
         if set(params) != {'start', 'end', 'sender', 'recipient', 'status', 'cursor'}: raise ValueError()
         start, end, now = trace_time(params['start']), trace_time(params['end']), datetime.datetime.now(datetime.timezone.utc)
@@ -265,10 +294,14 @@ def validate_request(value, tenants):
             if address is not None and (not isinstance(address, str) or len(address) > 320 or '@' not in address or any(c.isspace() for c in address)): raise ValueError()
             if type(params['keepCopy']) is not bool: raise ValueError()
     elif operation.startswith('mailbox.autoreply.'):
-        if set(params) != ({'mailboxId'} if operation == 'mailbox.autoreply.get' else {'mailboxId', 'state', 'message', 'start', 'end'}): raise ValueError()
+        required = {'mailboxId'} if operation == 'mailbox.autoreply.get' else {'mailboxId', 'state', 'message', 'start', 'end'}
+        optional = set() if operation == 'mailbox.autoreply.get' else {'externalMessage', 'externalAudience'}
+        if not required <= set(params) or set(params) - required - optional: raise ValueError()
         normalized_uuid(params['mailboxId'])
         if operation == 'mailbox.autoreply.set':
             if params['state'] not in ('Disabled', 'Enabled', 'Scheduled') or not isinstance(params['message'], str) or len(params['message']) > 8192: raise ValueError()
+            if 'externalMessage' in params and (not isinstance(params['externalMessage'], str) or len(params['externalMessage']) > 8192): raise ValueError()
+            if 'externalAudience' in params and params['externalAudience'] not in ('None', 'Known', 'All'): raise ValueError()
             if params['state'] == 'Scheduled':
                 try:
                     start = datetime.datetime.fromisoformat(params['start'].replace('Z', '+00:00'))
@@ -301,13 +334,21 @@ def validate_request(value, tenants):
 class PersistentPowerShell:
     def __init__(self, request, descriptor, script):
         self.tenant_id = request['tenantId']; self.descriptor = descriptor; self.used = time.monotonic(); self.lock = threading.RLock()
-        env = {**os.environ, 'CLOUDCOM_EXCHANGE_CONFIG': json.dumps(descriptor, separators=(',', ':'))}
+        # EXO generates ~3 MB of modules per connection. Own that temporary tree
+        # per process so idle rotations and failures cannot fill the shared tmpfs.
+        self.temp_directory = tempfile.TemporaryDirectory(prefix='cloudcom-exo-')
+        env = {**os.environ, 'CLOUDCOM_EXCHANGE_CONFIG': json.dumps(descriptor, separators=(',', ':')),
+               'TMPDIR': self.temp_directory.name, 'TMP': self.temp_directory.name, 'TEMP': self.temp_directory.name}
         self.buffer = b''
-        self.process = subprocess.Popen(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-File', script], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, env=env)
+        try: self.process = subprocess.Popen(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-File', script], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, env=env)
+        except Exception:
+            self.temp_directory.cleanup()
+            raise
     def close(self):
         if self.process.poll() is None: self.process.kill()
         try: self.process.wait(timeout=3)
-        except subprocess.TimeoutExpired: pass
+        except subprocess.TimeoutExpired: return
+        self.temp_directory.cleanup()
     def run(self, request):
         if request['tenantId'] != self.tenant_id: return fail(request['requestId'], 'connection_mismatch')
         with self.lock:
@@ -325,7 +366,10 @@ class PersistentPowerShell:
                 line, self.buffer = self.buffer.split(b'\n', 1)
                 result = json.loads(line.decode('utf-8')); self.used = time.monotonic()
                 if not isinstance(result, dict) or result.get('requestId') != request['requestId'] or result.get('ok') not in (True, False): return fail(request['requestId'], 'provider_unreachable')
-                if result.get('ok') is False: return fail(request['requestId'], result.get('code'))
+                if result.get('ok') is False:
+                    # Retire failed sessions; never replay a possibly dispatched write.
+                    self.close()
+                    return fail(request['requestId'], result.get('code'))
                 invalid = valid_success_response(result, request['requestId'], request['operation'])
                 if invalid: return fail(request['requestId'], 'unknown_write_outcome' if is_write(request['operation']) else invalid)
                 return result
@@ -361,7 +405,8 @@ class Handler(socketserver.StreamRequestHandler):
             if not body or len(body) > MAX_REQUEST: result = fail('00000000-0000-4000-8000-000000000000', 'invalid_request')
             else: result = self.server.broker.execute(json.loads(body))
         except Exception: result = fail('00000000-0000-4000-8000-000000000000', 'invalid_request')
-        self.wfile.write(json.dumps(result, separators=(',', ':')).encode('utf-8') + b'\n')
+        try: self.wfile.write(json.dumps(result, separators=(',', ':')).encode('utf-8') + b'\n')
+        except (BrokenPipeError, ConnectionResetError): pass
 # The fallback only allows contract tests to import this Linux-only service on Windows.
 UnixServerBase = getattr(socketserver, 'ThreadingUnixStreamServer', socketserver.TCPServer)
 class Server(UnixServerBase): allow_reuse_address = True; daemon_threads = True

@@ -67,7 +67,7 @@ const healthyStatuses = new Set(['serviceOperational', 'serviceRestored', 'postI
 function healthTone(status: string): 'green' | 'yellow' | 'red' | 'unknown' {
   return healthyStatuses.has(status) ? 'green' : status === 'serviceInterruption' ? 'red' : !status || status === 'unknownFutureValue' ? 'unknown' : 'yellow';
 }
-type RemovableMfaMethod = MfaMethod & { id: string; type: 'phone' | 'microsoftAuthenticator'; removable: true };
+type RemovableMfaMethod = MfaMethod & { id: string; type: Exclude<MfaMethodType, 'password' | 'other'>; removable: true };
 type UserDraft = Partial<Record<(typeof USER_FIELDS)[number], string>> & { accountEnabled?: boolean };
 // Cloud Command's Edit account drawer saves the account name as one field. The
 // directory is an MSP operations view, not a copy of every Graph profile field.
@@ -94,7 +94,6 @@ const USER_DIRECTORY_COLUMNS = [
   { key: 'mailbox', label: 'Mailbox' },
   { key: 'archive', label: 'Archive' },
   { key: 'oneDrive', label: 'OneDrive' },
-  { key: 'exclude', label: 'Exclude', defaultHidden: true },
 ] as const;
 
 export class CloudCommandMicrosoftPage extends HTMLElement {
@@ -116,13 +115,25 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private filter = '';
   private sortKey: string | null = null;
   private sortDirection: 'asc' | 'desc' = 'asc';
-  private directoryScope: 'users' | 'exclude' = 'users';
+  private directoryScope: 'users' | 'unlicensed' | 'exclude' = 'users';
   private directoryExclusions = new Map<string, boolean>();
   private directoryExclusionsReady = false;
   private directoryExclusionError = '';
   private directoryPreferenceRequest = 0;
   private detail: ResourceRow | null = null;
+  private createUserGroups: ResourceRow[] | null = null;
+  private createUserGroupIds: string[] = [];
+  private createUserGroupsError = '';
+  private createUserGroupOutcomes: string[] = [];
+  private createUserGroupsRequest = 0;
   private createUserOpen = false;
+  private createUserSession = 0;
+  private createUserPasswordMode = 'generated';
+  private createUserPassword = '';
+  private createUserForceChange = true;
+  private createUserDomainsRequest = 0;
+  private createUserLicensesRequest = 0;
+  private createUserUncertain = false;
   private createUserDomains: string[] | null = null;
   private createUserLicenses: LicenseOption[] | null = null;
   private createLicenseCatalogError = '';
@@ -143,6 +154,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private licenseNeedsRefresh = false;
   private licensesRequest = 0;
   private createGroupOpen = false;
+  private createGroupRequest = 0;
+  private createGroupUncertain = false;
   private createGroupUsers: ResourceData | null = null;
   private createGroupDraft = { kind: 'm365', name: '', alias: '', ownerId: '', primarySmtpAddress: '' };
   private createGroupError = '';
@@ -160,7 +173,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private forwardingRequest = 0;
   private autoReplyOpen = false;
   private autoReply: AutoReplyState | null = null;
-  private autoReplyDraft = { state: 'Disabled' as AutoReplyState['state'], message: '', start: '', end: '' };
+  private autoReplyDraft = { state: 'Disabled' as AutoReplyState['state'], message: '', externalMessage: '', externalAudience: 'All' as AutoReplyState['externalAudience'], start: '', end: '' };
   private autoReplyLoading = false;
   private autoReplyError = '';
   private autoReplyMessage = '';
@@ -178,6 +191,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private delegationOpen = false;
   private delegationUsers: ResourceData | null = null;
   private delegationSelectedId = '';
+  private delegationRemoveRight = '';
   private delegation: DelegationState | null = null;
   private delegationList: DelegationList | null = null;
   private delegationListLoading = false;
@@ -187,7 +201,6 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private delegationError = '';
   private delegationMessage = '';
   private delegationNeedsRefresh = false;
-  private delegationConfirmed = false;
   private delegationRequest = 0;
   private detailKind: DetailKind = 'read';
   private detailIsShared = false;
@@ -196,7 +209,6 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private userVerificationRequest = 0;
   private userSecurityRequest = 0;
   private userSecurityAction: UserSecurityAction | null = null;
-  private userSecurityConfirmed = false;
   private temporaryPassword: string | null = null;
   private globalAdminStatus: boolean | null = null;
   private globalAdminDraft: boolean | null = null;
@@ -209,12 +221,11 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private mfaLoading = false;
   private mfaError = '';
   private mfaRemoval: RemovableMfaMethod | null = null;
+  private mfaRemovalNeedsRefresh = false;
   private mfaConfirmation = '';
   private recoveryEmailDraft = '';
-  private recoveryEmailConfirmed = false;
   private recoveryEmailNeedsRefresh = false;
   private mobilePhoneDraft = '';
-  private mobilePhoneConfirmed = false;
   private mobilePhoneNeedsRefresh = false;
   private mfaRequest = 0;
   private drawerMessage = '';
@@ -230,10 +241,10 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private groupSettingsError = '';
   private groupSettingsRequest = 0;
   private groupExternalDraft: boolean | null = null;
-  private groupExternalConfirmed = false;
   private groupExternalNeedsRefresh = false;
+  private groupAliasDraft = '';
+  private groupAliasRemoval = '';
   private groupPrimaryDraft = '';
-  private groupPrimaryConfirmed = false;
   private groupPrimaryNeedsRefresh = false;
   private driveLink: string | null = null;
   private driveLinkError = '';
@@ -242,13 +253,11 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private groupNameNeedsRefresh = false;
   private membershipAction: 'add' | 'remove' = 'add';
   private membershipRole: 'member' | 'owner' = 'member';
-  private membershipConfirmed = false;
   private membershipNeedsRefresh = false;
   private userGroupOpen = false;
   private userGroups: ResourceData | null = null;
   private userGroupRequest = 0;
   private userGroupSelectedId = '';
-  private userGroupConfirmed = false;
   private userGroupNeedsRefresh = false;
   private userDraft: UserDraft = {};
   private visibleColumns: string[] = [];
@@ -257,7 +266,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private layoutEditVersion = 0;
   private layoutSave: Promise<void> = Promise.resolve();
   private layoutError = '';
-  private layoutOpen = false;
+  private accountPanel = 'account';
   private expandedRowId: string | null = null;
   private returnFocus: string | null = null;
   private message = '';
@@ -273,10 +282,18 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private healthRequest = 0;
   private traceOpen = false;
   private traceCriteria: TraceCriteria | null = null;
+  private quarantineRow: TraceRow | null = null;
+  private quarantineMatch: {identity:string;messageId:string;subject:string;sender:string;recipient:string;released:boolean} | null = null;
+  private quarantineBusy = false;
+  private quarantineMessage = '';
+  private quarantineRequest = 0;
+  private traceWidths: Record<string, number> = {};
   private traceRows: TraceRow[] = [];
   private traceNext: TraceCursor | null = null;
   private traceLoading = false;
   private traceError = '';
+  private traceSelected: TraceRow | null = null;
+  private traceExpanded = false;
   private traceDetail: TraceDetail | null = null;
   private traceDetailLoading = false;
   private traceRequest = 0;
@@ -301,6 +318,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
 
   connectedCallback(): void {
     this.resource = this.resourceFromHash();
+    if (window.location.hash === '#unlicensed') this.directoryScope = 'unlicensed';
     window.addEventListener('hashchange', this.onHashChange);
     this.render();
     if (this.contextValue) void this.loadConnection();
@@ -317,7 +335,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.globalAdminRequest += 1;
     this.mfaRequest += 1;
     this.temporaryPassword = null;
-    this.createdUser = null;
+    this.createdUser = null; this.createUserPassword = ''; this.createUserPasswordMode = 'generated'; this.createUserForceChange = true;
     this.createGroupOpen = false; this.createdGroup = null;
     this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
     this.resetAutoReply(); this.resetAddresses(); this.resetDelegation();
@@ -329,17 +347,18 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
 
   private onHashChange = (): void => {
     const next = this.resourceFromHash();
+    const nextScope = window.location.hash === '#unlicensed' ? 'unlicensed' : 'users';
     if (next !== this.resource) {
       this.manualRefreshRequest += 1;
       this.resource = next;
       this.driveUsageRequest += 1;
       this.mailboxStatisticsRequest += 1; this.mailboxStatisticsLoading = false; this.mailboxStatisticsTargets.clear();
-      if (next === 'users') this.directoryScope = 'users';
+      if (next === 'users') this.directoryScope = nextScope;
       this.data = null;
       this.allGroups = null;
       this.detail = null;
       this.createUserOpen = false;
-      this.createdUser = null; this.createUserBusy = false;
+      this.createdUser = null; this.createUserPassword = ''; this.createUserPasswordMode = 'generated'; this.createUserForceChange = true; this.createUserBusy = false;
       this.createGroupOpen = false; this.createdGroup = null;
       this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
       this.resetAutoReply(); this.resetAddresses(); this.resetDelegation();
@@ -349,19 +368,20 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       this.userSecurityRequest += 1;
       this.globalAdminRequest += 1;
       this.mfaRequest += 1;
-      this.userSecurityAction = null; this.userSecurityConfirmed = false; this.temporaryPassword = null;
+      this.userSecurityAction = null; this.temporaryPassword = null;
       this.licensesRequest += 1; this.licensesOpen = false; this.userLicenses = null;
       this.busy = false;
       this.filter = '';
       this.sortKey = null; this.sortDirection = 'asc';
-      this.directoryScope = 'users'; this.directoryExclusions.clear(); this.directoryExclusionsReady = false; this.directoryExclusionError = ''; this.directoryPreferenceRequest += 1;
+      this.directoryScope = window.location.hash === '#unlicensed' ? 'unlicensed' : 'users'; this.directoryExclusions.clear(); this.directoryExclusionsReady = false; this.directoryExclusionError = ''; this.directoryPreferenceRequest += 1;
       this.userDraft = {};
       this.expandedRowId = null;
       this.visibleColumns = [];
-      this.columnWidths = {}; this.layoutError = ''; this.layoutOpen = false; this.layoutRequest += 1; this.layoutEditVersion = 0;
+      this.columnWidths = {}; this.layoutError = ''; this.layoutRequest += 1; this.layoutEditVersion = 0;
       this.render();
       if (this.canRead()) void this.loadResource();
     }
+    if (next === 'users' && this.directoryScope !== nextScope) { this.directoryScope = nextScope; this.filter = ''; this.render(); }
   };
   private resourceFromHash(): Resource {
     const value = window.location.hash.slice(1);
@@ -380,14 +400,15 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.busy = false;
     this.connection = null;
     this.health = null; this.healthError = ''; this.healthOpen = false; this.healthLoading = false; this.healthRequest += 1;
-    this.traceRequest += 1; this.traceOpen = false; this.traceRows = []; this.traceNext = null; this.traceCriteria = null; this.traceDetail = null;
+    this.quarantineRequest++; this.quarantineRow=null; this.quarantineMatch=null; this.quarantineBusy=false;
+    this.traceRequest += 1; this.traceOpen = false; this.traceSelected=null; this.traceRows = []; this.traceNext = null; this.traceCriteria = null; this.traceDetail = null;
     this.traceLoading = false; this.traceDetailLoading = false; this.traceDraft = { start: '', end: '', sender: '', recipient: '', status: '' }; this.traceError = '';
     this.data = null;
     this.allGroups = null;
     this.mailboxInventory = null; this.mailboxError = '';
     this.detail = null;
     this.createUserOpen = false;
-    this.createdUser = null; this.createUserBusy = false;
+    this.createdUser = null; this.createUserPassword = ''; this.createUserPasswordMode = 'generated'; this.createUserForceChange = true; this.createUserBusy = false;
     this.createGroupOpen = false; this.createdGroup = null; this.createGroupUsers = null; this.createGroupBusy = false;
     this.forwardingRequest += 1; this.forwardingOpen = false; this.forwarding = null;
     this.resetAutoReply(); this.resetAddresses(); this.resetDelegation();
@@ -395,13 +416,13 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.expandedRowId = null;
     this.sortKey = null; this.sortDirection = 'asc';
     this.visibleColumns = [];
-    this.columnWidths = {}; this.layoutError = ''; this.layoutOpen = false; this.layoutRequest += 1; this.layoutEditVersion = 0;
+    this.columnWidths = {}; this.layoutError = ''; this.layoutRequest += 1; this.layoutEditVersion = 0;
     this.detailRequest += 1;
     this.userVerificationRequest += 1;
     this.userSecurityRequest += 1;
     this.globalAdminRequest += 1;
     this.mfaRequest += 1;
-    this.userSecurityAction = null; this.userSecurityConfirmed = false; this.temporaryPassword = null;
+    this.userSecurityAction = null; this.temporaryPassword = null;
     this.licensesRequest += 1; this.licensesOpen = false; this.userLicenses = null;
     this.drawerMessage = '';
     this.drawerError = false;
@@ -411,15 +432,16 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.membershipUsersRequest += 1;
     this.groupPeople = null; this.groupPeopleError = ''; this.groupPeopleRequest += 1;
     this.groupSettings = null; this.groupSettingsError = ''; this.groupSettingsRequest += 1;
-    this.groupExternalDraft = null; this.groupExternalConfirmed = false; this.groupExternalNeedsRefresh = false;
-    this.groupPrimaryDraft = ''; this.groupPrimaryConfirmed = false; this.groupPrimaryNeedsRefresh = false;
+    this.groupExternalDraft = null; this.groupExternalNeedsRefresh = false;
+    this.groupAliasDraft = ''; this.groupAliasRemoval = '';
+    this.groupPrimaryDraft = ''; this.groupPrimaryNeedsRefresh = false;
     this.driveLink = null; this.driveLinkError = ''; this.driveLinkLoading = false; this.driveLinkRequest += 1;
     this.groupNameNeedsRefresh = false;
     this.membershipAction = 'add';
     this.membershipRole = 'member'; this.membershipNeedsRefresh = false;
-    this.membershipConfirmed = false;
+
     this.userGroupRequest += 1; this.userGroupOpen = false; this.userGroups = null;
-    this.userGroupSelectedId = ''; this.userGroupConfirmed = false; this.userGroupNeedsRefresh = false;
+    this.userGroupSelectedId = ''; this.userGroupNeedsRefresh = false;
     this.groupNameDraft = '';
     this.forwardingRequest += 1; this.forwardingError = ''; this.forwardingMessage = ''; this.forwardingNeedsRefresh = false;
     this.userDraft = {};
@@ -753,13 +775,16 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (generation === this.generation && context === this.contextValue && request === this.directoryPreferenceRequest) { this.drawerError = true; this.drawerMessage = error instanceof Error ? error.message : 'Directory exclusion outcome is uncertain.'; }
     } finally { if (generation === this.generation && context === this.contextValue && request === this.directoryPreferenceRequest) { this.busy = false; this.render(); } }
   }
-  private setDirectoryScope(scope: 'users' | 'exclude'): void {
+  private setDirectoryScope(scope: 'users' | 'unlicensed' | 'exclude'): void {
+    if (scope === 'unlicensed') { window.location.hash = 'unlicensed'; this.onHashChange(); return; }
+    if (scope === 'users' && window.location.hash === '#unlicensed') window.location.hash = 'users';
     this.directoryScope = scope;
     this.filter = '';
     this.expandedRowId = null;
     this.render();
   }
-  private openDetail(row: ResourceRow, securityAction: UserSecurityAction | null = null): void {
+  private openDetail(row: ResourceRow, securityAction: UserSecurityAction | null = null, panel = 'account'): void {
+    this.accountPanel = securityAction ? 'security' : panel;
     this.busy = false;
     this.detail = row;
     this.detailKind = row.source === 'group' || this.resource === 'groups' ? 'group' : row.source === 'user' || this.resource === 'users' || this.resource === 'shared-mailboxes' ? 'user' : 'read';
@@ -770,11 +795,11 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.userVerificationRequest += 1;
     this.userSecurityRequest += 1;
     this.globalAdminRequest += 1;
-    this.userSecurityAction = securityAction; this.userSecurityConfirmed = false; this.temporaryPassword = null;
+    this.userSecurityAction = securityAction; this.temporaryPassword = null;
     const sharedMailbox = this.resource === 'shared-mailboxes' || this.mailboxInventory?.records.some(record => record.id.toLowerCase() === row.id.toLowerCase() && record.recipientType === 'SharedMailbox') === true;
     this.detailIsShared = sharedMailbox;
     this.globalAdminStatus = null; this.globalAdminDraft = null; this.globalAdminLoading = this.detailKind === 'user' && !sharedMailbox; this.globalAdminError = ''; this.globalAdminConfirmation = '';
-    this.mfaOpen = false; this.mfaMethods = null; this.mfaLoading = false; this.mfaError = ''; this.mfaRemoval = null; this.mfaConfirmation = ''; this.recoveryEmailDraft = ''; this.recoveryEmailConfirmed = false; this.recoveryEmailNeedsRefresh = false; this.mobilePhoneDraft = ''; this.mobilePhoneConfirmed = false; this.mobilePhoneNeedsRefresh = false;
+    this.mfaOpen = false; this.mfaMethods = null; this.mfaLoading = false; this.mfaError = ''; this.mfaRemoval = null; this.mfaConfirmation = ''; this.recoveryEmailDraft = ''; this.recoveryEmailNeedsRefresh = false; this.mobilePhoneDraft = ''; this.mobilePhoneNeedsRefresh = false;
     this.licensesRequest += 1; this.licensesOpen = false; this.userLicenses = null; this.licensesLoading = false;
     this.licensesError = ''; this.licenseRemovalSku = ''; this.licenseConfirmation = ''; this.licenseNeedsRefresh = false;
     this.drawerMessage = '';
@@ -785,15 +810,16 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.membershipUsersRequest += 1;
     this.groupPeople = null; this.groupPeopleError = ''; this.groupPeopleRequest += 1;
     this.groupSettings = null; this.groupSettingsError = ''; this.groupSettingsRequest += 1;
-    this.groupExternalDraft = null; this.groupExternalConfirmed = false; this.groupExternalNeedsRefresh = false;
-    this.groupPrimaryDraft = ''; this.groupPrimaryConfirmed = false; this.groupPrimaryNeedsRefresh = false;
+    this.groupExternalDraft = null; this.groupExternalNeedsRefresh = false;
+    this.groupAliasDraft = ''; this.groupAliasRemoval = '';
+    this.groupPrimaryDraft = ''; this.groupPrimaryNeedsRefresh = false;
     this.driveLink = null; this.driveLinkError = ''; this.driveLinkLoading = false; this.driveLinkRequest += 1;
     this.groupNameNeedsRefresh = false;
     this.membershipAction = 'add';
     this.membershipRole = 'member'; this.membershipNeedsRefresh = false;
-    this.membershipConfirmed = false;
+
     this.userGroupRequest += 1; this.userGroupOpen = false; this.userGroups = null;
-    this.userGroupSelectedId = ''; this.userGroupConfirmed = false; this.userGroupNeedsRefresh = false;
+    this.userGroupSelectedId = ''; this.userGroupNeedsRefresh = false;
     this.userDraft = {};
     this.returnFocus = `row-${row.id}`;
     this.render();
@@ -805,46 +831,55 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       this.render();
     }
     else if (this.detailKind !== 'read') void this.loadDetailRecord(row.id, this.detailKind);
-    if (this.detailKind === 'user' && !sharedMailbox) void this.loadGlobalAdminStatus(row.id);
-    if (this.detailKind === 'user' && this.mailboxInventory?.records.some(record => record.id.toLowerCase() === row.id.toLowerCase())) this.openAddresses();
-    if (this.detailKind === 'group' && this.connection?.canManage && (!row.values.groupKind || row.values.groupKind === 'Microsoft 365 group' || distribution)) void this.loadMembershipUsers(row.id);
-    if (this.detailKind === 'group' && (row.values.groupKind === 'Microsoft 365 group' || distribution)) void this.loadGroupPeople(row.id);
-    if (this.detailKind === 'group' && (row.values.groupKind === 'Microsoft 365 group' || distribution)) void this.loadGroupSettings(row.id);
+    if (this.detailKind === 'user' && !sharedMailbox && panel === 'account') void this.loadGlobalAdminStatus(row.id);
+    if (this.detailKind === 'user' && panel === 'addresses' && this.mailboxInventory?.records.some(record => record.id.toLowerCase() === row.id.toLowerCase())) this.openAddresses();
+    if (this.detailKind === 'group' && ['members', 'owners'].includes(panel) && this.connection?.canManage && (!row.values.groupKind || row.values.groupKind === 'Microsoft 365 group' || distribution)) void this.loadMembershipUsers(row.id);
+    if (this.detailKind === 'group' && ['members', 'owners'].includes(panel) && (!row.values.groupKind || row.values.groupKind === 'Microsoft 365 group' || distribution)) void this.loadGroupPeople(row.id);
+    if (this.detailKind === 'group' && panel === 'email' && (row.values.groupKind === 'Microsoft 365 group' || distribution)) void this.loadGroupSettings(row.id);
   }
   private openCreateUser(): void {
     if (!this.connection?.canManage || this.resource !== 'users') return;
-    this.createUserOpen = true;
-    this.createUserDomains = null; this.createUserError = ''; this.createdUser = null;
+    this.createUserOpen = true; this.createUserSession += 1; this.createUserUncertain = false;
+    this.createUserDomains = null; this.createUserError = ''; this.createdUser = null; this.createUserPassword = ''; this.createUserPasswordMode = 'generated'; this.createUserForceChange = true;
     this.createUserLicenses = null; this.createLicenseCatalogError = '';
     this.createUserDraft = { name: '', local: '', domain: '', location: '', skuId: '' };
+    this.createUserGroups = null; this.createUserGroupIds = []; this.createUserGroupsError = ''; this.createUserGroupOutcomes = [];
     this.createLicenseOutcome = ''; this.createLicenseOutcomeError = false;
     this.render();
     queueMicrotask(() => this.root.querySelector<HTMLButtonElement>('#create-user-close')?.focus());
     void this.loadCreateUserDomains();
     void this.loadCreateUserLicenses();
+    void this.loadCreateUserGroups();
   }
   private openCreateGroup(): void {
     if (!this.connection?.canManage || this.resource !== 'groups') return;
     this.createGroupOpen = true; this.createGroupUsers = null; this.createGroupDraft = { kind: 'm365', name: '', alias: '', ownerId: '', primarySmtpAddress: '' };
-    this.createGroupError = ''; this.createdGroup = null; this.createGroupBusy = false; this.render();
+    this.createGroupError = ''; this.createdGroup = null; this.createGroupBusy = false; this.createGroupUncertain = false; this.render();
+    void this.loadCreateGroupOwners();
+  }
+  private async loadCreateGroupOwners(): Promise<void> {
+    this.createGroupUsers = null; this.createGroupError = ''; this.render();
+    const request = ++this.createGroupRequest;
     const generation = this.generation; const context = this.contextValue;
     void this.request<unknown>(this.path('/resources/users')).then(raw => {
-      if (generation !== this.generation || context !== this.contextValue || !this.createGroupOpen) return;
-      this.createGroupUsers = parseResourceData(raw); this.render();
+      if (generation !== this.generation || context !== this.contextValue || !this.createGroupOpen || request !== this.createGroupRequest) return;
+      const users = parseResourceData(raw);
+      if (!users.complete) throw new Error('The owner list is incomplete. Refresh owners before creating a Microsoft 365 group.');
+      this.createGroupUsers = users; this.render();
     }).catch(error => {
-      if (generation !== this.generation || context !== this.contextValue || !this.createGroupOpen) return;
+      if (generation !== this.generation || context !== this.contextValue || !this.createGroupOpen || request !== this.createGroupRequest) return;
       this.createGroupError = error instanceof Error ? error.message : 'Could not load owners.'; this.render();
     });
   }
   private async createGroup(): Promise<void> {
-    if (!this.connection?.canManage || this.createGroupBusy || !this.createGroupOpen || this.createdGroup) return;
+    if (!this.connection?.canManage || this.createGroupBusy || this.createGroupUncertain || !this.createGroupOpen || this.createdGroup) return;
     const { kind, name, alias, ownerId, primarySmtpAddress } = this.createGroupDraft;
     if (!name.trim() || (kind === 'm365' && (!/^[A-Za-z0-9'.!#^~_-]{1,64}$/.test(alias.trim()) || !this.createGroupUsers?.items.some(row => row.id === ownerId))) ||
       (kind === 'distribution' && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(primarySmtpAddress.trim()))) {
       this.createGroupError = kind === 'distribution' ? 'Enter a name and full email address in a tenant accepted domain.'
         : 'Enter a group name and mail alias, then choose a loaded tenant user as owner.'; this.render(); return;
     }
-    const generation = this.generation; const context = this.contextValue;
+    const generation = this.generation; const context = this.contextValue; const request = this.createGroupRequest;
     this.createGroupBusy = true; this.createGroupError = ''; this.render();
     try {
       const result = await this.request<{ accepted: boolean; id: string | null; verified: boolean; mail?: string | null; primarySmtpAddress?: string }>(this.path('/administration'), {
@@ -852,82 +887,105 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
         body: JSON.stringify(kind === 'distribution' ? { type: 'distribution.create', name: name.trim(), primarySmtpAddress: primarySmtpAddress.trim() }
           : { type: 'group.create', group: { displayName: name.trim(), mailNickname: alias.trim(), ownerId } }),
       });
-      if (generation !== this.generation || context !== this.contextValue || !this.createGroupOpen) return;
+      if (generation !== this.generation || context !== this.contextValue || !(request === this.createGroupRequest) || !this.createGroupOpen) return;
       if (!result.accepted || (kind === 'm365' && !result.id) || (kind === 'distribution' && !result.verified))
         throw new Error('Group creation outcome is uncertain. Refresh before retrying.');
       this.createdGroup = { kind, id: result.id, mail: result.primarySmtpAddress ?? result.mail ?? null, verified: result.verified };
       void this.refreshDirectory();
     } catch (error) {
-      if (generation === this.generation && context === this.contextValue && this.createGroupOpen)
-        this.createGroupError = error instanceof Error ? error.message : 'Group creation outcome is uncertain. Refresh before retrying.';
-    } finally { if (generation === this.generation && context === this.contextValue) { this.createGroupBusy = false; this.render(); } }
+      if (generation === this.generation && context === this.contextValue && request === this.createGroupRequest && this.createGroupOpen) {
+        this.createGroupUncertain = true;
+        this.createGroupError = `${error instanceof Error ? error.message : 'Group creation outcome is uncertain.'} Close this panel and check the directory before starting another creation.`;
+      }
+    } finally { if (generation === this.generation && context === this.contextValue && request === this.createGroupRequest) { this.createGroupBusy = false; this.render(); } }
   }
   private closeCreateUser(): void {
     if (this.createUserBusy) return;
-    this.createUserOpen = false;
-    this.createdUser = null;
+    this.createUserOpen = false; this.createUserSession += 1;
+    this.createdUser = null; this.createUserPassword = ''; this.createUserPasswordMode = 'generated'; this.createUserForceChange = true;
     this.render();
     queueMicrotask(() => this.root.querySelector<HTMLButtonElement>('#create-user')?.focus());
   }
   private async loadCreateUserDomains(): Promise<void> {
-    const generation = this.generation, context = this.contextValue;
+    const generation = this.generation, context = this.contextValue, session = this.createUserSession, request = ++this.createUserDomainsRequest;
     try {
-      const result = await this.request<{ domains: string[] }>(this.path('/administration'), {
+      const result = await this.request<{ domains: string[]; defaultUsageLocation?: string | null }>(this.path('/administration'), {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'user.domains.list' }),
       });
-      if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen) return;
+      if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen || session !== this.createUserSession || request !== this.createUserDomainsRequest) return;
       if (!Array.isArray(result.domains) || !result.domains.every(domain => typeof domain === 'string')) throw new Error('Invalid verified-domain response.');
       this.createUserDomains = result.domains;
-      this.createUserDraft.domain = result.domains[0] ?? '';
+      this.createUserDraft.location = /^[A-Z]{2}$/.test(result.defaultUsageLocation ?? '') ? result.defaultUsageLocation! : '';
+      if (!result.domains.includes(this.createUserDraft.domain)) this.createUserDraft.domain = result.domains[0] ?? '';
       if (!result.domains.length) this.createUserError = 'No verified sign-in domain is available for this tenant.';
     } catch (error) {
-      if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen) return;
+      if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen || session !== this.createUserSession || request !== this.createUserDomainsRequest) return;
       this.createUserDomains = [];
       this.createUserError = error instanceof Error ? error.message : 'Could not load verified domains.';
     }
     this.render();
   }
   private async loadCreateUserLicenses(): Promise<void> {
-    const generation = this.generation, context = this.contextValue;
+    const generation = this.generation, context = this.contextValue, session = this.createUserSession, request = ++this.createUserLicensesRequest;
     try {
       const result = await this.request<{ items: LicenseOption[]; partial: boolean }>(this.path('/administration'), {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'licenses.list' }),
       });
-      if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen) return;
+      if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen || session !== this.createUserSession || request !== this.createUserLicensesRequest) return;
       if (!Array.isArray(result.items) || result.partial || !result.items.every(item => typeof item.skuId === 'string' && typeof item.skuPartNumber === 'string'
         && typeof item.consumedUnits === 'number' && typeof item.prepaidUnits?.enabled === 'number')) throw new Error('Complete license inventory is unavailable.');
       this.createUserLicenses = result.items.filter(item => item.capabilityStatus === 'Enabled'
         && item.prepaidUnits.enabled > item.consumedUnits);
     } catch (error) {
-      if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen) return;
+      if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen || session !== this.createUserSession || request !== this.createUserLicensesRequest) return;
       this.createLicenseCatalogError = error instanceof Error ? error.message : 'Could not load license inventory.';
       this.createUserLicenses = [];
     }
     this.render();
   }
+  private async loadCreateUserGroups(): Promise<void> {
+    const generation = this.generation, session = this.createUserSession, request = ++this.createUserGroupsRequest;
+    this.createUserGroupsError = '';
+    try {
+      const groups = parseResourceData(await this.request<unknown>(this.path('/resources/groups')));
+      if (generation !== this.generation || session !== this.createUserSession || request !== this.createUserGroupsRequest || !this.createUserOpen) return;
+      if (!groups.complete) throw new Error('The group list is incomplete. Retry before selecting memberships.');
+      this.createUserGroups = groups.items.filter(group => ['Microsoft 365 group', 'Distribution list'].includes(String(group.values.groupKind))
+        && !group.values.membershipRule && group.values.onPremisesSyncEnabled !== true && group.values.isAssignableToRole !== true);
+      this.createUserGroupIds = this.createUserGroupIds.filter(id => this.createUserGroups!.some(group => group.id === id));
+    } catch (error) {
+      if (generation !== this.generation || session !== this.createUserSession || request !== this.createUserGroupsRequest || !this.createUserOpen) return;
+      this.createUserGroupsError = error instanceof Error ? error.message : 'Could not load groups.';
+    }
+    this.render();
+  }
   private async createUser(): Promise<void> {
-    if (!this.connection?.canManage || this.createUserBusy || this.createdUser || !this.createUserDomains?.length) return;
+    if (!this.connection?.canManage || this.createUserBusy || this.createUserUncertain || this.createdUser || !this.createUserDomains?.length) return;
     const name = this.root.querySelector<HTMLInputElement>('#create-user-name')?.value.trim() ?? '';
     const local = this.root.querySelector<HTMLInputElement>('#create-user-local')?.value.trim() ?? '';
     const domain = this.root.querySelector<HTMLSelectElement>('#create-user-domain')?.value ?? '';
-    const location = this.root.querySelector<HTMLInputElement>('#create-user-location')?.value.trim().toUpperCase() ?? '';
+    const location = this.createUserDraft.location;
+    const password = this.createUserPasswordMode === 'custom' ? this.createUserPassword : undefined;
+    const forceChangePasswordNextSignIn = this.createUserForceChange;
+    if (password !== undefined && (password.length < 8 || password.length > 256)) { this.createUserError = 'Enter a password between 8 and 256 characters. Microsoft also applies the tenant password policy.'; this.render(); return; }
     const skuId = this.root.querySelector<HTMLSelectElement>('#create-user-license')?.value ?? '';
     this.createUserDraft = { name, local, domain, location, skuId };
     if (!name || !/^[A-Za-z0-9'.!#^~_-]+$/.test(local) || !this.createUserDomains.includes(domain)) {
       this.createUserError = 'Enter a name and valid sign-in name using a verified domain.'; this.render(); return;
     }
     if ((location && !/^[A-Z]{2}$/.test(location)) || (skuId && (!location || !this.createUserLicenses?.some(item => item.skuId === skuId)))) {
-      this.createUserError = 'A license needs an available seat and a two-letter usage location.'; this.render(); return;
+      this.createUserError = 'A license needs an available seat and a default usage location configured in this Microsoft tenant.'; this.render(); return;
     }
-    const generation = this.generation, context = this.contextValue;
+    const generation = this.generation, context = this.contextValue, session = this.createUserSession;
     this.createUserBusy = true; this.createUserError = ''; this.render();
     try {
       const result = await this.request<{ accepted: boolean; id: string; userPrincipalName: string; temporaryPassword: string }>(this.path('/administration'), {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ type: 'user.create', user: { displayName: name, userPrincipalName: `${local}@${domain}`, ...(location ? { usageLocation: location } : {}) } }),
+        body: JSON.stringify({ type: 'user.create', user: { displayName: name, userPrincipalName: `${local}@${domain}`, ...(location ? { usageLocation: location } : {}), ...(password !== undefined ? { password } : {}), ...(!forceChangePasswordNextSignIn ? { forceChangePasswordNextSignIn: false } : {}) } }),
       });
-      if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen) return;
+      if (generation !== this.generation || context !== this.contextValue || !(session === this.createUserSession) || !this.createUserOpen) return;
       if (!result.accepted || !result.id || !result.temporaryPassword) throw new Error('Creation outcome is uncertain. Refresh the directory before trying again.');
+      this.createUserPassword = '';
       this.createdUser = { id: result.id, userPrincipalName: result.userPrincipalName, temporaryPassword: result.temporaryPassword };
       this.render();
       if (skuId) {
@@ -936,29 +994,50 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
             method: 'POST', headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ type: 'user.license.assign', id: result.id, license: { skuId } }),
           });
-          if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen) return;
+          if (generation !== this.generation || context !== this.contextValue || !(session === this.createUserSession) || !this.createUserOpen) return;
           this.createLicenseOutcome = assignment.accepted
             ? assignment.verified ? 'License assigned and verified.' : 'Microsoft accepted the license assignment. Refresh the user to verify it appears.'
             : 'License assignment was not confirmed. Review the user before retrying.';
           this.createLicenseOutcomeError = !assignment.accepted || !assignment.verified;
         } catch (error) {
-          if (generation !== this.generation || context !== this.contextValue || !this.createUserOpen) return;
+          if (generation !== this.generation || context !== this.contextValue || !(session === this.createUserSession) || !this.createUserOpen) return;
           this.createLicenseOutcome = `User created; license assignment was not confirmed. ${error instanceof Error ? error.message : 'Review the user before retrying.'}`;
           this.createLicenseOutcomeError = true;
         }
       }
+      for (const groupId of [...this.createUserGroupIds]) {
+        if (generation !== this.generation || context !== this.contextValue || session !== this.createUserSession || !this.createUserOpen) return;
+        const group = this.createUserGroups?.find(item => item.id === groupId);
+        if (!group) continue;
+        const name = String(group.values.displayName ?? groupId);
+        try {
+          const membership = await this.request<{accepted?: boolean; verified?: boolean}>(this.path('/administration'), {
+            method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(group.values.groupKind === 'Distribution list'
+              ? {type: 'distribution.member.set', groupId, memberId: result.id, enabled: true}
+              : {type: 'group.member.add', groupId, userId: result.id}),
+          });
+          if (generation !== this.generation || context !== this.contextValue || session !== this.createUserSession || !this.createUserOpen) return;
+          this.createUserGroupOutcomes.push(`${name}: ${membership.verified ? 'membership verified' : 'submitted; check membership before retrying'}.`);
+        } catch {
+          if (generation !== this.generation || context !== this.contextValue || session !== this.createUserSession || !this.createUserOpen) return;
+          this.createUserGroupOutcomes.push(`${name}: membership not confirmed. Review this user’s groups before retrying.`);
+        }
+        this.render();
+      }
       void this.loadResource();
     } catch (error) {
-      if (generation === this.generation && context === this.contextValue && this.createUserOpen)
-        this.createUserError = error instanceof Error ? error.message : 'Creation outcome is uncertain. Refresh before retrying.';
+      if (generation === this.generation && context === this.contextValue && session === this.createUserSession && this.createUserOpen) {
+        this.createUserUncertain = true; this.createUserPassword = '';
+        this.createUserError = `${error instanceof Error ? error.message : 'Creation outcome is uncertain.'} Close this panel and check the directory before starting another creation.`;
+      }
     } finally {
-      if (generation === this.generation && context === this.contextValue) { this.createUserBusy = false; this.render(); }
+      if (generation === this.generation && context === this.contextValue && session === this.createUserSession) { this.createUserBusy = false; this.render(); }
     }
   }
   private openMfa(row: ResourceRow): void {
     if (!this.connection?.canManage) return;
-    this.openDetail(row);
-    this.mfaOpen = true; this.mfaMethods = null; this.mfaLoading = true; this.mfaError = ''; this.mfaRemoval = null; this.mfaConfirmation = ''; this.recoveryEmailDraft = ''; this.recoveryEmailConfirmed = false; this.recoveryEmailNeedsRefresh = false; this.mobilePhoneDraft = ''; this.mobilePhoneConfirmed = false; this.mobilePhoneNeedsRefresh = false;
+    this.openDetail(row, null, 'mfa');
+    this.mfaOpen = true; this.mfaMethods = null; this.mfaLoading = true; this.mfaError = ''; this.mfaRemoval = null; this.mfaConfirmation = ''; this.recoveryEmailDraft = ''; this.recoveryEmailNeedsRefresh = false; this.mobilePhoneDraft = ''; this.mobilePhoneNeedsRefresh = false;
     this.render();
     void this.loadMfaMethods(row.id);
   }
@@ -973,9 +1052,9 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.userVerificationRequest += 1;
     this.userSecurityRequest += 1;
     this.globalAdminRequest += 1;
-    this.userSecurityAction = null; this.userSecurityConfirmed = false; this.temporaryPassword = null;
+    this.userSecurityAction = null; this.temporaryPassword = null;
     this.globalAdminStatus = null; this.globalAdminDraft = null; this.globalAdminLoading = false; this.globalAdminError = ''; this.globalAdminConfirmation = '';
-    this.mfaOpen = false; this.mfaMethods = null; this.mfaLoading = false; this.mfaError = ''; this.mfaRemoval = null; this.mfaConfirmation = ''; this.recoveryEmailDraft = ''; this.recoveryEmailConfirmed = false; this.recoveryEmailNeedsRefresh = false; this.mobilePhoneDraft = ''; this.mobilePhoneConfirmed = false; this.mobilePhoneNeedsRefresh = false; this.mfaRequest += 1;
+    this.mfaOpen = false; this.mfaMethods = null; this.mfaLoading = false; this.mfaError = ''; this.mfaRemoval = null; this.mfaConfirmation = ''; this.recoveryEmailDraft = ''; this.recoveryEmailNeedsRefresh = false; this.mobilePhoneDraft = ''; this.mobilePhoneNeedsRefresh = false; this.mfaRequest += 1;
     this.licensesRequest += 1; this.licensesOpen = false; this.userLicenses = null; this.licensesLoading = false;
     this.licensesError = ''; this.licenseRemovalSku = ''; this.licenseConfirmation = ''; this.licenseNeedsRefresh = false;
     this.busy = false;
@@ -987,15 +1066,16 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.membershipUsersRequest += 1;
     this.groupPeople = null; this.groupPeopleError = ''; this.groupPeopleRequest += 1;
     this.groupSettings = null; this.groupSettingsError = ''; this.groupSettingsRequest += 1;
-    this.groupExternalDraft = null; this.groupExternalConfirmed = false; this.groupExternalNeedsRefresh = false;
-    this.groupPrimaryDraft = ''; this.groupPrimaryConfirmed = false; this.groupPrimaryNeedsRefresh = false;
+    this.groupExternalDraft = null; this.groupExternalNeedsRefresh = false;
+    this.groupAliasDraft = ''; this.groupAliasRemoval = '';
+    this.groupPrimaryDraft = ''; this.groupPrimaryNeedsRefresh = false;
     this.driveLink = null; this.driveLinkError = ''; this.driveLinkLoading = false; this.driveLinkRequest += 1;
     this.groupNameNeedsRefresh = false;
     this.membershipAction = 'add';
     this.membershipRole = 'member'; this.membershipNeedsRefresh = false;
-    this.membershipConfirmed = false;
+
     this.userGroupRequest += 1; this.userGroupOpen = false; this.userGroups = null;
-    this.userGroupSelectedId = ''; this.userGroupConfirmed = false; this.userGroupNeedsRefresh = false;
+    this.userGroupSelectedId = ''; this.userGroupNeedsRefresh = false;
     this.userDraft = {};
     this.render();
     if (id)
@@ -1023,53 +1103,69 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       this.render();
     }
   }
+  private userMemberships: { items: Array<{id: string; displayName: string; removable: boolean; reason: string; membershipProvider?: 'graph' | 'exchange' | null}>; partial: boolean } | null = null;
+  private userGroupRemoveId = '';
+  private userGroupCatalogError = '';
+  private userMembershipError = '';
   private async openUserGroups(): Promise<void> {
     if (!this.connection?.canManage || !this.detail || this.detailKind !== 'user' || this.busy) return;
     const userId = this.detail.id;
-    const generation = this.generation;
-    const context = this.contextValue;
-    const request = ++this.userGroupRequest;
-    this.userGroupOpen = true; this.userGroups = null; this.userGroupSelectedId = '';
-    this.userGroupConfirmed = false; this.userGroupNeedsRefresh = false;
+    const generation = this.generation, context = this.contextValue, request = ++this.userGroupRequest;
+    const current = () => generation === this.generation && context === this.contextValue && request === this.userGroupRequest
+      && this.detail?.id === userId && this.userGroupOpen;
+    this.userGroupOpen = true; this.userGroups = null; this.userMemberships = null; this.userGroupRemoveId = ''; this.userGroupSelectedId = '';
+    this.userGroupCatalogError = ''; this.userMembershipError = ''; this.drawerMessage = ''; this.drawerError = false;
+    this.userGroupNeedsRefresh = false;
     this.render();
-    try {
-      const groups = parseResourceData(await this.request<unknown>(this.path('/resources/groups')));
-      if (generation !== this.generation || context !== this.contextValue || request !== this.userGroupRequest
-        || this.detail?.id !== userId || !this.userGroupOpen) return;
-      if (!groups.complete) throw new Error('The complete group list is unavailable. Refresh before assigning a member.');
-      this.userGroups = groups;
-      this.render();
-    } catch (error) {
-      if (generation === this.generation && context === this.contextValue && request === this.userGroupRequest
-        && this.detail?.id === userId && this.userGroupOpen) {
-        this.drawerError = true;
-        this.drawerMessage = error instanceof Error ? error.message : 'Could not load groups.';
-        this.render();
-      }
-    }
+    await Promise.all([
+      this.request<unknown>(this.path('/resources/groups')).then(parseResourceData).then(groups => {
+        if (!current()) return;
+        if (!groups.complete) throw new Error('The complete group list is unavailable. Refresh before assigning a member.');
+        this.userGroups = groups;
+      }).catch(error => { if (current()) this.userGroupCatalogError = error instanceof Error ? error.message : 'Could not load available groups.'; })
+        .finally(() => { if (current()) this.render(); }),
+      this.request<{ items: Array<{ id: string; displayName: string; removable: boolean; reason: string; membershipProvider?: 'graph' | 'exchange' | null }>; partial: boolean }>(this.path('/administration'), {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'user.groups.get', id: userId }),
+      }).then(memberships => {
+        if (!current()) return;
+        if (!memberships || !Array.isArray(memberships.items) || typeof memberships.partial !== 'boolean'
+          || !memberships.items.every(group => group && typeof group.id === 'string' && typeof group.displayName === 'string'
+            && typeof group.removable === 'boolean' && typeof group.reason === 'string')) throw new Error('Current group memberships could not be verified.');
+        this.userMemberships = memberships;
+      }).catch(error => { if (current()) this.userMembershipError = error instanceof Error ? error.message : 'Could not load current memberships.'; })
+        .finally(() => { if (current()) this.render(); }),
+    ]);
   }
   private async addUserToGroup(): Promise<void> {
     if (!this.connection?.canManage || !this.detail || this.detailKind !== 'user' || !this.userGroupOpen
-      || this.busy || this.userGroupNeedsRefresh || !this.userGroupConfirmed) return;
-    const groupId = this.userGroupSelectedId;
-    if (!this.userGroups?.complete || !this.userGroups.items.some(group => group.id === groupId
-      && group.values.groupKind === 'Microsoft 365 group')) return;
+      || this.busy || this.userGroupNeedsRefresh) return;
+    const removing = !!this.userGroupRemoveId;
+    const groupId = this.userGroupRemoveId || this.userGroupSelectedId;
+    if (removing && (!this.userMemberships || this.userMemberships.partial || !this.userMemberships.items.some(group => group.id === groupId && group.removable))) return;
+    if (!removing && (!this.userMemberships || !this.userGroups?.complete || !this.userGroups.items.some(group => group.id === groupId
+      && group.values.groupKind === 'Microsoft 365 group'))) return;
     const userId = this.detail.id, generation = this.generation, context = this.contextValue;
     const request = this.userGroupRequest;
-    this.busy = true; this.drawerError = false; this.drawerMessage = 'Adding group member…'; this.render();
+    this.busy = true; this.drawerError = false; this.drawerMessage = removing ? 'Removing group membership…' : 'Adding group member…'; this.render();
     try {
       const result = await this.request<{ accepted?: boolean; verified?: boolean; changed?: boolean }>(
         this.path('/administration'), { method: 'POST', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ type: 'group.member.add', groupId, userId }) });
+          body: JSON.stringify(removing && this.userMemberships?.items.find(group => group.id === groupId)?.membershipProvider === 'exchange'
+            ? { type: 'distribution.member.set', groupId, memberId: userId, enabled: false }
+            : { type: removing ? 'group.member.remove' : 'group.member.add', groupId, userId }) });
       if (generation !== this.generation || context !== this.contextValue || request !== this.userGroupRequest
         || this.detail?.id !== userId) return;
       if (result.accepted !== true) throw new Error('Microsoft did not confirm the membership change.');
       this.userGroupNeedsRefresh = result.verified !== true;
       this.drawerError = result.verified !== true;
-      this.drawerMessage = result.changed === false ? 'This account was already a member.'
+      this.drawerMessage = removing ? result.verified ? 'Group membership removed and verified.' : 'Removal accepted; refresh to confirm membership.' : result.changed === false ? 'This account was already a member.'
         : result.verified ? 'Group membership added and verified.'
           : 'Microsoft accepted the membership change, but readback is pending. Refresh before trying again.';
-      this.userGroupConfirmed = false;
+      if (result.verified && this.userMemberships) {
+        if (removing) this.userMemberships.items = this.userMemberships.items.filter(group => group.id !== groupId);
+        else { const group = this.userGroups?.items.find(item => item.id === groupId); if (group && !this.userMemberships.items.some(item => item.id === groupId)) this.userMemberships.items.push({ id: groupId, displayName: String(group.values.displayName ?? groupId), removable: true, reason: '' }); }
+      }
+      this.userGroupRemoveId = '';
     } catch (error) {
       if (generation === this.generation && context === this.contextValue && request === this.userGroupRequest
         && this.detail?.id === userId) {
@@ -1170,7 +1266,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       const body = await this.request<unknown>(this.path('/administration'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'user.mfa.methods.list', id }) });
       if (!this.mfaRequestIsCurrent(id, generation, context, request)) return null;
       const methods = parseMfaMethods(body);
-      this.mfaMethods = methods; this.mfaError = ''; this.recoveryEmailNeedsRefresh = false; this.mobilePhoneNeedsRefresh = false;
+      this.mfaMethods = methods; this.mfaRemovalNeedsRefresh = false; this.recoveryEmailDraft = methods.find(method => method.type === 'email')?.detail ?? ''; this.mobilePhoneDraft = ''; this.mfaError = ''; this.recoveryEmailNeedsRefresh = false; this.mobilePhoneNeedsRefresh = false;
       return methods;
     } catch (error) {
       if (this.mfaRequestIsCurrent(id, generation, context, request)) { this.mfaMethods = null; this.mfaError = error instanceof Error ? error.message : 'MFA methods are unavailable.'; }
@@ -1180,11 +1276,11 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     }
   }
   private async removeMfaMethod(): Promise<void> {
-    if (!this.connection?.canManage || !this.detail || this.detailKind !== 'user' || !this.mfaOpen || !this.mfaRemoval || this.busy) return;
+    if (!this.connection?.canManage || !this.detail || this.detailKind !== 'user' || !this.mfaOpen || !this.mfaRemoval || this.busy || this.mfaRemovalNeedsRefresh) return;
     if (this.mfaConfirmation !== 'REMOVE_AUTH_METHOD') { this.drawerError = true; this.drawerMessage = 'Type REMOVE_AUTH_METHOD to confirm this authentication-method removal.'; this.render(); return; }
     const id = this.detail.id; const method = this.mfaRemoval; const generation = this.generation; const context = this.contextValue; const request = ++this.mfaRequest;
     const current = () => this.mfaRequestIsCurrent(id, generation, context, request);
-    this.busy = true; this.drawerError = false; this.drawerMessage = 'Removing authentication method…'; this.render();
+    this.busy = true; this.mfaRemovalNeedsRefresh = true; this.drawerError = false; this.drawerMessage = 'Removing authentication method…'; this.render();
     try {
       const result = await this.request<{ accepted?: boolean }>(this.path('/administration'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'user.mfa.method.remove', id, kind: method.type, methodId: method.id, confirmation: 'REMOVE_AUTH_METHOD' }) });
       if (!current()) return;
@@ -1196,12 +1292,12 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       this.mfaRemoval = null; this.mfaConfirmation = '';
       this.drawerError = false; this.drawerMessage = 'Authentication method removed and verified.';
     } catch (error) {
-      if (current()) { this.drawerError = true; this.drawerMessage = error instanceof Error ? error.message : 'Authentication-method removal outcome is uncertain. Review the account before retrying.'; }
+      if (current()) { this.mfaRemovalNeedsRefresh = true; this.drawerError = true; this.drawerMessage = error instanceof Error ? error.message : 'Authentication-method removal outcome is uncertain. Review the account before retrying.'; }
     } finally { if (current()) { this.busy = false; this.mfaLoading = false; this.render(); } }
   }
 
   private async saveRecoveryEmail(): Promise<void> {
-    if (!this.connection?.canManage || !this.detail || this.detailKind !== 'user' || !this.mfaOpen || this.busy || this.recoveryEmailNeedsRefresh || !this.recoveryEmailConfirmed) return;
+    if (!this.connection?.canManage || !this.detail || this.detailKind !== 'user' || !this.mfaOpen || this.busy || this.recoveryEmailNeedsRefresh) return;
     const emailAddress = this.recoveryEmailDraft.trim();
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailAddress) || emailAddress.length > 320) {
       this.drawerError = true; this.drawerMessage = 'Enter a valid recovery email address.'; this.render(); return;
@@ -1217,7 +1313,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (!current()) return;
       this.recoveryEmailNeedsRefresh = true;
       if (result.accepted !== true) throw new Error('Microsoft did not accept the recovery email change. Refresh methods before retrying.');
-      this.recoveryEmailConfirmed = false;
+
       this.drawerError = result.verified !== true;
       this.drawerMessage = result.verified === true ? 'Recovery email saved and verified. Refresh methods to see the current address.' : 'Microsoft accepted the recovery email, but readback is pending. Refresh methods before another change.';
     } catch (error) {
@@ -1261,10 +1357,10 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
         (data.kind === 'distribution' && typeof data.emailAddressPolicyEnabled !== 'boolean')) throw new Error('Group settings response is invalid.');
       this.groupSettings = data;
       this.groupExternalDraft = !data.requireSenderAuthenticationEnabled;
-      this.groupExternalConfirmed = false;
+
       this.groupExternalNeedsRefresh = false;
       this.groupPrimaryDraft = data.primarySmtpAddress;
-      this.groupPrimaryConfirmed = false;
+
       this.groupPrimaryNeedsRefresh = false;
     } catch (error) {
       if (generation !== this.generation || context !== this.contextValue || request !== this.groupSettingsRequest
@@ -1277,7 +1373,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     if (!this.connection?.canManage || this.detailKind !== 'group' || !this.detail || !this.groupSettings ||
       this.groupExternalDraft === null || this.busy || this.groupExternalNeedsRefresh) return;
     const allowExternalSenders = this.groupExternalDraft;
-    if (allowExternalSenders === !this.groupSettings.requireSenderAuthenticationEnabled || !this.groupExternalConfirmed) return;
+    if (allowExternalSenders === !this.groupSettings.requireSenderAuthenticationEnabled) return;
     const groupId = this.detail.id, generation = this.generation, context = this.contextValue;
     const detailRequest = this.detailRequest, settingsRequest = this.groupSettingsRequest;
     this.busy = true; this.drawerError = false; this.drawerMessage = 'Saving external-sender policy…'; this.render();
@@ -1291,7 +1387,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (result.groupId !== groupId || result.allowExternalSenders !== allowExternalSenders || !result.accepted || !result.verified)
         throw new Error('Microsoft did not verify the external-sender change.');
       this.groupSettings.requireSenderAuthenticationEnabled = !allowExternalSenders;
-      this.groupExternalConfirmed = false;
+
       this.drawerMessage = 'External-sender policy saved and verified.';
     } catch (error) {
       if (generation === this.generation && context === this.contextValue && detailRequest === this.detailRequest &&
@@ -1304,9 +1400,30 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
         settingsRequest === this.groupSettingsRequest && this.detail?.id === groupId) { this.busy = false; this.render(); }
     }
   }
+  private async writeGroupAlias(): Promise<void> {
+    const groupId = this.detail?.id, settings = this.groupSettings;
+    const removing = !!this.groupAliasRemoval;
+    const address = (this.groupAliasRemoval || this.groupAliasDraft).trim();
+    if (!groupId || this.detailKind !== 'group' || !settings || !this.connection?.canManage || this.busy || this.groupPrimaryNeedsRefresh || !address ||
+      settings.kind === 'distribution' && settings.emailAddressPolicyEnabled !== false || this.detailRecord?.onPremisesSyncEnabled === true) return;
+    if (removing && (!settings.aliases.some(alias => alias.toLowerCase() === address.toLowerCase()) || address.toLowerCase() === settings.primarySmtpAddress.toLowerCase() || /\.onmicrosoft\.com$/i.test(address))) return;
+    const generation = this.generation, context = this.contextValue;
+    this.busy = true; this.drawerMessage = ''; this.drawerError = false; this.render();
+    try {
+      const result = await this.request<{accepted: boolean; verified: boolean}>(this.path('/administration'), {method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({type: removing ? 'group.alias.remove' : 'group.alias.add', groupId, address})});
+      if (generation !== this.generation || context !== this.contextValue || this.detail?.id !== groupId) return;
+      this.groupPrimaryNeedsRefresh = true;
+      if (!result.accepted || !result.verified) throw new Error('Alias outcome is pending. Refresh settings before another change.');
+      this.groupAliasDraft = ''; this.groupAliasRemoval = ''; this.drawerMessage = 'Alias change saved and verified.';
+      await this.loadGroupSettings(groupId);
+    } catch (error) {
+      if (generation === this.generation && context === this.contextValue && this.detail?.id === groupId) { this.groupPrimaryNeedsRefresh = true; this.drawerError = true; this.drawerMessage = error instanceof Error ? error.message : 'Alias outcome is uncertain. Refresh settings before another change.'; }
+    } finally { if (generation === this.generation && context === this.contextValue && this.detail?.id === groupId) { this.busy = false; this.render(); } }
+  }
+
   private async saveGroupPrimary(): Promise<void> {
     if (!this.connection?.canManage || this.detailKind !== 'group' || !this.detail || !this.groupSettings ||
-      this.busy || this.groupPrimaryNeedsRefresh || !this.groupPrimaryConfirmed) return;
+      this.busy || this.groupPrimaryNeedsRefresh) return;
     const address = this.groupPrimaryDraft.trim();
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(address) || address.length > 320 ||
       address.toLowerCase() === this.groupSettings.primarySmtpAddress.toLowerCase()) return;
@@ -1332,7 +1449,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (this.detailRecord) this.detailRecord.mail = result.primarySmtpAddress;
       this.detail.values.mail = result.primarySmtpAddress;
       this.groupPrimaryDraft = result.primarySmtpAddress;
-      this.groupPrimaryConfirmed = false;
+
       this.drawerMessage = 'Primary address saved and verified. The previous address remains an alias.';
     } catch (error) {
       if (generation === this.generation && context === this.contextValue && detailRequest === this.detailRequest &&
@@ -1478,7 +1595,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   }
 
   private async saveMobilePhone(): Promise<void> {
-    if (!this.connection?.canManage || !this.detail || this.detailKind !== 'user' || !this.mfaOpen || this.busy || this.mobilePhoneNeedsRefresh || !this.mobilePhoneConfirmed) return;
+    if (!this.connection?.canManage || !this.detail || this.detailKind !== 'user' || !this.mfaOpen || this.busy || this.mobilePhoneNeedsRefresh) return;
     const phoneNumber = this.mobilePhoneDraft.trim();
     if (!/^\+[1-9]\d{0,2} [0-9][0-9 ]{5,24}(?:x[0-9]{1,8})?$/.test(phoneNumber) || phoneNumber.length > 40) {
       this.drawerError = true; this.drawerMessage = 'Enter a mobile number with country code, such as +1 5555551234.'; this.render(); return;
@@ -1494,7 +1611,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (!current()) return;
       this.mobilePhoneNeedsRefresh = true;
       if (result.accepted !== true) throw new Error('Microsoft did not accept the mobile phone change. Refresh methods before retrying.');
-      this.mobilePhoneConfirmed = false;
+
       this.drawerError = result.verified !== true;
       this.drawerMessage = result.verified === true ? 'Mobile phone saved and verified. Refresh methods to see its masked number.' : 'Microsoft accepted the mobile phone, but readback is pending. Refresh methods before another change.';
     } catch (error) {
@@ -1665,9 +1782,6 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   }
   private async performUserSecurityAction(): Promise<void> {
     if (!this.connection?.canManage || !this.detail || this.detailKind !== 'user' || this.busy || !this.userSecurityAction) return;
-    if (!this.userSecurityConfirmed) {
-      this.drawerError = true; this.drawerMessage = 'Confirm this security action before continuing.'; this.render(); return;
-    }
     const id = this.detail.id; const generation = this.generation; const context = this.contextValue;
     const request = ++this.userSecurityRequest; const action = this.userSecurityAction;
     const verification = ++this.userVerificationRequest;
@@ -1710,7 +1824,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       } else {
         this.drawerError = false; this.drawerMessage = 'Sign-out request accepted. Microsoft may take a few minutes to revoke existing sessions.';
       }
-      this.userSecurityAction = null; this.userSecurityConfirmed = false;
+      this.userSecurityAction = null;
     } catch (error) {
       if (current()) { this.drawerError = true; this.drawerMessage = error instanceof Error ? error.message : 'Security action outcome is uncertain. Refresh the account before retrying.'; }
     } finally { if (current()) { this.busy = false; this.render(); } }
@@ -1720,12 +1834,12 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const userId = this.membershipUserId;
     const action = this.root.querySelector<HTMLSelectElement>('#group-member-action')?.value ?? this.membershipAction;
     const role = this.root.querySelector<HTMLSelectElement>('#group-member-role')?.value ?? this.membershipRole;
-    const confirmed = this.root.querySelector<HTMLInputElement>('#group-member-confirm')?.checked ?? this.membershipConfirmed;
     this.membershipUserId = userId;
     if (action === 'add' || action === 'remove') this.membershipAction = action;
     if (role === 'member' || role === 'owner') this.membershipRole = role;
-    this.membershipConfirmed = confirmed;
-    if (!userId || (action !== 'add' && action !== 'remove') || (role !== 'member' && role !== 'owner') || !confirmed || this.membershipNeedsRefresh) { this.drawerError = true; this.drawerMessage = 'Choose a user and confirm this group change. Reopen the group after an uncertain result.'; this.render(); return; }
+    if (!userId || (action !== 'add' && action !== 'remove') || (role !== 'member' && role !== 'owner') || this.membershipNeedsRefresh) { this.drawerError = true; this.drawerMessage = 'Choose a user and group assignment. Reopen the group after an uncertain result.'; this.render(); return; }
+    if (action === 'remove' && (!this.groupPeople?.complete || !(role === 'owner' ? this.groupPeople.owners : this.groupPeople.members).some(person => person.id === userId)
+      || role === 'owner' && this.groupPeople.owners.length <= 1)) { this.drawerError = true; this.drawerMessage = 'Refresh the complete membership list before removing an assignment. The last owner cannot be removed.'; this.render(); return; }
     const id = this.detail.id; const generation = this.generation; const context = this.contextValue;
     const distribution = this.detail.values.groupKind === 'Distribution list';
     if (distribution && role !== 'member') { this.drawerError = true; this.drawerMessage = 'Distribution lists do not use Microsoft 365 group owners.'; this.render(); return; }
@@ -1811,10 +1925,10 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   }
 
   private resetDelegation(): void {
-    this.delegationRequest += 1; this.delegationOpen = false; this.delegationUsers = null; this.delegationSelectedId = '';
+    this.delegationRequest += 1; this.delegationOpen = false; this.delegationUsers = null; this.delegationSelectedId = ''; this.delegationRemoveRight = '';
     this.delegationListRequest += 1; this.delegationList = null; this.delegationListLoading = false; this.delegationListError = '';
     this.delegation = null; this.delegationLoading = false; this.delegationError = ''; this.delegationMessage = '';
-    this.delegationNeedsRefresh = false; this.delegationConfirmed = false;
+    this.delegationNeedsRefresh = false;
   }
   private openDelegation(): void {
     if (this.detailKind !== 'user' || !this.detail || !this.canRead()) return;
@@ -1866,7 +1980,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const mailboxId = this.detail?.id; const delegateId = this.delegationSelectedId;
     if (!this.delegationOpen || !mailboxId || !delegateId || !this.delegationUsers?.items.some(row => row.id === delegateId)) return;
     const generation = this.generation; const context = this.contextValue; const request = ++this.delegationRequest;
-    this.delegationLoading = true; this.delegation = null; this.delegationError = ''; this.delegationMessage = ''; this.delegationConfirmed = false; this.render();
+    this.delegationLoading = true; this.delegation = null; this.delegationError = ''; this.delegationMessage = ''; this.render();
     try {
       const data = await this.request<DelegationState>(this.path('/administration'), {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -1886,8 +2000,9 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   }
   private async setDelegation(right: 'FullAccess' | 'SendAs' | 'SendOnBehalf', enabled: boolean): Promise<void> {
     const mailboxId = this.detail?.id; const delegateId = this.delegationSelectedId;
+    if (this.delegationRemoveRight && (enabled || right !== this.delegationRemoveRight)) return;
     if (!this.connection?.canManage || !this.delegationOpen || !this.delegation || !mailboxId || !delegateId ||
-      !this.delegationConfirmed || this.delegationLoading || this.delegationNeedsRefresh) return;
+      this.delegationLoading || this.delegationNeedsRefresh) return;
     const generation = this.generation; const context = this.contextValue; const request = ++this.delegationRequest;
     this.delegationLoading = true; this.delegationError = ''; this.delegationMessage = ''; this.render();
     try {
@@ -1896,12 +2011,12 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
         body: JSON.stringify({ type: 'mailbox.delegation.set', mailboxId, delegateId, right, enabled }),
       });
       if (generation !== this.generation || context !== this.contextValue || request !== this.delegationRequest || this.detail?.id !== mailboxId || this.delegationSelectedId !== delegateId) return;
-      this.delegationNeedsRefresh = true; this.delegationConfirmed = false;
+      this.delegationNeedsRefresh = true;
       this.delegationMessage = data.verified ? 'Delegation change saved and verified. Refresh before another change.' : 'Microsoft accepted the delegation change, but readback is pending. Refresh before another change.';
       void this.loadDelegationList();
     } catch (error) {
       if (generation !== this.generation || context !== this.contextValue || request !== this.delegationRequest || this.detail?.id !== mailboxId || this.delegationSelectedId !== delegateId) return;
-      this.delegationNeedsRefresh = true; this.delegationConfirmed = false;
+      this.delegationNeedsRefresh = true;
       this.delegationError = `${error instanceof Error ? error.message : 'Delegation outcome is uncertain.'} Refresh direct rights before trying again.`;
     } finally {
       if (generation === this.generation && context === this.contextValue && request === this.delegationRequest && this.detail?.id === mailboxId && this.delegationSelectedId === delegateId) {
@@ -1914,11 +2029,18 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const users = this.delegationUsers?.items.filter(row => row.id !== this.detail?.id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row.id)) ?? [];
     const options = users.map(row => `<option value="${esc(row.id)}" ${row.id === this.delegationSelectedId ? 'selected' : ''}>${esc(String(row.values.displayName ?? row.id))} · ${esc(String(row.values.userPrincipalName ?? row.values.mail ?? ''))}</option>`).join('');
     const rights = this.delegation ? ([['FullAccess', 'fullAccess', 'Full Access'], ['SendAs', 'sendAs', 'Send As'], ['SendOnBehalf', 'sendOnBehalf', 'Send on Behalf']] as const)
-      .map(([right, field, label]) => `<div class="user-field"><span>${label}: ${this.delegation![field] ? 'Granted' : 'Not granted'}</span>${canManage ? `<button class="secondary compact" data-delegation-right="${right}" data-delegation-enabled="${!this.delegation![field]}" ${!this.delegationConfirmed || this.delegationLoading || this.delegationNeedsRefresh ? 'disabled' : ''}>${this.delegation![field] ? 'Remove' : 'Grant'}</button>` : ''}</div>`).join('') : '';
-    const current = this.delegationList?.entries.map(entry => `<li><strong>${esc(entry.delegateAddress)}</strong><span>${esc([entry.fullAccess ? 'Full Access' : '', entry.sendAs ? 'Send As' : '', entry.sendOnBehalf ? 'Send on Behalf' : ''].filter(Boolean).join(' · '))}</span></li>`).join('') ?? '';
+      .filter(([right]) => !this.delegationRemoveRight || this.delegationRemoveRight === right)
+      .map(([right, field, label]) => `<div class="user-field"><span>${label}: ${this.delegation![field] ? 'Granted' : 'Not granted'}</span>${canManage && (!this.delegationRemoveRight || this.delegation![field]) ? `<button class="secondary compact" data-delegation-right="${right}" data-delegation-enabled="${!this.delegation![field]}" ${this.delegationLoading || this.delegationNeedsRefresh ? 'disabled' : ''}>${this.delegation![field] ? 'Remove' : 'Grant'}</button>` : ''}</div>`).join('') : '';
+    const current = this.delegationList?.entries.map(entry => {
+      const matches = users.filter(user => [user.values.mail, user.values.userPrincipalName].some(value => typeof value === 'string' && value.toLowerCase() === entry.delegateAddress.toLowerCase()));
+      const delegateId = matches.length === 1 ? matches[0]!.id : null;
+      const badges = ([['FullAccess', 'fullAccess', 'Full Access'], ['SendAs', 'sendAs', 'Send As'], ['SendOnBehalf', 'sendOnBehalf', 'Send on Behalf']] as const)
+        .filter(([, field]) => entry[field]).map(([right, , label]) => `<span class="delegate-permission">${label}${canManage && delegateId ? `<button class="secondary compact" data-delegate-remove="${esc(delegateId)}" data-remove-right="${right}" aria-label="Remove ${label} from ${esc(entry.delegateAddress)}" ${this.delegationLoading || this.delegationListLoading || this.delegationNeedsRefresh || this.delegationList?.partial ? 'disabled' : ''}>×</button>` : ''}</span>`).join('');
+      return `<li><strong>${esc(entry.delegateAddress)}</strong><div class="delegate-permissions">${badges}</div>${canManage && !delegateId ? '<small>Cannot match this delegate to a unique tenant user.</small>' : ''}</li>`;
+    }).join('') ?? '';
     const inventory = `<section class="drawer-section"><div class="actions"><h3>Current delegates</h3><button class="secondary compact" id="delegation-list-refresh" ${this.delegationListLoading ? 'disabled' : ''}>Refresh</button></div>${this.delegationListError ? `<p class="status" data-error="true" role="alert">${esc(this.delegationListError)}</p>` : this.delegationListLoading && !this.delegationList ? '<p class="meta">Loading current delegates…</p>' : this.delegationList ? `<ul class="delegation-current">${current || '<li>No direct delegates found.</li>'}</ul>${this.delegationList.partial ? '<p class="meta">Some permissions could not be resolved; this list may be incomplete.</p>' : ''}` : ''}</section>`;
     const feedback = this.delegationError ? `<p class="status" data-error="true" role="alert">${esc(this.delegationError)}</p>` : this.delegationMessage ? `<p class="status" role="status">${esc(this.delegationMessage)}</p>` : '';
-    return `<div class="delegation-panel"><div class="actions"><button class="secondary compact" id="delegation-refresh" ${!this.delegationSelectedId || this.delegationLoading ? 'disabled' : ''}>Refresh rights</button><button class="secondary compact" id="delegation-close">Close</button></div>${inventory}${this.delegationUsers ? `<label>Delegate<select id="delegation-user" ${this.delegationLoading ? 'disabled' : ''}><option value="">Choose a tenant user</option>${options}</select></label>${!this.delegationUsers.complete ? '<p class="meta">This is a partial user inventory; some delegates may not appear.</p>' : ''}` : this.delegationLoading ? '<p class="meta">Loading tenant users…</p>' : ''}${this.delegationLoading && this.delegationSelectedId ? '<p class="meta">Loading direct rights…</p>' : ''}${this.delegation ? `<p class="meta">${esc(this.delegation.delegateAddress)} · Direct mailbox permissions only</p>${rights}${canManage ? `<label class="check"><input id="delegation-confirm" type="checkbox" ${this.delegationConfirmed ? 'checked' : ''} ${this.delegationLoading || this.delegationNeedsRefresh ? 'disabled' : ''}> Confirm this delegate permission change</label>` : ''}` : ''}${feedback}</div>`;
+    return `<div class="delegation-panel">${inventory}${this.delegationSelectedId ? `<div class="actions"><button class="secondary compact" id="delegation-refresh" ${this.delegationLoading ? 'disabled' : ''}>Refresh selected rights</button></div>` : ''}${this.delegationUsers ? `<label>Delegate<select id="delegation-user" ${this.delegationLoading ? 'disabled' : ''}><option value="">Choose a tenant user</option>${options}</select></label>${!this.delegationUsers.complete ? '<p class="meta">This is a partial user inventory; some delegates may not appear.</p>' : ''}` : this.delegationLoading ? '<p class="meta">Loading tenant users…</p>' : ''}${this.delegationLoading && this.delegationSelectedId ? '<p class="meta">Loading direct rights…</p>' : ''}${this.delegation ? `<p class="meta">${esc(this.delegation.delegateAddress)} · Direct mailbox permissions only</p>${rights}` : ''}${feedback}</div>`;
   }
   private resetAddresses(): void {
     this.addressesRequest += 1; this.addressesOpen = false; this.addresses = null;
@@ -1973,8 +2095,12 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: action, mailboxId, address }),
       });
       if (generation !== this.generation || context !== this.contextValue || request !== this.addressesRequest || this.detail?.id !== mailboxId) return;
-      this.addressesNeedsRefresh = true;
-      this.addressesMessage = data.verified ? 'Address change saved and verified. Refresh before another change.' : 'Microsoft accepted the address change, but readback is pending. Refresh before another change.';
+      if (data.mailboxId !== mailboxId) throw new Error('Mailbox identity did not match the selected user.');
+      this.addresses = data;
+      this.primaryDraft = data.primarySmtpAddress;
+      if (data.verified) this.aliasDraft = '';
+      this.addressesNeedsRefresh = !data.verified;
+      this.addressesMessage = data.verified ? 'Address change saved and verified.' : 'Microsoft accepted the address change, but readback is pending. Refresh before another change.';
     } catch (error) {
       if (generation !== this.generation || context !== this.contextValue || request !== this.addressesRequest || this.detail?.id !== mailboxId) return;
       this.addressesNeedsRefresh = true;
@@ -2021,7 +2147,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (generation !== this.generation || context !== this.contextValue || request !== this.autoReplyRequest || this.detail?.id !== mailboxId) return;
       if (data.mailboxId !== mailboxId) throw new Error('Mailbox identity did not match the selected user.');
       this.autoReply = data;
-      this.autoReplyDraft = { state: data.state, message: data.internalMessage,
+      this.autoReplyDraft = { state: data.state, message: data.internalMessage, externalMessage: data.externalMessage, externalAudience: data.externalAudience,
         start: this.replyLocalTime(data.start), end: this.replyLocalTime(data.end) };
       this.autoReplyNeedsRefresh = false;
     } catch (error) {
@@ -2036,7 +2162,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   private async saveAutoReply(): Promise<void> {
     const mailboxId = this.detail?.id;
     if (!this.connection?.canManage || !this.autoReplyOpen || !this.autoReply || !mailboxId || this.autoReplyLoading || this.autoReplyNeedsRefresh) return;
-    const { state, message, start: localStart, end: localEnd } = this.autoReplyDraft;
+    const { state, message, externalMessage, externalAudience, start: localStart, end: localEnd } = this.autoReplyDraft;
     let start: string | null = null; let end: string | null = null;
     if (state === 'Scheduled') {
       if (!localStart || !localEnd || Number.isNaN(Date.parse(localStart)) || Number.isNaN(Date.parse(localEnd)) || Date.parse(localEnd) <= Date.parse(localStart)) {
@@ -2049,7 +2175,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     try {
       const data = await this.request<AutoReplyState & { accepted: true; verified: boolean }>(this.path('/administration'), {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ type: 'mailbox.autoreply.set', mailboxId, state, message, start, end }),
+        body: JSON.stringify({ type: 'mailbox.autoreply.set', mailboxId, state, message, externalMessage, externalAudience, start, end }),
       });
       if (generation !== this.generation || context !== this.contextValue || request !== this.autoReplyRequest || this.detail?.id !== mailboxId) return;
       this.autoReplyNeedsRefresh = true;
@@ -2069,7 +2195,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const state = this.autoReply; const busy = this.autoReplyLoading;
     const disabled = busy || !canManage || this.autoReplyNeedsRefresh;
     const feedback = this.autoReplyError ? `<p class="status" data-error="true" role="alert">${esc(this.autoReplyError)}</p>` : this.autoReplyMessage ? `<p class="status" role="status">${esc(this.autoReplyMessage)}</p>` : '';
-    const controls = state ? `<label>Status<select id="autoreply-state" ${disabled ? 'disabled' : ''}><option value="Disabled" ${this.autoReplyDraft.state === 'Disabled' ? 'selected' : ''}>Disabled</option><option value="Enabled" ${this.autoReplyDraft.state === 'Enabled' ? 'selected' : ''}>Enabled</option><option value="Scheduled" ${this.autoReplyDraft.state === 'Scheduled' ? 'selected' : ''}>Scheduled</option></select></label>${this.autoReplyDraft.state === 'Scheduled' ? `<label>Start (your time)<input id="autoreply-start" type="datetime-local" value="${esc(this.autoReplyDraft.start)}" ${disabled ? 'disabled' : ''}></label><label>End (your time)<input id="autoreply-end" type="datetime-local" value="${esc(this.autoReplyDraft.end)}" ${disabled ? 'disabled' : ''}></label>` : ''}<label>Reply<textarea id="autoreply-message" maxlength="8192" ${disabled ? 'disabled' : ''}>${esc(this.autoReplyDraft.message)}</textarea></label><p class="meta">One reply is sent internally and externally. Enabled stays on without dates.</p>${state.internalMessage !== state.externalMessage ? '<p class="meta">The current external reply differs. Saving will replace it with this one reply.</p>' : ''}${canManage ? `<button class="secondary compact" id="autoreply-save" ${disabled ? 'disabled' : ''}>Save reply</button>` : ''}` : '';
+    const controls = state ? `<label>Status<select id="autoreply-state" ${disabled ? 'disabled' : ''}><option value="Disabled" ${this.autoReplyDraft.state === 'Disabled' ? 'selected' : ''}>Disabled</option><option value="Enabled" ${this.autoReplyDraft.state === 'Enabled' ? 'selected' : ''}>Enabled</option><option value="Scheduled" ${this.autoReplyDraft.state === 'Scheduled' ? 'selected' : ''}>Scheduled</option></select></label>${this.autoReplyDraft.state === 'Scheduled' ? `<label>Start (your time)<input id="autoreply-start" type="datetime-local" value="${esc(this.autoReplyDraft.start)}" ${disabled ? 'disabled' : ''}></label><label>End (your time)<input id="autoreply-end" type="datetime-local" value="${esc(this.autoReplyDraft.end)}" ${disabled ? 'disabled' : ''}></label>` : ''}<label>Internal reply<textarea id="autoreply-message" maxlength="8192" ${disabled ? 'disabled' : ''}>${esc(this.autoReplyDraft.message)}</textarea></label><label>External reply<textarea id="autoreply-external-message" maxlength="8192" ${disabled ? 'disabled' : ''}>${esc(this.autoReplyDraft.externalMessage)}</textarea></label><label>External audience<select id="autoreply-audience" ${disabled ? 'disabled' : ''}>${(['None', 'Known', 'All'] as const).map(audience => `<option value="${audience}" ${this.autoReplyDraft.externalAudience === audience ? 'selected' : ''}>${({None: 'No external replies', Known: 'Known contacts only', All: 'All external senders'})[audience]}</option>`).join('')}</select></label>${canManage ? `<button class="secondary compact" id="autoreply-save" ${disabled ? 'disabled' : ''}>Save reply</button>` : ''}` : '';
     return `<div class="autoreply-panel"><div class="actions"><button class="secondary compact" id="autoreply-refresh" ${busy ? 'disabled' : ''}>Refresh</button><button class="secondary compact" id="autoreply-close">Close</button></div>${busy ? '<p class="meta">Loading automatic replies…</p>' : controls}${feedback}</div>`;
   }
   private openForwarding(): void {
@@ -2253,7 +2379,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   }
   private renderUserLicenses(canManage: boolean): string {
     if (!this.licensesOpen) return '<button class="secondary compact" id="licenses-open">Manage licenses</button>';
-    const items = this.userLicenses?.map(item => `<li><span><strong>${esc(item.name)}</strong><small>${item.assignedByGroup ? 'Inherited from group' : 'Direct assignment'} · ${esc(item.state)}</small></span>${canManage && item.assignedByGroup === null ? `<button class="secondary compact" data-license-remove="${esc(item.skuId)}" ${this.licensesLoading || this.licenseNeedsRefresh ? 'disabled' : ''}>Remove</button>` : ''}</li>`).join('') ?? '';
+    const items = this.userLicenses?.map(item => `<li><span><strong>${esc(item.name)}</strong><small>${item.assignedByGroup ? 'Inherited from group' : 'Direct assignment'} · ${esc(item.state)}</small></span>${canManage && item.assignedByGroup === null ? `<button class="secondary compact" aria-label="Remove ${esc(item.name)} license" title="Remove license" data-license-remove="${esc(item.skuId)}" ${this.licensesLoading || this.licenseNeedsRefresh ? 'disabled' : ''}>&times;</button>` : ''}</li>`).join('') ?? '';
     const confirmation = this.licenseRemovalSku ? `<div class="security-confirmation"><p>Remove the direct license from this account. Group-inherited licenses remain.</p><label>Type REMOVE_LICENSE to confirm<input id="license-confirmation" value="${esc(this.licenseConfirmation)}" autocomplete="off"></label><div class="actions"><button class="secondary compact" id="license-cancel">Cancel</button><button id="license-submit" ${this.licensesLoading ? 'disabled' : ''}>Remove license</button></div></div>` : '';
     const available = this.userLicenseCatalog?.map(item => `<option value="${esc(item.skuId)}" ${item.skuId === this.licenseAssignSku ? 'selected' : ''}>${esc(microsoftSkuName(item.skuPartNumber))} · ${item.prepaidUnits.enabled - item.consumedUnits} available</option>`).join('') ?? '';
     const assign = canManage && this.userLicenseCatalog ? `<label>Assign license<select id="license-assign-sku" ${this.licensesLoading || this.licenseNeedsRefresh ? 'disabled' : ''}><option value="">Select an available license</option>${available}</select></label><button class="secondary compact" id="license-assign" ${!this.licenseAssignSku || this.licensesLoading || this.licenseNeedsRefresh ? 'disabled' : ''}>Assign license</button>` : '';
@@ -2263,7 +2389,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const detail = this.detail!;
     const record = this.detailRecord;
     const feedback = `<p class="drawer-feedback ${this.drawerError ? 'error' : ''}" data-testid="detail-mutation-feedback" role="${this.drawerError ? 'alert' : 'status'}">${esc(this.drawerMessage)}</p>`;
-    const userName = String(record?.displayName ?? detail.values.displayName ?? detail.id);
+    const userName = String(record?.displayName ?? detail.values.displayName ?? detail.values.primarySmtpAddress ?? detail.id);
     const userEmail = record?.userPrincipalName ?? detail.values.userPrincipalName ?? detail.values.mail;
     const sharedMailbox = this.detailKind === 'user' && this.detailIsShared;
     const subtitle = this.detailKind === 'user' ? `${esc(userName)}${userEmail && String(userEmail) !== userName ? ` · ${esc(String(userEmail))}` : ''}` : '';
@@ -2271,64 +2397,81 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     if (this.detailKind === 'read') {
       content = `<div class="drawer-body"><dl>${Object.entries(detail.values).map(([key, value]) => `<div><dt>${esc(key)}</dt><dd>${esc(String(value ?? '—'))}</dd></div>`).join('')}</dl></div><footer class="drawer-footer">${feedback}</footer>`;
     } else if (!record) {
-      content = `<div class="drawer-body"><p class="subtle">Loading current ${this.detailKind} details…</p></div><footer class="drawer-footer">${feedback}</footer>`;
+      content = `<div class="drawer-body">${this.drawerError ? `<p class="subtle">Current ${this.detailKind} details could not be loaded.</p><button class="secondary compact" id="detail-retry">Retry loading details</button>` : `<p class="subtle">Loading current ${this.detailKind} details…</p>`}</div><footer class="drawer-footer">${feedback}</footer>`;
     } else if (this.detailKind === 'user') {
       if (sharedMailbox) {
-        content = `<div class="drawer-body"><section class="drawer-section"><h3>Shared mailbox</h3><p class="meta">${esc(String(record.mail ?? detail.values.primarySmtpAddress ?? ''))}</p>${this.renderAddresses(canManage)}</section><section class="drawer-section"><h3>Mailbox</h3>${this.renderDelegation(canManage)}${this.renderForwarding(canManage)}${this.renderAutoReply(canManage)}</section></div><footer class="drawer-footer">${feedback}</footer>`;
+        const mailboxPanel = this.accountPanel === 'delegation' ? this.renderDelegation(canManage)
+          : this.accountPanel === 'forwarding' ? this.renderForwarding(canManage)
+            : this.accountPanel === 'autoreply' ? this.renderAutoReply(canManage) : this.renderAddresses(canManage);
+        content = `<div class="drawer-body"><section class="drawer-section">${mailboxPanel}</section></div><footer class="drawer-footer">${feedback}</footer>`;
       } else if (this.mfaOpen) {
-        const methods = this.mfaMethods?.map(method => `<li><span><strong>${this.mfaMethodLabel(method)}</strong><small>${esc(method.detail || 'No additional detail available')}</small></span>${method.removable && method.id && (method.type === 'phone' || method.type === 'microsoftAuthenticator') ? `<button class="secondary compact" data-mfa-remove="${esc(method.id)}" data-mfa-kind="${method.type}" ${this.busy ? 'disabled' : ''}>Remove</button>` : '<small>Not removable</small>'}</li>`).join('') ?? '';
-        const removal = this.mfaRemoval ? `<div class="security-confirmation" role="group"><p>Remove ${esc(this.mfaRemoval.type === 'phone' ? 'phone' : 'Microsoft Authenticator')} method: ${esc(this.mfaRemoval.detail || 'No additional detail available')}.</p><label>Type REMOVE_AUTH_METHOD to confirm<input id="mfa-removal-confirmation" value="${esc(this.mfaConfirmation)}" autocomplete="off" ${this.busy ? 'disabled' : ''}></label><div class="actions"><button class="secondary" id="mfa-removal-cancel" ${this.busy ? 'disabled' : ''}>Cancel</button><button id="mfa-removal-submit" ${this.busy ? 'disabled' : ''}>Remove method</button></div></div>` : '';
-        const inventory = this.mfaLoading ? '<p class="meta">Loading authentication methods…</p>' : this.mfaMethods ? methods ? `<ul class="mfa-methods">${methods}</ul>` : '<p class="meta">No supported removable phone or Authenticator methods are registered.</p>' : `<p class="meta">MFA methods unavailable${this.mfaError ? `: ${esc(this.mfaError)}` : ''}</p>`;
+        const methods = this.mfaMethods?.map(method => `<li><span><strong>${this.mfaMethodLabel(method)}</strong><small>${esc(method.detail || 'No additional detail available')}</small></span>${method.removable && method.id && (method.type !== 'password' && method.type !== 'other') ? `<button class="secondary compact" data-mfa-remove="${esc(method.id)}" data-mfa-kind="${method.type}" aria-label="Remove ${esc(this.mfaMethodLabel(method))}: ${esc(method.detail || 'authentication method')}" ${this.busy || this.mfaRemovalNeedsRefresh ? 'disabled' : ''}>&times;</button>` : `<small>${method.type === 'password' ? 'Use Reset password' : 'Removal unavailable for this method'}</small>`}</li>`).join('') ?? '';
+        const removal = this.mfaRemoval ? `<div class="security-confirmation" role="group">${this.mfaRemovalNeedsRefresh ? '<p role="status">Refresh methods to verify the last removal before trying another change.</p>' : ''}<p>Remove ${esc(this.mfaMethodLabel(this.mfaRemoval))} method: ${esc(this.mfaRemoval.detail || 'No additional detail available')}.</p><label>Type REMOVE_AUTH_METHOD to confirm<input id="mfa-removal-confirmation" value="${esc(this.mfaConfirmation)}" autocomplete="off" ${this.busy || this.mfaRemovalNeedsRefresh ? 'disabled' : ''}></label><div class="actions"><button class="secondary" id="mfa-removal-cancel" ${this.busy ? 'disabled' : ''}>Cancel</button><button id="mfa-removal-submit" ${this.busy || this.mfaRemovalNeedsRefresh ? 'disabled' : ''}>Remove method</button></div></div>` : '';
+        const inventory = this.mfaLoading ? '<p class="meta">Loading authentication methods…</p>' : this.mfaMethods ? methods ? `<ul class="mfa-methods">${methods}</ul>` : '<p class="meta">No authentication methods are registered.</p>' : `<p class="meta">MFA methods unavailable${this.mfaError ? `: ${esc(this.mfaError)}` : ''}</p>`;
         const recoveryEmail = this.mfaMethods?.find(method => method.type === 'email')?.detail ?? '';
-        const recovery = this.mfaMethods ? `<section class="drawer-section"><h3>Recovery email</h3><p class="meta">Current: ${recoveryEmail ? esc(recoveryEmail) : 'Not set'}</p><label>Email address<input id="mfa-recovery-email" type="email" autocomplete="off" maxlength="320" value="${esc(this.recoveryEmailDraft)}" ${this.busy || this.recoveryEmailNeedsRefresh ? 'disabled' : ''}></label><label class="check"><input id="mfa-recovery-confirm" type="checkbox" ${this.recoveryEmailConfirmed ? 'checked' : ''} ${this.busy || this.recoveryEmailNeedsRefresh ? 'disabled' : ''}> I confirm this recovery email change</label><div class="actions"><button id="mfa-recovery-save" ${this.busy || this.recoveryEmailNeedsRefresh || !this.recoveryEmailConfirmed ? 'disabled' : ''}>Save recovery email</button><button class="secondary compact" id="mfa-methods-refresh" ${this.busy ? 'disabled' : ''}>Refresh methods</button></div></section>` : '';
-        const mobile = this.mfaMethods ? `<section class="drawer-section"><h3>Mobile authentication phone</h3><p class="meta">Current: ${esc(this.mfaMethods.find(method => method.type === 'phone' && method.detail?.startsWith('mobile'))?.detail ?? 'Not set')}</p><label>Number with country code<input id="mfa-mobile-phone" type="tel" autocomplete="off" maxlength="40" placeholder="+1 5555551234" value="${esc(this.mobilePhoneDraft)}" ${this.busy || this.mobilePhoneNeedsRefresh ? 'disabled' : ''}></label><label class="check"><input id="mfa-mobile-confirm" type="checkbox" ${this.mobilePhoneConfirmed ? 'checked' : ''} ${this.busy || this.mobilePhoneNeedsRefresh ? 'disabled' : ''}> I confirm this mobile phone change</label><div class="actions"><button id="mfa-mobile-save" ${this.busy || this.mobilePhoneNeedsRefresh || !this.mobilePhoneConfirmed ? 'disabled' : ''}>Save mobile phone</button></div></section>` : '';
-        content = `<div class="drawer-body"><section class="drawer-section"><h3>MFA methods</h3>${inventory}${removal}</section>${recovery}${mobile}<section class="drawer-section"><h3>Unavailable</h3><p class="meta">Re-registration and per-user MFA state are unavailable until their backend operations exist.</p></section></div><footer class="drawer-footer">${feedback}</footer>`;
+        const recovery = this.mfaMethods ? `<section class="drawer-section"><h3>Recovery email</h3><p class="meta">Current: ${recoveryEmail ? esc(recoveryEmail) : 'Not set'}</p><label>Email address<input id="mfa-recovery-email" type="email" autocomplete="off" maxlength="320" value="${esc(this.recoveryEmailDraft)}" ${this.busy || this.recoveryEmailNeedsRefresh ? 'disabled' : ''}></label><div class="actions"><button id="mfa-recovery-save" ${this.busy || this.recoveryEmailNeedsRefresh ? 'disabled' : ''}>Save recovery email</button></div></section>` : '';
+        const mobile = this.mfaMethods ? `<section class="drawer-section"><h3>Mobile authentication phone</h3><p class="meta">Current: ${esc(this.mfaMethods.find(method => method.type === 'phone' && method.detail?.startsWith('mobile'))?.detail ?? 'Not set')}</p><p class="meta">Microsoft returns a masked number. Enter a full number only to replace it; use the remove control on the current method to remove it.</p><label>Replacement number with country code<input id="mfa-mobile-phone" type="tel" autocomplete="off" maxlength="40" placeholder="+1 5555551234" value="${esc(this.mobilePhoneDraft)}" ${this.busy || this.mobilePhoneNeedsRefresh ? 'disabled' : ''}></label><div class="actions"><button id="mfa-mobile-save" ${this.busy || this.mobilePhoneNeedsRefresh ? 'disabled' : ''}>Save mobile phone</button></div></section>` : '';
+        content = `<div class="drawer-body"><button class="secondary compact" id="account-back">&larr; Account</button><section class="drawer-section"><div class="actions"><h3>MFA methods</h3><button class="secondary compact" id="mfa-methods-refresh" ${this.busy ? 'disabled' : ''}>Refresh methods</button> </div>${inventory}${removal}</section>${recovery}${mobile}<section class="drawer-section"><h3>Unavailable</h3><p class="meta">Re-registration and per-user MFA state are unavailable until their backend operations exist.</p></section></div><footer class="drawer-footer">${feedback}</footer>`;
       } else {
       const field = (name: typeof USER_FIELDS[number], label: string) => `<div class="user-field"><label><span>${label}</span><input id="user-${name}" value="${esc(String(this.userDraft[name] ?? record[name] ?? ''))}" ${this.busy || !canManage ? 'disabled' : ''}></label>${canManage ? `<button class="secondary" type="button" data-user-save="${name}" ${this.busy || String(this.userDraft[name] ?? record[name] ?? '') === String(record[name] ?? '') ? 'disabled' : ''}>Save</button>` : ''}</div>`;
-      const securityConfirmation = this.userSecurityAction ? `<div class="security-confirmation" role="group" aria-label="Confirm security action"><p>${this.userSecurityAction === 'reset-password' ? 'Microsoft will set a new temporary password and require the user to change it at next sign-in.' : this.userSecurityAction === 'revoke-sessions' ? 'Microsoft will invalidate refresh tokens and browser session cookies. Users may need to sign in again; revocation can take a few minutes.' : this.userSecurityAction === 'block-sign-in' ? 'Microsoft will block this account from signing in.' : 'Microsoft will allow this account to sign in again.'}</p><label class="check"><input id="user-security-confirm" type="checkbox" ${this.userSecurityConfirmed ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> I confirm this security action</label><div class="actions"><button class="secondary" id="user-security-cancel" ${this.busy ? 'disabled' : ''}>Cancel</button><button id="user-security-submit" ${this.busy ? 'disabled' : ''}>${this.userSecurityAction === 'reset-password' ? 'Reset password' : this.userSecurityAction === 'revoke-sessions' ? 'Sign out all sessions' : this.userSecurityAction === 'block-sign-in' ? 'Block sign-in' : 'Restore sign-in'}</button></div></div>` : '';
+      const securityConfirmation = this.userSecurityAction ? `<div class="security-confirmation" role="group" aria-label="Confirm security action"><p>${this.userSecurityAction === 'reset-password' ? 'Microsoft will set a new temporary password and require the user to change it at next sign-in.' : this.userSecurityAction === 'revoke-sessions' ? 'Microsoft will invalidate refresh tokens and browser session cookies. Users may need to sign in again; revocation can take a few minutes.' : this.userSecurityAction === 'block-sign-in' ? 'Microsoft will block this account from signing in.' : 'Microsoft will allow this account to sign in again.'}</p><div class="actions"><button class="secondary" id="user-security-cancel" ${this.busy ? 'disabled' : ''}>Cancel</button><button id="user-security-submit" ${this.busy ? 'disabled' : ''}>${this.userSecurityAction === 'reset-password' ? 'Reset password' : this.userSecurityAction === 'revoke-sessions' ? 'Sign out all sessions' : this.userSecurityAction === 'block-sign-in' ? 'Block sign-in' : 'Restore sign-in'}</button></div></div>` : '';
       const passwordDisplay = this.temporaryPassword ? `<div class="one-time-secret" role="status"><strong>Temporary password</strong><code id="temporary-password">${esc(this.temporaryPassword)}</code><p>It is shown only in this drawer. Copy it now; closing the drawer clears it.</p><button class="secondary compact" id="copy-temporary-password">Copy password</button><button class="secondary compact" id="hide-temporary-password">Hide password</button></div>` : '';
-      const globalAdmin = this.globalAdminLoading ? '<p class="meta" data-testid="global-admin-status">Loading Global Administrator status…</p>' : this.globalAdminStatus === null ? `<p class="meta" data-testid="global-admin-status">Global Administrator status unavailable${this.globalAdminError ? `: ${esc(this.globalAdminError)}` : ''}</p>` : canManage ? `<div class="role-field"><label class="check"><input id="global-admin-enabled" type="checkbox" ${this.globalAdminDraft ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> Global Administrator</label>${this.globalAdminDraft !== this.globalAdminStatus ? `<label>Type GLOBAL_ADMIN to confirm<input id="global-admin-confirmation" value="${esc(this.globalAdminConfirmation)}" autocomplete="off" ${this.busy ? 'disabled' : ''}></label><button class="secondary compact" id="global-admin-save" ${this.busy ? 'disabled' : ''}>Save role</button>` : ''}</div>` : `<p class="meta" data-testid="global-admin-status">Global Administrator: ${this.globalAdminStatus ? 'Enabled' : 'Not assigned'}</p>`;
-      const eligibleGroups = this.userGroups?.items.filter(group => group.values.groupKind === 'Microsoft 365 group') ?? [];
-      const userGroup = !canManage ? '' : `<section class="drawer-section"><h3>Groups</h3>${this.userGroupOpen
-        ? `<div class="actions"><button class="secondary compact" id="user-group-close" ${this.busy ? 'disabled' : ''}>Close groups</button><button class="secondary compact" id="user-group-refresh" ${this.busy ? 'disabled' : ''}>Refresh groups</button></div>${this.userGroups
-          ? eligibleGroups.length ? `<label>Microsoft 365 group<select id="user-group-select" ${this.busy || this.userGroupNeedsRefresh ? 'disabled' : ''}><option value="">Choose a group</option>${eligibleGroups.map(group => `<option value="${esc(group.id)}" ${group.id === this.userGroupSelectedId ? 'selected' : ''}>${esc(String(group.values.displayName ?? group.id))}</option>`).join('')}</select></label><label class="check"><input id="user-group-confirm" type="checkbox" ${this.userGroupConfirmed ? 'checked' : ''} ${this.busy || this.userGroupNeedsRefresh ? 'disabled' : ''}> I confirm this membership change</label><button id="user-group-submit" ${this.busy || this.userGroupNeedsRefresh || !this.userGroupSelectedId || !this.userGroupConfirmed ? 'disabled' : ''}>Add to group</button>`
-            : '<p class="meta">No eligible Microsoft 365 groups are available.</p>'
-          : '<p class="meta">Loading the complete group list…</p>'}`
-        : `<button class="secondary compact" id="user-group-open" ${this.busy ? 'disabled' : ''}>Add to group</button>`}</section>`;
-      content = `<div class="drawer-body"><section class="drawer-section"><h3>Account</h3><div class="field-grid">${field('displayName', 'Name')}</div><div class="role-field">${globalAdmin}</div><div class="role-field">${this.renderAddresses(canManage)}</div></section><section class="drawer-section"><h3>Licenses</h3>${this.renderUserLicenses(canManage)}</section>${userGroup}${canManage ? `<section class="drawer-section"><h3>Security</h3><div class="actions"><button class="secondary" id="user-password-reset-start" ${this.busy ? 'disabled' : ''}>Reset password</button><button class="secondary" id="user-sessions-revoke-start" ${this.busy ? 'disabled' : ''}>Sign out of all sessions</button></div>${securityConfirmation}${passwordDisplay}</section>` : ''}<section class="drawer-section"><h3>Mailbox</h3>${this.renderDelegation(canManage)}${this.renderForwarding(canManage)}${this.renderAutoReply(canManage)}</section>${canManage ? `<section class="drawer-section"><h3>OneDrive</h3><p class="meta">The link opens the user's OneDrive. Your signed-in Microsoft account still needs file access.</p><button class="secondary compact" id="user-drive-link" ${this.driveLinkLoading ? 'disabled' : ''}>${this.driveLinkLoading ? 'Loading…' : 'Show OneDrive'}</button>${this.driveLinkError ? `<p class="status" data-error="true">${esc(this.driveLinkError)}</p>` : ''}${this.driveLink ? `<p><a href="${esc(this.driveLink)}" target="_blank" rel="noopener noreferrer">Open OneDrive</a></p>` : ''}</section>` : ''}</div><footer class="drawer-footer">${canManage ? '' : '<p class="read-only">An organization administrator can edit this user.</p>'}${feedback}</footer>`;
+      const globalAdmin = this.globalAdminLoading ? '<p class="meta" data-testid="global-admin-status">Loading Global Administrator status…</p>' : this.globalAdminStatus === null ? `<p class="meta" data-testid="global-admin-status">Global Administrator status unavailable${this.globalAdminError ? `: ${esc(this.globalAdminError)}` : ''}</p><button class="secondary compact" id="global-admin-retry">Retry role status</button>` : canManage ? `<div class="role-field"><label class="check"><input id="global-admin-enabled" type="checkbox" ${this.globalAdminDraft ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> Global Administrator</label>${this.globalAdminDraft !== this.globalAdminStatus ? `<label>Type GLOBAL_ADMIN to confirm<input id="global-admin-confirmation" value="${esc(this.globalAdminConfirmation)}" autocomplete="off" ${this.busy ? 'disabled' : ''}></label><button class="secondary compact" id="global-admin-save" ${this.busy ? 'disabled' : ''}>Save role</button>` : ''}</div>` : `<p class="meta" data-testid="global-admin-status">Global Administrator: ${this.globalAdminStatus ? 'Enabled' : 'Not assigned'}</p>`;
+      const eligibleGroups = this.userGroups?.items.filter(group => group.values.groupKind === 'Microsoft 365 group'
+        && !this.userMemberships?.items.some(member => member.id === group.id)) ?? [];
+      const existingMemberships = `<h4>Current groups</h4>${this.userMemberships
+        ? `${this.userMemberships.partial ? '<p class="meta">Membership list is incomplete. Refresh before removing a membership.</p>' : ''}${this.userMemberships.items.length
+          ? `<ul class="membership-list">${this.userMemberships.items.map(group => `<li><span class="membership-name">${esc(group.displayName)}</span>${group.removable
+            ? `<button class="secondary compact" data-user-group-remove="${esc(group.id)}" aria-label="Remove from ${esc(group.displayName)}" ${this.busy || this.userMemberships?.partial || this.userGroupNeedsRefresh ? 'disabled' : ''}>&times;</button>`
+            : `<span class="membership-reason">${esc(group.reason)}</span>`}</li>`).join('')}</ul>`
+          : '<p class="meta">No direct group memberships.</p>'}`
+        : this.userMembershipError ? `<p class="status" data-error="true" role="alert">${esc(this.userMembershipError)}</p>` : '<p class="meta" role="status">Loading current memberships...</p>'}`;
+      const catalog = this.userGroups ? eligibleGroups.length
+        ? `<label>Add to Microsoft 365 group<select id="user-group-select" ${this.busy || this.userGroupNeedsRefresh || !this.userMemberships ? 'disabled' : ''}><option value="">Choose a group</option>${eligibleGroups.map(group => `<option value="${esc(group.id)}" ${group.id === this.userGroupSelectedId ? 'selected' : ''}>${esc(String(group.values.displayName ?? group.id))}</option>`).join('')}</select></label>`
+        : '<p class="meta">No additional eligible Microsoft 365 groups are available.</p>'
+        : this.userGroupCatalogError ? `<p class="status" data-error="true" role="alert">${esc(this.userGroupCatalogError)}</p>` : '<p class="meta" role="status">Loading available groups...</p>';
+      const membershipConfirmation = this.userGroupRemoveId || eligibleGroups.length ? `${this.userGroupRemoveId ? `<p role="status">Remove this account from ${esc(this.userMemberships?.items.find(group => group.id === this.userGroupRemoveId)?.displayName ?? '')}?</p>` : ''}<button id="user-group-submit" ${this.busy || this.userGroupNeedsRefresh || !this.userMemberships || (!this.userGroupSelectedId && !this.userGroupRemoveId) ? 'disabled' : ''}>${this.userGroupRemoveId ? 'Remove membership' : 'Add to group'}</button>` : '';
+      const userGroup = !canManage ? '' : `<section class="drawer-section section-groups"><h3>Groups</h3>${this.userGroupOpen
+        ? `<div class="actions"><button class="secondary compact" id="user-group-refresh" ${this.busy ? 'disabled' : ''}>Refresh groups</button></div>${existingMemberships}${this.userGroupRemoveId ? '' : catalog}${membershipConfirmation}`
+        : '<button class="secondary compact" id="user-group-open">View group memberships</button>'}</section>`;
+      content = `<div class="drawer-body account-panel" data-panel="${this.accountPanel}"><section class="drawer-section section-account"><h3>Account</h3><div class="field-grid">${field('displayName', 'Name')}</div><div class="role-field">${globalAdmin}</div></section><section class="drawer-section section-addresses"><h3>Email addresses</h3>${this.renderAddresses(canManage)}</section><section class="drawer-section section-licenses"><h3>Licenses</h3>${this.renderUserLicenses(canManage)}</section>${userGroup}${canManage ? `<section class="drawer-section section-security"><h3>Security</h3><div class="actions"><button class="secondary" id="user-password-reset-start" ${this.busy ? 'disabled' : ''}>Reset password</button><button class="secondary" id="user-sessions-revoke-start" ${this.busy ? 'disabled' : ''}>Sign out of all sessions</button><button class="secondary" data-row-security="${record.accountEnabled === false ? 'restore-sign-in' : 'block-sign-in'}" data-row-id="${esc(detail.id)}" ${this.busy ? 'disabled' : ''}>${record.accountEnabled === false ? 'Restore sign-in' : 'Block sign-in'}</button><button class="secondary" data-mfa="${esc(detail.id)}" ${this.busy ? 'disabled' : ''}>MFA</button></div>${securityConfirmation}${passwordDisplay}</section>` : ''}<section class="drawer-section section-mailbox"><h3>Mailbox</h3><div class="mailbox-delegation">${this.renderDelegation(canManage)}</div><div class="mailbox-forwarding">${this.renderForwarding(canManage)}</div><div class="mailbox-autoreply">${this.renderAutoReply(canManage)}</div></section>${canManage ? `<section class="drawer-section section-drive"><h3>OneDrive</h3><p class="meta">The link opens the user's OneDrive. Your signed-in Microsoft account still needs file access.</p><button class="secondary compact" id="user-drive-link" ${this.driveLinkLoading ? 'disabled' : ''}>${this.driveLinkLoading ? 'Loading…' : 'Show OneDrive'}</button>${this.driveLinkError ? `<p class="status" data-error="true">${esc(this.driveLinkError)}</p>` : ''}${this.driveLink ? `<p><a href="${esc(this.driveLink)}" target="_blank" rel="noopener noreferrer">Open OneDrive</a></p>` : ''}</section>` : ''}</div><footer class="drawer-footer">${canManage ? '' : '<p class="read-only">An organization administrator can edit this user.</p>'}${feedback}</footer>`;
       }
     } else {
       const query = this.membershipSearch.trim().toLowerCase();
       const users = this.membershipUsers?.items.filter(user => `${user.values.displayName ?? ''} ${user.values.userPrincipalName ?? user.values.mail ?? ''}`.toLowerCase().includes(query)) ?? [];
       const selected = this.membershipUsers?.items.find(user => user.id === this.membershipUserId);
+      const selectedExisting = [...(this.groupPeople?.members ?? []), ...(this.groupPeople?.owners ?? [])].find(person => person.id === this.membershipUserId);
       const picker = !this.membershipUsers ? `<p class="meta" data-testid="member-picker-status">${this.drawerError ? 'User list unavailable. Refresh the directory before changing group assignments.' : 'Loading users for member picker…'}</p>` : !users.length ? '<p class="meta" data-testid="member-picker-status">No loaded users match this search.</p>' : `<div class="member-options" role="listbox" aria-label="Choose user">${users.slice(0, 20).map(user => { const name = String(user.values.displayName ?? user.id); const email = user.values.userPrincipalName ?? user.values.mail; return `<button type="button" class="member-option ${user.id === this.membershipUserId ? 'selected' : ''}" data-member-user="${esc(user.id)}" role="option" aria-selected="${user.id === this.membershipUserId}" ${this.busy ? 'disabled' : ''}><strong>${esc(name)}</strong>${email ? `<small>${esc(String(email))}</small>` : ''}</button>`; }).join('')}</div>`;
       const editable = Array.isArray(record.groupTypes) && record.groupTypes.includes('Unified') && record.onPremisesSyncEnabled !== true && record.isAssignableToRole !== true;
       const distribution = detail.values.groupKind === 'Distribution list';
       const people = this.groupPeople;
-      const personList = (items: GroupPeople['members']) => items.length
-        ? `<ul class="current-members">${items.map(person => `<li><strong>${esc(person.displayName || person.userPrincipalName || person.id)}</strong>${person.userPrincipalName ? `<small>${esc(person.userPrincipalName)}</small>` : ''}</li>`).join('')}</ul>`
+      const personList = (items: GroupPeople['members'], role: 'member' | 'owner') => items.length
+        ? `<ul class="current-members">${items.map(person => `<li><strong>${esc(person.displayName || person.userPrincipalName || person.id)}</strong>${person.userPrincipalName ? `<small>${esc(person.userPrincipalName)}</small>` : ''}${canManage && (editable || distribution) ? `<button class="secondary compact" data-group-person-remove="${esc(person.id)}" data-group-person-role="${role}" aria-label="Remove ${esc(person.displayName || person.userPrincipalName || person.id)} as ${role}" ${this.busy || this.membershipNeedsRefresh || !people?.complete || role === 'owner' && people.owners.length <= 1 ? 'disabled' : ''}>×</button>` : ''}</li>`).join('')}</ul>`
         : '<p class="meta">None</p>';
-      const currentPeople = `<div class="current-people" data-testid="current-group-people"><div class="actions"><h4>${distribution ? 'Current list members' : 'Current members and owners'}</h4><button class="secondary compact" id="group-people-refresh" ${this.busy ? 'disabled' : ''}>Refresh</button></div><div aria-live="polite">${this.groupPeopleError ? `<p class="status" data-error="true">${esc(this.groupPeopleError)}</p>` : people ? `<h5>Members (${people.members.length})</h5>${personList(people.members)}${distribution ? '' : `<h5>Owners (${people.owners.length})</h5>${personList(people.owners)}${people.otherMemberCount ? `<p class="meta">${people.otherMemberCount} other directory members are not shown.</p>` : ''}`}${!people.complete ? '<p class="status" data-error="true">The membership list is incomplete; refresh before relying on it.</p>' : ''}` : '<p class="meta">Loading current membership…</p>'}</div></div>`;
+      const currentPeople = `<div class="current-people" data-testid="current-group-people"><div class="actions"><h4>${this.accountPanel === 'owners' ? 'Current owners' : 'Current members'}</h4><button class="secondary compact" id="group-people-refresh" ${this.busy ? 'disabled' : ''}>Refresh</button></div><div aria-live="polite">${this.groupPeopleError ? `<p class="status" data-error="true">${esc(this.groupPeopleError)}</p>` : people ? `${this.accountPanel !== 'owners' ? `<h5>Members (${people.members.length})</h5>${personList(people.members, 'member')}` : ''}${distribution || this.accountPanel !== 'owners' ? '' : `<h5>Owners (${people.owners.length})</h5>${personList(people.owners, 'owner')}${people.owners.length === 1 ? '<p class="meta">The last owner cannot be removed. Add another owner first.</p>' : ''}${people.otherMemberCount ? `<p class="meta">${people.otherMemberCount} other directory members are not shown.</p>` : ''}`}${!people.complete ? '<p class="status" data-error="true">The membership list is incomplete; refresh before relying on it.</p>' : ''}` : '<p class="meta">Loading current membership…</p>'}</div></div>`;
       const settings = this.groupSettings;
       const primaryEditor = canManage && settings ? (settings.kind === 'distribution' && settings.emailAddressPolicyEnabled !== false
         ? '<p class="meta">This address follows an Exchange email-address policy and cannot be changed here.</p>'
-        : `<label>New primary address<input id="group-primary-address" type="email" maxlength="320" value="${esc(this.groupPrimaryDraft)}" ${this.busy || this.groupPrimaryNeedsRefresh ? 'disabled' : ''}></label>${this.groupPrimaryDraft.trim().toLowerCase() !== settings.primarySmtpAddress.toLowerCase() ? `<label class="check"><input id="group-primary-confirm" type="checkbox" ${this.groupPrimaryConfirmed ? 'checked' : ''} ${this.busy || this.groupPrimaryNeedsRefresh ? 'disabled' : ''}> I confirm this mail-routing change. The old address must remain an alias.</label><button class="secondary compact" id="group-primary-save" ${this.busy || this.groupPrimaryNeedsRefresh || !this.groupPrimaryConfirmed ? 'disabled' : ''}>Save primary address</button>` : ''}`) : '';
-      const settingsPanel = `<section class="drawer-section" data-testid="group-settings"><div class="actions"><h3>Delivery settings</h3><button class="secondary compact" id="group-settings-refresh" ${this.busy ? 'disabled' : ''}>Refresh</button></div>${this.groupSettingsError ? `<p class="status" data-error="true">${esc(this.groupSettingsError)}</p>` : settings ? `<dl><div><dt>Primary address</dt><dd>${esc(settings.primarySmtpAddress)}</dd></div><div><dt>Other SMTP addresses</dt><dd>${settings.aliases.length ? settings.aliases.map(alias => esc(alias)).join(' · ') : 'None'}</dd></div>${settings.kind === 'distribution' ? `<div><dt>Address policy</dt><dd>${settings.emailAddressPolicyEnabled ? 'Managed automatically' : 'Manual'}</dd></div>` : ''}<div><dt>External senders</dt><dd>${settings.requireSenderAuthenticationEnabled ? 'Not allowed' : 'Allowed'}</dd></div></dl>${canManage ? `<label class="check"><input id="group-external-allow" type="checkbox" ${this.groupExternalDraft ? 'checked' : ''} ${this.busy || this.groupExternalNeedsRefresh ? 'disabled' : ''}> Allow external senders</label>${this.groupExternalDraft !== !settings.requireSenderAuthenticationEnabled ? `<label class="check"><input id="group-external-confirm" type="checkbox" ${this.groupExternalConfirmed ? 'checked' : ''} ${this.busy || this.groupExternalNeedsRefresh ? 'disabled' : ''}> I confirm this sender-policy change</label><button class="secondary compact" id="group-external-save" ${this.busy || this.groupExternalNeedsRefresh || !this.groupExternalConfirmed ? 'disabled' : ''}>Save sender policy</button>` : ''}${primaryEditor}` : ''}` : '<p class="meta">Loading delivery settings…</p>'}</section>`;
-      content = `<div class="drawer-body"><p class="meta">${record.mail ? esc(String(record.mail)) : 'Microsoft 365 group'}</p>${canManage && (editable || distribution) ? `<section class="drawer-section"><h3>Group</h3><div class="user-field"><label><span>Name</span><input id="group-name" maxlength="256" value="${esc(this.groupNameDraft)}" ${this.busy || this.groupNameNeedsRefresh ? 'disabled' : ''}></label><button class="secondary compact" id="group-name-save" ${this.busy || this.groupNameNeedsRefresh || this.groupNameDraft.trim() === String(record.displayName ?? '') ? 'disabled' : ''}>Save name</button></div></section>` : ''}${settingsPanel}${currentPeople}${canManage && (editable || distribution) ? `<section class="drawer-section"><h3>Membership</h3><label>Find user<input id="group-member-search" value="${esc(this.membershipSearch)}" placeholder="Search loaded names or emails" autocomplete="off" ${this.busy ? 'disabled' : ''}></label>${picker}${selected ? `<p class="meta">Selected: ${esc(String(selected.values.displayName ?? selected.id))}</p>` : ''}${distribution ? '' : `<label>Group assignment<select id="group-member-role" ${this.busy || this.membershipNeedsRefresh ? 'disabled' : ''}><option value="member" ${this.membershipRole === 'member' ? 'selected' : ''}>Member</option><option value="owner" ${this.membershipRole === 'owner' ? 'selected' : ''}>Owner</option></select></label>`}<label>Membership action<select id="group-member-action" ${this.busy ? 'disabled' : ''}><option value="add" ${this.membershipAction === 'add' ? 'selected' : ''}>Add member</option><option value="remove" ${this.membershipAction === 'remove' ? 'selected' : ''}>Remove member</option></select></label><label class="check"><input id="group-member-confirm" type="checkbox" ${this.membershipConfirmed ? 'checked' : ''} ${this.busy ? 'disabled' : ''}> I confirm this membership change</label></section>` : '<p class="read-only">Membership changes for this group type are not available here.</p>'}</div><footer class="drawer-footer">${canManage && (editable || distribution) ? `<div class="actions"><button id="group-member-submit" ${this.busy || this.membershipNeedsRefresh || !this.membershipUserId ? 'disabled' : ''}>Confirm group change</button></div>` : ''}${feedback}</footer>`;
+        : `<label>New primary address<input id="group-primary-address" type="email" maxlength="320" value="${esc(this.groupPrimaryDraft)}" ${this.busy || this.groupPrimaryNeedsRefresh ? 'disabled' : ''}></label>${this.groupPrimaryDraft.trim().toLowerCase() !== settings.primarySmtpAddress.toLowerCase() ? `<p class="meta">Changing the primary address affects mail routing. The old address remains an alias.</p><button class="secondary compact" id="group-primary-save" ${this.busy || this.groupPrimaryNeedsRefresh ? 'disabled' : ''}>Save primary address</button>` : ''}`) : '';
+      const aliasEditable = canManage && settings && !(settings.kind === 'distribution' && settings.emailAddressPolicyEnabled !== false) && record.onPremisesSyncEnabled !== true;
+      const aliasList = settings?.aliases.map(alias => `<span class="alias-chip"><span>${esc(alias)}</span>${aliasEditable && alias.toLowerCase() !== settings.primarySmtpAddress.toLowerCase() && !/\.onmicrosoft\.com$/i.test(alias) ? `<button class="alias-remove" data-group-alias-remove="${esc(alias)}" aria-label="Remove alias ${esc(alias)}" ${this.busy || this.groupPrimaryNeedsRefresh ? 'disabled' : ''}>×</button>` : '<small>Managed address</small>'}</span>`).join('') || 'None';
+      const aliasEditor = aliasEditable ? `<section class="drawer-section"><h4>Aliases</h4>${this.groupAliasRemoval ? `<p>Remove alias ${esc(this.groupAliasRemoval)}?</p><button class="secondary compact" id="group-alias-cancel">Cancel removal</button>` : `<label>New alias<input id="group-alias-address" type="email" maxlength="320" value="${esc(this.groupAliasDraft)}" ${this.busy || this.groupPrimaryNeedsRefresh ? 'disabled' : ''}></label>`}<button id="group-alias-submit" ${this.busy || this.groupPrimaryNeedsRefresh || !(this.groupAliasRemoval || this.groupAliasDraft).trim() ? 'disabled' : ''}>${this.groupAliasRemoval ? 'Remove alias' : 'Add alias'}</button></section>` : '';
+      const settingsPanel = `<section class="drawer-section" data-testid="group-settings"><div class="actions"><h3>Delivery settings</h3><button class="secondary compact" id="group-settings-refresh" ${this.busy ? 'disabled' : ''}>Refresh</button></div>${this.groupSettingsError ? `<p class="status" data-error="true">${esc(this.groupSettingsError)}</p>` : settings ? `<dl><div><dt>Primary address</dt><dd>${esc(settings.primarySmtpAddress)}</dd></div><div><dt>Email aliases</dt><dd>${aliasList}</dd></div>${settings.kind === 'distribution' ? `<div><dt>Address policy</dt><dd>${settings.emailAddressPolicyEnabled ? 'Managed automatically' : 'Manual'}</dd></div>` : ''}<div><dt>External senders</dt><dd>${settings.requireSenderAuthenticationEnabled ? 'Not allowed' : 'Allowed'}</dd></div></dl>${canManage ? `<label class="check"><input id="group-external-allow" type="checkbox" ${this.groupExternalDraft ? 'checked' : ''} ${this.busy || this.groupExternalNeedsRefresh ? 'disabled' : ''}> Allow external senders</label>${this.groupExternalDraft !== !settings.requireSenderAuthenticationEnabled ? `<button class="secondary compact" id="group-external-save" ${this.busy || this.groupExternalNeedsRefresh ? 'disabled' : ''}>Save sender policy</button>` : ''}${primaryEditor}${aliasEditor}` : ''}` : '<p class="meta">Loading delivery settings…</p>'}</section>`;
+      content = `<div class="drawer-body"><p class="meta">${record.mail ? esc(String(record.mail)) : 'Microsoft 365 group'}</p>${this.accountPanel === 'account' && canManage && (editable || distribution) ? `<section class="drawer-section"><h3>Group</h3><div class="user-field"><label><span>Name</span><input id="group-name" maxlength="256" value="${esc(this.groupNameDraft)}" ${this.busy || this.groupNameNeedsRefresh ? 'disabled' : ''}></label><button class="secondary compact" id="group-name-save" ${this.busy || this.groupNameNeedsRefresh || this.groupNameDraft.trim() === String(record.displayName ?? '') ? 'disabled' : ''}>Save name</button></div></section>` : ''}${this.accountPanel === 'email' ? settingsPanel : ''}${['members', 'owners'].includes(this.accountPanel) ? currentPeople : ''}${['members', 'owners'].includes(this.accountPanel) && canManage && (editable || distribution) ? `<section class="drawer-section"><h3>Membership</h3><label>Find user<input id="group-member-search" value="${esc(this.membershipSearch)}" placeholder="Search loaded names or emails" autocomplete="off" ${this.busy ? 'disabled' : ''}></label>${picker}${selected || selectedExisting ? `<p class="meta">${this.membershipAction === 'remove' ? 'Remove' : 'Selected'} ${this.membershipRole}: ${esc(String(selected?.values.displayName ?? selectedExisting?.displayName ?? this.membershipUserId))}</p>` : ''}${distribution ? '' : `<label>Group assignment<select id="group-member-role" ${this.busy || this.membershipNeedsRefresh ? 'disabled' : ''}><option value="member" ${this.membershipRole === 'member' ? 'selected' : ''}>Member</option><option value="owner" ${this.membershipRole === 'owner' ? 'selected' : ''}>Owner</option></select></label>`}<label>Membership action<select id="group-member-action" ${this.busy ? 'disabled' : ''}><option value="add" ${this.membershipAction === 'add' ? 'selected' : ''}>Add member</option><option value="remove" ${this.membershipAction === 'remove' ? 'selected' : ''}>Remove member</option></select></label></section>` : ['members', 'owners'].includes(this.accountPanel) ? '<p class="read-only">Membership changes for this group type are not available here.</p>' : ''}</div><footer class="drawer-footer">${['members', 'owners'].includes(this.accountPanel) && canManage && (editable || distribution) ? `<div class="actions"><button id="group-member-submit" ${this.busy || this.membershipNeedsRefresh || !this.membershipUserId ? 'disabled' : ''}>${this.membershipAction === 'remove' ? 'Remove' : 'Add'} ${this.membershipRole}</button></div>` : ''}${feedback}</footer>`;
     }
-    const title = sharedMailbox ? 'Shared mailbox' : this.detailKind === 'user' ? (canManage ? 'Edit account' : 'View account') : this.detailKind === 'group' ? record && (detail.values.groupKind === 'Distribution list' || (Array.isArray(record.groupTypes) && record.groupTypes.includes('Unified'))) ? (canManage ? 'Edit group' : 'Group details') : 'Group details' : 'Resource details';
-    return `<div class="backdrop" data-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="detail-title"><div class="heading drawer-heading"><div><h2 id="detail-title">${title}</h2>${subtitle ? `<p class="subtle">${subtitle}</p>` : ''}</div><button class="secondary compact" id="detail-close">Close</button></div>${content}</aside></div>`;
+    const title = this.mfaOpen ? 'Authentication methods' : sharedMailbox ? 'Shared mailbox' : this.detailKind === 'user' ? (canManage ? 'Edit account' : 'View account') : this.detailKind === 'group' ? record && (detail.values.groupKind === 'Distribution list' || (Array.isArray(record.groupTypes) && record.groupTypes.includes('Unified'))) ? (canManage ? 'Edit group' : 'Group details') : 'Group details' : 'Resource details';
+    return `<div class="backdrop" data-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="detail-title"><div class="heading drawer-heading"><div><h2 id="detail-title">${this.detailKind === 'group' ? esc(({account: 'Group details', email: 'Group email settings', members: 'Group members', owners: 'Group owners'} as Record<string,string>)[this.accountPanel] ?? title) : this.detailKind === 'user' && !this.mfaOpen ? esc(({account: title, addresses: 'Email addresses', licenses: 'Licenses', groups: 'Group membership', security: 'Account security', delegation: 'Mailbox delegation', forwarding: 'Mail forwarding', autoreply: 'Out of office', drive: 'OneDrive'} as Record<string, string>)[this.accountPanel] ?? title) : title}</h2>${subtitle ? `<p class="subtle">${subtitle}</p>` : ''}</div><button class="secondary compact" id="detail-close">Close</button></div>${content}</aside></div>`;
   }
 
   private renderCreateUserDrawer(): string {
     const domains = this.createUserDomains;
     const done = this.createdUser;
     const licenseOptions = this.createUserLicenses?.map(item => `<option value="${esc(item.skuId)}" ${item.skuId === this.createUserDraft.skuId ? 'selected' : ''}>${esc(microsoftSkuName(item.skuPartNumber))} · ${item.prepaidUnits.enabled - item.consumedUnits} available</option>`).join('') ?? '';
-    const licenseForm = `<section class="drawer-section"><h3>Assignments</h3><label>Usage location (ISO country code)<input id="create-user-location" aria-label="Usage location" maxlength="2" autocomplete="off" value="${esc(this.createUserDraft.location)}" placeholder="US, GB, CA…" ${this.createUserBusy ? 'disabled' : ''}></label><label>License<select id="create-user-license" aria-label="License" ${this.createUserBusy || this.createUserLicenses === null ? 'disabled' : ''}><option value="">No license</option>${licenseOptions}</select></label>${this.createLicenseCatalogError ? `<p class="meta">${esc(this.createLicenseCatalogError)} You can create the user without a license.</p>` : this.createUserLicenses === null ? '<p class="meta">Loading available license seats…</p>' : !this.createUserLicenses.length ? '<p class="meta">No license seats are available.</p>' : ''}<p class="meta">MFA enrollment, aliases, and group membership remain separate actions after creation.</p></section>`;
+    const licenseForm = `<section class="drawer-section"><h3>Assignments</h3><label>Group membership<select id="create-user-group" aria-label="Group membership" ${this.createUserBusy || !this.createUserGroups ? 'disabled' : ''}><option value="">Choose a group to add</option>${(this.createUserGroups ?? []).filter(group => !this.createUserGroupIds.includes(group.id)).map(group => `<option value="${esc(group.id)}">${esc(String(group.values.displayName ?? group.id))}</option>`).join('')}</select></label><div class="address-aliases">${this.createUserGroupIds.map(id => `<div class="alias-chip"><span>${esc(String(this.createUserGroups?.find(group => group.id === id)?.values.displayName ?? id))}</span><button type="button" class="alias-remove" data-create-group-remove="${esc(id)}" aria-label="Remove selected group ${esc(String(this.createUserGroups?.find(group => group.id === id)?.values.displayName ?? id))}" ${this.createUserBusy ? 'disabled' : ''}>×</button></div>`).join('')}</div>${this.createUserGroupsError ? `<p class="meta" role="alert">${esc(this.createUserGroupsError)}</p><button id="create-user-groups-retry" class="secondary compact" type="button">Retry loading groups</button>` : this.createUserGroups === null ? '<p class="meta">Loading groups…</p>' : '<p class="meta">Selected groups are assigned after the account is created. Dynamic and synchronized groups are managed elsewhere.</p>'}<label>License<select id="create-user-license" aria-label="License" ${this.createUserBusy || this.createUserLicenses === null || !this.createUserDraft.location ? 'disabled' : ''}><option value="">No license</option>${licenseOptions}</select></label>${this.createUserDomains && !this.createUserDraft.location ? '<p class="meta">This tenant has no default usage location. Create the account without a license, or configure the tenant default before assigning a license here.</p>' : ''}${this.createLicenseCatalogError ? `<p class="meta">${esc(this.createLicenseCatalogError)} You can create the user without a license.</p><button class="secondary compact" id="create-user-licenses-retry" ${this.createUserBusy ? 'disabled' : ''}>Retry loading licenses</button>` : this.createUserLicenses === null ? '<p class="meta">Loading available license seats…</p>' : !this.createUserLicenses.length ? '<p class="meta">No license seats are available.</p>' : ''}<p class="meta">MFA enrollment and aliases can be managed after creation.</p></section>`;
     const licenseStatus = this.createLicenseOutcome ? `<p class="status" data-error="${this.createLicenseOutcomeError}" role="status">${esc(this.createLicenseOutcome)}</p>` : '';
     const status = this.createUserError ? `<div class="actions"><p class="status" data-error="true" role="alert">${esc(this.createUserError)}</p>${domains?.length ? '' : '<button class="secondary compact" id="create-user-domains-retry">Retry loading domains</button>'}</div>` : '';
-    const content = done ? `<div class="drawer-body"><section class="drawer-section"><h3>Created account</h3><p>${esc(done.userPrincipalName)}</p><label>Temporary password<input aria-label="Temporary password" type="text" readonly value="${esc(done.temporaryPassword)}"></label><p class="meta">Copy this password now. It is shown only in this drawer; the user must change it at next sign-in. It may take a moment to appear in the directory.</p></section><section class="drawer-section"><h3>Next assignments</h3>${licenseStatus}<p class="meta">MFA enrollment, aliases, and group membership remain separate actions; they were not applied during creation.</p></section></div>` : `<div class="drawer-body"><section class="drawer-section"><h3>Account</h3><label>Name<input id="create-user-name" aria-label="Name" maxlength="256" value="${esc(this.createUserDraft.name)}" placeholder="Full name" ${this.createUserBusy ? 'disabled' : ''}></label><label>Sign-in name<div class="upn-field"><input id="create-user-local" aria-label="Sign-in name" maxlength="64" value="${esc(this.createUserDraft.local)}" placeholder="name" ${this.createUserBusy ? 'disabled' : ''}><span>@</span><select id="create-user-domain" aria-label="Domain" ${!domains?.length || this.createUserBusy ? 'disabled' : ''}>${domains?.length ? domains.map(domain => `<option value="${esc(domain)}" ${domain === this.createUserDraft.domain ? 'selected' : ''}>${esc(domain)}</option>`).join('') : domains === null ? '<option>Loading verified domains…</option>' : '<option>Domains unavailable</option>'}</select></div></label></section><section class="drawer-section"><h3>Sign-in</h3><p class="meta">A temporary password is generated securely when the user is created.</p><label class="check"><input type="checkbox" checked disabled> Force change password at next sign-in</label></section>${licenseForm}</div>`;
-    return `<div class="backdrop" data-create-user-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="create-user-title"><div class="heading drawer-heading"><div><h2 id="create-user-title">Add user</h2><p class="subtle">${done ? 'Account created' : 'Create a Microsoft 365 user'}</p></div><button class="secondary compact" id="create-user-close" ${this.createUserBusy ? 'disabled' : ''}>Close</button></div>${status}${content}<footer class="drawer-footer"><div class="actions">${done ? '' : `<button id="create-user-submit" ${!domains?.length || this.createUserBusy ? 'disabled' : ''}>Create user</button>`}</div></footer></aside></div>`;
+    const content = done ? `<div class="drawer-body"><section class="drawer-section"><h3>Created account</h3><p>${esc(done.userPrincipalName)}</p><label>${this.createUserForceChange ? 'Temporary password' : 'Password'}<input aria-label="${this.createUserForceChange ? 'Temporary password' : 'Password'}" type="text" readonly value="${esc(done.temporaryPassword)}"></label><p class="meta">Copy this password now. It is shown only in this drawer; ${this.createUserForceChange ? 'The user must change it at next sign-in.' : 'A password change is not required at next sign-in.'} It may take a moment to appear in the directory.</p></section><section class="drawer-section"><h3>Assignment results</h3>${licenseStatus}${this.createUserGroupOutcomes.map(outcome => `<p class="meta" role="status">${esc(outcome)}</p>`).join('')}${this.createUserBusy ? '<p role="status">Applying selected assignments…</p>' : ''}<p class="meta">MFA enrollment and aliases remain separate actions. Review any unconfirmed assignments before retrying; do not create the account again.</p></section></div>` : `<div class="drawer-body"><section class="drawer-section"><h3>Account</h3><label>Name<input id="create-user-name" aria-label="Name" maxlength="256" value="${esc(this.createUserDraft.name)}" placeholder="Full name" ${this.createUserBusy ? 'disabled' : ''}></label><label>Sign-in name<div class="upn-field"><input id="create-user-local" aria-label="Sign-in name" maxlength="64" value="${esc(this.createUserDraft.local)}" placeholder="name" ${this.createUserBusy ? 'disabled' : ''}><span>@</span><select id="create-user-domain" aria-label="Domain" ${!domains?.length || this.createUserBusy ? 'disabled' : ''}>${domains?.length ? domains.map(domain => `<option value="${esc(domain)}" ${domain === this.createUserDraft.domain ? 'selected' : ''}>${esc(domain)}</option>`).join('') : domains === null ? '<option>Loading verified domains…</option>' : '<option>Domains unavailable</option>'}</select></div></label></section><section class="drawer-section"><h3>Sign-in</h3><label>Password setup<select id="create-user-password-mode" aria-label="Password setup" ${this.createUserBusy ? 'disabled' : ''}><option value="generated" ${this.createUserPasswordMode === 'generated' ? 'selected' : ''}>Generate a password automatically</option><option value="custom" ${this.createUserPasswordMode === 'custom' ? 'selected' : ''}>Set a password</option></select></label>${this.createUserPasswordMode === 'custom' ? `<label>Password<input type="password" id="create-user-password" aria-label="Password" autocomplete="new-password" minlength="8" maxlength="256" value="${esc(this.createUserPassword)}" ${this.createUserBusy ? 'disabled' : ''}></label><p class="meta">Must meet the tenant’s password policy.</p>` : '<p class="meta">A password is generated securely when the user is created.</p>'}<label class="check"><input id="create-user-force-change" type="checkbox" ${this.createUserForceChange ? 'checked' : ''} ${this.createUserBusy ? 'disabled' : ''}> Force change password at next sign-in</label></section>${licenseForm}</div>`;
+    return `<div class="backdrop" data-create-user-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="create-user-title"><div class="heading drawer-heading"><div><h2 id="create-user-title">Add user</h2><p class="subtle">${done ? 'Account created' : 'Create a Microsoft 365 user'}</p></div><button class="secondary compact" id="create-user-close" ${this.createUserBusy ? 'disabled' : ''}>Close</button></div>${status}${content}<footer class="drawer-footer"><div class="actions">${done ? '' : `<button id="create-user-submit" ${!domains?.length || this.createUserBusy || this.createUserUncertain ? 'disabled' : ''}>Create user</button>`}</div></footer></aside></div>`;
   }
   private renderCreateGroupDrawer(): string {
     const done = this.createdGroup;
@@ -2336,8 +2479,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const distribution = this.createGroupDraft.kind === 'distribution';
     const fields = distribution
       ? `<label>Email address<input id="create-group-address" type="email" maxlength="320" value="${esc(this.createGroupDraft.primarySmtpAddress)}" placeholder="team@example.com" ${this.createGroupBusy ? 'disabled' : ''}></label><p class="meta">The address must use a domain accepted by this tenant. Exchange verifies it before creating the list.</p>`
-      : `<label>Mail alias<input id="create-group-alias" maxlength="64" value="${esc(this.createGroupDraft.alias)}" placeholder="team" ${this.createGroupBusy ? 'disabled' : ''}></label><label>Owner<select id="create-group-owner" ${!owners.length || this.createGroupBusy ? 'disabled' : ''}><option value="">Choose a tenant user</option>${owners.map(row => `<option value="${esc(row.id)}" ${row.id === this.createGroupDraft.ownerId ? 'selected' : ''}>${esc(String(row.values.displayName ?? row.id))} · ${esc(String(row.values.userPrincipalName ?? ''))}</option>`).join('')}</select></label><p class="meta">Microsoft assigns the primary address for Microsoft 365 groups.</p>`;
-    return `<div class="backdrop" data-create-group-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="create-group-title"><div class="heading drawer-heading"><div><h2 id="create-group-title">Add group</h2><p class="subtle">${distribution ? 'Exchange distribution list' : 'Microsoft 365 group'}</p></div><button class="secondary compact" id="create-group-close" ${this.createGroupBusy ? 'disabled' : ''}>Close</button></div><div class="drawer-body">${done ? `<p role="status">Microsoft accepted group creation.${done.verified ? (done.kind === 'distribution' ? ' Microsoft verified the new group.' : ' Group details were verified.') : ' Group details are still propagating; refresh before another action.'}</p><p class="meta">${done.id ? `Group ID: ${esc(done.id)} · ` : ''}Address: ${esc(done.mail || 'Pending')}</p>` : `<section class="drawer-section"><label>Group type<select id="create-group-kind" ${this.createGroupBusy ? 'disabled' : ''}><option value="m365" ${!distribution ? 'selected' : ''}>Microsoft 365 group</option><option value="distribution" ${distribution ? 'selected' : ''}>Distribution list</option></select></label><label>Name<input id="create-group-name" maxlength="256" value="${esc(this.createGroupDraft.name)}" ${this.createGroupBusy ? 'disabled' : ''}></label>${fields}</section>`}${this.createGroupError ? `<p class="status" data-error="true" role="alert">${esc(this.createGroupError)}</p>` : ''}</div><footer class="drawer-footer">${done ? '' : `<div class="actions"><button id="create-group-submit" ${this.createGroupBusy || (!distribution && !owners.length) ? 'disabled' : ''}>Create group</button></div>`}</footer></aside></div>`;
+      : `<label>Mail alias<input id="create-group-alias" maxlength="64" value="${esc(this.createGroupDraft.alias)}" placeholder="team" ${this.createGroupBusy ? 'disabled' : ''}></label><label>Owner<select id="create-group-owner" ${!owners.length || this.createGroupBusy ? 'disabled' : ''}><option value="">Choose a tenant user</option>${owners.map(row => `<option value="${esc(row.id)}" ${row.id === this.createGroupDraft.ownerId ? 'selected' : ''}>${esc(String(row.values.displayName ?? row.id))} · ${esc(String(row.values.userPrincipalName ?? ''))}</option>`).join('')}</select></label><p class="meta">Microsoft assigns the primary address for Microsoft 365 groups.</p>${!this.createGroupUsers ? this.createGroupError ? '<button class="secondary compact" id="create-group-owners-retry">Retry loading owners</button>' : '<p class="meta" role="status">Loading tenant users…</p>' : !owners.length ? '<p class="meta">No tenant users are available to own this group.</p>' : ''}`;
+    return `<div class="backdrop" data-create-group-backdrop><aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="create-group-title"><div class="heading drawer-heading"><div><h2 id="create-group-title">Add group</h2><p class="subtle">${distribution ? 'Exchange distribution list' : 'Microsoft 365 group'}</p></div><button class="secondary compact" id="create-group-close" ${this.createGroupBusy ? 'disabled' : ''}>Close</button></div><div class="drawer-body">${done ? `<p role="status">Microsoft accepted group creation.${done.verified ? (done.kind === 'distribution' ? ' Microsoft verified the new group.' : ' Group details were verified.') : ' Group details are still propagating; refresh before another action.'}</p><p class="meta">${done.id ? `Group ID: ${esc(done.id)} · ` : ''}Address: ${esc(done.mail || 'Pending')}</p>` : `<section class="drawer-section"><label>Group type<select id="create-group-kind" ${this.createGroupBusy ? 'disabled' : ''}><option value="m365" ${!distribution ? 'selected' : ''}>Microsoft 365 group</option><option value="distribution" ${distribution ? 'selected' : ''}>Distribution list</option></select></label><label>Name<input id="create-group-name" maxlength="256" value="${esc(this.createGroupDraft.name)}" ${this.createGroupBusy ? 'disabled' : ''}></label>${fields}</section>`}${this.createGroupError ? `<p class="status" data-error="true" role="alert">${esc(this.createGroupError)}</p>` : ''}</div><footer class="drawer-footer">${done ? '' : `<div class="actions"><button id="create-group-submit" ${this.createGroupBusy || this.createGroupUncertain || (!distribution && !owners.length) ? 'disabled' : ''}>Create group</button></div>`}</footer></aside></div>`;
   }
 
   private async searchTrace(nextPage = false): Promise<void> {
@@ -2357,7 +2500,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       }
       criteria = { start: new Date(start).toISOString(), end: new Date(end).toISOString(),
         sender: sender || null, recipient: recipient || null, status: this.traceDraft.status || null, cursor: null };
-      this.traceCriteria = criteria; this.traceRows = []; this.traceNext = null; this.traceDetail = null;
+      this.quarantineRequest++; this.quarantineRow=null; this.quarantineMatch=null; this.quarantineBusy=false;
+      this.traceSelected=null; this.traceCriteria = criteria; this.traceRows = []; this.traceNext = null; this.traceDetail = null;
     }
     const generation = this.generation, context = this.contextValue, request = ++this.traceRequest;
     this.traceLoading = true; this.traceError = ''; this.render();
@@ -2387,9 +2531,13 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
   }
   private async showTraceDetail(index: number): Promise<void> {
     const row = this.traceRows[index];
-    if (!row || this.traceDetailLoading) return;
+    if (!row || this.quarantineBusy) return;
+    this.traceSelected = row; this.traceExpanded = false;
+    this.quarantineRequest++; this.quarantineBusy=false; this.quarantineRow=null; this.quarantineMatch=null;  this.quarantineMessage='';
     const generation = this.generation, context = this.contextValue, request = ++this.traceRequest;
     this.traceDetailLoading = true; this.traceDetail = null; this.traceError = ''; this.render();
+    this.root.querySelector<HTMLElement>('#trace-drawer-close')?.focus();
+    if (row.status === 'Quarantined') void this.lookupQuarantine(index);
     try {
       const data = await this.request<TraceDetail>(this.path('/administration'), {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -2415,17 +2563,57 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'message-trace-loaded-results.csv'; anchor.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
+  private async lookupQuarantine(index: number): Promise<void> {
+    const row=this.traceRows[index]; if(!row || this.quarantineBusy) return;
+    this.quarantineRow=row; this.quarantineMatch=null; this.quarantineMessage='';
+    await this.quarantineAction(false);
+  }
+  private async quarantineAction(release: boolean): Promise<void> {
+    const row=this.quarantineRow, match=this.quarantineMatch;
+    if(!row || this.quarantineBusy || (release && (!match || match.released || !this.connection?.canManage))) return;
+    const generation=this.generation, context=this.contextValue, request=++this.quarantineRequest;
+    this.quarantineBusy=true; this.render();
+    try {
+      const result=await this.request<{match: typeof match;accepted?:boolean;verified?:boolean}>(this.path('/administration'), {
+        method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:release?'quarantine.release.set':'quarantine.lookup',messageTraceId:row.messageTraceId,recipient:row.recipient,received:row.received,...(release?{identity:match!.identity}:{})}),
+      });
+      if(generation!==this.generation || context!==this.contextValue || request!==this.quarantineRequest) return;
+      this.quarantineMatch=release && !result.verified ? null : result.match;
+      this.quarantineMessage=release ? result.verified ? 'Release verified for this recipient.' : 'Release submitted; check quarantine status before retrying.' : result.match ? result.match.released ? 'Already released for this recipient.' : '' : 'No unique retained quarantine message matched this trace entry.';
+    } catch(error) {
+      if(generation!==this.generation || context!==this.contextValue || request!==this.quarantineRequest) return;
+      this.quarantineMatch=null;
+      this.quarantineMessage=release ? 'Release was not confirmed. Look up the current status before trying again.' : error instanceof Error ? error.message : 'Quarantine lookup failed.';
+    } finally { if(generation===this.generation && context===this.contextValue && request===this.quarantineRequest) {this.quarantineBusy=false;this.render();} }
+  }
+  private closeTraceDrawer(): void {
+    const index=this.traceRows.indexOf(this.traceSelected!);
+    this.traceRequest++; this.quarantineRequest++; this.traceSelected=null; this.traceDetail=null;
+    this.traceDetailLoading=false; this.quarantineBusy=false; this.quarantineRow=null; this.quarantineMatch=null;
+    this.render(); this.root.querySelector<HTMLElement>(`[data-trace-detail="${index}"]`)?.focus();
+  }
+  private renderTraceDrawer(): string {
+    const row=this.traceSelected; if(!row) return '';
+    const descriptions: Record<string,string>={Delivered:'Microsoft reports that this message was delivered.',Quarantined:'Microsoft placed this message in quarantine. Review the delivery events and quarantine status before releasing it.',Failed:'Microsoft reports that delivery failed. The events below may explain why.',Pending:'Microsoft reports that delivery is pending.',FilteredAsSpam:'Microsoft identified this message as spam. Review its delivery events for the action taken.'};
+    const events=this.traceDetail?.events ?? [];
+    const quarantine=row.status==='Quarantined' ? `<section class="drawer-section"><h3>Quarantine</h3>${this.quarantineBusy?'<p role="status">Checking quarantine…</p>':''}${this.quarantineMessage?`<p role="status">${esc(this.quarantineMessage)}</p>`:''}${this.quarantineMatch?`<p class="meta">${this.quarantineMatch.released?'Already released':'Matched quarantined message'} for ${esc(row.recipient)}</p>`:''}${this.quarantineMatch && !this.quarantineMatch.released && this.connection?.canManage ? `<button id="quarantine-release" ${this.quarantineBusy?'disabled':''}>Release message</button>`:''}${!this.quarantineBusy?'<button class="secondary compact" id="quarantine-refresh">Refresh quarantine status</button>':''}</section>`:'';
+    return `<div class="backdrop" data-trace-backdrop><aside class="drawer trace-drawer ${this.traceExpanded?'trace-expanded':''}" role="dialog" aria-modal="true" aria-labelledby="trace-message-title"><header class="drawer-heading"><div><p class="eyebrow">Message details</p><h2 id="trace-message-title">${esc(row.subject||'(No subject)')}</h2></div><div class="actions"><button class="secondary compact" id="trace-drawer-expand">${this.traceExpanded?'Collapse':'Expand'}</button><button class="secondary compact" id="trace-drawer-close">Close</button></div></header><div class="drawer-body"><dl class="trace-summary"><div><dt>Sender</dt><dd>${esc(row.sender)}</dd></div><div><dt>Recipient</dt><dd>${esc(row.recipient)}</dd></div><div><dt>Received</dt><dd>${esc(this.formatCheckedAt(row.received))}</dd></div><div><dt>Status</dt><dd><span class="badge">${esc(row.status)}</span></dd></div></dl><section class="drawer-section"><h3>Delivery status</h3><p>${esc(descriptions[row.status]||`Microsoft reports: ${row.status}.`)}</p></section>${quarantine}<section class="drawer-section"><div class="heading"><h3>Message events</h3><button class="secondary compact" id="trace-events-refresh" ${this.traceDetailLoading?'disabled':''}>Refresh events</button></div>${this.traceDetailLoading?'<p role="status">Loading delivery events…</p>':this.traceError?`<p role="alert">${esc(this.traceError)}</p>`:events.map(event=>`<details class="trace-event"><summary><span>${esc(event.date?this.formatCheckedAt(event.date):'Time unavailable')}</span><strong>${esc(event.event)}</strong></summary><p>${esc(event.detail||'No additional detail returned.')}</p></details>`).join('')||'<p class="meta">No delivery events returned.</p>'}${this.traceDetail?.partial?'<p class="meta">Only the first 1,000 events are shown.</p>':''}</section><section class="drawer-section"><h3>Message identifiers</h3><dl><div><dt>Trace ID</dt><dd>${esc(row.messageTraceId)}</dd></div>${this.quarantineMatch?`<div><dt>Internet Message-ID</dt><dd>${esc(this.quarantineMatch.messageId)}</dd></div>`:''}</dl><p class="meta">Message trace does not include the email body or attachments.</p></section></div></aside></div>`;
+  }
   private renderTrace(): string {
-    const rows = this.traceRows.map((row, index) => `<tr><td>${esc(this.formatCheckedAt(row.received))}</td><td>${esc(row.sender)}</td><td>${esc(row.recipient)}</td><td>${esc(row.subject || '—')}</td><td>${esc(row.status)}</td><td><button class="secondary compact" data-trace-detail="${index}">Details</button></td></tr>`).join('');
+    const traceColumns = ['Received', 'Sender', 'Recipient', 'Subject', 'Status', 'Actions'];
+    const defaults = [170, 230, 230, 360, 150, 100];
+    const widths = traceColumns.map((_, index) => this.traceWidths[`trace-${index}`] ?? defaults[index]);
+    const rows = this.traceRows.map((row, index) => `<tr><td>${esc(this.formatCheckedAt(row.received))}</td><td>${esc(row.sender)}</td><td>${esc(row.recipient)}</td><td><button class="trace-subject" data-trace-detail="${index}">${esc(row.subject || '(No subject)')}</button></td><td>${esc(row.status)}</td><td><button class="secondary compact" data-trace-detail="${index}">Details</button></td></tr>`).join('');
     const detail = this.traceDetail;
     return `<section class="trace-panel" aria-label="Microsoft message trace"><div class="heading"><div><h2>Message trace</h2><p class="meta">Exchange transport results for this connected tenant.</p></div><button class="secondary compact" id="trace-close">Close</button></div>
       <form id="trace-form" class="trace-form"><label>From<input id="trace-start" type="datetime-local" value="${esc(this.traceDraft.start)}" required></label><label>To<input id="trace-end" type="datetime-local" value="${esc(this.traceDraft.end)}" required></label>
       <label>Sender<input id="trace-sender" type="email" value="${esc(this.traceDraft.sender)}" placeholder="Optional"></label><label>Recipient<input id="trace-recipient" type="email" value="${esc(this.traceDraft.recipient)}" placeholder="Optional"></label>
       <label>Status<select id="trace-status">${['', 'Delivered', 'Failed', 'Pending', 'Quarantined', 'FilteredAsSpam', 'Expanded', 'GettingStatus'].map(value => `<option value="${value}" ${this.traceDraft.status === value ? 'selected' : ''}>${value || 'All statuses'}</option>`).join('')}</select></label><button type="submit" ${this.traceLoading ? 'disabled' : ''}>Search</button></form>
       ${this.traceError ? `<p class="status" data-error="true" role="alert">${esc(this.traceError)}</p>` : ''}<div class="trace-toolbar"><p class="meta">${this.traceLoading ? 'Loading trace…' : `${this.traceRows.length} loaded result${this.traceRows.length === 1 ? '' : 's'}${this.traceNext ? ' · more pages available' : ''}`}</p><button class="secondary compact" id="trace-export" ${!this.traceRows.length ? 'disabled' : ''}>Export loaded CSV</button></div>
-      ${this.traceRows.length ? `<div class="table-wrap"><table><thead><tr><th>Received</th><th>Sender</th><th>Recipient</th><th>Subject</th><th>Status</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>` : ''}
+      ${this.traceRows.length ? `<div class="table-wrap"><table style="table-layout:fixed;width:${widths.reduce((sum,width)=>sum+width,0)}px"><colgroup>${widths.map(width=>`<col style="width:${width}px">`).join('')}</colgroup><thead><tr>${traceColumns.map((label,index)=>`<th>${label}<span class="column-resize" data-resize="trace-${index}" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize ${label} column" title="Drag to resize; double-click to reset"></span></th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div>` : ''}
       ${this.traceNext ? `<div class="actions"><button class="secondary compact" id="trace-more" ${this.traceLoading || this.traceRows.length >= 5000 ? 'disabled' : ''}>Load next 1,000</button></div><p class="meta">CSV includes only loaded rows. Narrow the search after 5,000 loaded rows.</p>` : ''}
-      ${this.traceDetailLoading ? '<p class="meta">Loading delivery events…</p>' : detail ? `<div class="trace-events"><div class="heading"><h3>Delivery events</h3><button class="secondary compact" id="trace-detail-close">Close</button></div>${detail.events.map(event => `<p><strong>${esc(event.date ? this.formatCheckedAt(event.date) : 'Time unavailable')} · ${esc(event.event)}</strong><br>${esc(event.detail)}</p>`).join('') || '<p>No delivery events were returned.</p>'}${detail.partial ? '<p class="meta">Only the first 1,000 events are shown.</p>' : ''}</div>` : ''}</section>`;
+
+      </section>${this.renderTraceDrawer()}`;
   }
 
   private render(): void {
@@ -2435,6 +2623,7 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const sharedIds = new Set(this.mailboxInventory?.records.filter(row => row.recipientType === 'SharedMailbox').map(row => row.id.toLowerCase()) ?? []);
     const userRows = this.data?.items.filter(row => (this.resource === 'all' || this.resource === 'users')
       && (this.resource === 'all' || !sharedIds.has(row.id.toLowerCase()))
+      && (this.resource === 'all' || this.directoryScope === 'exclude' || (this.directoryScope === 'unlicensed' ? row.values.licenseSummary === 'Unlicensed' : row.values.licenseSummary !== 'Unlicensed'))
       && (this.directoryScope === 'exclude' ? this.directoryExclusions.get(row.id) === true : this.directoryExclusions.get(row.id) !== true)) ?? [];
     const groupRows = this.resource === 'all' ? this.allGroups?.items.filter(row => row.values.mailEnabled === true) ?? [] : [];
     const scoped = this.resource === 'all'
@@ -2464,24 +2653,22 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     const loadedCount = this.data ? `${this.resource === 'all' ? scoped.length : this.data.items.length}${this.data.complete ? '' : ' loaded'}` : '—';
     const tenant = connection?.tenantName || 'Microsoft 365 tenant';
     const createControl = canManage && this.resource === 'users' ? '<button class="secondary compact" id="create-user">Add user</button>' : canManage && this.resource === 'groups' ? '<button class="secondary compact" id="create-group">Add group</button>' : '';
-    const tabs = `<button data-resource="all" role="tab" aria-selected="${this.resource === 'all'}" class="resource-tab" ${!canRead ? 'disabled' : ''}>All</button><button data-resource="users" role="tab" aria-selected="${this.resource === 'users' && this.directoryScope === 'users'}" class="resource-tab" ${!canRead ? 'disabled' : ''}>Users</button><button data-resource="shared-mailboxes" role="tab" aria-selected="${this.resource === 'shared-mailboxes'}" class="resource-tab" ${!canRead ? 'disabled' : ''}>Shared mailboxes</button><button data-resource="groups" role="tab" aria-selected="${this.resource === 'groups'}" class="resource-tab" ${!canRead ? 'disabled' : ''}>Groups</button><button data-directory-scope="exclude" role="tab" aria-selected="${this.resource === 'users' && this.directoryScope === 'exclude'}" class="resource-tab" ${!canRead || this.resource !== 'users' ? 'disabled' : ''}>Exclude</button>`;
-    const chips = this.data ? `<div class="column-tools"><span>Columns</span>${allColumns.map((column, index) => `<button class="column-chip" data-column="${esc(column.key)}" aria-pressed="${index === 0 || this.visibleColumns.includes(column.key)}" ${index === 0 ? 'disabled' : ''}>${esc(column.label)}</button>`).join('')}<button class="secondary compact" id="reset-columns">Reset</button></div><details class="layout-details" ${this.layoutOpen ? 'open' : ''}><summary>Column order and width</summary><div class="layout-list">${columns.map((column, index) => `<div class="layout-row"><span>${esc(column.label)}</span><button class="secondary compact" data-move-left="${esc(column.key)}" aria-label="Move ${esc(column.label)} left" ${index <= 1 ? 'disabled' : ''}>←</button><button class="secondary compact" data-move-right="${esc(column.key)}" aria-label="Move ${esc(column.label)} right" ${index === 0 || index === columns.length - 1 ? 'disabled' : ''}>→</button><label>Width <input data-column-width="${esc(column.key)}" type="number" min="80" max="800" step="10" value="${this.columnWidths[column.key] ?? ''}" placeholder="Auto" aria-label="${esc(column.label)} width in pixels"></label></div>`).join('')}</div></details>${this.layoutError ? `<p class="directory-notice" role="status">${esc(this.layoutError)}</p>` : ''}` : '';
+    const tabs = `<button data-resource="all" role="tab" aria-selected="${this.resource === 'all'}" class="resource-tab" ${!canRead ? 'disabled' : ''}>All</button><button data-resource="users" role="tab" aria-selected="${this.resource === 'users' && this.directoryScope === 'users'}" class="resource-tab" ${!canRead ? 'disabled' : ''}>Users</button><button data-directory-scope="unlicensed" role="tab" aria-selected="${this.resource === 'users' && this.directoryScope === 'unlicensed'}" class="resource-tab" ${!canRead ? 'disabled' : ''}>Unlicensed</button><button data-resource="shared-mailboxes" role="tab" aria-selected="${this.resource === 'shared-mailboxes'}" class="resource-tab" ${!canRead ? 'disabled' : ''}>Shared mailboxes</button><button data-resource="groups" role="tab" aria-selected="${this.resource === 'groups'}" class="resource-tab" ${!canRead ? 'disabled' : ''}>Groups</button><button data-directory-scope="exclude" role="tab" aria-selected="${this.resource === 'users' && this.directoryScope === 'exclude'}" class="resource-tab" ${!canRead || this.resource !== 'users' ? 'disabled' : ''}>Exclude</button>`;
+    const chips = this.data ? `<div class="column-tools"><span>Columns</span>${allColumns.map((column, index) => `<button class="column-chip" data-column="${esc(column.key)}" aria-pressed="${index === 0 || this.visibleColumns.includes(column.key)}" ${index === 0 ? 'disabled' : ''}>${esc(column.label)}</button>`).join('')}<button class="secondary compact" id="reset-columns">Reset</button></div>${this.layoutError ? `<p class="directory-notice" role="status">${esc(this.layoutError)}</p>` : ''}` : '';
     const rows = filtered.map(row => {
       const isUser = this.resource === 'users' || this.resource === 'all' && row.source === 'user';
       const isGroup = this.resource === 'groups' || this.resource === 'all' && row.source === 'group';
-      const expanded = this.expandedRowId === row.id;
+      const expanded = this.detail?.id === row.id;
       const cells = columns.map((column, index) => {
         const value = isUser ? this.userDirectoryValue(row, column.key)
           : isGroup && this.resource === 'all' ? column.key === 'userType' ? 'Groups' : '—'
           : row.values[column.key];
-        return `<td class="${index === 0 ? 'identity' : ''}" ${this.columnWidths[column.key] ? `style="min-width:${this.columnWidths[column.key]}px;width:${this.columnWidths[column.key]}px"` : ''}>${index === 0 ? this.rowIdentity(row, column) : typeof value === 'boolean' ? `<span class="state ${value ? 'on' : ''}">${value ? 'Enabled' : 'Disabled'}</span>` : esc(String(value ?? 'Unavailable'))}</td>`;
+        return `<td class="${index === 0 ? 'identity' : ''}" ${this.columnWidths[column.key] ? `style="min-width:${this.columnWidths[column.key]}px;max-width:${this.columnWidths[column.key]}px;width:${this.columnWidths[column.key]}px"` : ''}>${index === 0 ? this.rowIdentity(row, column) : typeof value === 'boolean' ? `<span class="state ${value ? 'on' : ''}">${value ? 'Enabled' : 'Disabled'}</span>` : esc(String(value ?? 'Unavailable'))}</td>`;
       }).join('');
       const sharedMailbox = this.resource === 'shared-mailboxes' || this.mailboxInventory?.records.some(item => item.id.toLowerCase() === row.id.toLowerCase() && item.recipientType === 'SharedMailbox') === true;
-      const action = sharedMailbox ? `<button class="secondary compact" data-testid="row-${esc(row.id)}" data-detail="${esc(row.id)}">${canManage ? 'Manage mailbox' : 'View mailbox'}</button>` : isUser ? `<button class="secondary compact" data-testid="row-${esc(row.id)}" data-expand="${esc(row.id)}" aria-expanded="${expanded}">${canManage ? 'Account' : 'View account'} <span aria-hidden="true">${expanded ? '⌃' : '⌄'}</span></button>` : `<button class="secondary compact" data-testid="row-${esc(row.id)}" data-detail="${esc(row.id)}">${isGroup ? row.values.groupKind && !['Microsoft 365 group', 'Distribution list'].includes(String(row.values.groupKind)) ? 'View group' : 'Manage members' : 'View details'}</button>`;
-      const signInAction: UserSecurityAction = row.values.accountEnabled === false ? 'restore-sign-in' : 'block-sign-in';
-      const excluded = this.directoryExclusions.get(row.id) === true;
-      const expandedRow = isUser && !sharedMailbox && expanded ? `<tr class="row-actions"><td colspan="${columns.length + 1}"><div class="actionline"><span>Account</span><button class="secondary compact" data-detail="${esc(row.id)}">${canManage ? 'Edit account' : 'View account'}</button><button class="secondary compact" data-row-add-group="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>Add to group</button><button class="secondary compact" data-directory-exclude="${esc(row.id)}" data-excluded="${!excluded}" ${!canManage ? 'disabled' : ''}>${excluded ? 'Include user' : 'Exclude user'}</button><small>Delete and preservation workflows are unavailable.</small></div><div class="actionline"><span>Security</span><button class="secondary compact" data-row-security="reset-password" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>Reset password</button><button class="secondary compact" data-row-security="${signInAction}" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>${signInAction === 'block-sign-in' ? 'Block sign-in' : 'Restore sign-in'}</button><button class="secondary compact" data-row-security="revoke-sessions" data-row-id="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>Sign out of all sessions</button><button class="secondary compact" data-mfa="${esc(row.id)}" ${!canManage ? 'disabled' : ''}>MFA</button></div><div class="actionline"><span>Mailbox</span><button class="secondary compact" data-row-forwarding="${esc(row.id)}">Manage forwarding</button><button class="secondary compact" data-row-autoreply="${esc(row.id)}">Out of office</button><button class="secondary compact" data-row-delegation="${esc(row.id)}">Delegate mailbox</button></div></td></tr>` : '';
-      return `<tr class="${this.detail?.id === row.id || expanded ? 'selected-row' : ''}">${cells}<td class="row-control">${action}</td></tr>${expandedRow}`;
+      const userAction = (key: string, label: string, disabled = false) => `<button class="secondary compact" data-user-action="${key}" data-user-id="${esc(row.id)}" ${disabled ? 'disabled' : ''}>${label}</button>`;
+      const action = sharedMailbox ? `<div class="inline-user-actions" aria-label="Actions for ${esc(String(row.values.displayName ?? row.values.primarySmtpAddress ?? row.id))}">${userAction('addresses', 'Email addresses')}${userAction('delegation', 'Delegation')}${userAction('forwarding', 'Forwarding')}${userAction('autoreply', 'Out of office')}</div>` : isUser ? `<div class="inline-user-actions" aria-label="Actions for ${esc(String(row.values.displayName ?? row.id))}"><button class="secondary compact" data-testid="row-${esc(row.id)}" data-expand="${esc(row.id)}" aria-expanded="${expanded}">${canManage ? 'Account' : 'View account'}</button>${canManage ? `${userAction('addresses', 'Email addresses')}${userAction('licenses', 'Licenses')}${userAction('groups', 'Groups')}${userAction('reset-password', 'Reset password')}${userAction(row.values.accountEnabled === false ? 'restore-sign-in' : 'block-sign-in', row.values.accountEnabled === false ? 'Restore sign-in' : 'Block sign-in')}${userAction('revoke-sessions', 'Sign out sessions')}${userAction('mfa', 'MFA')}` : ''}${userAction('delegation', 'Delegation')}${userAction('forwarding', 'Forwarding')}${userAction('autoreply', 'Out of office')}${canManage ? `${userAction('drive', 'OneDrive')}<button class="secondary compact" data-directory-exclude="${esc(row.id)}" data-excluded="${this.directoryExclusions.get(row.id) !== true}" ${this.busy || !this.directoryExclusionsReady ? 'disabled' : ''}>${this.directoryExclusions.get(row.id) === true ? 'Include user' : 'Exclude user'}</button>` : ''}</div>` : isGroup ? `<div class="inline-user-actions">${[...['account'], ...((!row.values.groupKind || ['Microsoft 365 group', 'Distribution list'].includes(String(row.values.groupKind))) ? ['email', 'members', ...((!row.values.groupKind || row.values.groupKind === 'Microsoft 365 group') ? ['owners'] : [])] : [])].map(panel => `<button class="secondary compact" data-group-action="${panel}" data-group-id="${esc(row.id)}">${({account: 'Details', email: 'Email settings', members: 'Members', owners: 'Owners'} as Record<string,string>)[panel]}</button>`).join('')}</div>` : `<button class="secondary compact" data-testid="row-${esc(row.id)}" data-detail="${esc(row.id)}">View details</button>`;
+      return `<tr class="${this.detail?.id === row.id ? 'selected-row' : ''}">${cells}</tr><tr class="inline-actions-row ${this.detail?.id === row.id ? 'selected-row' : ''}"><td colspan="${columns.length}">${action}</td></tr>`;
     }).join('');
     const exclusionUnavailable = this.resource === 'users' && this.directoryScope === 'exclude' && !!this.directoryExclusionError;
     const mailboxNotice = !['users', 'all'].includes(this.resource) || !canRead ? '' : this.mailboxInventory
@@ -2500,33 +2687,65 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       })() : '';
     const reportNotice = ['users', 'all', 'shared-mailboxes'].includes(this.resource) && (this.mailboxInventory?.records.length ?? 0) > 200
       ? '<p class="directory-notice" role="status">Mailbox usage is loaded for up to 200 matching accounts at a time. Search for another account to load its usage.</p>' : '';
-    const inventory = !canRead ? `<div class="empty">${connection?.connected && connection.enabled === false ? 'Enable this connection before loading inventory.' : 'Connect Microsoft 365 in Extensions > Connect before loading inventory.'}</div>` : !this.data ? `<div class="empty">${this.error ? `Could not load ${labels[this.resource].toLowerCase()}. Use Refresh to try again.` : `Loading current ${labels[this.resource].toLowerCase()}…`}</div>` : exclusionUnavailable ? `<div class="empty">Could not load directory exclusions. Refresh before reviewing excluded users.</div>` : !filtered.length ? `<div class="empty">${this.filter ? 'No rows match this search.' : `No ${labels[this.resource].toLowerCase()} are available for this tenant.`}</div>` : `<div class="table-wrap"><table><thead><tr>${columns.map(column => `<th ${this.columnWidths[column.key] ? `style="min-width:${this.columnWidths[column.key]}px;width:${this.columnWidths[column.key]}px"` : ''} aria-sort="${sortKey === column.key ? this.sortDirection === 'asc' ? 'ascending' : 'descending' : 'none'}"><button class="table-sort" data-sort="${esc(column.key)}">${esc(column.label)}${sortKey === column.key ? `<span aria-hidden="true"> ${this.sortDirection === 'asc' ? '↑' : '↓'}</span>` : ''}</button></th>`).join('')}<th><span class="sr-only">Actions</span></th></tr></thead><tbody>${rows}</tbody></table></div>`;
-    this.root.innerHTML = `<style>${styles}${createUserStyles}${healthStyles}${traceStyles}${visualStyles}</style><main><header><div><p class="eyebrow">Microsoft 365</p><h1>Directory</h1><p class="subtle">${esc(tenant)} · ${labels[this.resource]}: ${loadedCount}</p></div><div class="header-actions">${createControl}<button class="secondary compact" id="trace-open" aria-expanded="${this.traceOpen}" ${!canRead ? 'disabled' : ''}>Message trace</button><button class="secondary compact" id="health-open" aria-expanded="${this.healthOpen}" ${!canRead ? 'disabled' : ''}>Service health</button><span class="badge ${canRead ? 'ok' : ''}">${connection?.available === false ? 'Unavailable' : connection?.connected ? (connection.enabled === false ? 'Disabled' : 'Connected') : 'Not configured'}</span></div></header>${this.traceOpen && canRead ? this.renderTrace() : ''}${this.healthOpen && canRead ? this.renderHealth() : ''}${this.message ? `<p class="status" data-testid="status" data-error="${this.error}" aria-live="polite">${esc(this.message)}</p>` : '<p class="status" data-testid="status" aria-live="polite"></p>'}<section class="directory"><div class="directory-top">${canRead ? `<label class="filter"><span class="sr-only">Search ${labels[this.resource]}</span><input id="filter" data-testid="filter" value="${esc(this.filter)}" placeholder="${this.resource === 'users' ? 'Search name or email' : `Search ${labels[this.resource].toLowerCase()}`}"></label>` : ''}<nav class="resource-nav" role="tablist" aria-label="Microsoft directory resources">${tabs}</nav><button class="secondary compact" id="refresh-resource" ${!canRead ? 'disabled' : ''}>Refresh</button></div>${canRead ? `${chips}${mailboxNotice}${reportNotice}${this.data ? `<p class="meta">${inventoryState}${mailboxUsageState} · checked ${esc(this.formatCheckedAt(this.data.checkedAt))}</p>` : ''}${inventory}` : inventory}</section>${this.detail ? this.renderDrawer(canManage) : ''}${this.createUserOpen ? this.renderCreateUserDrawer() : ''}${this.createGroupOpen ? this.renderCreateGroupDrawer() : ''}</main>`;
+    const inventory = !canRead ? `<div class="empty">${connection?.connected && connection.enabled === false ? 'Enable this connection before loading inventory.' : 'Connect Microsoft 365 in Extensions > Connect before loading inventory.'}</div>` : !this.data ? `<div class="empty">${this.error ? `Could not load ${labels[this.resource].toLowerCase()}. Use Refresh to try again.` : `Loading current ${labels[this.resource].toLowerCase()}…`}</div>` : exclusionUnavailable ? `<div class="empty">Could not load directory exclusions. Refresh before reviewing excluded users.</div>` : !filtered.length ? `<div class="empty">${this.filter ? 'No rows match this search.' : `No ${labels[this.resource].toLowerCase()} are available for this tenant.`}</div>` : `<div class="table-wrap"><table><thead><tr>${columns.map((column, index) => `<th data-header="${esc(column.key)}" draggable="${index > 0}" ${this.columnWidths[column.key] ? `style="min-width:${this.columnWidths[column.key]}px;max-width:${this.columnWidths[column.key]}px;width:${this.columnWidths[column.key]}px"` : ''} aria-sort="${sortKey === column.key ? this.sortDirection === 'asc' ? 'ascending' : 'descending' : 'none'}"><button class="table-sort" data-sort="${esc(column.key)}">${esc(column.label)}${sortKey === column.key ? `<span aria-hidden="true"> ${this.sortDirection === 'asc' ? '↑' : '↓'}</span>` : ''}</button><span class="column-resize" data-resize="${esc(column.key)}" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize ${esc(column.label)} column" title="Drag to resize; double-click to reset"></span></th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div>`;
+    this.root.innerHTML = `<style>${styles}${membershipStyles}${createUserStyles}${healthStyles}${traceStyles}${visualStyles}${traceDrawerStyles}</style><main><header><div><p class="eyebrow">Microsoft 365</p><h1>${this.traceOpen ? 'Message trace' : this.healthOpen ? 'Service health' : 'Directory'}</h1><p class="subtle">${esc(tenant)}${!this.traceOpen && !this.healthOpen ? ` · ${labels[this.resource]}: ${loadedCount}` : ''}</p></div><div class="header-actions"><nav class="module-nav" aria-label="Microsoft 365 areas"><button class="secondary compact" id="directory-open" aria-pressed="${!this.traceOpen && !this.healthOpen}">Directory</button><button class="secondary compact" id="trace-open" aria-pressed="${this.traceOpen}" ${!canRead ? 'disabled' : ''}>Message trace</button><button class="secondary compact" id="health-open" aria-pressed="${this.healthOpen}" ${!canRead ? 'disabled' : ''}>Service health</button></nav><span class="badge ${canRead ? 'ok' : ''}">${connection?.available === false ? 'Unavailable' : connection?.connected ? (connection.enabled === false ? 'Disabled' : 'Connected') : 'Not configured'}</span></div></header>${this.traceOpen && canRead ? this.renderTrace() : ''}${this.healthOpen && canRead ? this.renderHealth() : ''}${!this.traceOpen && !this.healthOpen ? `${this.message ? `<p class="status" data-testid="status" data-error="${this.error}" aria-live="polite">${esc(this.message)}</p>` : '<p class="status" data-testid="status" aria-live="polite"></p>'}<section class="directory"><div class="directory-actions">${createControl}</div><div class="directory-top">${canRead ? `<label class="filter"><span class="sr-only">Search ${labels[this.resource]}</span><input id="filter" data-testid="filter" value="${esc(this.filter)}" placeholder="${this.resource === 'users' ? 'Search name or email' : `Search ${labels[this.resource].toLowerCase()}`}"></label>` : ''}<nav class="resource-nav" role="tablist" aria-label="Microsoft directory resources">${tabs}</nav><button class="secondary compact" id="refresh-resource" ${!canRead ? 'disabled' : ''}>Refresh</button></div>${canRead ? `${chips}${mailboxNotice}${reportNotice}${this.data ? `<p class="meta">${inventoryState}${mailboxUsageState} · checked ${esc(this.formatCheckedAt(this.data.checkedAt))}</p>` : ''}${inventory}` : inventory}</section>` : ''}${this.detail ? this.renderDrawer(canManage) : ''}${this.createUserOpen ? this.renderCreateUserDrawer() : ''}${this.createGroupOpen ? this.renderCreateGroupDrawer() : ''}</main>`;
+    const activeSection = ['delegation', 'forwarding', 'autoreply'].includes(this.accountPanel) ? 'mailbox' : this.accountPanel;
+    this.root.querySelectorAll<HTMLElement>('.account-panel > .drawer-section').forEach(section => {
+      section.hidden = !section.classList.contains(`section-${activeSection}`);
+    });
+    this.root.querySelectorAll<HTMLElement>('.account-panel .section-mailbox > div').forEach(section => {
+      section.hidden = !section.classList.contains(`mailbox-${this.accountPanel}`);
+    });
+    this.root.querySelector('#directory-open')?.addEventListener('click', () => {  this.traceOpen = false; this.healthOpen = false; this.traceRequest += 1; this.traceLoading = false; this.traceDetailLoading = false; this.render(); });
     this.root.querySelector('#trace-open')?.addEventListener('click', () => {
-      this.traceOpen = !this.traceOpen; this.traceRequest += 1;
+      if (this.traceOpen) return;
+      this.traceOpen = true; this.healthOpen = false; this.traceRequest += 1;
+      this.traceLoading = false; this.traceDetailLoading = false; this.traceDetail = null;
       if (this.traceOpen && !this.traceDraft.start) {
         const local = (date: Date) => new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
         this.traceDraft.start = local(new Date(Date.now() - 86400000)); this.traceDraft.end = local(new Date());
       }
       this.render();
     });
-    this.root.querySelector('#trace-close')?.addEventListener('click', () => { this.traceRequest += 1; this.traceOpen = false; this.traceLoading = false; this.traceDetailLoading = false; this.traceDetail = null; this.render(); });
+    this.root.querySelector('#trace-close')?.addEventListener('click', () => {  this.traceRequest += 1; this.traceOpen = false; this.traceLoading = false; this.traceDetailLoading = false; this.traceDetail = null; this.render(); });
     for (const key of ['start', 'end', 'sender', 'recipient', 'status'] as const)
       this.root.querySelector<HTMLInputElement | HTMLSelectElement>(`#trace-${key}`)?.addEventListener('input', event => { this.traceDraft[key] = (event.target as HTMLInputElement | HTMLSelectElement).value; });
     this.root.querySelector('#trace-form')?.addEventListener('submit', event => { event.preventDefault(); void this.searchTrace(); });
     this.root.querySelector('#trace-more')?.addEventListener('click', () => void this.searchTrace(true));
     this.root.querySelector('#trace-export')?.addEventListener('click', () => this.exportTrace());
+    this.root.querySelector('#trace-drawer-close')?.addEventListener('click',()=>this.closeTraceDrawer());
+    this.root.querySelector('[data-trace-backdrop]')?.addEventListener('click',event=>{if(event.target===event.currentTarget)this.closeTraceDrawer();});
+    this.root.querySelector('#trace-drawer-expand')?.addEventListener('click',()=>{this.traceExpanded=!this.traceExpanded;this.render();});
+    this.root.querySelector('#trace-events-refresh')?.addEventListener('click',()=>void this.showTraceDetail(this.traceRows.indexOf(this.traceSelected!)));
+    this.root.querySelector('#quarantine-refresh')?.addEventListener('click',()=>void this.lookupQuarantine(this.traceRows.indexOf(this.traceSelected!)));
+    this.root.querySelector('#quarantine-release')?.addEventListener('click',()=>void this.quarantineAction(true));
     this.root.querySelector('#trace-detail-close')?.addEventListener('click', () => { this.traceRequest += 1; this.traceDetail = null; this.render(); });
     this.root.querySelectorAll<HTMLButtonElement>('[data-trace-detail]').forEach(button => button.addEventListener('click', () => void this.showTraceDetail(Number(button.dataset.traceDetail))));
+    this.root.querySelector('#create-user-password-mode')?.addEventListener('change', event => {
+      this.createUserPasswordMode = (event.target as HTMLSelectElement).value;
+      this.createUserPassword = ''; this.render();
+    });
+    this.root.querySelector('#create-user-password')?.addEventListener('input', event => { this.createUserPassword = (event.target as HTMLInputElement).value; });
+    this.root.querySelector('#create-user-force-change')?.addEventListener('change', event => { this.createUserForceChange = (event.target as HTMLInputElement).checked; });
+    this.root.querySelector('#create-user-groups-retry')?.addEventListener('click', () => void this.loadCreateUserGroups());
+    this.root.querySelector<HTMLSelectElement>('#create-user-group')?.addEventListener('change', event => {
+      const id = (event.target as HTMLSelectElement).value;
+      if (!this.createUserBusy && this.createUserGroups?.some(group => group.id === id) && !this.createUserGroupIds.includes(id)) { this.createUserGroupIds.push(id); this.render(); }
+    });
+    this.root.querySelectorAll<HTMLButtonElement>('[data-create-group-remove]').forEach(button => button.addEventListener('click', () => {
+      if (!this.createUserBusy) { this.createUserGroupIds = this.createUserGroupIds.filter(id => id !== button.dataset.createGroupRemove); this.render(); }
+    }));
     this.root.querySelector('#create-group')?.addEventListener('click', () => this.openCreateGroup());
-    this.root.querySelector('#create-group-close')?.addEventListener('click', () => { if (!this.createGroupBusy) { this.createGroupOpen = false; this.createdGroup = null; this.render(); } });
+    this.root.querySelector('#create-group-close')?.addEventListener('click', () => { if (!this.createGroupBusy) { this.createGroupOpen = false; this.createGroupRequest += 1; this.createdGroup = null; this.render(); } });
     this.root.querySelector('#create-group-submit')?.addEventListener('click', () => void this.createGroup());
+    this.root.querySelector('#create-group-owners-retry')?.addEventListener('click', () => void this.loadCreateGroupOwners());
     for (const [id, field] of [['create-group-name', 'name'], ['create-group-alias', 'alias'], ['create-group-owner', 'ownerId'], ['create-group-address', 'primarySmtpAddress']] as const)
       this.root.querySelector<HTMLInputElement | HTMLSelectElement>(`#${id}`)?.addEventListener('input', event => { this.createGroupDraft[field] = (event.target as HTMLInputElement | HTMLSelectElement).value; });
     this.root.querySelector<HTMLSelectElement>('#create-group-kind')?.addEventListener('change', event => {
       this.createGroupDraft.kind = (event.target as HTMLSelectElement).value;
       this.createGroupError = '';
       this.render();
+      if (this.createGroupDraft.kind === 'm365' && !this.createGroupUsers) void this.loadCreateGroupOwners();
     });
     this.root.querySelector('#group-name')?.addEventListener('input', event => {
       this.groupNameDraft = (event.target as HTMLInputElement).value;
@@ -2534,15 +2753,16 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       if (save) save.disabled = !this.groupNameDraft.trim() || this.groupNameDraft.trim() === String(this.detailRecord?.displayName ?? '');
     });
     this.root.querySelector('#group-name-save')?.addEventListener('click', () => void this.saveGroupName());
-    this.root.querySelector('#health-open')?.addEventListener('click', () => { this.healthOpen = !this.healthOpen; this.render(); if (this.healthOpen && !this.health) void this.loadHealth(); });
+    this.root.querySelector('#health-open')?.addEventListener('click', () => { if (this.healthOpen) return;  this.healthOpen = true; this.traceOpen = false; this.traceRequest += 1; this.traceLoading = false; this.traceDetailLoading = false; this.render(); if (!this.health) void this.loadHealth(); });
     this.root.querySelector('#health-close')?.addEventListener('click', () => { this.healthOpen = false; this.render(); });
     this.root.querySelector('#health-refresh')?.addEventListener('click', () => void this.loadHealth());
     this.root.querySelector('#refresh-resource')?.addEventListener('click', () => void this.refreshDirectory());
     this.root.querySelector('#create-user')?.addEventListener('click', () => this.openCreateUser());
     this.root.querySelector('#create-user-close')?.addEventListener('click', () => this.closeCreateUser());
     this.root.querySelector('#create-user-submit')?.addEventListener('click', () => void this.createUser());
+    this.root.querySelector('#create-user-licenses-retry')?.addEventListener('click', () => { this.createUserLicenses = null; this.createLicenseCatalogError = ''; this.render(); void this.loadCreateUserLicenses(); });
     this.root.querySelector('#create-user-domains-retry')?.addEventListener('click', () => { this.createUserDomains = null; this.createUserError = ''; this.render(); void this.loadCreateUserDomains(); });
-    for (const [id, field] of [['create-user-name', 'name'], ['create-user-local', 'local'], ['create-user-location', 'location'], ['create-user-domain', 'domain'], ['create-user-license', 'skuId']] as const) {
+    for (const [id, field] of [['create-user-name', 'name'], ['create-user-local', 'local'], ['create-user-domain', 'domain'], ['create-user-license', 'skuId']] as const) {
       this.root.querySelector<HTMLInputElement | HTMLSelectElement>(`#${id}`)?.addEventListener('input', event => {
         this.createUserDraft[field] = (event.target as HTMLInputElement | HTMLSelectElement).value;
       });
@@ -2556,34 +2776,84 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
           else this.setResource(button.dataset.resource as Resource);
         }),
       );
-    this.root.querySelectorAll<HTMLButtonElement>('[data-directory-scope]').forEach(button => button.addEventListener('click', () => this.setDirectoryScope('exclude')));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-directory-scope]').forEach(button => button.addEventListener('click', () => this.setDirectoryScope(button.dataset.directoryScope as 'exclude' | 'unlicensed')));
     this.root.querySelectorAll<HTMLButtonElement>('[data-column]').forEach(button => button.addEventListener('click', () => {
       const key = button.dataset.column!;
       this.updateVisibleColumns(key);
       queueMicrotask(() => Array.from(this.root.querySelectorAll<HTMLButtonElement>('[data-column]')).find(next => next.dataset.column === key)?.focus());
     }));
-    this.root.querySelector<HTMLDetailsElement>('.layout-details')?.addEventListener('toggle', event => {
-      this.layoutOpen = (event.currentTarget as HTMLDetailsElement).open;
+    this.root.querySelectorAll<HTMLElement>('[data-header]').forEach(header => {
+      header.addEventListener('dragstart', event => {
+        if ((event.target as HTMLElement).closest('[data-resize]')) { event.preventDefault(); return; }
+        event.dataTransfer?.setData('text/plain', header.dataset.header!);
+        if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
+      });
+      header.addEventListener('dragover', event => {
+        if (header.dataset.header === this.directoryColumns()[0]?.key) return;
+        event.preventDefault(); header.classList.add('column-drop');
+      });
+      header.addEventListener('dragleave', () => header.classList.remove('column-drop'));
+      header.addEventListener('drop', event => {
+        event.preventDefault(); header.classList.remove('column-drop');
+        const key = event.dataTransfer?.getData('text/plain');
+        const from = this.visibleColumns.indexOf(key ?? '');
+        const to = this.visibleColumns.indexOf(header.dataset.header!);
+        if (from <= 0 || to <= 0 || from === to) return;
+        this.visibleColumns.splice(from, 1); this.visibleColumns.splice(to, 0, key!);
+        this.layoutEditVersion++; this.saveDirectoryLayout(); this.render();
+      });
+      header.addEventListener('keydown', event => {
+        if (!event.altKey || !['ArrowLeft', 'ArrowRight'].includes(event.key) || (event.target as HTMLElement).closest('[data-resize]')) return;
+        event.preventDefault(); this.moveColumn(header.dataset.header!, event.key === 'ArrowLeft' ? -1 : 1);
+      });
     });
-    this.root.querySelectorAll<HTMLButtonElement>('[data-move-left], [data-move-right]').forEach(button => button.addEventListener('click', () => {
-      const key = button.dataset.moveLeft ?? button.dataset.moveRight;
-      if (!key) return;
-      this.moveColumn(key, button.dataset.moveLeft ? -1 : 1);
-      this.layoutOpen = true;
-    }));
-    this.root.querySelectorAll<HTMLInputElement>('[data-column-width]').forEach(input => input.addEventListener('change', () => {
-      const key = input.dataset.columnWidth;
-      if (!key) return;
-      if (!input.value.trim()) delete this.columnWidths[key];
-      else {
-        const width = Number(input.value);
-        if (!Number.isInteger(width) || width < 80 || width > 800) { input.setCustomValidity('Choose a width from 80 to 800 pixels.'); input.reportValidity(); return; }
-        input.setCustomValidity(''); this.columnWidths[key] = width;
-      }
-      this.layoutEditVersion += 1;
-      this.saveDirectoryLayout(); this.render();
-      this.layoutOpen = true;
-    }));
+    this.root.querySelectorAll<HTMLElement>('[data-resize]').forEach(handle => {
+      const key = handle.dataset.resize!;
+      const isTrace = key.startsWith('trace-');
+      const widths = isTrace ? this.traceWidths : this.columnWidths;
+      const commit = (width?: number) => {
+        if (width === undefined) delete widths[key];
+        else widths[key] = Math.max(80, Math.min(800, Math.round(width)));
+        if (!isTrace) { this.layoutEditVersion++; this.saveDirectoryLayout(); } this.render();
+      };
+      handle.addEventListener('click', event => event.stopPropagation());
+      handle.addEventListener('dblclick', () => commit());
+      handle.addEventListener('keydown', event => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home'].includes(event.key)) return;
+        event.preventDefault(); event.stopPropagation();
+        const width = widths[key] ?? handle.parentElement!.getBoundingClientRect().width;
+        commit(event.key === 'Home' ? undefined : width + (event.key === 'ArrowRight' ? 10 : -10));
+        this.root.querySelector<HTMLElement>(`[data-resize="${key}"]`)?.focus();
+      });
+      handle.addEventListener('pointerdown', event => {
+        if (event.button !== 0) return;
+        event.preventDefault(); event.stopPropagation();
+        const header = handle.parentElement as HTMLTableCellElement;
+        const table = header.closest('table')!;
+        const start = event.clientX; const initial = header.getBoundingClientRect().width;
+        let width = initial;
+        handle.setPointerCapture?.(event.pointerId);
+        const move = (next: PointerEvent) => {
+          width = Math.max(80, Math.min(800, Math.round(initial + next.clientX - start)));
+          if (isTrace) { const col = table.querySelectorAll('col')[header.cellIndex] as HTMLElement; if(col) col.style.width = `${width}px`; table.style.width = `${Array.from(table.querySelectorAll('col')).reduce((sum,col)=>sum+parseFloat((col as HTMLElement).style.width),0)}px`; }
+          table.querySelectorAll('tr').forEach(row => {
+            const cell = row.children[header.cellIndex] as HTMLElement | undefined;
+            if (cell && !cell.hasAttribute('colspan')) { cell.style.width = `${width}px`; cell.style.minWidth = `${width}px`; cell.style.maxWidth = `${width}px`; }
+          });
+        };
+        const finish = (next: PointerEvent) => {
+          handle.removeEventListener('pointermove', move);
+          handle.removeEventListener('pointerup', finish); handle.removeEventListener('pointercancel', cancel);
+          if (handle.hasPointerCapture?.(next.pointerId)) handle.releasePointerCapture(next.pointerId);
+          if (Math.abs(next.clientX - start) > 2) commit(width);
+        };
+        const cancel = () => {
+          handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', finish);
+          handle.removeEventListener('pointercancel', cancel); this.render();
+        };
+        handle.addEventListener('pointermove', move); handle.addEventListener('pointerup', finish); handle.addEventListener('pointercancel', cancel);
+      });
+    });
     this.root.querySelectorAll<HTMLButtonElement>('[data-sort]').forEach(button => button.addEventListener('click', () => {
       const key = button.dataset.sort!;
       if (this.sortKey === key) this.sortDirection = this.sortDirection === 'asc' ? 'desc' : 'asc';
@@ -2613,11 +2883,40 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
         if (start !== null && end !== null) next?.setSelectionRange(start, end);
       });
     });
+    this.root.querySelectorAll<HTMLButtonElement>('[data-user-action]').forEach(button => button.addEventListener('click', () => {
+      const row = this.data?.items.find(item => item.id === button.dataset.userId);
+      if (!row) return;
+      const action = button.dataset.userAction!;
+      if (action === 'mfa') { this.openMfa(row); return; }
+      const security = ['reset-password', 'block-sign-in', 'restore-sign-in', 'revoke-sessions'].includes(action) ? action as UserSecurityAction : null;
+      this.openDetail({ ...row, source: 'user' }, security, action);
+      if (action === 'addresses' && !this.addressesOpen) this.openAddresses();
+      if (action === 'groups') void this.openUserGroups();
+      if (action === 'licenses') { this.licensesOpen = true; void this.loadUserLicenses(); }
+      if (action === 'delegation') this.openDelegation();
+      if (action === 'forwarding') this.openForwarding();
+      if (action === 'autoreply') this.openAutoReply();
+      if (action === 'drive') void this.showDriveLink();
+    }));
     this.root.querySelectorAll<HTMLButtonElement>('[data-expand]').forEach(button => button.addEventListener('click', () => {
-      const id = button.dataset.expand!;
-      this.expandedRowId = this.expandedRowId === id ? null : id;
+      const row = this.data?.items.find(item => item.id === button.dataset.expand);
+      if (row) this.openDetail({ ...row, source: 'user' });
+    }));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-group-action]').forEach(button => button.addEventListener('click', () => {
+      const row = this.data?.items.find(item => item.id === button.dataset.groupId) ?? this.allGroups?.items.find(item => item.id === button.dataset.groupId);
+      if (!row) return;
+      this.openDetail({ ...row, source: 'group' }, null, button.dataset.groupAction!);
+      this.membershipRole = button.dataset.groupAction === 'owners' ? 'owner' : 'member';
+    }));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-group-person-remove]').forEach(button => button.addEventListener('click', () => {
+      const role = button.dataset.groupPersonRole === 'owner' ? 'owner' : 'member';
+      const id = button.dataset.groupPersonRemove!;
+      const people = this.groupPeople;
+      if (!this.connection?.canManage || this.busy || this.membershipNeedsRefresh || !people?.complete ||
+        !(role === 'owner' ? people.owners : people.members).some(person => person.id === id) || role === 'owner' && people.owners.length <= 1) return;
+      this.membershipUserId = id; this.membershipRole = role; this.membershipAction = 'remove';
       this.render();
-      queueMicrotask(() => Array.from(this.root.querySelectorAll<HTMLButtonElement>('[data-expand]')).find(next => next.dataset.expand === id)?.focus());
+      this.root.querySelector<HTMLButtonElement>('#group-member-submit')?.focus();
     }));
     this.root.querySelectorAll<HTMLButtonElement>('[data-detail]').forEach((button) =>
       button.addEventListener('click', () => {
@@ -2640,22 +2939,25 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       const row = this.data?.items.find(item => item.id === button.dataset.directoryExclude);
       if (row) void this.setDirectoryExcluded(row, button.dataset.excluded === 'true');
     }));
+    this.root.querySelector('#account-back')?.addEventListener('click', () => { if (this.detail) this.openDetail(this.detail); });
     this.root.querySelector('#detail-close')?.addEventListener('click', () => this.closeDetail());
+    this.root.querySelector('#detail-retry')?.addEventListener('click', () => { if (!this.detail || this.detailKind === 'read') return; this.drawerError = false; this.drawerMessage = ''; this.render(); void this.loadDetailRecord(this.detail.id, this.detailKind); });
+    this.root.querySelector('#global-admin-retry')?.addEventListener('click', () => { if (!this.detail || this.busy) return; this.globalAdminLoading = true; this.render(); void this.loadGlobalAdminStatus(this.detail.id); });
     this.root.querySelectorAll<HTMLButtonElement>('[data-row-add-group]').forEach(button => button.addEventListener('click', () => {
       const row = this.data?.items.find(item => item.id === button.dataset.rowAddGroup);
       if (row) { this.openDetail(row); void this.openUserGroups(); }
     }));
     this.root.querySelector('#user-group-open')?.addEventListener('click', () => void this.openUserGroups());
     this.root.querySelector('#user-group-refresh')?.addEventListener('click', () => void this.openUserGroups());
+    this.root.querySelectorAll<HTMLButtonElement>('[data-user-group-remove]').forEach(button => button.addEventListener('click', () => {
+      this.userGroupRemoveId = button.dataset.userGroupRemove!; this.userGroupSelectedId = ''; this.render();
+    }));
     this.root.querySelector('#user-group-close')?.addEventListener('click', () => {
       this.userGroupRequest += 1; this.userGroupOpen = false; this.userGroups = null;
-      this.userGroupSelectedId = ''; this.userGroupConfirmed = false; this.userGroupNeedsRefresh = false; this.render();
+      this.userGroupSelectedId = ''; this.userGroupNeedsRefresh = false; this.render();
     });
     this.root.querySelector<HTMLSelectElement>('#user-group-select')?.addEventListener('change', event => {
-      this.userGroupSelectedId = (event.target as HTMLSelectElement).value; this.userGroupConfirmed = false; this.render();
-    });
-    this.root.querySelector<HTMLInputElement>('#user-group-confirm')?.addEventListener('change', event => {
-      this.userGroupConfirmed = (event.target as HTMLInputElement).checked; this.render();
+      this.userGroupRemoveId = ''; this.userGroupSelectedId = (event.target as HTMLSelectElement).value; this.render();
     });
     this.root.querySelector('#user-group-submit')?.addEventListener('click', () => void this.addUserToGroup());
     this.root.querySelector('#licenses-open')?.addEventListener('click', () => { this.licensesOpen = true; void this.loadUserLicenses(); });
@@ -2682,15 +2984,18 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.root.querySelector('#delegation-refresh')?.addEventListener('click', () => void this.loadDelegation());
     this.root.querySelector('#delegation-list-refresh')?.addEventListener('click', () => void this.loadDelegationList());
     this.root.querySelector<HTMLSelectElement>('#delegation-user')?.addEventListener('change', event => {
-      this.delegationSelectedId = (event.target as HTMLSelectElement).value;
+      this.delegationSelectedId = (event.target as HTMLSelectElement).value; this.delegationRemoveRight = '';
       this.delegation = null; this.delegationError = ''; this.delegationMessage = ''; this.delegationNeedsRefresh = false;
-      this.delegationConfirmed = false; this.render();
+      this.render();
       if (this.delegationSelectedId) void this.loadDelegation();
     });
-    this.root.querySelector<HTMLInputElement>('#delegation-confirm')?.addEventListener('change', event => {
-      this.delegationConfirmed = (event.target as HTMLInputElement).checked;
-      this.root.querySelectorAll<HTMLButtonElement>('[data-delegation-right]').forEach(button => { button.disabled = !this.delegationConfirmed; });
-    });
+    this.root.querySelectorAll<HTMLButtonElement>('[data-delegate-remove]').forEach(button => button.addEventListener('click', () => {
+      if (this.delegationLoading || this.delegationNeedsRefresh || this.delegationList?.partial) return;
+      this.delegationSelectedId = button.dataset.delegateRemove!;
+      this.delegationRemoveRight = button.dataset.removeRight!;
+
+      void this.loadDelegation();
+    }));
     this.root.querySelectorAll<HTMLButtonElement>('[data-delegation-right]').forEach(button => button.addEventListener('click', () => {
       const right = button.dataset.delegationRight;
       if (right === 'FullAccess' || right === 'SendAs' || right === 'SendOnBehalf') void this.setDelegation(right, button.dataset.delegationEnabled === 'true');
@@ -2727,7 +3032,8 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.root.querySelector<HTMLSelectElement>('#autoreply-state')?.addEventListener('change', event => {
       this.autoReplyDraft.state = (event.target as HTMLSelectElement).value as AutoReplyState['state']; this.render();
     });
-    for (const [selector, field] of [['#autoreply-start', 'start'], ['#autoreply-end', 'end'], ['#autoreply-message', 'message']] as const) {
+    this.root.querySelector<HTMLSelectElement>('#autoreply-audience')?.addEventListener('change', event => { this.autoReplyDraft.externalAudience = (event.target as HTMLSelectElement).value as AutoReplyState['externalAudience']; });
+    for (const [selector, field] of [['#autoreply-start', 'start'], ['#autoreply-end', 'end'], ['#autoreply-message', 'message'], ['#autoreply-external-message', 'externalMessage']] as const) {
       this.root.querySelector<HTMLInputElement | HTMLTextAreaElement>(selector)?.addEventListener('input', event => {
         this.autoReplyDraft[field] = (event.target as HTMLInputElement | HTMLTextAreaElement).value;
       });
@@ -2744,11 +3050,10 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
       const field = button.dataset.userSave as (typeof USER_FIELDS)[number] | 'accountEnabled';
       void this.saveUserField(field);
     }));
-    this.root.querySelector('#user-password-reset-start')?.addEventListener('click', () => { this.userSecurityAction = 'reset-password'; this.userSecurityConfirmed = false; this.temporaryPassword = null; this.drawerError = false; this.drawerMessage = ''; this.render(); this.root.querySelector<HTMLInputElement>('#user-security-confirm')?.focus(); });
-    this.root.querySelector('#user-sessions-revoke-start')?.addEventListener('click', () => { this.userSecurityAction = 'revoke-sessions'; this.userSecurityConfirmed = false; this.temporaryPassword = null; this.drawerError = false; this.drawerMessage = ''; this.render(); this.root.querySelector<HTMLInputElement>('#user-security-confirm')?.focus(); });
+    this.root.querySelector('#user-password-reset-start')?.addEventListener('click', () => { this.userSecurityAction = 'reset-password'; this.temporaryPassword = null; this.drawerError = false; this.drawerMessage = ''; this.render(); this.root.querySelector<HTMLButtonElement>('#user-security-submit')?.focus(); });
+    this.root.querySelector('#user-sessions-revoke-start')?.addEventListener('click', () => { this.userSecurityAction = 'revoke-sessions'; this.temporaryPassword = null; this.drawerError = false; this.drawerMessage = ''; this.render(); this.root.querySelector<HTMLButtonElement>('#user-security-submit')?.focus(); });
     this.root.querySelector('#user-drive-link')?.addEventListener('click', () => void this.showDriveLink());
-    this.root.querySelector<HTMLInputElement>('#user-security-confirm')?.addEventListener('change', event => { this.userSecurityConfirmed = (event.target as HTMLInputElement).checked; });
-    this.root.querySelector('#user-security-cancel')?.addEventListener('click', () => { this.userSecurityRequest += 1; this.userSecurityAction = null; this.userSecurityConfirmed = false; this.drawerError = false; this.drawerMessage = ''; this.render(); });
+    this.root.querySelector('#user-security-cancel')?.addEventListener('click', () => { this.userSecurityRequest += 1; this.userSecurityAction = null; this.drawerError = false; this.drawerMessage = ''; this.render(); });
     this.root.querySelector('#user-security-submit')?.addEventListener('click', () => void this.performUserSecurityAction());
     this.root.querySelector<HTMLInputElement>('#global-admin-enabled')?.addEventListener('change', event => {
       this.globalAdminDraft = (event.target as HTMLInputElement).checked;
@@ -2760,16 +3065,14 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.root.querySelector('#global-admin-save')?.addEventListener('click', () => void this.saveGlobalAdmin());
     this.root.querySelectorAll<HTMLButtonElement>('[data-mfa-remove]').forEach(button => button.addEventListener('click', () => {
       const method = this.mfaMethods?.find(item => item.id === button.dataset.mfaRemove && item.type === button.dataset.mfaKind);
-      if (method && method.removable && method.id && (method.type === 'phone' || method.type === 'microsoftAuthenticator')) { this.mfaRemoval = method as RemovableMfaMethod; this.mfaConfirmation = ''; this.drawerError = false; this.drawerMessage = ''; this.render(); }
+      if (method && method.removable && method.id && (method.type !== 'password' && method.type !== 'other')) { this.mfaRemoval = method as RemovableMfaMethod; this.mfaConfirmation = ''; this.drawerError = false; this.drawerMessage = ''; this.render(); }
     }));
     this.root.querySelector<HTMLInputElement>('#mfa-removal-confirmation')?.addEventListener('input', event => { this.mfaConfirmation = (event.target as HTMLInputElement).value; });
     this.root.querySelector('#mfa-removal-cancel')?.addEventListener('click', () => { this.mfaRemoval = null; this.mfaConfirmation = ''; this.drawerError = false; this.drawerMessage = ''; this.render(); });
     this.root.querySelector('#mfa-removal-submit')?.addEventListener('click', () => void this.removeMfaMethod());
     this.root.querySelector<HTMLInputElement>('#mfa-recovery-email')?.addEventListener('input', event => { this.recoveryEmailDraft = (event.target as HTMLInputElement).value; });
-    this.root.querySelector<HTMLInputElement>('#mfa-recovery-confirm')?.addEventListener('change', event => { this.recoveryEmailConfirmed = (event.target as HTMLInputElement).checked; this.render(); });
     this.root.querySelector('#mfa-recovery-save')?.addEventListener('click', () => void this.saveRecoveryEmail());
     this.root.querySelector<HTMLInputElement>('#mfa-mobile-phone')?.addEventListener('input', event => { this.mobilePhoneDraft = (event.target as HTMLInputElement).value; });
-    this.root.querySelector<HTMLInputElement>('#mfa-mobile-confirm')?.addEventListener('change', event => { this.mobilePhoneConfirmed = (event.target as HTMLInputElement).checked; this.render(); });
     this.root.querySelector('#mfa-mobile-save')?.addEventListener('click', () => void this.saveMobilePhone());
     this.root.querySelector('#mfa-methods-refresh')?.addEventListener('click', () => { if (!this.detail || this.busy) return; this.mfaLoading = true; void this.loadMfaMethods(this.detail.id); this.render(); });
     this.root.querySelector('#hide-temporary-password')?.addEventListener('click', () => { this.temporaryPassword = null; this.render(); });
@@ -2804,30 +3107,29 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     }));
     this.root.querySelector<HTMLSelectElement>('#group-member-action')?.addEventListener('change', event => {
       const action = (event.target as HTMLSelectElement).value;
-      if (action === 'add' || action === 'remove') this.membershipAction = action;
+      if (action === 'add' || action === 'remove') { this.membershipAction = action; this.render(); }
     });
     this.root.querySelector<HTMLSelectElement>('#group-member-role')?.addEventListener('change', event => {
       const role = (event.target as HTMLSelectElement).value;
-      if (role === 'member' || role === 'owner') this.membershipRole = role;
+      if (role === 'member' || role === 'owner') { this.membershipRole = role; this.render(); }
     });
-    this.root.querySelector<HTMLInputElement>('#group-member-confirm')?.addEventListener('change', event => {
-      this.membershipConfirmed = (event.target as HTMLInputElement).checked;
+    this.root.querySelectorAll<HTMLButtonElement>('[data-group-alias-remove]').forEach(button => button.addEventListener('click', () => { this.groupAliasRemoval = button.dataset.groupAliasRemove!; this.render(); }));
+    this.root.querySelector('#group-alias-cancel')?.addEventListener('click', () => { this.groupAliasRemoval = ''; this.render(); });
+    this.root.querySelector<HTMLInputElement>('#group-alias-address')?.addEventListener('input', event => {
+      this.groupAliasDraft = (event.target as HTMLInputElement).value;
+      const submit = this.root.querySelector<HTMLButtonElement>('#group-alias-submit');
+      if (submit) submit.disabled = this.busy || this.groupPrimaryNeedsRefresh || !this.groupAliasDraft.trim();
     });
+    this.root.querySelector('#group-alias-submit')?.addEventListener('click', () => void this.writeGroupAlias());
     this.root.querySelector('#group-member-submit')?.addEventListener('click', () => void this.changeMembership());
     this.root.querySelector('#group-people-refresh')?.addEventListener('click', () => { if (this.detail?.id) void this.loadGroupPeople(this.detail.id); });
     this.root.querySelector('#group-settings-refresh')?.addEventListener('click', () => { if (this.detail?.id) void this.loadGroupSettings(this.detail.id); });
     this.root.querySelector<HTMLInputElement>('#group-external-allow')?.addEventListener('change', event => {
-      this.groupExternalDraft = (event.target as HTMLInputElement).checked; this.groupExternalConfirmed = false; this.render();
-    });
-    this.root.querySelector<HTMLInputElement>('#group-external-confirm')?.addEventListener('change', event => {
-      this.groupExternalConfirmed = (event.target as HTMLInputElement).checked; this.render();
+      this.groupExternalDraft = (event.target as HTMLInputElement).checked; this.render();
     });
     this.root.querySelector('#group-external-save')?.addEventListener('click', () => void this.saveGroupExternal());
     this.root.querySelector<HTMLInputElement>('#group-primary-address')?.addEventListener('change', event => {
-      this.groupPrimaryDraft = (event.target as HTMLInputElement).value; this.groupPrimaryConfirmed = false; this.render();
-    });
-    this.root.querySelector<HTMLInputElement>('#group-primary-confirm')?.addEventListener('change', event => {
-      this.groupPrimaryConfirmed = (event.target as HTMLInputElement).checked; this.render();
+      this.groupPrimaryDraft = (event.target as HTMLInputElement).value; this.render();
     });
     this.root.querySelector('#group-primary-save')?.addEventListener('click', () => void this.saveGroupPrimary());
     this.root.querySelector('[data-backdrop]')?.addEventListener('click', (event) => {
@@ -2836,9 +3138,9 @@ export class CloudCommandMicrosoftPage extends HTMLElement {
     this.root.querySelector<HTMLElement>('[role="dialog"]')?.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') {
         event.preventDefault();
-        if (this.createUserOpen) this.closeCreateUser(); else this.closeDetail();
+        if (this.traceSelected) this.closeTraceDrawer(); else if (this.createUserOpen) this.closeCreateUser(); else this.closeDetail();
       } else if (event.key === 'Tab') {
-        const focusable = Array.from(this.root.querySelectorAll<HTMLElement>('[role="dialog"] button:not(:disabled),[role="dialog"] input:not(:disabled),[role="dialog"] select:not(:disabled)'));
+        const focusable = Array.from(this.root.querySelectorAll<HTMLElement>('[role="dialog"] button:not(:disabled),[role="dialog"] input:not(:disabled),[role="dialog"] select:not(:disabled)')).filter(element => !element.closest('[hidden]'));
         const index = focusable.indexOf(this.root.activeElement as HTMLElement);
         const next = event.shiftKey ? (index <= 0 ? focusable.length - 1 : index - 1) : (index === focusable.length - 1 ? 0 : index + 1);
         if (focusable.length && (index === -1 || next !== index + (event.shiftKey ? -1 : 1))) { event.preventDefault(); focusable[next]?.focus(); }
@@ -2922,24 +3224,57 @@ function parseMfaMethods(input: unknown): MfaMethod[] {
 const createUserStyles = `.upn-field{display:flex;align-items:center;gap:.45rem;min-width:0}.upn-field input{flex:1;min-width:0}.upn-field select{min-width:0;max-width:55%}@media(max-width:600px){.upn-field{flex-wrap:wrap}.upn-field select{max-width:100%;flex:1}}`;
 const healthStyles = `.header-actions{align-items:center;display:flex;flex-wrap:wrap;gap:.5rem}.health-panel{background:hsl(var(--card));border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);margin-top:1rem;padding:.85rem 1rem}.health-heading{align-items:flex-start;display:flex;gap:.75rem;justify-content:space-between}.health-headline{align-items:center;display:flex;font-weight:700;gap:.5rem;margin-top:.8rem}.health-dot{background:hsl(var(--muted-foreground));border-radius:50%;display:inline-block;flex:none;height:.7rem;width:.7rem}.health-dot.green{background:hsl(var(--success))}.health-dot.yellow{background:#d9a441}.health-dot.red{background:hsl(var(--destructive))}.health-actions{margin:.65rem 0}.health-service{border-top:1px solid hsl(var(--border));padding:.55rem 0}.health-service summary{align-items:center;cursor:pointer;display:flex;gap:.55rem;font-weight:600}.health-service .meta{margin-left:1.25rem}.health-issue{border-left:2px solid hsl(var(--border));margin:.55rem 0 .55rem 1.25rem;padding:.15rem .65rem}.health-issue p{margin:.3rem 0;overflow-wrap:anywhere}.health-issue small{color:hsl(var(--muted-foreground))}@media(max-width:600px){.health-heading{align-items:flex-start}.header-actions{justify-content:flex-start}}`;
 const styles = `:host{display:block;color:hsl(var(--foreground));font-family:var(--font-sans,system-ui)}*{box-sizing:border-box}main{max-width:1200px;margin:auto;padding:1.5rem}header,.directory-top,.heading,.actions{align-items:flex-start;display:flex;gap:1rem;justify-content:space-between}h1,h2,h3,p{margin:0}h1{font-size:1.55rem}h2{font-size:1.1rem}h3{font-size:.9rem}.eyebrow{color:hsl(var(--primary));font-size:.75rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.subtle,.read-only,.meta{color:hsl(var(--muted-foreground));font-size:.875rem;margin-top:.35rem}.status{color:hsl(var(--muted-foreground));min-height:1.4rem;margin-top:.75rem}.status:empty{display:none}.status[data-error="true"],.drawer-feedback.error{color:hsl(var(--destructive))}.badge,.state{background:hsl(var(--muted));border-radius:999px;font-size:.8rem;font-weight:700;padding:.25rem .6rem}.badge.ok,.state.on{background:hsl(var(--success) / .16);color:hsl(var(--success))}.directory{border-top:1px solid hsl(var(--border));margin-top:1.25rem;padding-top:.8rem}.resource-nav{display:flex;gap:.15rem}.resource-tab{background:transparent;border-radius:0;color:hsl(var(--muted-foreground));min-height:2.45rem;padding:.45rem .8rem}.resource-tab[aria-selected="true"]{border-bottom:2px solid hsl(var(--primary));color:hsl(var(--foreground))}label{display:grid;gap:.4rem;font-size:.875rem;font-weight:600;margin-top:1rem}select,input{background:hsl(var(--background));border:1px solid hsl(var(--input));border-radius:calc(var(--radius,.5rem) - 2px);color:inherit;font:inherit;min-height:2.25rem;padding:.4rem .55rem}.filter{margin:0;flex:1;max-width:420px;min-width:180px}.directory-top{align-items:center;flex-wrap:wrap}.directory-top .resource-nav{margin-right:auto}.column-tools{align-items:center;display:flex;flex-wrap:wrap;gap:.4rem;margin-top:1rem}.column-tools>span{color:hsl(var(--muted-foreground));font-size:.8rem;font-weight:700;margin-right:.15rem}.column-chip{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground));font-size:.78rem;min-height:2rem;padding:.25rem .55rem}.column-chip[aria-pressed="false"]{background:transparent;border:1px solid hsl(var(--border));color:hsl(var(--muted-foreground))}.check{align-items:center;display:flex;gap:.5rem}.check input{min-height:auto;width:1rem}.actions{justify-content:flex-end;margin-top:1rem}button{background:hsl(var(--primary));border:0;border-radius:calc(var(--radius,.5rem) - 2px);color:hsl(var(--primary-foreground));cursor:pointer;font:inherit;font-weight:700;min-height:2.25rem;padding:.4rem .7rem}button.secondary{background:hsl(var(--secondary));color:hsl(var(--secondary-foreground))}button.compact{font-size:.8rem;min-height:1.9rem;padding:.25rem .55rem}button:disabled{cursor:not-allowed;opacity:.6}button:focus,input:focus,select:focus{outline:2px solid hsl(var(--ring));outline-offset:2px}.table-wrap{margin-top:1rem;overflow:auto}table{border-collapse:collapse;color:hsl(var(--foreground));min-width:700px;width:100%}th,td{border-bottom:1px solid hsl(var(--border));padding:.75rem;text-align:left;vertical-align:middle}th{color:hsl(var(--muted-foreground));font-size:.75rem;text-transform:uppercase}.identity strong,.identity span{display:block}.identity span{color:hsl(var(--muted-foreground));font-size:.84rem;margin-top:.15rem}.row-control{text-align:right}.selected-row td{background:hsl(var(--accent) / .42)}.row-actions td{background:hsl(var(--accent) / .28)}.row-actions td>div{align-items:center;display:flex;gap:.7rem}.empty{border:1px dashed hsl(var(--border));border-radius:var(--radius,.5rem);color:hsl(var(--muted-foreground));margin-top:1rem;padding:1.25rem;text-align:center}.sr-only{clip:rect(0,0,0,0);height:1px;margin:-1px;overflow:hidden;position:absolute;width:1px}.backdrop{background:hsl(var(--background) / .64);display:flex;inset:0;justify-content:flex-end;position:fixed;z-index:20}.drawer{background:hsl(var(--card));box-shadow:-8px 0 24px hsl(var(--foreground) / .16);display:flex;flex-direction:column;height:100%;max-width:min(100%,40rem);width:100%}.drawer-heading{border-bottom:1px solid hsl(var(--border));flex:0 0 auto;padding:.85rem 1.1rem}.drawer-body{flex:1;min-height:0;overflow:auto;padding:.9rem 1.1rem}.drawer-section{margin-top:.9rem}.security-confirmation,.one-time-secret{background:hsl(var(--muted) / .28);border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);margin-top:1rem;padding:1rem}.security-confirmation p,.one-time-secret p{color:hsl(var(--muted-foreground));margin-bottom:.75rem}.one-time-secret code{display:block;background:hsl(var(--background));border-radius:.35rem;font-size:1rem;margin:.5rem 0;overflow-wrap:anywhere;padding:.65rem;user-select:all}.field-grid{display:grid;gap:.55rem;grid-template-columns:1fr}.user-field{align-items:end;display:grid;gap:.5rem;grid-template-columns:minmax(0,1fr) auto}.user-field label{align-items:center;display:grid;grid-template-columns:112px minmax(0,1fr);margin:0}.user-field label.check{display:flex;justify-content:flex-start}.field-grid .user-field label{margin:0}.drawer-footer{border-top:1px solid hsl(var(--border));flex:0 0 auto;padding:.7rem 1.1rem}.drawer-footer .actions{margin-top:0}.drawer-feedback{margin-top:.75rem;min-height:1.4rem}dl{margin:0}dl div{border-bottom:1px solid hsl(var(--border));padding:.75rem 0}dt{color:hsl(var(--muted-foreground));font-size:.75rem;font-weight:700}dd{margin:.25rem 0 0;overflow-wrap:anywhere}@media(max-width:600px){main{padding:1rem}.directory-top,.heading{flex-direction:column}.field-grid .user-field label{align-items:stretch;grid-template-columns:1fr}.drawer-heading{padding:1rem}.drawer-body,.drawer-footer{padding-left:1rem;padding-right:1rem}}`;
-const traceStyles = `.trace-panel{border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);margin-top:1rem;padding:.8rem}.trace-form{align-items:end;display:grid;gap:.6rem;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-top:.5rem}.trace-form label{margin:0}.trace-form button{align-self:end}.trace-toolbar{align-items:center;display:flex;flex-wrap:wrap;gap:.6rem;justify-content:space-between;margin-top:.7rem}.trace-panel th,.trace-panel td{font-size:.82rem;padding:.45rem}.trace-panel table{min-width:760px}.trace-panel .table-wrap{max-height:360px;overflow:auto}.trace-events{background:hsl(var(--muted) / .24);border-radius:var(--radius,.5rem);margin-top:.8rem;padding:.8rem}.trace-events p{font-size:.82rem;margin-top:.55rem;overflow-wrap:anywhere}.header-actions{align-items:center;display:flex;flex-wrap:wrap;gap:.4rem}@media(max-width:600px){.trace-form{grid-template-columns:1fr 1fr}}`;
+const traceStyles = `.trace-panel{border:1px solid hsl(var(--border));border-radius:var(--radius,.5rem);margin-top:1rem;padding:.8rem}.trace-form{align-items:end;display:grid;gap:.6rem;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-top:.5rem}.trace-form label{margin:0}.trace-form button{align-self:end}.trace-toolbar{align-items:center;display:flex;flex-wrap:wrap;gap:.6rem;justify-content:space-between;margin-top:.7rem}.trace-panel th{position:sticky;top:0;z-index:3;background:hsl(var(--background))}.trace-panel td:last-child button{white-space:normal;text-align:left}.quarantine-inline{display:flex;flex-direction:column;align-items:flex-start;gap:.4rem;font-size:.8rem}.quarantine-inline .check{margin:0;align-items:flex-start}.quarantine-inline [role=status]{overflow-wrap:anywhere}.trace-panel th,.trace-panel td{font-size:.82rem;padding:.45rem}.trace-panel table{min-width:760px}.trace-panel .table-wrap{max-height:360px;overflow:auto}.trace-events{background:hsl(var(--muted) / .24);border-radius:var(--radius,.5rem);margin-top:.8rem;padding:.8rem}.trace-events p{font-size:.82rem;margin-top:.55rem;overflow-wrap:anywhere}.header-actions{align-items:center;display:flex;flex-wrap:wrap;gap:.4rem}@media(max-width:600px){.trace-form{grid-template-columns:1fr 1fr}}`;
 const visualStyles = `
   :host { font-size: .875rem; line-height: 1.45; }
   main { max-width: none; padding: 1.25rem 1.5rem; }
   h1 { font-size: 1.5rem; line-height: 1.2; }
   h2 { font-size: 1.2rem; line-height: 1.3; }
   h3 { font-size: .92rem; line-height: 1.35; }
-  button { font-size: .875rem; font-weight: 600; line-height: 1.25; }
+  button { border-radius: 4px; font-size: .8125rem; font-weight: 500; line-height: 1.35; max-width: 100%; }
   button.compact { font-size: .8125rem; min-height: 2rem; padding: .35rem .65rem; }
-  button.secondary { border: 1px solid hsl(var(--border)); }
+  button.secondary { background: transparent; border: 1px solid hsl(var(--border)); }
+  button:not(:disabled):hover { filter: brightness(1.12); }
+  button.secondary:not(:disabled):hover { background: hsl(var(--accent)); }
+  button:focus:not(:focus-visible) { outline: none; }
   .resource-nav { flex-wrap: wrap; row-gap: .25rem; }
   .column-tools { gap: .35rem; }
-  .layout-details { border: 1px solid hsl(var(--border)); border-radius: var(--radius,.5rem); margin-top: .6rem; padding: .35rem .65rem; }
-  .layout-details summary { color: hsl(var(--muted-foreground)); cursor: pointer; font-size: .8125rem; font-weight: 650; }
-  .layout-list { display: grid; gap: .3rem; margin-top: .55rem; max-width: 34rem; }
-  .layout-row { align-items: center; display: grid; gap: .35rem; grid-template-columns: minmax(8rem,1fr) auto auto 7rem; }
-  .layout-row label { align-items: center; display: flex; gap: .3rem; margin: 0; white-space: nowrap; }
-  .layout-row input { min-width: 0; width: 4.2rem; }
+  td { overflow-wrap:anywhere; }
+  th[data-header] { position:relative; padding-right:18px; }
+  th[draggable="true"] .table-sort { cursor:grab; }
+  th.column-drop { box-shadow:inset 3px 0 var(--primary,#5680ed); }
+  .column-resize { position:absolute; top:0; right:-4px; width:9px; height:100%; cursor:col-resize; touch-action:none; z-index:2; }
+  .column-resize:hover,.column-resize:focus-visible { background:var(--primary,#5680ed); opacity:.65; }
+  .column-settings { display: inline-block; margin-left: .45rem; vertical-align: middle; text-transform: none; letter-spacing: normal; }
+  .column-settings summary { cursor: pointer; list-style: none; padding: .1rem .45rem; border-radius: .25rem; font-size: 1rem; }
+  .column-settings summary:hover, .column-settings[open] summary { background: hsl(var(--secondary)); }
+  .column-settings summary:focus-visible { outline: 2px solid hsl(var(--ring)); }
+  .column-settings-body { min-width: 7rem; padding-top: .4rem; }
+  .column-move { display: flex; gap: .35rem; }
+  .column-settings label { margin-top: .4rem; font-size: .75rem; }
+  .column-settings input { width: 7rem; }
+  .inline-user-actions { display: flex; flex-wrap: wrap; gap: .35rem .5rem; width: 100%; white-space: normal; }
+  .inline-user-actions button.compact { background: transparent; border-color: transparent; color: hsl(var(--muted-foreground)); font-size: .75rem; min-height: 1.9rem; padding: .3rem .4rem; }
+  .inline-user-actions button.compact:hover, .inline-user-actions button.compact:focus-visible { background: hsl(var(--accent)); color: hsl(var(--foreground)); }
+  .directory .inline-actions-row td { padding: .35rem .75rem .65rem; border-top: 0; border-bottom: 1px solid hsl(var(--border)); }
+  .directory tbody tr:not(.inline-actions-row) td { border-bottom: 0; padding-bottom: .25rem; }
+  .directory th { white-space: nowrap; }
+  .account-panel > .drawer-section { display: none; }
+  .account-panel[data-panel="account"] > .section-account { display: block; border-top: 0; }
+  .account-panel[data-panel="licenses"] > .section-licenses { display: block; border-top: 0; }
+  .account-panel[data-panel="groups"] > .section-groups { display: block; border-top: 0; }
+  .account-panel[data-panel="security"] > .section-security { display: block; border-top: 0; }
+  .account-panel[data-panel="delegation"] > .section-mailbox { display: block; border-top: 0; }
+  .account-panel[data-panel="forwarding"] > .section-mailbox { display: block; border-top: 0; }
+  .account-panel[data-panel="autoreply"] > .section-mailbox { display: block; border-top: 0; }
+  .account-panel[data-panel="drive"] > .section-drive { display: block; border-top: 0; }
+  .account-panel .section-mailbox > div { display: none; }
+  .account-panel[data-panel="delegation"] .mailbox-delegation, .account-panel[data-panel="forwarding"] .mailbox-forwarding, .account-panel[data-panel="autoreply"] .mailbox-autoreply { display: block; }
+  .account-panel[data-panel="addresses"] > .section-addresses { display: block; border-top: 0; }
+  [hidden] { display: none !important; }
+  .account-panel button { font-size: .8125rem; min-height: 2rem; padding: .35rem .6rem; }
+  .account-panel .role-field { margin-top: .5rem; }
+  .account-panel .meta { font-size: .8rem; }
   .column-chip { font-size: .75rem; min-height: 1.9rem; }
   .directory .table-wrap { border: 1px solid hsl(var(--border)); border-radius: var(--radius,.5rem); }
   .directory table { min-width: 620px; font-size: .8125rem; }
@@ -2959,24 +3294,46 @@ const visualStyles = `
   .actionline + .actionline { border-top: 1px solid hsl(var(--border)); margin-top: .7rem; padding-top: .7rem; }
   .actionline > span { color: hsl(var(--muted-foreground)); flex: 0 0 100%; font-size: .72rem; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
   .actionline > small { color: hsl(var(--muted-foreground)); flex: 0 0 100%; font-size: .75rem; }
+  .drawer, .drawer-body, .drawer-section, .drawer label { min-width: 0; }
+  .drawer-body button[id$="-close"], .drawer-body #account-back { display: none; }
+  .drawer-body .actions { flex-wrap: wrap; }
+  .drawer-body .mfa-methods { list-style: none; margin: .5rem 0; padding: 0; }
+  .drawer-body .mfa-methods li { display: flex; align-items: center; justify-content: space-between; min-width: 0; gap: .65rem; padding: .6rem 0; border-bottom: 1px solid hsl(var(--border)); }
+  .drawer-body .mfa-methods strong, .drawer-body .mfa-methods small { display: block; }
+  .drawer-body .mfa-methods small { color: hsl(var(--muted-foreground)); margin-top: .15rem; }
+  .drawer-body .mfa-methods button { flex: 0 0 auto; }
+  .drawer-body ul.address-aliases { list-style: none; margin: .5rem 0; padding: 0; }
+  .drawer-body ul.address-aliases li { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; padding: .35rem 0; }
+
+  .drawer-body .mfa-methods li > span { min-width: 0; overflow-wrap: anywhere; }
+  .drawer select, .drawer input:not([type="checkbox"]), .drawer textarea { min-width: 0; width: 100%; max-width: 100%; box-sizing: border-box; }
+  .drawer label { grid-template-columns: minmax(0, 1fr); }
+  .drawer-heading > div { min-width: 0; overflow-wrap: anywhere; }
+  .delegation-current { list-style: none; padding: 0; }
+  .delegation-current li { display: flex; flex-direction: column; gap: .5rem; padding: .65rem 0; overflow-wrap: anywhere; }
+  .delegate-permissions { display: flex; flex-wrap: wrap; gap: .5rem; }
+  .delegate-permission { display: inline-flex; align-items: center; gap: .35rem; font-size: .85rem; }
   .drawer { max-width: min(100%, 38rem); }
   .drawer-heading { align-items: flex-start; flex-direction: row; padding: 1rem 1.25rem; }
   .drawer-heading > div { min-width: 0; }
   .drawer-heading .subtle { font-size: .8125rem; overflow-wrap: anywhere; }
   .drawer-body { padding: 0 1.25rem 1.5rem; }
-  .drawer-section { border-top: 1px solid hsl(var(--border)); margin-top: 1.2rem; padding-top: 1.2rem; }
+  .drawer-section { border-top: 1px solid hsl(var(--border)); margin-top: .75rem; padding-top: .75rem; }
   .drawer-section:first-child { border-top: 0; }
-  .drawer-section h3 { margin-bottom: .7rem; }
+  .drawer-section h3 { margin-bottom: .45rem; }
   .drawer-section > .actions { flex-wrap: wrap; gap: .5rem; justify-content: flex-start; margin-top: .5rem; }
   .drawer-section > button { margin: .15rem .45rem .25rem 0; }
   .drawer-section label { margin-top: .75rem; }
   .drawer-section .meta { line-height: 1.5; margin-top: .65rem; }
-  .current-people { border-top: 1px solid hsl(var(--border)); margin-top: 1.2rem; padding-top: 1.2rem; }
+  .current-people { border-top: 1px solid hsl(var(--border)); margin-top: .75rem; padding-top: .75rem; }
   .current-people > .actions { align-items: center; justify-content: space-between; margin: 0 0 .55rem; }
   .current-people h4 { font-size: .9rem; margin: 0; }
   .current-people h5 { color: hsl(var(--muted-foreground)); font-size: .75rem; margin: .75rem 0 .35rem; text-transform: uppercase; }
   .current-members { border: 1px solid hsl(var(--border)); border-radius: var(--radius,.5rem); list-style: none; margin: 0; max-height: 12rem; overflow: auto; padding: 0; }
   .current-members li { border-bottom: 1px solid hsl(var(--border)); min-width: 0; overflow-wrap: anywhere; padding: .5rem .65rem; }
+  .current-members li:has(button) { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: .15rem .6rem; align-items: center; }
+  .current-members li > button { grid-column: 2; grid-row: 1 / span 2; }
+  .drawer, .drawer * { scrollbar-width: thin; scrollbar-color: hsl(var(--muted-foreground) / .4) transparent; }
   .current-members li:last-child { border-bottom: 0; }
   .current-members strong, .current-members small { display: block; }
   .current-members small { color: hsl(var(--muted-foreground)); }
@@ -2993,14 +3350,41 @@ const visualStyles = `
   .addresses-heading strong { font-size: .8125rem; }
   .addresses-heading .actions { gap: .4rem; margin: 0; }
   .address-aliases { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .75rem; }
-  .alias-chip { align-items: center; background: hsl(var(--secondary)); border: 1px solid hsl(var(--border)); border-radius: 999px; display: inline-flex; font-size: .75rem; gap: .3rem; max-width: 100%; min-height: 1.9rem; padding: .2rem .3rem .2rem .65rem; }
+  .alias-chip { align-items: center; background: hsl(var(--secondary)); border: 1px solid hsl(var(--border)); border-radius: 4px; display: inline-flex; font-size: .75rem; gap: .3rem; max-width: 100%; min-height: 1.9rem; padding: .2rem .3rem .2rem .65rem; }
   .alias-chip span { min-width: 0; overflow-wrap: anywhere; }
-  .alias-remove { align-items: center; background: transparent; border-radius: 50%; color: hsl(var(--muted-foreground)); display: inline-flex; flex: 0 0 1.35rem; font-size: 1rem; justify-content: center; min-height: 1.35rem; padding: 0; width: 1.35rem; }
+  .alias-remove { align-items: center; background: transparent; border-radius: 3px; color: hsl(var(--muted-foreground)); display: inline-flex; flex: 0 0 1.35rem; font-size: 1rem; justify-content: center; min-height: 1.35rem; padding: 0; width: 1.35rem; }
   .alias-remove:hover { background: hsl(var(--accent)); color: hsl(var(--foreground)); }
   .user-field label { grid-template-columns: 5rem minmax(0,1fr); }
   .user-field > button { align-self: stretch; }
   .drawer-footer { padding: .8rem 1.25rem; }
   .drawer-feedback:empty { display: none; }
+  .module-nav { display: flex; flex-wrap: wrap; gap: .4rem; }
+  .module-nav button[aria-pressed="true"] { border-color: hsl(var(--primary)); color: hsl(var(--foreground)); background: hsl(var(--accent)); }
+  .directory-actions { display: flex; justify-content: flex-end; margin-bottom: .75rem; }
+  .directory-actions:empty { display: none; }
+  /* One restrained control hierarchy across every focused Microsoft panel. */
+  .drawer .upn-field { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1.2fr); align-items: center; gap: .5rem; }
+  .drawer .upn-field input, .drawer .upn-field select { width: 100%; max-width: 100%; min-width: 0; }
+  @media (max-width: 420px) { .drawer .upn-field { grid-template-columns: minmax(0, 1fr) auto; } .drawer .upn-field select { grid-column: 1 / -1; } }
+  .badge, .state { border-radius: 4px; font-weight: 500; }
+  .column-chip { background: transparent; border: 1px solid hsl(var(--border)); border-radius: 4px; font-weight: 500; }
+  .column-chip[aria-pressed="true"] { background: hsl(var(--accent) / .5); border-color: hsl(var(--muted-foreground) / .4); }
+  .drawer input, .drawer select, .drawer textarea { border-radius: 4px; font-weight: 400; }
+  .drawer textarea { background: hsl(var(--background)); color: inherit; border: 1px solid hsl(var(--input)); font: inherit; padding: .55rem; resize: vertical; }
+  .drawer label + button, .drawer select + button, .drawer input + button { margin-top: .65rem; }
+  .drawer .actions { align-items: center; gap: .65rem; }
+  .drawer .actions h3 { margin: 0; margin-right: auto; }
+  .drawer .check { grid-template-columns: none; flex-wrap: nowrap; align-items: flex-start; font-weight: 400; line-height: 1.5; }
+  .drawer .check input { flex: 0 0 1rem; height: 1rem; margin: .15rem 0 0; padding: 0; }
+  .drawer-heading > button { flex: 0 0 auto; }
+  .drawer-body { overscroll-behavior: contain; }
+  .addresses-panel { border-radius: 4px; }
+  .addresses-heading { flex-wrap: wrap; row-gap: .65rem; }
+  .alias-chip { background: transparent; gap: .5rem; }
+  .alias-remove { min-width: 1.75rem; min-height: 1.75rem; }
+  .drawer .alias-remove { padding: .15rem; }
+  .resource-tab { border-radius: 0; }
+
   @media (max-width: 700px) {
     main { padding: 1rem; }
     header, .directory-top { align-items: stretch; flex-direction: column; }
@@ -3015,3 +3399,13 @@ const visualStyles = `
 `;
 
 if (!customElements.get(ELEMENT)) customElements.define(ELEMENT, CloudCommandMicrosoftPage);
+
+const traceDrawerStyles = `.trace-drawer{width:min(740px,100vw)!important;max-width:100vw!important}.trace-drawer.trace-expanded{width:min(1100px,100vw)!important}.trace-drawer .drawer-heading{align-items:flex-start}.trace-drawer h2{overflow-wrap:anywhere;font-size:1.15rem}.trace-summary{display:grid;grid-template-columns:1fr 1fr;gap:0 1.25rem}.trace-event{border-bottom:1px solid hsl(var(--border));padding:.65rem 0}.trace-event summary{display:flex;gap:1rem;cursor:pointer;align-items:baseline;font-size:.82rem}.trace-event summary:before{content:'›'}.trace-event[open] summary:before{content:'⌄'}.trace-event p{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.85rem;margin:.65rem 0}.trace-subject{background:none;color:inherit;border:0;padding:0;text-align:left;font-weight:500}.trace-subject:hover{text-decoration:underline}.trace-drawer .drawer-section>button{margin:.6rem .5rem 0 0}@media(max-width:500px){.trace-summary{grid-template-columns:1fr}.trace-event summary{flex-wrap:wrap;gap:.4rem}}`;
+
+const membershipStyles = `
+  .membership-list { list-style: none; margin: .65rem 0; padding: 0; display: grid; gap: .4rem; }
+  .membership-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: .75rem; row-gap: .2rem; padding: .55rem .65rem; border: 1px solid hsl(var(--border)); border-radius: 4px; }
+  .membership-name { font-size: .875rem; font-weight: 500; overflow-wrap: anywhere; }
+  .membership-reason { grid-column: 1; font-size: .8rem; font-weight: 400; color: hsl(var(--muted-foreground)); overflow-wrap: anywhere; }
+  .membership-list button { grid-column: 2; grid-row: 1 / span 2; margin: 0; }
+`;

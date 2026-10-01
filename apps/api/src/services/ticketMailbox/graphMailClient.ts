@@ -25,6 +25,7 @@ export interface GraphHeader {
 
 export interface GraphMessage {
   id: string;
+  '@removed'?: { reason?: string };
   internetMessageId?: string;
   subject?: string;
   from?: GraphRecipient;
@@ -81,7 +82,9 @@ export async function listInboxDelta(
   let finalDelta: string | null = null;
 
   for (let guard = 0; guard < 1000; guard++) {
-    const res = await graphFetch(url, token);
+    const res = await graphFetch(url, token, {
+      headers: { Prefer: 'odata.maxpagesize=100' },
+    });
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       const err = new Error(`Graph delta ${res.status}: ${body.slice(0, 200)}`);
@@ -101,9 +104,11 @@ export async function listInboxDelta(
     }
 
     finalDelta = data['@odata.deltaLink'] ?? null;
+    if (!finalDelta) throw new Error('Graph inbox delta returned no continuation or final cursor');
     break;
   }
 
+  if (!finalDelta) throw new Error('Graph inbox delta exceeded the pagination limit');
   return { messages, deltaLink: finalDelta };
 }
 

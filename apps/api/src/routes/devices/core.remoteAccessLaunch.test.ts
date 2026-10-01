@@ -33,6 +33,7 @@ vi.mock('../../services/partnerTrust', () => ({ evaluateCapability, requireCapab
 // Hold a configurable partner-settings value the mocked select chain returns.
 // Each test mutates this before calling app.request().
 let mockPartnerSettings: unknown = {};
+let mockEnrolledId: string | null = null;
 
 // A fully chainable, table-aware query-builder stub. Every chain method
 // (from/innerJoin/where/orderBy/limit) returns the same node so any call
@@ -47,7 +48,8 @@ function makeSelectMock() {
   return vi.fn(() => {
     let fromTableName: string | null = null;
     const resolveRows = (): unknown[] =>
-      fromTableName === 'partners' ? [{ settings: mockPartnerSettings }] : [];
+      fromTableName === 'partners' ? [{ settings: mockPartnerSettings }] :
+      fromTableName === 'portal_native_targets' && mockEnrolledId ? [{ rustdeskId: mockEnrolledId }] : [];
     const node: any = {
       from: vi.fn((table: unknown) => {
         try {
@@ -189,10 +191,22 @@ describe('POST /devices/:id/remote-access-launch', () => {
     vi.clearAllMocks();
     evaluateCapability.mockResolvedValue({ allow: true });
     mockPartnerSettings = {};
+    mockEnrolledId = null;
     app = new Hono();
     app.route('/devices', coreRoutes);
   });
 
+  it('uses active enrollment for GET availability and POST when no custom identifier exists', async () => {
+    mockEnrolledId = '503234560';
+    setPartnerSettings({ remoteAccessProviders: { defaultProviderId: 'rustdesk', providers: [{ id: 'rustdesk', name: 'RustDesk', enabled: true,
+      customFieldKey: 'rustdesk_id', urlTemplate: 'rustdesk://{id}', password: '' }] } });
+    vi.mocked(getDeviceWithOrgAndSiteCheck).mockResolvedValue({ id: deviceId, orgId: 'org-123', siteId: 'site-123', customFields: {} } as any);
+    const get = await app.request(`/devices/${deviceId}`);
+    expect((await get.json()).hasRemoteAccessLauncher).toBe(true);
+    const post = await app.request(`/devices/${deviceId}/remote-access-launch`, { method: 'POST' });
+    expect(post.status).toBe(200);
+    expect((await post.json()).launchUrl).toBe('rustdesk://503234560');
+  });
   it('returns 403 before resolving a credential-bearing URL when remote control is denied', async () => {
     evaluateCapability.mockResolvedValueOnce({
       allow: false,

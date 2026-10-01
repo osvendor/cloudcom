@@ -253,6 +253,21 @@ export default function ConnectDesktopButton({ viewerMode = 'browser', deviceId,
           const body = await launchRes.json() as { launchUrl?: string; scheme?: string };
           const url = body?.launchUrl;
           if (typeof url === 'string' && isAllowedLauncherScheme(url)) {
+            // Enrolled managed endpoints require a fresh staff admission in the app.
+            // This URI carries only a device hint, never a password or access ticket.
+            if (targetSessionId === undefined && /^rustdesk:\/\//i.test(url)) {
+              const managed = await fetchWithAuth(`/staff-native/launch/${deviceId}`, { method: 'POST' });
+              if (managed.status !== 404) {
+                const result = await runAction<{ launchUrl: string }>({ request: async () => managed,
+                  errorFallback: 'Managed remote access is unavailable.',
+                  parseSuccess: data => data as { launchUrl: string } });
+                if (result.launchUrl !== `cloudcom-remote://staff/connect/${deviceId}`) throw new Error('Invalid managed connection response.');
+                tryDeepLink(result.launchUrl);
+                showToast({ type: 'success', message: 'Continue in OS Consultants Remote Access. Sign in as staff and select Connect for the requested computer.' });
+                setStatus('idle');
+                return;
+              }
+            }
             setStatus('launching');
             if (/^https?:\/\//i.test(url)) {
               window.open(url, '_blank', 'noopener,noreferrer');

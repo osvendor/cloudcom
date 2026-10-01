@@ -46,6 +46,32 @@ async function mount(canManage = true, complete = true, userType = user.userType
 afterEach(() => { document.body.replaceChildren(); window.location.hash = ''; });
 
 describe('Microsoft directory interaction', () => {
+  it('separates unlicensed accounts from licensed users and shared mailboxes', async () => {
+    const at = '2026-09-25T12:00:00Z';
+    const resource = (items: unknown[]) => ({ items, columns: [{ key: 'displayName', label: 'User' }], complete: true, checkedAt: at });
+    const { root } = await mount(true, true, user.userType, [], undefined, false, null, {
+      directory: { status: 'ready', collectedAt: at, data: {
+        users: resource([
+          { id: 'licensed', values: { displayName: 'Licensed person', licenseSummary: 'Business Standard' } },
+          { id: 'free', values: { displayName: 'Unlicensed person', licenseSummary: 'Unlicensed' } },
+          { id: 'shared', values: { displayName: 'Shared team', licenseSummary: 'Unlicensed' } },
+          { id: 'unknown', values: { displayName: 'Unknown license', licenseSummary: null } },
+        ]), groups: resource([]), licenses: resource([]),
+        mailboxes: [{ id: 'shared', primarySmtpAddress: 'team@example.test', recipientType: 'SharedMailbox', archiveEnabled: false }],
+      } }, usage: { status: 'never', collectedAt: null, data: null },
+    });
+    expect(root.querySelector('table')?.textContent).toContain('Licensed person');
+    expect(root.querySelector('table')?.textContent).not.toContain('Unlicensed person');
+    root.querySelector<HTMLButtonElement>('[data-directory-scope="unlicensed"]')!.click();
+    await flush(); await flush();
+    expect(root.querySelector('table')?.textContent).toContain('Unlicensed person');
+    expect(root.querySelector('table')?.textContent).not.toContain('Shared team');
+    expect(root.querySelector('table')?.textContent).not.toContain('Unknown license');
+    expect(root.querySelector('table')?.textContent).not.toContain('Licensed person');
+    root.querySelector<HTMLButtonElement>('[data-resource="all"]')!.click();
+    await flush(); await flush();
+    expect(root.querySelector('table')?.textContent).toContain('Unlicensed person');
+  });
   it('queues a background refresh without clearing the displayed snapshot or making live inventory calls', async () => {
     const at = '2026-09-25T12:00:00Z';
     const data = { items: [{ id: 'u1', values: { displayName: 'Ada' } }],
@@ -134,7 +160,7 @@ describe('Microsoft directory interaction', () => {
   it('shows assignment origin and permits confirmed removal of only a direct license', async () => {
     const { root, request } = await mount();
     root.querySelector<HTMLButtonElement>('[data-expand="u1"]')!.click();
-    root.querySelector<HTMLButtonElement>('[data-detail="u1"]')!.click();
+
     await flush(); await flush();
     root.querySelector<HTMLButtonElement>('#licenses-open')!.click();
     await flush(); await flush();
@@ -151,13 +177,34 @@ describe('Microsoft directory interaction', () => {
   it('restores account-scoped column order, widths and sort and saves changes', async () => {
     const saved = { columns: ['displayName', 'oneDrive', 'mailbox'], widths: { mailbox: 210 }, sortKey: 'oneDrive', sortDirection: 'desc' as const };
     const { root, request } = await mount(true, true, user.userType, [], undefined, false, saved);
-    expect(Array.from(root.querySelectorAll('thead th')).map(cell => cell.textContent?.trim()).slice(0, 3)).toEqual(['User', 'OneDrive ↓', 'Mailbox']);
+    expect(Array.from(root.querySelectorAll('thead th')).map(cell => cell.querySelector('.table-sort')?.textContent?.trim()).slice(0, 3)).toEqual(['User', 'OneDrive ↓', 'Mailbox']);
     expect(root.querySelector('[data-sort="mailbox"]')?.parentElement?.getAttribute('style')).toContain('210px');
     root.querySelector<HTMLButtonElement>('[data-column="archive"]')!.click();
     await flush();
     const writes = request.mock.calls.filter(([path, init]) => path === '/microsoft/directory/layout/users' && init?.method === 'PUT');
     expect(writes).toHaveLength(1);
     expect(JSON.parse(String(writes[0]![1]?.body)).columns).toContain('archive');
+  });
+  it('resizes by dragging an edge and persists without sorting', async () => {
+    const { root, request } = await mount();
+    const handle = root.querySelector<HTMLElement>('[data-resize="userType"]')!;
+    handle.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, button: 0, clientX: 100 }));
+    handle.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX: 280 }));
+    handle.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, clientX: 280 }));
+    await flush();
+    const writes = request.mock.calls.filter(([, init]) => init?.method === 'PUT');
+    expect(JSON.parse(String(writes.at(-1)![1]?.body)).widths.userType).toBe(180);
+    expect(root.querySelector('.column-settings')).toBeNull();
+    expect(root.querySelector('[data-header="userType"]')?.getAttribute('aria-sort')).toBe('none');
+  });
+  it('reorders by dropping a header and keeps identity anchored', async () => {
+    const { root, request } = await mount();
+    const drop = new Event('drop', { bubbles: true, cancelable: true });
+    Object.defineProperty(drop, 'dataTransfer', { value: { getData: () => 'oneDrive' } });
+    root.querySelector('[data-header="userType"]')!.dispatchEvent(drop);
+    await flush();
+    const writes = request.mock.calls.filter(([, init]) => init?.method === 'PUT');
+    expect(JSON.parse(String(writes.at(-1)![1]?.body)).columns.slice(0, 3)).toEqual(['displayName', 'oneDrive', 'userType']);
   });
   it('combines users, shared mailboxes, and mail-enabled groups without exposing security groups', async () => {
     const { root } = await mount(true, true, user.userType, [{
@@ -174,24 +221,39 @@ describe('Microsoft directory interaction', () => {
     expect(table).toContain('Dispatch');
     expect(table).toContain('Groups');
     expect(table).not.toContain('Private admins');
-    expect(root.querySelector('[data-detail="u1"]')?.textContent).toContain('Manage mailbox');
-    expect(root.querySelector('[data-detail="g1"]')).toBeTruthy();
-    root.querySelector<HTMLButtonElement>('[data-detail="u1"]')!.click();
+    expect(root.querySelector('[data-user-id="u1"][data-user-action="addresses"]')?.textContent).toBe('Email addresses');
+    expect(root.querySelector('[data-group-id="g1"][data-group-action="account"]')).toBeTruthy();
+    root.querySelector<HTMLButtonElement>('[data-user-id="u1"][data-user-action="addresses"]')!.click();
     await flush(); await flush();
-    expect(root.querySelector('#detail-title')?.textContent).toBe('Shared mailbox');
+    expect(root.querySelector('#detail-title')?.textContent).toBe('Email addresses');
   });
-  it('loads primary address and aliases when opening a mailbox account', async () => {
+  it('loads primary address and aliases when opening the focused email panel', async () => {
     const { root, request } = await mount(true, true, user.userType, [{
       id: user.id, primarySmtpAddress: 'ada@example.test', recipientType: 'UserMailbox',
       archiveEnabled: false, mailboxBytes: 0, archiveBytes: null,
       collectedAt: '2026-09-22T12:00:00Z', statisticsUnavailable: false,
     }]);
-    root.querySelector<HTMLButtonElement>('[data-expand="u1"]')!.click();
-    root.querySelector<HTMLButtonElement>('[data-detail="u1"]')!.click();
+    root.querySelector<HTMLButtonElement>('[data-user-id="u1"][data-user-action="addresses"]')!.click();
+
     await flush(); await flush();
     expect(root.querySelector<HTMLInputElement>('#addresses-primary')?.value).toBe('ada@example.test');
     expect(root.querySelector('.address-aliases')?.textContent).toContain('alias@example.test');
     expect(request.mock.calls.some(([, init]) => JSON.parse(String(init?.body || '{}')).type === 'mailbox.addresses.get')).toBe(true);
+  });
+  it('shows inline actions and opens a focused prepopulated license panel', async () => {
+    const { root, request } = await mount();
+    expect(root.querySelector('.row-actions')).toBeNull();
+    expect(root.querySelector('.layout-details')).toBeNull();
+    expect(root.querySelector('[data-column="exclude"]')).toBeNull();
+    expect(root.querySelector('thead [data-resize="displayName"]')).toBeTruthy();
+    root.querySelector<HTMLButtonElement>('[data-user-action="licenses"]')!.click();
+    await flush(); await flush();
+    expect(root.querySelector('#detail-title')?.textContent).toBe('Licenses');
+    expect(root.querySelector<HTMLElement>('.section-licenses')?.hidden).toBe(false);
+    expect(root.querySelector<HTMLElement>('.section-account')?.hidden).toBe(true);
+    expect(root.querySelector('[data-license-remove="direct-sku"]')?.getAttribute('aria-label')).toContain('Remove');
+    expect(root.querySelector('[data-license-remove="group-sku"]')).toBeNull();
+    expect(request.mock.calls.some(([, init]) => String(init?.body).includes('user.license.remove'))).toBe(false);
   });
   it('sorts directory rows from column headings in both directions', async () => {
     const { root, request } = await mount();
@@ -207,6 +269,7 @@ describe('Microsoft directory interaction', () => {
       if (path === '/microsoft/administration' && JSON.parse(String(init?.body)).type === 'mailbox.inventory') return Response.json({ records: [], partial: false, collectedAt: '2026-09-22T12:00:00Z' });
       throw new Error(`Unexpected ${path}`);
     });
+    root.querySelector<HTMLButtonElement>('[data-directory-scope="unlicensed"]')!.click(); await flush();
     root.querySelector<HTMLButtonElement>('#refresh-resource')!.click(); await flush(); await flush();
     expect(root.querySelector('tbody tr:first-child')?.textContent).toContain('Ada');
     root.querySelector<HTMLButtonElement>('[data-sort="displayName"]')!.click();
@@ -243,6 +306,7 @@ describe('Microsoft directory interaction', () => {
       }
       throw new Error(`Unexpected ${path}`);
     });
+    root.querySelector<HTMLButtonElement>('[data-directory-scope="unlicensed"]')!.click(); await flush();
     root.querySelector<HTMLButtonElement>('#refresh-resource')!.click(); await flush(); await flush();
     expect(root.textContent).toContain('Search for another account to load its usage');
     const filter = root.querySelector<HTMLInputElement>('#filter')!;
@@ -261,12 +325,12 @@ describe('Microsoft directory interaction', () => {
     expect(root.textContent).not.toContain('change that report privacy setting');
     expect(request.mock.calls.some(([, init]) => init?.body && JSON.parse(String(init.body)).type === 'user.drive.usage.get')).toBe(true);
   });
-  it('expands account actions without making a mutation and opens an editing drawer', async () => {
+  it('opens the account panel directly without duplicating row actions or making a mutation', async () => {
     const { root, request } = await mount();
     expect(root.querySelector('[role="dialog"]')).toBeNull();
     root.querySelector<HTMLButtonElement>('[data-expand="u1"]')!.click();
-    expect(root.querySelector('[data-expand="u1"]')?.getAttribute('aria-expanded')).toBe('true');
-    root.querySelector<HTMLButtonElement>('[data-detail="u1"]')!.click();
+    expect(root.querySelector('.row-actions')).toBeNull();
+
     await flush();
     expect(root.querySelector('[role="dialog"]')).toBeTruthy();
     expect(root.querySelector<HTMLInputElement>('#user-displayName')?.value).toBe(user.displayName);
@@ -296,14 +360,13 @@ describe('Microsoft directory interaction', () => {
     const headers = Array.from(root.querySelectorAll('thead th')).map(header => header.querySelector('button')?.firstChild?.textContent?.trim() ?? header.textContent?.trim());
     expect(headers.slice(0, 6)).toEqual(['User', 'Type', 'License', 'Mailbox', 'Archive', 'OneDrive']);
     expect(headers).not.toContain('Exclude');
-    expect(root.querySelector('[data-column="exclude"]')?.getAttribute('aria-pressed')).toBe('false');
+    expect(root.querySelector('[data-column="exclude"]')).toBeNull();
     expect(root.querySelector('[data-column="mailbox"]')?.getAttribute('aria-pressed')).toBe('true');
     expect(root.querySelector('table')?.textContent).not.toContain('Member');
     expect(root.querySelectorAll<HTMLTableCellElement>('tbody tr:first-child td')[1]?.textContent).toBe('User');
     expect(root.querySelector('table')?.textContent).toContain('M365_BUSINESS_PREMIUM');
     expect(root.querySelector('table')?.textContent).toContain('M365_BUSINESS_PREMIUM');
-    root.querySelector<HTMLButtonElement>('[data-column="exclude"]')!.click();
-    expect(root.querySelector('thead')?.textContent).toContain('Exclude');
+    expect(root.querySelector('thead')?.textContent).not.toContain('Exclude');
     root.querySelector<HTMLButtonElement>('[data-column="mailbox"]')!.click();
     expect(root.querySelector('thead')?.textContent).not.toContain('Mailbox');
   });
@@ -327,11 +390,12 @@ describe('Microsoft directory interaction', () => {
     expect(page.shadowRoot!.querySelector('table')?.textContent).toContain('ada@example.test');
     expect(page.shadowRoot!.querySelector('table')?.textContent).toContain('2.0 GB');
     expect(page.shadowRoot!.querySelector('table')?.textContent).toContain('512.0 MB');
-    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-detail="u1"]')!.click();
+    page.shadowRoot!.querySelector<HTMLButtonElement>('[data-user-id="u1"][data-user-action="addresses"]')!.click();
     await flush(); await flush();
-    expect(page.shadowRoot!.querySelector('#detail-title')?.textContent).toBe('Shared mailbox');
-    expect(page.shadowRoot!.textContent).toContain('Manage forwarding');
-    expect(page.shadowRoot!.textContent).toContain('Delegate mailbox');
+    expect(page.shadowRoot!.querySelector('#detail-title')?.textContent).toBe('Email addresses');
+    expect(page.shadowRoot!.querySelector('.drawer')?.textContent).not.toContain('Manage forwarding');
+    expect(page.shadowRoot!.querySelector('.drawer')?.textContent).not.toContain('Delegate mailbox');
+    expect(page.shadowRoot!.querySelector<HTMLInputElement>('#addresses-primary')?.value).toBe('ada@example.test');
     expect(page.shadowRoot!.querySelector('#user-password-reset-start')).toBeNull();
     expect(page.shadowRoot!.querySelector('#global-admin-enabled')).toBeNull();
   });
@@ -369,10 +433,10 @@ describe('Microsoft directory interaction', () => {
     expect(root.textContent).toContain('Groups');
     expect(root.textContent).toContain('Exclude');
     root.querySelector<HTMLButtonElement>('[data-expand="u1"]')!.click();
-    expect(root.textContent).toContain('Delegate mailbox');
-    expect(root.querySelector('#user-password-reset-start')).toBeNull();
-    expect(root.querySelector('[data-row-security="reset-password"]')).toBeTruthy();
-    expect(root.textContent).toContain('Manage forwarding');
+    expect(root.textContent).toContain('Delegation');
+    await flush();
+    expect(root.querySelector('[data-user-action="reset-password"]')).toBeTruthy();
+    expect(root.textContent).toContain('Forwarding');
   });
 
   it('creates a distribution list through the typed Exchange action without requiring a group owner', async () => {
@@ -409,7 +473,7 @@ describe('Microsoft directory interaction', () => {
     request.mockImplementation(async (path: string, init?: RequestInit) => {
       if (path === '/microsoft/administration') {
         const operation = JSON.parse(String(init?.body));
-        if (operation.type === 'user.domains.list') return Response.json({ domains: ['example.test'] });
+        if (operation.type === 'user.domains.list') return Response.json({ domains: ['example.test'], defaultUsageLocation: 'GB' });
         if (operation.type === 'licenses.list') return Response.json({ items: [], partial: false });
         if (operation.type === 'user.create') return Response.json({ accepted: true, id: '11111111-1111-4111-8111-111111111111', userPrincipalName: operation.user.userPrincipalName, temporaryPassword: 'temporary-secret' });
       }
@@ -429,7 +493,7 @@ describe('Microsoft directory interaction', () => {
     await flush(); await flush();
     expect(request.mock.calls.some(([, init]) => JSON.parse(String(init?.body || '{}')).type === 'user.create')).toBe(true);
     expect(root.querySelector<HTMLInputElement>('[aria-label="Temporary password"]')?.value).toBe('temporary-secret');
-    expect(root.textContent).toContain('MFA enrollment, aliases, and group membership remain separate actions');
+    expect(root.textContent).toContain('MFA enrollment and aliases remain separate actions');
     expect(root.querySelector<HTMLButtonElement>('#create-user-close')).toBeTruthy();
     expect(root.querySelector('#create-user-submit')).toBeNull();
   });
@@ -438,7 +502,7 @@ describe('Microsoft directory interaction', () => {
     request.mockImplementation(async (path: string, init?: RequestInit) => {
       if (path === '/microsoft/administration') {
         const operation = JSON.parse(String(init?.body));
-        if (operation.type === 'user.domains.list') return Response.json({ domains: ['example.test'] });
+        if (operation.type === 'user.domains.list') return Response.json({ domains: ['example.test'], defaultUsageLocation: 'GB' });
         if (operation.type === 'licenses.list') return Response.json({ items: [
           { skuId: '11111111-1111-4111-8111-111111111111', skuPartNumber: 'O365_BUSINESS_PREMIUM', capabilityStatus: 'Enabled', consumedUnits: 1, prepaidUnits: { enabled: 2 } },
           { skuId: '22222222-2222-4222-8222-222222222222', skuPartNumber: 'AAD_PREMIUM_P2', capabilityStatus: 'Enabled', consumedUnits: 0, prepaidUnits: { enabled: 2 } },
@@ -456,7 +520,6 @@ describe('Microsoft directory interaction', () => {
     expect(root.textContent).not.toContain('AAD_PREMIUM_P2');
     root.querySelector<HTMLInputElement>('#create-user-name')!.value = 'New User';
     root.querySelector<HTMLInputElement>('#create-user-local')!.value = 'new';
-    root.querySelector<HTMLInputElement>('#create-user-location')!.value = 'GB';
     root.querySelector<HTMLSelectElement>('#create-user-license')!.value = '11111111-1111-4111-8111-111111111111';
     root.querySelector<HTMLButtonElement>('#create-user-submit')!.click(); await flush(); await flush();
     const mutations = request.mock.calls.map(([, init]) => JSON.parse(String(init?.body || '{}'))).filter(op => op.type === 'user.create' || op.type === 'user.license.assign');
@@ -472,7 +535,7 @@ describe('Microsoft directory interaction', () => {
     request.mockImplementation(async (path: string, init?: RequestInit) => {
       if (path === '/microsoft/administration') {
         const operation = JSON.parse(String(init?.body));
-        if (operation.type === 'user.domains.list') return Response.json({ domains: ['example.test'] });
+        if (operation.type === 'user.domains.list') return Response.json({ domains: ['example.test'], defaultUsageLocation: 'GB' });
         if (operation.type === 'licenses.list') return Response.json({ items: [{ skuId: '11111111-1111-4111-8111-111111111111', skuPartNumber: 'O365_BUSINESS_PREMIUM', capabilityStatus: 'Enabled', consumedUnits: 0, prepaidUnits: { enabled: 1 } }], partial: false });
         if (operation.type === 'user.create') return Response.json({ accepted: true, id: '33333333-3333-4333-8333-333333333333', userPrincipalName: operation.user.userPrincipalName, temporaryPassword: 'one-time-secret' });
         if (operation.type === 'user.license.assign') return Response.json({ error: 'Seat was taken' }, { status: 409 });
@@ -485,7 +548,6 @@ describe('Microsoft directory interaction', () => {
     root.querySelector<HTMLButtonElement>('#create-user')!.click(); await flush(); await flush();
     root.querySelector<HTMLInputElement>('#create-user-name')!.value = 'New User';
     root.querySelector<HTMLInputElement>('#create-user-local')!.value = 'new';
-    root.querySelector<HTMLInputElement>('#create-user-location')!.value = 'CA';
     root.querySelector<HTMLSelectElement>('#create-user-license')!.value = '11111111-1111-4111-8111-111111111111';
     root.querySelector<HTMLButtonElement>('#create-user-submit')!.click(); await flush(); await flush();
     expect(root.querySelector<HTMLInputElement>('[aria-label="Temporary password"]')?.value).toBe('one-time-secret');
@@ -511,9 +573,8 @@ describe('Microsoft directory interaction', () => {
     expect(root.querySelector('[data-expand="11111111-1111-4111-8111-111111111111"]')).toBeNull();
     root.querySelector<HTMLButtonElement>('[data-directory-scope="exclude"]')!.click();
     expect(root.querySelector('[data-expand="11111111-1111-4111-8111-111111111111"]')).toBeTruthy();
-    root.querySelector<HTMLButtonElement>('[data-column="exclude"]')!.click();
-    expect(root.querySelector('table')?.textContent).toContain('Excluded');
-    root.querySelector<HTMLButtonElement>('[data-expand="11111111-1111-4111-8111-111111111111"]')!.click();
+    expect(root.querySelector('table')?.textContent).toContain('Include user');
+    root.querySelector<HTMLButtonElement>('[data-expand="11111111-1111-4111-8111-111111111111"]')!.click(); await flush();
     root.querySelector<HTMLButtonElement>('[data-directory-exclude]')!.click(); await flush();
     expect(request.mock.calls.map(([, init]) => init?.body).some(body => String(body).includes('"excluded":false'))).toBe(true);
     expect(root.querySelector('[data-expand="11111111-1111-4111-8111-111111111111"]')).toBeNull();
@@ -535,14 +596,14 @@ describe('Microsoft directory interaction', () => {
   it('keeps partial result counts honest and omits unsupported controls', async () => {
     const { root } = await mount(true, false);
     expect(root.textContent).toMatch(/partial|loaded/i);
-    for (const action of ['Delete user', 'Reset password', 'Delegate mailbox', 'Threat Hunting']) expect(root.textContent).not.toContain(action);
+    for (const action of ['Delete user', 'Threat Hunting']) expect(root.textContent).not.toContain(action);
     expect(root.querySelector('[data-resource="sites"]')).toBeNull();
   });
 
   it('opens read-only account details without exposing a save action', async () => {
     const { root } = await mount(false);
     root.querySelector<HTMLButtonElement>('[data-expand="u1"]')!.click();
-    root.querySelector<HTMLButtonElement>('[data-detail="u1"]')!.click(); await flush();
+     await flush();
     expect(root.querySelector<HTMLInputElement>('#user-displayName')?.disabled).toBe(true);
     expect(root.querySelector('#user-save')).toBeNull();
   });
@@ -550,9 +611,9 @@ describe('Microsoft directory interaction', () => {
   it('wraps drawer keyboard focus and returns focus when closed', async () => {
     const { root } = await mount();
     root.querySelector<HTMLButtonElement>('[data-expand="u1"]')!.click();
-    root.querySelector<HTMLButtonElement>('[data-detail="u1"]')!.click(); await flush();
+     await flush();
     const close = root.querySelector<HTMLButtonElement>('#detail-close')!;
-    const lastButton = root.querySelector<HTMLButtonElement>('#user-drive-link')!;
+    const lastButton = Array.from(root.querySelectorAll<HTMLElement>('[role="dialog"] button:not(:disabled), [role="dialog"] input:not(:disabled)')).filter(element => !element.closest('[hidden]')).at(-1)!;
     lastButton.focus(); lastButton.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
     expect(root.activeElement).toBe(close);
     close.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true }));
@@ -565,7 +626,7 @@ describe('Microsoft directory interaction', () => {
   it('clears expanded rows and pending account drafts immediately on organization change', async () => {
     const { page, root } = await mount();
     root.querySelector<HTMLButtonElement>('[data-expand="u1"]')!.click();
-    root.querySelector<HTMLButtonElement>('[data-detail="u1"]')!.click(); await flush();
+     await flush();
     const name = root.querySelector<HTMLInputElement>('#user-displayName')!;
     name.value = 'Private draft'; name.dispatchEvent(new Event('input'));
     page.context = { contractVersion: 1, extensionName: 'cloudcommand', path: '/extensions/cloudcommand/microsoft', organizationId: 'org-b' };
@@ -573,7 +634,7 @@ describe('Microsoft directory interaction', () => {
     expect(root.textContent).not.toContain('Private draft');
     await flush();
     root.querySelector<HTMLButtonElement>('[data-expand="u1"]')!.click();
-    root.querySelector<HTMLButtonElement>('[data-detail="u1"]')!.click(); await flush();
+     await flush();
     expect(root.querySelector<HTMLInputElement>('#user-displayName')!.value).toBe(user.displayName);
   });
 });

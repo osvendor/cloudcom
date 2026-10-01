@@ -55,6 +55,9 @@ export const adminUserCreateSchema = z.object({
   displayName: z.string().trim().min(1).max(256),
   userPrincipalName: z.string().trim().min(3).max(320).regex(/^[A-Za-z0-9'.!#^~_-]+@[A-Za-z0-9.-]+$/),
   usageLocation: z.string().regex(/^[A-Z]{2}$/).optional(),
+  // Preserve the supplied password exactly; Microsoft enforces tenant password policy.
+  password: z.string().min(8).max(256).regex(/^[^\x00-\x1f\x7f]+$/).optional(),
+  forceChangePasswordNextSignIn: z.boolean().optional(),
 }).strict();
 export type AdminUserCreate = z.infer<typeof adminUserCreateSchema>;
 export const adminLicenseAssignSchema = z.object({ skuId: uuid }).strict();
@@ -180,7 +183,7 @@ export function createAdminGraphProvider(options: {
     const mutation = method !== 'GET';
     try {
       const result = await options.fetch(`${ORIGIN}${path}`, {
-        method, headers: { Authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+        method, headers: { Authorization: `Bearer ${token}`, ...(path.includes('/memberOf/microsoft.graph.group?') ? { ConsistencyLevel: 'eventual' } : {}), ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
         body: body === undefined ? undefined : JSON.stringify(body),
         redirect: 'error', signal: AbortSignal.timeout(15000), timeoutMs: 15000, maxBytes: 1024 * 1024,
       });
@@ -235,7 +238,7 @@ export function createAdminGraphProvider(options: {
       const cursor = query.getAll('$skiptoken');
       if (url.origin !== initial.origin || url.pathname !== initial.pathname || url.hash
         || url.username || url.password || cursor.length !== 1 || !cursor[0] || cursor[0].length > 2048
-        || [...query.keys()].some(key => !['$select', '$top', '$skiptoken'].includes(key))
+        || [...query.keys()].some(key => !['$select', '$top', '$skiptoken', ...(initial.searchParams.has('$count') ? ['$count'] : [])].includes(key))
         || [...initial.searchParams.keys()].some(key => query.getAll(key).length !== 1 || query.get(key) !== initial.searchParams.get(key)))
         return { items, partial: true };
       next = url.href.slice(ORIGIN.length);
@@ -383,10 +386,12 @@ export function createAdminGraphProvider(options: {
     async listVerifiedUserDomains() {
       const token = await session();
       const organization = parse(z.object({ value: z.array(z.object({
-        id: uuid, verifiedDomains: z.array(z.object({ name: z.string().min(1).max(255) })).max(256),
-      })).length(1) }), await request(token, '/organization?$select=id,verifiedDomains'), 'invalid_provider_response');
+        id: uuid, verifiedDomains: z.array(z.object({ name: z.string().min(1).max(255) })).max(256), defaultUsageLocation: z.string().nullable().optional(),
+      })).length(1) }), await request(token, '/organization?$select=id,verifiedDomains,defaultUsageLocation'), 'invalid_provider_response');
       if (organization.value[0]!.id !== tenantId) throw new AdminGraphError('tenant_identity_mismatch');
-      return { domains: organization.value[0]!.verifiedDomains.map(domain => domain.name.toLowerCase()) };
+      const defaultLocation = organization.value[0]!.defaultUsageLocation?.trim().toUpperCase();
+      return { domains: organization.value[0]!.verifiedDomains.map(domain => domain.name.toLowerCase()),
+        defaultUsageLocation: defaultLocation && /^[A-Z]{2}$/.test(defaultLocation) ? defaultLocation : null };
     },
     async createUser(input: AdminUserCreate, authorize?: () => Promise<void>) {
       const value = parse(adminUserCreateSchema, input, 'invalid_input');
@@ -395,18 +400,22 @@ export function createAdminGraphProvider(options: {
       const token = await session();
       requireAppRole(token, 'User.ReadWrite.All');
       const organization = parse(z.object({ value: z.array(z.object({
-        id: uuid, verifiedDomains: z.array(z.object({ name: z.string().min(1).max(255) })).max(256),
-      })).length(1) }), await request(token, '/organization?$select=id,verifiedDomains'), 'invalid_provider_response');
+        id: uuid, verifiedDomains: z.array(z.object({ name: z.string().min(1).max(255) })).max(256), defaultUsageLocation: z.string().nullable().optional(),
+      })).length(1) }), await request(token, '/organization?$select=id,verifiedDomains,defaultUsageLocation'), 'invalid_provider_response');
       if (organization.value[0]!.id !== tenantId) throw new AdminGraphError('tenant_identity_mismatch');
       if (!organization.value[0]!.verifiedDomains.some(entry => entry.name.toLowerCase() === domain.toLowerCase()))
         throw new AdminGraphError('invalid_input');
+      // Organization country is not necessarily its service usage location. Never guess a country.
+      const defaultLocation = organization.value[0]!.defaultUsageLocation?.trim().toUpperCase();
+      const usageLocation = value.usageLocation ?? (defaultLocation && /^[A-Z]{2}$/.test(defaultLocation) ? defaultLocation : undefined);
       await authorize?.();
-      const temporaryPassword = createTemporaryPassword();
+      const temporaryPassword = value.password ?? createTemporaryPassword();
+      const forceChangePasswordNextSignIn = value.forceChangePasswordNextSignIn ?? true;
       const result = await request(token, '/users', 'POST', {
         accountEnabled: true, displayName: value.displayName, mailNickname: localPart,
         userPrincipalName: value.userPrincipalName,
-        ...(value.usageLocation ? { usageLocation: value.usageLocation } : {}),
-        passwordProfile: { password: temporaryPassword, forceChangePasswordNextSignIn: true },
+        ...(usageLocation ? { usageLocation } : {}),
+        passwordProfile: { password: temporaryPassword, forceChangePasswordNextSignIn },
       }, true);
       let created: { id: string; userPrincipalName: string };
       try { created = z.object({ id: uuid, userPrincipalName: z.string().min(3).max(320) }).parse(result); }
@@ -414,7 +423,7 @@ export function createAdminGraphProvider(options: {
       if (created.userPrincipalName.toLowerCase() !== value.userPrincipalName.toLowerCase())
         throw new AdminGraphError('unknown_write_outcome');
       return { accepted: true as const, id: created.id, userPrincipalName: created.userPrincipalName,
-        temporaryPassword, forceChangePasswordNextSignIn: true as const };
+        temporaryPassword, forceChangePasswordNextSignIn };
     },
     async assignUserLicense(id: string, input: AdminLicenseAssign, authorize?: () => Promise<void>) {
       id = parse(uuid, id, 'invalid_input');
@@ -518,6 +527,24 @@ export function createAdminGraphProvider(options: {
       })) };
     },
     listLicenses: () => collection(`/subscribedSkus?$select=${licenseSelect}`, license),
+    async getUserGroups(id: string) {
+      id = parse(uuid, id, 'invalid_input');
+      const token = await session();
+      await resource(token, '/users', id, user, userSelect);
+      const result = await collection(`/users/${id}/memberOf/microsoft.graph.group?$select=${groupSelect}&$top=100&$count=true`, group, token);
+      return { ...result, items: result.items.map(item => {
+        const protectedReason = item.groupTypes.includes('DynamicMembership') ? 'Dynamic membership'
+          : item.onPremisesSyncEnabled ? 'Managed on premises'
+          : item.isAssignableToRole !== false && item.isAssignableToRole !== null ? 'Protected role group' : '';
+        const membershipProvider = protectedReason ? null
+          : item.groupTypes.includes('Unified') || (item.securityEnabled && !item.mailEnabled) ? 'graph'
+          : item.mailEnabled && !item.securityEnabled ? 'exchange' : null;
+        return { id: item.id, displayName: item.displayName ?? item.mail ?? item.id,
+          membershipProvider, removable: membershipProvider !== null,
+          reason: protectedReason || (membershipProvider ? '' : item.mailEnabled ? 'Manage in Exchange' : 'Membership cannot be changed here'),
+        };
+      }) };
+    },
     async getUser(id: string) { id = parse(uuid, id, 'invalid_input'); return resource(await session(), '/users', id, user, userSelect); },
     async getUserDriveUsage(id: string) {
       id = parse(uuid, id, 'invalid_input');

@@ -17,6 +17,37 @@ const staticGroup = { id: GROUP, securityEnabled: true, mailEnabled: false, grou
 afterEach(() => vi.useRealTimers());
 
 describe('bounded Microsoft administration provider', () => {
+  it('reads direct user memberships and marks externally managed groups read-only', async () => {
+    const { fetch, provider } = harness();
+    fetch.mockResolvedValueOnce(response({ id: USER })).mockResolvedValueOnce(response({ value: [
+      { ...staticGroup, displayName: 'Static' },
+      { ...staticGroup, id: OTHER_ADMIN, displayName: 'Dynamic', groupTypes: ['DynamicMembership'] },
+      { ...staticGroup, id: SKU, displayName: 'Exchange', mailEnabled: true },
+    ] }));
+    await expect(provider.getUserGroups(USER)).resolves.toMatchObject({ partial: false, items: [
+      { id: GROUP, removable: true, membershipProvider: 'graph' }, { id: OTHER_ADMIN, removable: false, reason: 'Dynamic membership' },
+      { id: SKU, removable: false, membershipProvider: null, reason: 'Manage in Exchange' },
+    ] });
+    expect(String(fetch.mock.calls[2]?.[0])).toContain(`/users/${USER}/memberOf/microsoft.graph.group?`);
+    expect(String(fetch.mock.calls[2]?.[0])).toContain('$count=true');
+    expect(fetch.mock.calls[2]?.[1].headers).toMatchObject({ ConsistencyLevel: 'eventual' });
+    expect(fetch.mock.calls.every(([, init]) => init.method === 'GET')).toBe(true);
+  });
+
+  it.each([
+    [{ mailEnabled: true, securityEnabled: false }, true, 'exchange', ''],
+    [{ mailEnabled: true, securityEnabled: false, onPremisesSyncEnabled: true }, false, null, 'Managed on premises'],
+    [{ mailEnabled: true, securityEnabled: false, groupTypes: ['DynamicMembership'] }, false, null, 'Dynamic membership'],
+    [{ isAssignableToRole: true }, false, null, 'Protected role group'],
+    [{ isAssignableToRole: undefined }, false, null, 'Protected role group'],
+    [{ mailEnabled: true, groupTypes: ['Unified'] }, true, 'graph', ''],
+  ])('classifies membership routing without weakening restrictions: %j', async (overrides, removable, membershipProvider, reason) => {
+    const { fetch, provider } = harness();
+    fetch.mockResolvedValueOnce(response({ id: USER })).mockResolvedValueOnce(response({ value: [{ ...staticGroup, ...overrides }] }));
+    await expect(provider.getUserGroups(USER)).resolves.toMatchObject({ items: [{ id: GROUP, removable, membershipProvider, reason }] });
+    expect(fetch.mock.calls.every(([, init]) => init.method === 'GET')).toBe(true);
+  });
+
   it('lists current group members and owners with bounded same-group pages and no writes', async () => {
     const token = `h.${Buffer.from(JSON.stringify({ roles: ['Group.Read.All'] })).toString('base64url')}.s`;
     const memberPath = `/groups/${GROUP}/members`;
@@ -131,11 +162,76 @@ describe('bounded Microsoft administration provider', () => {
     expect(JSON.stringify(result)).not.toContain('do-not-echo');
   });
 
+  it.each([true, false])('uses an exact custom initial password with force change %s', async forceChangePasswordNextSignIn => {
+    const password = ' Custom-Example-9! ';
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ value: [{ id: TENANT, verifiedDomains: [{ name: 'example.test' }] }] }))
+      .mockResolvedValueOnce(response({ id: USER, userPrincipalName: 'new@example.test' }, 201));
+    const result = await createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token })
+      .createUser({ displayName: 'New User', userPrincipalName: 'new@example.test', password, forceChangePasswordNextSignIn });
+    expect(JSON.parse(fetch.mock.calls[2]![1].body).passwordProfile).toEqual({ password, forceChangePasswordNextSignIn });
+    expect(result).toMatchObject({ temporaryPassword: password, forceChangePasswordNextSignIn });
+    expect(fetch.mock.calls.filter(([, init]) => init.method !== 'GET')).toHaveLength(1);
+  });
+
+  it('allows generated passwords without forcing a password change', async () => {
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ value: [{ id: TENANT, verifiedDomains: [{ name: 'example.test' }] }] }))
+      .mockResolvedValueOnce(response({ id: USER, userPrincipalName: 'new@example.test' }, 201));
+    const result = await createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token })
+      .createUser({ displayName: 'New User', userPrincipalName: 'new@example.test', forceChangePasswordNextSignIn: false });
+    expect(result.temporaryPassword).toHaveLength(32);
+    expect(JSON.parse(fetch.mock.calls[2]![1].body).passwordProfile).toEqual({ password: result.temporaryPassword, forceChangePasswordNextSignIn: false });
+  });
+
+  it.each([{ password: '' }, { password: 'short' }, { password: 'x'.repeat(257) }, { password: 'Example\nSecret9!' },
+    { password: null }, { forceChangePasswordNextSignIn: 'false' }])('rejects invalid password options before accessing Microsoft: %j', async options => {
+    const fetch = vi.fn();
+    const acquireToken = vi.fn();
+    await expect(createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken })
+      .createUser({ displayName: 'New', userPrincipalName: 'new@example.test', ...options } as never))
+      .rejects.toMatchObject({ code: 'invalid_input', message: 'invalid_input' });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(acquireToken).not.toHaveBeenCalled();
+  });
+
+  it('does not expose a supplied password echoed by a rejected Microsoft request', async () => {
+    const password = 'Example-Secret9!';
+    const token = `h.${Buffer.from(JSON.stringify({ roles: ['User.ReadWrite.All'] })).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
+      .mockResolvedValueOnce(response({ value: [{ id: TENANT, verifiedDomains: [{ name: 'example.test' }] }] }))
+      .mockResolvedValueOnce(response({ error: { message: password } }, 400));
+    await expect(createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => token })
+      .createUser({ displayName: 'New', userPrincipalName: 'new@example.test', password }))
+      .rejects.toMatchObject({ code: 'provider_rejected', message: 'provider_rejected' });
+  });
+
   it('loads sign-in domains from the verifiedDomains shape returned by Graph', async () => {
     const fetch = vi.fn().mockResolvedValueOnce(response({ value: [{ id: TENANT }] }))
       .mockResolvedValueOnce(response({ value: [{ id: TENANT, verifiedDomains: [{ name: 'Example.Test', isDefault: true, type: 'Managed' }] }] }));
     const provider = createAdminGraphProvider({ tenantId: TENANT, fetch, acquireToken: async () => 'token' });
-    await expect(provider.listVerifiedUserDomains()).resolves.toEqual({ domains: ['example.test'] });
+    await expect(provider.listVerifiedUserDomains()).resolves.toEqual({ domains: ['example.test'], defaultUsageLocation: null });
+  });
+
+  it.each([{location:'CA', expected:'CA'}, {location:null, expected:undefined}, {location:'invalid', expected:undefined}])('derives omitted usage location only from verified tenant service default: %j', async ({location,expected}) => {
+    const token = `h.${Buffer.from(JSON.stringify({roles:['User.ReadWrite.All']})).toString('base64url')}.s`;
+    const fetch = vi.fn().mockResolvedValueOnce(response({value:[{id:TENANT}]}))
+      .mockResolvedValueOnce(response({value:[{id:TENANT,verifiedDomains:[{name:'example.test'}],defaultUsageLocation:location,countryLetterCode:'US'}]}))
+      .mockResolvedValueOnce(response({id:USER,userPrincipalName:'new@example.test'},201));
+    await createAdminGraphProvider({tenantId:TENANT,fetch,acquireToken:async()=>token}).createUser({displayName:'New',userPrincipalName:'new@example.test'});
+    expect(JSON.parse(fetch.mock.calls[2]![1].body).usageLocation).toBe(expected);
+    expect(fetch.mock.calls.filter(([,init])=>init.method !== 'GET')).toHaveLength(1);
+  });
+  it('returns the tenant service usage default with domains and rejects a foreign tenant', async () => {
+    for (const id of [TENANT, USER]) {
+      const fetch=vi.fn().mockResolvedValueOnce(response({value:[{id:TENANT}]}))
+        .mockResolvedValueOnce(response({value:[{id,verifiedDomains:[{name:'example.test'}],defaultUsageLocation:'GB'}]}));
+      const provider=createAdminGraphProvider({tenantId:TENANT,fetch,acquireToken:async()=>'token'});
+      if(id===TENANT) await expect(provider.listVerifiedUserDomains()).resolves.toEqual({domains:['example.test'],defaultUsageLocation:'GB'});
+      else await expect(provider.listVerifiedUserDomains()).rejects.toMatchObject({code:'tenant_identity_mismatch'});
+    }
   });
 
   it('rejects unverified domains, missing create permission, and arbitrary create properties without writing', async () => {

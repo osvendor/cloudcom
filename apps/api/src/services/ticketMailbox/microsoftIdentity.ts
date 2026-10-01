@@ -94,7 +94,8 @@ export function buildMicrosoftAuthorizationUrl(input: {
 export async function exchangeMicrosoftAuthorizationCode(input: {
   tenantHint: string;
   clientId: string;
-  clientSecret: string;
+  clientSecret?: string;
+  credentialVersion?: string;
   redirectUri: string;
   code: string;
   codeVerifier: string;
@@ -103,7 +104,6 @@ export async function exchangeMicrosoftAuthorizationCode(input: {
   const tokenUrl = new URL(`/${tenant}/oauth2/v2.0/token`, MICROSOFT_LOGIN_ORIGIN);
   const body = new URLSearchParams({
     client_id: input.clientId,
-    client_secret: input.clientSecret,
     redirect_uri: input.redirectUri,
     grant_type: 'authorization_code',
     code: input.code,
@@ -111,6 +111,16 @@ export async function exchangeMicrosoftAuthorizationCode(input: {
   });
 
   try {
+    if (input.credentialVersion !== undefined && input.clientSecret === undefined) {
+      const { cloudCommandAdminRuntime } = await import('../../extensions/cloudCommandAdminRuntime');
+      const assertion = await cloudCommandAdminRuntime.createClientAssertion({ tenantId: tenant, clientId: input.clientId, credentialVersion: input.credentialVersion });
+      body.set('client_assertion_type', 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer');
+      body.set('client_assertion', assertion);
+    } else if (input.clientSecret && input.credentialVersion === undefined) {
+      body.set('client_secret', input.clientSecret);
+    } else {
+      throw new MicrosoftIdentityVerificationError('Microsoft identity verification failed');
+    }
     const response = await (dependencies.fetch ?? globalThis.fetch)(tokenUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },

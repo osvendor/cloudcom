@@ -97,6 +97,7 @@ try {
     if($installer.ExitCode -notin @(0,3010)){throw "Managed MSI installation failed ($($installer.ExitCode)); inspect the MSI log."}
     $installedService=Get-CimInstance Win32_Service -Filter "Name='RustDesk'"
     if(!(Test-CloudComRustDeskServicePath $installedService.PathName $exe) -or $installedService.State -ne 'Running'){throw 'Managed service was not installed/running at its expected path.'}
+    if(!(Test-CloudComRustDeskFirewall $exe)){throw 'Installed managed service lacks a durable direct-access firewall rule.'}
     if((Get-FileHash -LiteralPath $exe).Hash -ne $NewExecutableSha256 -or (Get-FileHash -LiteralPath (Join-Path (Split-Path $exe) 'librustdesk.dll')).Hash -ne $NewLibrarySha256){throw 'Installed native payload differs from the approved build.'}
     if((Read-NativeValue $exe '--cloudcom-managed-protocol') -ne '2' -or (Read-NativeValue $exe '--get-id') -ne $peer -or (Read-NativeValue $exe '--cloudcom-managed-public-key') -ne $key){throw 'Native protocol or existing target identity changed.'}
     if(!(Get-Printer -Name 'RustDesk Printer' -ErrorAction SilentlyContinue) -or !(Get-PrinterDriver -Name 'RustDesk v4 Printer Driver' -ErrorAction SilentlyContinue)){throw 'Printer setup failed; MSI exit status alone is insufficient.'}

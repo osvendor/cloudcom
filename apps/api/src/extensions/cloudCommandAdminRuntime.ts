@@ -23,6 +23,7 @@ export type CloudCommandAdminAuditEvent = { orgId: string; actorId: string; acti
 export interface CloudCommandAdminRuntime {
   configuration(): Promise<CloudCommandAdminConfiguration | null>;
   acquireToken(connection: CloudCommandAdminConnection): Promise<string>;
+  createClientAssertion(connection: CloudCommandAdminConnection): Promise<string>;
   verifyAuthorization(input: CloudCommandAdminConnection & { code: string; codeVerifier: string; nonce: string }): Promise<{ tenantId: string; administratorObjectId: string }>;
   audit(event: CloudCommandAdminAuditEvent): Promise<void>;
   exchange(): Promise<{ registry: ExchangeDescriptorRegistry; worker: ReturnType<typeof createUnixSocketExchangeWorkerPort> } | null>;
@@ -211,6 +212,12 @@ export function createCloudCommandAdminRuntime(dependencies: Dependencies = {}):
   return {
     async configuration() { const config = await descriptor(); return config && { clientId: config.clientId, credentialVersion: config.credentialVersion, redirectUri: config.redirectUri }; },
     acquireToken: acquireBoundToken,
+    async createClientAssertion(connection) {
+      const config = await requiredDescriptor();
+      const { tenantId } = requireBoundConnection(connection, config);
+      const material = await certificate(config);
+      return assertion(config, tenantId, material.certificatePem, material.privateKeyPem);
+    },
     async verifyAuthorization(input) {
       const config = await requiredDescriptor();
       const { tenantId } = requireBoundConnection(input, config);

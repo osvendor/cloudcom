@@ -36,6 +36,19 @@ describe('listInboxDelta', () => {
     expect(page.deltaLink).toBe('https://graph.microsoft.com/delta-final');
     expect(fetchMock.mock.calls[0]![0]).toContain('/mailFolders/inbox/messages/delta');
     expect(fetchMock.mock.calls[0]![0]).toContain(SELECT);
+    for (const [, options] of fetchMock.mock.calls) {
+      expect(options.headers.Prefer).toBe('odata.maxpagesize=100');
+    }
+  });
+
+  it('rejects an incomplete sync instead of silently replaying the inbox next poll', async () => {
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ value: [] }) });
+    await expect(listInboxDelta('tok', 'support@a.com', null)).rejects.toThrow('no continuation or final cursor');
+  });
+
+  it('rejects exhausted pagination without claiming a completed sync', async () => {
+    fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ value: [], '@odata.nextLink': 'https://graph.microsoft.com/next' }) });
+    await expect(listInboxDelta('tok', 'support@a.com', null)).rejects.toThrow('pagination limit');
   });
 
   it('uses the stored deltaLink verbatim when provided', async () => {

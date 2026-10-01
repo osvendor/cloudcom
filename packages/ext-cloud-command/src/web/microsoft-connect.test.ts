@@ -20,6 +20,13 @@ describe('Microsoft Connect onboarding', () => {
     expect(page.shadowRoot!.querySelector('#start')).toBeNull();
     expect(page.shadowRoot!.querySelector('a')).toBeNull();
   });
+  it('shows configured Exchange separately from verified readiness', async () => {
+    const page = mount(async () => Response.json(status({ capabilities: [{ id: 'exchange', label: 'Exchange administration', status: 'configured', message: 'Mailbox panels verify access when opened.' }] })));
+    await flush();
+    expect(page.shadowRoot!.querySelector('.status')!.textContent).toBe('Configured');
+    expect(page.shadowRoot!.textContent).toContain('Mailbox panels verify access when opened.');
+    expect(page.shadowRoot!.textContent).not.toContain('invalid status');
+  });
   it('rechecks through the organization bridge and reports the outcome', async () => {
     const request = vi.fn(async () => Response.json(status()));
     const page = mount(request); await flush();

@@ -1,6 +1,8 @@
+import { createExchangeQuarantineClient, quarantineLookupParameters, quarantineReleaseParameters } from './exchange-contract';
+import { exchangeTraceIdSchema } from './exchange-contract';
 import { z } from 'zod';
 import type { AdministrationConnection } from './admin-execution';
-import { createExchangeAddressesClient, createExchangeAutoReplyClient, createExchangeDelegationClient, createExchangeDistributionClient, createExchangeDistributionMemberClient, createExchangeDistributionMembersClient, createExchangeDistributionNameClient, createExchangeGroupPrimaryClient, createExchangeGroupSettingsClient, createExchangeGroupExternalClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, createExchangeMailboxStatisticsClient, createExchangeSharedClient, createExchangeTraceClient, type ExchangeTraceSearch, type ExchangeTraceDetail, type ExchangeAddressAction, type ExchangeAddressWrite, type ExchangeAutoReplySet, type ExchangeConnectionBinding, type ExchangeDelegationSet, type ExchangeDistributionCreate, type ExchangeDistributionMemberSet, type ExchangeDistributionNameSet, type ExchangeGroupPrimarySet, type ExchangeGroupExternalSet, type ExchangeSharedCreate, type ExchangeForwardingSet, type ExchangeWorkerPort, ExchangeWorkerError } from './exchange-contract';
+import { createExchangeGroupAliasClient, createExchangeAddressesClient, createExchangeAutoReplyClient, createExchangeDelegationClient, createExchangeDistributionClient, createExchangeDistributionMemberClient, createExchangeDistributionMembersClient, createExchangeDistributionNameClient, createExchangeGroupPrimaryClient, createExchangeGroupSettingsClient, createExchangeGroupExternalClient, createExchangeForwardingClient, createExchangeMailboxInventoryClient, createExchangeMailboxStatisticsClient, createExchangeSharedClient, createExchangeTraceClient, type ExchangeTraceSearch, type ExchangeTraceDetail, type ExchangeAddressAction, type ExchangeAddressWrite, type ExchangeAutoReplySet, type ExchangeConnectionBinding, type ExchangeDelegationSet, type ExchangeDistributionCreate, type ExchangeDistributionMemberSet, type ExchangeDistributionNameSet, type ExchangeGroupPrimarySet, type ExchangeGroupExternalSet, type ExchangeSharedCreate, type ExchangeForwardingSet, type ExchangeWorkerPort, ExchangeWorkerError } from './exchange-contract';
 
 const uuid = z.string().uuid().transform(value => value.toLowerCase());
 const inventoryInput = z.object({ pageSize: z.number().int().min(1).max(200).optional() }).strict();
@@ -9,7 +11,7 @@ const traceCursor = z.object({ received: z.string().datetime({ offset: true }), 
 const traceSearchInput = z.object({ start: z.string().datetime({ offset: true }), end: z.string().datetime({ offset: true }),
   sender: z.string().email().max(320).nullable(), recipient: z.string().email().max(320).nullable(),
   status: traceStatus.nullable(), cursor: traceCursor.nullable() }).strict();
-const traceDetailInput = z.object({ messageTraceId: uuid, recipient: z.string().email().max(320) }).strict();
+const traceDetailInput = z.object({ messageTraceId: exchangeTraceIdSchema, recipient: z.string().email().max(320) }).strict();
 const connection = z.object({
   id: uuid, orgId: uuid, tenantId: uuid, clientId: uuid, enabled: z.literal(true), generation: z.number().int().positive(),
   credentialVersion: z.string().min(1).max(128), permissionManifestVersion: z.string().min(1).max(128),
@@ -58,6 +60,7 @@ export function createExchangeMailboxInventoryService<Request>(ports: {
   const groupSettings = createExchangeGroupSettingsClient(ports.worker);
   const groupExternal = createExchangeGroupExternalClient(ports.worker);
   const distributionName = createExchangeDistributionNameClient(ports.worker);
+  const groupAlias = createExchangeGroupAliasClient(ports.worker);
   const groupPrimary = createExchangeGroupPrimaryClient(ports.worker);
   const shared = createExchangeSharedClient(ports.worker);
   const trace = createExchangeTraceClient(ports.worker);
@@ -99,6 +102,40 @@ export function createExchangeMailboxInventoryService<Request>(ports: {
         const code = dispatched && (rawCode === 'connection_changed' || rawCode === 'access_denied' || rawCode === 'audit_unavailable' || rawCode === 'provider_unreachable')
           ? 'unknown_write_outcome' : rawCode;
         try { await audit({ organizationId, actorId: principal.actorId, action: 'cloudcommand.microsoft.exchange.group.primary.set.outcome',
+          result: 'failure', details: { ...details, code } }); }
+        catch { throw new ExchangeServiceError(dispatched ? 'unknown_write_outcome' : 'audit_unavailable'); }
+        throw new ExchangeServiceError(code === 'invalid_request' || code === 'connection_mismatch' || code === 'credential_unavailable' || code === 'response_too_large'
+          ? 'provider_unreachable' : code);
+      }
+    },
+    async groupAliasWrite(request: Request, organizationId: string, input: ExchangeGroupPrimarySet, action: 'group.alias.add' | 'group.alias.remove') {
+      if (!uuid.safeParse(organizationId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId);
+      const parsed = z.object({ groupId: uuid, address: z.string().trim().email().max(320) }).strict().safeParse(input);
+      if (!parsed.success) throw new ExchangeServiceError('invalid_operation');
+      const principal = await ports.authorize(request, organizationId, true);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: action,
+        groupId: parsed.data.groupId, changedFields: ['EmailAddresses'] };
+      await audit({ organizationId, actorId: principal.actorId, action: `cloudcommand.microsoft.exchange.${action}.intent`, result: 'success', details });
+      let dispatched = false;
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        dispatched = true;
+        const result = await groupAlias(bindingOf(snapshot), parsed.data, action);
+        await fence(request, organizationId, principal.actorId, snapshot, true);
+        await audit({ organizationId, actorId: principal.actorId, action: `cloudcommand.microsoft.exchange.${action}.outcome`,
+          result: 'success', details: { ...details, outcome: 'verified', changed: result.changed } });
+        return result;
+      } catch (error) {
+        const rawCode = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        const code = dispatched && (rawCode === 'connection_changed' || rawCode === 'access_denied' || rawCode === 'audit_unavailable' || rawCode === 'provider_unreachable')
+          ? 'unknown_write_outcome' : rawCode;
+        try { await audit({ organizationId, actorId: principal.actorId, action: `cloudcommand.microsoft.exchange.${action}.outcome`,
           result: 'failure', details: { ...details, code } }); }
         catch { throw new ExchangeServiceError(dispatched ? 'unknown_write_outcome' : 'audit_unavailable'); }
         throw new ExchangeServiceError(code === 'invalid_request' || code === 'connection_mismatch' || code === 'credential_unavailable' || code === 'response_too_large'
@@ -344,6 +381,36 @@ export function createExchangeMailboxInventoryService<Request>(ports: {
         throw new ExchangeServiceError(code === 'provider_access_denied' || code === 'provider_rejected' || code === 'worker_busy' || code === 'connection_changed' || code === 'access_denied' ? code : 'provider_unreachable');
       }
     },
+    async quarantine(request: Request, organizationId: string, input: unknown, release: boolean) {
+      if (!uuid.safeParse(organizationId).success) throw new ExchangeServiceError('invalid_operation');
+      organizationId = uuid.parse(organizationId);
+      const parsed = (release ? quarantineReleaseParameters : quarantineLookupParameters).safeParse(input);
+      if (!parsed.success || Date.parse(parsed.data.received) < Date.now() - 90 * 86400000 || Date.parse(parsed.data.received) > Date.now() + 300000) throw new ExchangeServiceError('invalid_operation');
+      const principal = await ports.authorize(request, organizationId, release);
+      if (!principal || !uuid.safeParse(principal.actorId).success) throw new ExchangeServiceError('access_denied');
+      const loaded = connection.safeParse(await ports.loadConnection(request, organizationId));
+      if (!loaded.success || loaded.data.orgId !== organizationId) throw new ExchangeServiceError('connection_not_ready');
+      const snapshot = loaded.data;
+      const action = release ? 'quarantine.release.set' : 'quarantine.lookup';
+      const details = { connectionId: snapshot.id, generation: snapshot.generation, operation: action, messageTraceId: parsed.data.messageTraceId };
+      await audit({ organizationId, actorId: principal.actorId, action: `cloudcommand.microsoft.exchange.${action}.intent`, result: 'success', details });
+      let dispatched = false;
+      try {
+        await this.provision(snapshot);
+        await fence(request, organizationId, principal.actorId, snapshot, release);
+        dispatched = release;
+        const result = await createExchangeQuarantineClient(ports.worker)(bindingOf(snapshot), parsed.data, release);
+        await fence(request, organizationId, principal.actorId, snapshot, release);
+        await audit({ organizationId, actorId: principal.actorId, action: `cloudcommand.microsoft.exchange.${action}.outcome`, result: 'success', details: { ...details, verified: 'verified' in result ? result.verified : undefined } });
+        return result;
+      } catch (error) {
+        const raw = error instanceof ExchangeServiceError || error instanceof ExchangeWorkerError ? error.code : 'provider_unreachable';
+        const code = dispatched && ['connection_changed','access_denied','audit_unavailable','provider_unreachable'].includes(raw) ? 'unknown_write_outcome' : raw;
+        try { await audit({ organizationId, actorId: principal.actorId, action: `cloudcommand.microsoft.exchange.${action}.outcome`, result: 'failure', details: { ...details, code } }); }
+        catch { throw new ExchangeServiceError(dispatched ? 'unknown_write_outcome' : 'audit_unavailable'); }
+        throw new ExchangeServiceError(code === 'invalid_request' || code === 'connection_mismatch' || code === 'credential_unavailable' || code === 'response_too_large' ? 'provider_unreachable' : code);
+      }
+    },
     async traceSearch(request: Request, organizationId: string, input: ExchangeTraceSearch) {
       if (!uuid.safeParse(organizationId).success) throw new ExchangeServiceError('invalid_operation');
       organizationId = uuid.parse(organizationId);
@@ -522,7 +589,7 @@ export function createExchangeMailboxInventoryService<Request>(ports: {
     async autoReplySet(request: Request, organizationId: string, input: ExchangeAutoReplySet) {
       if (!uuid.safeParse(organizationId).success) throw new ExchangeServiceError('invalid_operation');
       organizationId = uuid.parse(organizationId);
-      const parsed = z.object({ mailboxId: uuid, state: z.enum(['Disabled', 'Enabled', 'Scheduled']), message: z.string().max(8192),
+      const parsed = z.object({ mailboxId: uuid, state: z.enum(['Disabled', 'Enabled', 'Scheduled']), message: z.string().max(8192), externalMessage: z.string().max(8192).optional(), externalAudience: z.enum(['None', 'Known', 'All']).optional(),
         start: z.string().datetime({ offset: true }).nullable(), end: z.string().datetime({ offset: true }).nullable() }).strict().safeParse(input);
       if (!parsed.success || (parsed.data.state === 'Scheduled' ? !parsed.data.start || !parsed.data.end || Date.parse(parsed.data.end) <= Date.parse(parsed.data.start) : parsed.data.start !== null || parsed.data.end !== null))
         throw new ExchangeServiceError('invalid_operation');
