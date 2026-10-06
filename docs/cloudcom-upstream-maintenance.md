@@ -13,6 +13,23 @@ This guide records how the CloudCom fork differs from LanternOps/Breeze and how 
 
 ## Change register
 
+### Windows agent 0.121.5 release
+
+The Windows self-host agent, backup, watchdog and user-helper binaries now target
+the same 0.121.5 fork version as the server. Release metadata therefore emits an
+empty baked binary pairing for a full release. Keep the deployed agent manifest
+signatures and SHA-256 checks bound to the exact Windows artifacts; preserve
+other platform/component promotion slots. Build and test the four-executable MSI
+in the Windows test environment before promotion, including enrollment retention
+and service recovery without a reboot. Runtime rollout evidence belongs in the
+private operational ledger, not this source-level release declaration.
+
+Windows validation uses race checks for version policy, watchdog, installer and
+update trust. Heartbeat/native/PAM tests use the shipped CGO-disabled build mode:
+the Windows desktop implementation does not currently compile with CGO enabled.
+The complete cross-platform installer/updater suites have additional Windows
+failures; targeted acceptance is not a claim that those full suites pass.
+
 ### Staff native access (2026-09-30)
 
 `staffNativeAuthority`, `staffNativeLogin`, `staffNativeAdmission` and
