@@ -101,6 +101,8 @@ const INTENTIONAL_UNSCOPED: ReadonlySet<string> = new Set<string>([
   'llm_provider_catalog', // System-wide curated catalog of vetted LLM endpoints; writes gated by platform-admin role + MFA at the route layer.
   'llm_provider_catalog_revisions', // System-wide curated catalog of vetted LLM endpoints; writes gated by platform-admin role + MFA at the route layer.
   'llm_provider_verifications', // System-wide curated catalog of vetted LLM endpoints; writes gated by platform-admin role + MFA at the route layer.
+  'ai_model_registry_state', // W03 cutover coordinator: one row, no tenant column (#7601). Forced RLS, single system-only policy — only the system-context cutover sweep reads/writes its lease and completion stamp. No org_id / device_id / partner_id, so no cascade, merge or export registration applies.
+  'ai_platform_models', // AI model registry W01 (#7599): system-wide platform model catalog (Anthropic model ids, capabilities, operator prices, option support). No tenant column and NO RLS — same posture as llm_provider_catalog; every request context reads it for pricing and capabilities. Writes are gated to the ai-model-discovery worker and the platform-admin + MFA /admin/ai-models routes. No org_id / device_id, so no cascade, merge or export registration applies. Plan: docs/superpowers/plans/ai-mcp/2026-09-30-ai-model-registry-w01-platform-catalog.md.
   'third_party_release_tests', // System-wide release test results; references catalog (unscoped) and is platform-admin-only at the route layer.
   'supported_currencies', // Global ISO-4217 allowlist (multi-currency spec §4). No tenant axis. Forced RLS: permissive USING (true) SELECT (org-scoped request contexts read it), system-only writes. Mirrors winget_package_index.
   'exchange_rates', // Global reporting-only FX reference data (multi-currency spec §8). No tenant axis. Forced RLS: permissive USING (true) SELECT (org-scoped request contexts read rates to render an approximate total), system-only writes. Mirrors supported_currencies. Proven by exchangeRates.integration.test.ts.
@@ -116,6 +118,7 @@ const INTENTIONAL_UNSCOPED: ReadonlySet<string> = new Set<string>([
   'installed_extensions', // Global runtime-extension operational state (version/trust/lifecycle/enabled). No tenant axis. Forced RLS, system-only policy → only system context.
   'extension_schema_history', // Global append-only record of the schema-compatibility floor each extension bundle version applied. No tenant axis. Forced RLS, system-only policy → only system context.
   'backup_snapshot_id_tombstones', // Backup snapshot ids that may never be issued or accepted again (2026-11-08-120000). Id, reason and timestamp only — no org, device or configuration reference, so there is no tenant axis and no cascade/merge/export registration applies. Forced RLS, single system-only policy; breeze_app holds SELECT/INSERT only (UPDATE/DELETE/TRUNCATE revoked, re-revoked at boot by ensureAppRole). Written only by triggers on backup_snapshot_id_reservations and by storage reclaim, both of which elevate to system scope for that statement.
+  'portal_session_revocations', // Customer-portal sessions ended at logout (2026-11-11-110000). SHA-256 token digest, portal_user_id (FK ON DELETE CASCADE, so org erasure removes rows through portal_users), timestamps — no org_id, so no cascade/merge/export registration applies. Written by portal logout and read by the pre-auth portal session lookup, both in system scope. Forced RLS, single system-only policy → tenant contexts can neither read nor forge records.
   'email_provider_domain_releases', // Provider-side "delete this domain" outbox (spec 2026-09-17 partner sending domains §3.3). Deliberately carries NO partner_id: cascadeDeletePartner deletes from every table that has one, which would erase the provider handle this table exists to keep across the partner's deletion. No tenant axis. Forced RLS, single system-only policy → only system context. Not in EXEMPT_TABLES: with no org_id and no shape-list entry, no offender scan reaches it.
 ]);
 
@@ -233,6 +236,9 @@ const PARTNER_TENANT_TABLES: ReadonlyMap<string, string> = new Map<string, strin
   ['report_series', 'partner_id'],
   ['billing_profiles', 'partner_id'],
   ['billing_profile_rules', 'partner_id'],
+  // billing_profile_ai_rates (#7608 W10): per-model client AI price list on a card.
+  // Shape 3, same policy as billing_profile_rules (2026-11-26-100000).
+  ['billing_profile_ai_rates', 'partner_id'],
   ['org_billing_profile_assignments', 'partner_id'],
   ['legacy_labour_pricing_archive', 'partner_id'],
   ['ticket_response_templates', 'partner_id'],
@@ -317,6 +323,21 @@ const PARTNER_TENANT_TABLES: ReadonlyMap<string, string> = new Map<string, strin
   // stripeConnectCredentialsRls.integration.test.ts.
   ['stripe_connect_credentials', 'partner_id'],
   ['partner_llm_configs', 'partner_id'],
+  // AI model registry W02 (#7600): partner_ai_connections — partner axis like
+  // partner_llm_configs (rows copied with the same id); no org_id, so no
+  // org-cascade / export-policy entry. No org-token read branch by design.
+  ['partner_ai_connections', 'partner_id'],
+  // partner_ai_models (#7600 W02): partner axis + a SEPARATE FOR SELECT
+  // org-token branch partner_ai_models_org_read_enabled
+  // (enabled AND partner_id = breeze_current_partner_id()). Forge proofs:
+  // aiModelRegistryForgery.integration.test.ts.
+  ['partner_ai_models', 'partner_id'],
+  // ai_model_registry_partner_cutover (#7601 W03 Task 6A): partner axis; reads
+  // on system OR breeze_has_partner_access, writes system-only (the cutover
+  // runs in system context). FK ON DELETE CASCADE from partners, plus
+  // cascadeDeletePartner's partner_id sweep. No org_id → no org cascade /
+  // merge / export entry.
+  ['ai_model_registry_partner_cutover', 'partner_id'],
   // authenticator_policies: per-MSP approval-security policy (Shape 3). One row
   // per partner; policy gates on breeze_has_partner_access(partner_id) with a
   // system-scope OR branch. Functional forge: authenticatorRls.integration.test.ts.
@@ -415,6 +436,7 @@ const PARTNER_TENANT_TABLES: ReadonlyMap<string, string> = new Map<string, strin
 // is the canonical case: a user row is visible if the caller has access
 // to the user's partner OR the user's org OR is the user themselves.
 const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
+  'billing_payment_settings',
   // caller_verification_policies (#6354 W01): org XOR partner via
   // caller_verification_policies_one_owner_chk; SELECT-only partner-wide branch
   // cv_policy_partner_select ships in 2026-10-26-170100. Functional forge
@@ -463,6 +485,11 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
   // Functional cross-partner forge proof:
   // aiScriptPoliciesPartnerRls.integration.test.ts.
   'ai_script_policies',
+  // ai_model_assignments (AI model registry W02, #7600): org override (org_id
+  // set) OR partner-wide (partner_id set, org_id NULL). Created dual-axis from
+  // day one in 2026-11-14-100200 with its partner-wide SELECT branch in the
+  // same file. Functional forge proof: aiModelAssignmentsPartnerRls.integration.test.ts.
+  'ai_model_assignments',
   // deliverable_template_sets / deliverable_template_items (spec #5573 §4.6,
   // D9): a template set is org-scoped (org_id set) OR partner-wide (partner_id
   // set, org_id NULL — one service tier applied across every org the MSP
@@ -765,22 +792,8 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
 // (org_id AND partner_id together via the composite FK
 // deployment_invites_org_partner_fk — a row carries BOTH, not one or the
 // other), and `software_policy_audit` / `software_remediation_requests`
-// (dual-owned, explicitly documented above as NOT XOR). `access_reviews` IS
-// included below even though it has no DB-level CHECK: its own migration
-// (2026-05-29-access-reviews-dual-axis-rls.sql) documents the axes as
-// "mutually exclusive, so no composite FK applies", and it is app-enforced
-// only. As of #3257 W02 it is the LAST such example — the two tables this
-// comment used to group it with are both DB-enforced and were verified
-// against pg_constraint on a live database:
-//   - client_ai_prompt_templates_scope_check CHECK (num_nonnulls(org_id,
-//     partner_id) = 1), shipped 2026-06-12-b, never dropped. (This half of
-//     the comment was wrong before this wave touched it.)
-//   - custom_field_definitions_one_owner_chk, added by
-//     2026-10-10-100300 (#3257 W02).
-// Membership in this set has never depended on having a CHECK — it only
-// drives the partner-wide SELECT-branch assertions below — so nothing else
-// changes. If access_reviews ever gains a CHECK, this note has no examples
-// left and should be deleted rather than patched.
+// (dual-owned, explicitly documented above as NOT XOR). `access_reviews` is
+// org XOR partner by access_reviews_one_owner_chk (2026-11-19-101100).
 //
 // … and `reports` (#3198 W01): org XOR partner by CHECK, but NOT a config
 // table — a partner-owned report is a partner-PRIVATE cross-org aggregate
@@ -789,6 +802,7 @@ const DUAL_AXIS_TENANT_TABLES: ReadonlySet<string> = new Set<string>([
 // read, so reports must never carry one. Its partner branch is proven
 // functionally by reportsPartnerRls.integration.test.ts instead.
 const XOR_OWNERSHIP_DUAL_AXIS_TABLES: ReadonlySet<string> = new Set<string>([
+  'billing_payment_settings',
   'caller_verification_policies',
   // fix_memory_one_owner_chk, 2026-11-03-100000 (AI Suggested Fixes W1); its
   // partner-wide SELECT branch ships in the same migration.
@@ -806,6 +820,8 @@ const XOR_OWNERSHIP_DUAL_AXIS_TABLES: ReadonlySet<string> = new Set<string>([
   'monitor_conversion_outputs',
   // ai_script_policies_one_owner_chk, 2026-10-16-120200 (#5612 W04).
   'ai_script_policies',
+  // ai_model_assignments_one_owner_chk, 2026-11-14-100200 (#7600 W02).
+  'ai_model_assignments',
   // deliverable_template_sets_one_owner_chk / deliverable_template_items_one_owner_chk
   // ((org_id IS NULL) <> (partner_id IS NULL)), 2026-10-16-100500.
   'deliverable_template_sets',
@@ -945,6 +961,13 @@ const PARENT_FK_JOIN_POLICY_TABLES: ReadonlyMap<string, readonly string[]> = new
   // nc.partner_id), deliberately without the partner-wide read branch —
   // functional proof: notificationChannelConfigsRls.integration.test.ts.
   ['notification_channel_configs', ['notification_channels']],
+  // access_review_items: tenancy is the parent access review (org XOR
+  // partner owner). Until 2026-11-19-101100 its policies were Phase 6
+  // user-keyed and never consulted the parent; they now require the parent
+  // review's owner, spelled out on the joined row (not inherited from the
+  // parent's SELECT-only partner-wide branch). Functional proof:
+  // accessReviewItemsParentReviewRls.integration.test.ts.
+  ['access_review_items', ['access_reviews']],
   // 2026-06-13-b backstop: seven more child tables that shipped with NO rls and
   // reach their tenant only through a parent FK. role_permissions' parent
   // `roles` is dual-axis (org_id/partner_id) — its policy ORs in
@@ -1057,7 +1080,6 @@ const USER_ID_SCOPED_TABLES: ReadonlySet<string> = new Set<string>([
   // through tickets is #1016-safe: tickets.org_id is NOT NULL and the
   // tickets policy has no OR branches.
   'ticket_comments',
-  'access_review_items',
   'oauth_authorization_codes',
   'oauth_grants',
   'oauth_refresh_tokens',

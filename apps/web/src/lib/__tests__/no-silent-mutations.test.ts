@@ -37,7 +37,12 @@ const TARGET_GLOBS = [
   'src/components/monitoring/conversion/NeedsConversionPanel.tsx',
   'src/components/monitoring/conversion/ConversionPendingBanner.tsx',
   'src/components/admin/MonitorConversionAdmin.tsx',
+  'src/components/ai/AiContinuationPrompt.tsx', // W05 #7603: POST /ai/sessions/:id/continue via runAction
+  'src/components/admin/AiModels.tsx', // W01 #7599: /admin/ai-models (PATCH + refresh via runAction)
   'src/components/configurationPolicies/featureTabs/useFeatureLink.ts',
+  // Old storage key check / operator confirmation: both mutations surface
+  // their outcome through runAction from birth.
+  'src/components/configurationPolicies/featureTabs/StorageKeyRevocationCard.tsx',
   // Per-rule legacy convert (POST /monitor-definitions/convert-from-rule).
   'src/components/monitoring/LegacyRulesTable.tsx',
   // Disk Cleanup v2 W01: scan and cleanup-preview failures must surface.
@@ -69,7 +74,14 @@ const TARGET_GLOBS = [
   // gone when it is still being stamped.
   'src/components/settings/WorkTypesCard.tsx',
   'src/components/settings/PartnerSettingsPage.tsx',
-  'src/components/settings/PartnerAiProviderTab.tsx',
+  'src/components/settings/aiModels/PartnerAiModelsTab.tsx',
+  'src/components/settings/aiModels/ConnectionDrawer.tsx',
+  'src/components/settings/aiModels/ResidencySwitch.tsx',
+  'src/components/settings/aiModels/ModelsCard.tsx',
+  'src/components/settings/aiModels/OfferingDrawer.tsx',
+  'src/components/settings/aiModels/ManualModelForm.tsx', // W06 #7604: POST manual model via runAction
+  'src/components/settings/aiModels/FeatureDefaultsCard.tsx',
+  'src/components/settings/aiModels/OrgModelDefaultsCard.tsx',
   'src/components/settings/OrgSettingsPage.tsx',
   // Tool catalog W01 PR C (#5216): the Tool Sources surface authors the
   // credentials and risk tiers that decide what the assistant may call on a
@@ -868,7 +880,17 @@ describe('no silent mutations in targeted set', () => {
     // devices/UnassignedDevicesPage.tsx (parked-device assignment).
     // Multi-org report series W03 adds reports/series/seriesApi.ts: 202 → 203.
     // Multi-org report series W04 adds reports/series/CombineDialog.tsx: 203 → 204.
-    expect(absoluteFiles.length).toBe(204);
+    // Backup storage key revocation card (StorageKeyRevocationCard.tsx): 204 → 205.
+    // AI model registry W01 #7599 adds admin/AiModels.tsx: 205 → 206.
+    // AI model registry W04 #7602 Task 11 replaces PartnerAiProviderTab.tsx with
+    // aiModels/{PartnerAiModelsTab,ConnectionDrawer,ResidencySwitch}.tsx: 206 → 208.
+    // Task 12 adds aiModels/{ModelsCard,OfferingDrawer}.tsx: 208 → 210.
+    // Task 13 adds aiModels/FeatureDefaultsCard.tsx: 210 → 211.
+    // Task 14 adds aiModels/OrgModelDefaultsCard.tsx: 211 → 212.
+    // W05 #7603 Task 13 adds ai/AiContinuationPrompt.tsx: 212 -> 213.
+    // W06 #7604 Task 14 adds aiModels/ManualModelForm.tsx: 213 → 214.
+    // (connectionForms/*.tsx hold no fetch calls: ConnectionDrawer performs the connection mutations.)
+    expect(absoluteFiles.length).toBe(214);
     for (const f of absoluteFiles) {
       expect(() => statSync(f)).not.toThrow();
     }

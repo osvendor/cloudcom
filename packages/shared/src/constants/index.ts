@@ -24,6 +24,9 @@ export * from './googleDwdScopes';
 // alert resolution reasons. Leaf module, no imports.
 export * from './fixMemory';
 
+// Shared AI connection kind lists for registry and gateway dispatch.
+export * from './aiConnectionKinds';
+
 // Backup recovery-readiness score bands shared by the API summary/alerts and
 // the web readiness views. Leaf module, no imports.
 export * from './backupReadiness';
@@ -183,3 +186,6 @@ export * from './timeSync';
 
 // Software-install time budgets, mirrored from the Go agent (#3578)
 export * from './softwareInstallTimeouts';
+
+// AI model registry W01 (#7599): AI surfaces and roles. Leaf module.
+export * from './aiSurfaces';

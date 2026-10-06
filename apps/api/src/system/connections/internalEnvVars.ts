@@ -17,6 +17,8 @@ export const INTERNAL_ENV_VARS: Readonly<Record<string, string>> = {
   AGENT_CHANGES_MAX_ROWS_PER_DEVICE_PER_DAY: 'agent ingest quota knob',
   AGENT_CHANGES_MAX_ROWS_PER_ORG_PER_DAY: 'agent ingest quota knob',
   AGENT_EDITION_AUTO_MIGRATE_ENABLED: 'agent edition migration toggle',
+  AGENT_ENROLL_RATE_LIMIT: 'rate limit knob',
+  AGENT_ENROLL_RATE_WINDOW_SECONDS: 'rate limit knob',
   AGENT_EVENTLOG_MAX_BYTES_PER_DEVICE_PER_DAY: 'agent ingest quota knob',
   AGENT_EVENTLOG_MAX_BYTES_PER_ORG_PER_DAY: 'agent ingest quota knob',
   AGENT_EVENTLOG_MAX_ROWS_PER_ORG_PER_DAY: 'agent ingest quota knob',
@@ -42,6 +44,9 @@ export const INTERNAL_ENV_VARS: Readonly<Record<string, string>> = {
   AGENT_WS_UPDATE_STATUS_MESSAGE_BUDGET_REFILL_PER_SECOND: 'agent WS message budget knob',
   // AI_*
   AI_COMPUTE_PRICE_MULTIPLIER: 'AI billing price multiplier',
+  AI_INVOCATIONS_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
+  AI_INVOCATIONS_RETENTION_DAYS: 'data retention window',
+  AI_INVOCATIONS_RETENTION_MAX_BATCHES: 'retention sweep batch knob',
   AI_TOOL_EVAL_KEY: 'dev script (services/llm/__scripts__)',
   AI_TOOL_SEARCH: 'AI chat tool-search override (auto/on/off)',
   // ALERT_*
@@ -211,6 +216,8 @@ export const INTERNAL_ENV_VARS: Readonly<Record<string, string>> = {
   HELPER_BINARY_DIR: 'filesystem path',
   HELPER_SCREENSHOT_RATE_LIMIT: 'rate limit knob',
   HELPER_SCREENSHOT_RATE_WINDOW_SECONDS: 'rate limit knob',
+  // HOME
+  HOME: 'OS env passed to the Agent SDK CLI by a dev spike script',
   // HTTPS_*
   HTTPS_PROXY: 'egress proxy passthrough',
   // HTTP_*
@@ -339,6 +346,8 @@ export const INTERNAL_ENV_VARS: Readonly<Record<string, string>> = {
   PARTNER_API_ENROLLMENT_KEY_WRITE_RATE_LIMIT: 'rate limit knob',
   PARTNER_MEETING_URL: 'partner onboarding copy link',
   PARTNER_TRUST_MODE: 'hosted partner trust mode',
+  // PATH
+  PATH: 'OS env passed to the Agent SDK CLI by a dev spike script',
   // PATCH_*
   PATCH_REPORT_STORAGE_PATH: 'filesystem path',
   PATCH_TOMBSTONE_PRUNE_AFTER_HOURS: 'data retention window',
@@ -453,6 +462,9 @@ export const INTERNAL_ENV_VARS: Readonly<Record<string, string>> = {
   TD_SYNNEX_DIGITAL_BRIDGE_TIMEOUT_MS: 'timing knob',
   // TENANT_*
   TENANT_TOOL_MAX_IN_FLIGHT_PER_ORG: 'tenant tool in-flight cap',
+  // TERMINAL_*
+  TERMINAL_INPUT_MAX_BYTES_PER_MIN: 'rate limit knob',
+  TERMINAL_INPUT_MAX_MESSAGES_PER_MIN: 'rate limit knob',
   // TICKET_*
   TICKET_OUTBOX_RETENTION_BATCH_SIZE: 'retention sweep batch knob',
   TICKET_OUTBOX_RETENTION_DAYS: 'data retention window',
@@ -482,13 +494,15 @@ export const INTERNAL_ENV_VARS: Readonly<Record<string, string>> = {
   USER_RISK_WORKER_CONCURRENCY: 'worker throughput knob',
   // VIEWER_*
   VIEWER_BINARY_DIR: 'filesystem path',
+  // VITEST
+  VITEST: 'test-runner hook (skips server bootstrap on import)',
   // WINGET_*
   WINGET_BOOTSTRAP_ARTIFACT_DIR: 'filesystem path',
   // WIN_*
   WIN_TEST_VM_SSH_KEY: 'AI patch-test lab VM',
   WIN_TEST_VM_TARGET: 'AI patch-test lab VM',
   // WORKSPACE_*
-  WORKSPACE_CONTENT_LLM_MODEL: 'model override',
+  WORKSPACE_CONTENT_LLM_MODEL: 'model override (deprecated: the extension_content assignment decides)',
   // WS_*
   WS_TICKETS_REQUIRE_REDIS: 'remote access strictness flag',
   WS_TICKET_BIND_IP: 'remote access ticket binding flag',

@@ -11,6 +11,7 @@ import { resolveInvoiceByLinkToken, getOrMintInvoiceLink, buildPublicInvoiceUrl 
 import { toCustomerInvoiceHeader, toCustomerInvoiceLine, markViewed } from '../services/invoiceService';
 import { getInvoicePdf, renderInvoicePdf, invoiceLineTicketNumberSql, invoiceLineTicketSubjectSql, invoiceLineTicketCategorySql } from '../services/invoicePdf';
 import { createInvoicePayLink } from '../services/invoiceCheckout';
+import { isPartnerOnlinePaymentAvailable } from '../services/partnerStripe';
 import { CUSTOMER_SAFE_CURRENCY_UNSUPPORTED_MESSAGE } from '../services/stripeCheckoutErrors';
 import { HeldDbContextForStripeError, settleCheckoutSession } from '../services/stripeSettle';
 import { InvoiceServiceError } from '../services/invoiceTypes';
@@ -159,7 +160,9 @@ invoicesPublicRoutes.get('/:token', zValidator('param', tokenParam), async (c) =
       invoice: { ...toCustomerInvoiceHeader(inv), paidAt: inv.paidAt },
       lines: rows.map(toCustomerInvoiceLine),
       chargeNow,
-      payable: PAYABLE.has(inv.status) && Number(inv.balance) > 0,
+      // #7509: no Pay CTA unless the partner can actually take online payment.
+      payable: PAYABLE.has(inv.status) && Number(inv.balance) > 0
+        && await isPartnerOnlinePaymentAvailable(inv.partnerId),
       branding: brandingBlock(inv, partner, brand),
     };
   }));
@@ -235,21 +238,19 @@ invoicesPublicRoutes.post('/:token/pay', zValidator('param', tokenParam), async 
 
   const returnBase = `${portalBase()}/invoice/return`;
   try {
-    // #1448 — NOT wrapped in withSystemDbAccessContext: createInvoicePayLink opens
-    // its own short system contexts around each DB step and runs
-    // checkout.sessions.create outside any transaction. An enclosing context here
-    // pinned a pooled connection idle-in-transaction across the Stripe
-    // round-trip (#3777 review F2). runOutsideDbContext is kept only so a
-    // stray ambient context can never be inherited.
-    const link = await runOutsideDbContext(() =>
-      createInvoicePayLink(inv.id, { userId: null, partnerId: null, accessibleOrgIds: [inv.orgId] }, {
-        successUrl: `${returnBase}?session_id={CHECKOUT_SESSION_ID}`,
-        cancelUrl: `${returnBase}?canceled=1&session_id={CHECKOUT_SESSION_ID}`,
-        idempotencySuffix: '_pub',
-      }));
+    // The producer owns short committed contexts. Do not hide a caller's held
+    // transaction with runOutsideDbContext: its Stripe guard must see it.
+    const link = await createInvoicePayLink(inv.id, { userId: null, partnerId: null, accessibleOrgIds: [inv.orgId] }, {
+      successUrl: `${returnBase}?session_id={CHECKOUT_SESSION_ID}`,
+      cancelUrl: `${returnBase}?canceled=1&session_id={CHECKOUT_SESSION_ID}`,
+      idempotencySuffix: '_pub',
+    });
     return c.json({ data: { url: link.url } });
   } catch (err) {
     if (err instanceof InvoiceServiceError) {
+      if (err.code === 'COLLECTION_IN_PROGRESS') {
+        return c.json({ error: 'A payment is already processing', code: err.code }, 409);
+      }
       // Customer-facing wording for the benign 409s.
       if (err.code === 'STRIPE_NOT_CONNECTED') {
         return c.json({ error: 'Online payment is not available for this invoice — please contact the sender', code: err.code }, 409);

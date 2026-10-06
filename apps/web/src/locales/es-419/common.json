@@ -60,6 +60,7 @@
     "billing": "Facturación",
     "organizations": "Organizaciones",
     "aiUsage": "Uso de IA",
+    "aiProvidersModels": "Proveedores y modelos de IA",
     "scriptAuthoring": "Creación de scripts",
     "toolSources": "Fuentes de herramientas",
     "aiAgents": "Agentes de IA",
@@ -105,7 +106,8 @@
     "securityScans": "Escaneos de IOC",
     "system": "Sistema",
     "monitorConversion": "Conversión de monitores",
-    "timeSync": "Sincronización de hora"
+    "timeSync": "Sincronización de hora",
+    "aiModels": "Modelos de IA"
   },
   "documentTitles": {
     "dashboard": "Panel",
@@ -1426,6 +1428,7 @@
           "created": "Webhook creado",
           "disabled": "Webhook deshabilitado",
           "enabled": "Webhook habilitado",
+          "testQueued": "Entrega de prueba en cola",
           "updated": "Webhook actualizado"
         },
         "title": "Webhooks"

@@ -536,7 +536,27 @@ describe('validateViewerSessionAccess (via /:id/viewer/offer)', () => {
     }));
   });
 
-  it.each([0, 2, undefined])('refuses a consent-mode start before dispatch when the agent reports consent prompt protocol %s', async (version) => {
+  it('dispatches a consent-mode start to an agent on consent prompt protocol 2', async () => {
+    primeHappyPath();
+    mockViewerSelect({ session: ACTIVE_SESSION, device: { ...DEVICE, consentPromptProtocolVersion: 2 }, user: USER });
+    const { buildRemoteSessionPromptPayload } = await import('./remote/helpers');
+    vi.mocked(buildRemoteSessionPromptPayload).mockResolvedValueOnce({
+      mode: 'consent',
+      technicianName: null,
+      technicianEmail: null,
+      orgName: null,
+      consentUnavailableBehavior: 'block',
+      consentTimeoutMs: 30000,
+      notifyOnEnd: true,
+      showIndicator: true,
+    } as never);
+
+    const res = await offerRequest();
+
+    expect(res.status).toBe(200);
+  });
+
+  it.each([0, 3, undefined])('refuses a consent-mode start before dispatch when the agent reports consent prompt protocol %s', async (version) => {
     primeHappyPath();
     mockViewerSelect({ session: ACTIVE_SESSION, device: { ...DEVICE, consentPromptProtocolVersion: version }, user: USER });
     const { buildRemoteSessionPromptPayload } = await import('./remote/helpers');
@@ -720,7 +740,7 @@ describe('GET /:id/viewer/session failure diagnostics', () => {
   // #6818: the agent holds its answer until the end user answers the consent
   // dialog, so the viewer needs the start's prompt mode and answer budget.
   it.each([
-    ['consent', 77_000],
+    ['consent', 87_000],
     ['notify', 45_000],
     ['off', 15_000],
     [null, 15_000],

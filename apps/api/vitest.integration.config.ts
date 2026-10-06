@@ -11,6 +11,7 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     include: [
+      'src/services/autopay/**/*.integration.test.ts',
       'src/jobs/scriptVerifyReconciliation.integration.test.ts',
       'src/__tests__/integration/**/*.test.ts',
       'src/routes/integrationConnectionScope.integration.test.ts',
@@ -273,6 +274,8 @@ export default defineConfig({
       // #7217 — failed Add Device attempts leave no live key; failed
       // short-link downloads give their use back; the list names the site.
       'src/routes/enrollmentKeysFailureCleanup.integration.test.ts',
+      // #7345 — Add Device reuses one parent key per (org, site, creator).
+      'src/routes/enrollmentKeysAddDeviceParent.integration.test.ts',
       // Co-located real-DB integration test for the fleet posture report
       // (#3244): the mixed never-scanned/stale/clean/detected fixture that
       // guards the two-query split — a mocked unit test cannot catch the
@@ -388,7 +391,8 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
-      include: ['src/**/*.ts'],
+      include: [
+'src/**/*.ts'],
       exclude: [
         'src/**/*.test.ts',
         'src/__tests__/**',

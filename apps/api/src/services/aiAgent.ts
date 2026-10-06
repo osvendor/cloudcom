@@ -11,6 +11,7 @@ import { aiSessions, aiMessages, aiToolExecutions, approvalRequests, delegantM36
 import { eq, and, desc, sql, type SQL } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import type { AiPageContext, AiApprovalMode } from '@breeze/shared/types/ai';
+import type { OfferingOptions } from '@breeze/shared';
 import { buildSessionContextSnapshot } from './aiSessionOrgAnchor';
 import type { ActiveSession } from './streamingSessionManager';
 import { escapeLike } from '../utils/sql';
@@ -22,12 +23,14 @@ import {
   UNTRUSTED_FIELD_MAX_LENGTH,
 } from './aiInputSanitizer';
 import { looksLikeInternalErrorDetail } from './aiToolErrors';
-import { LlmUnavailableError, resolveLlmConfigForOrg } from './llm/llmConfigResolver';
-import { LlmNotConfiguredError, llmUnusableCode } from './llm/llmAvailability';
+import { LlmUnavailableError } from './llm/llmConfigResolver';
+import { readOrgPartnerId } from './aiModels/candidateLoader';
+import { chooseSessionModel, type SessionModelChoice } from './aiModels/sessionModel';
 import { getEffectiveAiBudget } from './effectiveSettings';
 import { authorizeTopologySessionSite } from './topology/aiToolGate';
 import { topologySessionAccessCondition } from './topology/aiSessionAccess';
 export { BREEZE_FALLBACK_MODEL, resolveDefaultModel } from './aiModel';
+export { InvalidSessionModelError } from './aiModels/invalidSessionModelError';
 
 // ============================================
 // Session Management
@@ -83,7 +86,9 @@ export async function createSession(
   auth: AuthContext,
   options: {
     pageContext?: AiPageContext;
-    model?: string;
+    /** Registry offering to run the session on (W03 #7601). */
+    offeringId?: string;
+    options?: Partial<OfferingOptions>;
     title?: string;
     orgId?: string;
     delegantM365ConnectionId?: string;
@@ -207,12 +212,19 @@ export async function createSession(
     deviceId = deviceRow.id;
   }
 
-  const resolved = await resolveLlmConfigForOrg(orgId);
-  // No session without a model to answer it: a platform path with no key
-  // would otherwise start a turn that can only come back empty.
-  const unusable = llmUnusableCode(resolved);
-  if (unusable === 'ai_not_configured') throw new LlmNotConfiguredError();
-  if (resolved.source === 'unavailable') throw new LlmUnavailableError();
+  // The session's model is picked through the registry (W03 #7601): a
+  // requested offering is a strict user choice, and a refused one stores
+  // nothing. No session without a model to answer it.
+  const partnerId = await readOrgPartnerId(orgId);
+  if (!partnerId) throw new LlmUnavailableError();
+  // Topology sessions are `chat` too (spec §4).
+  const choice: Pick<SessionModelChoice, 'offeringId' | 'options' | 'model' | 'billingSource'> & {
+    offeringPartnerId: string | null;
+  } = await chooseSessionModel({
+    partnerId, orgId, userId: auth.user.id, surface: 'chat',
+    ...(options.offeringId ? { offeringId: options.offeringId } : {}),
+    ...(options.options ? { options: options.options } : {}),
+  });
 
   // #6473 — without this, every new session fell back to the `ai_sessions`
   // schema column default (50) regardless of the configured org/partner
@@ -228,8 +240,11 @@ export async function createSession(
     .values({
       orgId,
       userId: auth.user.id,
-      model: options.model ?? resolved.model,
-      billingSource: resolved.source === 'partner' ? 'partner_key' : 'platform',
+      model: choice.model,
+      offeringId: choice.offeringId,
+      offeringPartnerId: choice.offeringPartnerId,
+      options: choice.options,
+      billingSource: choice.billingSource,
       title: options.title ?? null,
       contextSnapshot: buildSessionContextSnapshot(sanitizedPageContext, orgAnchoredToPage),
       delegantM365ConnectionId,

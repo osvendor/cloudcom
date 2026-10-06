@@ -1411,6 +1411,14 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    name: 'autopayWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/autopayWorker');
+      return { init: m.initializeAutopayWorkers, shutdown: m.shutdownAutopayWorkers };
+    },
+  },
+  {
     // #3828 wave-6-4 task 2. Same shape/precedent as ticketOutboxPublisher —
     // drains metric_anomaly_incidents' dispatch marker onto the generic
     // eventBus. No agent-socket-local dispatch dependency, so 'global'.
@@ -1455,6 +1463,26 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     load: async () => {
       const m = await import('../jobs/aiUnattendedExposureRetention');
       return { init: m.initializeAiUnattendedExposureRetention, shutdown: m.shutdownAiUnattendedExposureRetention };
+    },
+  },
+  {
+    // #7600 W02: daily prune of the append-only `ai_invocations` ledger as
+    // breeze_audit_admin. No route graph / socket import in its closure.
+    name: 'aiInvocationRetention',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/aiInvocationRetention');
+      return { init: m.initializeAiInvocationRetention, shutdown: m.shutdownAiInvocationRetention };
+    },
+  },
+  {
+    // #7608 W10: daily AI chargeback close. Its closure is db + services only
+    // (no route graph, no socket import) — `global`, like the retention workers.
+    name: 'aiChargebackWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/aiChargebackWorker');
+      return { init: m.initializeAiChargebackWorker, shutdown: m.shutdownAiChargebackWorker };
     },
   },
   {
@@ -1681,6 +1709,15 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     load: async () => {
       const m = await import('../jobs/fixOutcomeWorker');
       return { init: m.initializeFixOutcomeWorker, shutdown: m.shutdownFixOutcomeWorker };
+    },
+  },
+  // AI model registry W01 (#7599): platform model discovery (ai-model-discovery queue).
+  {
+    name: 'aiModelDiscoveryWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/aiModelDiscoveryWorker');
+      return { init: m.initializeAiModelDiscoveryWorker, shutdown: m.shutdownAiModelDiscoveryWorker };
     },
   },
 ];

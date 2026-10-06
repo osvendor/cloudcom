@@ -550,20 +550,83 @@ fn start_ipc_driver() -> bool {
 }
 
 /// Build a reqwest::Client, optionally with mTLS identity.
+///
+/// Trusts the bundled public roots plus the OS trust store (#7550). reqwest
+/// fails the build if the OS store yields certificates but none parse; in that
+/// case fall back to the bundled roots alone (the pre-#7550 behavior) rather
+/// than taking Assist offline, and log why.
 fn build_client(cfg: &AgentConfigFull) -> Result<Client, String> {
-    let mut builder = Client::builder().use_rustls_tls();
+    let identity = match (&cfg.mtls_cert_pem, &cfg.mtls_key_pem) {
+        (Some(cert_pem), Some(key_pem)) => {
+            // reqwest Identity expects PEM with both cert and key concatenated.
+            let combined_pem = format!("{}\n{}", cert_pem, key_pem);
+            Some(
+                Identity::from_pem(combined_pem.as_bytes())
+                    .map_err(|e| format!("Failed to build mTLS identity: {}", e))?,
+            )
+        }
+        _ => None,
+    };
 
-    if let (Some(cert_pem), Some(key_pem)) = (&cfg.mtls_cert_pem, &cfg.mtls_key_pem) {
-        // reqwest Identity expects PEM with both cert and key concatenated.
-        let combined_pem = format!("{}\n{}", cert_pem, key_pem);
-        let identity = Identity::from_pem(combined_pem.as_bytes())
-            .map_err(|e| format!("Failed to build mTLS identity: {}", e))?;
-        builder = builder.identity(identity);
+    let builder = |native_roots: bool| {
+        let mut b = Client::builder()
+            .use_rustls_tls()
+            .tls_built_in_native_certs(native_roots);
+        if let Some(identity) = identity.clone() {
+            b = b.identity(identity);
+        }
+        b
+    };
+
+    match builder(true).build() {
+        Ok(client) => Ok(client),
+        Err(native_err) => {
+            log_helper_error(&format!(
+                "HTTP client build with OS trust store failed ({:?}); \
+                 falling back to bundled public roots only",
+                native_err
+            ));
+            builder(false)
+                .build()
+                .map_err(|e| format!("Failed to build HTTP client: {}", e))
+        }
     }
+}
 
-    builder
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))
+const GENERIC_CONNECT_ERROR: &str =
+    "Cannot connect to the Breeze server. Check your network connection.";
+const CERTIFICATE_CONNECT_ERROR: &str =
+    "Cannot connect to the Breeze server: its TLS certificate is not trusted on this computer. \
+     If the server uses a private certificate authority, install that CA in the operating \
+     system's trusted root certificate store.";
+const CLIENT_CERTIFICATE_REJECTED_ERROR: &str =
+    "Cannot connect to the Breeze server: the server rejected this computer's TLS client \
+     certificate. The Breeze agent may need to be re-enrolled.";
+
+/// User-facing message for a request that failed before a response arrived
+/// (#7550). TLS failures surface as connect errors whose cause chain ends in a
+/// rustls error; name the certificate problem instead of blaming the network.
+/// The top-level error is skipped because its Display embeds the request URL.
+/// The full chain is still logged by callers.
+fn transport_error_message(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut current = err.source();
+    while let Some(e) = current {
+        let msg = e.to_string().to_ascii_lowercase();
+        // We rejected the server's certificate (UnknownIssuer, expired, name
+        // mismatch, ...).
+        if msg.contains("invalid peer certificate") {
+            return CERTIFICATE_CONNECT_ERROR.to_string();
+        }
+        // The server rejected ours (mTLS): BadCertificate, CertificateRequired,
+        // CertificateExpired/Revoked, UnknownCA, ...
+        if msg.contains("received fatal alert")
+            && (msg.contains("certificate") || msg.contains("unknownca"))
+        {
+            return CLIENT_CERTIFICATE_REJECTED_ERROR.to_string();
+        }
+        current = e.source();
+    }
+    GENERIC_CONNECT_ERROR.to_string()
 }
 
 /// Ensure the HTTP state is initialized, returning a reference. Caller holds the mutex guard.
@@ -627,41 +690,73 @@ fn minimize_window(app: tauri::AppHandle) {
     }
 }
 
-/// Submit the local user's consent verdict for a remote session.
+/// Submit the local user's answer to the remote-session consent prompt.
 ///
-/// Invoked by the React consent window on Allow / Deny / timeout. `decision` is
-/// `"allow"` or `"deny"`. The verdict is handed to the live IPC session loop via
-/// the [`ConsentBridge`](crate::ipc::desktop::ConsentBridge), which writes the
-/// `consent_result` response back to the agent (correlated by envelope id
-/// `consent-<session_id>`), then we close the consent window.
+/// Invoked by the React consent window on Allow / Deny, and — for a v2 prompt
+/// (`nonce` present) — when its countdown runs out (`decision` = `expired`).
+/// The event goes to the live IPC session loop via the
+/// [`ConsentBridge`](crate::ipc::desktop::ConsentBridge); the loop's
+/// `ConsentTracker` turns it into the `consent_result` for the agent. Then we
+/// close the consent window.
 ///
-/// Best-effort: if no IPC session is currently live the verdict is dropped — the
-/// agent has its own consent-timeout fallback, so a missing response is safe.
+/// If no IPC session is live the answer is dropped; the agent then reports the
+/// prompt as unanswered, which never starts a session on its own.
 #[tauri::command]
-fn submit_consent(app: tauri::AppHandle, session_id: String, decision: String) {
-    // Normalize to the two values the agent understands; anything unexpected is
-    // treated as a deny (fail-closed).
-    let decision = if decision == "allow" {
-        "allow".to_string()
-    } else {
-        "deny".to_string()
-    };
+fn submit_consent(
+    app: tauri::AppHandle,
+    session_id: String,
+    decision: String,
+    nonce: Option<String>,
+) {
+    // Normalize to the values the tracker understands; anything unexpected
+    // is treated as a deny (fail-closed).
+    let decision = match decision.as_str() {
+        "allow" => "allow",
+        "expired" => "expired",
+        _ => "deny",
+    }
+    .to_string();
 
-    if let Some(bridge) =
-        app.try_state::<std::sync::Arc<crate::ipc::desktop::ConsentBridge>>()
-    {
-        let submitted = bridge.submit(crate::ipc::desktop::ConsentDecision {
+    if let Some(bridge) = app.try_state::<std::sync::Arc<crate::ipc::desktop::ConsentBridge>>() {
+        let submitted = bridge.submit(crate::ipc::desktop::UiEvent::Decision {
             session_id,
+            nonce: nonce.filter(|n| !n.is_empty()),
             decision,
         });
         if !submitted {
-            eprintln!("[helper] submit_consent: no live IPC session to deliver verdict");
+            eprintln!("[helper] submit_consent: no live IPC session to deliver the answer");
         }
     } else {
         eprintln!("[helper] submit_consent: consent bridge not initialized");
     }
 
     crate::ipc::desktop::close_consent_window(&app);
+}
+
+/// The consent window has rendered the prompt for `nonce` and it is visible;
+/// the agent starts the countdown from here (v2 presentation acknowledgement).
+#[tauri::command]
+fn consent_presented(app: tauri::AppHandle, nonce: String) {
+    if nonce.is_empty() {
+        return;
+    }
+    match app.try_state::<std::sync::Arc<crate::ipc::desktop::ConsentBridge>>() {
+        Some(bridge) => {
+            if !bridge.submit(crate::ipc::desktop::UiEvent::Presented { nonce }) {
+                eprintln!("[helper] consent_presented: no live IPC session");
+            }
+        }
+        None => eprintln!("[helper] consent_presented: consent bridge not initialized"),
+    }
+}
+
+/// The request the consent window should display. The window pulls it on
+/// mount, so a `consent-request` event emitted before its listener was ready
+/// is never lost.
+#[tauri::command]
+fn get_consent_request(app: tauri::AppHandle) -> Option<serde_json::Value> {
+    app.try_state::<std::sync::Arc<crate::ipc::desktop::ConsentBridge>>()
+        .and_then(|bridge| bridge.current())
 }
 
 /// Update the helper status file when chat activity changes.
@@ -1034,20 +1129,17 @@ async fn helper_fetch(
                     return Err(message)
                 }
                 Err(SendError::Request { error, url }) => {
-                    log_helper_error(&format!("HTTP request to {} failed: {}", url, error));
-                    return Err(
-                        "Cannot connect to the Breeze server. Check your network connection."
-                            .to_string(),
-                    );
+                    // Debug includes the source chain (hyper/io/rustls cause),
+                    // which Display omits.
+                    log_helper_error(&format!("HTTP request to {} failed: {:?}", url, error));
+                    return Err(transport_error_message(&error));
                 }
             }
         }
         Err(SendError::Url(message)) | Err(SendError::NoToken(message)) => return Err(message),
         Err(SendError::Request { error, url }) => {
-            log_helper_error(&format!("HTTP request to {} failed: {}", url, error));
-            return Err(
-                "Cannot connect to the Breeze server. Check your network connection.".to_string(),
-            );
+            log_helper_error(&format!("HTTP request to {} failed: {:?}", url, error));
+            return Err(transport_error_message(&error));
         }
     };
 
@@ -1255,6 +1347,8 @@ pub fn run() {
             helper_token_ready,
             restart_ipc_if_stopped,
             submit_consent,
+            consent_presented,
+            get_consent_request,
             workspace_open::open_workspace_path,
         ])
         .setup(|app| {
@@ -1476,6 +1570,141 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #7550: Assist must trust the OS certificate store (self-hosted servers
+    // on a private CA installed in LocalMachine\Root / keychain / system
+    // bundle) IN ADDITION TO the bundled public roots. reqwest unions the two
+    // root sources only when both features are compiled in, so pin both.
+    #[test]
+    fn reqwest_trusts_os_store_and_bundled_public_roots() {
+        let line = include_str!("../Cargo.toml")
+            .lines()
+            .find(|l| l.trim_start().starts_with("reqwest ="))
+            .expect("reqwest dependency line in Cargo.toml");
+        let features: Vec<String> = line
+            .split("features")
+            .nth(1)
+            .and_then(|rest| rest.split('[').nth(1))
+            .and_then(|rest| rest.split(']').next())
+            .unwrap_or("")
+            .split(',')
+            .map(|f| f.trim().trim_matches('"').to_string())
+            .filter(|f| !f.is_empty())
+            .collect();
+        assert!(
+            features.iter().any(|f| f == "rustls-tls-native-roots"),
+            "reqwest must enable rustls-tls-native-roots (OS trust store); got {:?}",
+            features
+        );
+        assert!(
+            features.iter().any(|f| f == "rustls-tls"),
+            "reqwest must keep rustls-tls (bundled public roots); got {:?}",
+            features
+        );
+    }
+
+    #[test]
+    fn build_client_loads_native_roots_without_error() {
+        let cfg = AgentConfigFull {
+            api_url: "https://breeze.example.com".to_string(),
+            file_token: None,
+            agent_id: "agent".to_string(),
+            mtls_cert_pem: None,
+            mtls_key_pem: None,
+        };
+        build_client(&cfg).expect("client with OS + bundled roots builds");
+    }
+
+    #[derive(Debug)]
+    struct ChainErr {
+        msg: &'static str,
+        source: Option<Box<ChainErr>>,
+    }
+    impl std::fmt::Display for ChainErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.msg)
+        }
+    }
+    impl std::error::Error for ChainErr {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|e| e as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn transport_error_names_certificate_problem() {
+        // Shape of a reqwest -> hyper -> io -> rustls chain on an untrusted CA.
+        let err = ChainErr {
+            msg: "error sending request for url (https://breeze.local/api/v1/x)",
+            source: Some(Box::new(ChainErr {
+                msg: "client error (Connect)",
+                source: Some(Box::new(ChainErr {
+                    msg: "invalid peer certificate: UnknownIssuer",
+                    source: None,
+                })),
+            })),
+        };
+        let message = transport_error_message(&err);
+        assert!(
+            message.to_lowercase().contains("certificate"),
+            "expected a certificate-specific message, got: {message}"
+        );
+    }
+
+    // Review finding: the top-level reqwest error embeds the request URL, so a
+    // path like /certificates must not turn a network failure into a cert one.
+    #[test]
+    fn transport_error_ignores_certificate_word_in_request_url() {
+        let err = ChainErr {
+            msg: "error sending request for url (https://breeze.local/api/v1/certificates)",
+            source: Some(Box::new(ChainErr {
+                msg: "tcp connect error: Connection refused (os error 61)",
+                source: None,
+            })),
+        };
+        assert_eq!(transport_error_message(&err), GENERIC_CONNECT_ERROR);
+    }
+
+    // A fatal alert means the SERVER rejected our (mTLS) client certificate —
+    // telling the user to install a CA would send them to the wrong fix.
+    #[test]
+    fn transport_error_distinguishes_rejected_client_certificate() {
+        for alert in [
+            "received fatal alert: BadCertificate",
+            "received fatal alert: CertificateRequired",
+            "received fatal alert: UnknownCA",
+        ] {
+            let err = ChainErr {
+                msg: "error sending request for url (https://breeze.local/api/v1/x)",
+                source: Some(Box::new(ChainErr {
+                    msg: alert,
+                    source: None,
+                })),
+            };
+            assert_eq!(
+                transport_error_message(&err),
+                CLIENT_CERTIFICATE_REJECTED_ERROR,
+                "alert: {alert}"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_error_keeps_generic_message_for_network_failures() {
+        let err = ChainErr {
+            msg: "error sending request",
+            source: Some(Box::new(ChainErr {
+                msg: "tcp connect error: Connection refused (os error 61)",
+                source: None,
+            })),
+        };
+        assert_eq!(
+            transport_error_message(&err),
+            "Cannot connect to the Breeze server. Check your network connection."
+        );
+    }
 
     // #3202: a config written by an agent that predates show_tray_icon must
     // leave the icon VISIBLE. A bare `#[serde(default)]` would decode the

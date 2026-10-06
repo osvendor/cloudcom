@@ -189,6 +189,7 @@ const ORG_ID_BLOCKING_TRIGGERS: Readonly<Record<string, string>> = {
     'RAISEs 23514 when org_id changes; a native enrollment cannot move to another organization',
   'portal_remote_assignments.portal_remote_assignment_version':
     'RAISEs 23514 on org or principal/device identity changes; remote grants never transfer between organizations',
+  'org_autopay_consents.org_autopay_consents_immutable': 'unconditional append-only RAISE; consent authority remains with the loser for erasure',
   'offline_transition_effects.offline_effect_source_guard': 'RAISEs iff immutable source org_id changes; historical intents remain with source until erasure',
   // Conditional immutability guards: RAISE iff org_id changed.
   'action_intents.action_intents_immutable_trg': 'RAISEs iff org_id changed',
@@ -242,12 +243,27 @@ const ORG_ID_BLOCKING_TRIGGERS: Readonly<Record<string, string>> = {
  * row's org_id is unchanged afterwards.
  */
 const CUSTOM_EXECUTORS_THAT_NEVER_WRITE_ORG_ID: Readonly<Record<string, string>> = {
+  org_autopay_enrollments: 'Cancel and retain source authority; proven by autopayMerge.integration.test.ts.',
+  org_payment_methods: 'Remove and retain source authority; proven by autopayMerge.integration.test.ts.',
+
   // fenceScriptProposals sets status/decision_note in the resolve phase;
   // moveScriptProposals is a documented no-op. Proven by
   // scriptProposalsLifecycle.integration.test.ts ("an org merge expires live
   // proposals in the loser and leaves terminal ones alone": org_id stays with
   // the loser for both fenced and terminal rows).
   script_proposals: 'fence (status/decision_note only) + no-op move — orgMergeCustomExecutors.ts',
+};
+
+/**
+ * Append-only 'repoint' tables whose table-level UPDATE is DELIBERATELY revoked
+ * from breeze_app, leaving only a column-level `UPDATE (org_id)` grant (re-granted
+ * by ensureAppRole.ts step 5 after its re-revoke). The plain repoint statement
+ * writes org_id alone, so that grant is all it needs. Explicit list, reason per
+ * entry — never infer it from the catalog.
+ */
+const ORG_ID_COLUMN_UPDATE_REPOINT_TABLES: Readonly<Record<string, string>> = {
+  ai_invocations: 'append-only invocation ledger (2026-11-14-100300, #7600 W02); usage history follows the merged client, everything but org_id is immutable',
+  ai_usage_charge_claims: 'write-once chargeback claims (2026-11-26-100200, #7608 W10); a claim follows its merged invocation so it is never re-claimed, everything but org_id is immutable',
 };
 
 /** BENIGN = fires on the repoint but does not obstruct it. Reason per entry. */
@@ -257,6 +273,11 @@ const ORG_ID_BENIGN_TRIGGERS: Readonly<Record<string, string>> = {
   // and the pin's composite FK to sites(id, org_id) is DEFERRABLE, so the
   // separate ai_sessions/sites re-points commit together.
   'ai_sessions.breeze_ai_sessions_topology_site_guard': 'fires only on UPDATE OF topology_site_id and blocks a pin change; never reads or blocks org_id',
+  // AI model registry W02 (2026-11-14-100400, #7600): BEFORE UPDATE OF org_id;
+  // never RAISEs. Clears the offering pair (and options) only when the new org
+  // belongs to another partner. Merges are same-partner, so a merge repoint
+  // leaves the binding intact.
+  'ai_sessions.breeze_ai_sessions_offering_partner_guard': 'fires on UPDATE OF org_id but never blocks it; only clears the offering binding on a cross-partner org change, which a same-partner merge never makes',
   // Brokered backup writes (2026-11-08-120000 / 120100): parent-org guards that
   // check only the references (device, job, reservation, session, snapshot,
   // configuration) an INSERT sets or an UPDATE changes. An UPDATE that changes
@@ -264,6 +285,9 @@ const ORG_ID_BENIGN_TRIGGERS: Readonly<Record<string, string>> = {
   'backup_snapshot_id_reservations.backup_snapshot_id_reservations_parent_org_guard': 'checks only changed parent references; an org_id-only repoint is exempt',
   'backup_storage_sessions.backup_storage_sessions_parent_org_guard': 'checks only changed parent references; an org_id-only repoint is exempt',
   'backup_storage_session_uploads.backup_storage_session_uploads_parent_org_guard': 'checks only changed parent references; an org_id-only repoint is exempt',
+  // Storage key history (2026-11-12-100000): checks only a config_id an
+  // INSERT sets or an UPDATE changes; an org_id-only repoint is never checked.
+  'backup_storage_credential_history.backup_storage_credential_history_parent_org_guard': 'checks only a changed config_id; an org_id-only repoint is exempt',
   // Partner alerts feed (2026-10-30-130000): BEFORE INSERT OR UPDATE, only sets
   // NEW.partner_feed_xid := pg_current_xact_id(). Never reads or blocks org_id;
   // an org repoint restamps the row, which correctly re-delivers it in the feed.
@@ -283,6 +307,18 @@ const ORG_ID_BENIGN_TRIGGERS: Readonly<Record<string, string>> = {
   // when the last pointer goes null. Never reads or writes org_id; the table is
   // leave-for-erasure anyway.
   'ai_operator_task_targets.ai_operator_task_targets_stamp_detach': 'stamps a detach when the last pointer is nulled; never touches org_id',
+  // AI model registry W02 (2026-11-14-100200, #7600): BEFORE INSERT OR UPDATE
+  // OF permitted_offering_ids, fallback_offering_ids, offering_partner_id.
+  // Checks the offering arrays belong to offering_partner_id. A merge repoint
+  // changes org_id only (same partner), so it never fires on a merge.
+  'ai_model_assignments.ai_model_assignments_offering_ownership_guard': 'fires only on offering-array/offering_partner_id changes; an org_id-only repoint never fires it',
+  // AI model registry W02 (2026-11-14-100300, #7600): the append-only ledger
+  // guard RAISEs on every UPDATE EXCEPT an org_id-only change made in system
+  // scope, away from an org fenced 'merging', to an org of the same partner —
+  // which is exactly the merge's `UPDATE ai_invocations SET org_id = <survivor>
+  // WHERE org_id = <loser>` (buildRepoint, run under withSystemDbAccessContext
+  // after the fence). Proven by aiInvocationsAppendOnly.integration.test.ts.
+  'ai_invocations.ai_invocations_block_update': 'admits exactly the system-scope, same-partner org_id-only repoint away from a merging org; blocks everything else',
   // These detach only on DELETE or an actual site change. Org-only repoints
   // retain bindings; topology's ambient merge hooks fence and rekey them.
   'devices.breeze_topology_source_lifecycle': 'same-site org-only updates retain source snapshots; merge prepare/finalize fences authority',
@@ -493,10 +529,13 @@ describe('Org merge policy registry contract', () => {
     for (const [table, policy] of policies) {
       if (policy.kind !== 'keep-survivor') continue;
       const indexes = await getUniqueIndexes(table);
-      const match = indexes.find((ix) => ix.whereNormalized === null && ix.nonOrgColumns.size === 0);
+      // Dual-axis settings have one row per non-null org, plus partner-owned rows.
+      // Their merge executor deletes source settings and never repoints them.
+      const expectedWhere = table === 'billing_payment_settings' ? normalizeSql('org_id IS NOT NULL') : null;
+      const match = indexes.find((ix) => ix.whereNormalized === expectedWhere && ix.nonOrgColumns.size === 0);
       expect(
         match,
-        `${table}: expected a total (non-partial) UNIQUE index on exactly (org_id); found unique indexes: ${JSON.stringify(indexes.map((i) => i.indexname))}`,
+        `${table}: expected a UNIQUE index on exactly (org_id) with predicate ${expectedWhere ?? 'none'}; found unique indexes: ${JSON.stringify(indexes.map((i) => i.indexname))}`,
       ).toBeDefined();
     }
   });
@@ -737,15 +776,28 @@ describe('Org merge policy registry contract', () => {
 
     const revoked: string[] = [];
     for (const table of mutating) {
+      const columnGrantOnly = table in ORG_ID_COLUMN_UPDATE_REPOINT_TABLES;
       const [row] = (await db.execute(sql`
-        SELECT has_table_privilege('breeze_app', ${table}, 'UPDATE') AS can_update
-      `)) as unknown as Array<{ can_update: boolean }>;
+        SELECT has_table_privilege('breeze_app', ${table}, 'UPDATE') AS can_update,
+               has_column_privilege('breeze_app', ${table}, 'org_id', 'UPDATE') AS can_update_org_id
+      `)) as unknown as Array<{ can_update: boolean; can_update_org_id: boolean }>;
+      if (columnGrantOnly) {
+        // A plain repoint is the single statement `UPDATE <t> SET org_id = …
+        // WHERE org_id = …` (orgMergeExecutors.buildRepoint), so a column-level
+        // UPDATE (org_id) grant is sufficient. repoint-dedupe also DELETEs, so
+        // the exemption is only valid for 'repoint'; and table-level UPDATE must
+        // really be revoked, or the entry is stale and should be removed.
+        expect(policies.get(table)?.kind, `${table} is column-grant-only, so it must be a plain 'repoint'`).toBe('repoint');
+        expect(row?.can_update, `${table} is listed as column-grant-only but breeze_app holds table-level UPDATE`).toBe(false);
+        if (!row?.can_update_org_id) revoked.push(table);
+        continue;
+      }
       if (!row?.can_update) revoked.push(table);
     }
 
     expect(
       revoked,
-      `these tables are classified 'repoint'/'repoint-dedupe' (a direct UPDATE ... SET org_id as breeze_app) but breeze_app has UPDATE revoked on them — the statement raises 42501 mid-merge, after the loser org is already fenced. Reclassify 'derived' if org_id instead moves via an ON UPDATE CASCADE FK from a repointed parent (see partner_export_device_material_state), or 'leave-for-erasure' if it never moves at all: ${revoked.join(', ')}`,
+      `these tables are classified 'repoint'/'repoint-dedupe' (a direct UPDATE ... SET org_id as breeze_app) but breeze_app has UPDATE revoked on them — the statement raises 42501 mid-merge, after the loser org is already fenced. Reclassify 'derived' if org_id instead moves via an ON UPDATE CASCADE FK from a repointed parent (see partner_export_device_material_state), or 'leave-for-erasure' if it never moves at all (an append-only 'repoint' table that keeps a column-level UPDATE (org_id) grant belongs in ORG_ID_COLUMN_UPDATE_REPOINT_TABLES): ${revoked.join(', ')}`,
     ).toEqual([]);
   });
 

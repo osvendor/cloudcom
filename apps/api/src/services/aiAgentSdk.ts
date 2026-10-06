@@ -78,12 +78,16 @@ import {
 import { TEMP_PASSWORD_ENC_KEY } from './actionIntents/resultSecrets';
 import { captureException } from './sentry';
 import { recordActionIntentMetric } from './actionIntents/metrics';
-import { resolveLlmConfigForOrg, type UsableLlmConfig } from './llm/llmConfigResolver';
-import { llmUnusableCode } from './llm/llmAvailability';
+import { isPlatformLlmConfigured } from './llm/llmAvailability';
+import type { AiModelChoice, AiSurface } from '@breeze/shared';
+import type { ResolveFailureReason } from './aiModels/eligibility';
+import type { ModelUnavailable, ResolvedModel } from './aiModels/resolveModel';
+import { resolveSessionTurn } from './aiModels/sessionModel';
 import { resolveLiveSessionToolAuthority } from './aiSessionLiveAuthority';
 
-const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
-const SESSION_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000; // 2 hours
+import { SESSION_IDLE_TIMEOUT_MS, SESSION_MAX_AGE_MS } from './aiAgentSessionLimits';
+
+export { SESSION_IDLE_TIMEOUT_MS, SESSION_MAX_AGE_MS };
 
 /**
  * Total time a single assistant cycle (one assistant message's batch of tool
@@ -370,12 +374,36 @@ export type PreFlightResult = {
   sanitizedContent: string;
   systemPrompt: string;
   maxBudgetUsd: number | undefined;
-  resolved: UsableLlmConfig;
+  /**
+   * The turn's model from the registry (W03 Task 7): dispatch, admission and
+   * settlement all take it unchanged. Always resolved — W06 removed the env
+   * OpenAI-compatible chat runtime; an env deployment's chat resolves to its
+   * env-managed offering like any other.
+   */
+  model: ResolvedModel;
 } | {
   ok: false;
   error: string;
   status?: number;
+  /** A recoverable model-resolution failure (the route answers 409 with it). */
+  code?: ResolveFailureReason;
 };
+
+/**
+ * A turn whose model cannot be resolved. `connection_unavailable` while the
+ * deployment has no platform credential keeps the pre-registry
+ * `ai_not_configured` contract (the web client localizes it); the cutover gate
+ * is transient (503); anything else is the recoverable 409 "choose another".
+ */
+function unresolvedTurn(turn: ModelUnavailable): Extract<PreFlightResult, { ok: false }> {
+  if (turn.reason === 'connection_unavailable' && !isPlatformLlmConfigured(process.env.ANTHROPIC_API_KEY, 'agent_sdk')) {
+    return { ok: false, error: 'ai_not_configured', status: 503 };
+  }
+  if (turn.reason === 'registry_unavailable') {
+    return { ok: false, error: turn.message, status: 503, code: turn.reason };
+  }
+  return { ok: false, error: turn.message, status: 409, code: turn.reason };
+}
 
 /**
  * Validates rate limits, budget, session status, expiration, and sanitizes input.
@@ -387,6 +415,8 @@ export async function runPreFlightChecks(
   auth: AuthContext,
   pageContext?: AiPageContext,
   requestContext?: RequestLike,
+  /** W05: the composer's model choice on this message (chat only; strict user resolution). */
+  choice?: AiModelChoice,
 ): Promise<PreFlightResult> {
   const session = await getSession(sessionId, auth);
   if (!session) {
@@ -394,25 +424,20 @@ export async function runPreFlightChecks(
   }
   const orgId = session.orgId;
 
-  let resolved;
+  // Spec §9: every turn re-resolves the session's stored offering + options
+  // (bounded fallback, recoverable refusal) — funding included, decided here,
+  // before any admission check. One runtime (W06): chat and the script builder
+  // both run the Agent SDK on the resolved model.
+  const surface: AiSurface = session.type === 'script_builder' ? 'script_builder' : 'chat';
+  let turn;
   try {
-    resolved = await resolveLlmConfigForOrg(orgId);
+    turn = await resolveSessionTurn({ sessionId, surface, userId: auth.user.id, ...(choice ? { choice } : {}) });
   } catch (error) {
     captureException(error, undefined, { service: 'aiAgentSdk', orgId });
-    return {
-      ok: false,
-      error: 'AI configuration could not be loaded. Try again.',
-      status: 503,
-    };
+    return { ok: false, error: 'AI configuration could not be loaded. Try again.', status: 503 };
   }
-  // The script builder always runs the Agent SDK; chat can also run on the
-  // platform's OpenAI-compatible provider.
-  if (llmUnusableCode(resolved, session.type === 'script_builder' ? 'agent_sdk' : 'chat') === 'ai_not_configured') {
-    return { ok: false, error: 'ai_not_configured', status: 503 };
-  }
-  if (resolved.source === 'unavailable') {
-    return { ok: false, error: 'ai_unavailable', status: 503 };
-  }
+  if (!turn.ok) return unresolvedTurn(turn);
+  const model: ResolvedModel = turn;
 
   // Rate limits
   try {
@@ -425,10 +450,8 @@ export async function runPreFlightChecks(
 
   // Budget
   try {
-    const budgetError = await checkBudget(
-      orgId,
-      resolved.source === 'partner' ? 'partner_key' : 'platform',
-    );
+    // Funding from the RESOLVED offering (quorum #4).
+    const budgetError = await checkBudget(orgId, model.funding);
     if (budgetError) return { ok: false, error: budgetError };
   } catch (err) {
     console.error('[AI-SDK] Budget check failed:', err);
@@ -437,10 +460,11 @@ export async function runPreFlightChecks(
 
   if (session.status !== 'active') {
     // 'expired' must read as expired to the caller: routes map on the word to
-    // return 410, and a session retired eagerly by openaiSessionManager's
-    // eviction reaches this branch BEFORE the age checks below would have
-    // produced that wording lazily. Without this, the same terminal state
-    // surfaced as 410 or 400 depending purely on which path got there first.
+    // return 410, and a session retired eagerly (streamingSessionManager's
+    // eviction stamps 'expired') reaches this branch BEFORE the age checks
+    // below would have produced that wording lazily. Without this, the same
+    // terminal state surfaced as 410 or 400 depending purely on which path
+    // got there first.
     return {
       ok: false,
       error:
@@ -524,7 +548,7 @@ export async function runPreFlightChecks(
   // A durable reservation is acquired immediately before provider dispatch by
   // the route. Returning an advisory remaining-budget snapshot here would
   // recreate the check-then-spend race this preflight must not authorize.
-  return { ok: true, session, sanitizedContent, systemPrompt, maxBudgetUsd: undefined, resolved };
+  return { ok: true, session, sanitizedContent, systemPrompt, maxBudgetUsd: undefined, model };
 }
 
 /**

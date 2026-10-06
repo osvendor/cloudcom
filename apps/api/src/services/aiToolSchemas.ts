@@ -120,7 +120,7 @@ export const executeCommandShape = {
     'list_services', 'start_service', 'stop_service', 'restart_service',
     'file_list', 'file_read',
     'event_logs_list', 'event_logs_query',
-  ]),
+  ]).describe('The type of command to execute. Before kill_process, restate the evidence tying that PID to the problem, each claim labelled verified or inferred.'),
   payload: executeCommandPayloadSchema
     .describe('Command-specific parameters — see level/logName for event_logs_query, name for service control, pid (required) for kill_process, path for file ops.')
     .optional(),
@@ -1925,7 +1925,7 @@ export const toolInputSchemas: Record<string, z.ZodType> = {
     configId: uuid.optional(),
     name: z.string().min(1).max(200).optional(),
     type: z.enum(['file', 'system_image', 'database', 'application']).optional(),
-    provider: z.enum(['s3', 'azure_blob', 'google_cloud', 'backblaze', 'local']).optional(),
+    provider: z.enum(['s3', 'local']).optional(),
     providerConfig: z.record(z.string(), z.unknown()).optional(),
     schedule: z.record(z.string(), z.unknown()).optional(),
     retention: z.record(z.string(), z.unknown()).optional(),

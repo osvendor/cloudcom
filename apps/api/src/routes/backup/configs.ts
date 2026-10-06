@@ -9,18 +9,19 @@ import { DeleteObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
 import { createGuardedS3Client } from '../../services/guardedS3Client';
 import { assertSafeUrl, SsrfBlockedError } from '../../services/urlSafety';
 import { selfHostAllowsPrivateNetwork } from '../../config/env';
-import { db } from '../../db';
+import { db, withDbTransaction } from '../../db';
+import { isPgForeignKeyViolation } from '../../utils/pgErrors';
 import { backupConfigs, backupSnapshots } from '../../db/schema';
 import { normalizeStorageIdentity } from '../../jobs/backupRetention';
 import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
+import { recordCredentialChange } from '../../services/backupStorageCredentialHistory';
 import { writeRouteAudit } from '../../services/auditEvents';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../../services/siteCeilingAccess';
 import {
   isRecord,
   isRedactedSecretMarker,
-  isSecretField,
-  MASKED_SECRET,
   preserveSecretFields,
+  redactProviderConfig,
   s3EndpointOriginChanged,
 } from '../../services/backupProviderConfigSecrets';
 import {
@@ -37,32 +38,19 @@ import { isHoldingOrg } from '../../services/unassignedPool/protectedOrg';
 import { PROTECTED_ORG_ERROR } from '../../services/unassignedPool/orgType';
 export const configsRoutes = new Hono();
 
-const configIdParamSchema = z.object({ id: z.string().guid() });
+const CONFIG_DELETE_BLOCKERS: Array<[constraint: string, what: string]> = [
+  ['backup_jobs_config_id_backup_configs_id_fk', 'backup job history'],
+  ['backup_snapshots_config_id_backup_configs_id_fk', 'snapshots'],
+  ['backup_policies_config_id_backup_configs_id_fk', 'backup policies'],
+];
 
-type JsonRecord = Record<string, unknown>;
-
-function redactProviderConfig(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(redactProviderConfig);
-  }
-  if (!isRecord(value)) {
-    return value;
-  }
-
-  const redacted: JsonRecord = {};
-  for (const [key, nestedValue] of Object.entries(value)) {
-    if (isSecretField(key)) {
-      redacted[key] = {
-        redacted: true,
-        hasSecret: nestedValue !== null && nestedValue !== undefined && nestedValue !== '',
-        masked: MASKED_SECRET,
-      };
-    } else {
-      redacted[key] = redactProviderConfig(nestedValue);
-    }
-  }
-  return redacted;
+function describeConfigDeleteBlocker(err: unknown): string {
+  const hit = CONFIG_DELETE_BLOCKERS.find(([constraint]) => isPgForeignKeyViolation(err, constraint));
+  const what = hit ? hit[1] : 'other records (such as backup history, snapshots or policies)';
+  return `This destination can't be deleted because it still has ${what}. Disable it instead, or remove the dependent records first.`;
 }
+
+const configIdParamSchema = z.object({ id: z.string().guid() });
 
 function buildCapabilityState(
   checkedAt: string | null,
@@ -246,14 +234,15 @@ configsRoutes.post(
     // its previous default already cleared and no new one to replace it (the
     // org default is the destination every partner-wide backup resolves to).
     // The partial unique index on (org_id) WHERE is_default enforces at most one.
-    const [row] = await db.transaction(async (tx) => {
+    // The key record is written in the same transaction as the destination.
+    const [row] = await withDbTransaction(async () => {
       if (payload.isDefault === true) {
-        await tx
+        await db
           .update(backupConfigs)
           .set({ isDefault: false, updatedAt: now })
           .where(and(eq(backupConfigs.orgId, orgId), eq(backupConfigs.isDefault, true)));
       }
-      return tx
+      const inserted = await db
         .insert(backupConfigs)
         .values({
           orgId,
@@ -270,6 +259,17 @@ configsRoutes.post(
           updatedAt: now,
         })
         .returning();
+      const created = inserted[0];
+      if (created) {
+        // A key configured from now on has never been sent to a device.
+        await recordCredentialChange({
+          orgId,
+          configId: created.id,
+          previous: null,
+          next: { provider: created.provider, providerConfig: created.providerConfig },
+        });
+      }
+      return inserted;
     });
 
     if (!row) {
@@ -334,11 +334,14 @@ configsRoutes.patch(
     // org with NO default destination — and the org default is what every
     // partner-wide and profile-linked backup resolves to, so their scheduled
     // backups would start skipping with no obvious cause.
+    // Locked: the key change recorded below compares against exactly this
+    // state, and a concurrent change waits for this one to commit.
     const [current] = await db
       .select()
       .from(backupConfigs)
       .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
-      .limit(1);
+      .limit(1)
+      .for('update');
 
     if (!current) {
       return c.json({ error: 'Config not found' }, 404);
@@ -475,18 +478,30 @@ configsRoutes.patch(
     // Demote + promote atomically: the partial unique index on (org_id) WHERE
     // is_default allows at most one default, so a concurrent promote must not
     // see a half-applied swap.
-    const [row] = await db.transaction(async (tx) => {
+    // The key record is written in the same transaction as the change.
+    const [row] = await withDbTransaction(async () => {
       if (payload.isDefault === true) {
-        await tx
+        await db
           .update(backupConfigs)
           .set({ isDefault: false, updatedAt: new Date() })
           .where(and(eq(backupConfigs.orgId, orgId), eq(backupConfigs.isDefault, true)));
       }
-      return tx
+      const updated = await db
         .update(backupConfigs)
         .set(updateData)
         .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
         .returning();
+      const changed = updated[0];
+      if (changed && payload.details !== undefined) {
+        // A replaced key stays listed until there is evidence it was disabled.
+        await recordCredentialChange({
+          orgId,
+          configId: changed.id,
+          previous: { provider: current.provider, providerConfig: current.providerConfig },
+          next: { provider: changed.provider, providerConfig: changed.providerConfig },
+        });
+      }
+      return updated;
     });
 
     if (!row) {
@@ -539,10 +554,42 @@ configsRoutes.delete(
   }
 
   const { id: configId } = c.req.valid('param');
-  const [deleted] = await db
-    .delete(backupConfigs)
+  // Locked so the first-start key recording (services/backupStorageCredentialHistory.ts)
+  // and this deletion see the destination one after the other.
+  const [existing] = await db
+    .select()
+    .from(backupConfigs)
     .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
-    .returning();
+    .limit(1)
+    .for('update');
+  if (!existing) {
+    return c.json({ error: 'Config not found' }, 404);
+  }
+  let deleted: typeof existing | undefined;
+  try {
+    [deleted] = await withDbTransaction(async () => {
+      // The destination's key stays listed (with its settings sealed, so it can
+      // still be checked) until there is evidence it was disabled.
+      await recordCredentialChange({
+        orgId,
+        configId: existing.id,
+        previous: { provider: existing.provider, providerConfig: existing.providerConfig },
+        next: null,
+      });
+      return db
+        .delete(backupConfigs)
+        .where(and(eq(backupConfigs.id, configId), eq(backupConfigs.orgId, orgId)))
+        .returning();
+    });
+  } catch (err) {
+    // Jobs, snapshots and policies keep NO ACTION FKs to the destination:
+    // history (and the objects it tracks in storage) must not be silently
+    // destroyed. The savepoint above has rolled back, so nothing was recorded.
+    if (isPgForeignKeyViolation(err)) {
+      return c.json({ error: describeConfigDeleteBlocker(err) }, 409);
+    }
+    throw err;
+  }
 
   if (!deleted) {
     return c.json({ error: 'Config not found' }, 404);

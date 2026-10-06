@@ -79,8 +79,15 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   { method: 'POST', pattern: /^\/api\/v1\/monitor-definitions\/convert-from-rule\/[^/]+\/?$/ },
   // Partner-initiated "Send payment link" — createInvoicePayLink.
   { method: 'POST', pattern: /^\/api\/v1\/invoices\/[^/]+\/pay-link\/?$/ },
+  // Public bearer-link payment delegates to the same short-transaction producer.
+  { method: 'POST', pattern: /^\/api\/v1\/invoices\/public\/[^/]+\/pay\/?$/ },
   // Customer-portal "Pay invoice online".
   { method: 'POST', pattern: /^\/api\/v1\/portal\/invoices\/[^/]+\/pay\/?$/ },
+  // Customer-portal logout. The handler's only database work is the durable
+  // signed-out record, which must commit in its own system transaction before
+  // the response; under the portal request transaction that write would take a
+  // second pooled connection while the first sat idle (the #6671 double-hold).
+  { method: 'POST', pattern: /^\/api\/v1\/portal\/auth\/logout\/?$/ },
   // Customer-portal "Pay quote" — createQuotePayLink → createInvoicePayLink →
   // checkout.sessions.create. Same shape as the invoice pay route; it was missed
   // when the route shipped, so the portal request tx was pinned across Stripe
@@ -312,6 +319,11 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   // withAuthDbAccessContext block and dispatch strictly after it commits.
   { method: 'POST', pattern: /^\/api\/v1\/backup\/mssql\/backup\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/backup\/hyperv\/backup\/?$/ },
+  // Checking a replaced storage key (routes/backup/storageCredentials.ts)
+  // calls the storage provider with that key, against a TENANT-CONTROLLED
+  // endpoint. The handler reads and records in short withAuthDbAccessContext
+  // blocks and makes the storage call with no context held.
+  { method: 'POST', pattern: /^\/api\/v1\/backup\/storage-credentials\/[^/]+\/check\/?$/ },
   // PSA connection "Test connection" — constructs a real PSA adapter and calls
   // the remote PSA API (psaFetch, 20s timeout) against a TENANT-CONTROLLED
   // baseUrl; a blackholed host would otherwise pin a pooled connection
@@ -500,6 +512,19 @@ const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
   { method: 'POST', pattern: /^\/api\/v1\/ai\/script-builder\/sessions\/[^/]+\/messages\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/client-ai\/sessions\/[^/]+\/messages\/?$/ },
   { method: 'POST', pattern: /^\/api\/v1\/helper\/chat\/sessions\/[^/]+\/messages\/?$/ },
+  // AI model registry W05 (#7603, D12): the continuation route makes a
+  // provider call (the summary) and takes/settles a budget reservation in
+  // their own system transactions; it must not hold the request's connection
+  // across any of them (#1105). It reads the owner-bound source session and
+  // writes the new session in two short withAuthDbAccessContext phases.
+  { method: 'POST', pattern: /^\/api\/v1\/ai\/sessions\/[^/]+\/continue\/?$/ },
+  // AI model registry W05 (#7603): the chat / agent model pickers judge every
+  // permitted offering through the candidate loader, which opens its own short
+  // system transactions (up to the 200-candidate cap). Under the ambient
+  // request transaction each would hold a second pooled connection (#1105 /
+  // #2417). The handler reads the owner-bound session in one short
+  // withAuthDbAccessContext and runs the loader reads with no context held.
+  { method: 'GET', pattern: /^\/api\/v1\/ai\/models\/choices\/(chat|ai-agents)\/?$/ },
 ];
 
 /**

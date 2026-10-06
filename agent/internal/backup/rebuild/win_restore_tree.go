@@ -100,7 +100,17 @@ func winRestoreTree(ctx context.Context, r *run) error {
 	if err := os.MkdirAll(workRoot, 0o700); err != nil {
 		return fmt.Errorf("create restore work root: %w", err)
 	}
-	res, err := backup.RestoreFromSnapshotContext(ctx, r.opts.Provider, backup.RestoreConfig{SnapshotID: r.opts.SnapshotID, TargetPath: r.rootVolume, WorkRoot: workRoot}, func(_ string, cur, total int64, msg string) {
+	res, err := restoreSnapshotFiles(ctx, r.opts.Provider, backup.RestoreConfig{
+		SnapshotID: r.opts.SnapshotID, TargetPath: r.rootVolume, WorkRoot: workRoot, Integrity: r.opts.Integrity,
+		// The restored tree becomes the machine the recorded principals
+		// belong to; the recovery environment running this recognises none
+		// of them.
+		SecurityDescriptorsAsCaptured: true,
+		// Junctions (#7325) must resolve on the rebuilt machine, whose
+		// root is C: again once it boots, not on the recovery-time volume
+		// path the restore writes through.
+		JunctionTargetsAsCaptured: true,
+	}, func(_ string, cur, total int64, msg string) {
 		r.progress(PhaseRestore, msg, cur, total)
 	})
 	if err != nil {

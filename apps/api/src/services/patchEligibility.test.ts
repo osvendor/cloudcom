@@ -37,7 +37,7 @@ vi.mock('../db/schema', () => ({
 }));
 
 vi.mock('./featureConfigResolver', () => ({
-  resolvePatchConfigDetailsForDevice: vi.fn(),
+  resolvePatchConfigPolicyForDevice: vi.fn(),
 }));
 vi.mock('./configPolicyPatching', () => ({
   loadPolicyLocalPatchConfig: vi.fn(),
@@ -45,7 +45,7 @@ vi.mock('./configPolicyPatching', () => ({
 vi.mock('./sentry', () => ({ captureException: vi.fn() }));
 
 import { db } from '../db';
-import { resolvePatchConfigDetailsForDevice } from './featureConfigResolver';
+import { resolvePatchConfigPolicyForDevice } from './featureConfigResolver';
 import { loadPolicyLocalPatchConfig } from './configPolicyPatching';
 import { captureException } from './sentry';
 import type { ApprovalEvaluationConfig } from './patchApprovalEvaluator';
@@ -107,7 +107,7 @@ const ringConfig = (o: Partial<ApprovalEvaluationConfig> = {}): ApprovalEvaluati
 
 beforeEach(() => {
   vi.mocked(db.select).mockReset();
-  vi.mocked(resolvePatchConfigDetailsForDevice).mockReset();
+  vi.mocked(resolvePatchConfigPolicyForDevice).mockReset();
   vi.mocked(loadPolicyLocalPatchConfig).mockReset();
 });
 
@@ -140,7 +140,9 @@ describe('evaluatePatchInstallEligibility — the decision, with a reason for ev
     const releasedTwoDaysAgo = new Date(Date.now() - 2 * 86_400_000).toISOString();
     mockEvaluatorReads([row({ patchId: P1, releaseDate: releasedTwoDaysAgo })], []);
     const held = await evaluatePatchInstallEligibility({ deviceId: DEV, orgId: ORG, config });
-    expect(held.ineligible).toEqual([{ patchId: P1, reason: 'held_by_deferral' }]);
+    // #7625: the deferral denial carries when the window ends (release + 7 days).
+    const sevenDaysAfterRelease = new Date(new Date(releasedTwoDaysAgo).getTime() + 7 * 86_400_000).toISOString();
+    expect(held.ineligible).toEqual([{ patchId: P1, reason: 'held_by_deferral', holdUntil: sevenDaysAfterRelease }]);
 
     const releasedTenDaysAgo = new Date(Date.now() - 10 * 86_400_000).toISOString();
     vi.mocked(db.select).mockReset();
@@ -155,9 +157,12 @@ describe('evaluatePatchInstallEligibility — the decision, with a reason for ev
       sources: ['os', 'third_party'],
       autoApprove: { enabled: true, severities: ['critical'], thirdPartyApps: true, deferralDays: 7 },
     });
-    mockEvaluatorReads([row({ patchId: P1, source: 'third_party', releaseDate: null, firstSeenAt: new Date(Date.now() - 2 * 86_400_000) })], []);
+    const firstSeen = new Date(Date.now() - 2 * 86_400_000);
+    mockEvaluatorReads([row({ patchId: P1, source: 'third_party', releaseDate: null, firstSeenAt: firstSeen })], []);
     const held = await evaluatePatchInstallEligibility({ deviceId: DEV, orgId: ORG, config });
-    expect(held.ineligible).toEqual([{ patchId: P1, reason: 'held_by_deferral' }]);
+    expect(held.ineligible).toEqual([{
+      patchId: P1, reason: 'held_by_deferral', holdUntil: new Date(firstSeen.getTime() + 7 * 86_400_000).toISOString(),
+    }]);
 
     vi.mocked(db.select).mockReset();
     mockEvaluatorReads([row({ patchId: P1, source: 'third_party', releaseDate: null, firstSeenAt: new Date(Date.now() - 10 * 86_400_000) })], []);
@@ -170,7 +175,8 @@ describe('evaluatePatchInstallEligibility — the decision, with a reason for ev
     mockEvaluatorReads([row({ patchId: P1, releaseDate: null, firstSeenAt: null })], []);
     const res = await evaluatePatchInstallEligibility({ deviceId: DEV, orgId: ORG, config });
     expect(res.eligible).toEqual([]);
-    expect(res.ineligible).toEqual([{ patchId: P1, reason: 'held_by_deferral' }]);
+    // No usable age anchor: held, with no end date to report.
+    expect(res.ineligible).toEqual([{ patchId: P1, reason: 'held_by_deferral', holdUntil: null }]);
   });
 
   it('reports blocked_by_category for an excluded category and blocked_by_app_rule for a denied app', async () => {
@@ -320,12 +326,12 @@ describe('resolvePatchInstallEligibility — the live composition', () => {
     expect(res.eligible).toEqual([]);
     expect(res.ineligible).toEqual([{ patchId: P1, reason: 'device_not_in_org' }, { patchId: P2, reason: 'device_not_in_org' }]);
     expect(res.ringId).toBeNull();
-    expect(resolvePatchConfigDetailsForDevice).not.toHaveBeenCalled();
+    expect(resolvePatchConfigPolicyForDevice).not.toHaveBeenCalled();
   });
 
   it("resolves the device's effective ring live, reads its deferral window, and excludes superseded patches", async () => {
     mockDevice(true);
-    vi.mocked(resolvePatchConfigDetailsForDevice).mockResolvedValue({ configPolicyId: 'cp-1' } as never);
+    vi.mocked(resolvePatchConfigPolicyForDevice).mockResolvedValue({ configPolicyId: 'cp-1' } as never);
     vi.mocked(loadPolicyLocalPatchConfig).mockResolvedValue(policyLocal() as never);
     mockRingRow(30);
     mockEvaluatorReads([
@@ -336,7 +342,7 @@ describe('resolvePatchInstallEligibility — the live composition', () => {
     const res = await resolvePatchInstallEligibility({ deviceId: DEV, orgId: ORG, patchIds: [P1, P2, P3] });
     expect(res.ringId).toBe(RING);
     expect(res.ineligible).toEqual(expect.arrayContaining([
-      { patchId: P1, reason: 'held_by_deferral' },
+      { patchId: P1, reason: 'held_by_deferral', holdUntil: expect.any(String) },
       { patchId: P2, reason: 'superseded' },
     ]));
     expect(res.eligible.map((e) => e.patchId)).toEqual([P3]);
@@ -346,7 +352,7 @@ describe('resolvePatchInstallEligibility — the live composition', () => {
 
   it('with no patch policy at all, only a manual partner-wide approval can admit a patch', async () => {
     mockDevice(true);
-    vi.mocked(resolvePatchConfigDetailsForDevice).mockResolvedValue(null);
+    vi.mocked(resolvePatchConfigPolicyForDevice).mockResolvedValue(null);
     mockEvaluatorReads([row({ patchId: P1 }), row({ patchId: P2 })], [{ patchId: P1, status: 'approved', ringId: null }]);
     const res = await resolvePatchInstallEligibility({ deviceId: DEV, orgId: ORG });
     expect(res.ringId).toBeNull();
@@ -357,7 +363,7 @@ describe('resolvePatchInstallEligibility — the live composition', () => {
 
   it('fails CLOSED when the ring vanishes between resolution and the deferral read — no ring, loudly', async () => {
     mockDevice(true);
-    vi.mocked(resolvePatchConfigDetailsForDevice).mockResolvedValue({ configPolicyId: 'cp-1' } as never);
+    vi.mocked(resolvePatchConfigPolicyForDevice).mockResolvedValue({ configPolicyId: 'cp-1' } as never);
     vi.mocked(loadPolicyLocalPatchConfig).mockResolvedValue(policyLocal() as never);
     // The ring row read comes back empty (deleted mid-flight).
     vi.mocked(db.select).mockReturnValueOnce(chain('limit', []) as never);
@@ -375,7 +381,7 @@ describe('resolvePatchInstallEligibility — the live composition', () => {
 
   it('treats an invalid ring reference as no ring, keeping the policy sources/app rules', async () => {
     mockDevice(true);
-    vi.mocked(resolvePatchConfigDetailsForDevice).mockResolvedValue({ configPolicyId: 'cp-1' } as never);
+    vi.mocked(resolvePatchConfigPolicyForDevice).mockResolvedValue({ configPolicyId: 'cp-1' } as never);
     vi.mocked(loadPolicyLocalPatchConfig).mockResolvedValue(policyLocal({
       ring: { classification: 'missing_target', valid: false, ringId: null, ringName: null, categoryRules: [], categories: [], excludeCategories: [], autoApprove: {} },
     }) as never);

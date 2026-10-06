@@ -60,6 +60,7 @@
     "billing": "Faturalandırma",
     "organizations": "Organizasyonlar",
     "aiUsage": "Yapay Zeka Kullanımı",
+    "aiProvidersModels": "Yapay zeka sağlayıcıları ve modelleri",
     "scriptAuthoring": "Betik yazımı",
     "toolSources": "Araç Kaynakları",
     "aiAgents": "Yapay Zeka Aracıları",
@@ -105,7 +106,8 @@
     "securityScans": "IOC Taramaları",
     "system": "Sistem",
     "monitorConversion": "İzleyici Dönüşümü",
-    "timeSync": "Saat eşitleme"
+    "timeSync": "Saat eşitleme",
+    "aiModels": "Yapay zeka modelleri"
   },
   "documentTitles": {
     "dashboard": "Kontrol Paneli",
@@ -1426,6 +1428,7 @@
           "created": "Web kancası oluşturuldu",
           "disabled": "Web kancası devre dışı bırakıldı",
           "enabled": "Web kancası etkinleştirildi",
+          "testQueued": "Test teslimatı kuyruğa alındı",
           "updated": "Web kancası güncellendi"
         },
         "title": "Web kancaları"

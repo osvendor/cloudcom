@@ -60,6 +60,7 @@
     "billing": "Billing",
     "organizations": "Organizations",
     "aiUsage": "AI Usage",
+    "aiProvidersModels": "AI Providers & Models",
     "scriptAuthoring": "Script authoring",
     "toolSources": "Tool Sources",
     "aiAgents": "AI Agents",
@@ -105,7 +106,8 @@
     "securityScans": "IOC Scans",
     "system": "System",
     "monitorConversion": "Monitor Conversion",
-    "timeSync": "Time Sync"
+    "timeSync": "Time Sync",
+    "aiModels": "AI Models"
   },
   "documentTitles": {
     "dashboard": "Dashboard",
@@ -1426,6 +1428,7 @@
           "created": "Webhook created",
           "disabled": "Webhook disabled",
           "enabled": "Webhook enabled",
+          "testQueued": "Test delivery queued",
           "updated": "Webhook updated"
         },
         "title": "Webhooks"

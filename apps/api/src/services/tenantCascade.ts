@@ -291,6 +291,17 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'ai_budget_reservations',
   'ai_budgets',
   'ai_cost_usage',
+  // ai_invocations (AI model registry W02, #7600): shape 1, APPEND-ONLY
+  // (REVOKE UPDATE/DELETE from breeze_app + ai_invocations_append_only), so it
+  // is ALSO in AUDIT_ADMIN_REQUIRED_TABLES. Leaf: FK out to organizations only,
+  // no FKs in (provenance ids are snapshots).
+  'ai_invocations',
+  // ai_model_assignments (AI model registry W02, #7600): org_id XOR partner_id.
+  // Only ORG override rows are cascade participants; partner-wide rows have
+  // org_id NULL and go with the partner. FKs out only: organizations
+  // (cascade + a deferrable composite), partner_ai_models (partner axis, not in
+  // this list), partners. Nothing references it.
+  'ai_model_assignments',
   // AI Operator thin slice (#5205 W03, #5208). All three are Shape 1 with a
   // NOT NULL org_id, so all three are required here.
   //   - ai_operator_operations references action_intents and ai_agent_runs,
@@ -353,6 +364,13 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   // NULL for intent_id), so topologicalCascadeOrder()'s runtime pg_constraint
   // read is what actually orders the DELETE, not this list's alphabetization.
   'ai_unattended_exposure',
+  // ai_usage_charge_* (AI chargeback W10, #7608): shape 1. claims → charges is
+  // the only FK between them (claims first; NO ACTION, so the order matters);
+  // run_id is a snapshot id (no FK). Neither is append-only, so neither is in
+  // AUDIT_ADMIN_REQUIRED_TABLES.
+  'ai_usage_charge_claims',
+  'ai_usage_charge_runs',
+  'ai_usage_charges',
   'alert_correlation_groups',
   'alert_correlation_members',
   'alert_rules',
@@ -402,6 +420,9 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'backup_snapshot_id_reservations',
   'backup_snapshot_retirements',
   'backup_snapshots',
+  // Storage key history: config_id and verified_by_user_id are SET NULL, so
+  // position is determinism, not correctness.
+  'backup_storage_credential_history',
   // Multipart uploads of write-scoped storage sessions (FKs CASCADE).
   'backup_storage_session_uploads',
   // Brokered storage sessions: org_id denormalised from the executing device;
@@ -410,6 +431,9 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'backup_storage_sessions',
   'backup_verifications',
   'bare_metal_recoveries',
+  'billing_link_tokens',
+  'billing_notice_outbox',
+  'billing_payment_settings',
   'brain_device_context',
   'browser_extensions',
   'browser_policies',
@@ -574,6 +598,8 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'incident_evidence',
   'incidents',
   'installer_bootstrap_tokens',
+  'invoice_autopay_schedules',
+  'invoice_collection_attempts',
   'invoice_documents',
   // Same '_' < 's' prefix-extension trap: invoice_line_devices sorts BEFORE
   // invoice_lines. It is also the FK child, so children-before-parents and
@@ -659,6 +685,8 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'oauth_grants',
   'oauth_refresh_tokens',
   'onedrive_device_state',
+  'org_autopay_consents',
+  'org_autopay_enrollments',
   'org_billing_profile_assignments',
   // org_documents (service deliverables W03). Alphabetical slot only: the list
   // is STATIC and alphabetised (the contract test asserts exactly that), while
@@ -670,6 +698,7 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   // tenantCascade.integration.test.ts. The self-FK on supersedes_document_id is
   // ignored by that sort by design (one DELETE clears the whole org's rows).
   'org_documents',
+  'org_payment_methods',
   'org_ticket_settings',
   // organization_external_links (#3242): external-system linkage rows. The
   // composite FK to organizations (id, partner_id) carries ON DELETE CASCADE,
@@ -856,6 +885,10 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   // DELETE SET NULL. localeCompare sorts this BEFORE 'ticket_form_org_links'
   // ('e' < 'f').
   'ticket_email_links',
+  // ticket_external_refs (Partner API tickets): a ticket's id in
+  // an external PSA/ITSM, per service principal. FK child of tickets
+  // (ON DELETE CASCADE) with a denormalized org_id; also on both org movers.
+  'ticket_external_refs',
   // ticket_form_org_links (spec 2026-07-11): org allowlist for partner-wide
   // ticket_forms. Own org_id column is a direct FK to organizations (ON
   // DELETE CASCADE already clears rows on org delete; listed here anyway per
@@ -1208,6 +1241,7 @@ const ASSOCIATED_SYSTEM_SCOPED_TABLES: ReadonlyArray<{
  * grants so ordinary app paths can append/read but cannot mutate them.
  */
 const AUDIT_ADMIN_REQUIRED_TABLES: ReadonlySet<string> = new Set<string>([
+  'org_autopay_consents',
   'audit_logs',
   'audit_log_chain',
   'audit_chain_anchors',
@@ -1224,6 +1258,10 @@ const AUDIT_ADMIN_REQUIRED_TABLES: ReadonlySet<string> = new Set<string>([
   // (2026-10-26-160000), so erasure has to run as breeze_audit_admin with
   // breeze.allow_audit_retention=1.
   'ai_operator_task_events',
+  // Append-only AI invocation ledger: REVOKE UPDATE/DELETE from breeze_app plus
+  // ai_invocations_append_only() (2026-11-14-100300, #7600 W02), so erasure has
+  // to run as breeze_audit_admin with breeze.allow_audit_retention=1.
+  'ai_invocations',
 ]);
 
 interface FkEdge {

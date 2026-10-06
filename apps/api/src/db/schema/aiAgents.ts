@@ -2,10 +2,12 @@ import { sql } from 'drizzle-orm';
 import {
   bigint,
   boolean,
+  foreignKey,
   index,
   integer,
   jsonb,
   pgTable,
+  smallint,
   text,
   timestamp,
   unique,
@@ -29,6 +31,7 @@ import type {
 } from '@breeze/shared';
 import { alertCorrelationGroups, alerts } from './alerts';
 import { aiSessions } from './ai';
+import { partnerAiModels } from './aiModelRegistry';
 import { aiAgentSchedules } from './aiAgentSchedules';
 import { devices } from './devices';
 import { metricAnomalyIncidents } from './metricAnomalyIncidents';
@@ -51,6 +54,10 @@ export const aiAgents = pgTable('ai_agents', {
   enabled: boolean('enabled').notNull().default(false),
   mode: text('mode').$type<AiAgentMode>().notNull().default('off'),
   model: varchar('model', { length: 100 }),
+  // AI model registry W02 (#7600): the offering this policy is bound to
+  // (backfilled from `model` by the boot reconcile; runs read `model` until W03).
+  offeringId: uuid('offering_id'),
+  offeringPartnerId: uuid('offering_partner_id'),
   toolAllowlist: jsonb('tool_allowlist').$type<string[]>().notNull().default([]),
   protectedResources: jsonb('protected_resources').$type<Partial<AiAgentProtectedResources>>().notNull().default({}),
   limits: jsonb('limits').$type<Partial<AiAgentLimits>>().notNull().default({}),
@@ -76,6 +83,17 @@ export const aiAgents = pgTable('ai_agents', {
     .where(sql`${table.disabledAt} IS NULL`),
   partnerIdx: index('ai_agents_partner_id_idx').on(table.partnerId),
   orgIdx: index('ai_agents_org_id_idx').on(table.orgId),
+  offeringFk: foreignKey({
+    columns: [table.offeringId, table.offeringPartnerId],
+    foreignColumns: [partnerAiModels.id, partnerAiModels.partnerId],
+    name: 'ai_agents_offering_fk',
+  }).onDelete('set null'),
+  offeringOrgPartnerFk: foreignKey({
+    columns: [table.orgId, table.offeringPartnerId],
+    foreignColumns: [organizations.id, organizations.partnerId],
+    name: 'ai_agents_offering_org_partner_fk',
+  }),
+  offeringIdx: index('ai_agents_offering_idx').on(table.offeringId).where(sql`${table.offeringId} IS NOT NULL`),
 }));
 
 // Ledger (spec §4.2). org_id is ALWAYS the target org (the device's org), even
@@ -185,6 +203,18 @@ export const aiAgentRuns = pgTable('ai_agent_runs', {
   // `analysis`-profile run — `{ handles, deviceIds, region }`. NULL for every
   // other profile. Read DEFENSIVELY (jsonb has no compile-time shape).
   stagedInputs: jsonb('staged_inputs').$type<AiAgentRunStagedInputs>(),
+  /** AI model registry W03 (#7601): funding of the offering resolved at admission. NULL = admitted before W03. */
+  fundingSource: text('funding_source').$type<'platform' | 'partner_key'>(),
+  /** W03 (review finding 6): the offering admission resolved; the run dispatches this one or is blocked. No FK (provenance id). */
+  admittedOfferingId: uuid('admitted_offering_id'),
+  /** W09 (#7607): the offering that served the run's model tokens when it was a failover hop. */
+  servedOfferingId: uuid('served_offering_id'),
+  /** W09: that hop's funding. Sandbox compute stays on `fundingSource` (D7). */
+  servedFundingSource: text('served_funding_source').$type<'platform' | 'partner_key'>(),
+  /** W09: the hop index; a re-driven run resumes on this hop's reservation key. */
+  servedFailoverHop: smallint('served_failover_hop'),
+  /** W09: why it failed over; restores the ledger provenance on a re-driven run. */
+  servedFailoverCause: text('served_failover_cause'),
 }, (table) => ({
   // Tenant-scoped (see 2026-09-02-ai-agents.sql): a global unique on
   // dedupe_key is enforced below RLS and leaks cross-tenant existence.

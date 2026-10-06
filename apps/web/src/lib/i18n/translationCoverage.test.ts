@@ -88,6 +88,9 @@ const namespaceDuplicateBaselines = {
     // errors namespace (Task 3 of #3859): pt-BR fully translated, no cognates.
     // Wave E2b (DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND, PATH_CONFLICT,
     // AGENT_COMMAND_REJECTED) translated too — still 0 cognates.
+    // Wave E2c (SCHEME_NOT_ALLOWED, INVALID_CUSTOM_FIELD_VALUE, RACE_LOST,
+    // RE_ENROLLMENT_REQUIRED, SOFTWARE_INVENTORY_LOCK_TIMEOUT) translated too — still
+    // 0 cognates.
     'errors.json': 0,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +1 W04 (#5654): legacy.columns.script — "Script" is the identical loanword in pt-BR.
@@ -155,7 +158,8 @@ const namespaceDuplicateBaselines = {
     // a sample display name. Localising them would change the protected-literal
     // occurrence count that localeParity.test.ts:513 pins against English.
     // +1: emailTemplates.variables.total — "Total" is spelled identically in pt-BR.
-    'settings.json': 129,
+    // AI model registry W04 (#7602) aiModels.*: cognates/loanwords (Chat, Helper, Endpoint, Status, Anthropic names, interpolation-only labels) — reviewed.
+    'settings.json': 133,
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     // +1: ticketWorkbench.invoice.missingRateEntry "{{description}} — {{hours}} h" is two
@@ -166,7 +170,8 @@ const namespaceDuplicateBaselines = {
     'toolSources.json': 1,
     // Topology (#5997): 'Site' is the identical pt-BR cognate.
     // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
-    'topology.json': 2,
+    // +2 (grouped overview): grouped.mac 'MAC' and grouped.gateway 'Gateway' are identical pt-BR cognates/acronyms.
+    'topology.json': 4,
     // +1 (#2262 softwareGroupTable devices-affected rework): cves_one/cves_other
     // ('{{count}} CVE'/'{{count}} CVEs') keep the acronym untranslated, same as
     // the existing CVEs-namespace duplicates above.
@@ -246,7 +251,10 @@ const namespaceDuplicateBaselines = {
     // added as English placeholders, same as the rest of this namespace.
     // +5 (Part of #3859, Wave E2b): DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND,
     // PATH_CONFLICT and AGENT_COMMAND_REJECTED added as English placeholders too.
-    'errors.json': 16,
+    // +5 (Part of #3859, Wave E2c): SCHEME_NOT_ALLOWED, INVALID_CUSTOM_FIELD_VALUE,
+    // RACE_LOST, RE_ENROLLMENT_REQUIRED and SOFTWARE_INVENTORY_LOCK_TIMEOUT added as
+    // English placeholders too.
+    'errors.json': 21,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +1 W04 (#5654): legacy.columns.script — "Script" is the identical loanword in es-419.
     'fleetDesign.json': 2,
@@ -306,7 +314,8 @@ const namespaceDuplicateBaselines = {
     // a sample display name. Localising them would change the protected-literal
     // occurrence count that localeParity.test.ts:513 pins against English.
     // +1: emailTemplates.variables.total — "Total" is spelled identically in es-419.
-    'settings.json': 131,
+    // AI model registry W04 (#7602) aiModels.*: cognates/loanwords (Chat, Helper, Endpoint, Status, Anthropic names, interpolation-only labels) — reviewed.
+    'settings.json': 135,
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     // +1: ticketWorkbench.invoice.missingRateEntry "{{description}} — {{hours}} h" is two
@@ -314,7 +323,8 @@ const namespaceDuplicateBaselines = {
     'tickets.json': 15,
     'toolSources.json': 1,
     // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
-    'topology.json': 1,
+    // +1 (grouped overview): grouped.mac 'MAC' is an identical es-419 acronym.
+    'topology.json': 2,
     // +1 (#2262): softwareGroupTable.cves_one/_other keep 'CVE'/'CVEs' untranslated.
     'vulnerabilities.json': 17,
   },
@@ -322,7 +332,9 @@ const namespaceDuplicateBaselines = {
     // +7: llmProviderCatalog admin UI (#3922 W1) — "Slug", "Actions", "Notes"
     // are identical cognates in fr-FR; the "openrouter"/"OpenRouter" example
     // values and the example base URL are literal placeholders, not wording.
-    'admin.json': 34,
+    // W01 #7599 admin.aiModels.*: +3 identical cognates (Actions, Budget, Standard).
+    // #7609 admin.aiModels.variants.*: +3 identical cognates (Conversations, Candidate, Active).
+    'admin.json': 40,
     'ai.json': 9,
     // +3 W07 (#5212, AI Operator task detail): originKind "ticket"/"chat" and
     // waitReason "information" are identical cognates in fr-FR.
@@ -400,7 +412,10 @@ const namespaceDuplicateBaselines = {
     // added as English placeholders, same as the rest of this namespace.
     // +5 (Part of #3859, Wave E2b): DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND,
     // PATH_CONFLICT and AGENT_COMMAND_REJECTED added as English placeholders too.
-    'errors.json': 16,
+    // +5 (Part of #3859, Wave E2c): SCHEME_NOT_ALLOWED, INVALID_CUSTOM_FIELD_VALUE,
+    // RACE_LOST, RE_ENROLLMENT_REQUIRED and SOFTWARE_INVENTORY_LOCK_TIMEOUT added as
+    // English placeholders too.
+    'errors.json': 21,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +2 W04 (#5654): legacy.columns.script — "Script" — and legacy.columns.notes —
     // "Notes" — both spell identically in fr-FR.
@@ -479,7 +494,10 @@ const namespaceDuplicateBaselines = {
     // +1 W01 settings consolidation (#6224): partnerSettingsPage.tabs.modules.label
     // — "Modules" spells identically in French.
     // +1: emailTemplates.variables.total — "Total" is spelled identically in French.
-    'settings.json': 178,
+    // AI model registry W04 (#7602) aiModels.*: cognates/loanwords (Chat, Helper, Endpoint, Status, Anthropic names, interpolation-only labels) — reviewed.
+    // W04 Task 12 (#7602) fr-FR: aiModels.offering.speed.standard "Standard" is spelled identically (+1).
+    // #7609 aiModels.quality.columns.conversations: "Conversations" is the identical word in French.
+    'settings.json': 185,
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     // +1: ticketWorkbench.invoice.missingRateEntry "{{description}} — {{hours}} h" is two
@@ -489,7 +507,8 @@ const namespaceDuplicateBaselines = {
     // Topology (#5997): 'Configuration', 'Diagnostics', 'Site' and
     // targetFields.port 'Port' are identical fr-FR cognates.
     // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
-    'topology.json': 5,
+    // +2 (grouped overview): grouped.mac 'MAC' and grouped.type 'Type' are identical fr-FR cognates/acronyms.
+    'topology.json': 7,
     // +2 (#2262): softwareGroupTable.cves_one/_other keep 'CVE'/'CVEs' untranslated
     // (fr-FR's old table.cves was "CVE", not a duplicate of English "CVEs", so
     // both new plural forms are net-new duplicates here).
@@ -499,7 +518,9 @@ const namespaceDuplicateBaselines = {
     // +7: llmProviderCatalog admin UI (#3922 W1) — "Slug", "Actions", "Notes"
     // are identical cognates in fr-CA; the "openrouter"/"OpenRouter" example
     // values and the example base URL are literal placeholders, not wording.
-    'admin.json': 34,
+    // W01 #7599 admin.aiModels.*: +3 identical cognates (Actions, Budget, Standard).
+    // #7609 admin.aiModels.variants.*: +3 identical cognates (Conversations, Candidate, Active).
+    'admin.json': 40,
     'ai.json': 9,
     // +3 W07 (#5212, AI Operator task detail): originKind "ticket"/"chat" and
     // waitReason "information" are identical cognates in fr-CA.
@@ -571,7 +592,10 @@ const namespaceDuplicateBaselines = {
     // added as English placeholders, same as the rest of this namespace.
     // +5 (Part of #3859, Wave E2b): DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND,
     // PATH_CONFLICT and AGENT_COMMAND_REJECTED added as English placeholders too.
-    'errors.json': 16,
+    // +5 (Part of #3859, Wave E2c): SCHEME_NOT_ALLOWED, INVALID_CUSTOM_FIELD_VALUE,
+    // RACE_LOST, RE_ENROLLMENT_REQUIRED and SOFTWARE_INVENTORY_LOCK_TIMEOUT added as
+    // English placeholders too.
+    'errors.json': 21,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +2 W04 (#5654): legacy.columns.script — "Script" — and legacy.columns.notes —
     // "Notes" — both spell identically in fr-CA.
@@ -652,7 +676,10 @@ const namespaceDuplicateBaselines = {
     // +1 W01 settings consolidation (#6224): partnerSettingsPage.tabs.modules.label
     // — "Modules" spells identically in Canadian French too.
     // +1: emailTemplates.variables.total — "Total" is spelled identically in Canadian French.
-    'settings.json': 184,
+    // AI model registry W04 (#7602) aiModels.*: cognates/loanwords (Chat, Helper, Endpoint, Status, Anthropic names, interpolation-only labels) — reviewed.
+    // W04 Task 12 (#7602) fr-CA: aiModels.offering.speed.standard "Standard" is spelled identically (+1).
+    // #7609 aiModels.quality.columns.conversations: "Conversations" is the identical word in French.
+    'settings.json': 190,
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     // +1: ticketWorkbench.invoice.missingRateEntry "{{description}} — {{hours}} h" is two
@@ -662,7 +689,8 @@ const namespaceDuplicateBaselines = {
     // Topology (#5997): 'Configuration', 'Diagnostics', 'Site' and
     // targetFields.port 'Port' are identical fr-CA cognates.
     // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
-    'topology.json': 5,
+    // +2 (grouped overview): grouped.mac 'MAC' and grouped.type 'Type' are identical fr-CA cognates/acronyms.
+    'topology.json': 7,
     // +2 (#2262): softwareGroupTable.cves_one/_other keep 'CVE'/'CVEs' untranslated
     // (fr-CA's old table.cves was "CVE", not a duplicate of English "CVEs", so
     // both new plural forms are net-new duplicates here).
@@ -672,7 +700,8 @@ const namespaceDuplicateBaselines = {
     // +8: llmProviderCatalog admin UI (#3922 W1) — "Slug", "Name", "Status"
     // are identical cognates in de-DE; the "openrouter"/"OpenRouter" example
     // values and the example base URL are literal placeholders, not wording.
-    'admin.json': 31,
+    // W01 #7599 admin.aiModels.*: +4 identical cognates (Status, Budget, Frontier, Standard).
+    'admin.json': 35,
     'ai.json': 5,
     // +4 W07 (#5212, AI Operator task detail): originKind "ticket"/"sweep"/
     // "chat" and waitReason "information" are identical cognates in de-DE.
@@ -760,7 +789,10 @@ const namespaceDuplicateBaselines = {
     // added as English placeholders, same as the rest of this namespace.
     // +5 (Part of #3859, Wave E2b): DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND,
     // PATH_CONFLICT and AGENT_COMMAND_REJECTED added as English placeholders too.
-    'errors.json': 16,
+    // +5 (Part of #3859, Wave E2c): SCHEME_NOT_ALLOWED, INVALID_CUSTOM_FIELD_VALUE,
+    // RACE_LOST, RE_ENROLLMENT_REQUIRED and SOFTWARE_INVENTORY_LOCK_TIMEOUT added as
+    // English placeholders too.
+    'errors.json': 21,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     'fleetDesign.json': 1,
     // +1 (W03 #6011): backupProviders.cove is a protected proper noun pinned
@@ -823,7 +855,9 @@ const namespaceDuplicateBaselines = {
     // `identityDisplayNamePlaceholder` are sample values — a domain example and
     // a sample display name. Localising them would change the protected-literal
     // occurrence count that localeParity.test.ts:513 pins against English.
-    'settings.json': 191,
+    // AI model registry W04 (#7602) aiModels.*: cognates/loanwords (Chat, Helper, Endpoint, Status, Anthropic names, interpolation-only labels) — reviewed.
+    // W04 Task 12 (#7602) de-DE: aiModels.models.details "Details" and offering.speed.standard "Standard" are spelled identically (+2).
+    'settings.json': 200,
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     // +1: ticketWorkbench.invoice.missingRateEntry "{{description}} — {{hours}} h" is two
@@ -833,7 +867,8 @@ const namespaceDuplicateBaselines = {
     // Topology (#5997): 'Name', 'Revision' and targetFields.hostname/port
     // ('Hostname'/'Port') are identical de-DE cognates.
     // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
-    'topology.json': 5,
+    // +2 (grouped overview): grouped.mac 'MAC' and grouped.gateway 'Gateway' are identical de-DE cognates/acronyms.
+    'topology.json': 7,
     // +1 (#2262): softwareGroupTable.cves_one/_other keep 'CVE'/'CVEs' untranslated.
     'vulnerabilities.json': 21,
   },
@@ -841,7 +876,9 @@ const namespaceDuplicateBaselines = {
     // +7: llmProviderCatalog admin UI (#3922 W1) — "Slug", "Input", "Output"
     // are identical cognates in it-IT; the "openrouter"/"OpenRouter" example
     // values and the example base URL are literal placeholders, not wording.
-    'admin.json': 38,
+    // W01 #7599 admin.aiModels.*: +5 identical cognates (Budget, Standard, Input, Output,
+    // "Input / output per MTok"; "No" duplicates an existing counted string).
+    'admin.json': 43,
     'ai.json': 12,
     // +2 W07 (#5212, AI Operator task detail): originKind "ticket"/"chat" are
     // identical cognates in it-IT.
@@ -897,7 +934,10 @@ const namespaceDuplicateBaselines = {
     // added as English placeholders, same as the rest of this namespace.
     // +5 (Part of #3859, Wave E2b): DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND,
     // PATH_CONFLICT and AGENT_COMMAND_REJECTED added as English placeholders too.
-    'errors.json': 16,
+    // +5 (Part of #3859, Wave E2c): SCHEME_NOT_ALLOWED, INVALID_CUSTOM_FIELD_VALUE,
+    // RACE_LOST, RE_ENROLLMENT_REQUIRED and SOFTWARE_INVENTORY_LOCK_TIMEOUT added as
+    // English placeholders too.
+    'errors.json': 21,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     // +1 W04 (#5654): legacy.columns.script — "Script" is the identical loanword in it-IT.
     'fleetDesign.json': 2,
@@ -952,7 +992,9 @@ const namespaceDuplicateBaselines = {
     // +1 W01 settings consolidation (#6224): ticketingSettingsTabs.email —
     // "Email" is the standard loanword in it-IT technical UI (same word is
     // already used for inboundEmail elsewhere in this file).
-    'settings.json': 171,
+    // AI model registry W04 (#7602) aiModels.*: cognates/loanwords (Chat, Helper, Endpoint, Status, Anthropic names, interpolation-only labels) — reviewed.
+    // W04 Task 12 (#7602) it-IT: aiModels.offering.prices.input/output ("Input"/"Output") and speed.standard "Standard" are spelled identically (+3).
+    'settings.json': 178,
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     // +1: ticketWorkbench.invoice.missingRateEntry "{{description}} — {{hours}} h" is two
@@ -960,7 +1002,8 @@ const namespaceDuplicateBaselines = {
     'tickets.json': 8,
     'toolSources.json': 1,
     // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
-    'topology.json': 1,
+    // +2 (grouped overview): grouped.mac 'MAC' and grouped.gateway 'Gateway' are identical it-IT cognates/acronyms.
+    'topology.json': 3,
     // +1 (#2262): softwareGroupTable.cves_one keeps 'CVE' untranslated (cves_other
     // is 'CVE' too, since Italian does not inflect the acronym).
     'vulnerabilities.json': 18,
@@ -1017,7 +1060,10 @@ const namespaceDuplicateBaselines = {
     // added as English placeholders, same as the rest of this namespace.
     // +5 (Part of #3859, Wave E2b): DEVICE_OFFLINE, AGENT_TIMEOUT, PATH_NOT_FOUND,
     // PATH_CONFLICT and AGENT_COMMAND_REJECTED added as English placeholders too.
-    'errors.json': 16,
+    // +5 (Part of #3859, Wave E2c): SCHEME_NOT_ALLOWED, INVALID_CUSTOM_FIELD_VALUE,
+    // RACE_LOST, RE_ENROLLMENT_REQUIRED and SOFTWARE_INVENTORY_LOCK_TIMEOUT added as
+    // English placeholders too.
+    'errors.json': 21,
     // +1: roleCorrectionLabel is pure interpolation ("{{from}} → {{to}}"), no wording to translate.
     'fleetDesign.json': 1,
     // +2 (W03 #6011): backupProviders.cove and backupProviders.namePlaceholder
@@ -1059,14 +1105,17 @@ const namespaceDuplicateBaselines = {
     // `identityDisplayNamePlaceholder` are sample values — a domain example and
     // a sample display name. Localising them would change the protected-literal
     // occurrence count that localeParity.test.ts:513 pins against English.
-    'settings.json': 72,
+    // AI model registry W04 (#7602) aiModels.*: cognates/loanwords (Chat, Helper, Endpoint, Status, Anthropic names, interpolation-only labels) — reviewed.
+    // #7609 aiModels.quality.groupBy.model: "Model" is the identical word in Turkish.
+    'settings.json': 75,
     // +1: ticketTimeBilling.noAmount — the em-dash placeholder for a row with
     // no amount is locale-invariant punctuation, identical in every catalog.
     'tickets.json': 12,
     'toolSources.json': 1,
     // Topology (#5997): 'Site' is the identical tr-TR cognate.
     // +1: topology `counts` "{{nodes}} · {{edges}}" only joins two translated plurals; locale-invariant.
-    'topology.json': 2,
+    // +1 (grouped overview): grouped.mac 'MAC' is an identical tr-TR acronym.
+    'topology.json': 3,
     // +1 (#2262): softwareGroupTable.cves_one keeps 'CVE' untranslated.
     'vulnerabilities.json': 12,
   },

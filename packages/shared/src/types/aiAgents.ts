@@ -22,8 +22,14 @@ export function minAgentMode(a: AiAgentMode, b: AiAgentMode): AiAgentMode {
   return AI_AGENT_MODE_RANK[a] <= AI_AGENT_MODE_RANK[b] ? a : b;
 }
 
+/**
+ * `blocked` (AI model registry W03): a terminal status for a run whose model
+ * was unavailable at dispatch (error_code `model_unavailable`) or that the
+ * model refused (`model_refused`, category in `outcome`). Neutral for the
+ * circuit breaker: an admin's model choice is not an agent fault.
+ */
 export const AI_AGENT_RUN_STATUSES = [
-  'queued', 'running', 'awaiting_approval', 'completed', 'failed', 'cancelled', 'expired', 'skipped',
+  'queued', 'running', 'awaiting_approval', 'completed', 'failed', 'cancelled', 'expired', 'skipped', 'blocked',
 ] as const;
 export type AiAgentRunStatus = (typeof AI_AGENT_RUN_STATUSES)[number];
 
@@ -551,6 +557,15 @@ export interface AiAgentPolicy {
   enabled: boolean;
   mode: AiAgentMode;
   model: string | null;
+  /**
+   * AI model registry W03: the registry offering the policy's `model` is bound
+   * to (`ai_agents.offering_id`, written at policy-write time). Org row's
+   * binding wins, else the partner baseline's; null = follow the `ai_agents`
+   * assignment. Optional because snapshots frozen before W03 lack it — read it
+   * as `?? null`. The run-time resolver re-checks it against the `ai_agents`
+   * permitted set, so it never widens what the org may use.
+   */
+  offeringId?: string | null;
   toolAllowlist: string[];
   protectedResources: AiAgentProtectedResources;
   limits: AiAgentLimits;
@@ -773,6 +788,12 @@ export interface AiAgentDto {
   enabled: boolean;
   mode: AiAgentMode;
   model: string | null;
+  /**
+   * AI model registry W05: the registry offering the policy model is bound to
+   * (`ai_agents.offering_id`); null = the agent follows the `ai_agents`
+   * assignment default. `model` is its provenance snapshot.
+   */
+  offeringId: string | null;
   orgId: string | null;
   partnerId: string | null;
   /** Derived from the owner columns; always consistent with them. */

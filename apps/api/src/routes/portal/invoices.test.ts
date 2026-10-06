@@ -1,3 +1,5 @@
+const reservation = vi.hoisted(() => ({ assert: vi.fn(), lock: vi.fn(), invoice: null as Record<string, unknown> | null }));
+vi.mock('../../services/autopay/reservation', () => ({ assertNoActiveCollection: reservation.assert, lockInvoiceForCollection: reservation.lock }));
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 import { db } from '../../db';
@@ -60,6 +62,8 @@ vi.mock('../../db', () => {
     for (const m of ['select', 'from', 'where', 'orderBy', 'limit', 'offset', 'for']) chain[m] = vi.fn(() => chain);
     (chain as { then: unknown }).then = (resolve: (v: unknown) => unknown) => {
       const rows = dbResults.shift() ?? [];
+      const first = rows[0];
+      if (first && typeof first === 'object' && 'currencyCode' in first && 'balance' in first) reservation.invoice = first as Record<string, unknown>;
       return Promise.resolve(rows).then(resolve);
     };
     (chain as { insert: unknown }).insert = vi.fn(() => ({
@@ -84,7 +88,8 @@ vi.mock('../../db', () => {
 // Stripe client + connect service mocks for the pay route.
 // Partner Stripe-key mocks for the pay route (API-key model — no Connect). The
 // pay route builds the partner's own client and charges directly on their account.
-const { sessionsCreateMock, getPartnerStripeClientMock } = vi.hoisted(() => ({
+const { sessionsCreateMock, getPartnerStripeClientMock, onlinePayMock } = vi.hoisted(() => ({
+  onlinePayMock: vi.fn(),
   sessionsCreateMock: vi.fn(),
   getPartnerStripeClientMock: vi.fn(),
 }));
@@ -93,6 +98,7 @@ vi.mock('../../services/partnerStripe', async (importOriginal) => {
   return {
     PartnerStripeError: actual.PartnerStripeError,
     getPartnerStripeClient: getPartnerStripeClientMock,
+    isPartnerOnlinePaymentAvailable: onlinePayMock,
   };
 });
 
@@ -103,6 +109,7 @@ const { settleCheckoutSessionMock, HeldCtxError } = vi.hoisted(() => ({
 }));
 vi.mock('../../services/stripeSettle', () => ({
   settleCheckoutSession: settleCheckoutSessionMock,
+  assertNoHeldDbContextForStripe: vi.fn(),
   HeldDbContextForStripeError: HeldCtxError,
 }));
 
@@ -151,7 +158,8 @@ function boundParams(node: unknown, out: unknown[] = [], seen = new Set<unknown>
 import { checkoutSessionExpiry } from '../../services/invoiceCheckout';
 
 describe('portal invoices routes', () => {
-  beforeEach(() => { vi.clearAllMocks(); dbResults.length = 0; insertValuesMock.mockReset(); });
+  beforeEach(() => {
+    reservation.invoice = null; reservation.assert.mockResolvedValue(undefined); reservation.lock.mockImplementation(async () => ({ invoice: reservation.invoice, reservedAmount: '0.00' })); vi.clearAllMocks(); dbResults.length = 0; insertValuesMock.mockReset(); onlinePayMock.mockResolvedValue(true); });
 
   it.each(['pay', 'settle'])('rejects cookie-authenticated POST /invoices/:id/%s without CSRF before side effects', async (action) => {
     const res = await app(ORG_ID, 'cookie').request(`/invoices/${INV_ID}/${action}`, {
@@ -166,6 +174,15 @@ describe('portal invoices routes', () => {
     expect(sessionsCreateMock).not.toHaveBeenCalled();
     expect(settleCheckoutSessionMock).not.toHaveBeenCalled();
   });
+
+it('portal pay returns 409 for a reservation before contacting Stripe', async () => {
+  dbResults.push([{ id: INV_ID, orgId: ORG_ID, partnerId: 'p1', status: 'sent', currencyCode: 'USD', balance: '100.00' }]);
+  reservation.assert.mockRejectedValueOnce(new InvoiceServiceError('A payment is already processing', 409, 'COLLECTION_IN_PROGRESS'));
+  const response = await app().request(`/invoices/${INV_ID}/pay`, { method: 'POST' });
+  expect(response.status).toBe(409);
+  expect(await response.json()).toMatchObject({ code: 'COLLECTION_IN_PROGRESS' });
+  expect(sessionsCreateMock).not.toHaveBeenCalled();
+});
 
   it('rejects a form-urlencoded settle body for bearer auth', async () => {
     const res = await app().request(`/invoices/${INV_ID}/settle`, {
@@ -211,6 +228,22 @@ describe('portal invoices routes', () => {
     expect(body.lines).toHaveLength(1);
     expect(getCustomerInvoiceMock).toHaveBeenCalledWith(INV_ID, ORG_ID);
     expect(markViewedMock).toHaveBeenCalledWith(INV_ID, ORG_ID);
+  });
+
+  it.each([[true], [false]])('GET /invoices/:id reports onlinePaymentAvailable=%s from the shared resolver (#7509)', async (available) => {
+    onlinePayMock.mockResolvedValue(available);
+    getCustomerInvoiceMock.mockResolvedValue({ partnerId: 'p1', invoice: { id: INV_ID, status: 'sent', invoiceNumber: 'INV-1' }, lines: [] });
+    const body = await (await app().request(`/invoices/${INV_ID}`, { method: 'GET' })).json();
+    expect(body.onlinePaymentAvailable).toBe(available);
+    expect(onlinePayMock).toHaveBeenCalledWith('p1');
+  });
+
+  it('GET /invoices/:id fails closed (200, unavailable) when the availability lookup throws (#7509)', async () => {
+    onlinePayMock.mockRejectedValue(new Error('db down'));
+    getCustomerInvoiceMock.mockResolvedValue({ partnerId: 'p1', invoice: { id: INV_ID, status: 'sent', invoiceNumber: 'INV-1' }, lines: [] });
+    const res = await app().request(`/invoices/${INV_ID}`, { method: 'GET' });
+    expect(res.status).toBe(200);
+    expect((await res.json()).onlinePaymentAvailable).toBe(false);
   });
 
   it('GET /invoices/:id serializes the exact safe line keyset even if the service row has internal fields', async () => {

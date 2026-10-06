@@ -57,8 +57,17 @@ describe('Compose never overrides the image-baked APP_VERSION (#7024)', () => {
     expect(api.slice(api.indexOf('    environment:'))).not.toMatch(/^\s+APP_VERSION:/m);
   });
 
-  it('the release workflow bakes the release version into the API image', () => {
-    expect(read('.github/workflows/release.yml')).toMatch(/^\s+APP_VERSION=\$\{\{ steps\.version\.outputs\.version \}\}\s*$/m);
-    expect(read('docker/Dockerfile.api')).toMatch(/^ENV APP_VERSION=\$\{APP_VERSION\}$/m);
+  it('the CloudCom candidate workflow bakes matching API and web versions', () => {
+    const workflow = read('.github/workflows/cloudcom-candidate.yml');
+    expect(workflow).toMatch(/^\s+- component: api\s*\n\s+dockerfile: apps\/api\/Dockerfile\s*$/m);
+    expect(workflow).toMatch(/^\s+- component: web\s*\n\s+dockerfile: apps\/web\/Dockerfile\s*$/m);
+    expect(workflow).toMatch(/^\s+BUILD_VERSION: \$\{\{ needs\.validate\.outputs\.build_version \}\}\s*$/m);
+    expect(workflow).toContain('api) args+=(--build-arg "APP_VERSION=$BUILD_VERSION" --build-arg "BREEZE_BINARIES_VERSION=$BINARIES_VERSION") ;;');
+    expect(workflow).toContain('web) args+=(--build-arg "PUBLIC_APP_VERSION=$BUILD_VERSION"');
+    expect(workflow).toMatch(/docker build[^\n]+--file "\$DOCKERFILE"[^\n]+"\$\{args\[@\]\}"/);
+    for (const dockerfile of ['apps/api/Dockerfile', 'docker/Dockerfile.api']) {
+      expect(read(dockerfile)).toMatch(/^ENV APP_VERSION=\$\{APP_VERSION\}$/m);
+    }
+    expect(read('apps/web/Dockerfile')).toMatch(/^ENV PUBLIC_APP_VERSION=\$\{PUBLIC_APP_VERSION\}$/m);
   });
 });

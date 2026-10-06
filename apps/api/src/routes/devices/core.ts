@@ -67,6 +67,7 @@ import {
 import { readPartnerRemoteAccessSettings } from '../../services/remoteAccessProviders';
 import { captureException } from '../../services/sentry';
 import type { InheritableRemoteAccessSettings } from '@breeze/shared';
+import { ERROR_CODES } from '@breeze/shared';
 import { hashEnrollmentKey } from '../../services/enrollmentKeySecurity';
 import {
   disconnectAgent,
@@ -452,6 +453,12 @@ export const CUSTOM_ORG_REWRITE_TABLES = [
   // moveOrg.ts also names ticket_checklist_items_ticket_org_fk in its
   // SET CONSTRAINTS … DEFERRED statement.
   'ticket_checklist_items',
+  // ticket_external_refs (Partner API tickets): rewritten through the
+  // tickets join, appended last to extend — not reorder — the shared lock
+  // order. Its composite (ticket_id, org_id) FK is DEFERRABLE INITIALLY
+  // IMMEDIATE, so moveDeviceOrgInTransaction.ts also names
+  // ticket_external_refs_ticket_org_fk in its SET CONSTRAINTS … DEFERRED.
+  'ticket_external_refs',
 ] as const;
 
 /**
@@ -1747,7 +1754,7 @@ coreRoutes.post(
         c,
       );
       return c.json(
-        { error: 'Remote-access launcher rejected by scheme policy', code: 'scheme_not_allowed' },
+        { error: 'Remote-access launcher rejected by scheme policy', code: ERROR_CODES.SCHEME_NOT_ALLOWED },
         422,
       );
     }
@@ -1875,7 +1882,7 @@ coreRoutes.patch(
         return c.json(
           {
             error: INVALID_CUSTOM_FIELD_VALUE_MESSAGE,
-            code: 'invalid-custom-field-value',
+            code: ERROR_CODES.INVALID_CUSTOM_FIELD_VALUE,
             fields: validation.rejected,
           },
           400,
@@ -2244,12 +2251,37 @@ coreRoutes.post(
     // must not be wedged by a race that lasts seconds — but reports
     // `uninstallAlreadyDispatched: true` so the caller can tell the user
     // plainly the machine may already be gone and will need a reinstall.
+    //
+    // Restore also admits the device against the partner device limit, the
+    // same admission enrollment and provisioning use, so it runs in a SYSTEM
+    // context: the partner row and the partner-wide count are invisible under
+    // the caller's tenant RLS. Authorization is unchanged and happened above,
+    // in the tenant context; the service refuses (STATE_CHANGED) if the locked
+    // row is no longer in the org and site that check approved.
+    // `runOutsideDbContext` is required, not an optimisation: inside the
+    // request's `withDbAccessContext` transaction a bare
+    // `withSystemDbAccessContext` joins that tenant transaction instead of
+    // escalating, and admission would then find no partner row.
     let result: Awaited<ReturnType<typeof restoreRemovedDevice>>;
     try {
-      result = await db.transaction((tx) => restoreRemovedDevice(tx, deviceId));
+      result = await runOutsideDbContext(() =>
+        withSystemDbAccessContext(
+          () => db.transaction((tx) =>
+            restoreRemovedDevice(tx, deviceId, { orgId: device.orgId, siteId: device.siteId }),
+          ),
+          'devices.restore',
+        ),
+      );
     } catch (err) {
       if (err instanceof DeviceLifecycleError) {
-        return c.json({ error: err.message, code: err.code }, err.status);
+        return c.json({ error: err.message, code: err.code, ...err.details }, err.status);
+      }
+      // 55P03: the partner-row and devices-row waits are both bounded (3s).
+      // Transient and retryable, the same answer permanent delete gives.
+      if (pgErrorCode(err) === '55P03') {
+        return c.json({
+          error: 'Device is busy: another operation is currently modifying it. Try again in a moment.',
+        }, 409);
       }
       throw err;
     }

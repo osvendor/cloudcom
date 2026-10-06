@@ -60,6 +60,7 @@
     "billing": "Abrechnung",
     "organizations": "Organisationen",
     "aiUsage": "KI-Nutzung",
+    "aiProvidersModels": "KI-Anbieter und -Modelle",
     "scriptAuthoring": "Skripterstellung",
     "toolSources": "Tool-Quellen",
     "aiAgents": "KI-Agenten",
@@ -105,7 +106,8 @@
     "securityScans": "IOC-Scans",
     "system": "System",
     "monitorConversion": "Monitor-Konvertierung",
-    "timeSync": "Zeitsynchronisierung"
+    "timeSync": "Zeitsynchronisierung",
+    "aiModels": "KI-Modelle"
   },
   "documentTitles": {
     "dashboard": "Dashboard",
@@ -1426,6 +1428,7 @@
           "created": "Webhook erstellt",
           "disabled": "Webhook deaktiviert",
           "enabled": "Webhook aktiviert",
+          "testQueued": "Testzustellung in die Warteschlange gestellt",
           "updated": "Webhook aktualisiert"
         },
         "title": "Webhooks"

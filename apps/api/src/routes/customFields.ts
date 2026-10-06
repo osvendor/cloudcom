@@ -53,7 +53,9 @@ const createCustomFieldSchema = z.object({
 
 const updateCustomFieldSchema = z.object({
   name: z.string().min(1).max(100).optional(),
-  options: customFieldOptionsSchema.optional(),
+  // Nullable for the same reason as create: the edit form sends
+  // options: null for non-Dropdown types (#7476).
+  options: customFieldOptionsSchema.nullable().optional(),
   required: z.boolean().optional(),
   defaultValue: z.unknown().optional(),
   deviceTypes: z.array(z.enum(['windows', 'macos', 'linux'])).nullable().optional(),
@@ -263,7 +265,16 @@ customFieldRoutes.get(
       .where(whereCondition)
       .orderBy(desc(customFieldDefinitions.createdAt));
 
-    let results = fields;
+    // #7572: alphabetical by display name for every consumer (settings page,
+    // device details, filters). Done in JS — Postgres collation is deployment-
+    // dependent. There is no explicit position column, so name is the sole key;
+    // fieldKey then id make the order deterministic for equal names.
+    let results = [...fields].sort(
+      (a, b) =>
+        a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true }) ||
+        a.fieldKey.localeCompare(b.fieldKey) ||
+        a.id.localeCompare(b.id)
+    );
     if (query.search) {
       const term = query.search.toLowerCase();
       results = results.filter((field) =>

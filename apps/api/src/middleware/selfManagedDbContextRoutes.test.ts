@@ -32,6 +32,10 @@ describe('isSelfManagedDbContextRoute', () => {
     ['get', '/api/v1/portal/network/overview'], // method is case-insensitive
     ['GET', '/api/v1/portal/network/assets'],
     ['GET', '/api/v1/portal/network/assets/'],
+    // Portal logout commits its durable signed-out record in its own system
+    // transaction; no portal request transaction may be held around it.
+    ['POST', '/api/v1/portal/auth/logout'],
+    ['POST', '/api/v1/portal/auth/logout/'],
     ['POST', '/api/v1/partner/stripe-connect/key'],
     ['POST', '/api/v1/partner/stripe-connect/key/'],
     ['GET', '/api/v1/partner/stripe-connect'],
@@ -262,6 +266,8 @@ describe('isSelfManagedDbContextRoute', () => {
     ['POST', '/api/v1/invoices//pay-link', 'empty id segment must not match'],
     ['POST', '/api/v1/portal/invoices/def-456/pay/confirm', 'deeper portal path must not match'],
     ['GET', '/api/v1/portal/invoices/def-456/settle', 'portal settle is POST-only'],
+    ['GET', '/api/v1/portal/auth/logout', 'portal logout is POST-only'],
+    ['POST', '/api/v1/portal/auth/login', 'portal login keeps its own handling'],
     ['POST', '/api/v1/portal/invoices//settle', 'empty id segment must not match'],
     ['GET', '/api/v1/portal/quotes/def-456/pay', 'portal quote pay is POST-only'],
     ['POST', '/api/v1/portal/quotes/def-456/accept', 'accept/decline are DB-only and keep the ambient org tx'],
@@ -599,4 +605,31 @@ it('self-manages the per-rule convert-to-monitor POST (its converter opens its o
   expect(isSelfManagedDbContextRoute('GET', `/api/v1/monitor-definitions/convert-from-rule/${rule}`)).toBe(false);
   expect(isSelfManagedDbContextRoute('POST', `/api/v1/monitor-definitions/convert-from-rule/${rule}/extra`)).toBe(false);
   expect(isSelfManagedDbContextRoute('POST', '/api/v1/monitor-definitions')).toBe(false);
+});
+
+// AI model registry W05 (#7603): the two model pickers run many short loader
+// transactions; they must not hold the request's connection meanwhile (#1105).
+it.each([
+  ['GET', '/api/v1/ai/models/choices/chat'],
+  ['GET', '/api/v1/ai/models/choices/chat/'],
+  ['GET', '/api/v1/ai/models/choices/ai-agents'],
+])('W05: %s %s manages its own DB context', (method, path) => {
+  expect(isSelfManagedDbContextRoute(method, path)).toBe(true);
+});
+it('W05: the W04 snapshot GET /ai/models and every sibling keep the request context', () => {
+  expect(isSelfManagedDbContextRoute('GET', '/api/v1/ai/models')).toBe(false);
+  expect(isSelfManagedDbContextRoute('GET', '/api/v1/ai/models/choices')).toBe(false);
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/ai/models/choices/chat')).toBe(false);
+  expect(isSelfManagedDbContextRoute('GET', '/api/v1/ai/models/choices/chat/extra')).toBe(false);
+  expect(isSelfManagedDbContextRoute('GET', '/api/v1/ai/models/offerings')).toBe(false);
+});
+
+// AI model registry W05 (#7603, D12): the continuation route makes a provider
+// call (the summary) and must not hold the request's connection across it.
+it('W05: the continuation route manages its own DB context (it makes a provider call)', () => {
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/ai/sessions/11111111-1111-1111-1111-111111111111/continue')).toBe(true);
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/ai/sessions/11111111-1111-1111-1111-111111111111/continue/')).toBe(true);
+  expect(isSelfManagedDbContextRoute('GET', '/api/v1/ai/sessions/11111111-1111-1111-1111-111111111111/continue')).toBe(false);
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/ai/sessions/11111111-1111-1111-1111-111111111111/continue/extra')).toBe(false);
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/ai/sessions//continue')).toBe(false);
 });

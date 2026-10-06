@@ -31,6 +31,8 @@ const mockResolveLiveSessionToolAuthority = vi.fn(async (session: any): Promise<
   auth: session.auth,
   toolAuth: session.toolAuth ?? session.auth,
 }));
+// W03: preflight resolves through the registry; these suites never reach it.
+vi.mock('./aiModels/sessionModel', () => ({ resolveSessionTurn: vi.fn() }));
 vi.mock('./aiSessionLiveAuthority', () => ({
   resolveLiveSessionToolAuthority: (...args: unknown[]) => (mockResolveLiveSessionToolAuthority as any)(...args),
 }));
@@ -75,11 +77,6 @@ vi.mock('./aiAgent', () => ({
   getSession: (...args: unknown[]) => mockGetSession(...args),
   buildSystemPrompt: (...args: unknown[]) => mockBuildSystemPrompt(...args),
   waitForApproval: vi.fn(),
-}));
-
-const mockResolveLlmConfigForOrg = vi.fn();
-vi.mock('./llm/llmConfigResolver', () => ({
-  resolveLlmConfigForOrg: (...args: unknown[]) => mockResolveLlmConfigForOrg(...args),
 }));
 
 const mockCheckAiRateLimit = vi.fn();

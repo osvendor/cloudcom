@@ -6,7 +6,9 @@ import { tenantExportRoutes } from './tenantExport';
 import { desktopFinalizationRoutes } from './desktopFinalization';
 import { exchangeRateAdminRoutes } from './exchangeRates';
 import { llmProviderCatalogAdminRoutes } from './llmProviderCatalog';
+import { aiModelsAdminRoutes } from './aiModels';
 import { aiKillStateAdminRoutes } from './aiKillState';
+import { aiPromptVariantAdminRoutes } from './aiPromptVariants';
 import { aiToolUsageAdminRoutes } from './aiToolUsage';
 import { trustAdminRoutes } from './trust';
 import { trustActionAdminRoutes } from './trustAct';
@@ -14,10 +16,12 @@ import { adminMonitorConversionRoutes } from './monitorConversion';
 import { adminSendingDomainsRoutes } from './sendingDomains';
 import { deprecationsAdminRoutes } from './deprecations';
 import { systemConnectionsAdminRoutes } from './systemConnections';
+import { adminAutopayRolloutRoutes } from './autopayRollout';
 
 export const adminRoutes = new Hono();
 
 adminRoutes.use('*', platformAdminMiddleware);
+adminRoutes.route('/', adminAutopayRolloutRoutes);
 adminRoutes.route('/', abuseRoutes);
 adminRoutes.route('/', trustAdminRoutes);
 adminRoutes.route('/', trustActionAdminRoutes);
@@ -33,6 +37,10 @@ adminRoutes.route('/desktop-finalizations', desktopFinalizationRoutes);
 // as tenant-erasure above and third_party_package_catalog).
 adminRoutes.route('/exchange-rates', exchangeRateAdminRoutes);
 adminRoutes.route('/llm-provider-catalog', llmProviderCatalogAdminRoutes);
+// AI model registry W01 (#7599): platform model catalog: prices, option
+// support, plan gate, prompt profile, platform offer/default. Global rows, so
+// platform-admin (gate above) + MFA on mutations, like the provider catalog.
+adminRoutes.route('/ai-models', aiModelsAdminRoutes);
 // Wave 6 PR 2 (#3828): the AI kill switch's authorized surface. Global row —
 // a flip stops unattended AI for every partner, hence platform-admin + MFA.
 // UI: apps/web AiKillSwitch.tsx at /admin/ai-kill-switch (#4208). Runbook
@@ -41,6 +49,10 @@ adminRoutes.route('/llm-provider-catalog', llmProviderCatalogAdminRoutes);
 adminRoutes.route('/ai-kill-state', aiKillStateAdminRoutes);
 // A-W01 (#6148): read-only cross-tenant AI tool-usage report.
 adminRoutes.route('/ai', aiToolUsageAdminRoutes);
+// AI model registry W11 (#7609): read-only, cross-tenant prompt variant
+// comparison (aggregates by variant only). UI: the Prompt variants card on
+// /admin/ai-models. Runbook: docs/deploy/ai-prompt-variants.md.
+adminRoutes.route('/ai', aiPromptVariantAdminRoutes);
 // Partner sending domains W03: cross-partner list plus the kill switch
 // (suspend / unsuspend / force-release, spec §9.1). Mounted UNDER the
 // platform-admin gate above; the router adds its own requireMfa() on each

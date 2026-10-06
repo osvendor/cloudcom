@@ -16,8 +16,9 @@
     "pin:github-actions": "node scripts/security/pin-github-actions.mjs",
     "test:override-floors": "node --test scripts/security/check-override-floors.test.mjs",
     "check:override-floors": "node scripts/security/check-override-floors.mjs",
+    "test:npm-audit-exceptions": "node --test scripts/security/check-npm-audit.test.mjs",
     "test:release-trust-allowlist": "node --test scripts/security/check-release-trust-allowlist.test.mjs",
-    "test:release-lineage": "node --test scripts/release/check-release-lineage.test.mjs scripts/release/release-image-manifest.test.mjs scripts/release/verify-release-images.test.mjs scripts/release/release-image-consumers.test.mjs scripts/check-migration-immutability.test.mjs",
+    "test:release-lineage": "node --test scripts/release/check-release-lineage.test.mjs scripts/release/release-image-manifest.test.mjs scripts/release/verify-release-images.test.mjs scripts/release/release-image-consumers.test.mjs scripts/release/notarize-submit.test.mjs scripts/check-migration-immutability.test.mjs",
     "check:release-trust-allowlist": "node scripts/security/check-release-trust-allowlist.mjs",
     "check:agent-mtls-edge-policy": "bash scripts/check-agent-mtls-edge-policy.sh",
     "check:agent-binary-signatures": "bash scripts/security/check-agent-binary-signatures.sh --source",
@@ -48,7 +49,7 @@
   "pnpm": {
     "overrides": {
       "adm-zip@<0.6.1": ">=0.6.1",
-      "axios@>=1.0.0 <1.15.2": ">=1.15.2",
+      "axios@>=1.0.0 <1.20.0": ">=1.20.0",
       "websocket-driver@<0.7.5": ">=0.7.5",
       "fast-xml-parser@<5.5.7": ">=5.5.7",
       "fast-xml-parser@<5.7.0": ">=5.7.0",
@@ -103,7 +104,7 @@
       "uuid@<14.0.0": ">=14.0.0",
       "@astrojs/node@<10.0.5": ">=10.0.5",
       "shell-quote@<1.9.0": ">=1.9.0",
-      "@grpc/grpc-js@<1.14.4": ">=1.14.4",
+      "@grpc/grpc-js@<1.14.5": ">=1.14.5",
       "js-yaml@>=4.0.0 <4.3.1": ">=4.3.1 <5.0.0",
       "nanoid@<3.3.18": ">=3.3.18 <4.0.0",
       "deepmerge-ts@<8.0.0": ">=8.0.1 <9.0.0",

@@ -20,6 +20,13 @@ import {
   parseOAuthAuthEpochEnforceAfter,
 } from './env';
 
+/**
+ * W06 (#7604): minimum MCP_LLM_API_KEY length. Mirrors MIN_GATEWAY_KEY_LENGTH
+ * (services/aiModels/connections.ts — not imported: it pulls in the DB layer);
+ * envOpenAiBootstrap.test.ts asserts the two stay equal.
+ */
+export const MCP_LLM_MIN_API_KEY_LENGTH = 8;
+
 // ---------------------------------------------------------------------------
 // Insecure default detection
 // ---------------------------------------------------------------------------
@@ -630,6 +637,24 @@ const envObjectSchema = z
         'APPROVER_ASSURANCE_DEFAULT_ENFORCE_FROM must be an ISO date (YYYY-MM-DD) or timestamp',
       ),
 
+    // Per-source-IP limit on POST /api/v1/agents/enroll (#7472). Read at
+    // runtime by getEnrollmentRateLimit() (blank = 10 per 60s). Validated here
+    // so a typo fails boot instead of silently keeping the default.
+    AGENT_ENROLL_RATE_LIMIT: z
+      .string()
+      .optional()
+      .refine(
+        (v) => !v?.trim() || /^[1-9]\d{0,8}$/.test(v.trim()),
+        'AGENT_ENROLL_RATE_LIMIT must be a positive integer below 1,000,000,000',
+      ),
+    AGENT_ENROLL_RATE_WINDOW_SECONDS: z
+      .string()
+      .optional()
+      .refine(
+        (v) => !v?.trim() || /^[1-9]\d{0,8}$/.test(v.trim()),
+        'AGENT_ENROLL_RATE_WINDOW_SECONDS must be a positive integer below 1,000,000,000',
+      ),
+
     // Controlled agent-fleet rollout (decouple registration from promotion).
     // When false, binarySync registers new binaries WITHOUT touching
     // agent_versions.isLatest — the fleet upgrade target only changes via
@@ -723,6 +748,12 @@ const envObjectSchema = z
     // approval bypass, so a typo must fail boot rather than leave an operator
     // guessing which way it resolved.
     BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED: z.string().optional(),
+
+    // Remote desktop start fence (default true). A recognized false value is
+    // the explicit opt-out for fleets still on agents older than v0.114.0;
+    // validated in the superRefine below so a typo refuses boot instead of
+    // leaving an operator unsure which way it resolved.
+    REMOTE_DESKTOP_FENCE_REQUIRED: z.string().optional(),
 
     // #1374 W04 — Google Cloud service account (JSON, or base64 of that JSON)
     // with the Play Integrity API enabled, used to decode Android
@@ -1303,9 +1334,25 @@ const envSchema = envObjectSchema
       }
     }
 
-    // MCP_LLM_PROVIDER openai-compatible: vLLM endpoint + auth + model id required at boot
-    // (enforced in all environments, not just production)
+    // MCP_LLM_PROVIDER openai-compatible: endpoint + model id required at boot
+    // (enforced in all environments, not just production). W06 (#7604, D6):
+    // boot turns these into one env-managed OpenAI-compatible connection PER
+    // PARTNER (services/aiModels/envOpenAiBootstrap.ts), so the path is
+    // self-host only — refused unless self-host is affirmatively declared
+    // (same fail-closed rule as ANTHROPIC_BASE_URL above). The key is optional
+    // (keyless local model servers); when set it must meet the gateway
+    // scrubber's minimum (MIN_GATEWAY_KEY_LENGTH). Messages never echo it.
     if (data.MCP_LLM_PROVIDER === 'openai-compatible') {
+      if (!isRecognizedSelfHostSignal(data.IS_HOSTED)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['MCP_LLM_PROVIDER'],
+          message:
+            'MCP_LLM_PROVIDER=openai-compatible is for self-hosted Breeze (set IS_HOSTED explicitly to false). '
+            + 'On hosted — or with IS_HOSTED unset/invalid — it is refused: it would create a connection for every '
+            + 'partner. Add an OpenAI-compatible connection under Partner Settings → AI Providers & Models instead.',
+        });
+      }
       if (!data.MCP_LLM_BASE_URL) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -1320,11 +1367,12 @@ const envSchema = envObjectSchema
           message: 'MCP_LLM_MODEL is required when MCP_LLM_PROVIDER is openai-compatible.',
         });
       }
-      if (!data.MCP_LLM_API_KEY?.trim()) {
+      const mcpLlmKey = data.MCP_LLM_API_KEY?.trim();
+      if (mcpLlmKey && mcpLlmKey.length < MCP_LLM_MIN_API_KEY_LENGTH) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['MCP_LLM_API_KEY'],
-          message: 'MCP_LLM_API_KEY is required when MCP_LLM_PROVIDER is openai-compatible.',
+          message: `MCP_LLM_API_KEY must be at least ${MCP_LLM_MIN_API_KEY_LENGTH} characters when set (leave it empty for a keyless endpoint).`,
         });
       }
     }
@@ -2036,6 +2084,21 @@ const envSchema = envObjectSchema
           'BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED must be a boolean (true/false, 1/0, yes/no, on/off) when set. ' +
           'Defaults to true (an L4/critical-tier approval requires a trusted platform_bound_basis). ' +
           'Set false ONLY as a break-glass revert — it re-opens the critical-tier bypass for every legacy mobile approver key.',
+      });
+    }
+
+    // REMOTE_DESKTOP_FENCE_REQUIRED (remote desktop start fence). Same
+    // treatment as BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED: the runtime
+    // reader keeps the fence required for an unrecognized value.
+    const fenceRequiredRaw = (data.REMOTE_DESKTOP_FENCE_REQUIRED ?? '').trim().toLowerCase();
+    if (fenceRequiredRaw && !boolValues.has(fenceRequiredRaw)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['REMOTE_DESKTOP_FENCE_REQUIRED'],
+        message:
+          'REMOTE_DESKTOP_FENCE_REQUIRED must be a boolean (true/false, 1/0, yes/no, on/off) when set. ' +
+          'Defaults to true (remote desktop requires an agent with the start fence, v0.114.0 or later). ' +
+          'Set false only while agents older than v0.114.0 are still updating.',
       });
     }
 
@@ -2771,8 +2834,8 @@ export function validateConfig(): AppConfig {
     }
     console.warn(
       `[config] AI Agent routed to a custom Anthropic-compatible backend (ANTHROPIC_BASE_URL host=${host}). `
-      + 'Cost tracking is best-effort: an unrecognized model id is priced at conservative '
-      + 'DEFAULT_PRICING (Opus-tier), not actual backend cost.',
+      + 'An unrecognized model id is billed at a conservative Opus-tier rate until it is '
+      + 'priced on /admin/ai-models, not at actual backend cost.',
     );
   }
 

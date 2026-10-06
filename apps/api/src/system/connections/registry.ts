@@ -189,12 +189,19 @@ export const CONNECTION_REGISTRY: readonly ConnectionEntry[] = [
       { name: 'ANTHROPIC_AUTH_TOKEN' },
       { name: 'ANTHROPIC_BASE_URL', secret: false },
       { name: 'ANTHROPIC_MODEL', secret: false },
+      { name: 'AI_PLATFORM_INFERENCE_GEO', secret: false },
+      { name: 'AI_GATEWAY_HEADERS_TIMEOUT_SECONDS', secret: false },
     ],
   }),
+  // W06: these no longer drive a separate chat runtime. When MCP_LLM_PROVIDER
+  // is openai-compatible, boot bootstraps an env-managed OpenAI-compatible
+  // connection + offering per partner from them; per-partner status lives on
+  // the AI Providers & Models tab. Kept here because every env var the API
+  // reads must be classified (envInventory.test.ts) and these are operator-set.
   defineEntry({
     id: 'openai-compatible-llm',
     group: 'ai',
-    label: 'Alternative LLM backend (OpenAI-compatible)',
+    label: 'OpenAI-compatible endpoint (configured via env bootstrap)',
     docsUrl: '/deploy/environment/#self-hosted-alternative-anthropic-compatible-backends',
     vars: [
       { name: 'MCP_LLM_BASE_URL', secret: false, required: true },
@@ -731,6 +738,7 @@ export const CONNECTION_REGISTRY: readonly ConnectionEntry[] = [
     id: 'audit-anchor-signing',
     group: 'security-abuse',
     label: 'Audit-chain anchor signing',
+    docsUrl: '/deploy/environment/#anchor-signing',
     vars: [
       { name: 'AUDIT_ANCHOR_SIGNING_KEY', required: true },
     ],

@@ -6,7 +6,7 @@
  * and backup configs. These must be created before they can be linked to a config policy.
  */
 
-import { db } from '../db';
+import { db, withDbTransaction } from '../db';
 import { pgErrorCode } from '../utils/pgErrors';
 import { patchPolicies } from '../db/schema/patches';
 import { softwarePolicies } from '../db/schema/softwarePolicies';
@@ -36,8 +36,10 @@ import {
   isRecord,
   isRedactedSecretMarker,
   preserveSecretFields,
+  redactProviderConfig,
   s3EndpointOriginChanged,
 } from './backupProviderConfigSecrets';
+import { findCiphertextShapedValue } from './backupProviderConfigSealing';
 import {
   resolvePeripheralPolicyDeviceIds,
   schedulePeripheralPolicyDevices,
@@ -919,7 +921,7 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           configId: { type: 'string', description: 'Backup config UUID (required for get/update)' },
           name: { type: 'string', description: 'Config name (required for create)' },
           type: { type: 'string', enum: ['file', 'system_image', 'database', 'application'], description: 'Backup type (required for create)' },
-          provider: { type: 'string', enum: ['s3', 'azure_blob', 'google_cloud', 'backblaze', 'local'], description: 'Storage provider (required for create)' },
+          provider: { type: 'string', enum: ['s3', 'local'], description: 'Storage provider (required for create)' },
           providerConfig: { type: 'object', description: 'Provider settings. S3: { bucket, region, accessKey, secretKey, endpoint? }. Local: { path }' },
           schedule: { type: 'object', description: 'Schedule config: { frequency: "daily"|"weekly"|"monthly", time: "02:00", dayOfWeek?, dayOfMonth? }' },
           retention: { type: 'object', description: 'Retention config: { days: 30, versions: 5 }' },
@@ -940,6 +942,16 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
       // Reads (list/get) are not gated by the site-ceiling — only create/update/delete.
       if (action !== 'list' && action !== 'get' && !canMutateOrgWideGovernance(auth)) {
         return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
+      }
+
+      if ((action === 'create' || action === 'update') && input.providerConfig) {
+        // Same refusal as the REST schema (routes/backup/schemas.ts): a value
+        // already in the stored encrypted format would be opened by the server
+        // as if it had sealed it itself.
+        const presealed = findCiphertextShapedValue(input.providerConfig);
+        if (presealed) {
+          return JSON.stringify({ error: `providerConfig.${presealed}: destination settings cannot contain values in the internal encrypted format` });
+        }
       }
 
       if (action === 'list') {
@@ -975,10 +987,11 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         const oc = orgWhere(auth, backupConfigs.orgId);
         if (oc) conditions.push(oc);
 
-        const [config] = await db.select().from(backupConfigs).where(and(...conditions)).limit(1);
+        // The row's encryption key is key material: it is never returned to the model.
+        const [config] = (await db.select().from(backupConfigs).where(and(...conditions)).limit(1)).map(({ encryptionKey: _encryptionKey, ...row }) => row);
         if (!config) return JSON.stringify({ error: 'Backup config not found or access denied' });
         // Redact sensitive provider config fields
-        const safeConfig = { ...config, providerConfig: config.providerConfig ? { ...config.providerConfig as Record<string, unknown>, secretKey: undefined, accessKey: undefined, encryptionKey: undefined } : null };
+        const safeConfig = { ...config, providerConfig: config.providerConfig ? redactProviderConfig(config.providerConfig) : null };
         return JSON.stringify({ config: safeConfig });
       }
 
@@ -988,7 +1001,7 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         const orgId = resolvedConfigOrg.orgId;
         if (!input.name) return JSON.stringify({ error: 'name is required' });
         if (!input.type) return JSON.stringify({ error: 'type is required (file, system_image, database, application)' });
-        if (!input.provider) return JSON.stringify({ error: 'provider is required (s3, azure_blob, google_cloud, backblaze, local)' });
+        if (!input.provider) return JSON.stringify({ error: 'provider is required (s3 or local)' });
         if (!input.providerConfig) return JSON.stringify({ error: 'providerConfig is required (provider-specific settings)' });
 
         let providerConfig = input.providerConfig as Record<string, unknown>;
@@ -998,19 +1011,35 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
           providerConfig = resolved.value;
         }
 
-        const rows = await db.insert(backupConfigs).values({
-          orgId,
-          name: input.name as string,
-          type: input.type as any,
-          provider: input.provider as any,
-          providerConfig: providerConfig as any,
-          schedule: (input.schedule as any) ?? null,
-          retention: (input.retention as any) ?? null,
-          compression: input.compression !== false,
-          encryption: input.encryption !== false,
-          isActive: input.isActive !== false,
-        }).returning();
-        const config = rows[0];
+        // The destination and its key record are written in one transaction.
+        // The history module is loaded on use: it pulls in storage code this
+        // tool registry does not otherwise need.
+        const { recordCredentialChange } = await import('./backupStorageCredentialHistory');
+        const config = await withDbTransaction(async () => {
+          const rows = await db.insert(backupConfigs).values({
+            orgId,
+            name: input.name as string,
+            type: input.type as any,
+            provider: input.provider as any,
+            providerConfig: providerConfig as any,
+            schedule: (input.schedule as any) ?? null,
+            retention: (input.retention as any) ?? null,
+            compression: input.compression !== false,
+            encryption: input.encryption !== false,
+            isActive: input.isActive !== false,
+          }).returning();
+          const created = rows[0];
+          if (created) {
+            // A key configured from now on has never been sent to a device.
+            await recordCredentialChange({
+              orgId,
+              configId: created.id,
+              previous: null,
+              next: { provider: created.provider, providerConfig: created.providerConfig },
+            });
+          }
+          return created;
+        });
         if (!config) return JSON.stringify({ error: 'Failed to create backup config' });
 
         return JSON.stringify({
@@ -1027,7 +1056,9 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         const oc = orgWhere(auth, backupConfigs.orgId);
         if (oc) conditions.push(oc);
 
-        const [existing] = await db.select().from(backupConfigs).where(and(...conditions)).limit(1);
+        // Locked: the key change recorded below compares against exactly this
+        // state, and a concurrent change waits for this one to commit.
+        const [existing] = await db.select().from(backupConfigs).where(and(...conditions)).limit(1).for('update');
         if (!existing) return JSON.stringify({ error: 'Backup config not found or access denied' });
 
         const updates: Record<string, unknown> = {
@@ -1087,7 +1118,26 @@ export function registerPolicyPrereqTools(aiTools: Map<string, AiTool>): void {
         if (typeof input.encryption === 'boolean') updates.encryption = input.encryption;
         if (typeof input.isActive === 'boolean') updates.isActive = input.isActive;
 
-        await db.update(backupConfigs).set(updates).where(eq(backupConfigs.id, existing.id));
+        const destinationChanged = updates.provider !== undefined || updates.providerConfig !== undefined;
+        const { recordCredentialChange } = destinationChanged
+          ? await import('./backupStorageCredentialHistory')
+          : { recordCredentialChange: null };
+        // The change and its key record are written in one transaction.
+        await withDbTransaction(async () => {
+          await db.update(backupConfigs).set(updates).where(eq(backupConfigs.id, existing.id));
+          if (recordCredentialChange) {
+            // A replaced key stays listed until there is evidence it was disabled.
+            await recordCredentialChange({
+              orgId: existing.orgId,
+              configId: existing.id,
+              previous: { provider: existing.provider, providerConfig: existing.providerConfig },
+              next: {
+                provider: (updates.provider as string | undefined) ?? existing.provider,
+                providerConfig: updates.providerConfig ?? existing.providerConfig,
+              },
+            });
+          }
+        });
         return JSON.stringify({ success: true, message: `Backup config "${existing.name}" updated` });
       }
 

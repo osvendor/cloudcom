@@ -7,6 +7,7 @@ import { eq, and, inArray } from "drizzle-orm";
 import { db, withSystemDbAccessContext } from "../db";
 import { agentVersions } from "../db/schema";
 import { isS3Configured, syncDirectory } from "./s3Storage";
+import { binaryStoreDir, s3SyncTargets } from "./binaryStores";
 import {
   getBinarySource,
   getAgentAutoPromote,
@@ -1041,29 +1042,41 @@ async function reportServerOnlyBoot(paired: string): Promise<void> {
   }
 }
 
-async function syncBinaryDirsToS3(
-  agentBinaryDir: string,
-  viewerBinaryDir: string,
-): Promise<void> {
+// Mirrors every staged binaries directory to S3 under the prefix the download
+// paths read it from. Both sides take the key from services/binaryStores.ts,
+// so a component can never be uploaded under one prefix and read from another
+// (#7515) — and because every deploy re-runs this, no S3 object a download
+// reads can outlive the release it was staged with.
+async function syncBinaryDirsToS3(): Promise<void> {
   if (!isS3Configured()) return;
-  const logSyncResult = (
-    label: string,
-    result: import("./s3Storage").SyncResult,
-  ) => {
+  for (const { dir, s3Prefix } of s3SyncTargets()) {
+    const result = await syncDirectory(dir, s3Prefix);
     console.log(
-      `[binarySync] S3 ${label} sync: ${result.uploaded} uploaded, ${result.skipped} skipped` +
+      `[binarySync] S3 ${s3Prefix} sync: ${result.uploaded} uploaded, ${result.skipped} skipped` +
         (result.errors.length > 0 ? `, ${result.errors.length} errors` : ""),
     );
     for (const err of result.errors) {
-      console.error(`[binarySync] S3 ${label} sync error: ${err}`);
+      console.error(`[binarySync] S3 ${s3Prefix} sync error: ${err}`);
     }
-  };
-
-  const agentSync = await syncDirectory(agentBinaryDir, "agent");
-  logSyncResult("agent", agentSync);
-
-  const viewerSync = await syncDirectory(viewerBinaryDir, "viewer");
-  logSyncResult("viewer", viewerSync);
+    // #7574: agent_versions already advertises these files' checksums, so a
+    // key whose upload failed must never serve its previous object.
+    // syncDirectory tombstones it (downloads fall back to disk) and deletes
+    // the stale object best-effort; this is the alertable signal that the
+    // bandwidth offload is degraded for those files. Not fatal: the staged
+    // bytes on disk match the registered checksum, and failing boot over an
+    // S3 blip would take every API route down with it.
+    if (result.failedKeys.length > 0) {
+      console.error(
+        `[binarySync] S3_SYNC_UPLOAD_FAILED prefix=${s3Prefix} keys=${result.failedKeys.join(",")} — ` +
+          "these files are served from disk until a later sync uploads them",
+      );
+      captureException(
+        new Error(`binary S3 sync: ${result.failedKeys.length} upload(s) failed under ${s3Prefix}/`),
+        undefined,
+        { binary_s3_sync: "upload_failed", binary_s3_prefix: s3Prefix },
+      );
+    }
+  }
 }
 
 export async function syncBinaries(): Promise<void> {
@@ -1112,10 +1125,7 @@ export async function syncBinaries(): Promise<void> {
     return;
   }
 
-  const agentBinaryDir = resolve(process.env.AGENT_BINARY_DIR || "./agent/bin");
-  const viewerBinaryDir = resolve(
-    process.env.VIEWER_BINARY_DIR || "./viewer/bin",
-  );
+  const agentBinaryDir = binaryStoreDir("agent");
   const versionFile = process.env.BINARY_VERSION_FILE;
   const expectedVersion = pairedBinariesVersion ?? process.env.BREEZE_VERSION;
 
@@ -1193,7 +1203,7 @@ export async function syncBinaries(): Promise<void> {
 
   if (pairedBinariesVersion) {
     await reportServerOnlyBoot(pairedBinariesVersion);
-    await syncBinaryDirsToS3(agentBinaryDir, viewerBinaryDir);
+    await syncBinaryDirsToS3();
     return;
   }
 
@@ -1237,7 +1247,7 @@ export async function syncBinaries(): Promise<void> {
   const userHelperBinaries = await scanBinaryDir(agentBinaryDir, "user-helper");
   const watchdogBinaries = await scanBinaryDir(agentBinaryDir, "watchdog");
   const backupBinaries = await scanBinaryDir(agentBinaryDir, "backup");
-  const helperBinaryDir = resolve(process.env.HELPER_BINARY_DIR || "./agent/bin");
+  const helperBinaryDir = binaryStoreDir("helper");
   const helperInstallers = await scanHelperInstallerDir(helperBinaryDir);
 
   if (binaries.length > 0) {
@@ -1529,7 +1539,7 @@ export async function syncBinaries(): Promise<void> {
   await ensureCurrentVersionRegistered();
 
   // Sync to S3 if configured (runs regardless of whether agent binaries were found)
-  await syncBinaryDirsToS3(agentBinaryDir, viewerBinaryDir);
+  await syncBinaryDirsToS3();
 }
 
 /**

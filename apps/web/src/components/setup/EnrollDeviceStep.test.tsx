@@ -38,7 +38,7 @@ global.URL.revokeObjectURL = vi.fn();
 function mockHappyPath() {
   fetchWithAuthMock.mockImplementation(async (input) => {
     const url = String(input);
-    if (url === '/enrollment-keys') {
+    if (url === '/enrollment-keys/add-device-parent') {
       return makeJsonResponse({ id: 'key-abc', key: 'raw-key' }, true, 201);
     }
     if (url.startsWith('/enrollment-keys/key-abc/installer/')) {
@@ -50,7 +50,7 @@ function mockHappyPath() {
 
 /**
  * #2992 — guided setup mints its installer through the same two-step flow as
- * the Add Device modal: POST /enrollment-keys for a parent, then
+ * the Add Device modal: POST /enrollment-keys/add-device-parent for the site's parent, then
  * GET /enrollment-keys/:id/installer/:platform?count=N.
  *
  * The device count belongs on the bootstrap token that the second call mints,
@@ -77,7 +77,7 @@ describe('EnrollDeviceStep — installer device count (#2992)', () => {
     });
 
     const createCall = fetchWithAuthMock.mock.calls[0];
-    expect(String(createCall[0])).toBe('/enrollment-keys');
+    expect(String(createCall[0])).toBe('/enrollment-keys/add-device-parent');
     const createBody = JSON.parse((createCall[1] as RequestInit).body as string);
     expect(createBody.siteId).toBe('site-1');
     expect(createBody.orgId).toBe('org-1');
@@ -118,5 +118,84 @@ describe('EnrollDeviceStep — installer device count (#2992)', () => {
       expect(fetchWithAuthMock).toHaveBeenCalledTimes(2);
     });
     expect(String(fetchWithAuthMock.mock.calls[1][0])).toContain('discardKeyOnFailure=1');
+  });
+
+  // #7345 — a reused site parent already backs earlier installers; a failed
+  // build must never ask for it to be discarded.
+  it('never asks to discard a reused parent', async () => {
+    fetchWithAuthMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === '/enrollment-keys/add-device-parent') {
+        return makeJsonResponse({ id: 'key-abc', reused: true }, true, 200);
+      }
+      if (url.startsWith('/enrollment-keys/key-abc/installer')) {
+        return makeJsonResponse({ shortUrl: 'https://x/s/abc' }, true);
+      }
+      return makeJsonResponse({}, false, 404);
+    });
+
+    render(<EnrollDeviceStep orgId="org-1" siteId="site-1" onFinish={vi.fn()} />);
+    fireEvent.click(screen.getByTestId('setup-download-installer'));
+    await waitFor(() => expect(fetchWithAuthMock).toHaveBeenCalledTimes(2));
+    expect(String(fetchWithAuthMock.mock.calls[1][0])).not.toContain('discardKeyOnFailure');
+  });
+});
+
+/**
+ * #7628 — the CLI tab used to render the install command with a literal
+ * "<TOKEN>" while the onboarding token was loading or after the mint failed,
+ * and the copy button copied it. That command fails enrollment with
+ * enrollment_key_not_found (exit 11).
+ */
+describe('EnrollDeviceStep — CLI command needs a real token (#7628)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Object.assign(navigator, {
+      clipboard: { writeText: vi.fn().mockResolvedValue(undefined) },
+    });
+  });
+
+  it('shows no command and no copy button when the token mint fails', async () => {
+    fetchWithAuthMock.mockResolvedValue(makeJsonResponse({ error: 'nope' }, false, 500));
+
+    render(<EnrollDeviceStep orgId="org-1" siteId="site-1" onFinish={vi.fn()} />);
+    fireEvent.click(screen.getByText('CLI Commands'));
+
+    await waitFor(() => {
+      expect(screen.getByText('nope')).toBeDefined();
+    });
+    expect(screen.queryByText(/<TOKEN>/)).toBeNull();
+    expect(screen.queryByTestId('setup-cli-command')).toBeNull();
+    expect(screen.queryByTestId('setup-cli-copy-command')).toBeNull();
+    expect(screen.getByTestId('setup-cli-command-needs-token')).toBeDefined();
+  });
+
+  it('shows no command while the token is still being minted', () => {
+    fetchWithAuthMock.mockReturnValue(new Promise<Response>(() => {}));
+
+    render(<EnrollDeviceStep orgId="org-1" siteId="site-1" onFinish={vi.fn()} />);
+    fireEvent.click(screen.getByText('CLI Commands'));
+
+    expect(screen.queryByText(/<TOKEN>/)).toBeNull();
+    expect(screen.queryByTestId('setup-cli-copy-command')).toBeNull();
+    expect(screen.getByTestId('setup-cli-command-needs-token')).toBeDefined();
+  });
+
+  it('shows and copies the real command once the token exists', async () => {
+    fetchWithAuthMock.mockResolvedValue(
+      makeJsonResponse({ token: 'wizard-token-1', enrollmentSecret: 'sec' })
+    );
+
+    render(<EnrollDeviceStep orgId="org-1" siteId="site-1" onFinish={vi.fn()} />);
+    fireEvent.click(screen.getByText('CLI Commands'));
+
+    const command = await screen.findByTestId('setup-cli-command');
+    expect(command.textContent).toContain('wizard-token-1');
+    expect(screen.queryByTestId('setup-cli-command-needs-token')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('setup-cli-copy-command'));
+    await waitFor(() => {
+      expect(navigator.clipboard.writeText).toHaveBeenCalledWith(command.textContent);
+    });
   });
 });

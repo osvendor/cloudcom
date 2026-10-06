@@ -136,6 +136,15 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   portal_remote_settings: { kind: 'blocks-merge', note: 'Explicitly disable and remove remote access configuration before merging customer identities; assignments never transfer authority between organizations.' },
   portal_remote_assignments: { kind: 'blocks-merge', note: 'Remote approvals are bound to the original customer organization; revoke and remove assignments before merging.' },
   portal_remote_sessions: { kind: 'blocks-merge', note: 'Remote session identity and audit history remain bound to the original customer organization.' },
+  billing_payment_settings: { kind: 'keep-survivor' },
+  org_autopay_enrollments: { kind: 'custom', note: 'Cancel with org_merged and retain authority on the loser.' },
+  org_autopay_consents: { kind: 'leave-for-erasure', note: 'Append-only authorization evidence belongs to the loser.' },
+  org_payment_methods: { kind: 'custom', note: 'Remove and retain on loser; detach from original Stripe account after commit.' },
+  invoice_autopay_schedules: { kind: 'custom', note: 'Cancel non-terminal schedules, detach enrollment authority, then repoint invoice history.' },
+  invoice_collection_attempts: { kind: 'blocks-merge', note: 'Block reserved/created/confirming/processing; otherwise repoint history after detaching method authority.' },
+  billing_notice_outbox: { kind: 'custom', note: 'Cancel unsent notices; repoint invoice rows and retain enrollment-only rows.' },
+  billing_link_tokens: { kind: 'custom', note: 'Revoke all tokens; repoint invoice rows and retain enrollment-only rows.' },
+
   organizations: { kind: 'loser-shell' },
 
   // Caller verification (#6354 W01). Bindings are canonical per org: the
@@ -408,6 +417,13 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   // FK to organizations, so a bare org_id UPDATE breaks the moment the two
   // orgs' partners differ. No writer exists yet in this PR either way.
   ai_unattended_exposure: { kind: 'leave-for-erasure', note: 'unattended-exposure history is per-org (like llm_egress_events); composite (org_id, partner_id) FK also makes a bare org_id repoint fragile — rows die with the loser shell' },
+  // AI chargeback (#7608): a run is only "this org closed this month". The
+  // survivor may legitimately close the same month itself, and the unique
+  // (org_id, period_start) would collide on a repoint, so the loser's runs stay
+  // with the loser shell and die with its erasure. Its charges and claims move
+  // (REPOINT_TABLES); their run_id is a snapshot id with no FK, so nothing
+  // references a run that stays behind.
+  ai_usage_charge_runs: { kind: 'leave-for-erasure', note: 'per-(org, month) close marker; unique (org_id, period_start)' },
 
   // Durable PAM actuation evidence (Track E org-merge contract,
   // specs/2026-08-31-s0-track-e-pam-org-merge-contract-design.md): never
@@ -526,6 +542,14 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   sso_verified_domains: { kind: 'repoint-dedupe', key: ['domain'] }, // verified: sso_verified_domains_org_domain_idx (org_id, domain)
   alert_correlation_groups: { kind: 'repoint-dedupe', key: ['group_key'] }, // verified: alert_correlation_groups_org_key_uq (org_id, group_key)
   ai_cost_usage: { kind: 'repoint-dedupe', key: ['period', 'period_key'] }, // verified: ai_cost_usage_org_period_idx (org_id, period, period_key)
+  // AI model registry W02 (#7600, quorum #12): one org override per
+  // (surface, role) — verified: ai_model_assignments_org_uq (org_id, surface,
+  // role) WHERE org_id IS NOT NULL. Two merged orgs can't both keep one; the
+  // survivor's wins. Partner-wide rows have org_id NULL and are not merge
+  // participants (keyWhere mirrors the index's partial predicate, as
+  // deliverable_template_sets below). Merges are same-partner, so the
+  // deferrable (org_id, offering_partner_id) composite FK holds after the repoint.
+  ai_model_assignments: { kind: 'repoint-dedupe', key: ['surface', 'role'], keyWhere: '{org_id} IS NOT NULL' },
   ai_budget_alert_events: { kind: 'repoint-dedupe', key: ['period', 'period_key', 'threshold_pct'] }, // verified: ai_budget_alert_events_org_period_rung_uidx (org_id, period, period_key, threshold_pct)
   ai_budget_reservations: { kind: 'repoint-dedupe', key: ['idempotency_key'] }, // verified: ai_budget_reservations_org_idempotency_uidx (org_id, idempotency_key). Its composite (session_id, org_id) FK to ai_sessions is DEFERRABLE INITIALLY IMMEDIATE so the merge can re-point ai_sessions and this table in separate statements.
   client_ai_usage: { kind: 'repoint-dedupe', key: ['client_user_id', 'period', 'period_key'] }, // verified: client_ai_usage_bucket_uniq (org_id, client_user_id, period, period_key)
@@ -633,15 +657,16 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   // 2026-10-27-130100 (#3198 W01; it was NO ACTION before and raised 23503),
   // and report_run_deliveries / service_deliverable_evidence cascade from
   // the runs in turn — so run history would be lost SILENTLY. The custom
-  // executor re-homes report_runs (and recipients) onto the survivor's
-  // definition BEFORE deleting the duplicate, so nothing cascades. Same shape
+  // executor re-homes report_runs (and recipients, deliverable evidence and
+  // auto-evidence bindings, #7443) onto the survivor's definition BEFORE
+  // deleting the duplicate, so nothing cascades. Same shape
   // as plugin_installations/plugin_logs, so the same remedy.
   //
   // Narrative definitions dedupe by non-NULL source_ai_agent_schedule_id.
   // Portal self-service definitions have a second pass keyed by type and
   // explicitly restricted to portal_self_service=true on both sides, so
   // ordinary reports of the same type remain independent.
-  reports: { kind: 'custom', note: "dedupe narrative-schedule definitions by source_ai_agent_schedule_id, portal-self-service definitions by type, and ai_fleet_design definitions by type (Fleet Designer W01, #5651); in all three passes re-home report_runs.report_id, dedupe report_schedule_recipients by (report_id, contact_id), and re-home remaining recipients before deleting duplicate definitions. Multi-org report series children (W02) colliding on reports_series_active_child_uniq (org_id, series_id) are ARCHIVED in place, never deleted and never re-homed: their runs may be deliverable evidence, and sd_evidence_report_run_fk (report_run_id, report_id) is non-deferrable with no ON UPDATE action, so moving a run would abort the merge with 23503; their recipient overrides are unioned onto the survivor's child with removes winning. NEVER delete report runs or recipient rows except recipient-key collisions; partner-owned definitions (org_id NULL, #3198) are never touched by an org merge — the pass keys on org_id = loser" },
+  reports: { kind: 'custom', note: "dedupe narrative-schedule definitions by source_ai_agent_schedule_id, portal-self-service definitions by type, and ai_fleet_design definitions by type (Fleet Designer W01, #5651); in all three passes re-home report_runs.report_id, re-point service_deliverable_evidence.report_id and service_deliverables.auto_evidence_report_id (#7443 — evidence would otherwise CASCADE away with the duplicate and the auto-evidence binding SET NULL; sd_evidence_report_run_fk is DEFERRABLE since 2026-12-03-120200 so the run/evidence pair may mismatch until commit), dedupe report_schedule_recipients by (report_id, contact_id), and re-home remaining recipients before deleting duplicate definitions. Multi-org report series children (W02) colliding on reports_series_active_child_uniq (org_id, series_id) are ARCHIVED in place, never deleted and never re-homed (their runs and evidence stay attached to the archived child); their recipient overrides are unioned onto the survivor's child with removes winning. NEVER delete report runs or recipient rows except recipient-key collisions; partner-owned definitions (org_id NULL, #3198) are never touched by an org merge — the pass keys on org_id = loser" },
   incidents: { kind: 'custom', note: "NULL the colliding loser row's source_ref (it leaves the incidents_source_ref_unique partial index, which is WHERE source_ref IS NOT NULL) and record the old value in `summary`; NEVER delete — incident_actions/incident_evidence are NOT NULL NO ACTION children and an incident is a case file, not a derived row" },
   contacts: { kind: 'custom', note: 'clear loser is_primary if survivor has one, then repoint (partial unique)' },
   backup_configs: { kind: 'custom', note: 'clear loser is_default if survivor has one, then repoint (org-owned storage creds must NOT be dropped)' },
@@ -713,8 +738,20 @@ const REPOINT_TABLES: readonly string[] = [
   // agent_rollback_events removed (#4371 fixup): reclassified 'leave-for-erasure'
   // in SPECIAL above — breeze_app has no UPDATE on this append-only table.
   "ai_action_plans",
+  // ai_invocations (#7600 W02) is append-only, but its trigger admits exactly
+  // the org_id-only UPDATE this policy issues while the loser org is fenced
+  // 'merging' (same partner), and breeze_app holds a column-level UPDATE
+  // (org_id) grant for it — so usage history follows the merged client
+  // (spec §5.5; chargeback W10).
+  "ai_invocations",
   "ai_screenshots",
   "ai_sessions",
+  // AI chargeback (#7608): billed history and unbilled charges follow the
+  // merged client; claims follow so a merged invocation is never re-claimed.
+  // Claims are write-once: breeze_app holds only a column-level UPDATE (org_id)
+  // grant, which is all this plain repoint statement needs.
+  "ai_usage_charge_claims",
+  "ai_usage_charges",
   "alert_correlation_members",
   "alert_rules",
   "alert_templates",
@@ -764,6 +801,8 @@ const REPOINT_TABLES: readonly string[] = [
   "backup_snapshot_id_reservations",
   "backup_snapshot_retirements",
   "backup_snapshots",
+  // Storage key history (and its revocation evidence) moves with the org.
+  "backup_storage_credential_history",
   // Multipart uploads of write sessions travel with their session.
   "backup_storage_session_uploads",
   // Short-lived storage sessions travel with their device and snapshot.
@@ -1059,6 +1098,7 @@ const REPOINT_TABLES: readonly string[] = [
   // whose non-deferrable legs forced a custom executor.
   "ticket_checklist_items",
   "ticket_email_links",
+  "ticket_external_refs",
   "ticket_forms",
   "ticket_outbox",
   "ticket_parts",

@@ -51,6 +51,7 @@ import { xeroWebhookRoutes } from './routes/webhooks/xero';
 import { resendWebhookRoutes } from './routes/webhooks/emailProvider';
 import { invoiceAssemblyRoutes } from './routes/invoices/assembly';
 import { invoiceSettingsRoutes } from './routes/invoices/settings';
+import { billingPaymentSettingsRoutes } from './routes/billingPaymentSettings';
 import { contractRoutes } from './routes/contracts';
 import { timeEntriesRoutes } from './routes/timeEntries';
 import { billingProfilesRoutes } from './routes/billingProfiles';
@@ -162,6 +163,7 @@ import { aiScriptProposalRoutes } from './routes/ai/scriptProposals';
 import { aiScriptPolicyRoutes } from './routes/ai/scriptPolicy';
 import { partnerAiScriptPolicyRoutes } from './routes/partnerAiScriptPolicy';
 import { aiProviderRoutes } from './routes/aiProvider';
+import { aiModelsRoutes } from './routes/aiModels';
 import { aiAgentsRoutes } from './routes/aiAgents';
 import { aiArtifactRoutes } from './routes/aiArtifacts';
 import { aiAgentSchedulesRoutes } from './routes/aiAgentSchedules';
@@ -180,6 +182,13 @@ import { ensureSystemLibraryScripts } from './services/systemScriptLibrary';
 import { runLegacyAlertingRetirement, LEGACY_ALERTING_RETRY_DELAYS_MS } from './services/monitors/conversion/retirementSweep';
 import { ensureBuiltInMonitorsForAllPartners } from './services/monitors/builtInMonitors';
 import { sealUnsealedSettingsSecrets } from './services/settingsSecretBackfill';
+import { reportableCutoverError, runRegistryCutoverSweepWithRetry } from './services/aiModels/registryCutover';
+import { runEnvOpenAiBootstrapAtBoot } from './services/aiModels/envOpenAiBootstrap';
+import { registerGatewayConnectionCheck } from './services/aiModels/gatewayConnectionState';
+import { sealUnsealedBackupProviderConfigs } from './services/backupProviderConfigBackfill';
+import { safeErrorMessage } from './services/aiModels/safeDbError';
+import { baselineCredentialHistory } from './services/backupStorageCredentialHistory';
+import { runStartupTaskWithRetry } from './services/startupTaskRetry';
 import { seedDefaultAuditBaselines } from './services/auditBaselineService';
 import { changesRoutes } from './routes/changes';
 import { dnsSecurityRoutes } from './routes/dnsSecurity';
@@ -284,6 +293,7 @@ import {
 } from './jobs/agentCommandRelayWorker';
 import { AI_AGENTS_ENABLED, abuseSignalsEnabled, breezeRole, eventDispatchMode } from './config/env';
 import { logAiAgentsSubsystemState } from './services/aiAgents/subsystemState';
+import { startPlatformModelSnapshotRefresher, warnOnUnsupportedPlatformInferenceGeo } from './services/aiModels/platformModels';
 import { partnerTrustMode } from './config/partnerTrustMode';
 import { isPartnerLaneConfigured } from './services/emailDomains/config';
 import { auditChainVerifyEnabled } from './config/auditChainVerify';
@@ -292,6 +302,7 @@ import { writeAuditEvent } from './services/auditEvents';
 import { drainAuditRetryQueue, runWithAuditRequestTracking } from './services/auditService';
 import { runShutdownPhases } from './services/shutdownPhases';
 import { drainLlmEgressQueue } from './services/llm/llmEgressRecorder';
+import { closeModelGateway } from './services/aiModels/gateway/server';
 import { createCorsOriginResolver } from './services/corsOrigins';
 import { validateConfig } from './config/validate';
 import { initializeDatabaseForStartup } from './db/databaseStartup';
@@ -339,7 +350,7 @@ const REQUIRE_REDIS_ON_STARTUP = envFlag(
   (process.env.NODE_ENV ?? 'development') === 'production'
 );
 
-const app = new Hono();
+export const app = new Hono();
 
 /**
  * Boot-time connectivity results. These drive the startup fail-fast gate and
@@ -762,6 +773,7 @@ api.route('/', invoiceAssemblyRoutes);
 // /api/v1/partner/billing-settings and /api/v1/orgs/:orgId/billing-settings.
 // invoiceSettingsRoutes applies authMiddleware itself.
 api.route('/', invoiceSettingsRoutes);
+api.route('/', billingPaymentSettingsRoutes);
 api.route('/time-entries', timeEntriesRoutes);
 api.route('/ticket-categories', ticketCategoriesRoutes);
 api.route('/billing-profiles', billingProfilesRoutes);
@@ -951,6 +963,8 @@ api.route('/agent-ws', createAgentWsRoutes(upgradeWebSocket));
 api.route('/agent-versions', agentVersionRoutes);
 api.route('/viewers', viewerRoutes);
 api.route('/ai/provider', aiProviderRoutes);
+// AI model registry (W04 #7602) — before the broad '/ai' mounts (Hono matches in order).
+api.route('/ai/models', aiModelsRoutes);
 // BEFORE /ai/agents: aiAgentsRoutes owns /:id, which would otherwise capture
 // '/schedules' as an agent id (#4189).
 api.route('/ai/agents/schedules', aiAgentSchedulesRoutes);
@@ -1382,6 +1396,9 @@ async function shutdownRuntime(signal: NodeJS.Signals): Promise<void> {
         // subscribers. A leaked one keeps the process alive past SIGTERM, which
         // is how a rolling deploy turns into a stuck pod.
         shutdownChatRunBridge,
+        // W06: the loopback model gateway — revokes every grant (aborting in-flight
+        // upstream calls) once the workers that hold them have settled.
+        closeModelGateway,
         shutdownEventDispatchWorker,
         shutdownEventDispatchQueue,
         shutdownAgentCommandRelayWorker,
@@ -1773,6 +1790,15 @@ async function bootstrap(): Promise<void> {
   // warm completes still gets its own bounded fetch via fetchRegularMsi's
   // existing cache-miss fallback.
   startRegularMsiCacheWarmer();
+  // AI model registry W01 (#7599): keep the in-process ai_platform_models
+  // snapshot warm for the synchronous hot paths (Agent SDK thinking options,
+  // token-price fallback). Not awaited; until the first load lands, those
+  // paths use the W00 bootstrap rules.
+  startPlatformModelSnapshotRefresher();
+  // AI model registry W03 (#7601): the platform key serves only us/global
+  // (W01 D3). Non-fatal: an unsupported AI_PLATFORM_INFERENCE_GEO takes
+  // platform models offline (residency_unavailable), so say so at boot.
+  warnOnUnsupportedPlatformInferenceGeo();
 
   // Boot-time self-test for every deployment that signs its own update
   // manifests: round-trip a synthetic manifest through sign + validate. If this
@@ -1806,6 +1832,11 @@ async function bootstrap(): Promise<void> {
   // controller site). Default-deny when absent, so install before serving.
   registerTopologyPhysicalAuthorities();
 
+  // Model gateway: before every upstream dial, refuse a grant whose connection
+  // was disconnected or re-keyed/re-pointed (on any replica) since it was
+  // issued. Installed before serving, so no request can dial without it.
+  registerGatewayConnectionCheck();
+
   server = serve({
     fetch: app.fetch,
     port
@@ -1821,7 +1852,11 @@ async function bootstrap(): Promise<void> {
   // partners × ~40 queries each must never delay /health. One-time per partner
   // (partners.settings marker), each partner its own transaction; opt out with
   // BREEZE_BUILTIN_MONITORS_AUTOSEED=false.
-  void ensureBuiltInMonitorsForAllPartners()
+  void runStartupTaskWithRetry('built-in monitors provisioning', () => ensureBuiltInMonitorsForAllPartners(), {
+    hasFailures: (r) => r.failed > 0,
+    onFailure: ({ attempt, error, result }) =>
+      console.error(`[startup] Built-in monitors provisioning attempt ${attempt + 1} failed:`, error ?? `${result?.failed} partner(s) failed`),
+  })
     .then((result) => {
       if (result.provisioned > 0 || result.failed > 0) {
         console.log(
@@ -1837,7 +1872,11 @@ async function bootstrap(): Promise<void> {
   // write; this seals values stored before that. Detached after serve() like
   // the built-ins above: readers open both forms, so nothing waits on it.
   // Idempotent — once every value is sealed it finds nothing to do.
-  void sealUnsealedSettingsSecrets()
+  void runStartupTaskWithRetry('settings secret sealing', () => sealUnsealedSettingsSecrets(), {
+    hasFailures: (r) => Object.values(r).some((s) => s.failed > 0),
+    onFailure: ({ attempt, error }) =>
+      console.error(`[startup] Sealing stored settings secrets attempt ${attempt + 1} failed:`, error ?? 'row failures'),
+  })
     .then((result) => {
       const touched = Object.entries(result).filter(([, stats]) => stats.scanned > 0);
       if (touched.length > 0) {
@@ -1851,6 +1890,89 @@ async function bootstrap(): Promise<void> {
     .catch((err) => {
       console.error('[startup] Sealing stored settings secrets failed:', err);
       captureException(err, undefined, { area: 'settings_secret_backfill' });
+    });
+
+  // Backup destination credentials (backup_configs.provider_config) are sealed
+  // on write by the column type; this seals rows stored before that. Detached
+  // and idempotent like the settings sweep above — readers open both forms.
+  void sealUnsealedBackupProviderConfigs()
+    .then((stats) => {
+      if (stats.scanned > 0) {
+        console.log(
+          `[startup] Backup destination credentials sealed: ${stats.sealed}/${stats.scanned} config(s) `
+            + `(${stats.contended} changed concurrently, ${stats.failed} failed)`,
+        );
+      }
+      if (stats.failed > 0 || stats.contended > 0) {
+        captureException(
+          new Error(`backup destination credential sealing left ${stats.failed} failed and ${stats.contended} contended config(s)`),
+          undefined,
+          { area: 'backup_provider_config_backfill' },
+        );
+      }
+    })
+    .catch((err) => {
+      console.error('[startup] Sealing stored backup destination credentials failed:', err);
+      captureException(err, undefined, { area: 'backup_provider_config_backfill' });
+    });
+
+  // AI model registry W03 (#7601 Task 6A): cut every partner over to the
+  // registry in the background — each partner is projected from legacy config
+  // exactly once, durably (replaces W02's per-boot re-projection). Detached:
+  // /health is never blocked. A singleton lease makes concurrent replicas (and
+  // the split worker, which runs the same sweep) no-ops, and resolveModel cuts
+  // a partner over on demand if its first AI request beats the sweep.
+  void runRegistryCutoverSweepWithRetry()
+    .then((result) => {
+      console.log(
+        `[startup] AI model registry cutover sweep: ${result.outcome}, ${result.processed} partner(s) cut over, ${result.failed.length} failed`,
+      );
+    })
+    .catch((err) => {
+      // Scrubbed: a query error's message carries the statement's bound values.
+      console.error('[startup] AI model registry cutover sweep failed:', safeErrorMessage(err));
+      captureException(reportableCutoverError(err), undefined, { area: 'ai_model_registry_cutover' });
+    });
+
+  // W06 (#7604, D6): MCP_LLM_PROVIDER=openai-compatible → one env-managed
+  // OpenAI-compatible connection + priced offering per partner (and the chat
+  // default re-pointed once); unset → those connections are released. Started
+  // after the cutover sweep: each partner is cut over FIRST inside the
+  // bootstrap, so the cutover can never undo it. Detached and retried on a
+  // bounded schedule; idempotent across restarts and replicas (per-partner
+  // registry lock). One Sentry event if it still ends incomplete; then, every
+  // 10 minutes, partners created since boot get their connection. Never logs
+  // the key.
+  void runEnvOpenAiBootstrapAtBoot()
+    .catch((err) => {
+      console.error('[startup] MCP_LLM_* env bootstrap failed:', safeErrorMessage(err));
+      captureException(reportableCutoverError(err), undefined, { area: 'ai_env_openai_bootstrap' });
+    });
+
+  // Storage keys that S3 backup destinations used before backups were written
+  // only through storage sessions are recorded once, so each stays listed
+  // until there is evidence it was disabled. Detached after serve() like the
+  // sweep above; idempotent (a destination whose current key is recorded is
+  // skipped) and never logs a key.
+  void runStartupTaskWithRetry('backup storage key history', () => baselineCredentialHistory(), {
+    hasFailures: (r) => r.failed > 0,
+    onFailure: ({ attempt, error }) =>
+      console.error(
+        `[startup] Recording backup storage key history attempt ${attempt + 1} failed:`,
+        error instanceof Error ? error.name : error ? 'unknown' : 'destination failures',
+      ),
+  })
+    .then((result) => {
+      if (result.recorded > 0 || result.failed > 0) {
+        console.log(
+          `[startup] Backup storage key history: ${result.recorded} recorded, ${result.failed} failed `
+          + `(${result.scanned} S3 destination(s) scanned)`,
+        );
+      }
+    })
+    .catch((err) => {
+      console.error('[startup] Recording backup storage key history failed:', err instanceof Error ? err.name : 'unknown');
+      captureException(err, undefined, { area: 'backup_storage_key_history' });
     });
 
   // W05d — convert whatever legacy alerting the W05c release left unconverted,
@@ -1908,7 +2030,9 @@ async function bootstrap(): Promise<void> {
   installSignalHandlers();
 }
 
-void bootstrap().catch((error) => {
-  console.error('[CRITICAL] API startup failed:', error);
-  process.exit(1);
-});
+if (!process.env.VITEST) {
+  void bootstrap().catch((error) => {
+    console.error('[CRITICAL] API startup failed:', error);
+    process.exit(1);
+  });
+}

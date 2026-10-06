@@ -6,6 +6,7 @@ import type { SQL } from 'drizzle-orm';
 const queueCommandForExecutionMock = vi.fn();
 const queueBackupStopCommandMock = vi.fn();
 const authorizeResilienceResourcesMock = vi.fn();
+const cancelBareMetalRecoveryMock = vi.fn();
 const runOutsideDbContextMock = vi.fn((fn: () => unknown) => fn());
 const authzState = vi.hoisted(() => ({
   allowedPermissions: new Set<string>(['*:*']),
@@ -111,6 +112,13 @@ vi.mock('../../services/commandQueue', () => ({
   },
   queueBackupStopCommand: (...args: unknown[]) => queueBackupStopCommandMock(...(args as [])),
   queueCommandForExecution: (...args: unknown[]) => queueCommandForExecutionMock(...(args as [])),
+}));
+
+vi.mock('../../services/bareMetalRecoveryService', () => ({
+  cancelBareMetalRecovery: (...args: unknown[]) => cancelBareMetalRecoveryMock(...(args as [])),
+  BareMetalRecoveryError: class BareMetalRecoveryError extends Error {
+    constructor(public code: string, public status = 409) { super(code); }
+  },
 }));
 
 vi.mock('../../services/backupMetrics', () => ({
@@ -683,6 +691,73 @@ describe('restore routes', () => {
     });
   });
 
+  it('does not present warnings on a completed restore as an error summary', async () => {
+    const row = (status: string) => ({
+      id: 'restore-3',
+      snapshotId: 'snap-1',
+      deviceId: 'device-1',
+      restoreType: 'full',
+      selectedPaths: [],
+      status,
+      targetPath: null,
+      startedAt: new Date('2026-04-01T00:00:00Z'),
+      completedAt: new Date('2026-04-01T00:05:00Z'),
+      restoredSize: 10,
+      restoredFiles: 1,
+      targetConfig: {
+        result: {
+          commandType: 'backup_restore',
+          status,
+          warnings: ['restored from an unattested snapshot: files were not checked against a snapshot attestation'],
+        },
+      },
+      commandId: 'cmd-3',
+      createdAt: new Date('2026-04-01T00:00:00Z'),
+      updatedAt: new Date('2026-04-01T00:05:00Z'),
+    });
+
+    selectMock.mockReturnValueOnce(chainMock([row('completed')]));
+    const completed = await (await app.request('/restore/restore-3', { method: 'GET' })).json();
+    expect(completed.data.errorSummary).toBeNull();
+    expect(completed.data.resultDetails.warnings).toHaveLength(1);
+
+    selectMock.mockReturnValueOnce(chainMock([row('partial')]));
+    const partial = await (await app.request('/restore/restore-3', { method: 'GET' })).json();
+    expect(partial.data.errorSummary).toBeNull();
+  });
+
+  it('uses the first non-advisory warning as the summary of a partial restore', async () => {
+    selectMock.mockReturnValueOnce(chainMock([{
+      id: 'restore-4',
+      snapshotId: 'snap-1',
+      deviceId: 'device-1',
+      restoreType: 'full',
+      selectedPaths: [],
+      status: 'partial',
+      targetPath: null,
+      startedAt: new Date('2026-04-01T00:00:00Z'),
+      completedAt: new Date('2026-04-01T00:05:00Z'),
+      restoredSize: 10,
+      restoredFiles: 1,
+      targetConfig: {
+        result: {
+          commandType: 'backup_restore',
+          status: 'partial',
+          warnings: [
+            'restored from an unattested snapshot: files were not checked against a snapshot attestation',
+            'vault copy differs from backup; restored from primary storage: snapshots/s1/files/a',
+            'C:\\Data\\x.bin: access denied',
+          ],
+        },
+      },
+      commandId: 'cmd-4',
+      createdAt: new Date('2026-04-01T00:00:00Z'),
+      updatedAt: new Date('2026-04-01T00:05:00Z'),
+    }]));
+    const body = await (await app.request('/restore/restore-4', { method: 'GET' })).json();
+    expect(body.data.errorSummary).toBe('C:\\Data\\x.bin: access denied');
+  });
+
   it('surfaces immediate dispatch failure details through the read API', async () => {
     selectMock.mockReturnValueOnce(
       chainMock([{
@@ -943,6 +1018,86 @@ describe('restore routes', () => {
 
     expect(res.status).toBe(200);
     expect(queueBackupStopCommandMock).not.toHaveBeenCalled();
+  });
+
+  describe('rebuild-engine jobs (#7512)', () => {
+    const rebuildJob = (status: string) => ({
+      id: 'restore-r1',
+      orgId: 'org-1',
+      snapshotId: 'snap-db-1',
+      deviceId: 'device-1',
+      restoreType: 'full',
+      selectedPaths: [],
+      status,
+      targetPath: null,
+      startedAt: null,
+      completedAt: null,
+      restoredSize: null,
+      restoredFiles: null,
+      targetConfig: { engine: 'rebuild', recoveryId: 'recovery-1' },
+      commandId: 'command-r1',
+      createdAt: new Date('2026-04-01T00:00:00Z'),
+      updatedAt: new Date('2026-04-01T00:00:00Z'),
+    });
+
+    it('closes the bare-metal recovery when a queued rebuild is cancelled', async () => {
+      selectMock.mockReturnValueOnce(chainMock([rebuildJob('pending')]));
+      updateMock.mockReturnValueOnce(chainMock([{ ...rebuildJob('cancelled') }]));
+      deleteMock.mockReturnValueOnce(chainMock([{ id: 'command-r1' }]));
+      cancelBareMetalRecoveryMock.mockResolvedValue({});
+
+      const res = await app.request('/restore/restore-r1/cancel', { method: 'POST' });
+
+      expect(res.status).toBe(200);
+      expect(cancelBareMetalRecoveryMock).toHaveBeenCalledWith(
+        expect.objectContaining({ recoveryId: 'recovery-1', orgId: 'org-1' }),
+      );
+      expect(queueBackupStopCommandMock).not.toHaveBeenCalled();
+    });
+
+    it('warns when the bare-metal recovery could not be closed', async () => {
+      selectMock.mockReturnValueOnce(chainMock([rebuildJob('pending')]));
+      updateMock.mockReturnValueOnce(chainMock([{ ...rebuildJob('cancelled') }]));
+      deleteMock.mockReturnValueOnce(chainMock([{ id: 'command-r1' }]));
+      cancelBareMetalRecoveryMock.mockRejectedValue(new Error('db down'));
+
+      const res = await app.request('/restore/restore-r1/cancel', { method: 'POST' });
+
+      expect(res.status).toBe(200);
+      expect((await res.json()).warning).toMatch(/recovery could not be closed/);
+    });
+
+    it('cancels a pending rebuild that has no command', async () => {
+      selectMock.mockReturnValueOnce(chainMock([{ ...rebuildJob('pending'), commandId: null }]));
+      updateMock.mockReturnValueOnce(chainMock([{ ...rebuildJob('cancelled') }]));
+      cancelBareMetalRecoveryMock.mockResolvedValue({});
+
+      const res = await app.request('/restore/restore-r1/cancel', { method: 'POST' });
+
+      expect(res.status).toBe(200);
+      expect(cancelBareMetalRecoveryMock).toHaveBeenCalled();
+    });
+
+    it('refuses to cancel a rebuild that is already running', async () => {
+      selectMock.mockReturnValueOnce(chainMock([rebuildJob('running')]));
+
+      const res = await app.request('/restore/restore-r1/cancel', { method: 'POST' });
+
+      expect(res.status).toBe(409);
+      expect(updateMock).not.toHaveBeenCalled();
+      expect(cancelBareMetalRecoveryMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses when the rebuild command was already delivered', async () => {
+      selectMock.mockReturnValueOnce(chainMock([rebuildJob('pending')]));
+      deleteMock.mockReturnValueOnce(chainMock([]));
+
+      const res = await app.request('/restore/restore-r1/cancel', { method: 'POST' });
+
+      expect(res.status).toBe(409);
+      expect(updateMock).not.toHaveBeenCalled();
+      expect(cancelBareMetalRecoveryMock).not.toHaveBeenCalled();
+    });
   });
 });
 

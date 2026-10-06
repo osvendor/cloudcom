@@ -1,0 +1,64 @@
+/**
+ * AI model registry (#7598): the features that call a model (spec §4). The
+ * W02 `ai_model_assignments.surface` / `role` CHECKs mirror these. Leaf module.
+ */
+export const AI_SURFACES = [
+  'chat',
+  'helper',
+  'script_builder',
+  'script_reviewer',
+  'office_chat',
+  'office_ticket',
+  'ai_agents',
+  'catalog_enrichment',
+  'extension_content',
+  'patch_test',
+] as const;
+export type AiSurface = (typeof AI_SURFACES)[number];
+
+/** Every surface resolves `default`. `ai_agents` also has the W09 escalation stages. */
+export const AI_SURFACE_ROLES: Readonly<Record<AiSurface, readonly string[]>> = Object.freeze({
+  chat: ['default'],
+  helper: ['default'],
+  script_builder: ['default'],
+  script_reviewer: ['default'],
+  office_chat: ['default'],
+  office_ticket: ['default'],
+  ai_agents: ['default', 'triage', 'analysis', 'remediation'],
+  catalog_enrichment: ['default'],
+  extension_content: ['default'],
+  patch_test: ['default'],
+});
+
+/** W09 (#7607): the escalation stages an `ai_agents` run resolves (#7570). Mirrors AI_SURFACE_ROLES.ai_agents minus 'default'. */
+export const AI_AGENT_ESCALATION_ROLES = ['triage', 'analysis', 'remediation'] as const;
+export type AiAgentEscalationRole = (typeof AI_AGENT_ESCALATION_ROLES)[number];
+
+/** W09: the longest ordered failover list on one assignment row (the DB CHECK mirrors it). */
+export const MAX_FALLBACK_OFFERINGS = 5;
+
+/** An offering without verified tool support can't be assigned or permitted here (spec §7). */
+export const TOOL_REQUIRING_SURFACES = [
+  'chat',
+  'helper',
+  'script_builder',
+  'ai_agents',
+  'office_chat',
+] as const satisfies readonly AiSurface[];
+
+/**
+ * AI chargeback (#7608, spec §8): surfaces whose usage an MSP may rebill to the
+ * client org. The rest is the MSP's own tooling (catalog enrichment,
+ * extension content, patch tests) and is never chargeable. The script reviewer is
+ * chargeable (client work; decided by Todd 2026-10-02, #7598). Changing this
+ * list changes only future stamps (snapshot rule).
+ */
+export const AI_CHARGEBACK_ELIGIBLE_SURFACES = [
+  'chat',
+  'helper',
+  'script_builder',
+  'script_reviewer',
+  'office_chat',
+  'office_ticket',
+  'ai_agents',
+] as const satisfies readonly AiSurface[];

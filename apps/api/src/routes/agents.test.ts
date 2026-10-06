@@ -1,10 +1,16 @@
 import { createHash } from 'crypto';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Hono } from 'hono';
+import { ERROR_CODES } from '@breeze/shared';
 import { agentRoutes } from './agents';
 
 // Public download routes (routes/agents/download.ts) take their per-IP
 // limiter's Redis client from ../services and fail closed (503) without one.
+// services/aiAgent.ts (reached transitively) resolves session models through
+// the registry (W03 #7601); stub its DB adapters under this partial schema mock.
+vi.mock('../services/aiModels/sessionModel', () => ({ chooseSessionModel: vi.fn() }));
+vi.mock('../services/aiModels/candidateLoader', () => ({ readOrgPartnerId: vi.fn() }));
+
 vi.mock('../services', () => ({
   getRedis: vi.fn(() => ({})),
 }));
@@ -816,7 +822,7 @@ describe('agent routes', () => {
 
       expect(res.status).toBe(401);
       const body = await res.json() as { code?: string; expected?: string; declared?: string };
-      expect(body.code).toBe('re_enrollment_required');
+      expect(body.code).toBe(ERROR_CODES.RE_ENROLLMENT_REQUIRED);
       expect(body.expected).toBe('agent');
       expect(body.declared).toBe('watchdog');
       expect(claimPendingCommandsForDevice).not.toHaveBeenCalled();

@@ -2,7 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // db is mocked so the handler never touches Postgres. The insert/update mocks
 // double as spies that assert we never WRITE a fail-open autoApprove shape.
-const { insertMock, updateMock, selectMock, resolvePolicyDeviceIdsMock, schedulePolicyDevicesMock } = vi.hoisted(() => ({
+const { insertMock, updateMock, selectMock, resolvePolicyDeviceIdsMock, schedulePolicyDevicesMock, recordCredentialChangeMock, txn } = vi.hoisted(() => ({
+  recordCredentialChangeMock: vi.fn(async () => undefined),
+  txn: { depth: 0, log: [] as string[] },
   insertMock: vi.fn(),
   updateMock: vi.fn(),
   selectMock: vi.fn(),
@@ -20,6 +22,14 @@ vi.mock('../db', () => ({
     insert: insertMock,
     update: updateMock,
     select: selectMock,
+  },
+  withDbTransaction: async (fn: () => Promise<unknown>) => {
+    txn.depth += 1;
+    try {
+      return await fn();
+    } finally {
+      txn.depth -= 1;
+    }
   },
 }));
 
@@ -52,6 +62,7 @@ vi.mock('./aiToolsSoftwarePolicyAudit', () => ({
 }));
 vi.mock('../db/schema/peripheralControl', () => ({ peripheralPolicies: {} }));
 vi.mock('../db/schema/backup', () => ({ backupConfigs: {}, backupProfiles: {} }));
+vi.mock('./backupStorageCredentialHistory', () => ({ recordCredentialChange: recordCredentialChangeMock }));
 
 import { registerPolicyPrereqTools } from './aiToolsPolicyPrereqs';
 
@@ -133,13 +144,16 @@ function mockInsertReturns(row: Record<string, unknown>) {
 }
 
 function mockSelectReturns(row: Record<string, unknown> | undefined) {
+  const rows = row ? [row] : [];
+  const forUpdate = vi.fn().mockResolvedValue(rows);
   selectMock.mockReturnValue({
     from: vi.fn().mockReturnValue({
       where: vi.fn().mockReturnValue({
-        limit: vi.fn().mockResolvedValue(row ? [row] : []),
+        limit: vi.fn(() => Object.assign(Promise.resolve(rows), { for: forUpdate })),
       }),
     }),
   });
+  return forUpdate;
 }
 
 function mockUpdate() {
@@ -689,6 +703,29 @@ describe('manage_backup_configs S3 endpoint validation (Sentry BREEZE-P residual
     expect(setArg.providerConfig.accessKey).toBe('fresh-access-key');
     expect(setArg.providerConfig.secretKey).toBe('fresh-secret-key');
   });
+  it('get omits the stored encryption key and provider credentials from the result', async () => {
+    mockSelectReturns({
+      id: BACKUP_CONFIG_ID,
+      orgId: ORG_ID,
+      name: 'S3 backup',
+      provider: 's3',
+      encryption: true,
+      encryptionKey: 'stored-backup-encryption-key',
+      providerConfig: {
+        bucket: 'backups', region: 'us-east-1', accessKey: 'stored-access-key', secretKey: 'stored-secret-key',
+      },
+    });
+    const tool = getBackupConfigsTool();
+    const output = await tool.handler({ action: 'get', configId: BACKUP_CONFIG_ID }, makeOrgAuth());
+
+    expect(output).not.toContain('stored-backup-encryption-key');
+    expect(output).not.toContain('stored-access-key');
+    expect(output).not.toContain('stored-secret-key');
+    const parsed = JSON.parse(output);
+    expect(parsed.config).not.toHaveProperty('encryptionKey');
+    expect(parsed.config).toMatchObject({ id: BACKUP_CONFIG_ID, name: 'S3 backup', encryption: true });
+    expect(parsed.config.providerConfig).toMatchObject({ bucket: 'backups', region: 'us-east-1' });
+  });
 });
 
 /**
@@ -937,5 +974,147 @@ describe('write-org resolution for org-owning creates (#6667)', () => {
       const values = insertMock.mock.results[0]!.value.values.mock.calls[0][0];
       expect(values.orgId).toBe('org-2');
     });
+  });
+});
+
+describe('manage_backup_configs refuses destination values in the stored encrypted format', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each(['create', 'update'] as const)('%s', async (action) => {
+    const { encryptSecret } = await import('./secretCrypto');
+    const tool = getBackupConfigsTool();
+    const output = await tool.handler(
+      {
+        action,
+        configId: BACKUP_CONFIG_ID,
+        name: 'S3 backup',
+        type: 'file',
+        provider: 's3',
+        providerConfig: {
+          bucket: 'backups',
+          region: 'us-east-1',
+          accessKey: 'key',
+          secretKey: encryptSecret('sealed-elsewhere'),
+        },
+      },
+      makeOrgAuth()
+    );
+
+    expect(JSON.parse(output).error).toMatch(/internal encrypted format/);
+    expect(insertMock).not.toHaveBeenCalled();
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('manage_backup_configs get masks every destination credential', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('shows whether each credential is set, never its value', async () => {
+    mockSelectReturns({
+      id: BACKUP_CONFIG_ID,
+      name: 'S3 backup',
+      provider: 's3',
+      providerConfig: {
+        bucket: 'backups',
+        region: 'us-east-1',
+        accessKey: 'AKIA-PLAIN',
+        secretKey: 'plain-secret',
+        sessionToken: 'plain-session',
+        secretAccessKey: 'plain-legacy-secret',
+      },
+    });
+    const output = await getBackupConfigsTool().handler({ action: 'get', configId: BACKUP_CONFIG_ID }, makeOrgAuth());
+
+    const parsed = JSON.parse(output);
+    expect(parsed.config.providerConfig.bucket).toBe('backups');
+    expect(parsed.config.providerConfig.sessionToken).toEqual({ redacted: true, hasSecret: true, masked: '********' });
+    expect(output).not.toMatch(/AKIA-PLAIN|plain-secret|plain-session|plain-legacy-secret/);
+  });
+});
+
+describe('manage_backup_configs storage key history', () => {
+  const S3 = { bucket: 'backups', region: 'us-east-1', accessKey: 'key', secretKey: 'secret' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('records the key of a destination it creates', async () => {
+    mockInsertReturns({ id: BACKUP_CONFIG_ID, name: 'S3 backup', provider: 's3', providerConfig: S3 });
+    const output = await getBackupConfigsTool().handler(
+      { action: 'create', name: 'S3 backup', type: 'file', provider: 's3', providerConfig: S3 },
+      makeOrgAuth(),
+    );
+    expect(JSON.parse(output).success).toBe(true);
+    expect(recordCredentialChangeMock).toHaveBeenCalledWith({
+      orgId: ORG_ID,
+      configId: BACKUP_CONFIG_ID,
+      previous: null,
+      next: { provider: 's3', providerConfig: S3 },
+    });
+  });
+
+  it('records a destination it changes, with its settings before and after', async () => {
+    mockSelectReturns({ id: BACKUP_CONFIG_ID, orgId: ORG_ID, name: 'S3 backup', provider: 's3', providerConfig: S3 });
+    mockUpdate();
+    const output = await getBackupConfigsTool().handler(
+      { action: 'update', configId: BACKUP_CONFIG_ID, providerConfig: { ...S3, accessKey: 'key2', secretKey: 'secret2' } },
+      makeOrgAuth(),
+    );
+    expect(JSON.parse(output).success).toBe(true);
+    expect(recordCredentialChangeMock).toHaveBeenCalledWith(expect.objectContaining({
+      orgId: ORG_ID,
+      configId: BACKUP_CONFIG_ID,
+      previous: { provider: 's3', providerConfig: S3 },
+      next: { provider: 's3', providerConfig: expect.objectContaining({ accessKey: 'key2', secretKey: 'secret2' }) },
+    }));
+  });
+
+  it('records nothing for a change that does not touch the destination', async () => {
+    mockSelectReturns({ id: BACKUP_CONFIG_ID, orgId: ORG_ID, name: 'S3 backup', provider: 's3', providerConfig: S3 });
+    mockUpdate();
+    await getBackupConfigsTool().handler({ action: 'update', configId: BACKUP_CONFIG_ID, name: 'Renamed' }, makeOrgAuth());
+    expect(recordCredentialChangeMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('manage_backup_configs writes a destination change and its key record together', () => {
+  const S3 = { bucket: 'backups', region: 'us-east-1', accessKey: 'key', secretKey: 'secret' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    txn.depth = 0;
+    txn.log = [];
+    recordCredentialChangeMock.mockImplementation(async () => { txn.log.push(`record:${txn.depth}`); });
+  });
+
+  it('locks the destination it reads and updates it in the same transaction as the key record', async () => {
+    const forUpdate = mockSelectReturns({ id: BACKUP_CONFIG_ID, orgId: ORG_ID, name: 'S3 backup', provider: 's3', providerConfig: S3 });
+    updateMock.mockImplementation(() => {
+      txn.log.push(`update:${txn.depth}`);
+      return { set: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }) };
+    });
+    await getBackupConfigsTool().handler(
+      { action: 'update', configId: BACKUP_CONFIG_ID, providerConfig: { ...S3, accessKey: 'key2', secretKey: 'secret2' } },
+      makeOrgAuth(),
+    );
+    expect(forUpdate).toHaveBeenCalledWith('update');
+    expect(txn.log).toEqual(['update:1', 'record:1']);
+  });
+
+  it('creates a destination and records its key in one transaction', async () => {
+    insertMock.mockImplementation(() => {
+      txn.log.push(`insert:${txn.depth}`);
+      return { values: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ id: BACKUP_CONFIG_ID, name: 'S3', provider: 's3', providerConfig: S3 }]) }) };
+    });
+    await getBackupConfigsTool().handler(
+      { action: 'create', name: 'S3 backup', type: 'file', provider: 's3', providerConfig: S3 },
+      makeOrgAuth(),
+    );
+    expect(txn.log).toEqual(['insert:1', 'record:1']);
   });
 });

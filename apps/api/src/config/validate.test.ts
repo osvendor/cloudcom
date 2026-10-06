@@ -122,6 +122,22 @@ describe('validateConfig', () => {
     });
   });
 
+  describe.each(['AGENT_ENROLL_RATE_LIMIT', 'AGENT_ENROLL_RATE_WINDOW_SECONDS'])('%s (#7472)', (name) => {
+    it('is valid when unset, blank, or a positive integer', () => {
+      withEnv(validEnv, () => { expect(() => validateConfig()).not.toThrow(); });
+      withEnv({ ...validEnv, [name]: '' }, () => { expect(() => validateConfig()).not.toThrow(); });
+      withEnv({ ...validEnv, [name]: '120' }, () => { expect(() => validateConfig()).not.toThrow(); });
+    });
+    it('accepts surrounding whitespace', () => {
+      withEnv({ ...validEnv, [name]: ' 10 ' }, () => { expect(() => validateConfig()).not.toThrow(); });
+    });
+    it.each(['0', '-1', 'ten', '1.5', '+5', '007', '99999999999999999999'])('refuses to boot on %s', (bad) => {
+      withEnv({ ...validEnv, [name]: bad }, () => {
+        expect(() => validateConfig()).toThrow(new RegExp(name));
+      });
+    });
+  });
+
   it('does not require IP classification provider configuration', () => {
     const previousProvider = process.env.IP_CLASSIFY_PROVIDER;
     const previousKey = process.env.IP_CLASSIFY_API_KEY;
@@ -1470,13 +1486,56 @@ describe('validateConfig', () => {
     });
   });
 
+  // W06 (#7604, D6): the env path bootstraps per-partner rows for EVERY
+  // partner, so it is self-host only — affirmatively declared, fail closed.
   const openAiCompatibleEnv = {
     ...validEnv,
+    IS_HOSTED: 'false',
     MCP_LLM_PROVIDER: 'openai-compatible',
-    MCP_LLM_BASE_URL: 'http://localhost:8000/v1',
+    MCP_LLM_BASE_URL: 'http://10.0.0.5:8000/v1',
     MCP_LLM_MODEL: 'test-model',
-    MCP_LLM_API_KEY: 'sk-test',
+    MCP_LLM_API_KEY: 'sk-test-key',
   };
+
+  it('refuses MCP_LLM_PROVIDER=openai-compatible on hosted, pointing at the per-partner connection', () => {
+    withEnv({ ...openAiCompatibleEnv, IS_HOSTED: 'true' }, () => {
+      expect(() => validateConfig()).toThrow(/MCP_LLM_PROVIDER=openai-compatible is for self-hosted Breeze/);
+      expect(() => validateConfig()).toThrow(/Partner Settings → AI Providers & Models/);
+    });
+  });
+
+  it('refuses MCP_LLM_PROVIDER=openai-compatible when IS_HOSTED is unset or unrecognised (fail closed)', () => {
+    for (const IS_HOSTED of ['', 'maybe']) {
+      withEnv({ ...openAiCompatibleEnv, IS_HOSTED }, () => {
+        expect(() => validateConfig()).toThrow(/MCP_LLM_PROVIDER=openai-compatible is for self-hosted Breeze/);
+      });
+    }
+  });
+
+  it('accepts a keyless openai-compatible endpoint (local model server)', () => {
+    const { MCP_LLM_API_KEY: _, ...rest } = openAiCompatibleEnv;
+    withEnv(rest as Record<string, string>, () => {
+      const config = validateConfig();
+      expect(config.MCP_LLM_PROVIDER).toBe('openai-compatible');
+    });
+    withEnv({ ...openAiCompatibleEnv, MCP_LLM_API_KEY: '' }, () => {
+      expect(validateConfig().MCP_LLM_PROVIDER).toBe('openai-compatible');
+    });
+  });
+
+  it('refuses an MCP_LLM_API_KEY shorter than 8 characters without echoing it', () => {
+    withEnv({ ...openAiCompatibleEnv, MCP_LLM_API_KEY: 'sk-Q7z' }, () => {
+      let message = '';
+      try {
+        validateConfig();
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toContain('MCP_LLM_API_KEY');
+      expect(message).toContain('at least 8 characters');
+      expect(message).not.toContain('sk-Q7z');
+    });
+  });
 
   it('requires MCP_LLM_MODEL when MCP_LLM_PROVIDER is openai-compatible', () => {
     const { MCP_LLM_MODEL: _, ...rest } = openAiCompatibleEnv;
@@ -1491,10 +1550,10 @@ describe('validateConfig', () => {
     });
   });
 
-  it('requires MCP_LLM_API_KEY when MCP_LLM_PROVIDER is openai-compatible', () => {
-    const { MCP_LLM_API_KEY: _, ...rest } = openAiCompatibleEnv;
+  it('requires MCP_LLM_BASE_URL when MCP_LLM_PROVIDER is openai-compatible', () => {
+    const { MCP_LLM_BASE_URL: _, ...rest } = openAiCompatibleEnv;
     withEnv(rest as Record<string, string>, () => {
-      expect(() => validateConfig()).toThrow('MCP_LLM_API_KEY');
+      expect(() => validateConfig()).toThrow('MCP_LLM_BASE_URL');
     });
   });
 
@@ -1503,7 +1562,7 @@ describe('validateConfig', () => {
       const config = validateConfig();
       expect(config.MCP_LLM_PROVIDER).toBe('openai-compatible');
       expect(config.MCP_LLM_MODEL).toBe('test-model');
-      expect(config.MCP_LLM_API_KEY).toBe('sk-test');
+      expect(config.MCP_LLM_API_KEY).toBe('sk-test-key');
     });
   });
 
@@ -3584,6 +3643,35 @@ describe('BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED boolean guard (#1374)', () =
       withoutEnv(['BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED'], () => {
         expect(validateConfig().BREEZE_AUTHENTICATOR_ATTESTATION_ENFORCED).toBeUndefined();
       });
+    });
+  });
+});
+
+// REMOTE_DESKTOP_FENCE_REQUIRED is required by default; a recognized false value
+// is the explicit opt-out. The runtime reader keeps the start fence required for
+// an unrecognized value, so a typo must refuse boot rather than leave an
+// operator believing they opted out.
+describe('REMOTE_DESKTOP_FENCE_REQUIRED boolean guard', () => {
+  it('is declared in the schema, so the superRefine rule actually runs', () => {
+    expect(ENV_SCHEMA_KEYS).toContain('REMOTE_DESKTOP_FENCE_REQUIRED');
+    expect(
+      buildEnvParseInput({ REMOTE_DESKTOP_FENCE_REQUIRED: 'sentinel' })
+        .REMOTE_DESKTOP_FENCE_REQUIRED,
+    ).toBe('sentinel');
+  });
+
+  it.each(['true', 'false', '1', '0', 'yes', 'no', 'on', 'off', 'FALSE', ' off '])(
+    'accepts the recognized boolean %j',
+    (value) => {
+      withEnv({ ...validEnv, REMOTE_DESKTOP_FENCE_REQUIRED: value }, () => {
+        expect(() => validateConfig()).not.toThrow();
+      });
+    },
+  );
+
+  it.each(['flase', 'enabled', 'ture'])('refuses boot on the typo %j', (value) => {
+    withEnv({ ...validEnv, REMOTE_DESKTOP_FENCE_REQUIRED: value }, () => {
+      expect(() => validateConfig()).toThrow(/REMOTE_DESKTOP_FENCE_REQUIRED/);
     });
   });
 });
