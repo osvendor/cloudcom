@@ -5,6 +5,11 @@ const input = { clientId: 'cloudcom-rustdesk-v1', redirectUri: 'http://127.0.0.1
 describe('native browser handoff', () => {
   it('accepts only one complete registered PKCE request', () => {
     expect(parseNativeLoginRequest(new URLSearchParams(input))).toEqual(input);
+    expect(parseNativeLoginRequest(new URLSearchParams({ ...input, 'cf-access-login': 'success' }))).toEqual(input);
+    expect(parseNativeLoginRequest(new URLSearchParams({ ...input, 'cf-access-login': 'failed' }))).toBeNull();
+    const accessDuplicate = new URLSearchParams({ ...input, 'cf-access-login': 'success' });
+    accessDuplicate.append('cf-access-login', 'success');
+    expect(parseNativeLoginRequest(accessDuplicate)).toBeNull();
     const duplicate = new URLSearchParams(input); duplicate.append('state', input.state);
     expect(parseNativeLoginRequest(duplicate)).toBeNull();
     expect(parseNativeLoginRequest(new URLSearchParams({ ...input, next: '/devices' }))).toBeNull();

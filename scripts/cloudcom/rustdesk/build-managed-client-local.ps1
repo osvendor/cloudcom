@@ -59,6 +59,10 @@ try {
         New-Item -ItemType Directory -Force "$Source\target\release\deps" | Out-Null
         Copy-Item "$CargoTargetDirectory\release\librustdesk.dll" "$Source\target\release\librustdesk.dll" -Force
         Copy-Item "$CargoTargetDirectory\release\deps\dylib_virtual_display.dll" "$Source\target\release\deps\dylib_virtual_display.dll" -Force
+        $env:CLOUDCOM_TEST_NATIVE_LIBRARY = "$Source\target\release\librustdesk.dll"
+        try {
+            Run 'native-retry-capability' "$flutter\flutter.bat" @('test','test/cloudcom_native_retry_capability_test.dart') "$Source\flutter"
+        } finally { Remove-Item Env:\CLOUDCOM_TEST_NATIVE_LIBRARY }
         Run 'flutter' "$flutter\flutter.bat" @('build','windows','--release','--dart-define=CLOUDCOM_ACCOUNT_ACCESS=true',"--dart-define=CLOUDCOM_ORIGIN=$Origin") "$Source\flutter"
         $bundle = Join-Path $Source 'flutter\build\windows\x64\runner\Release'
         Copy-Item "$Source\target\release\deps\dylib_virtual_display.dll" $bundle -Force

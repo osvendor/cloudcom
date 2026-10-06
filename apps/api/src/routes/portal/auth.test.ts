@@ -23,6 +23,7 @@ const { portalUserRow, activeOrgResult } = vi.hoisted(() => ({
 const resolveOrgTimezone = vi.hoisted(() => vi.fn(async () => 'UTC'));
 const gateway = vi.hoisted(() => vi.fn());
 const passwordCheck = vi.hoisted(() => vi.fn());
+const staffLookup = vi.hoisted(() => vi.fn());
 vi.mock('../../services/portalCompanyGateway', () => ({ checkPortalCompanyGateway: gateway }));
 vi.mock('../../services/password', () => ({ verifyPassword: passwordCheck, hashPassword: vi.fn(), isPasswordStrong: vi.fn() }));
 
@@ -44,8 +45,8 @@ vi.mock('../../db', () => ({
   db: {
     update: () => ({ set: () => ({ where: async () => undefined }) }),
     select: (columns: Record<string, unknown>) => ({
-      from: () => ({
-        where: () => ({ limit: () => Promise.resolve(project(columns)) }),
+      from: (table: Record<string, unknown>) => ({
+        where: () => ({ limit: () => table.id === 'staff-id' ? staffLookup() : Promise.resolve(project(columns)) }),
       }),
     }),
   },
@@ -65,6 +66,7 @@ vi.mock('../../db/schema', () => ({
     status: 'status',
   },
   portalBranding: { orgId: 'orgId', enablePasswordReset: 'enablePasswordReset' },
+  users: { id: 'staff-id', email: 'staff-email' },
 }));
 vi.mock('../../services/email', () => ({ getEmailService: () => null }));
 vi.mock('../../services/tenantStatus', () => ({
@@ -101,6 +103,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   gateway.mockResolvedValue({ ok: true, orgId: ORG_ID });
   passwordCheck.mockResolvedValue(true);
+  staffLookup.mockResolvedValue([]);
   portalSessions.clear();
   portalUserRow.current = {
     id: USER_ID,
@@ -118,11 +121,11 @@ beforeEach(() => {
 });
 
 describe('two-step remote login', () => {
-  function login() {
+  function login(unifiedNative = false) {
     const app = new Hono(); app.route('/', authRoutes);
     return app.request('/auth/login', { method: 'POST', headers: {
       'Content-Type': 'application/json', 'Cf-Access-Jwt-Assertion': 'company-assertion',
-    }, body: JSON.stringify({ email: 'cust@acme.example', password: 'synthetic-password' }) });
+    }, body: JSON.stringify({ email: 'cust@acme.example', password: 'synthetic-password', unifiedNative }) });
   }
   beforeEach(() => { portalUserRow.current!.passwordHash = 'synthetic-hash'; portalUserRow.current!.accessMode = 'remote_only'; });
   it('does not issue a session when a correct individual password has the wrong company', async () => {
@@ -140,6 +143,35 @@ describe('two-step remote login', () => {
     const response = await login(); expect(response.status).toBe(200);
     expect((await response.json()).user.accessMode).toBe('remote_only');
     expect(portalSessions.size).toBe(1);
+  });
+  it('does not turn a staff denial into a customer session for a shared identity', async () => {
+    staffLookup.mockResolvedValue([{ id: 'staff-account' }]);
+    const response = await login(true);
+    expect(response.status).toBe(401);
+    expect(await response.json()).toEqual({ error: 'Invalid email or password' });
+    expect(portalSessions.size).toBe(0);
+    expect(gateway).not.toHaveBeenCalled();
+  });
+  it('does not query staff identity before proving the customer password', async () => {
+    passwordCheck.mockResolvedValue(false);
+    expect((await login(true)).status).toBe(401);
+    expect(staffLookup).not.toHaveBeenCalled();
+  });
+  it('allows an authenticated remote customer through the existing company gate', async () => {
+    expect((await login(true)).status).toBe(200);
+    expect(staffLookup).toHaveBeenCalledOnce();
+    expect(gateway).toHaveBeenCalledWith('company-assertion', ORG_ID);
+    expect(portalSessions.size).toBe(1);
+  });
+  it('preserves ordinary portal login when the unified flow is not requested', async () => {
+    staffLookup.mockResolvedValue([{ id: 'staff-account' }]);
+    expect((await login()).status).toBe(200);
+    expect(staffLookup).not.toHaveBeenCalled();
+  });
+  it('does not issue a unified remote login for a standard portal account', async () => {
+    portalUserRow.current!.accessMode = 'standard';
+    expect((await login(true)).status).toBe(403);
+    expect(portalSessions.size).toBe(0);
   });
 });
 

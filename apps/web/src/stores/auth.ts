@@ -1558,6 +1558,7 @@ export async function getPasskeyCredential(
 
 export async function apiLogin(email: string, password: string): Promise<{
   success: boolean;
+  status?: number;
   mfaRequired?: boolean;
   challenge?: MfaChallenge;
   tempToken?: string;
@@ -1580,7 +1581,7 @@ export async function apiLogin(email: string, password: string): Promise<{
     const data = await response.json();
 
     if (!response.ok) {
-      return { success: false, error: extractApiError(data, 'Login failed') };
+      return { success: false, status: response.status, error: extractApiError(data, 'Login failed') };
     }
 
     if (data.mfaRequired) {

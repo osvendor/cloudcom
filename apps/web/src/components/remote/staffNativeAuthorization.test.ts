@@ -13,6 +13,9 @@ describe('staff native authorization request validation', () => {
   it('accepts the exact S256 request and rejects malformed, duplicate, or unsafe query values', () => {
     const query = new URLSearchParams(request).toString();
     expect(readStaffNativeAuthorizationRequest(`?${query}`)).toEqual(request);
+    expect(readStaffNativeAuthorizationRequest(`?${query}&cf-access-login=success`)).toEqual(request);
+    expect(readStaffNativeAuthorizationRequest(`?${query}&cf-access-login=failed`)).toBeNull();
+    expect(readStaffNativeAuthorizationRequest(`?${query}&cf-access-login=success&cf-access-login=success`)).toBeNull();
     expect(readStaffNativeAuthorizationRequest(`?${query}&state=${state}`)).toBeNull();
     expect(readStaffNativeAuthorizationRequest(`?${query}&extra=1`)).toBeNull();
     expect(readStaffNativeAuthorizationRequest(`?${query.replace('127.0.0.1%3A1024', 'localhost%3A1024')}`)).toBeNull();

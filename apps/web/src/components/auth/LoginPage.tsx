@@ -156,9 +156,11 @@ async function bootstrapThenNavigate(url: string): Promise<void> {
 
 interface LoginPageProps {
   next?: string;
+  authenticate?: typeof apiLogin;
+  skipAutomaticStaffSso?: boolean;
 }
 
-export default function LoginPage({ next }: LoginPageProps = {}) {
+export default function LoginPage({ next, authenticate = apiLogin, skipAutomaticStaffSso = false }: LoginPageProps = {}) {
   const { t } = useTranslation('auth');
   const safeNext = getSafeNext(next);
   const [error, setError] = useState<string>();
@@ -234,7 +236,7 @@ export default function LoginPage({ next }: LoginPageProps = {}) {
     // Post-redirect bounce / explicit sign-out: skip the check and show the
     // form immediately (one tick after mount, so SSR and CSR still agree on the
     // initial placeholder render).
-    if (shouldSkipCfAccessRedirect()) {
+    if (skipAutomaticStaffSso || shouldSkipCfAccessRedirect()) {
       setCfAccessRedirectChecked(true);
       return;
     }
@@ -256,13 +258,13 @@ export default function LoginPage({ next }: LoginPageProps = {}) {
       setCfAccessRedirectChecked(true);
     });
     return () => { cancelled = true; };
-  }, [cfAccessRedirectChecked, safeNext]);
+  }, [cfAccessRedirectChecked, safeNext, skipAutomaticStaffSso]);
 
   const handleLogin = async (values: { email: string; password: string }) => {
     setLoading(true);
     setError(undefined);
 
-    const result = await apiLogin(values.email, values.password);
+    const result = await authenticate(values.email, values.password);
 
     if (!result.success) {
       setError(result.error);

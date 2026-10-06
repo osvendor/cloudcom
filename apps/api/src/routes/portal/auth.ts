@@ -6,7 +6,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { createHash } from 'crypto';
 import { db, withDbAccessContext, withSystemDbAccessContext } from '../../db';
-import { organizations, portalBranding, portalUsers } from '../../db/schema';
+import { organizations, portalBranding, portalUsers, users } from '../../db/schema';
 import { hashPassword, isPasswordStrong, verifyPassword } from '../../services/password';
 import { getEmailService } from '../../services/email';
 import { getRedis } from '../../services/redis';
@@ -420,7 +420,7 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
 authRoutes.post('/auth/login', zValidator('json', loginSchema), async (c) => {
   sweepPortalState();
 
-  const { email, password, orgId } = c.req.valid('json');
+  const { email, password, orgId, unifiedNative } = c.req.valid('json');
   const normalizedEmail = normalizeEmail(email);
   const clientIp = getClientIp(c);
   const ipRateKey = `portal:login:ip:${rateLimitIpKey(clientIp)}`;
@@ -475,6 +475,19 @@ authRoutes.post('/auth/login', zValidator('json', loginSchema), async (c) => {
   const validPassword = await verifyPassword(user.passwordHash, password);
   if (!validPassword) {
     return c.json({ error: 'Invalid email or password' }, 401);
+  }
+
+  if (unifiedNative) {
+    // A staff denial can mean locked, disabled, SSO-only, or MFA policy failure.
+    // Only after verifying a portal password, reject ambiguous identities rather
+    // than interpreting the staff endpoint's deliberately generic 401 as routing.
+    const [staffIdentity] = await withSystemDbAccessContext(() => db
+      .select({ id: users.id }).from(users)
+      .where(eq(users.email, normalizedEmail)).limit(1));
+    if (staffIdentity) return c.json({ error: 'Invalid email or password' }, 401);
+    if (user.accessMode !== 'remote_only') {
+      return c.json({ error: 'This account is not enabled for remote access' }, 403);
+    }
   }
 
   if (user.status !== 'active') {

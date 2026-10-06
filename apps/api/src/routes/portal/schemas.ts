@@ -150,7 +150,8 @@ export const brandingParamSchema = z.object({
 export const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
-  orgId: z.string().guid().optional()
+  orgId: z.string().guid().optional(),
+  unifiedNative: z.boolean().optional()
 });
 
 export const forgotPasswordSchema = z.object({

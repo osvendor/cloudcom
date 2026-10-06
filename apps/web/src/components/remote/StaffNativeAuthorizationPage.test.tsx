@@ -45,6 +45,16 @@ describe('StaffNativeAuthorizationPage', () => {
     expect(mocks.fetchWithAuth).not.toHaveBeenCalled();
   });
 
+  it('adds the authority only after validating the unified callback', async () => {
+    window.history.replaceState({}, '', window.location.pathname + window.location.search + '&unified=1');
+    const callback = 'http://127.0.0.1:1024/cloudcom/callback?code=' + 'A'.repeat(43) + '&state=' + 'A'.repeat(43);
+    mocks.runAction.mockResolvedValue({ redirectUri: callback });
+    const navigate = vi.fn();
+    render(<StaffNativeAuthorizationPage navigate={navigate} />);
+    fireEvent.click(screen.getByTestId('staff-native-continue-button'));
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith(callback + '&authority=staff'));
+  });
+
   it('displays an error and refuses to navigate when the server returns an unsafe callback', async () => {
     mocks.runAction.mockResolvedValue({ redirectUri: 'https://attacker.example/?code=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB&state=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' });
     const navigate = vi.fn();

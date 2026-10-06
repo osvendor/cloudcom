@@ -16,6 +16,11 @@ const ONE_TIME_CODE = /^[A-Za-z0-9_-]{43}$/;
 
 export function readStaffNativeAuthorizationRequest(search: string): StaffNativeAuthorizationRequest | null {
   const params = new URLSearchParams(search);
+  // Cloudflare Access appends this after browser authentication. It is only
+  // transport metadata, never proof of a Breeze identity or authorization.
+  if (params.getAll('cf-access-login').length === 1 && params.get('cf-access-login') === 'success') {
+    params.delete('cf-access-login');
+  }
   const keys = ['clientId', 'redirectUri', 'codeChallenge', 'codeChallengeMethod', 'state'] as const;
   if (keys.some((key) => params.getAll(key).length !== 1) || [...params.keys()].some((key) => !keys.includes(key as typeof keys[number]))) return null;
   const request = {
