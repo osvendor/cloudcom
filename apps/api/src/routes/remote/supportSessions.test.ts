@@ -28,6 +28,12 @@ const { endSupportSession } = vi.hoisted(() => ({
   }> => Promise.resolve({ ended: true, disconnect: 'closed', commandDelivered: true })),
 }));
 
+// The shared capability gate has its own flag/compatibility tests; isolate this
+// route from its Redis and worker dependencies.
+vi.mock('../../services/remoteRevocationLease', () => ({
+  isDesktopFenceCapable: (version: number) => version === 1,
+}));
+
 vi.mock('../../services/quickSupportOrg', () => ({ getOrCreateQuickSupportOrg }));
 vi.mock('../../services/quickSupportEnd', () => ({ endSupportSession }));
 vi.mock('./helpers', () => ({ logSessionAudit }));
@@ -44,6 +50,14 @@ vi.mock('../../services/partnerTrust', () => ({
     meetingUrl: null,
   }),
 }));
+
+const { createRemoteSession, RemoteSessionDeniedError } = vi.hoisted(() => ({
+  createRemoteSession: vi.fn(),
+  RemoteSessionDeniedError: class extends Error {
+    constructor(public code: string, public reason: string) { super(code); }
+  },
+}));
+vi.mock('../../services/remoteSessionCreate', () => ({ createRemoteSession, RemoteSessionDeniedError }));
 
 // Scripted select results, consumed in call order.
 const selectResults: unknown[][] = [];
@@ -147,6 +161,13 @@ beforeEach(() => {
   process.env.PUBLIC_WEB_URL = 'https://us.2breeze.app';
 });
 
+beforeEach(() => {
+  createRemoteSession.mockImplementation(async (_kind: string, input: unknown) => {
+    insertedValues.push(input);
+    return insertReturns.shift()?.[0];
+  });
+});
+
 describe('POST /support-sessions', () => {
   it('creates a session and returns the formatted code exactly once', async () => {
     insertReturns.push([SESSION_ROW]);
@@ -170,13 +191,7 @@ describe('POST /support-sessions', () => {
   });
 
   it('maps partner-trust denial to a 403 without inserting', async () => {
-    partnerTrustMode.mockReturnValueOnce('enforce');
-    evaluateCapability.mockResolvedValueOnce({
-      allow: false,
-      code: 'TRUST_PROBATION',
-      capability: 'remote_control',
-      reason: 'probation_default_deny',
-    });
+    createRemoteSession.mockRejectedValueOnce(new RemoteSessionDeniedError('TRUST_PROBATION', 'probation_default_deny'));
 
     const res = await buildApp().request('/support-sessions', {
       method: 'POST',
@@ -266,9 +281,25 @@ describe('POST /support-sessions', () => {
 });
 
 describe('GET /support-sessions/:id', () => {
+  it.each([
+    { name: 'missing heartbeat', caps: {}, ready: false },
+    { name: 'lease only', caps: { revocationLeaseProtocolVersion: 1 }, ready: false },
+    { name: 'fence only', caps: { desktopFenceProtocolVersion: 1 }, ready: false },
+    { name: 'capable', caps: { revocationLeaseProtocolVersion: 1, desktopFenceProtocolVersion: 1 }, ready: true },
+  ])('derives desktop readiness for $name in both detail and list', async ({ caps, ready }) => {
+    for (const path of ['/support-sessions/sess-1', '/support-sessions']) {
+      selectResults.push([{ ...SESSION_ROW, status: 'ready', deviceId: 'dev-1' }]);
+      selectResults.push([{ id: 'dev-1', status: 'online', ...caps }]);
+      selectResults.push([]);
+      const body = await (await buildApp().request(path)).json();
+      const session = body.sessions ? body.sessions[0] : body;
+      expect(session).toMatchObject({ status: 'ready', deviceOnline: true, desktopReady: ready });
+    }
+  });
+
   it('derives active status from a live remote session and reports device presence', async () => {
     selectResults.push([{ ...SESSION_ROW, status: 'ready', deviceId: 'dev-1' }]); // session
-    selectResults.push([{ status: 'online' }]); // device
+    selectResults.push([{ status: 'online', revocationLeaseProtocolVersion: 1, desktopFenceProtocolVersion: 1 }]); // device
     selectResults.push([{ id: 'rs-1' }]); // live remote session
 
     const res = await buildApp().request('/support-sessions/sess-1');
@@ -281,7 +312,7 @@ describe('GET /support-sessions/:id', () => {
 
   it('stays ready when the device is online but no remote session is live', async () => {
     selectResults.push([{ ...SESSION_ROW, status: 'ready', deviceId: 'dev-1' }]);
-    selectResults.push([{ status: 'online' }]);
+    selectResults.push([{ status: 'online', revocationLeaseProtocolVersion: 1, desktopFenceProtocolVersion: 1 }]);
     selectResults.push([]); // no live remote sessions
 
     const body = await (await buildApp().request('/support-sessions/sess-1')).json();
@@ -295,7 +326,15 @@ describe('GET /support-sessions/:id', () => {
     const body = await (await buildApp().request('/support-sessions/sess-1')).json();
     expect(body.status).toBe('pending');
     expect(body.deviceOnline).toBe(false);
+    expect(body.desktopReady).toBe(false);
     // only the session lookup ran
+    expect(selectResults).toHaveLength(0);
+  });
+
+  it('does not expose readiness for a terminal session', async () => {
+    selectResults.push([{ ...SESSION_ROW, status: 'ended', deviceId: 'dev-1' }]);
+    const body = await (await buildApp().request('/support-sessions/sess-1')).json();
+    expect(body).toMatchObject({ status: 'ended', deviceOnline: false, desktopReady: false });
     expect(selectResults).toHaveLength(0);
   });
 
@@ -383,7 +422,7 @@ describe('GET /support-sessions', () => {
     const body = await res.json();
     expect(body.sessions).toHaveLength(2);
     expect(body.sessions[0]).toMatchObject({ id: 'sess-2', status: 'active', deviceOnline: true });
-    expect(body.sessions[1]).toMatchObject({ id: 'sess-1', status: 'ready', deviceOnline: false });
+    expect(body.sessions[1]).toMatchObject({ id: 'sess-1', status: 'ready', deviceOnline: false, desktopReady: false });
     // session page + one batched device query + one batched remote-session query
     expect(selectResults).toHaveLength(0);
   });

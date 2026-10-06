@@ -56,6 +56,7 @@ function view(overrides: Partial<SupportSessionView> = {}): SupportSessionView {
     hardExpiresAt: CREATED.hardExpiresAt,
     deviceId: null,
     deviceOnline: false,
+    desktopReady: false,
     attributedOrgId: null,
     attributionLabel: null,
     endedAt: null,
@@ -239,12 +240,12 @@ describe('QuickSupportPage', () => {
     expect(detailCallCount()).toBe(1);
   });
 
-  it('renders the connect button only once a device is enrolled and online', async () => {
+  it('waits for heartbeat capabilities even after the socket reports ready', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     installFetch({
       detail: [
-        view({ status: 'claimed', deviceId: 'dev-9', deviceOnline: false }),
-        view({ status: 'ready', deviceId: 'dev-9', deviceOnline: true }),
+        view({ status: 'ready', deviceId: 'dev-9', deviceOnline: true, desktopReady: false }),
+        view({ status: 'ready', deviceId: 'dev-9', deviceOnline: true, desktopReady: true }),
       ],
     });
     render(<QuickSupportPage />);
@@ -252,6 +253,7 @@ describe('QuickSupportPage', () => {
 
     await waitFor(() => expect(detailCallCount()).toBe(1));
     expect(screen.queryByTestId('quick-support-connect')).not.toBeInTheDocument();
+    expect(screen.getByTestId('quick-support-status')).not.toHaveTextContent('Ready to connect');
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000);
@@ -337,11 +339,11 @@ describe('QuickSupportPage', () => {
         view({
           status: 'ready',
           deviceId: 'dev-9',
-          deviceOnline: true,
+          deviceOnline: true, desktopReady: true,
           attributionLabel: 'Reception PC',
         }),
       ],
-      detail: [view({ status: 'ready', deviceId: 'dev-9', deviceOnline: true })],
+      detail: [view({ status: 'ready', deviceId: 'dev-9', deviceOnline: true, desktopReady: true })],
     });
     render(<QuickSupportPage />);
 

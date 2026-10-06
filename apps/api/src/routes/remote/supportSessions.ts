@@ -16,6 +16,7 @@ import { getTrustedClientIp } from '../../services/clientIp';
 import { endSupportSession } from '../../services/quickSupportEnd';
 import { logSessionAudit } from './helpers';
 import { createRemoteSession, RemoteSessionDeniedError } from '../../services/remoteSessionCreate';
+import { isDesktopFenceCapable } from '../../services/remoteRevocationLease';
 import { trustDenyBody } from '../../services/partnerTrust';
 
 export const supportSessionRoutes = new Hono();
@@ -38,13 +39,24 @@ function toView(
   session: SupportSessionRow,
   deviceOnline: boolean,
   hasLiveRemoteSession: boolean,
+  desktopReady = false,
 ) {
   const { codeHash: _codeHash, ...rest } = session;
   return {
     ...rest,
     status: session.status === 'ready' && hasLiveRemoteSession ? 'active' : session.status,
     deviceOnline,
+    desktopReady,
   };
+}
+
+type DesktopDevice = Pick<typeof devices.$inferSelect, 'status' | 'revocationLeaseProtocolVersion' | 'desktopFenceProtocolVersion'>;
+
+// A socket can come online before the first heartbeat declares security support.
+function isDesktopReady(device: DesktopDevice | undefined): boolean {
+  return device?.status === 'online'
+    && device.revocationLeaseProtocolVersion === 1
+    && isDesktopFenceCapable(device.desktopFenceProtocolVersion ?? 0);
 }
 
 /** Only 'claimed'/'ready' sessions can have a live device worth probing. */
@@ -160,15 +172,17 @@ supportSessionRoutes.get('/support-sessions', async (c) => {
   const deviceIds = [...new Set(sessions.filter(isProbeable).map((s) => s.deviceId!))];
 
   const onlineDeviceIds = new Set<string>();
+  const desktopReadyIds = new Set<string>();
   const liveSessionDeviceIds = new Set<string>();
 
   if (deviceIds.length > 0) {
     const deviceRows = await db
-      .select({ id: devices.id, status: devices.status })
+      .select({ id: devices.id, status: devices.status, revocationLeaseProtocolVersion: devices.revocationLeaseProtocolVersion, desktopFenceProtocolVersion: devices.desktopFenceProtocolVersion })
       .from(devices)
-      .where(inArray(devices.id, deviceIds)) as Array<{ id: string; status: string }>;
+      .where(inArray(devices.id, deviceIds)) as Array<DesktopDevice & { id: string }>;
     for (const row of deviceRows) {
       if (row.status === 'online') onlineDeviceIds.add(row.id);
+      if (isDesktopReady(row)) desktopReadyIds.add(row.id);
     }
 
     const liveRows = await db
@@ -186,6 +200,7 @@ supportSessionRoutes.get('/support-sessions', async (c) => {
       s,
       !!s.deviceId && onlineDeviceIds.has(s.deviceId),
       !!s.deviceId && liveSessionDeviceIds.has(s.deviceId),
+      !!s.deviceId && desktopReadyIds.has(s.deviceId),
     )),
   });
 });
@@ -247,10 +262,10 @@ supportSessionRoutes.get('/support-sessions/:id', async (c) => {
   if (!isProbeable(session)) return c.json(toView(session, false, false));
 
   const [device] = await db
-    .select({ status: devices.status })
+    .select({ status: devices.status, revocationLeaseProtocolVersion: devices.revocationLeaseProtocolVersion, desktopFenceProtocolVersion: devices.desktopFenceProtocolVersion })
     .from(devices)
     .where(eq(devices.id, session.deviceId!))
-    .limit(1) as Array<{ status: string }>;
+    .limit(1) as DesktopDevice[];
 
   const live = await db
     .select({ id: remoteSessions.id })
@@ -261,5 +276,5 @@ supportSessionRoutes.get('/support-sessions/:id', async (c) => {
     ))
     .limit(1) as Array<{ id: string }>;
 
-  return c.json(toView(session, device?.status === 'online', live.length > 0));
+  return c.json(toView(session, device?.status === 'online', live.length > 0, isDesktopReady(device)));
 });

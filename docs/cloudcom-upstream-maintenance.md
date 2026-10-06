@@ -13,6 +13,23 @@ This guide records how the CloudCom fork differs from LanternOps/Breeze and how 
 
 ## Change register
 
+### Quick Support desktop readiness (2026-10-06)
+
+Support-session list/detail responses now expose `desktopReady` separately from
+`deviceOnline`. Readiness requires the first heartbeat to report revocation-lease
+version 1 and satisfy the shared desktop-fence capability gate; opening an agent
+socket alone no longer enables the technician Connect button. The page displays
+the existing initializing/claimed state while waiting. Stored session state and
+remote-session authorization are unchanged; no migration is required.
+
+Affected files: `apps/api/src/routes/remote/supportSessions.ts` and its tests,
+`apps/web/src/components/remote/QuickSupportPage.tsx` and its tests. Preserve this
+additive API/UI contract across upstream merges and deploy API before or with web.
+Regression cases cover online-before-heartbeat, partial capability reports, and
+polling into readiness. Focused Linux-container validation passed 25 API and
+19 UI tests; API and web production builds passed. Production deployment and
+desktop connection acceptance are recorded separately in the private ledger.
+
 ### Windows agent 0.121.5 release
 
 The Windows self-host agent, backup, watchdog and user-helper binaries now target

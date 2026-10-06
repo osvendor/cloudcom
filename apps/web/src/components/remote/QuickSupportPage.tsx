@@ -27,6 +27,7 @@ export interface SupportSessionView {
   hardExpiresAt: string;
   deviceId: string | null;
   deviceOnline: boolean;
+  desktopReady: boolean;
   attributedOrgId: string | null;
   attributionLabel: string | null;
   endedAt: string | null;
@@ -322,10 +323,12 @@ export default function QuickSupportPage() {
   // comment for why that is intended).
   const createdCode = created && created.id === selectedId ? created : null;
 
-  const currentStatus: SupportSessionStatus = selectedSession?.status ?? 'pending';
+  const displayStatus = (session: SupportSessionView): SupportSessionStatus =>
+    session.status === 'ready' && !session.desktopReady ? 'claimed' : session.status;
+  const currentStatus: SupportSessionStatus = selectedSession ? displayStatus(selectedSession) : 'pending';
   const isTerminal = TERMINAL_STATUSES.has(currentStatus);
   const canConnect = Boolean(
-    selectedSession?.deviceId && selectedSession.deviceOnline && !isTerminal,
+    selectedSession?.deviceId && selectedSession.desktopReady && !isTerminal,
   );
 
   return (
@@ -596,8 +599,8 @@ export default function QuickSupportPage() {
                     : ''}
                 </span>
               </span>
-              <span className={`shrink-0 text-xs font-medium ${statusClass(session.status)}`}>
-                {statusLabel(session.status)}
+              <span className={`shrink-0 text-xs font-medium ${statusClass(displayStatus(session))}`}>
+                {statusLabel(displayStatus(session))}
               </span>
             </button>
           ))}
