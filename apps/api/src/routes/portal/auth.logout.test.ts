@@ -60,6 +60,7 @@ vi.mock('../../db/schema', () => ({
     contactId: 'contactId',
     receiveNotifications: 'receiveNotifications',
     status: 'status',
+    accessMode: 'accessMode',
   },
   portalBranding: { orgId: 'orgId', enablePasswordReset: 'enablePasswordReset' },
 }));
@@ -167,6 +168,7 @@ beforeEach(() => {
     contactId: null,
     receiveNotifications: true,
     status: 'active',
+    accessMode: 'standard',
     authMethod: 'password',
     authEpoch: 1,
     sessionRevoked: false,
