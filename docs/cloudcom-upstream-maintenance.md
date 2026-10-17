@@ -62,9 +62,13 @@ upstream restart/token-verification marker; the current fleet binary is unchange
 Live browser acceptance caught a clipboard adapter initialization-order regression:
 the upstream clipboard ref precedes the browser status and paste-notice state.
 The browser transform now attaches its controller after that state is declared.
-A real, unmocked viewer render test reproduces the original temporal-dead-zone
-failure and passes after repair; all 42 browser desktop tests and the 47-module
-sync contract pass. Preserve this render test across future viewer refreshes.
+A real viewer render test reproduces the original temporal-dead-zone failure.
+The adaptation also replaces every native clipboard-controller reference in
+transport startup, cleanup and keyboard handling; generation fails if any remain.
+A transport-start test exercises the real viewer with mocked network channels,
+including connected rendering and unmount cleanup. All 43 browser desktop tests
+and the 47-module sync contract pass. Preserve these tests across viewer refreshes
+and keep browser clipboard gestures gated by connected, writable session state.
 
 Local MSI serving now requires a signed artifact manifest. Stage a manifest for
 the verified current MSI using the established CloudCom release trust key and

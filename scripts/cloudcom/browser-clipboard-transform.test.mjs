@@ -55,4 +55,5 @@ test('upstream clipboard sync is replaced by browser adapters without native cli
   assert.match(result, /text = await navigator\.clipboard\.readText\(\);/);
   assert.doesNotMatch(result, /@tauri-apps\/plugin-clipboard-manager/);
   assert.doesNotMatch(result, /ClipboardSync/);
+  assert.doesNotMatch(result, /\b(?:clipboardSyncRef|clipboardState|setClipboardState)\b/);
 });

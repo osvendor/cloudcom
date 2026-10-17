@@ -15,6 +15,32 @@ export function applyBrowserClipboard(content) {
   }
   if (modernClipboard) {
     replace('  // One controller per WebRTC clipboard channel (lib/clipboardSync.ts).\n  const clipboardSyncRef = useRef<ClipboardSync | null>(null);\n  const [clipboardState, setClipboardState] = useState<ClipboardSyncState | null>(null);', '');
+    const cleanup = /clipboardSyncRef\.current\?\.close\(\);\n\s*clipboardSyncRef\.current = null;/g;
+    if ([...content.matchAll(cleanup)].length !== 2) throw new Error('Browser clipboard cleanup attachment point changed');
+    content = content.replace(cleanup, 'browserClipboardRef.current?.clear();');
+    replace('    setClipboardState(null);\n', '');
+    replace("transport === 'vnc' ? vncSessionRef.current?.clipboard ?? null : clipboardSyncRef.current", "transport === 'vnc' ? vncSessionRef.current?.clipboard ?? null : null");
+    const chipStart = content.indexOf('  const clipboardChipInput: ClipboardChipInput =');
+    const chipEnd = content.indexOf('\n\n', chipStart);
+    if (chipStart < 0 || chipEnd < 0) throw new Error('Browser clipboard chip attachment point changed');
+    content = content.slice(0, chipStart) + `  // WebRTC clipboard actions live in the browser's gesture-aware text bar.
+  const clipboardChipInput: ClipboardChipInput = transport === 'vnc' && vncClipboardState
+    ? { kind: 'vnc', ...vncClipboardState }
+    : { kind: 'hidden' };` + content.slice(chipEnd);
+    replace(`      const sync = clipboardSyncRef.current;
+      if (!sync) {
+        dispatchPaste();
+        return;
+      }
+      void sync.pasteTransaction(dispatchPaste).then((outcome) => {
+        if (outcome.result === 'failed') setPasteNotice(clipboardFailureMessage(outcome.reason, 'paste'));
+      });`, `      if (transport === 'webrtc') {
+        void navigator.clipboard.readText().then(text => {
+          if (!viewOnlyRef.current) return browserClipboardRef.current?.paste(text, dispatchPaste);
+        }).catch(() => setPasteNotice('Clipboard access was blocked. Use Ctrl+V or Paste Text.'));
+      } else {
+        dispatchPaste();
+      }`);
     replace('  const [remapOverride, setRemapOverride] = useState<boolean | null>(null);\n  const remapCmdCtrl = remapOverride ?? defaultRemapCmdCtrl(VIEWER_OS, remoteOs);', `  const [remapCmdCtrl, setRemapCmdCtrl] = useState(false);
   const browserRemapOverrideRef = useRef(false);
   useEffect(() => {
@@ -60,7 +86,7 @@ export function applyBrowserClipboard(content) {
   const keyReplacement = modernClipboard
     ? `    if (!viewOnlyRef.current && composition.keyDown(ne) === 'capture') return;
     // Leave native paste enabled: ClipboardEvent supplies text without a read permission prompt.
-    if (transport === 'webrtc' && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
+    if (!viewOnlyRef.current && transport === 'webrtc' && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
       if (e.code === 'KeyV') return;
       if (e.code === 'KeyC') {
         e.preventDefault();
@@ -105,7 +131,7 @@ export function applyBrowserClipboard(content) {
         }}`);
   }
   replace('    onKeyDown: handleKeyDown,', `    onPaste: (event: React.ClipboardEvent) => {
-      if (transport !== 'webrtc') return;
+      if (transport !== 'webrtc' || status !== 'connected' || closing${modernClipboard ? ' || viewOnlyRef.current' : ''}) return;
       event.preventDefault();
       const text = event.clipboardData.getData('text/plain');
       void browserClipboardRef.current?.paste(text, () => {
@@ -115,7 +141,7 @@ export function applyBrowserClipboard(content) {
     // Browser shells may deliver native Copy without dispatching a KeyC event.
     // Keep this on the remote surface, never the local credential panel/forms.
     onCopy: (event: React.ClipboardEvent) => {
-      if (transport !== 'webrtc' || status !== 'connected' || closing) return;
+      if (transport !== 'webrtc' || status !== 'connected' || closing${modernClipboard ? ' || viewOnlyRef.current' : ''}) return;
       event.preventDefault();
       browserClipboardRef.current?.requestCopy(() => {
         sendInputFn({ type: 'key_press', key: 'c', modifiers: [remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl'] });
@@ -129,5 +155,8 @@ export function applyBrowserClipboard(content) {
         </div>
       )}
       <div className="flex-1 overflow-hidden flex items-center justify-center bg-black relative">`);
+  if (/\b(?:clipboardSyncRef|clipboardState|setClipboardState)\b/.test(content)) {
+    throw new Error('Browser clipboard adaptation left a native controller reference');
+  }
   return content;
 }

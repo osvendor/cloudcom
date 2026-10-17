@@ -756,9 +756,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
 
     // The previous peer connection's clipboard session is over; the chip must
     // not keep describing it if this one brings no clipboard channel.
-    clipboardSyncRef.current?.close();
-    clipboardSyncRef.current = null;
-    setClipboardState(null);
+    browserClipboardRef.current?.clear();
 
     // Taken before the await: anything that supersedes this call while the
     // transport is negotiating (a newer call, a cancelled connect effect, a
@@ -1321,8 +1319,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
         }
       }
 
-      clipboardSyncRef.current?.close();
-      clipboardSyncRef.current = null;
+      browserClipboardRef.current?.clear();
 
 	      if (sessionRegisteredRef.current) {
 	        sessionRegisteredRef.current = false;
@@ -2198,7 +2195,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
   // ── Clipboard chip actions ─────────────────────────────────────────
 
   const activeClipboard = useCallback(() => (
-    transport === 'vnc' ? vncSessionRef.current?.clipboard ?? null : clipboardSyncRef.current
+    transport === 'vnc' ? vncSessionRef.current?.clipboard ?? null : null
   ), [transport]);
 
   // "Copy remote clipboard": the latest remote item, including one a
@@ -2225,18 +2222,10 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
     else if (outcome.result === 'empty') setPasteNotice('Your clipboard is empty — nothing was sent.');
   }, [activeClipboard]);
 
-  const clipboardChipInput: ClipboardChipInput =
-    transport === 'vnc'
-      ? (vncClipboardState ? { kind: 'vnc', ...vncClipboardState } : { kind: 'hidden' })
-      : transport === 'webrtc'
-        ? (clipboardState
-          ? { kind: 'webrtc', state: clipboardState }
-          : status === 'connected'
-            ? { kind: 'unavailable', reason: 'No clipboard channel: the clipboard is disabled by policy in both directions, or the agent does not support it.' }
-            : { kind: 'hidden' })
-        : transport === 'websocket' && status === 'connected'
-          ? { kind: 'unavailable', reason: 'The clipboard is not available over the WebSocket fallback.' }
-          : { kind: 'hidden' };
+  // WebRTC clipboard actions live in the browser's gesture-aware text bar.
+  const clipboardChipInput: ClipboardChipInput = transport === 'vnc' && vncClipboardState
+    ? { kind: 'vnc', ...vncClipboardState }
+    : { kind: 'hidden' };
 
   // ── Input: keyboard handlers ───────────────────────────────────────
 
@@ -2254,7 +2243,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
     // forwarded): their text is sent once, as type_text, by the capture.
     if (!viewOnlyRef.current && composition.keyDown(ne) === 'capture') return;
     // Leave native paste enabled: ClipboardEvent supplies text without a read permission prompt.
-    if (transport === 'webrtc' && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
+    if (!viewOnlyRef.current && transport === 'webrtc' && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
       if (e.code === 'KeyV') return;
       if (e.code === 'KeyC') {
         e.preventDefault();
@@ -2376,14 +2365,13 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
           forgetModifiersReleasedByKeyPress(pasteModifiers);
         }
       };
-      const sync = clipboardSyncRef.current;
-      if (!sync) {
+      if (transport === 'webrtc') {
+        void navigator.clipboard.readText().then(text => {
+          if (!viewOnlyRef.current) return browserClipboardRef.current?.paste(text, dispatchPaste);
+        }).catch(() => setPasteNotice('Clipboard access was blocked. Use Ctrl+V or Paste Text.'));
+      } else {
         dispatchPaste();
-        return;
       }
-      void sync.pasteTransaction(dispatchPaste).then((outcome) => {
-        if (outcome.result === 'failed') setPasteNotice(clipboardFailureMessage(outcome.reason, 'paste'));
-      });
       return;
     }
 
@@ -2827,7 +2815,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
     onContextMenu: handleContextMenu,
     onPointerDown: handlePointerDown,
     onPaste: (event: React.ClipboardEvent) => {
-      if (transport !== 'webrtc') return;
+      if (transport !== 'webrtc' || status !== 'connected' || closing || viewOnlyRef.current) return;
       event.preventDefault();
       const text = event.clipboardData.getData('text/plain');
       void browserClipboardRef.current?.paste(text, () => {
@@ -2837,7 +2825,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
     // Browser shells may deliver native Copy without dispatching a KeyC event.
     // Keep this on the remote surface, never the local credential panel/forms.
     onCopy: (event: React.ClipboardEvent) => {
-      if (transport !== 'webrtc' || status !== 'connected' || closing) return;
+      if (transport !== 'webrtc' || status !== 'connected' || closing || viewOnlyRef.current) return;
       event.preventDefault();
       browserClipboardRef.current?.requestCopy(() => {
         sendInputFn({ type: 'key_press', key: 'c', modifiers: [remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl'] });
