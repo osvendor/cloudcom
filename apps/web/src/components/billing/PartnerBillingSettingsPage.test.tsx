@@ -35,13 +35,14 @@ function renderPage() {
 // up inside the "More" dropdown in tests. Open it before selecting any tab
 // other than the first.
 async function selectTab(id: string) {
-  const visible = screen.queryByTestId(`billing-settings-tab-${id}`);
+  const testId = id === 'payments' ? 'autopay-payments-tab' : `billing-settings-tab-${id}`;
+  const visible = screen.queryByTestId(testId);
   if (visible?.getAttribute('role') === 'tab') {
     await userEvent.click(visible);
     return;
   }
   await userEvent.click(await screen.findByTestId('billing-settings-tab-more'));
-  await userEvent.click(await screen.findByTestId(`billing-settings-tab-${id}`));
+  await userEvent.click(await screen.findByTestId(testId));
 }
 
 async function gotoDocumentsTab() {
@@ -49,6 +50,50 @@ async function gotoDocumentsTab() {
 }
 
 describe('PartnerBillingSettingsPage', () => {
+it('mounts fee settings in the real Payments tab',async()=>{
+  fetchMock.mockImplementation(async path=>json(String(path).endsWith('/payment-settings')?feeView():
+    {currencyCode:'USD',invoiceNumberPrefix:'INV',invoiceTermsDays:30}));
+  renderPage();await selectTab('payments');
+  expect(await screen.findByTestId('autopay-fee-settings-page')).toBeInTheDocument();
+  expect(await screen.findByTestId('autopay-fees')).toBeInTheDocument();
+  expect(screen.getByTestId('autopay-attest-notified')).toBeInTheDocument();
+});
+it('keeps the Payments tab but hides fees when rollout is off',async()=>{
+  fetchMock.mockImplementation(async path=>json(String(path).endsWith('/payment-settings')?feeView(false):
+    {currencyCode:'USD',invoiceNumberPrefix:'INV',invoiceTermsDays:30}));
+  renderPage();await selectTab('payments');
+  await screen.findByTestId('autopay-settings-save');
+  expect(screen.queryByTestId('autopay-fees')).toBeNull();
+});
+
+it.each([false, true])('mounts Payments when autopayEnabled=%s', async autopayEnabled => {
+  const fields = {
+    autopayOffsetDays: { value: 0, source: 'default' }, autopayOffsetRule: { value: 'later', source: 'default' },
+    autopayCap: { value: { enabled: false }, source: 'default' }, achMode: { value: 'ach_preferred', source: 'default' },
+    cardFeeBps: { value: 0, source: 'default' }, achFeeAmount: { value: '0.00', source: 'default' }, feeAttested: false,
+    remindersEnabled: { value: false, source: 'default' },
+    reminderBeforeDueDays: { value: 3, source: 'default' },
+    reminderRepeatDays: { value: null, source: 'default' },
+    overdueReminderEveryDays: { value: 7, source: 'default' },
+  };
+  fetchMock.mockImplementation(async url => {
+    if (String(url).endsWith('/billing/payment-settings')) return json({
+      effective: fields, inherited: fields, autopayEnabled,
+      values: { autopayOffsetDays: null, autopayOffsetRule: null, autopayCapEnabled: null, autopayCapAmount: null, autopayCapCurrency: null, achMode: null },
+    });
+    return json({ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 });
+  });
+  window.location.hash = '#payments';
+  renderPage();
+  expect(await screen.findByTestId('autopay-payments-shell')).toBeInTheDocument();
+  expect(await screen.findByTestId('autopay-reminders-section')).toBeInTheDocument();
+  expect(screen.queryByTestId('autopay-settings-section') !== null).toBe(autopayEnabled);
+  expect(window.location.hash).toBe('#payments');
+  await selectTab('defaults');
+  await selectTab('payments');
+  expect(await screen.findByTestId('autopay-reminders-section')).toBeInTheDocument();
+});
+
   beforeEach(() => {
     vi.clearAllMocks();
     canWrite = true;
@@ -56,14 +101,14 @@ describe('PartnerBillingSettingsPage', () => {
     window.location.hash = '';
   });
 
-  it('has four tabs in order: Defaults, Documents, Rates, Connections (Documents onward behind "More" under jsdom)', async () => {
+  it('has five tabs in order: Defaults, Documents, Rates, Payments, Connections (Documents onward behind "More" under jsdom)', async () => {
     fetchMock.mockResolvedValue(json({ currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 }));
     renderPage();
     expect(await screen.findByTestId('billing-settings-tab-defaults')).toBeInTheDocument();
     await userEvent.click(await screen.findByTestId('billing-settings-tab-more'));
     expect(screen.getByTestId('billing-settings-tab-documents')).toBeInTheDocument();
     expect(screen.getByTestId('billing-settings-tab-connections')).toBeInTheDocument();
-    const order = ['billing-settings-tab-defaults', ...['documents', 'rates', 'connections'].map(id => `billing-settings-tab-${id}`)];
+    const order = ['billing-settings-tab-defaults', ...['documents', 'rates'].map(id => `billing-settings-tab-${id}`), 'autopay-payments-tab', 'billing-settings-tab-connections'];
     expect(screen.getAllByRole('tab').map(tab => tab.getAttribute('data-testid'))).toEqual([order[0]]);
     expect(screen.getAllByRole('menuitem').map(item => item.getAttribute('data-testid'))).toEqual(order.slice(1));
   });
@@ -295,6 +340,41 @@ describe('PartnerBillingSettingsPage', () => {
     });
   });
 
+  it('#8604: time entry line settings load from the partner payload and ride the save body', async () => {
+    fetchMock.mockImplementation(async (_input: string, opts?: RequestInit) => {
+      if (opts?.method === 'PATCH') return json({ data: {} });
+      return json({
+        currencyCode: 'USD', defaultTaxRate: null, invoiceNumberPrefix: 'INV', invoiceTermsDays: 30, invoiceFooter: null,
+        invoiceLineGrouping: 'day', invoiceLineShowDate: true, invoiceLineShowNote: false, invoiceLineShowWorkedTime: true,
+      });
+    });
+    renderPage();
+    await gotoDocumentsTab();
+    expect(((await screen.findByTestId('partner-billing-line-show-date')) as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId('partner-billing-line-show-note') as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByTestId('partner-billing-line-grouping') as HTMLSelectElement).value).toBe('day');
+    fireEvent.click(screen.getByTestId('partner-billing-line-show-worked-time'));
+    fireEvent.click(screen.getByTestId('partner-billing-save'));
+    await waitFor(() => {
+      const patch = fetchMock.mock.calls.find((c) => c[0] === '/partner/billing-settings' && (c[1] as RequestInit)?.method === 'PATCH');
+      expect(JSON.parse((patch![1] as RequestInit).body as string)).toMatchObject({
+        invoiceLineGrouping: 'day', invoiceLineShowDate: true, invoiceLineShowNote: false, invoiceLineShowWorkedTime: false,
+      });
+    });
+  });
+
+  it('#8604: an older payload without the fields reads as the defaults', async () => {
+    fetchMock.mockImplementation(async () => json({
+      currencyCode: 'USD', defaultTaxRate: null, invoiceNumberPrefix: 'INV', invoiceTermsDays: 30, invoiceFooter: null,
+    }));
+    renderPage();
+    await gotoDocumentsTab();
+    expect(((await screen.findByTestId('partner-billing-line-show-date')) as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByTestId('partner-billing-line-show-note') as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId('partner-billing-line-show-worked-time') as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId('partner-billing-line-grouping') as HTMLSelectElement).value).toBe('entry');
+  });
+
   it('#6635: the on-behalf acceptance notice toggle loads off by default and round-trips', async () => {
     fetchMock.mockImplementation(async (_input: string, opts?: RequestInit) => {
       if (opts?.method === 'PATCH') return json({ data: {} });
@@ -462,5 +542,71 @@ describe('PartnerBillingSettingsPage', () => {
       expect(screen.queryByTestId('partner-billing-website-error')).toBeNull();
       expect((screen.getByTestId('partner-billing-save') as HTMLButtonElement).disabled).toBe(false);
     });
+  });
+});
+
+function feeView(enabled=true){
+  const effective={autopayOffsetDays:{value:0,source:'default'},autopayOffsetRule:{value:'later',source:'default'},
+    autopayCap:{value:{enabled:false},source:'default'},achMode:{value:'ach_preferred',source:'default'},
+    cardFeeBps:{value:300,source:'partner'},achFeeAmount:{value:'2.50',source:'partner'},feeAttested:true,
+    remindersEnabled:{value:false,source:'default'},reminderBeforeDueDays:{value:3,source:'default'},
+    reminderRepeatDays:{value:null,source:'default'},overdueReminderEveryDays:{value:7,source:'default'}};
+  return {autopayEnabled:enabled,effective,inherited:effective,values:{autopayOffsetDays:null,autopayOffsetRule:null,
+    autopayCapEnabled:null,autopayCapAmount:null,autopayCapCurrency:null,achMode:null,cardFeeBps:null,achFeeAmount:null}};
+}
+
+describe('PartnerBillingSettingsPage billing defaults validation', () => {
+  const profile = { currencyCode: 'USD', invoiceNumberPrefix: 'INV', invoiceTermsDays: 30 };
+  const patchCalls = () => fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === 'PATCH');
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    canWrite = true;
+    canManagePartnerWide = true;
+    window.location.hash = '';
+  });
+
+  it.each(['150', '-5'])('shows an inline error and sends nothing for tax rate %s', async (bad) => {
+    fetchMock.mockResolvedValue(json(profile));
+    renderPage();
+    fireEvent.change(await screen.findByTestId('partner-billing-tax'), { target: { value: bad } });
+    await userEvent.click(screen.getByTestId('partner-billing-save'));
+    expect(await screen.findByTestId('partner-billing-tax-error')).toBeInTheDocument();
+    expect(screen.getByTestId('partner-billing-tax')).toHaveAttribute('aria-invalid', 'true');
+    expect(patchCalls()).toHaveLength(0);
+  });
+
+  it.each(['2.5', '400', '-1', ''])('shows an inline error and sends nothing for payment terms %j', async (bad) => {
+    fetchMock.mockResolvedValue(json(profile));
+    renderPage();
+    fireEvent.change(await screen.findByTestId('partner-billing-terms-days'), { target: { value: bad } });
+    await userEvent.click(screen.getByTestId('partner-billing-save'));
+    expect(await screen.findByTestId('partner-billing-terms-days-error')).toBeInTheDocument();
+    expect(patchCalls()).toHaveLength(0);
+  });
+
+  it('sends the request, converting percent to a fraction, when values are valid', async () => {
+    fetchMock.mockResolvedValue(json(profile));
+    renderPage();
+    fireEvent.change(await screen.findByTestId('partner-billing-tax'), { target: { value: '8.5' } });
+    fireEvent.change(screen.getByTestId('partner-billing-terms-days'), { target: { value: '45' } });
+    await userEvent.click(screen.getByTestId('partner-billing-save'));
+    await waitFor(() => expect(patchCalls()).toHaveLength(1));
+    const body = JSON.parse((patchCalls()[0][1] as RequestInit).body as string);
+    expect(body.defaultTaxRate).toBeCloseTo(0.085);
+    expect(body.invoiceTermsDays).toBe(45);
+    expect(screen.queryByTestId('partner-billing-tax-error')).not.toBeInTheDocument();
+  });
+
+  it('maps a server field-level 400 onto the matching input instead of raw zod text', async () => {
+    fetchMock.mockImplementation(async (_url, init) =>
+      (init as RequestInit | undefined)?.method === 'PATCH'
+        ? json({ error: 'defaultTaxRate: Too big: expected number to be <=1', details: { formErrors: [], fieldErrors: { defaultTaxRate: ['Too big: expected number to be <=1'] } } }, false, 400)
+        : json(profile));
+    renderPage();
+    await screen.findByTestId('partner-billing-tax');
+    await userEvent.click(screen.getByTestId('partner-billing-save'));
+    expect(await screen.findByTestId('partner-billing-tax-error')).toBeInTheDocument();
+    expect(JSON.stringify(showToast.mock.calls)).not.toContain('Too big');
   });
 });

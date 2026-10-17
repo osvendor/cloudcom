@@ -1,5 +1,6 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
+import { formatMoney } from '@breeze/shared';
 import {
   checkBudget,
   checkAiRateLimit,
@@ -62,7 +63,7 @@ export class EnrichmentError extends Error {
  * `console.warn` when `actor.orgId` was null — and then dispatch anyway, with
  * paid Anthropic web-search turns on the platform key. A rate limit bounds the
  * RATE of unbudgeted spend; it does not make the spend accounted. No
- * reservation is taken on that path either, so nothing else in SEC-142's fence
+ * reservation is taken on that path either, so nothing else in the spend fence
  * applies to it.
  *
  * Fail closed, with one deliberate exemption the caller must DECLARE (see
@@ -258,11 +259,14 @@ function coerceDraft(
   };
 }
 
-function priceGuidanceFrom(low: number | null, high: number | null, currency: string | null): string | null {
-  const sym = currency === 'USD' || currency == null ? '$' : `${currency} `;
-  if (low != null && high != null) return `typically ${sym}${low}–${high}`;
-  if (low != null) return `from ${sym}${low}`;
-  if (high != null) return `up to ${sym}${high}`;
+export function priceGuidanceFrom(low: number | null, high: number | null, currency: string | null): string | null {
+  // Canonical shared formatter (#3200). Fixed en-US: this is English prose, not
+  // a per-viewer render, so the runtime default locale must not leak in.
+  const code = currency?.trim() || 'USD';
+  const fmt = (n: number) => formatMoney(n, code, 'en-US');
+  if (low != null && high != null) return `typically ${fmt(low)}–${fmt(high)}`;
+  if (low != null) return `from ${fmt(low)}`;
+  if (high != null) return `up to ${fmt(high)}`;
   return null;
 }
 

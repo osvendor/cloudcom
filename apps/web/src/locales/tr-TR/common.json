@@ -66,6 +66,7 @@
     "aiAgents": "Yapay Zeka Aracıları",
     "aiAgentRuns": "Yapay Zeka Ajan Çalıştırmaları",
     "aiImpact": "Yapay Zeka Etkisi",
+    "fixMemory": "Düzeltme belleği",
     "fleetDesign": "Filo Tasarımı",
     "customFields": "Özel Alanlar",
     "variables": "Değişkenler",
@@ -107,7 +108,13 @@
     "system": "Sistem",
     "monitorConversion": "İzleyici Dönüşümü",
     "timeSync": "Saat eşitleme",
-    "aiModels": "Yapay zeka modelleri"
+    "aiModels": "Yapay zeka modelleri",
+    "autopay": "Autopay",
+    "payments": "Payments",
+    "ticketsIncidents": "Olaylar",
+    "ticketsServiceRequests": "Hizmet talepleri",
+    "ticketsProblems": "Sorunlar",
+    "ticketsChanges": "Değişiklikler"
   },
   "documentTitles": {
     "dashboard": "Kontrol Paneli",
@@ -405,7 +412,9 @@
       "unratedPending": "{{count}} derecelendirilmemiş yama beklemede (otomatik onaylanmayacak)",
       "unratedPending_one": "{{count}} derecelendirilmemiş yama beklemede (otomatik onaylanmayacak)",
       "unratedPending_other": "{{count}} derecelendirilmemiş yama beklemede (otomatik onaylanmayacak)",
-      "empty": "Henüz yama verisi yok"
+      "empty": "Henüz yama verisi yok",
+      "imagesNotChecked_one": "{{count}} kapsayıcı imajı denetlenmedi",
+      "imagesNotChecked_other": "{{count}} kapsayıcı imajı denetlenmedi"
     },
     "vuln": {
       "title": "Güvenlik Açıkları",
@@ -491,7 +500,9 @@
       "noGroups": "Kullanılabilir cihaz grubu yok",
       "deviceCount": "{{count}} cihazlar",
       "loadSaved": "Kaydedilen filtreyi yükle:",
-      "select": "Seç"
+      "select": "Seç",
+      "dynamic": "Dinamik",
+      "refusedGroup": "Hedef olarak kullanılamaz: bu grubun kuralları cihazın kendisinin bildirdiği alanlara dayanıyor ({{fields}})."
     },
     "preview": {
       "title": "Eşleşen Cihazlar",
@@ -1304,6 +1315,26 @@
           "ticketCreated": {
             "description": "Bir bilet oluşturulduğunda tetiklenir.",
             "label": "Bilet Oluşturuldu"
+          },
+          "ticketCommented": {
+            "description": "Bir bilete yorum veya not eklendiğinde tetiklenir.",
+            "label": "Bilete Yorum Yapıldı"
+          },
+          "ticketStatusChanged": {
+            "description": "Bir biletin durumu değiştiğinde tetiklenir.",
+            "label": "Bilet Durumu Değişti"
+          },
+          "ticketUpdated": {
+            "description": "Bilet alanları düzenlendiğinde tetiklenir.",
+            "label": "Bilet Güncellendi"
+          },
+          "ticketAssigned": {
+            "description": "Bir bilet atandığında veya ataması kaldırıldığında tetiklenir.",
+            "label": "Bilet Atandı"
+          },
+          "migrationWindowClosed": {
+            "description": "Bir bilet taşıma penceresi kapandığında, içe aktarılan sayılarla birlikte kuruluş başına bir kez tetiklenir.",
+            "label": "Taşıma penceresi kapandı"
           }
         },
         "fields": {
@@ -1428,6 +1459,7 @@
           "created": "Web kancası oluşturuldu",
           "disabled": "Web kancası devre dışı bırakıldı",
           "enabled": "Web kancası etkinleştirildi",
+          "retryQueued": "Teslimat yeniden deneme kuyruğa alındı",
           "testQueued": "Test teslimatı kuyruğa alındı",
           "updated": "Web kancası güncellendi"
         },
@@ -1639,18 +1671,24 @@
         "friendly": {
           "adminRequired": "Zaman çizelgelerini onaylamak yönetici rolü gerektirir.",
           "approvedImmutable": "Onaylanan girişler yalnızca yönetici tarafından değiştirilebilir.",
-          "notOwnEntry": "Yalnızca kendi zaman girişlerinizi düzenleyebilirsiniz."
+          "notOwnEntry": "Yalnızca kendi zaman girişlerinizi düzenleyebilirsiniz.",
+          "entryBilled": "Bu giriş faturalandırıldığı için silinemez. Önce faturayı iptal et.",
+          "notOwnEntryDelete": "Yalnızca kendi zaman girişlerini silebilirsin.",
+          "entryDeleteLost": "Giriş silinirken değişti. Yeniden yükleyip tekrar dene.",
+          "entryNotFound": "Bu giriş artık mevcut değil."
         },
         "errors": {
           "bulkApprovalFailed": "Toplu onay başarısız oldu. Tekrar dene.",
           "saveEntryFailed": "Giriş kaydedilemedi. Tekrar dene.",
-          "loadTimesheetFailed": "Zaman çizelgesi yüklenemedi. Tekrar dene."
+          "loadTimesheetFailed": "Zaman çizelgesi yüklenemedi. Tekrar dene.",
+          "deleteEntryFailed": "Giriş silinemedi. Tekrar dene."
         },
         "toasts": {
           "bulkSkipped": "{{updated}} güncellendi, {{skipped}} atlandı ({{reasons}})",
           "bulkApproved": "{{count}} onaylandı",
           "bulkUnapproved": "{{count}} onaylanmadı",
-          "entryUpdated": "Giriş güncellendi"
+          "entryUpdated": "Giriş güncellendi",
+          "entryDeleted": "Giriş silindi"
         },
         "title": "Zaman Çizelgesi",
         "selectTechnician": "Teknisyeni seçin",
@@ -1675,7 +1713,12 @@
         "editEntry": "Girişi düzenle {{id}}",
         "total": "Toplam: {{duration}}",
         "billableTotal": "Faturalandırılabilir: {{duration}}",
-        "billedVsWorked": "{{worked}} sa çalışıldı · {{billed}} sa faturalandı"
+        "billedVsWorked": "{{worked}} sa çalışıldı · {{billed}} sa faturalandı",
+        "deleteEntry": "Girişi sil {{id}}",
+        "deleteConfirmTitle": "Zaman girişi silinsin mi?",
+        "deleteConfirmMessage": "Bu işlem {{ticket}} biletindeki {{duration}} girişini kalıcı olarak kaldırır. Geri alınamaz.",
+        "deleteConfirmMessageNoTicket": "Bu işlem {{duration}} girişini kalıcı olarak kaldırır. Geri alınamaz.",
+        "noteInvoiceCue": "Faturalama ayarlarınız notları gizlemedikçe müşteriler bu notu faturalarında görür."
       },
       "sourceBadge": {
         "timer": "Zamanlayıcı",
@@ -2162,7 +2205,8 @@
         "viewInSource": "{{source}}'da görüntüle",
         "promoteFromEdr": "EDR görünümünden yükseltme",
         "pagination": "Sayfa {{page}} / {{totalPages}} ({{total}} toplam)",
-        "previous": "Önceki"
+        "previous": "Önceki",
+        "genericEdrProvider": "EDR sağlayıcısı"
       },
       "IncidentDetailPage": {
         "errors": {
@@ -2375,7 +2419,10 @@
           "script": "Komut Dosyası",
           "template": "Şablon",
           "playbook": "Başucu Kitabı",
-          "diagnostic": "Teşhis"
+          "diagnostic": "Teşhis",
+          "builtin": "Yerleşik eylem",
+          "manualSteps": "Elle adımlar",
+          "scriptDraft": "Betik taslağı"
         },
         "targetIdentifiers": {
           "script": "komut dosyası {{id}}\nKomut dosyası kimliği olmayan ",
@@ -2384,7 +2431,8 @@
           "templateMissing": "şablonu",
           "playbook": "başucu kitabı {{id}}",
           "playbookMissing": "Başucu kitabı kimliği olmayan başucu kitabı",
-          "diagnostic": "teşhis eylemi"
+          "diagnostic": "teşhis eylemi",
+          "builtin": "yerleşik eylem {{action}}"
         },
         "targetDevices": {
           "none": "Bu öneride hedef cihaz yok",
@@ -2396,9 +2444,12 @@
           "generateFailed": "Önerilen düzeltmeler oluşturulamadı",
           "updateFailed": "Önerilen düzeltme güncellenemedi",
           "executeFailed": "Önerilen düzeltme yürütülemedi",
-          "approvalFailed": "Onay istenemedi"
+          "approvalFailed": "Onay istenemedi",
+          "researchFailed": "Araştırma başlatılamadı",
+          "draftFailed": "Betik taslağı açılamadı."
         },
         "messages": {
+          "draftCopied": "Depolama engelli — özet kopyalandı; betik oluşturucuya yapıştırın.",
           "disabled": "Önerilen düzeltmeler devre dışı bırakıldı",
           "generated": "Önerilen düzeltmeler oluşturuldu",
           "accepted": "Önerilen düzeltme kabul edildi",
@@ -2482,6 +2533,52 @@
             "inconclusive": "belirsiz",
             "cancelled": "iptal edildi"
           }
+        },
+        "groups": {
+          "proven": "Kanıtlanmış düzeltmeler",
+          "ai": "Yapay zekâ önerileri",
+          "similar": "Benzer düzeltmeler",
+          "legacy": "Önceki anahtar kelime eşleşmeleri"
+        },
+        "badges": {
+          "aiResearched": "Yapay zekâ araştırdı",
+          "aiWritten": "Yapay zekâ tarafından yazıldı — izlemeden önce gözden geçirin"
+        },
+        "track": {
+          "lastVerified": "son doğrulama {{days}} gün önce",
+          "neverVerified": "henüz doğrulanmadı"
+        },
+        "research": {
+          "running": "Araştırılıyor…",
+          "runningDeep": "Derinlemesine araştırılıyor…",
+          "stalled": "Araştırma sürüyor — birkaç dakika sonra tekrar bakın.",
+          "failed": "Araştırma başarısız oldu.",
+          "noSafeFix": "Yapay zekâ bu sorun için güvenli bir düzeltme bulamadı.",
+          "checkBudget": "Yapay zekâ bütçesini kontrol edin",
+          "deeper": "Daha derin araştır",
+          "retry": "Yeniden dene",
+          "denial": {
+            "credits": "Bu faturalama dönemi için yapay zekâ kredileri tükendi.",
+            "dailyBudget": "Araştırma için günlük yapay zekâ bütçesine ulaşıldı.",
+            "orgBudget": "Bu kuruluşun yapay zekâ bütçesine ulaşıldı.",
+            "autoCap": "Otomatik araştırma sınırına ulaşıldı. Araştırmayı yine de elle başlatabilirsiniz.",
+            "busy": "Araştırma şu anda meşgul. Birkaç dakika sonra tekrar deneyin.",
+            "permission": "Yapay zekâ araştırması başlatma izniniz yok.",
+            "unavailable": "Yapay zekâ araştırması geçici olarak kullanılamıyor.",
+            "modelUnavailable": "Araştırma için yapay zekâ modeli kullanılamıyor.",
+            "notProvisioned": "Yapay zekâ araştırması bu kurulum için henüz ayarlanmadı."
+          }
+        },
+        "runBuiltin": "{{action}} çalıştır",
+        "draftScript": "Betik taslağı hazırla",
+        "emptyHint": "Oluştur önce kanıtlanmış düzeltmelere bakar, ardından yapay zekâya sorar.",
+        "reviewed": {
+          "pickerLabel": "Gözden geçirilmiş adımlar",
+          "asWritten": "Yazıldığı gibi adımlar (paylaşılmaz)",
+          "save": "Gözden geçirilmiş adımlar olarak kaydet",
+          "saved": "Gözden geçirilmiş adımlar olarak kaydedildi",
+          "failed": "Gözden geçirilmiş adımlar kaydedilemedi",
+          "stepsLabel": "Adımlar (satır başına bir)"
         }
       }
     },
@@ -2540,5 +2637,66 @@
     "noneConfigured": "Yapılandırılmış {{source}} yok",
     "overriding": "{{source}} değerini geçersiz kılıyor",
     "overridingWithValue": "{{source}} değerini geçersiz kılıyor ({{value}})"
+  },
+  "fixMemoryPage": {
+    "title": "Düzeltme belleği",
+    "subtitle": "Ekibinizin uyguladığı düzeltmeler ve bunların gerçekten ne sıklıkla kalıcı olduğu.",
+    "tabs": {
+      "fixes": "Düzeltmeler",
+      "steps": "İncelenmiş adımlar"
+    },
+    "filters": {
+      "os": "İşletim sistemi",
+      "anyOs": "Herhangi bir işletim sistemi",
+      "status": "Durum",
+      "anyStatus": "Herhangi bir durum",
+      "scope": "Kapsam",
+      "anyScope": "Herhangi bir kapsam",
+      "condition": "Koşula göre ara"
+    },
+    "columns": {
+      "fix": "Düzeltme",
+      "record": "Sonuç geçmişi",
+      "rate": "Başarı oranı",
+      "scope": "Kapsam",
+      "os": "İS",
+      "condition": "Koşul",
+      "lastVerified": "Son doğrulama",
+      "status": "Durum",
+      "actions": "Eylemler"
+    },
+    "status": {
+      "active": "Etkin",
+      "demoted": "Düşürüldü",
+      "retired": "Kullanımdan kaldırıldı",
+      "stale": "Eski"
+    },
+    "scope": {
+      "everyClient": "Tüm müşteriler",
+      "oneClient": "Bu müşteri"
+    },
+    "signature": "İmza {{prefix}}",
+    "retire": {
+      "action": "Kaldır",
+      "confirmTitle": "Bu düzeltme kaldırılsın mı?",
+      "confirmBody": "Kaldırılan düzeltmeler artık önerilmez. Geçmişi saklanır.",
+      "confirm": "Düzeltmeyi kaldır",
+      "success": "Düzeltme kaldırıldı.",
+      "failed": "Düzeltme kaldırılamadı."
+    },
+    "steps": {
+      "heading": "Adımlar",
+      "retire": "Adımları kaldır",
+      "success": "Adımlar kaldırıldı.",
+      "failed": "Adımlar kaldırılamadı.",
+      "empty": "Henüz incelenmiş adım yok. Burada görmek için bir öneriden adımları kaydedin."
+    },
+    "empty": "Henüz hatırlanan düzeltme yok. Düzeltmeler, çalıştırılıp sonuçları gözlemlendikten sonra burada görünür.",
+    "loadMore": "Daha fazla yükle",
+    "never": "Hiçbir zaman",
+    "retry": "Yeniden dene",
+    "errors": {
+      "loadFailed": "Düzeltme belleği yüklenemedi."
+    }
   }
 }

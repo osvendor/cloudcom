@@ -121,7 +121,9 @@ func init() {
 	serviceCmd.AddCommand(serviceStatusCmd)
 	serviceCmd.AddCommand(serviceReconcileUnitCmd)
 	serviceInstallCmd.Flags().BoolVar(&withUserHelper, "with-user-helper", false, "Also install the per-user desktop helper systemd unit")
-	serviceInstallCmd.Flags().BoolVar(&noWatchdog, "no-watchdog", false, "Skip automatic watchdog installation")
+	serviceInstallCmd.Flags().BoolVar(&noWatchdog, "no-watchdog", false, "Skip automatic watchdog installation and remember the choice (the running agent will not install it either)")
+	serviceInstallCmd.Flags().BoolVar(&watchdogOptIn, "watchdog", false, watchdogOptInUsage)
+	serviceInstallCmd.Flags().BoolVar(&strictWatchdog, "strict-watchdog", false, strictWatchdogUsage)
 	// A failed start returns an error from RunE; usage text would bury it.
 	serviceInstallCmd.SilenceUsage = true
 }
@@ -144,6 +146,13 @@ var serviceInstallCmd = &cobra.Command{
 		// can read agent.yaml.
 		if err := os.Chmod(linuxConfigDir, 0700); err != nil {
 			return fmt.Errorf("failed to set permissions on %s: %w", linuxConfigDir, err)
+		}
+
+		// Persist --no-watchdog / --watchdog (or honour a standing opt-out)
+		// before any install side effect: a failed marker write aborts here.
+		skipWatchdog, err := applyWatchdogFlags(defaultWatchdogFlagDeps(nil), noWatchdog, watchdogOptIn)
+		if err != nil {
+			return err
 		}
 
 		// Stop existing service before replacing binary (safe for upgrades).
@@ -186,7 +195,7 @@ var serviceInstallCmd = &cobra.Command{
 		}
 
 		// Write systemd unit file
-		if err := os.WriteFile(linuxUnitDst, []byte(linuxUnit), 0644); err != nil {
+		if err := os.WriteFile(linuxUnitDst, []byte(currentLinuxUnit()), 0644); err != nil {
 			return fmt.Errorf("failed to write unit file: %w", err)
 		}
 		fmt.Printf("Systemd unit installed to %s\n", linuxUnitDst)
@@ -276,7 +285,8 @@ var serviceInstallCmd = &cobra.Command{
 			fmt.Println("  4. Logs:    journalctl -u breeze-agent -f")
 		}
 
-		if !noWatchdog {
+		var watchdogExit error
+		if !skipWatchdog {
 			// Describe the service state we actually left behind. This line
 			// used to assert "installed and running" unconditionally, which
 			// before #5252 was never true on this platform and is still not
@@ -301,15 +311,18 @@ var serviceInstallCmd = &cobra.Command{
 						"  1. Re-run `sudo breeze-agent service install` (will retry the download).\n"+
 						"  2. Download %s manually, place it next to breeze-agent,\n"+
 						"     then run `sudo breeze-watchdog service install`.\n"+
-						"  3. To skip the watchdog entirely, use `--no-watchdog`.\n",
+						"  3. To skip the watchdog entirely, use `--no-watchdog`.\n"+
+						watchdogSelfHealHint,
 					err, agentStateLine, watchdogManualDownloadURL(version, runtime.GOOS, runtime.GOARCH, serverURL))
 			}
+			watchdogExit = reportWatchdogBootstrap(err, strictWatchdog, os.Stdout)
 		}
 
 		// Reported last so the watchdog still gets bootstrapped, but reported:
 		// a silent exit 0 on a host whose agent is down is exactly how #5252
-		// went unnoticed until the device showed Offline.
-		return startErr
+		// went unnoticed until the device showed Offline. The agent's start
+		// failure wins over the watchdog outcome (--strict-watchdog → 78).
+		return installExitError(startErr, watchdogExit)
 	},
 }
 
@@ -456,7 +469,7 @@ var serviceReconcileUnitCmd = &cobra.Command{
 		// Best-effort heal: if a later step fails the unit is already v2 on disk,
 		// so the next startup won't re-attempt the restart — the relaxed sandbox
 		// then applies on the following natural service restart rather than now.
-		if err := os.WriteFile(linuxUnitDst, []byte(linuxUnit), 0644); err != nil {
+		if err := os.WriteFile(linuxUnitDst, []byte(currentLinuxUnit()), 0644); err != nil {
 			recordReconcileFailure(fmt.Sprintf("reconcile subcommand: write unit: %v", err))
 			return fmt.Errorf("write unit: %w", err)
 		}

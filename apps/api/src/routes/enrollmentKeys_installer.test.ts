@@ -514,6 +514,33 @@ describe('enrollment key routes — installer download', () => {
       );
     });
 
+    it('#7974: macOS installer_download audit never stores the live short code', async () => {
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+      mockInsertValuesReturning([
+        makeEnrollmentKey({ id: 'child-key-id', name: 'Test Key (installer)', maxUsage: 1 }),
+      ]);
+
+      await app.request(`/enrollment-keys/${KEY_ID}/installer/macos`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer token' },
+      });
+
+      const insertMock = vi.mocked(db.insert).mock.results[0]!.value;
+      const liveCode = insertMock.values.mock.calls[0][0].shortCode as string;
+      expect(liveCode).toMatch(/^[A-Za-z0-9]{10}$/);
+
+      const call = vi
+        .mocked(createAuditLogAsync)
+        .mock.calls.map(([arg]) => arg)
+        .find((arg) => arg.action === 'enrollment_key.installer_download');
+      expect(call).toBeDefined();
+      expect(JSON.stringify(call)).not.toContain(liveCode);
+      expect(call!.details).not.toHaveProperty('shortCode');
+      expect(call!.details).toMatchObject({
+        shortCodeRef: expect.stringMatching(/^[0-9a-f]{12}$/),
+      });
+    });
+
     it('windows bootstrap passes maxUsage to issueBootstrapTokenForKey (count query param)', async () => {
       mockSelectFromWhereLimit([makeEnrollmentKey()]);
 
@@ -542,6 +569,75 @@ describe('enrollment key routes — installer download', () => {
       expect(issueBootstrapTokenForKey).toHaveBeenCalledWith(
         expect.objectContaining({ maxUsage: 5, ttlMinutes: 43200 }),
       );
+    });
+
+    // The installer embeds a credential (a bootstrap token, or on the legacy
+    // macOS path a child enrollment key) that lives at most 30 days. An
+    // explicit longer pick is refused with a 400 rather than silently
+    // shortened, so the admin learns the installer will not last that long.
+    it.each([
+      ['windows', 43201],
+      ['windows', 129600],
+      ['macos', 525600],
+    ] as const)('rejects (400) a %s installer ttlMinutes of %i, above the 30-day maximum', async (platform, ttlMinutes) => {
+      mockSelectFromWhereLimit([makeEnrollmentKey()]);
+
+      const res = await app.request(
+        `/enrollment-keys/${KEY_ID}/installer/${platform}?ttlMinutes=${ttlMinutes}`,
+        { method: 'GET', headers: { Authorization: 'Bearer token' } },
+      );
+
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain('43200');
+      expect(body.error).toContain('30 days');
+      expect(issueBootstrapTokenForKey).not.toHaveBeenCalled();
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    // Legacy macOS zip: the embedded credential is a child enrollment key.
+    // With no explicit ttlMinutes it falls back to CHILD_ENROLLMENT_KEY_TTL_MINUTES,
+    // which an operator may have set to a year; the downloaded zip must still
+    // stop enrolling after 30 days. The constant is read at import, so the
+    // route module is re-imported under the stubbed env.
+    it('bounds the legacy macOS child key to 30 days even when CHILD_ENROLLMENT_KEY_TTL_MINUTES is longer', async () => {
+      vi.stubEnv('CHILD_ENROLLMENT_KEY_TTL_MINUTES', '525600');
+      vi.resetModules();
+      try {
+        const { enrollmentKeyRoutes: freshRoutes } = await import('./enrollmentKeys');
+        const { db: freshDb } = await import('../db');
+        const rows = (r: unknown[]) => ({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue(r) }),
+          }),
+        });
+        vi.mocked(freshDb.select)
+          .mockReturnValueOnce(rows([makeEnrollmentKey()]) as any) // parent key
+          .mockReturnValueOnce(rows([]) as any); // allocateShortCode probe
+        const values = vi.fn().mockReturnValue({
+          returning: vi.fn().mockResolvedValue([
+            makeEnrollmentKey({ id: 'child-key-id', name: 'Test Key (installer)', maxUsage: 1 }),
+          ]),
+        });
+        vi.mocked(freshDb.insert).mockReturnValueOnce({ values } as any);
+
+        const freshApp = new Hono();
+        freshApp.route('/enrollment-keys', freshRoutes);
+        const before = Date.now();
+        const res = await freshApp.request(`/enrollment-keys/${KEY_ID}/installer/macos`, {
+          method: 'GET', headers: { Authorization: 'Bearer token' },
+        });
+        const after = Date.now();
+
+        expect(res.status).toBe(200);
+        const childExpiryMs = (values.mock.calls[0]![0] as { expiresAt: Date }).expiresAt.getTime();
+        expect(childExpiryMs).toBeGreaterThanOrEqual(before + 43200 * 60_000 - 50);
+        expect(childExpiryMs).toBeLessThanOrEqual(after + 43200 * 60_000 + 50);
+        expect(clampTtlToCapMock).toHaveBeenCalledWith(ORG_ID, 43200);
+      } finally {
+        vi.unstubAllEnvs();
+        vi.resetModules();
+      }
     });
 
     it('child key honors the ttlMinutes query param (per-link picker) (macos)', async () => {

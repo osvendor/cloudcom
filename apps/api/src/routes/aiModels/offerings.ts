@@ -8,6 +8,7 @@ import { CONNECTION_DISCONNECTED_MESSAGE, RegistryWriteError } from '../../servi
 import {
   ensurePlatformOffering,
   listOfferingDefaultUses,
+  removeOffering,
   setOfferingEnabled,
   updateOfferingDetails,
 } from '../../services/aiModels/offeringWrites';
@@ -15,6 +16,7 @@ import {
   APPROVALS_DECIDE_REQUIRED,
   canDecideApprovals,
   idParamSchema,
+  partnerRateLimit,
   partnerWrite,
   platformModelIdParamSchema,
   queueConnectionSync,
@@ -76,11 +78,30 @@ aiModelOfferingRoutes.patch('/:id', ...partnerWrite, zValidator('param', idParam
   });
 });
 
+// Remove a hand-added model (#8510). Discovered/platform/catalog models are
+// disabled instead (they are re-listed on every sync); a model still used by a
+// default, fallback list, refusal fallback or agent is refused with the list.
+aiModelOfferingRoutes.delete('/:id', ...partnerWrite, zValidator('param', idParamSchema), async (c) => {
+  const { partnerId } = requirePartnerWide(c);
+  return registryWrite(c, partnerId, async () => {
+    const removed = await removeOffering({ partnerId, offeringId: c.req.valid('param').id });
+    auditOffering(c, partnerId, 'removed', {
+      offeringId: removed.id, connectionId: removed.connectionId, modelId: removed.modelId, source: removed.source,
+    });
+    return c.json({ deleted: true, id: removed.id });
+  });
+});
+
 // "Verify" (spec §11, Decision D4): for an Anthropic-dialect connection it re-runs
 // discovery, which re-reads its capabilities and lifecycle; for a gateway
 // connection (W06) it queues the fidelity-harness verification. Platform
 // offerings (no connection) are verified by the operator on /admin/ai-models.
-aiModelOfferingRoutes.post('/:id/verify', ...partnerWrite, zValidator('param', idParamSchema), async (c) => {
+// Each verify queues upstream calls against the partner's endpoint, so it is
+// bounded per partner.
+const VERIFY_LIMIT_PER_WINDOW = 20;
+const VERIFY_WINDOW_SECONDS = 60 * 60;
+
+aiModelOfferingRoutes.post('/:id/verify', ...partnerWrite, partnerRateLimit('offering-verify', VERIFY_LIMIT_PER_WINDOW, VERIFY_WINDOW_SECONDS), zValidator('param', idParamSchema), async (c) => {
   const { partnerId } = requirePartnerWide(c);
   const { id: offeringId } = c.req.valid('param');
   return registryWrite(c, partnerId, async () => {

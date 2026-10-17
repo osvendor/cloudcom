@@ -14,6 +14,7 @@ import { queueCommand, type CommandPayload, type QueuedCommand } from './command
 import { assertDeviceExecuteAllowed, TrustDeniedError } from './partnerTrust.commands';
 import { backupReadHelperRefusal } from './backupReadHelperGate';
 import { backupWriteHelperRefusal } from './backupWriteHelperGate';
+import { restoreIntegrityHelperRefusal } from './backupRestoreGate';
 import { captureException } from './sentry';
 import {
   isParkedDeliverableCommandType,
@@ -62,9 +63,13 @@ export type DispatchDeviceCommandResult =
        * `delivered` = pushed over the live socket now. `queued_live` = device is
        * online but the push did not happen (no socket, push failed, or
        * preferHeartbeat); the next heartbeat claims it. `queued_offline` = the
-       * device was not online at enqueue.
+       * device was not online at enqueue. `cancelled` = the push's claim-time
+       * eligibility check (the same one the heartbeat claim runs) refused and
+       * terminalised the row; it will never be delivered — see `cancelReason`.
        */
-      delivery: 'delivered' | 'queued_offline' | 'queued_live';
+      delivery: 'delivered' | 'queued_offline' | 'queued_live' | 'cancelled';
+      /** Present only when `delivery` is `cancelled`: `device_commands.result.reason`. */
+      cancelReason?: string;
       /** NULL for a `reject` policy: those rows stay on the legacy execution clock. */
       deliverBy: Date | null;
       /**
@@ -233,8 +238,12 @@ async function prepareDeviceCommand(
   // destination, which is never done. Refused here, before a row exists, so
   // the caller can say so; the delivery refreshers enforce the same rules
   // against the helper's reported capability at the moment of delivery.
+  // A privileged restore (one that installs, imports or boots snapshot
+  // bytes) additionally needs a helper that checks restored bytes against the
+  // snapshot attestation (services/backupRestoreGate.ts); delivery re-checks.
   const helperRefusal = backupReadHelperRefusal(input.type, payload, device.backupReadProtocolVersion)
-    ?? backupWriteHelperRefusal(input.type, payload, device.backupWriteProtocolVersion);
+    ?? backupWriteHelperRefusal(input.type, payload, device.backupWriteProtocolVersion)
+    ?? restoreIntegrityHelperRefusal(input.type, device.backupIntegrityProtocolVersion);
   if (helperRefusal) {
     return { ok: false, code: 'backup_helper_update_required', error: helperRefusal };
   }
@@ -277,7 +286,16 @@ async function deliverPreparedDeviceCommand(
   }
 
   const claimed = await claimPendingCommandForDelivery(command.id);
-  if (!claimed) return { ok: true, command, delivery: 'queued_live', deliverBy };
+  if (claimed.status === 'cancelled') {
+    return {
+      ok: true,
+      command: { ...command, status: 'cancelled' } as QueuedCommand,
+      delivery: 'cancelled',
+      cancelReason: claimed.reason,
+      deliverBy,
+    };
+  }
+  if (claimed.status !== 'claimed') return { ok: true, command, delivery: 'queued_live', deliverBy };
 
   // The enqueue-time push runs the same late-binding preparation the heartbeat
   // batch does, so a `software_install` pushed now and one claimed in six hours

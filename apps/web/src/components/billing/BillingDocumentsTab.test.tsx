@@ -9,6 +9,10 @@ function renderTab(overrides: Partial<Parameters<typeof BillingDocumentsTab>[0]>
     autoEmailInvoice: true, setAutoEmailInvoice: vi.fn(),
     notifyOnBehalfAcceptance: false, setNotifyOnBehalfAcceptance: vi.fn(),
     deviceAppendix: false, setDeviceAppendix: vi.fn(),
+    lineShowDate: false, setLineShowDate: vi.fn(),
+    lineShowNote: true, setLineShowNote: vi.fn(),
+    lineShowWorkedTime: true, setLineShowWorkedTime: vi.fn(),
+    lineGrouping: 'entry' as const, setLineGrouping: vi.fn(),
     footer: '', setFooter: vi.fn(),
     documentTheme: 'classic' as const, setDocumentTheme: vi.fn(),
     documentPageSize: 'letter' as const, setDocumentPageSize: vi.fn(),
@@ -25,6 +29,27 @@ function renderTab(overrides: Partial<Parameters<typeof BillingDocumentsTab>[0]>
   return props;
 }
 
+describe('BillingDocumentsTab — time entry lines (#8604)', () => {
+  it('renders the loaded values and wires the setters', () => {
+    const props = renderTab({ lineShowDate: true, lineShowNote: false, lineShowWorkedTime: true, lineGrouping: 'day' });
+    expect((screen.getByTestId('partner-billing-line-show-date') as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByTestId('partner-billing-line-show-note') as HTMLInputElement).checked).toBe(false);
+    expect((screen.getByTestId('partner-billing-line-show-worked-time') as HTMLInputElement).checked).toBe(true);
+    const select = screen.getByTestId('partner-billing-line-grouping') as HTMLSelectElement;
+    expect(select.value).toBe('day');
+    expect(select.disabled).toBe(false);
+    fireEvent.click(screen.getByTestId('partner-billing-line-show-note'));
+    expect(props.setLineShowNote).toHaveBeenCalledWith(true);
+    fireEvent.change(select, { target: { value: 'entry' } });
+    expect(props.setLineGrouping).toHaveBeenCalledWith('entry');
+  });
+
+  it('disables the grouping select while show-date is off', () => {
+    renderTab({ lineShowDate: false });
+    expect((screen.getByTestId('partner-billing-line-grouping') as HTMLSelectElement).disabled).toBe(true);
+  });
+});
+
 describe('BillingDocumentsTab', () => {
   it('renders auto-email, device appendix, document theme/size, footer, and the Company card', () => {
     renderTab();
@@ -35,6 +60,14 @@ describe('BillingDocumentsTab', () => {
     expect(screen.getByTestId('partner-billing-footer')).toBeInTheDocument();
     expect(screen.getByTestId('partner-billing-company-name')).toBeInTheDocument();
     expect(screen.getByTestId('partner-billing-website')).toBeInTheDocument();
+  });
+
+  it('names the document theme by its fonts — "Condensed" read as a layout change, not a font choice', () => {
+    renderTab();
+    expect(screen.getByLabelText('Document fonts')).toBe(screen.getByTestId('partner-billing-document-theme'));
+    const options = [...(screen.getByTestId('partner-billing-document-theme') as HTMLSelectElement).options].map((o) => [o.value, o.text]);
+    // Stored values are unchanged (partners.document_theme, quote presentation snapshots).
+    expect(options).toEqual([['classic', 'Helvetica'], ['condensed', 'Barlow Condensed + DM Sans']]);
   });
 
   it('#6635: renders the on-behalf acceptance notice toggle unchecked by default and wires its setter', () => {

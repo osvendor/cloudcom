@@ -400,6 +400,9 @@ func TestApplyPromotionFailurePersistsFailureAndCleanupEvidence(t *testing.T) {
 				t.Fatalf("manager Available()=%v, want %v", manager.Available(), tc.wantAvailable)
 			}
 			if tc.wantAvailable {
+				if !entry.RecoveredFromActive {
+					t.Fatal("compensated pre-launch failure lost its restart verification marker")
+				}
 				if result.Evidence.AccountEnabled == nil || *result.Evidence.AccountEnabled || result.Evidence.AccountInAdministrators == nil || *result.Evidence.AccountInAdministrators || result.Evidence.PrivilegedTokenPresent == nil || *result.Evidence.PrivilegedTokenPresent {
 					t.Fatalf("missing verified cleanup evidence: %+v", result.Evidence)
 				}

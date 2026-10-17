@@ -130,12 +130,18 @@ vi.mock('../db', () => ({
   withDbAccessContext: vi.fn(async (_ctx: any, fn: any) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: any) => fn()),
   runOutsideDbContext: vi.fn((fn: any) => fn()),
+  // #8053 W1a-1: DeferredCacheFills consults these.
+  hasDbAccessContext: () => false,
+  getCurrentDbAccessContext: () => ({ scope: 'system' }),
+  runAfterDbContextExit: (_label: string, work: () => unknown) => { work(); },
   // #3530: the command-result route's CAS + persistence savepoint.
   withDbTransaction: vi.fn(async (fn: any) => fn()),
   SYSTEM_DB_ACCESS_CONTEXT: { scope: 'system', orgId: null, accessibleOrgIds: null }
 }));
 
 vi.mock('../db/schema', () => ({
+  deviceReliability: { deviceId: 'deviceId', details: 'details', reliabilityScore: 'reliabilityScore', trendDirection: 'trendDirection' },
+  deviceReliabilityBaselines: { id: 'id', deviceId: 'deviceId', baselineAt: 'baselineAt', createdAt: 'createdAt', clearedAt: 'clearedAt', reason: 'reason', source: 'source' },
   devices: {},
   deviceHardware: {},
   deviceNetwork: {},
@@ -297,12 +303,14 @@ import { queueCommandForExecution } from '../services/commandQueue';
 import { processBackupVerificationResult } from './backup/verificationService';
 import { claimPendingCommandsForDevice } from '../services/commandDispatch';
 import { agentAuthMiddleware } from '../middleware/agentAuth';
+import { __resetHotPathCachesForTests } from '../services/hotPathCacheRegistry';
 
 describe('agent routes', () => {
   let app: Hono;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    __resetHotPathCachesForTests(); // per-org heartbeat caches (#8053)
     // Reset db mock implementations to factory defaults (clearAllMocks doesn't reset mockReturnValue)
     vi.mocked(db.select).mockImplementation(() => defaultSelectChain() as any);
     vi.mocked(db.insert).mockImplementation(() => defaultInsertChain() as any);
@@ -982,6 +990,7 @@ describe('agent routes', () => {
       const body = await res.json();
       expect(body.configUpdate).toEqual({
         backup_server_url: '',
+        ech_enabled: true,
         event_log_settings: {
           max_events_per_cycle: 100,
           collect_categories: ['security', 'hardware', 'application', 'system'],
@@ -1110,6 +1119,7 @@ describe('agent routes', () => {
       expect(body.commands[0].type).toBe('filesystem_analysis');
       expect(body.configUpdate).toEqual({
         backup_server_url: '',
+        ech_enabled: true,
         event_log_settings: {
           max_events_per_cycle: 100,
           collect_categories: ['security', 'hardware', 'application', 'system'],

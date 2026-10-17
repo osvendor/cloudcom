@@ -144,7 +144,7 @@ export const aiSessions = pgTable('ai_sessions', {
 
 export const aiMessages = pgTable('ai_messages', {
   id: uuid('id').primaryKey().defaultRandom(),
-  sessionId: uuid('session_id').notNull().references(() => aiSessions.id),
+  sessionId: uuid('session_id').notNull().references(() => aiSessions.id, { onDelete: 'cascade' }),
   role: aiMessageRoleEnum('role').notNull(),
   content: text('content'),
   contentBlocks: jsonb('content_blocks'),
@@ -166,13 +166,13 @@ export const aiMessages = pgTable('ai_messages', {
 
 export const aiToolExecutions = pgTable('ai_tool_executions', {
   id: uuid('id').primaryKey().defaultRandom(),
-  sessionId: uuid('session_id').notNull().references(() => aiSessions.id),
-  messageId: uuid('message_id').references(() => aiMessages.id),
+  sessionId: uuid('session_id').notNull().references(() => aiSessions.id, { onDelete: 'cascade' }),
+  messageId: uuid('message_id').references(() => aiMessages.id, { onDelete: 'set null' }),
   toolName: varchar('tool_name', { length: 100 }).notNull(),
   toolInput: jsonb('tool_input').notNull(),
   toolOutput: jsonb('tool_output'),
   status: aiToolStatusEnum('status').notNull().default('pending'),
-  approvedBy: uuid('approved_by').references(() => users.id),
+  approvedBy: uuid('approved_by').references(() => users.id, { onDelete: 'set null' }),
   approvedAt: timestamp('approved_at'),
   commandId: uuid('command_id'),
   durationMs: integer('duration_ms'),
@@ -229,7 +229,6 @@ export const aiBudgets = pgTable('ai_budgets', {
   monthlyBudgetCents: integer('monthly_budget_cents'),
   dailyBudgetCents: integer('daily_budget_cents'),
   maxTurnsPerSession: integer('max_turns_per_session').notNull().default(50),
-  allowedModels: jsonb('allowed_models').default(['claude-sonnet-4-5-20250929']),
   messagesPerMinutePerUser: integer('messages_per_minute_per_user').notNull().default(20),
   messagesPerHourPerOrg: integer('messages_per_hour_per_org').notNull().default(200),
   approvalMode: aiApprovalModeEnum('approval_mode').notNull().default('per_step'),
@@ -298,6 +297,10 @@ export const aiBudgetReservations = pgTable('ai_budget_reservations', {
   modelBinding: jsonb('model_binding').$type<Record<string, unknown> | null>(),
   // A settlement deferred by org-lock contention, replayed by the sweep.
   pendingSettlement: jsonb('pending_settlement').$type<Record<string, unknown> | null>(),
+  // #7773: turn-time rate of each unbound BYOK refusal-fallback key, written
+  // by settleInvocation from the connection's offering (first write wins) and
+  // verified by the settlement transaction, so a deferred replay settles at it.
+  unboundRateAttestations: jsonb('unbound_rate_attestations').$type<Record<string, unknown> | null>(),
   // Replay dead-letter (#7700 finding 5): failed replays so far, the last
   // scrubbed error, and when it was given up on (excluded from replay).
   pendingSettlementAttempts: integer('pending_settlement_attempts').notNull().default(0),

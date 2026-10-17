@@ -10,9 +10,10 @@ import {
 import {
   createManualInvoice, getInvoice, listInvoices, addManualLine, addCatalogLine, addBundleLine,
   updateLine, removeLine, deleteDraftInvoice, updateInvoice, updateIssuedDueDate,
-  changeInvoiceCurrency
+  changeInvoiceCurrency, refreshDraftTimeLines
 } from '../../services/invoiceService';
 import { writeRouteAudit } from '../../services/auditEvents';
+import { auditBillingDocument } from '../../services/billingDocumentAudit';
 import { InvoiceServiceError, type InvoiceActor } from '../../services/invoiceTypes';
 import { resolveInvoiceBranding } from '../../services/quoteBranding';
 
@@ -55,8 +56,11 @@ invoiceCrudRoutes.get('/', scopes, readPerm, zValidator('query', listInvoicesQue
   catch (err) { return handleServiceError(c, err); }
 });
 invoiceCrudRoutes.post('/', scopes, writePerm, zValidator('json', createManualInvoiceSchema), async (c) => {
-  try { return c.json({ data: await createManualInvoice(c.req.valid('json'), invoiceActorFrom(c)) }); }
-  catch (err) { return handleServiceError(c, err); }
+  try {
+    const invoice = await createManualInvoice(c.req.valid('json'), invoiceActorFrom(c));
+    auditBillingDocument(c, 'invoice', 'create', invoice);
+    return c.json({ data: invoice });
+  } catch (err) { return handleServiceError(c, err); }
 });
 invoiceCrudRoutes.get('/:id', scopes, readPerm, zValidator('param', idParam), async (c) => {
   try {
@@ -76,7 +80,11 @@ invoiceCrudRoutes.patch('/:id', scopes, writePerm, zValidator('param', idParam),
   catch (err) { return handleServiceError(c, err); }
 });
 invoiceCrudRoutes.delete('/:id', scopes, writePerm, zValidator('param', idParam), async (c) => {
-  try { await deleteDraftInvoice(c.req.valid('param').id, invoiceActorFrom(c)); return c.json({ data: { ok: true } }); }
+  try {
+    const deleted = await deleteDraftInvoice(c.req.valid('param').id, invoiceActorFrom(c));
+    auditBillingDocument(c, 'invoice', 'delete', deleted);
+    return c.json({ data: { ok: true } });
+  }
   catch (err) { return handleServiceError(c, err); }
 });
 invoiceCrudRoutes.post('/:id/lines', scopes, writePerm, zValidator('param', idParam), zValidator('json', manualLineSchema), async (c) => {
@@ -114,6 +122,22 @@ invoiceCrudRoutes.patch('/:id/due-date', scopes, writePerm, zValidator('param', 
 invoiceCrudRoutes.patch('/:id/lines/:lineId', scopes, writePerm, zValidator('param', lineParam), zValidator('json', updateLineSchema), async (c) => {
   try { const p = c.req.valid('param'); return c.json({ data: await updateLine(p.id, p.lineId, c.req.valid('json'), invoiceActorFrom(c)) }); }
   catch (err) { return handleServiceError(c, err); }
+});
+// #8606: draft-only "Refresh from time entries". Re-reads each time-entry
+// line's source entry; never changes quantities, prices or totals. Returns the
+// per-line outcome (refreshed / unchanged / skipped + reason / quantityDrifted).
+invoiceCrudRoutes.post('/:id/refresh-time-lines', scopes, writePerm, zValidator('param', idParam), async (c) => {
+  try {
+    const result = await refreshDraftTimeLines(c.req.valid('param').id, invoiceActorFrom(c));
+    writeRouteAudit(c, {
+      orgId: result.orgId,
+      action: 'invoice.time_lines.refreshed',
+      resourceType: 'invoice',
+      resourceId: result.invoiceId,
+      details: { ...result.summary },
+    });
+    return c.json({ data: result });
+  } catch (err) { return handleServiceError(c, err); }
 });
 invoiceCrudRoutes.delete('/:id/lines/:lineId', scopes, writePerm, zValidator('param', lineParam), async (c) => {
   try { const p = c.req.valid('param'); return c.json({ data: await removeLine(p.id, p.lineId, invoiceActorFrom(c)) }); }

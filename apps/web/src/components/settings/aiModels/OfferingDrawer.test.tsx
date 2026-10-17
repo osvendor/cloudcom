@@ -28,6 +28,15 @@ describe('OfferingDrawer', () => {
     expect(fetchWithAuth.mock.calls[0][1].method).toBe('PATCH');
   });
 
+  it('locks name and price inputs on an env-managed offering and explains why', () => {
+    render(<OfferingDrawer offering={row({ id: OFF, connectionId: CONN, funding: 'partner_key', pricesEditable: true, priceSource: 'offering', rates: RATES, ownPrices: RATES })}
+      offerings={[]} envManaged onClose={vi.fn()} onSaved={vi.fn()} />);
+    expect((screen.getByTestId('ai-offering-display-name') as HTMLInputElement).disabled).toBe(true);
+    expect(screen.queryByTestId('ai-offering-price-input')).toBeNull();
+    expect(screen.getByTestId('ai-offering-env-managed').textContent).toMatch(/MCP_LLM_/);
+    expect(screen.getByTestId('ai-offering-price-readonly')).toBeTruthy();
+  });
+
   it('disables Save until something changed', () => {
     render(<OfferingDrawer offering={row()} offerings={[]} onClose={vi.fn()} onSaved={vi.fn()} />);
     expect((screen.getByTestId('ai-offering-save') as HTMLButtonElement).disabled).toBe(true);
@@ -182,5 +191,72 @@ describe('OfferingDrawer', () => {
     unmount();
     render(<OfferingDrawer offering={row({ id: OFF, connectionId: CONN, funding: 'partner_key' })} offerings={[]} onClose={vi.fn()} onSaved={vi.fn()} />);
     expect(screen.queryByTestId('ai-offering-verify-hint')).toBeNull();
+  });
+  describe('remove model (#8510)', () => {
+    const manualRow = (over: Partial<AiOfferingDto> = {}) =>
+      row({ id: OFF, source: 'manual', connectionId: CONN, funding: 'partner_key', ...over });
+
+    it('offers Remove only for a hand-added model', () => {
+      const { unmount } = render(<OfferingDrawer offering={manualRow()} offerings={[]} onClose={vi.fn()} onSaved={vi.fn()} />);
+      expect(screen.getByTestId('ai-offering-remove')).toBeTruthy();
+      unmount();
+      render(<OfferingDrawer offering={manualRow({ source: 'discovered' })} offerings={[]} onClose={vi.fn()} onSaved={vi.fn()} />);
+      expect(screen.queryByTestId('ai-offering-remove')).toBeNull();
+    });
+
+    it('hides Remove on an env-managed connection (the API refuses it)', () => {
+      render(<OfferingDrawer offering={manualRow()} offerings={[]} envManaged onClose={vi.fn()} onSaved={vi.fn()} />);
+      expect(screen.queryByTestId('ai-offering-remove')).toBeNull();
+    });
+
+    it('confirms, DELETEs the offering, then refreshes and closes', async () => {
+      fetchWithAuth.mockResolvedValueOnce(jsonRes({ deleted: true, id: OFF }));
+      const onSaved = vi.fn();
+      const onClose = vi.fn();
+      render(<OfferingDrawer offering={manualRow()} offerings={[]} onClose={onClose} onSaved={onSaved} />);
+      fireEvent.click(screen.getByTestId('ai-offering-remove'));
+      expect(fetchWithAuth).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByTestId('ai-offering-remove-confirm'));
+      await waitFor(() => expect(onClose).toHaveBeenCalled());
+      expect(fetchWithAuth.mock.calls[0][0]).toBe(`/ai/models/offerings/${OFF}`);
+      expect(fetchWithAuth.mock.calls[0][1].method).toBe('DELETE');
+      expect(onSaved).toHaveBeenCalled();
+    });
+
+    it('keeps the drawer open and shows the server reason when the model is still in use', async () => {
+      fetchWithAuth.mockResolvedValueOnce(jsonRes(
+        { error: 'This model is still used by a feature, a fallback list or an agent. Remove it from those first.', code: 'offering_in_use' },
+        409,
+      ));
+      const onClose = vi.fn();
+      const onSaved = vi.fn();
+      render(<OfferingDrawer offering={manualRow()} offerings={[]} onClose={onClose} onSaved={onSaved} />);
+      fireEvent.click(screen.getByTestId('ai-offering-remove'));
+      fireEvent.click(screen.getByTestId('ai-offering-remove-confirm'));
+      await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'error', message: expect.stringContaining('still used'),
+      })));
+      expect(onClose).not.toHaveBeenCalled();
+      expect(onSaved).not.toHaveBeenCalled();
+    });
+
+    it('reloads and closes when the model was already removed elsewhere (404)', async () => {
+      fetchWithAuth.mockResolvedValueOnce(jsonRes({ error: 'Model not found.', code: 'not_found' }, 404));
+      const onSaved = vi.fn();
+      const onClose = vi.fn();
+      render(<OfferingDrawer offering={manualRow()} offerings={[]} onClose={onClose} onSaved={onSaved} />);
+      fireEvent.click(screen.getByTestId('ai-offering-remove'));
+      fireEvent.click(screen.getByTestId('ai-offering-remove-confirm'));
+      await waitFor(() => expect(onClose).toHaveBeenCalled());
+      expect(onSaved).toHaveBeenCalled();
+    });
+
+    it('hides Remove for platform and catalog models', () => {
+      for (const source of ['platform', 'catalog'] as const) {
+        const { unmount } = render(<OfferingDrawer offering={manualRow({ source })} offerings={[]} onClose={vi.fn()} onSaved={vi.fn()} />);
+        expect(screen.queryByTestId('ai-offering-remove')).toBeNull();
+        unmount();
+      }
+    });
   });
 });

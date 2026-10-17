@@ -336,6 +336,16 @@ describe('callout block content', () => {
   });
 });
 
+describe('coverPageSchema — showContents (PDF contents list)', () => {
+  it('accepts an opt-in showContents flag and leaves it absent by default', () => {
+    expect(coverPageSchema.parse({ enabled: false, showContents: true }).showContents).toBe(true);
+    expect(coverPageSchema.parse({ enabled: true }).showContents).toBeUndefined();
+  });
+  it('rejects a non-boolean showContents', () => {
+    expect(coverPageSchema.safeParse({ enabled: true, showContents: 'yes' }).success).toBe(false);
+  });
+});
+
 describe('coverPageSchema', () => {
   it('accepts a minimal disabled cover page', () => {
     const parsed = coverPageSchema.parse({ enabled: false });
@@ -566,8 +576,10 @@ describe('quoteLineDeviceSetIssues (#3205 W05)', () => {
   // The divergence tripwire. These are equal TODAY; a future wave that widens
   // one without the other must fail here rather than silently accept a quote
   // line acceptance cannot map.
-  it('QUOTE_DEVICE_SET_TYPES equals ALLOWANCE_LINE_TYPES', () => {
-    expect([...QUOTE_DEVICE_SET_TYPES]).toEqual([...ALLOWANCE_LINE_TYPES]);
+  it('QUOTE_DEVICE_SET_TYPES equals ALLOWANCE_LINE_TYPES minus hour_block', () => {
+    // A quote line cannot express a block (quoteToContract.ts is unchanged by #4547):
+    // block hours are created on the contract, never accepted from a quote.
+    expect([...QUOTE_DEVICE_SET_TYPES]).toEqual([...ALLOWANCE_LINE_TYPES].filter((t) => t !== 'hour_block'));
   });
 });
 

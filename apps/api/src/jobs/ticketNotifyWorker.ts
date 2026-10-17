@@ -7,6 +7,8 @@
  *   - ticket.commented (isPublic) → email to requester
  *   - ticket.status_changed → resolved → email to requester
  *   - ticket.sla_breached → in-app + email to assignee
+ *   - ticket.approval_requested / ticket.approval_decided → customer approver /
+ *     notify emails + staff in-app (ticketApprovalNotify.ts, #4617)
  *
  * Pre-commit emission contract: ticketService emits events while the request
  * transaction is still open (see emitTicketEvent usage in ticketService.ts).
@@ -28,9 +30,9 @@
 import { Worker, type Job } from 'bullmq';
 import { and, asc, eq, isNull, lte } from 'drizzle-orm';
 import * as dbModule from '../db';
-import { organizations, partners, tickets, ticketComments } from '../db/schema';
+import { organizations, partners, tickets, ticketComments, devices, ticketStatuses } from '../db/schema';
 import { getEmailService } from '../services/email';
-import { escapeHtml } from '../services/emailLayout';
+import { escapeHtml, renderButton, renderLayout, renderParagraph } from '../services/emailLayout';
 import { renderTicketConversation, ticketConversationSubject } from '../services/emailTemplates/ticketConversation';
 import { renderPartnerEmail, type PartnerEmailCustom } from '../services/emailTemplates/renderPartnerEmail';
 import { resolveCommentNotificationPortalHref } from '../services/inboundEmail/commentNotificationPortalHref';
@@ -42,7 +44,19 @@ import { captureException } from '../services/sentry';
 import { TICKET_EVENTS_QUEUE, type TicketEvent } from '../services/ticketEvents';
 import { attachWorkerObservability } from './workerObservability';
 import { createNotification } from '../services/userNotifications';
+import {
+  admitApprovalMail,
+  releaseApprovalMail,
+  collectApprovalDecided,
+  collectApprovalRequested,
+  type ApprovalCollected,
+  type ApprovalMail,
+} from './ticketApprovalNotify';
 import { buildTicketPush, dispatchPushToTokens } from '../services/expoPush';
+import { sendPushoverNotification, validatePushoverConfig, type PushoverConfig, type PushoverNotificationPayload } from '../services/notificationSenders';
+import { applyPartnerPushoverDefaults, readPartnerPushoverDefaults } from '../services/partnerPushoverDefaults';
+import { loadUserPushoverKey } from '../services/ticketPushover';
+import type { AlertSeverity } from '../services/email';
 import {
   admitPush,
   assertSamePartner,
@@ -94,7 +108,7 @@ interface EmailPayloadBase {
  */
 type EmailPayloadSender =
   | { purpose: 'ticket.staff_notification' }
-  | { purpose: 'ticket.customer_notification'; partnerId: string | null };
+  | { purpose: 'ticket.customer_notification'; partnerId: string | null; partnerName: string | null };
 
 type EmailPayload = EmailPayloadBase & EmailPayloadSender;
 
@@ -106,6 +120,81 @@ async function getTicket(ticketId: string) {
 async function getOrgName(orgId: string): Promise<string> {
   const rows = await db.select({ name: organizations.name }).from(organizations).where(eq(organizations.id, orgId)).limit(1);
   return rows?.[0]?.name ?? '';
+}
+
+function dashboardBaseUrl(): string {
+  return (process.env.DASHBOARD_URL || process.env.PUBLIC_APP_URL || 'http://localhost:4321').replace(/\/+$/, '');
+}
+
+// Both lookups run in system scope, so they bind the row to the ticket's own
+// tenant explicitly: a stale or foreign id yields no name rather than another
+// tenant's data.
+export async function getDeviceName(deviceId: string | null | undefined, orgId: string): Promise<string | null> {
+  if (!deviceId) return null;
+  const rows = await db.select({ displayName: devices.displayName, hostname: devices.hostname })
+    .from(devices).where(and(eq(devices.id, deviceId), eq(devices.orgId, orgId))).limit(1);
+  const d = rows[0];
+  if (!d) return null;
+  // Same normalization as the device pickers: a blank display name falls back to the hostname.
+  return d.displayName?.trim() || d.hostname || null;
+}
+
+/** The partner's configured status name (custom statuses), else null. */
+export async function getStatusName(statusId: string | null | undefined, partnerId: string): Promise<string | null> {
+  if (!statusId) return null;
+  const rows = await db.select({ name: ticketStatuses.name }).from(ticketStatuses)
+    .where(and(eq(ticketStatuses.id, statusId), eq(ticketStatuses.partnerId, partnerId))).limit(1);
+  return rows[0]?.name ?? null;
+}
+
+function priorityChip(p: string | null | undefined): string {
+  const v = (p ?? 'normal').toLowerCase();
+  const color = v === 'urgent' || v === 'high' ? '#b42318' : v === 'low' ? '#6b7280' : '#1a7f37';
+  return `<span style="display:inline-block;padding:2px 8px;border-radius:4px;background:${color};color:#ffffff;font-size:12px;font-weight:600;text-transform:uppercase;">${escapeHtml(v)}</span>`;
+}
+
+/** Assignee notification email: facts table, the ticket body (escaped, capped)
+ *  and an open-in-dashboard button, inside the shared transactional layout
+ *  (services/emailLayout.ts). Staff-only; the content is the ticket the
+ *  assignee can already open. renderLayout escapes title, preheader and
+ *  heading itself, so those are passed raw. */
+export function buildAssigneeEmailHtml(
+  t: { id: string; subject: string; description?: string | null; priority?: string | null; status?: string | null; statusName?: string | null; submitterName?: string | null; submitterEmail?: string | null },
+  label: string,
+  orgName: string,
+  deviceName: string | null,
+): string {
+  const url = `${dashboardBaseUrl()}/tickets/${t.id}`;
+  // The first 1,200 code points, so an emoji at the boundary is kept whole.
+  // Pre-cutting at 2,400 code units bounds the work; 2,400 units always hold at
+  // least 1,200 complete code points, so that pre-cut can never reach the result.
+  const excerpt = Array.from((t.description ?? '').slice(0, 2400)).slice(0, 1200).join('');
+  const bodyHtml = escapeHtml(excerpt).replace(/\n/g, '<br>');
+  const requester = [t.submitterName, t.submitterEmail].filter(Boolean).map(String).join(' ').trim();
+  const row = (k: string, v: string) =>
+    v ? `<tr><td style="padding:4px 12px 4px 0;color:#6b7280;font-size:13px;white-space:nowrap;vertical-align:top;">${k}</td><td style="padding:4px 0;color:#111111;font-size:13px;">${v}</td></tr>` : '';
+  const body = [
+    `<table role="presentation" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:0 0 14px;">`,
+    row('Ticket', escapeHtml(label)),
+    row('Client', escapeHtml(orgName)),
+    row('Priority', priorityChip(t.priority)),
+    row('Status', escapeHtml(String(t.statusName ?? t.status ?? ''))),
+    row('From', escapeHtml(requester)),
+    deviceName ? row('Device', escapeHtml(deviceName)) : '',
+    `</table>`,
+    bodyHtml
+      ? `<div style="border-left:3px solid #d1d5db;padding:8px 12px;margin:0 0 16px;color:#374151;font-size:14px;line-height:1.5;background:#f9fafb;">${bodyHtml}</div>`
+      : '',
+    renderButton('Open ticket', url),
+    renderParagraph(escapeHtml(url), { muted: true, marginTop: 12 }),
+  ].join('');
+  const heading = `Assigned to you: ${t.subject}`;
+  return renderLayout({
+    title: `[${label}] ${heading}`,
+    preheader: `Ticket ${label} has been assigned to you.`,
+    heading,
+    body,
+  });
 }
 
 const EMAIL_ONLY_HINT = 'If you do not have a portal account, reply to this email instead.';
@@ -181,7 +270,7 @@ function asPartnerEmailCustom(raw: unknown): PartnerEmailCustom | null {
 async function composeLaidOutRequesterMail(
   ticket: TicketRow,
   id: 'ticket_comment_notification' | 'ticket_resolved',
-): Promise<{ html: string; subject: string; replyTo: string | undefined; fullMessageReply: boolean; brandName: string }> {
+): Promise<{ html: string; subject: string; replyTo: string | undefined; fullMessageReply: boolean; brandName: string; partnerName: string | null }> {
   let href = '';
   let hasPortalUser = false;
   try {
@@ -222,6 +311,7 @@ async function composeLaidOutRequesterMail(
     replyTo: partner.replyTo,
     fullMessageReply: partner.inbound?.fullMessageReply === true,
     brandName: partner.name,
+    partnerName: partner.name.trim() || null,
   };
 }
 
@@ -246,6 +336,10 @@ interface Collected {
    * collection context closes — see handleTicketEvent (#1105).
    */
   pushes: PendingPush[];
+  /** Ticket-assignment Pushover to the assignee's own key (see collectAssignmentPushover). */
+  /** Ticket-assignment Pushover still to be resolved; its DB reads happen only
+   *  after the email has been sent (see handleTicketEvent). */
+  pushover?: PendingAssignmentPushover;
 }
 
 /**
@@ -288,6 +382,12 @@ async function collectAssigneeNotification(
   if (!partnerId || !assertSamePartner(assignee, partnerId, { ticketId: ticket.id })) return none;
   if (!(await isEligibleTicketRecipient(assignee, partnerId, ticket.orgId, ticket.deviceId))) return none;
 
+  // The email's name lookups run BEFORE the dedupe anchor: if one throws, no
+  // row has been written yet, so the BullMQ retry can still send.
+  const orgName = await getOrgName(ticket.orgId);
+  const deviceName = await getDeviceName(ticket.deviceId, ticket.orgId);
+  const statusName = await getStatusName(ticket.statusId, partnerId);
+
   // Idempotency anchor (D2): null = replay -> nothing else happens.
   const id = await createNotification({
     userId: assigneeId,
@@ -305,7 +405,7 @@ async function collectAssigneeNotification(
     ? [{
         to: assignee.email,
         subject: stripHeaderBreaks(`[${label}] Assigned to you: ${ticket.subject}`),
-        html: `<p>You have been assigned ticket <strong>${escapeHtml(label)}</strong>: ${escapeHtml(ticket.subject)}</p>`,
+        html: buildAssigneeEmailHtml({ ...ticket, statusName }, String(label), orgName, deviceName),
         bestEffort: true,
         purpose: 'ticket.staff_notification',
       }]
@@ -320,11 +420,89 @@ async function collectAssigneeNotification(
         ticketId: ticket.id,
         reason: 'assigned',
         internalNumber: ticket.internalNumber ?? null,
-        orgName: await getOrgName(ticket.orgId),
+        orgName,
       }),
     });
   }
-  return { emails, pushes };
+  // Pushover is resolved later, after the email is sent: nothing it reads can
+  // delay or fail the email.
+  const pushover: PendingAssignmentPushover = { partnerId, assigneeId, ticket, label: String(label), orgName, deviceName };
+  return { emails, pushes, pushover };
+}
+
+function ticketPriorityToSeverity(priority: string | null | undefined): AlertSeverity {
+  switch ((priority ?? '').toLowerCase()) {
+    case 'urgent':
+    case 'high':
+      return 'high';
+    case 'low':
+      return 'low';
+    default:
+      return 'medium';
+  }
+}
+
+/**
+ * Ticket-assignment Pushover. The application token comes from the partner's
+ * existing Pushover defaults (Settings > Notifications). The recipient is the
+ * ASSIGNEE's own Pushover user key (Profile, sealed per user). Only when the
+ * assignee has none AND the partner turned on `pushoverTicketAssignmentFallback`
+ * does the push go to the partner's default user or group key. A value that
+ * cannot be opened, or an incomplete config, sends nothing.
+ *
+ * The partner's default sound applies, but its default priority does not: the
+ * Pushover priority always comes from the ticket priority (via the severity
+ * below), so an alert-channel default such as 2 (emergency) never turns an
+ * assignment into a repeating emergency push.
+ */
+interface PendingAssignmentPushover {
+  partnerId: string;
+  assigneeId: string;
+  ticket: TicketRow;
+  label: string;
+  orgName: string;
+  deviceName: string | null;
+}
+
+async function collectAssignmentPushover(
+  { partnerId, assigneeId, ticket, label, orgName, deviceName }: PendingAssignmentPushover,
+): Promise<{ config: PushoverConfig; payload: PushoverNotificationPayload } | undefined> {
+  const rows = await db.select({ settings: partners.settings }).from(partners).where(eq(partners.id, partnerId)).limit(1);
+  const settings = rows?.[0]?.settings as { notifications?: { pushoverTicketAssignmentFallback?: unknown } } | undefined;
+  const fallback = settings?.notifications?.pushoverTicketAssignmentFallback === true;
+  let config: PushoverConfig;
+  try {
+    const defaults = readPartnerPushoverDefaults(settings);
+    if (!defaults.appToken) return undefined;
+    const personalKey = await loadUserPushoverKey(assigneeId);
+    if (personalKey) {
+      config = applyPartnerPushoverDefaults({ user: personalKey }, defaults);
+    } else if (fallback) {
+      config = applyPartnerPushoverDefaults({}, defaults);
+    } else {
+      return undefined;
+    }
+  } catch (err) {
+    console.warn('[TicketNotify] Pushover credentials could not be opened', { partnerId, err: err instanceof Error ? err.message : String(err) });
+    return undefined;
+  }
+  delete config.priority;
+  if (!validatePushoverConfig(config).valid) return undefined;
+  return {
+    config,
+    payload: {
+      alertId: ticket.id,
+      alertName: `${orgName || 'Ticket'}: ticket assigned`,
+      severity: ticketPriorityToSeverity(ticket.priority),
+      summary: `${ticket.subject}\n${label}`,
+      deviceId: ticket.deviceId ?? undefined,
+      deviceName: deviceName ?? undefined,
+      orgId: ticket.orgId,
+      orgName: orgName || undefined,
+      triggeredAt: new Date().toISOString(),
+      dashboardUrl: `${dashboardBaseUrl()}/tickets/${ticket.id}`,
+    },
+  };
 }
 
 /**
@@ -370,7 +548,8 @@ async function collectRequesterEmail(
       html: composed.html,
       graphMailbox,
       purpose: 'ticket.customer_notification',
-      partnerId: ticket.partnerId ?? null
+      partnerId: ticket.partnerId ?? null,
+      partnerName: composed.partnerName,
     }];
   }
 
@@ -437,7 +616,8 @@ async function collectRequesterEmail(
     headers,
     graphMailbox,
     purpose: 'ticket.customer_notification',
-    partnerId: ticket.partnerId ?? null
+    partnerId: ticket.partnerId ?? null,
+    partnerName: composed.partnerName,
   }];
 }
 
@@ -500,6 +680,7 @@ async function collectAutoresponse(
     graphMailbox,
     purpose: 'ticket.customer_notification',
     partnerId: ticket.partnerId ?? null,
+    partnerName: partner.name.trim() || null,
   }];
 }
 
@@ -609,6 +790,8 @@ export async function handleTicketEvent(event: TicketEvent, jobId?: string): Pro
   const eventId = event.eventId ?? jobId ?? `legacy:${event.ticketId}:${event.type}`;
   let emailPayloads: EmailPayload[] = [];
   let pending: PendingPush[] = [];
+  let pushover: Collected['pushover'];
+  let approvalThrottle: ApprovalCollected['throttle'] = null;
 
   await runWithSystemDbAccess(async () => {
     switch (event.type) {
@@ -619,6 +802,7 @@ export async function handleTicketEvent(event: TicketEvent, jobId?: string): Pro
           const collected = await collectAssigneeNotification(event, assigneeId, eventId);
           emailPayloads = collected.emails;
           pending = collected.pushes;
+          pushover = collected.pushover;
         }
         return;
       }
@@ -646,9 +830,12 @@ export async function handleTicketEvent(event: TicketEvent, jobId?: string): Pro
         }
         return;
       }
-      case 'ticket.updated': {
-        // Plain field edits (subject, priority, …) notify no one in Phase 1 —
-        // explicit no-op case so the exhaustiveness default stays meaningful.
+      case 'ticket.updated':
+      case 'ticket.link_added':
+      case 'ticket.link_removed': {
+        // Plain field edits (subject, priority, …) and ticket-to-ticket link
+        // changes (#7900 W02) notify no one in Phase 1 — explicit no-op case
+        // so the exhaustiveness default stays meaningful.
         return;
       }
       case 'ticket.autoresponse': {
@@ -692,6 +879,17 @@ export async function handleTicketEvent(event: TicketEvent, jobId?: string): Pro
         }
         return;
       }
+      case 'ticket.approval_requested':
+      case 'ticket.approval_decided': {
+        // #4617 W04: customer approver / notify emails + staff in-app rows.
+        // Re-validated against the committed request row (ticketApprovalNotify.ts).
+        const collected = event.type === 'ticket.approval_requested'
+          ? await collectApprovalRequested(event)
+          : await collectApprovalDecided(event);
+        emailPayloads = collected.emails.map(approvalMailPayload);
+        approvalThrottle = collected.throttle;
+        return;
+      }
       default: {
         const _exhaustive: never = event as never;
         console.warn('[TicketNotify] Unhandled event type:', (_exhaustive as TicketEvent).type);
@@ -718,15 +916,74 @@ export async function handleTicketEvent(event: TicketEvent, jobId?: string): Pro
     }
   }
 
+  // Approval re-notification throttle: claimed in Redis with no DB context
+  // open, only when there is mail to send (in-app rows were already written).
+  if (approvalThrottle && emailPayloads.length > 0 && !(await admitApprovalMail(approvalThrottle, eventId))) {
+    emailPayloads = [];
+  }
+
   // Send emails OUTSIDE the DB context to avoid idle-in-transaction pool poison (#1105).
-  if (emailPayloads.length === 0) return;
+  const delivery = await sendEmailPayloads(emailPayloads);
+
+  // Approval mail is best-effort per recipient, so a failure would otherwise
+  // be swallowed while the throttle claim stays held — and the approver would
+  // never hear of the request (or, for a decision, the 7-day dedupe key would
+  // suppress it for good). When NOTHING was delivered, release this event's
+  // claim and throw so BullMQ retries; no recipient got a copy, so a retry
+  // duplicates nothing. A partial failure keeps the claim and is reported.
+  if (approvalThrottle && delivery.attempted > 0) {
+    if (delivery.delivered === 0) {
+      await releaseApprovalMail(approvalThrottle, eventId);
+      throw new Error(`[TicketNotify] every approval email failed (${event.type}, requestId=${event.type === 'ticket.approval_requested' || event.type === 'ticket.approval_decided' ? event.payload.requestId : ''})`);
+    }
+    if (delivery.delivered < delivery.attempted) {
+      captureException(new Error(`[TicketNotify] ${delivery.attempted - delivery.delivered} of ${delivery.attempted} approval emails failed (${event.type})`));
+    }
+  }
+
+  // Pushover after email, best-effort: a slow or failing Pushover call never
+  // delays or suppresses the email, and never fails the job.
+  if (pushover) {
+    try {
+      const pending = pushover;
+      const resolved = await runWithSystemDbAccess(() => collectAssignmentPushover(pending));
+      if (!resolved) return;
+      const result = await sendPushoverNotification(resolved.config, resolved.payload);
+      if (!result.success) console.warn('[TicketNotify] ticket-assignment Pushover failed', result.error);
+    } catch (err) {
+      console.warn('[TicketNotify] ticket-assignment Pushover failed', err instanceof Error ? err.message : err);
+    }
+  }
+}
+
+/**
+ * Customer approval mail: partner lane, one recipient per message, best effort
+ * — a BullMQ retry would re-send to every recipient, so one bad address must
+ * not fail the job.
+ */
+function approvalMailPayload(m: ApprovalMail): EmailPayload {
+  return {
+    to: m.to,
+    subject: stripHeaderBreaks(m.subject),
+    html: m.html,
+    bestEffort: true,
+    purpose: 'ticket.customer_notification',
+    partnerId: m.partnerId,
+    partnerName: m.partnerName,
+  };
+}
+
+/** `delivered` counts payloads handed to a transport; a missing transport or a swallowed best-effort error is not delivered. */
+async function sendEmailPayloads(emailPayloads: EmailPayload[]): Promise<{ attempted: number; delivered: number }> {
+  if (emailPayloads.length === 0) return { attempted: 0, delivered: 0 };
+  let delivered = 0;
   // getEmailService() may be null (no platform transport configured). Graph payloads
   // must still send in that case, so the null-guard moved inside the loop's EmailService
   // branch rather than short-circuiting the whole send phase.
   const email = getEmailService();
 
   for (const payload of emailPayloads) {
-    const send = async () => {
+    const send = async (): Promise<boolean> => {
       // Customer-facing reply via the partner's connected M365 mailbox (Graph).
       if (payload.graphMailbox) {
         const { tenantId, mailbox, originalMessageId } = payload.graphMailbox;
@@ -735,11 +992,11 @@ export async function handleTicketEvent(event: TicketEvent, jobId?: string): Pro
         } else {
           await sendNewMail({ tenantId, mailbox }, payload.to, payload.subject, payload.html);
         }
-        return;
+        return true;
       }
       // Platform EmailService path (tech/assignee notifications + customers on partners
       // with no connected mailbox). Skip silently if no transport is configured.
-      if (!email) return;
+      if (!email) return false;
       // Branch rather than spread: `purpose` is the discriminant of
       // SendEmailParams, so a union-typed value would not narrow.
       if (payload.purpose === 'ticket.customer_notification') {
@@ -750,9 +1007,10 @@ export async function handleTicketEvent(event: TicketEvent, jobId?: string): Pro
           replyTo: payload.replyTo,
           headers: payload.headers,
           purpose: 'ticket.customer_notification',
-          partnerId: payload.partnerId
+          partnerId: payload.partnerId,
+          partnerName: payload.partnerName,
         });
-        return;
+        return true;
       }
       await email.sendEmail({
         to: payload.to,
@@ -762,19 +1020,21 @@ export async function handleTicketEvent(event: TicketEvent, jobId?: string): Pro
         headers: payload.headers,
         purpose: 'ticket.staff_notification'
       });
+      return true;
     };
 
     if (payload.bestEffort) {
       try {
-        await send();
+        if (await send()) delivered += 1;
       } catch (err) {
         console.error('[TicketNotify] email send failed', err instanceof Error ? err.message : err);
       }
     } else {
       // Non-best-effort: let throw bubble up so BullMQ can retry.
-      await send();
+      if (await send()) delivered += 1;
     }
   }
+  return { attempted: emailPayloads.length, delivered };
 }
 
 let worker: Worker<TicketEvent> | null = null;

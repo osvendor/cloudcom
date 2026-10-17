@@ -1,16 +1,29 @@
 import { defineConfig } from 'vitest/config';
 import { config } from 'dotenv';
+import path from 'node:path';
 
 // Load test environment variables
 config({ path: '../../.env.test', quiet: true });
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@breeze/shared': path.resolve(import.meta.dirname, '../../packages/shared/src'),
+    },
+  },
   test: {
     // explicit: vitest 5 flips the default to true; flip per package in a follow-up
     clearMocks: false,
     globals: true,
     environment: 'node',
     include: [
+      'src/services/accounting/accountingFeePush.integration.test.ts',
+      'src/index.autopay.integration.test.ts',
+      'src/db/schema/autopaySetupAttempts.integration.test.ts',
+      'src/services/autopay/enrollmentService.integration.test.ts',
+      'src/services/autopay/cardExpiryCheck.integration.test.ts',
+      // Charging locks/replay require real PostgreSQL (never the unit DB mocks).
+      'src/services/autopay/charging.integration.test.ts',
       'src/services/autopay/**/*.integration.test.ts',
       'src/jobs/scriptVerifyReconciliation.integration.test.ts',
       'src/__tests__/integration/**/*.test.ts',
@@ -30,16 +43,27 @@ export default defineConfig({
       // Hardware & RAID monitoring real-DB migration/RLS proof (W01 #6856).
       'src/services/hardwareHealth/**/*.integration.test.ts',
       'src/services/timeSync/**/*.integration.test.ts',
+      'src/services/workloads/**/*.integration.test.ts',
+      // Workload image currency (W05 #8194): the pass under real RLS + the system-only cache.
+      'src/services/imageCurrency/**/*.integration.test.ts',
       // Hardware & RAID monitoring (W05 BMC in-band): real-DB migration/enum
       // proof and BMC discovery-worker/topology-publish suites. Import
       // `__tests__/integration/setup` (real postgres pool + autoMigrate).
       // Belong to vitest.integration.config.ts (excluded from the unit runner).
       'src/services/discovery/agentReportedBmcLink.integration.test.ts',
       'src/jobs/discoveryWorker.bmc.integration.test.ts',
+      // Scheduled discovery dispatch is enqueued only after the job row commits (#7187 hazard).
+      'src/jobs/discoveryWorker.dispatchAfterCommit.integration.test.ts',
       'src/services/topology/bmc.integration.test.ts',
       // #5861 Customer Portal Network Visibility: real-Postgres proof of
       // org isolation and partner-wide monitor result scoping.
       'src/services/portal/networkVisibilityReadModel.integration.test.ts',
+      // #7731 portal hardware health: real-Postgres proof of org isolation.
+      'src/services/portal/hardwareHealthReadModel.integration.test.ts',
+      // #7732 portal hardware inventory: real-Postgres proof of org isolation.
+      'src/services/portal/hardwareInventoryReadModel.integration.test.ts',
+      // #7733 portal performance metrics: real-Postgres proof of org isolation.
+      'src/services/portal/performanceReadModel.integration.test.ts',
       // Co-located real-DB integration test for the platform-admin bootstrap
       // (#2655): the mocked unit suite executes no SQL, so it never caught the
       // prod-bundle `= ANY(::text[])` array-literal failure. This drives the
@@ -204,6 +228,9 @@ export default defineConfig({
       // (real Redis; no Postgres fixtures used). Belongs to
       // vitest.integration.config.ts, not the no-Redis unit runner.
       'src/services/mfaStepUpGrant.integration.test.ts',
+      // Real-Redis test of the per-org script-review concurrency slot Lua
+      // scripts (#5637): cap, release, TTL self-heal, idempotent release.
+      'src/services/scriptProposals/reviewConcurrency.integration.test.ts',
       // Co-located real-DB integration test for the nightly enrollment-key
       // purge sweep: the #2775 live-bootstrap-token exemption (proving
       // Postgres itself evaluates the correlated NOT EXISTS subquery per row,
@@ -223,6 +250,9 @@ export default defineConfig({
       'src/routes/installerRotationRevocation.integration.test.ts',
       // One-time legacy token/child cutover and replay proof.
       'src/db/installerBootstrapCredentialGeneration.migration.integration.test.ts',
+      // v0.122.0 EU deploy: the quarantine execution-authority migration on a
+      // table with security links (deferred parity trigger + ALTER TABLE).
+      'src/db/securityQuarantineExecutionAuthorityMigration.integration.test.ts',
       // Hardware & RAID monitoring (W03): disposable-database replay proof for
       // the monitor-kind enum and alert subject-identity migrations.
       'src/db/hardwareAlertMigrations.integration.test.ts',

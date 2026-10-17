@@ -10,6 +10,17 @@ vi.mock('./sentry', () => ({
   captureMessage: (...a: unknown[]) => sentry.captureMessage(...a),
 }));
 
+// The fix-memory side of the cascade (#7278) is unit-tested in
+// fixMemory/store.test.ts; here it only has to run in THIS transaction, at the
+// right point. The stand-in records a marker statement through the same tx.
+const fixMemoryStore = vi.hoisted(() => ({
+  deleteDeviceFixOutcomes: vi.fn(async (tx: { execute(q: unknown): Promise<unknown> }, deviceId: string) => {
+    await tx.execute(`__FIX_OUTCOMES_DELETE_AND_STALE_MARK__:${deviceId}`);
+    return { deleted: 0, identitiesMarked: 0 };
+  }),
+}));
+vi.mock('./fixMemory/store', () => fixMemoryStore);
+
 /**
  * Captures the SQL this cascade issues, in order, so the lock-ordering
  * regression is testable without a database. Follows the `ops` pattern from
@@ -204,9 +215,10 @@ describe('deleteDeviceCascade lock ordering', () => {
 
     expect(sentry.captureMessage).toHaveBeenCalledTimes(1);
     expect(String(sentry.captureMessage.mock.calls[0]?.[0])).toContain('lock_timeout');
-    // The bound WAS applied (it rides on the same statement), so exactly one
-    // set_config was issued and none afterwards to undo it.
-    expect(statements.filter((t) => t.includes('set_config')).length).toBe(1);
+    // The bound WAS applied (it rides on the same statement), so each bounded
+    // window (the parent-row lock and the fix-memory step, #7278) issued its one
+    // tightening set_config and none afterwards to undo it.
+    expect(statements.filter((t) => t.includes('set_config') && t.includes('lock_timeout')).length).toBe(2);
     expect(statements[0]).toContain('pg_settings');
     expect(statements.some((t) => t.includes('FOR UPDATE'))).toBe(true);
     expect(statements).toContain('__DELETE_DEVICES_ROW__');
@@ -243,8 +255,9 @@ describe('deleteDeviceCascade lock ordering', () => {
     await deleteDeviceCascade(tx, 'device-1');
 
     // The SQL CASE keeps the caller's 500ms, and because nothing changed there
-    // is no restore statement afterwards — one set_config total, not two.
-    expect(statements.filter((t) => t.includes('set_config')).length).toBe(1);
+    // is no restore statement afterwards — one set_config per bounded window
+    // (the parent-row lock and the fix-memory step, #7278), no restores.
+    expect(statements.filter((t) => t.includes('set_config') && t.includes('lock_timeout')).length).toBe(2);
 
     // Assert the CONDITIONAL is actually in the generated SQL. The mock returns
     // prior_ms=500 whatever it is handed, so a count of set_config calls proves
@@ -273,10 +286,43 @@ describe('deleteDeviceCascade lock ordering', () => {
     // captureTx reports 7000ms > 3000ms, so the bound genuinely tightens and
     // must be applied — then restored to the caller's ORIGINAL value, not to a
     // hard-coded default.
-    const sets = statements.filter((t) => t.includes('set_config'));
-    expect(sets.length).toBe(2);
+    const sets = statements.filter((t) => t.includes('set_config') && t.includes('lock_timeout'));
+    // Two bounded windows, each tightened then restored: the parent-row lock
+    // and the fix-memory identity locks (#7278).
+    expect(sets.length).toBe(4);
     expect(sets[0]).toContain('3000');
     expect(sets[1]).toContain('7000ms');
+    expect(sets[2]).toContain('3000');
+    expect(sets[3]).toContain('7000ms');
+  });
+
+  it('deletes fix_outcomes through the fix-memory store, which stale-marks their aggregates, before the generic child deletes (#7278)', async () => {
+    const { tx, statements } = captureTx();
+    await deleteDeviceCascade(tx, 'device-1');
+    expect(fixMemoryStore.deleteDeviceFixOutcomes).toHaveBeenCalledWith(tx, 'device-1');
+    const marker = statements.indexOf('"__FIX_OUTCOMES_DELETE_AND_STALE_MARK__:device-1"');
+    expect(marker).toBeGreaterThan(statements.findIndex((s) => s.includes('FOR UPDATE')));
+    // A bare DELETE would drop the proof without marking fix_memory stale; the
+    // generic loop's statement must come after (and find nothing left).
+    const generic = statements.findIndex((s) => s.includes('DELETE FROM') && s.includes('"fix_outcomes"'));
+    expect(generic === -1 || generic > marker).toBe(true);
+    expect(marker).toBeLessThan(statements.indexOf('__DELETE_DEVICES_ROW__'));
+  });
+
+  it('bounds the fix-memory identity-lock wait with lock_timeout and restores the caller value right after (#7278 review)', async () => {
+    // The identity locks can queue behind a whole-partner rebuild while this
+    // transaction holds the devices row; unbounded, that pins the connection
+    // and every writer of the row. Bounded, it fails fast with a retryable 55P03.
+    const { tx, statements } = captureTx();
+    await deleteDeviceCascade(tx, 'device-1');
+    const marker = statements.indexOf('"__FIX_OUTCOMES_DELETE_AND_STALE_MARK__:device-1"');
+    const tightens = statements.map((s, i) => (s.includes('pg_settings') ? i : -1)).filter((i) => i >= 0);
+    expect(tightens).toHaveLength(2); // the parent-row lock, then the fix-memory step
+    expect(tightens[1]!).toBeLessThan(marker);
+    expect(tightens[1]!).toBeGreaterThan(statements.findIndex((s) => s.includes('FOR UPDATE')));
+    const restore = statements[marker + 1]!;
+    expect(restore).toContain("set_config('lock_timeout'");
+    expect(restore).toContain('7000ms');
   });
 
   it('deletes the devices row last, after the child tables', async () => {
@@ -287,7 +333,12 @@ describe('deleteDeviceCascade lock ordering', () => {
 
     await deleteDeviceCascade(tx, 'device-1');
 
-    expect(statements[statements.length - 1]).toBe('__DELETE_DEVICES_ROW__');
+    // Only the backup-fence disarm (#7982) follows it: the devices-row delete
+    // itself FK-cascades into backup_snapshot_id_reservations, so the fence
+    // must stay armed through it.
+    expect(statements[statements.length - 2]).toBe('__DELETE_DEVICES_ROW__');
+    expect(statements[statements.length - 1]).toContain('breeze.backup_erasure_org');
+    expect(statements[statements.length - 1]).not.toContain('DELETE');
   });
 
   // #4371 fixup: agent_rollback_events and pam_actuation_results joined
@@ -332,6 +383,48 @@ describe('deleteDeviceCascade lock ordering', () => {
   });
 });
 
+
+describe('deleteDeviceCascade backup storage fence (#7982)', () => {
+  // Org erasure (#7980) keeps an erased org's backup objects by fencing every
+  // backup source row it deletes: the BEFORE DELETE trigger
+  // breeze_backup_erasure_fence_on_delete records a backup_erasure_targets row
+  // whenever `breeze.backup_erasure_org` names the deleted row's org. Device
+  // purge deletes the same rows (backup_snapshots, retirements, reservations,
+  // and recovery media through recovery_tokens' ON DELETE CASCADE), so it must
+  // arm the same trigger, or storage GC later sees the device's snapshot
+  // prefixes as unowned orphans on a shared bucket and reclaims them.
+  const isFenceSet = (t: string) => t.includes('set_config') && t.includes('breeze.backup_erasure_org');
+
+  it('arms the fence for the device org after the parent lock and before any child row is deleted', async () => {
+    const { tx, statements } = captureTx();
+    await deleteDeviceCascade(tx, 'device-1');
+
+    const lock = statements.findIndex((t) => t.includes('FOR UPDATE'));
+    const arm = statements.findIndex((t) => isFenceSet(t) && t.includes('FROM devices'));
+    const firstDelete = statements.findIndex((t) => t.includes('DELETE FROM') || t === '__DELETE_DEVICES_ROW__');
+    const firstBackup = statements.findIndex((t) => t.includes('backup_snapshots'));
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(arm).toBeGreaterThan(lock);
+    expect(firstDelete).toBeGreaterThan(arm);
+    expect(firstBackup).toBeGreaterThan(arm);
+    expect(statements[arm]).toContain('org_id');
+  });
+
+  it("puts the caller's fence context back once the device row is gone", async () => {
+    const { tx, statements } = captureTx();
+    await deleteDeviceCascade(tx, 'device-1');
+
+    const deviceRow = statements.indexOf('__DELETE_DEVICES_ROW__');
+    const sets = statements.map((t, i) => [t, i] as const).filter(([t]) => isFenceSet(t));
+    expect(sets.length).toBe(2);
+    expect(sets[1]![1]).toBeGreaterThan(deviceRow);
+    // The prior value is read before arming, so an enclosing context is put
+    // back as it was rather than cleared.
+    const priorRead = statements.findIndex((t) => t.includes('current_setting') && t.includes('breeze.backup_erasure_org'));
+    expect(priorRead).toBeGreaterThanOrEqual(0);
+    expect(priorRead).toBeLessThan(sets[0]![1]);
+  });
+});
 
 describe('deleteDeviceCascade link detach (#3952)', () => {
   /** The UPDATE this cascade issues for one linked_device_id table. */
@@ -395,6 +488,48 @@ describe('deleteDeviceCascade link detach (#3952)', () => {
       statements.filter((s) => s.includes('manual_assets') && s.includes('delete')),
       'manual_assets must be DETACHED, never deleted, by a device cascade',
     ).toHaveLength(0);
+  });
+});
+
+describe('deleteDeviceCascade EDR detection site snapshot (#8165, spec D14)', () => {
+  it('snapshots last_site_id on linked EDR detections after the lock and before the device delete', async () => {
+    // edr_detections.(breeze_device_id, org_id) -> devices(id, org_id) is
+    // ON DELETE SET NULL (breeze_device_id), so the hard delete itself clears
+    // the link. Without this snapshot the finding becomes a "never linked"
+    // null-device row that every site-restricted technician in the org can
+    // see — visibility widened as a side effect of a delete.
+    const { tx, statements } = captureTx();
+
+    await deleteDeviceCascade(tx, 'device-1');
+
+    const snapshots = statements.filter((s) => s.includes('edr_detections'));
+    expect(snapshots, 'expected exactly one edr_detections statement').toHaveLength(1);
+    const snapshot = snapshots[0]!;
+    expect(snapshot).toContain('last_site_id');
+    expect(snapshot).toContain('SELECT site_id FROM devices WHERE id =');
+    expect(snapshot).toContain('device_detached_at = COALESCE(device_detached_at, now())');
+    // Snapshot only: the FK's column-list SET NULL clears the link itself.
+    expect(snapshot).not.toContain('breeze_device_id = NULL');
+
+    const lockIdx = statements.findIndex((s) => s.includes('FOR UPDATE'));
+    const snapshotIdx = statements.indexOf(snapshot);
+    const deleteIdx = statements.indexOf('__DELETE_DEVICES_ROW__');
+    expect(lockIdx).toBeGreaterThanOrEqual(0);
+    expect(snapshotIdx).toBeGreaterThan(lockIdx);
+    expect(snapshotIdx).toBeLessThan(deleteIdx);
+  });
+
+  it('clears the EDR endpoint link together with device_match_source before the device delete', async () => {
+    // The FK's SET NULL (breeze_device_id) alone would leave a 'manual'
+    // provenance on an unlinked endpoint, which the matcher never re-matches.
+    const { tx, statements } = captureTx();
+
+    await deleteDeviceCascade(tx, 'device-1');
+
+    const detaches = statements.filter((s) => s.includes('edr_endpoints'));
+    expect(detaches).toHaveLength(1);
+    expect(detaches[0]).toContain('breeze_device_id = NULL, device_match_source = NULL');
+    expect(statements.indexOf(detaches[0]!)).toBeLessThan(statements.indexOf('__DELETE_DEVICES_ROW__'));
   });
 });
 

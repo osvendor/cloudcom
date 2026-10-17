@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
-import { Loader2, RefreshCw, Save } from 'lucide-react';
+import { Loader2, RefreshCw, Save, Trash2 } from 'lucide-react';
 import {
   AI_MODEL_REQUIRED_PERMISSION_CHOICES,
   EFFORT_LEVELS,
@@ -17,6 +17,7 @@ import { formatCurrency } from '../../../lib/i18n/format';
 import { showToast } from '../../shared/Toast';
 import { navigateTo } from '@/lib/navigation';
 import { Drawer } from '../../shared/Drawer';
+import { ConfirmDialog } from '../../shared/ConfirmDialog';
 import { registryFriendly } from './surfaceLabels';
 
 const PREMIUM_PERMISSION = AI_MODEL_REQUIRED_PERMISSION_CHOICES[0];
@@ -174,16 +175,20 @@ export interface OfferingDrawerProps {
   offering: AiOfferingDto;
   /** Every offering in the snapshot (the refusal-fallback candidates). */
   offerings: AiOfferingDto[];
+  /** The offering's connection is managed by the MCP_LLM_* environment: its name and price are read-only (the API refuses them with 409 managed_by_env). */
+  envManaged?: boolean;
   onClose: () => void;
   onSaved: () => void | Promise<void>;
 }
 
-export default function OfferingDrawer({ offering, offerings, onClose, onSaved }: OfferingDrawerProps) {
+export default function OfferingDrawer({ offering, offerings, envManaged = false, onClose, onSaved }: OfferingDrawerProps) {
   const { t } = useTranslation('settings');
   const initial = useMemo(() => draftFrom(offering), [offering]);
   const [draft, setDraft] = useState<Draft>(initial);
   const [saving, setSaving] = useState(false);
   const [verifying, setVerifying] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const [removing, setRemoving] = useState(false);
   const friendly = registryFriendly(t);
 
   const set = (patch: Partial<Draft>) => setDraft((d) => ({ ...d, ...patch }));
@@ -230,6 +235,41 @@ export default function OfferingDrawer({ offering, offerings, onClose, onSaved }
     }
   };
 
+  // Only a hand-added model can be removed: discovered / platform / catalog rows
+  // are re-listed by the next sync, so those are disabled instead. An
+  // env-managed connection's models are the operator's (the API refuses it).
+  const canRemove = offering.id !== null && offering.source === 'manual' && !envManaged;
+
+  const handleRemove = async () => {
+    if (offering.id === null || saving || removing) return;
+    setRemoving(true);
+    try {
+      await runAction({
+        request: () => fetchWithAuth(`/ai/models/offerings/${offering.id}`, { method: 'DELETE' }),
+        successMessage: t('aiModels.offering.removed'),
+        errorFallback: t('aiModels.offering.removeFailed'),
+        friendly,
+        onUnauthorized,
+      });
+      setConfirmRemove(false);
+      await onSaved();
+      onClose();
+    } catch (err) {
+      setConfirmRemove(false);
+      if (err instanceof ActionError && err.status === 401) return;
+      if (err instanceof ActionError && err.code === 'not_found') {
+        // Already toasted: removed elsewhere. Reload so the list drops the stale row, and close.
+        await onSaved();
+        onClose();
+        return;
+      }
+      if (!(err instanceof ActionError)) showToast({ type: 'error', message: t('aiModels.offering.removeFailed') });
+      // other ActionErrors (in use, not removable) already toasted; the drawer stays open
+    } finally {
+      setRemoving(false);
+    }
+  };
+
   const handleSave = async () => {
     if (saving || !dirty) return;
     if (patchOrInvalid === 'invalid_prices') {
@@ -269,17 +309,22 @@ export default function OfferingDrawer({ offering, offerings, onClose, onSaved }
     <Drawer open onClose={onClose} title={offering.displayName}
       dataTestId="ai-offering-drawer" closeDisabled={saving}>
       <div className="space-y-5">
+        {envManaged && (
+          <p data-testid="ai-offering-env-managed" className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+            {t('aiModels.offering.envManaged')}
+          </p>
+        )}
         <div className="space-y-1">
           <label className="text-sm font-medium" htmlFor="ai-offering-display-name">{t('aiModels.offering.displayName')}</label>
           <input id="ai-offering-display-name" data-testid="ai-offering-display-name" className={inputClass} maxLength={120}
-            value={draft.displayName} placeholder={offering.displayName} disabled={saving}
+            value={draft.displayName} placeholder={offering.displayName} disabled={saving || envManaged}
             onChange={(e) => set({ displayName: e.target.value })} />
           <p className="text-xs text-muted-foreground">{t('aiModels.offering.displayNameHint', { modelId: offering.modelId })}</p>
         </div>
 
         <fieldset className="space-y-2" disabled={saving}>
           <legend className="text-sm font-medium">{t('aiModels.offering.pricesTitle')}</legend>
-          {offering.pricesEditable ? (
+          {offering.pricesEditable && !envManaged ? (
             <>
               <p className="text-xs text-muted-foreground">{t('aiModels.offering.pricesHint')}</p>
               <div className="grid grid-cols-2 gap-2">
@@ -398,6 +443,13 @@ export default function OfferingDrawer({ offering, offerings, onClose, onSaved }
                 {t('aiModels.offering.verify')}
               </button>
             )}
+            {canRemove && (
+              <button type="button" data-testid="ai-offering-remove" onClick={() => setConfirmRemove(true)} disabled={saving || removing}
+                className="inline-flex items-center gap-2 rounded-md border border-destructive/40 px-3 py-2 text-sm font-medium text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50">
+                <Trash2 className="h-4 w-4" />
+                {t('aiModels.offering.remove')}
+              </button>
+            )}
           </div>
           <div className="flex gap-2">
           <button type="button" data-testid="ai-offering-cancel" onClick={onClose} disabled={saving}
@@ -412,6 +464,17 @@ export default function OfferingDrawer({ offering, offerings, onClose, onSaved }
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={confirmRemove}
+        onClose={() => { if (!removing) setConfirmRemove(false); }}
+        onConfirm={() => { void handleRemove(); }}
+        title={t('aiModels.offering.removeTitle')}
+        message={t('aiModels.offering.removeMessage', { model: offering.displayName })}
+        confirmLabel={t('aiModels.offering.remove')}
+        confirmTestId="ai-offering-remove-confirm"
+        isLoading={removing}
+      />
     </Drawer>
   );
 }

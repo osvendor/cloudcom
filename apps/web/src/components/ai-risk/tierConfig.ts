@@ -64,11 +64,13 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'query_devices', description: 'Search and filter devices', category: 'Devices & Hardware' },
       { name: 'get_device_details', description: 'Get comprehensive device info', category: 'Devices & Hardware' },
       { name: 'get_device_hardware_health', description: 'Get RAID, disk and hardware collector health', category: 'Devices & Hardware' },
+      { name: 'query_device_workloads', description: 'List containers and VMs hosted on a device (Docker, Podman, Hyper-V, Proxmox)', category: 'Devices & Hardware' },
       { name: 'get_device_time_status', description: 'Get Windows time sync health and expected timezone', category: 'Devices & Hardware' },
       { name: 'list_time_sync_issues', description: 'List observed time synchronization findings', category: 'Devices & Hardware' },
       { name: 'analyze_metrics', description: 'Time-series metrics analysis', category: 'Devices & Hardware' },
       { name: 'get_active_users', description: 'Active user sessions', category: 'Devices & Hardware' },
       { name: 'get_user_experience_metrics', description: 'Login performance and session trends', category: 'Devices & Hardware' },
+      { name: 'get_fleet_device_stats', description: 'Exact fleet-wide device counts by status', category: 'Devices & Hardware' },
       { name: 'get_fleet_health', description: 'Fleet health overview and aggregates', category: 'Devices & Hardware' },
       { name: 'get_fleet_findings', description: 'Deduplicated fleet hygiene findings', category: 'Devices & Hardware' },
       { name: 'analyze_fleet_metrics', description: 'Fleet-wide metric aggregation from rollups', category: 'Devices & Hardware' },
@@ -115,6 +117,7 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'manage_alert_rules (list_rules/get_rule/test_rule)', description: 'View alert rules', category: 'Alerts & Notifications' },
       // Files, Disk & Registry
       { name: 'analyze_disk_usage', description: 'Filesystem analysis from the latest stored scan', category: 'Files, Disk & Registry' },
+      { name: 'list_diagnostic_access_grants', description: 'List diagnostic access requests and grants', category: 'Files, Disk & Registry' },
       { name: 'disk_cleanup (preview)', description: 'Preview cleanup candidates', category: 'Files, Disk & Registry' },
       { name: 'system_cleanup (status)', description: 'Read the progress and result of a native cleanup run', category: 'Files, Disk & Registry' },
       // Logs & Audit
@@ -196,6 +199,7 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'list_time_entries', description: 'List tracked time entries', category: 'Ticketing' },
       { name: 'get_running_timer', description: 'Get the current running timer', category: 'Ticketing' },
       { name: 'get_timesheet', description: 'Get a timesheet summary', category: 'Ticketing' },
+      { name: 'get_ticket_approval_status', description: 'View a ticket\'s budget and customer-approval status', category: 'Ticketing' },
       { name: 'manage_ticket_checklist (list/list_templates/get_template)', description: 'View ticket checklist steps and checklist templates', category: 'Ticketing' },
       // AI Governance
       { name: 'list_ai_agents', description: 'List AI agents', category: 'AI Governance' },
@@ -245,6 +249,10 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'file_operations (list)', description: 'List directory contents on device', category: 'Files, Disk & Registry' },
       { name: 'analyze_disk_usage (refresh)', description: 'Run a fresh filesystem scan on the device', category: 'Files, Disk & Registry' },
       { name: 'system_cleanup (list)', description: 'List OS-native cleaners and their estimated reclaim', category: 'Files, Disk & Registry' },
+      { name: 'request_diagnostic_access', description: 'Ask an administrator to approve read-only diagnostic access to specific paths', category: 'Files, Disk & Registry' },
+      { name: 'revoke_diagnostic_access', description: 'Withdraw a diagnostic access request or grant', category: 'Files, Disk & Registry' },
+      { name: 'diagnostic_list_directory', description: 'List a folder under an administrator-approved read-only grant', category: 'Files, Disk & Registry' },
+      { name: 'diagnostic_read_file', description: 'Read part of a file under an administrator-approved read-only grant', category: 'Files, Disk & Registry' },
       { name: 'registry_operations (read_key/get_value)', description: 'Read Windows registry values on device', category: 'Files, Disk & Registry' },
       // Logs & Audit
       { name: 'detect_log_correlations', description: 'Log correlation detection', category: 'Logs & Audit' },
@@ -266,6 +274,7 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       // Ticketing (P2-4, #4191) — pre-existing gap, manage_tickets had zero
       // entries here before. move_org is listed separately under Tier 3.
       { name: 'manage_tickets (create/comment/assign/update_status/update_fields/link_alert/unlink_alert/create_from_alert/edit_comment/delete_comment)', description: 'Create and update support tickets', category: 'Ticketing' },
+      { name: 'manage_tickets (link_ticket/unlink_ticket)', description: 'Link related tickets in one organization, or remove a link', category: 'Ticketing' },
       { name: 'manage_tickets (log_time_entry/start_timer/stop_timer)', description: 'Track time against tickets', category: 'Ticketing' },
       { name: 'manage_tickets (link_device/draft)', description: 'AI ticket triage: link a device or store a reply/resolution-note draft', category: 'Ticketing' },
       { name: 'manage_ticket_checklist (add_item/update_item/delete_item/reorder/apply_template)', description: 'Edit ticket checklist steps (ticking a step done stays human-only)', category: 'Ticketing' },
@@ -335,6 +344,7 @@ export const TIER_DEFINITIONS: TierDefinition[] = [
       { name: 'manage_tickets (move_org)', description: 'Move a ticket to a different organization', category: 'Ticketing' },
       // AI Governance (P2-5, #4192)
       { name: 'manage_ai_agents (authorize_supervised_key)', description: 'Grant an AI agent a pre-authorized action key', category: 'AI Governance' },
+      { name: 'operator_plan', description: 'Approve an AI Operator plan: one four-eyes decision over an ordered set of provider effects', category: 'AI Governance' },
     ],
   },
   {
@@ -377,6 +387,9 @@ export const RATE_LIMIT_CONFIGS: RateLimitConfig[] = [
   { toolName: 'analyze_screen', tier: 3, permission: 'devices.execute', category: 'Remote Access & Control' },
   { toolName: 'create_remote_session', tier: 3, permission: 'devices.execute + remote.access', category: 'Remote Access & Control' },
   { toolName: 'set_device_context', tier: 2, permission: 'devices.write', category: 'Devices & Hardware' },
+  { toolName: 'request_diagnostic_access', tier: 2, permission: 'devices.execute', category: 'Files, Disk & Registry' },
+  { toolName: 'diagnostic_list_directory', tier: 2, permission: 'devices.execute', category: 'Files, Disk & Registry' },
+  { toolName: 'diagnostic_read_file', tier: 2, permission: 'devices.execute', category: 'Files, Disk & Registry' },
   { toolName: 'resolve_device_context', tier: 2, permission: 'devices.write', category: 'Devices & Hardware' },
   // Services & Processes
   { toolName: 'manage_services', tier: 3, permission: 'devices.execute', category: 'Services & Processes' },
@@ -475,6 +488,7 @@ export const RATE_LIMIT_CONFIGS: RateLimitConfig[] = [
   { toolName: 'manage_delivery', tier: 1, permission: 'alerts.read', category: 'Alerts & Notifications' },
   // AI Governance
   { toolName: 'manage_ai_agents', tier: 3, permission: 'ai_agents.write', category: 'AI Governance' },
+  { toolName: 'operator_plan', tier: 3, permission: 'organizations.write', category: 'AI Governance' },
   // Other
   { toolName: 'export_dataset', tier: 1, permission: 'devices.read', category: 'Other' },
 ];
@@ -487,10 +501,12 @@ export const RBAC_MAPPINGS: Record<string, string | Record<string, string>> = {
   get_device_details: 'devices.read',
   get_device_hardware_health: 'devices.read',
   get_device_time_status: 'devices.read',
+  query_device_workloads: 'devices.read',
   list_time_sync_issues: 'devices.read',
   analyze_metrics: 'devices.read',
   get_active_users: 'devices.read',
   get_user_experience_metrics: 'devices.read',
+  get_fleet_device_stats: 'devices.read',
   get_fleet_health: 'devices.read',
   get_fleet_findings: 'devices.read',
   analyze_fleet_metrics: 'devices.read',
@@ -498,6 +514,11 @@ export const RBAC_MAPPINGS: Record<string, string | Record<string, string>> = {
   analyze_boot_performance: { stored: 'devices.read', triggerCollection: 'devices.execute' },
   analyze_disk_usage: { stored: 'devices.read', refresh: 'devices.execute' },
   manage_processes: { list: 'devices.execute', kill: 'devices.execute' },
+  request_diagnostic_access: 'devices.execute',
+  list_diagnostic_access_grants: 'devices.read',
+  revoke_diagnostic_access: 'devices.read',
+  diagnostic_list_directory: 'devices.execute',
+  diagnostic_read_file: 'devices.execute',
   // Network
   get_network_changes: 'devices.read',
   get_ip_history: 'devices.read',
@@ -604,7 +625,8 @@ export const RBAC_MAPPINGS: Record<string, string | Record<string, string>> = {
   query_analytics: 'devices.read',
   get_executive_summary: 'devices.read',
   // Integrations
-  query_webhooks: 'devices.read',
+  // Route requires webhooks:read (routes/webhooks.ts GET / and GET /:id/deliveries).
+  query_webhooks: 'webhooks.read',
   // Route requires organizations:read (routes/psa.ts:435).
   query_psa_status: 'organizations.read',
   test_webhook: 'organizations.write',

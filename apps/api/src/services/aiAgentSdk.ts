@@ -22,7 +22,7 @@ import { eq, and, isNull } from 'drizzle-orm';
 import type { AuthContext } from '../middleware/auth';
 import type { AiPageContext, AiApprovalMode } from '@breeze/shared/types/ai';
 import { DIAGNOSTIC_STATES } from '@breeze/shared/validators/topology';
-import { checkGuardrails, checkToolPermission, checkToolRateLimit, checkPermissionRequirements } from './aiGuardrails';
+import { checkGuardrails, checkToolPermission, checkToolRateLimit, checkPermissionRequirements, type GuardrailContext } from './aiGuardrails';
 import { attachProposalToSession, loadProposalGuardrailContext } from './scriptProposals';
 import {
   guardrailCheckForTenantTool,
@@ -35,6 +35,7 @@ import { sanitizeUserMessage, sanitizePageContext } from './aiInputSanitizer';
 import { getSession, buildSystemPrompt, waitForApproval } from './aiAgent';
 import { TOOL_TIERS, type PreToolUseCallback, type PostToolUseCallback } from './aiAgentSdkTools';
 import { isAllowedForSession, stripMcpPrefix } from './mcpToolNames';
+import { claimToolUseId } from './aiToolUseCorrelation';
 import {
   resolveScriptRunContextForApproval,
   describeScriptRunContext,
@@ -728,11 +729,61 @@ function reportLostTerminalCas(opts: {
 // ============================================
 
 /**
+ * #7906: the guardrail context for a CHAT tool call. An interactive
+ * `user_session` principal (same test as middleware/auth.ts
+ * `isInteractiveUserSession`, inlined to keep this module's import surface)
+ * that is not a Helper session opts in to the payload-aware read-only
+ * `event_logs_query` classification. Anything else — a Helper session (PAM
+ * governs its tier-2+ calls), or any non-user principal — passes the loaded
+ * proposal context through untouched and keeps the base Tier 3. Used by BOTH
+ * the gate and postToolUse so the two always resolve the same tier.
+ */
+function chatGuardrailContext(
+  session: ActiveSession,
+  base: GuardrailContext | undefined,
+): GuardrailContext | undefined {
+  const interactiveChat = session.auth.principal?.kind === 'user_session' && !session.auth.helperDeviceId;
+  return interactiveChat ? { ...base, chatSession: true } : base;
+}
+
+/**
  * Creates a PreToolUseCallback that enforces guardrails, RBAC, rate limits,
  * and the approval gate before MCP tool execution. This runs inside
  * makeHandler() in aiAgentSdkTools.ts and IS invoked for in-process MCP
  * server tools.
  */
+/**
+ * The model-facing text for an action intent that could not be created.
+ *
+ * Generic for every failure the model cannot act on — but a `run_script`
+ * whose proposal is no longer runnable is the model's to fix (#7918).
+ * `createActionIntent` CAS-claims a proposal for exactly one intent, so a
+ * second run of a proposal that already ran is refused with
+ * `ActionIntentError('proposal_not_runnable')`. Reported as "Failed to create
+ * approval record", the model told the user nothing had run, when the first
+ * run had in fact completed on the device. Matched on the error's `code`
+ * (the class lives in intentService, whose module this file's tests mock).
+ */
+export function intentCreationRefusal(toolName: string, input: unknown, err: unknown): string {
+  const code = err instanceof Error ? (err as Error & { code?: unknown }).code : undefined;
+  const proposalId = (input as { proposalId?: unknown } | null)?.proposalId;
+  if (toolName === 'run_script' && code === 'proposal_not_runnable' && typeof proposalId === 'string') {
+    return `proposal_not_runnable: proposal ${proposalId} cannot start another run. A proposal runs once, `
+      + 'and this one is already claimed by an earlier run_script (one that ran, or one still awaiting approval), '
+      + 'has expired, or is no longer reviewed. '
+      + 'Call get_script_proposal: its executions list each run\'s executionId, and get_script_execution reads '
+      + 'that run\'s output. To run the script again, submit it as a new proposal with propose_script.';
+  }
+  // #8600: a device-group refusal (too large, not found, empty, out of scope,
+  // malformed) says what to do instead. The messages are existence-neutral by
+  // construction (actionIntents/runScriptGroupTarget.ts), so they are safe to
+  // hand back to the model verbatim.
+  if (toolName === 'run_script' && typeof code === 'string' && code.startsWith('group_target_') && err instanceof Error) {
+    return `${code}: ${err.message}`;
+  }
+  return 'Failed to create approval record';
+}
+
 export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallback {
   return async (toolName, input, mcpToolName) => {
     // Set only by the tier-3 branch below when it creates a durable intent;
@@ -811,10 +862,20 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
     // own — it maps straight to guardrailCheckForTenantTool's tier.
     const guardrailCheck = tenant
       ? guardrailCheckForTenantTool(tenant)
-      : checkGuardrails(toolName, input, await loadProposalGuardrailContext(input, session.orgId));
+      : checkGuardrails(
+        toolName,
+        input,
+        chatGuardrailContext(session, await loadProposalGuardrailContext(input, session.orgId)),
+      );
 
     if (!guardrailCheck.allowed) {
       return { allowed: false, error: guardrailCheck.reason ?? 'Blocked by guardrails' };
+    }
+
+    // #7906: a read-only event_logs_query was classified on a strictly-parsed
+    // payload; carry those exact values to dispatch on every allowed exit.
+    if (guardrailCheck.pinnedEventLogsQuery) {
+      verifiedToolContext = { pinnedEventLogsQuery: guardrailCheck.pinnedEventLogsQuery };
     }
 
     // RBAC permission check
@@ -1066,7 +1127,7 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           toolName,
           method: effectiveMode === 'auto_approve' ? 'auto_approve_mode' : 'read_only_auto',
         });
-        return { allowed: true };
+        return { allowed: true, ...(verifiedToolContext ? { context: verifiedToolContext } : {}) };
       }
 
       // Action plan / hybrid plan mode: check if tool matches an approved plan step.
@@ -1147,6 +1208,7 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
               Math.min(readBack.timeoutMs, TERMINAL_READBACK_BUDGET_MS),
               readBack.signal,
             ),
+            { toolName, input },
           );
         } catch (err) {
           // An unreadable outcome is NOT evidence the action failed — say
@@ -1211,7 +1273,7 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           }
           session.currentPlanStepIndex = match.stepIndex + 1;
           lastApprovalBySession.set(session, { toolName, method: 'plan_step' });
-          return { allowed: true };
+          return { allowed: true, ...(verifiedToolContext ? { context: verifiedToolContext } : {}) };
         }
         if (match.matches) {
           // Matched an approved plan step but declined the shortcut: this
@@ -1450,7 +1512,7 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
             });
           } catch (err) {
             console.error('[AI-SDK] Failed to create action intent:', toolName, err);
-            return await failMatchedPlanStep({ allowed: false, error: 'Failed to create approval record' });
+            return await failMatchedPlanStep({ allowed: false, error: intentCreationRefusal(toolName, input, err) });
           }
 
           // Stamp the intent link onto the ledger row so handleApproval (web
@@ -1498,9 +1560,18 @@ export function createSessionPreToolUse(session: ActiveSession): PreToolUseCallb
           // Topology M4-D3 (#6000): the approver must read the PINNED effect —
           // the server-materialized arguments and approval text the digest
           // binds — never the model's raw input.
+          // #8600: same rule for a device-group run_script — the intent froze
+          // the group's resolved deviceIds (plus a count + id hash in its
+          // reason), and THAT is what the approver must read, not `{groupId}`.
           const pinnedCard = toolName === 'diagnose_connectivity'
-            ? await loadPinnedApprovalCard(session.orgId, intent.id)
-            : null;
+            ? await loadPinnedApprovalCard(session.orgId, intent.id, 'Run one approved topology connectivity check')
+            : toolName === 'run_script' && (input as Record<string, unknown>).groupId != null
+              ? await loadPinnedApprovalCard(
+                session.orgId,
+                intent.id,
+                'Device-group script run: the resolved device list could not be loaded here. Review it in the Approvals queue before approving.',
+              )
+              : null;
           // Emit approval_required event via session event bus. `intentBacked:
           // true` always means the four-eyes waiting state UNLESS
           // selfApprovalRequestId is also set — in that case the sole-operator
@@ -2331,19 +2402,27 @@ export async function attachChatProposalToSession(
  */
 /**
  * The stored (immutable) arguments and approval text of a pinned-effect intent
- * (topology M4-D3). A read failure yields an EMPTY input and a fixed text —
+ * (topology M4-D3), or of a device-group run_script whose group the intent
+ * resolved and froze (#8600). A read failure yields an EMPTY input and a fixed text —
  * never the model's input — the approval stays bound to the pinned digest
  * server-side either way.
  */
-async function loadPinnedApprovalCard(orgId: string, intentId: string): Promise<{ input: Record<string, unknown>; description: string }> {
-  const fallback = { input: {}, description: 'Run one approved topology connectivity check' };
+async function loadPinnedApprovalCard(
+  orgId: string,
+  intentId: string,
+  fallbackDescription: string,
+): Promise<{ input: Record<string, unknown>; description: string }> {
+  const fallback = { input: {}, description: fallbackDescription };
   try {
     const [row] = await withDbAccessContext(
       { scope: 'organization', orgId, accessibleOrgIds: [orgId] },
       () => db.select({ arguments: actionIntents.arguments, reason: actionIntents.reason })
         .from(actionIntents).where(eq(actionIntents.id, intentId)).limit(1),
     );
-    if (!row || !row.arguments || typeof row.arguments !== 'object') return fallback;
+    if (!row || !row.arguments || typeof row.arguments !== 'object') {
+      console.error('[AI-SDK] Pinned approval effect missing for intent', intentId);
+      return fallback;
+    }
     return { input: row.arguments as Record<string, unknown>, description: typeof row.reason === 'string' && row.reason ? row.reason : fallback.description };
   } catch (err) {
     console.error('[AI-SDK] Failed to read the pinned approval effect:', err instanceof Error ? err.message : err);
@@ -2369,10 +2448,11 @@ function approvedTopologyRun(toolName: string, output: string, isError: boolean)
   return { runId, state };
 }
 
-async function topologyPostToolUse(session: ActiveSession, toolName: string, input: Record<string, unknown>, output: string, isError: boolean, durationMs: number): Promise<void> {
+async function topologyPostToolUse(session: ActiveSession, toolName: string, input: Record<string, unknown>, output: string, isError: boolean, durationMs: number, sdkToolUseId: string | undefined): Promise<void> {
   session.pendingTurnToolExecutionCount += 1;
-  const toolUseId = session.toolUseIdQueue.shift();
-  if (toolUseId) session.toolUseNames?.delete(toolUseId);
+  // No tool row is written here, but the call must stop being pending or the
+  // dropped-call fallback would misreport it (#7931).
+  claimToolUseId(session, toolName, sdkToolUseId);
   session.eventBus.publish({ type: 'topology_progress', phase: 'analyzing' });
   const run = approvedTopologyRun(toolName, output, isError);
   if (run) session.eventBus.publish({ type: 'topology_diagnostic_run', ...run });
@@ -2395,13 +2475,18 @@ async function topologyPostToolUse(session: ActiveSession, toolName: string, inp
 }
 
 export function createSessionPostToolUse(session: ActiveSession): PostToolUseCallback {
-  return async (toolName, input, output, isError, durationMs, sealed, handoff) => {
+  return async (toolName, input, output, isError, durationMs, sealed, handoff, sdkToolUseId) => {
     // A timed-out topology turn (C1): its gate is gone, so a tool that was
     // still in flight must not fall through to the generic path and persist
-    // its raw output.
-    if (session.topologyTurnSealed) return;
+    // its raw output. It did run, though, so it must stop being pending —
+    // otherwise a late SDK echo of its result would reach the dropped-call
+    // fallback, which persists that text (#7931).
+    if (session.topologyTurnSealed) {
+      claimToolUseId(session, toolName, sdkToolUseId);
+      return;
+    }
     if (session.topologyInvestigation) {
-      await topologyPostToolUse(session, toolName, input, output, isError, durationMs);
+      await topologyPostToolUse(session, toolName, input, output, isError, durationMs, sdkToolUseId);
       return;
     }
     // Count this tool call toward the turn's tool_execution_count rollup
@@ -2409,14 +2494,13 @@ export function createSessionPostToolUse(session: ActiveSession): PostToolUseCal
     // whether the DB writes below succeed — postToolUse only fires for a tool
     // that actually ran, which is the event the counter tracks.
     session.pendingTurnToolExecutionCount += 1;
-    const toolUseId = session.toolUseIdQueue.shift();
+    // Pair this result with its own tool_use by the id the SDK sent with the
+    // call, never by queue position (#7931). Claiming also tells the
+    // dropped-call fallback (#3094) this call ran, whichever of this and its
+    // content_block_start the processor sees first.
+    const toolUseId = claimToolUseId(session, toolName, sdkToolUseId);
     if (!toolUseId) {
-      console.warn(`[AI-SDK] postToolUse: toolUseIdQueue empty for ${toolName} — tool_result will have no toolUseId`);
-    } else {
-      // Drop the paired name entry recorded at content_block_start — it exists
-      // for the dropped-call fallback (#3094), which must not fire for a call
-      // this postToolUse is handling.
-      session.toolUseNames?.delete(toolUseId);
+      console.warn(`[AI-SDK] postToolUse: no tool_use id for ${toolName} (none from the SDK, no pending call of that name) — tool_result will have no toolUseId`);
     }
     const safeOutput = compactToolResultForChat(toolName, output);
     const parsedOutput = safeParseJson(safeOutput);
@@ -2424,7 +2508,7 @@ export function createSessionPostToolUse(session: ActiveSession): PostToolUseCal
     // Canonical session org (always set) — `auth.orgId` is null for partner-
     // scope logins, which left tool audit rows without an org attribution.
     const orgId = session.orgId;
-    const guardrailContext = await loadProposalGuardrailContext(input, session.orgId);
+    const guardrailContext = chatGuardrailContext(session, await loadProposalGuardrailContext(input, session.orgId));
     const guardrailCheck = checkGuardrails(toolName, input, guardrailContext);
 
     // Script-builder "apply" tools deliver their payload (code / metadata) to

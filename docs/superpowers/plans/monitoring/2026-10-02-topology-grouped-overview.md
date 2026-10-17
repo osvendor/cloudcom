@@ -17,7 +17,7 @@ white boxes. Root causes, all verified in code:
    (`baselineProjector.ts`), so a 20-agent LAN shows 20× `10.1.2.100`, 19× `10.1.2.0/24`, 41× `fe80::/64`.
 2. Link-local, host (`/32`, `/128`) and overlay (Tailscale `100.64.0.0/10`, `fd7a:115c:a1e0::/48`)
    prefixes render as first-class networks.
-3. `nodeLabelSql` falls back to `kind || ' ' || id` — 67/171 Whalers nodes read `endpoint <uuid>`; the
+3. `nodeLabelSql` falls back to `kind || ' ' || id` — 67/171 nodes on the measured production site read `endpoint <uuid>`; the
    live device/asset name is never consulted (legacy labels are a one-time copy).
 4. `presentNode` hardcodes node `freshness:'unknown'` and empty evidence classes; no inventory facts
    (IP, MAC, OS, agent state) reach the client, so the inspector cannot answer "what is this".
@@ -81,6 +81,13 @@ New presentation node roles (role is already a free string):
   - `networkClass`: `link_local` (169.254/16, fe80::/10), `host` (/32, /128), `overlay`
     (100.64.0.0/10, fd7a:115c:a1e0::/48), else `lan`. Non-`lan` groups are emitted but the client
     hides them by default behind a toggle; they never receive address-containment members.
+    **Amended (#7819):** the agent-reported kind of the membership's interface wins when known
+    (`topologyNetworkClass(prefix, interfaceKind)` in `@breeze/shared`, also used by the
+    neighbour-cache selector): a `tunnel` interface makes any non-link-local prefix `overlay` (a VPN
+    on RFC1918 included); a link-layer LAN kind (`ethernet`, `wifi`, `bridge`) disables the
+    Tailscale/CGNAT range guess, so a genuine CGNAT LAN stays `lan`. The CIDR guess remains only
+    for `unknown`/`virtual`/`cellular`/`other` kinds and memberships with no interface (a cellular
+    uplink is a carrier WAN, so its CGNAT address keeps the guess).
 - `gateway_group` — one per **(family, address)** for non-link-local gateways reported by observers
   inside the same network-group candidate; label `"Reported gateway 10.1.2.100"`,
   `observerCount`, `canonicalNodeIds` = per-observer gateway nodes. Link-local gateways
@@ -135,6 +142,8 @@ counts folded canonical nodes.
 
 - Projecting ARP/NDP `neighbors` into relationships (spec gives neighbours only gateway-alias
   enrichment, C:190; would need the `attributes.method` enum + a spec decision). Follow-up issue.
+  Decided 2026-10-02 (#7816/#7817): presentation-only corroboration, no canonical projection — see
+  `2026-10-02-topology-neighbour-corroboration.md`.
 - Physical view, switch inference (never invent switches, C:14).
 - Changing canonical identity (per-observer nodes stay; grouping is presentation only).
 
@@ -153,15 +162,34 @@ Fable and Codex (xhigh, read-only, 2026-10-02) agreed on the direction; Codex's 
   when exactly one exists. Known limitation, stated in the group's provenance text: a roaming device
   reporting the same private prefix *and* gateway address joins the office group; corroboration by
   gateway MAC (neighbour cache, C:190) is the follow-up.
+  **Amended 2026-10-03 (site location):** a `lan` card carries `declaration` (declared/undeclared for
+  the viewed site by exact prefix). When the site declares at least one network, undeclared cards move off the
+  canvas into the "Other / unidentified networks" roster (toggle "Show other networks on the map");
+  with no declarations the canvas is unchanged and shows a declare-networks hint. From W2, devices whose
+  presence is `visiting` another site leave the home site's cards and render on the matched site's card
+  as presentation-only visitors (`site-location` spec §4, §8).
 - **Q3 — revised.** Pins are honoured, including `source:'legacy'` (they mix snapshot pins with later
   explicit edits). A pinned group member keeps its coordinates; its group becomes a fixed obstacle sized
   to contain it. When pins distort the grouped map the explorer offers **"Use grouped layout"**: editors
   get a draft with every position cleared, saved through the normal shared-layout save; nothing moves
   until they save.
+  **Amended 2026-10-03 (#7880, owner decision from prod evidence):** members of a group card are
+  ALWAYS packed by the card's grid; a saved pin never places a member inside its card. On US prod,
+  The measured site's 37 mostly legacy pins (layout revision 37, saved for the old flat map) turned the top third
+  of an 85-device card into an unreadable pile, while the "Use grouped layout" preview of the same
+  site was clean. Pins on members now only anchor the card: it is translated so its pinned members'
+  grid centroid sits on the centroid of their saved pins (a card dragged whole stays where it was
+  dropped). Pins on ungrouped nodes (Internet, gateway tiles, loose devices) are still honoured. Saved
+  pins are never deleted or rewritten by the grouped layout and still apply in views without grouping.
+  "Use grouped layout" stays available to editors who want to clear pins, through the normal save.
 - **Q4 — deliberate spec extension, labelled.** Discovered-only endpoints whose inventory address falls in
   exactly one `lan` candidate across the complete site are drawn inside it with per-member placement
   `address_match` and copy "Address in this range — membership not verified". No canonical relationship
-  is created; these members are excluded from counts of observed members.
+  is created; these members are excluded from counts of observed members. **Amended 2026-10-02 (#7816):** an
+  explicit third category, `neighbor_seen` (inferred/low), keeps the unique-range rule but places the endpoint in
+  the ONE candidate whose observer's fresh, published neighbour cache holds the endpoint's exact (IP, MAC) pair
+  from a single inventory row; conflicts stay `address_match`. Also excluded from observer counts. See
+  `2026-10-02-topology-neighbour-corroboration.md`.
 - **Q5 — agreed.** `inventory` (with presence) rides on graph nodes; presence uses neutral icons and
   explicit text ("Agent offline", last seen), never health colours; refreshing it never re-runs layout.
 - **Layout — revised.** Two-stage, in the existing worker and within its 3 s budget: (1) pack each
@@ -173,10 +201,47 @@ Fable and Codex (xhigh, read-only, 2026-10-02) agreed on the direction; Codex's 
   `relationshipDetail.ts` need no join changes. Folded gateways keep their operational value: the group
   inspector lists each reporter's canonical gateway, selectable for Diagnose. Search matches IP/MAC
   independently of the display label.
-- **Deferred (follow-up issues):** group-scoped expansion cursor claims (groups expose a focus token on
-  their first canonical network node meanwhile), neighbour-cache gateway MAC corroboration, interface-kind
-  tunnel classification (CIDR heuristics for Tailscale/CGNAT meanwhile), VPN half-default handling in the
+- **Group expansion (#7818, done):** a card's `frontierToken` carries a signed `group` claim
+  (`{kind, key: sha256(grouping key)}`) in place of the old first-canonical-node focus. The expansion
+  re-resolves the card's complete `members ∪ canonicalNodeIds` from the complete site under the pinned
+  graph revision, pages over exactly that set with the usual limit/after/edge/boundary continuations
+  (each carrying the same claim), and answers `409 presentation_group_changed` when the grouping no
+  longer yields that key. Aggregate edges expand the card they used to stand in for (`routes_via` → its
+  network card, `shared_devices` → the secondary card). Folded gateways stay on their gateway card.
+- **Deferred (follow-up issues):** neighbour-cache gateway MAC corroboration (done in #7817), interface-kind
+  tunnel classification (CIDR heuristics for Tailscale/CGNAT meanwhile; done in #7819), VPN half-default handling in the
   projector ("Selected path unknown").
+
+## Overview truth (#7879, binding)
+
+Found on a production site re-check; each rule is presentation-only and never authority.
+
+- **Scan presence.** `presence.source:'scan'` is `online` only when the asset appeared in the latest
+  completed scan of the profile that last saw it (`last_job_id` is the newest job that saw it, so a
+  later completed job of that profile is one that did not), `offline` otherwise, `unknown`
+  ("Not scanned") with no scan at all. Never `discovered_assets.is_online`: the disappeared sweep only
+  flips approved assets, so the column is sticky for everything else. Per profile, because one site's
+  profiles scan different subnets. A completed scan that found no hosts proves no absence (same
+  refusal as the sweep). A UniFi controller verdict (`status_source='unifi'`, rewritten every sync)
+  wins while dated within 1 h (`UNIFI_FRESHNESS_MS`).
+- **Node observation.** `evidence.lastObservedAt` is the latest of the node's own observation and its
+  incident relationships' observations, where a source that re-captured unchanged, still-published
+  content confirms them at `confirmed_through_at` — the same rule `observedFreshUntilSql` applies to
+  freshness. An agent node has no node-level observation of its own; its routes and memberships are
+  its evidence.
+- **Orphans.** An unbound network/gateway node with no relationship in the view to a shown, live node
+  folds into the card with the same prefix or the gateway group with the same next hop (never a
+  link-local next hop). Otherwise: no current evidence (no fresh incident relationship and no node
+  observation within 900 s, the `max(3 × cadence, 900 s)` floor) → a `hidden` group
+  (`no_current_evidence`); an evidenced non-LAN orphan → a memberless card of its class, governed by
+  the hidden-networks toggle; an evidenced LAN orphan stays a canonical node.
+- **Decommissioned devices.** A node with at least one device binding, all of them decommissioned, is a
+  retired agent: its stale memberships and routes never shape a card. If it also has a discovered-asset
+  binding that is online in its latest completed scan, it renders AS that asset (label, inventory and
+  presence from the asset; the agent's hostname and status dropped) and is placed by the asset's
+  address. Otherwise it is listed in a `hidden` group (`decommissioned`); the client never draws a
+  `hidden` group and shows "N removed devices hidden". (Prod shape: decommissioned agents usually also
+  carry an asset binding.)
 
 ## Quorum questions (original)
 
@@ -206,4 +271,4 @@ Fable and Codex (xhigh, read-only, 2026-10-02) agreed on the direction; Codex's 
 - Web: canvas element builder pure function tests (parents, hidden folded nodes, aggregate edges,
   toggle); layout adapter compound/rectpacking determinism + no overlap; inspector identity fields.
 - Browser gates (`topology-worker`, `topology-baseline`, `topology-performance` V200/V500/V1000)
-  stay green; re-measure on a Whalers-shaped fixture.
+  stay green; re-measure on a large-site fixture.

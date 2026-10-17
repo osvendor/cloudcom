@@ -120,8 +120,65 @@
     "revoked": "Chave revogada",
     "revokeFailed": "Falha ao revogar a chave",
     "copyNow": "Copie esta chave agora",
+    "copy": "Copiar",
+    "copied": "Copiado",
     "oneTimeWarning": "Esta chave em texto simples é exibida apenas uma vez e não poderá ser recuperada depois.",
-    "done": "Concluído"
+    "done": "Concluído",
+    "owner": "Proprietário",
+    "unknownOwner": "Usuário desconhecido",
+    "ownerOnlyTooltip": "Somente {{owner}} pode emitir ou rotacionar chaves",
+    "ownerOnlyScopeTooltip": "Somente {{owner}} pode adicionar escopos",
+    "ownerOnlyEditNotice": "Você pode renomear, restringir ou encurtar este principal. Somente {{owner}} pode adicionar escopos, estender a expiração ou ampliar os IPs de origem.",
+    "ownerOnlyWidening": "Somente {{owner}} pode estender a expiração ou ampliar os IPs de origem. Desfaça essas alterações para salvar.",
+    "presetsHint": "Comece com uma predefinição e depois ajuste os escopos abaixo. As predefinições apenas marcam as caixas de seleção.",
+    "presets": {
+      "docs-sync": {
+        "label": "Sincronização somente leitura de documentação e ativos",
+        "description": "Acesso de leitura a organizações, sites, dispositivos, inventário, configuração, scripts, configuração de backup e campos personalizados."
+      },
+      "provisioning": {
+        "label": "Provisionamento de tenants",
+        "description": "O conjunto de leitura mais a criação de organizações e sites e a geração de chaves de registro. As chaves de registro exigem validade e IPs de origem."
+      },
+      "alert-feed": {
+        "label": "Feed de alertas",
+        "description": "Ler organizações e alertas."
+      },
+      "ticketing": {
+        "label": "Integração de tickets",
+        "description": "Ler organizações e ler e gravar tickets."
+      },
+      "ai-mcp": {
+        "label": "Cliente de IA / MCP",
+        "description": "Acesso ao MCP com ai:read. Adicione ai:write ou ai:execute somente se o cliente precisar deles."
+      },
+      "custom": {
+        "label": "Personalizado",
+        "description": "Limpe a seleção e escolha cada escopo manualmente."
+      }
+    },
+    "scopeDescriptions": {
+      "organizations_read": "Nomes, slugs e tipos das organizações, em todas as organizações que o principal pode acessar.",
+      "sites_read": "Sites (locais) e seus detalhes.",
+      "devices_read": "Registros de dispositivos: nome do host, SO, hardware e associação a grupos.",
+      "inventory_read": "Inventário de hardware e software coletado dos dispositivos.",
+      "configuration_read": "Políticas de configuração e suas atribuições.",
+      "scripts_read": "Entradas da biblioteca de scripts, incluindo o conteúdo dos scripts.",
+      "backup-configuration_read": "Configuração e agendamentos de backup (não os dados do backup).",
+      "custom-fields_read": "Definições de campos personalizados e os valores definidos nos dispositivos.",
+      "alerts_read": "Títulos e mensagens de alertas em todas as organizações que o principal pode acessar.",
+      "tickets_read": "Assuntos, descrições e comentários de tickets, escritos pelos clientes, em todas as organizações que o principal pode acessar.",
+      "device-status_read": "Estado de heartbeat em tempo real: online/offline, último contato e versão do agente. Não incluído em devices:read.",
+      "organizations_write": "Criar organizações. Não pode atualizar nem excluir.",
+      "sites_write": "Criar sites. Não pode atualizar nem excluir.",
+      "enrollment-keys_write": "Gerar chaves de registro de dispositivos. Exige validade e pelo menos um IP de origem ou CIDR.",
+      "contracts_write": "Ler, criar e editar contratos e linhas de contrato, e remover linhas. Não pode ativar, pausar nem cancelar.",
+      "tickets_write": "Criar, atualizar, atribuir, alterar o status e comentar tickets. Não pode excluir nem mover tickets.",
+      "ai_read": "Conectar-se ao endpoint MCP e usar ferramentas somente leitura. Exigido por todos os outros escopos ai:*.",
+      "ai_write": "Ferramentas MCP que alteram dados.",
+      "ai_execute": "Ferramentas MCP que executam ações nos dispositivos.",
+      "ai_execute_admin": "Ferramentas MCP que executam ações administrativas. Conceda somente a um cliente em quem você confie totalmente."
+    }
   },
   "language": {
     "title": "Idioma",
@@ -230,6 +287,8 @@
       "add": "Adicionar conexão",
       "edit": "Editar",
       "created": "Conexão adicionada",
+      "createdDiscoveryQueued": "Conexão adicionada. Descobrindo seus modelos agora.",
+      "createdDiscoveryNotQueued": "Conexão adicionada, mas não foi possível agendar a descoberta de modelos. Use Atualizar para tentar novamente.",
       "saved": "Conexão salva",
       "saveFailed": "Não foi possível salvar a conexão.",
       "keyFailed": "Não foi possível substituir a chave de API.",
@@ -365,12 +424,14 @@
       "crossesFunding": "Esse modelo de backup é pago por outra fonte. Permita primeiro o failover entre créditos do Breeze e sua própria chave de API.",
       "egress_blocked": "Esse endereço não é permitido.",
       "invalid_url": "Essa URL não é válida.",
+      "endpoint_unreachable": "Não foi possível resolver ou alcançar o host do endpoint. Verifique a URL base.",
       "managed_by_env": "Esta conexão é gerenciada pelo ambiente da instância e não pode ser alterada aqui.",
       "connection_in_use": "Um recurso ainda usa um modelo desta conexão. Escolha outro padrão primeiro.",
       "duplicate_model": "Esse ID de modelo já existe nesta conexão.",
       "geo_not_supported": "Este tipo de conexão não pode definir uma região de inferência.",
       "key_required_for_new_endpoint": "Informe a chave para a nova URL (ou remova a chave).",
-      "too_many_models": "Esta conexão já tem o número máximo de modelos adicionados manualmente."
+      "too_many_models": "Esta conexão já tem o número máximo de modelos adicionados manualmente.",
+      "not_removable": "Somente modelos adicionados manualmente podem ser removidos. Desative este em vez disso."
     },
     "org": {
       "title": "Modelos padrão",
@@ -456,6 +517,7 @@
     "offering": {
       "displayName": "Nome de exibição",
       "displayNameHint": "Deixe em branco para usar o nome do provedor. ID do modelo: {{modelId}}",
+      "envManaged": "Este modelo é gerenciado pelas variáveis de ambiente MCP_LLM_*. Nome e preço são definidos lá e não podem ser alterados aqui.",
       "pricesTitle": "Preço",
       "pricesHint": "Centavos por 1 mi de tokens. Preencha os quatro ou deixe todos em branco para nenhum preço (o modelo não poderá ser ativado).",
       "prices": {
@@ -506,7 +568,12 @@
       "verify": "Verificar",
       "verifyQueued": "Verificação do modelo na fila",
       "verifyFailed": "Não foi possível enfileirar a verificação do modelo.",
-      "verifyGatewayHint": "Executa um breve teste de chamada de ferramentas no seu endpoint (usa alguns milhares de tokens)."
+      "verifyGatewayHint": "Executa um breve teste de chamada de ferramentas no seu endpoint (usa alguns milhares de tokens).",
+      "remove": "Remover modelo",
+      "removeTitle": "Remover este modelo?",
+      "removeMessage": "“{{model}}” será excluído desta conexão. O histórico de uso e custos é mantido. Você pode adicioná-lo novamente depois.",
+      "removed": "Modelo removido",
+      "removeFailed": "Não foi possível remover o modelo. Tente novamente."
     },
     "defaults": {
       "title": "Padrões por recurso",
@@ -874,6 +941,8 @@
     "slackChannelPlaceholder": "#alertas",
     "pushoverDefaults": "Padrões do Pushover",
     "pushoverDescription": "Herdados por qualquer canal Pushover da organização que deixe o campo correspondente em branco.",
+    "pushoverTicketAssignmentFallback": "Enviar atribuições de chamados para a chave padrão quando o responsável não tiver chave do Pushover",
+    "pushoverTicketAssignmentFallbackHelp": "Cada técnico pode adicionar a própria chave de usuário do Pushover no perfil; as atribuições chegam somente a ele. Ative para enviar as atribuições de técnicos sem chave para a chave de usuário ou grupo padrão acima.",
     "applicationToken": "Token do aplicativo",
     "defaultUserKey": "Chave padrão de usuário ou grupo",
     "defaultSound": "Som padrão",
@@ -1159,7 +1228,9 @@
     "saved": "Identidade visual do login salva",
     "saveFailed": "Falha ao salvar a identidade visual do login",
     "title": "Identidade visual do login",
-    "description": "Personalize a tela de login dos técnicos. Exibida automaticamente quando esta implantação corresponde a um único parceiro (configuração típica auto-hospedada).",
+    "description": "Personalize a tela de login dos técnicos. Exibida automaticamente quando esta implantação corresponde a um único parceiro (configuração típica auto-hospedada). Cada parceiro também tem sua própria página de login (abaixo), que a exibe em qualquer implantação.",
+    "signInPage": "Sua página de login",
+    "signInPageHelp": "Compartilhe este link com seus técnicos. Ele exibe sua marca e seu botão de login SSO em qualquer implantação, incluindo as hospedadas compartilhadas.",
     "loadFailed": "Não foi possível carregar sua identidade visual atual — recarregue a página antes de salvar ou você poderá substituir configurações existentes.",
     "logoUrl": "URL do logotipo",
     "logoPlaceholder": "https://cdn.example.com/logo.png",
@@ -1228,6 +1299,7 @@
     "fetchFailed": "Falha ao buscar chaves de registro",
     "genericError": "Ocorreu um erro",
     "createFailed": "Falha ao criar a chave de registro",
+    "expiresAtPast": "A expiração deve estar no futuro.",
     "deleteFailed": "Falha ao excluir a chave de registro",
     "deleted": "Chave de registro \"{{name}}\" excluída",
     "rotateFailed": "Falha ao rotacionar a chave de registro",
@@ -1331,7 +1403,54 @@
       "invoice_number": "Número da fatura",
       "due_date": "Data de vencimento",
       "invite_url": "URL do convite",
-      "cta_button": "Botão"
+      "name": "Nome do destinatário",
+      "inviter_name": "Nome de quem convida",
+      "expires_days": "Dias até o convite expirar",
+      "cta_button": "Botão",
+      "client_name": "Client name",
+      "setup_link": "Automatic payments setup link",
+      "ach_mode_text": "Available payment methods",
+      "payment_method": "Saved payment method",
+      "schedule_text": "Payment schedule",
+      "fee_text": "Processing fee terms",
+      "stopped_by": "Who stopped automatic payments",
+      "open_invoices_text": "Open invoice summary",
+      "expires_on": "Card expiry date",
+      "update_link": "Payment method update link",
+      "amount_due": "Valor devido",
+      "charge_date": "Data da cobrança",
+      "fee_amount": "Taxa de processamento",
+      "invoice_link": "Link da fatura",
+      "amount_paid": "Valor pago",
+      "total_charged": "Total cobrado",
+      "paid_on": "Data do pagamento",
+      "balance_remaining": "Saldo restante",
+      "failure_text": "Detalhes da falha",
+      "action_link": "Link da ação",
+      "action_label": "Rótulo da ação",
+      "days_overdue": "Dias em atraso",
+      "pay_link": "Link de pagamento",
+      "charge_total": "Cobrança total",
+      "attempted_amount": "Valor do pagamento tentado",
+      "approval_ask": "Solicitação de aprovação",
+      "approval_snapshot": "Números da aprovação",
+      "approval_expires": "Prazo da aprovação",
+      "approval_status": "Status da aprovação"
+    },
+    "billingPayments": "Billing & payments",
+    "supportPortal": "Support & portal",
+    "labels": {
+      "autopay_request": "Automatic payments request",
+      "autopay_enrolled": "Automatic payments confirmed",
+      "autopay_stopped": "Automatic payments stopped",
+      "autopay_paused": "Pagamentos automáticos pausados",
+      "autopay_resumed": "Pagamentos automáticos retomados",
+      "card_expiring": "Saved card expiring",
+      "payment_receipt": "Recibo de pagamento on-line",
+      "payment_failed": "Não foi possível concluir o pagamento",
+      "ticket_approval_requested_approver": "Solicitação de aprovação de trabalho (aprovador)",
+      "ticket_approval_requested_notify": "Solicitação de aprovação de trabalho (para conhecimento)",
+      "ticket_approval_decided": "Decisão sobre a aprovação de trabalho"
     }
   },
   "inboundEmail": {
@@ -1363,6 +1482,12 @@
     "dropDescription": "Sem chamado, entrada na fila de revisão ou resposta automática. Uma linha de auditoria ainda é registrada. Use para manter spam não mapeado fora da triagem e da fila de revisão.",
     "dropUnverified": "Descartar mensagens que falham na autenticação do remetente (SPF/DKIM/DMARC)",
     "dropUnverifiedDescription": "Quando desativado, mensagens não verificadas ficam em quarentena para revisão. Quando ativado, são descartadas silenciosamente. Isso se aplica a <all>todos</all> os remetentes não verificados — inclusive clientes mapeados cuja mensagem falhe na verificação.",
+    "staffForwardRouting": "Registrar encaminhamentos da equipe no cliente do remetente original",
+    "staffForwardRoutingDescription": "Quando um membro da sua equipe no nível de parceiro encaminha o e-mail de um cliente para o endereço de suporte, o novo ticket é registrado na organização vinculada ao domínio do remetente original, e não na sua. O membro da equipe precisa ter acesso a essa organização. Funciona apenas para encaminhamentos feitos no Gmail e recebidos por uma caixa do Gmail conectada; não para o endereço de entrada nativo, caixas do Microsoft 365 nem encaminhamentos do Outlook.",
+    "defaultAssignee": "Responsável padrão para novos tickets recebidos",
+    "defaultAssigneeDescription": "Todo ticket novo criado a partir de um e-mail recebido é atribuído a essa pessoa, a menos que outra regra já o tenha atribuído. Se ela não tiver acesso à organização do ticket, o ticket fica sem responsável.",
+    "defaultAssigneeUnavailable": "Usuário indisponível",
+    "defaultAssigneeNotAssignable": "Esse usuário não pode ser o responsável padrão. Escolha um membro ativo da sua equipe com acesso a tickets.",
     "enableAutoresponse": "Enviar resposta automática confirmando novos chamados por e-mail",
     "editEmailTemplates": "O e-mail de confirmação é editado em Modelos de e-mail.",
     "editEmailTemplatesLink": "Editar modelos de e-mail",
@@ -1419,6 +1544,7 @@
     },
     "scopeMailbox": "Restringir esta caixa de correio (Política de Acesso ao Aplicativo)",
     "reauthRequired": "É necessário novo consentimento do administrador antes que a consulta e as respostas do Microsoft 365 sejam retomadas.",
+    "pollFailing": "As últimas {{failures}} verificações desta caixa de correio falharam com um erro temporário do Microsoft 365. O Breeze continua tentando; os novos e-mails serão recebidos quando o Microsoft 365 voltar a responder.",
     "retest": "Testar novamente",
     "reconnect": "Reconectar",
     "disconnect": "Desconectar",
@@ -1459,7 +1585,28 @@
     "namePlaceholder": "Suporte",
     "connect": "Conectar",
     "credentialOrg": "Credencial: conexão do Google Workspace de {{org}}",
-    "credentialOrgUnknown": "uma organização que você não pode ver"
+    "credentialOrgUnknown": "uma organização que você não pode ver",
+    "handling": {
+      "off": "Desativado: o e-mail continua na caixa de entrada depois de virar um ticket.",
+      "onArchive": "O e-mail que vira um ticket recebe o marcador do Gmail \"{{label}}\" e é arquivado fora da caixa de entrada.",
+      "onLabelOnly": "O e-mail que vira um ticket recebe o marcador do Gmail \"{{label}}\" e continua na caixa de entrada.",
+      "edit": "Alterar o tratamento de e-mails",
+      "labelField": "Marcador do Gmail para e-mails com ticket (deixe em branco para desativar)",
+      "labelPlaceholder": "Breeze/Ticket",
+      "archiveField": "Também arquivar (remover da caixa de entrada)",
+      "scopeNote": "A marcação precisa deste escopo adicional na delegação em todo o domínio da organização. A leitura dos e-mails não precisa dele, então a consulta continua funcionando sem ele.",
+      "saved": "Tratamento de e-mails salvo",
+      "saveFailed": "Não foi possível salvar o tratamento de e-mails.",
+      "error": {
+        "access_denied": "Falha ao marcar: o Google negou o acesso. Adicione o escopo gmail.modify à delegação em todo o domínio.",
+        "rate_limited": "Falha ao marcar: limite de taxa do Gmail atingido. Novos e-mails serão tentados novamente.",
+        "unavailable": "Falha ao marcar: o Gmail não respondeu a tempo. Novos e-mails serão tentados novamente.",
+        "label_invalid": "Falha ao marcar: este marcador não pode ser usado. Escolha outro nome.",
+        "no_credential": "Falha ao marcar: a conexão do Google Workspace desta organização está ausente ou inativa. Reconecte-a em Integrações.",
+        "not_queued": "Marcação ignorada: a fila de marcação estava indisponível ou cheia, então alguns e-mails que viraram chamados ficaram na caixa de entrada sem o marcador. Novos e-mails serão tentados novamente.",
+        "failed": "Falha ao marcar. O e-mail continua na caixa de entrada."
+      }
+    }
   },
   "orgApprovalSecurityTab": {
     "title": "Segurança de aprovação",
@@ -1827,13 +1974,45 @@
           "label": "Ciclo de vida do hardware",
           "description": "Mostra o plano de substituição atualizado dos equipamentos do seu cliente."
         },
+        "enableHardwareHealth": {
+          "label": "Saúde do hardware",
+          "description": "Mostra a saúde dos componentes, eventos, discos e bateria das máquinas do seu cliente."
+        },
+        "enableHardwareInventory": {
+          "label": "Inventário de hardware",
+          "description": "Mostra fabricante, modelo, processador, memória, adaptadores de rede e contagem de conexões das máquinas do seu cliente."
+        },
+        "enablePerformanceMetrics": {
+          "label": "Métricas de desempenho",
+          "description": "Mostra tendências somente leitura de CPU, memória, disco e rede das máquinas do seu cliente."
+        },
+        "enableSoftwareInventory": {
+          "label": "Inventário de software",
+          "description": "Mostra nome, versão, fornecedor, data de instalação e última observação dos softwares nos dispositivos do cliente."
+        },
         "enableNetworkVisibility": {
           "label": "Visibilidade de rede",
           "description": "Exibe no portal do cliente a integridade da rede e os ativos descobertos em modo somente leitura."
         },
+        "enableEdrVisibility": {
+          "label": "Proteção de endpoints (EDR)",
+          "description": "Mostra aos clientes um status genérico de “Proteção de endpoints gerenciada” e as contagens de ameaças dos provedores de EDR conectados. Os nomes dos fornecedores nunca são exibidos no portal."
+        },
         "enableNetworkAlerts": {
           "label": "Alertas de rede",
           "description": "Exibe no portal do cliente a contagem de alertas ativos e os chamados abertos vinculados aos ativos de rede."
+        },
+        "enablePatchDetail": {
+          "label": "Detalhes de patches",
+          "description": "Mostra a todos os logins do portal desta organização os patches pendentes, instalados e com falha de cada dispositivo (título, gravidade, versão, link KB). Isso revela quais máquinas estão sem patches. Não é ativado por Ativar toda a visibilidade."
+        },
+        "enableVulnerabilityDetail": {
+          "label": "Detalhes de vulnerabilidades",
+          "description": "Mostra a cada login do portal desta organização os achados de CVE de cada dispositivo e sua gravidade (ID do CVE, descrição, gravidade, pontuação CVSS, disponibilidade de patch, status). Isso revela quais máquinas estão vulneráveis. Não é ativado por Ativar toda a visibilidade."
+        },
+        "enableHourBlock": {
+          "label": "Horas de suporte",
+          "description": "Mostra as horas pré-pagas do pacote usadas e restantes dentro da seção de uso de suporte do cliente. Requer Uso de suporte. Não é ativado ao habilitar toda a visibilidade."
         }
       }
     },
@@ -2111,6 +2290,13 @@
     "failedToFetchReviewDetails": "Falha ao buscar detalhes da avaliação",
     "noReviewerEmailsAvailableForNotifications": "Nenhum e-mail de revisor disponível para notificações",
     "unableToLaunchEmailNotification": "Não foi possível iniciar a notificação por e-mail",
+    "reviewersEmailed": "Revisor atribuído notificado por e-mail",
+    "assignedReviewerEmailedOnly": "Revisor atribuído notificado por e-mail. Os outros revisores selecionados não receberam e-mail — uma revisão armazena apenas um revisor atribuído.",
+    "fallbackToMailClient": "{{reason}} Abrindo seu cliente de e-mail em vez disso.",
+    "fallbackEmailNotConfigured": "O envio de e-mail não está configurado neste servidor.",
+    "fallbackNoReviewerEmail": "O revisor atribuído não tem endereço de e-mail cadastrado.",
+    "fallbackSendFailed": "O servidor não conseguiu enviar o e-mail.",
+    "fallbackRequestFailed": "A solicitação de notificação falhou.",
     "failedToCreateAccessReview": "Falha ao criar revisão de acesso",
     "failedToUpdateDecision": "Falha ao atualizar a decisão",
     "failedToFetchReviewForReport": "Falha ao buscar a revisão do relatório",
@@ -2125,7 +2311,12 @@
     "sending": "Enviando...",
     "notifyReviewers": "Notificar revisores",
     "completing": "Concluindo...",
-    "completeReview": "Concluir revisão"
+    "completeReview": "Concluir revisão",
+    "selfDecided": "Autodecidido",
+    "selfDecidedHint": "Decidido pelo próprio usuário avaliado, porque nenhum outro administrador podia revisá-lo (exceção de administrador único).",
+    "ownItemBlocked": "Você não pode decidir sobre o seu próprio acesso. Outro administrador com permissão de gerenciar usuários precisa revisar este item.",
+    "ownItemBlockedShort": "Requer outro revisor",
+    "ownItemSelfDecisionWarning": "Você é o único administrador que pode revisar isto, então pode decidir sobre o seu próprio acesso. Isso será registrado como autodecisão."
   },
   "aiUsagePage": {
     "aIUsageBudget": "Uso de IA",
@@ -2287,7 +2478,8 @@
       "triage": "Investiga os alertas novos e propõe o que fazer com eles.",
       "patch": "Revisa as correções pendentes e propõe o que instalar.",
       "helpdesk": "Assume chamados e propõe respostas e próximos passos.",
-      "designer": "Lê toda a frota e escreve um projeto de monitoramento justificado para um técnico aprovar."
+      "designer": "Lê toda a frota e escreve um projeto de monitoramento justificado para um técnico aprovar.",
+      "research": "Integrado. Pesquisa um problema em um dispositivo quando um técnico pede e sugere correções seguras. Nunca executa nada."
     },
     "emptyState": {
       "title": "Nenhum agente ainda",
@@ -2433,7 +2625,8 @@
       "triage": "Triagem de alertas",
       "patch": "Aplicação de patches",
       "helpdesk": "Central de ajuda",
-      "designer": "Projetista de frota"
+      "designer": "Projetista de frota",
+      "research": "Pesquisa de correções"
     },
     "modes": {
       "off": "Desligado",
@@ -2704,6 +2897,7 @@
           "blocked_by_app_rule": "Bloqueada por uma regra de aplicativo",
           "awaiting_manual_approval": "Aguardando aprovação manual",
           "no_ring_resolved": "O dispositivo não tem um anel de atualização",
+          "ring_reference_invalid": "O anel de atualização da política é inválido",
           "device_not_in_org": "O dispositivo não pertence a esta organização"
         },
         "failureClasses": {
@@ -3737,6 +3931,11 @@
           "blurb": "Lê toda a frota e escreve um projeto de monitoramento justificado para um técnico aprovar.",
           "runsWhen": "você inicia um Projeto de frota para uma organização, ou em um agendamento trimestral",
           "recommended": "uma migração do zero, ou uma auditoria de configuração trimestral"
+        },
+        "research": {
+          "blurb": "Integrado. Pesquisa um problema em um dispositivo quando um técnico pede e sugere correções seguras. Nunca executa nada.",
+          "runsWhen": "um técnico pede sugestões de correção para um problema de um dispositivo",
+          "recommended": "pesquisa automática somente leitura, um problema por vez"
         }
       },
       "kindCard": {
@@ -3764,6 +3963,36 @@
       "title": "Este agente apenas lê e escreve relatórios",
       "body": "Um Fleet Designer nunca executa nada em um dispositivo. Ligado significa que ele pode ser executado e entregar seus designs aos destinatários que você escolher.",
       "ack": "Entendo que este agente é executado sem supervisão e entrega Fleet Designs."
+    },
+    "research": {
+      "capsTitle": "Limites de pesquisa",
+      "builtInNote": "Integrado e somente sugere: nunca executa nada. Você pode desativá-lo e definir seus limites de gasto.",
+      "caps": {
+        "maxConcurrentResearchRuns": {
+          "label": "Pesquisas simultâneas",
+          "hint": "Quantas pesquisas podem estar em andamento ao mesmo tempo."
+        },
+        "maxResearchRunsPerHour": {
+          "label": "Pesquisas por hora",
+          "hint": "Máximo de pesquisas iniciadas em uma hora."
+        },
+        "maxAutoResearchRunsPerHour": {
+          "label": "Pesquisas automáticas por hora",
+          "hint": "Máximo de pesquisas iniciadas automaticamente por alertas altos e críticos. 0 desativa a pesquisa automática."
+        },
+        "researchQuickBudgetCentsPerRun": {
+          "label": "Orçamento de pesquisa rápida (centavos)",
+          "hint": "Limite de gasto de uma pesquisa rápida."
+        },
+        "researchDeepBudgetCentsPerRun": {
+          "label": "Orçamento de pesquisa aprofundada (centavos)",
+          "hint": "Limite de gasto de uma pesquisa aprofundada."
+        },
+        "maxBudgetCentsPerDay": {
+          "label": "Gasto diário de pesquisa (centavos)",
+          "hint": "Limite total de gasto por dia em todas as execuções deste agente."
+        }
+      }
     }
   },
   "apiKeyForm": {
@@ -4051,7 +4280,16 @@
     "partnerCurrencyUnavailable": "Não foi possível carregar a moeda do seu parceiro.",
     "retry": "Tentar novamente",
     "priceCouldNotBeSavedRetry": "Não foi possível salvar o preço em {{currency}}. Tente novamente.",
-    "priceCouldNotBeRemovedRetry": "Não foi possível remover o preço em {{currency}}. Tente novamente."
+    "priceCouldNotBeRemovedRetry": "Não foi possível remover o preço em {{currency}}. Tente novamente.",
+    "billing": "Cobrança",
+    "billingOneTime": "Único",
+    "billingRecurring": "Recorrente",
+    "billingFrequency": "Frequência",
+    "frequencyMonthly": "Mensal",
+    "frequencyAnnual": "Anual",
+    "commitmentTerm": "Prazo de compromisso (meses)",
+    "commitmentTermPlaceholder": "ex.: 12",
+    "commitmentTermRange": "Prazo de compromisso: insira um número inteiro de 1 a 120 meses."
   },
   "catalogItemsTab": {
     "itemArchived": "Item arquivado",
@@ -4151,7 +4389,8 @@
     "sessionInvalid": "Sua sessão foi alterada antes que a vinculação pudesse ser concluída. Faça login novamente e tente de novo.",
     "providerInactive": "Esse provedor de logon único não está mais ativo. Entre em contato com o administrador.",
     "configChanged": "A configuração de logon único mudou enquanto você se conectava. Tente novamente.",
-    "emailUnverified": "Seu provedor de identidade não confirmou que seu endereço de e-mail foi verificado. Entre em contato com o administrador."
+    "emailUnverified": "Seu provedor de identidade não confirmou que seu endereço de e-mail foi verificado. Entre em contato com o administrador.",
+    "idpVerifyFailed": "O Breeze não conseguiu verificar o login retornado pelo seu provedor de identidade. Tente novamente."
   },
   "connectedAppsList": {
     "loadingConnectedApps": "Carregando aplicativos conectados…",
@@ -4352,6 +4591,7 @@
     "ssoReauthProviderInactive": "O logon único não está mais disponível para esta conta. Fale com o administrador e tente de novo.",
     "ssoReauthConfigChanged": "Suas configurações de logon único mudaram durante a verificação. Inicie a verificação novamente.",
     "ssoReauthEmailUnverified": "Seu provedor de identidade informa que seu endereço de e-mail não foi verificado. Verifique-o lá e tente de novo.",
+    "ssoReauthIdpVerifyFailed": "O Breeze não conseguiu verificar o login retornado pelo seu provedor de identidade. Tente de novo. Se continuar falhando, peça ao administrador para verificar os logs do servidor.",
     "ssoReauthProofExpired": "Sua verificação com o provedor de identidade expirou. Verifique novamente para concluir a configuração da autenticação multifator.",
     "thisAccountSignsInThroughAnIdentityProviderVerifyBeforeAddingAPasskey": "Esta conta faz login por um provedor de identidade e não tem senha. Verifique novamente com o provedor antes de adicionar uma chave de acesso.",
     "yourIdentityIsVerifiedNameThisPasskeyAndContinue": "Sua identidade foi verificada. Dê um nome a esta chave de acesso e continue.",
@@ -5389,7 +5629,8 @@
     "loading": "Carregando configurações de chamados…",
     "errors": {
       "load": "Não foi possível carregar as configurações de chamados.",
-      "save": "Falha ao salvar as configurações de chamados"
+      "save": "Falha ao salvar as configurações de chamados",
+      "savedApprovalFailed": "Configurações de tickets salvas, mas a política de aprovação do cliente não pôde ser salva"
     },
     "toasts": {
       "saved": "Configurações de chamados salvas"
@@ -5415,6 +5656,28 @@
       "inherit": "Herdar",
       "billableOption": "Faturável",
       "nonBillableOption": "Não faturável"
+    },
+    "approval": {
+      "title": "Aprovação de trabalho pelo cliente",
+      "description": "Substitui o padrão do parceiro para esta organização. Escolha Herdar para usar o padrão do parceiro.",
+      "enabled": "Exigir aprovação do cliente",
+      "budgetTrigger": "Perguntar quando o orçamento de um ticket seria excedido",
+      "afterHoursTrigger": "Perguntar em trabalho fora do horário",
+      "enforcement": "Aplicação",
+      "enforcementSoft": "Flexível (avisar, permitir o lançamento)",
+      "enforcementHard": "Rígida (bloquear até aprovar)",
+      "ttl": "A solicitação de aprovação expira após (horas)",
+      "ttlRange": "A expiração deve ficar entre {{min}} e {{max}} horas",
+      "on": "Ativado",
+      "off": "Desativado",
+      "inherit": "Herdar",
+      "inheritValue": "Herdar ({{value}})",
+      "clear": "Remover substituição (herdar)",
+      "pendingInherit": "Herdará o padrão após salvar",
+      "loadFailed": "Não foi possível carregar as configurações de aprovação do cliente.",
+      "sourceOrg": "Substituição da organização",
+      "sourcePartner": "Padrão do parceiro",
+      "sourceDefault": "Padrão integrado"
     }
   },
   "organizationForm": {
@@ -5666,7 +5929,8 @@
       "title": "Endereço"
     },
     "actions": {
-      "saveChanges": "Salvar alterações"
+      "saveChanges": "Salvar alterações",
+      "sendMessage": "Enviar mensagem"
     },
     "policies": {
       "assignedTitle": "Políticas atribuídas",
@@ -5862,7 +6126,12 @@
       "messagePrefix": "Tem certeza de que deseja excluir",
       "messageSuffix": "Isto removerá a definição do campo e todos os valores armazenados nos dispositivos."
     },
-    "typeFilterLabel": "Tipo de campo"
+    "typeFilterLabel": "Tipo de campo",
+    "toasts": {
+      "created": "Campo personalizado criado",
+      "updated": "Campo personalizado atualizado",
+      "deleted": "Campo personalizado excluído"
+    }
   },
   "knownGuestsSettings": {
     "title": "Convidados conhecidos",
@@ -5960,6 +6229,7 @@
     "accessDenied": "Você não tem permissão para visualizar usuários.",
     "title": "Usuários",
     "description": "Gerencie o acesso, as funções e as permissões do usuário.",
+    "sessionTimeoutPointer": "O tempo limite de inatividade da sessão é configurado em Segurança",
     "never": "Nunca",
     "actions": {
       "tryAgain": "Tente novamente",
@@ -6103,9 +6373,34 @@
     "mergeGapLabel": "Intervalo de mesclagem (minutos)",
     "save": "Salvar",
     "saved": "Configurações de controle de tempo salvas",
+    "loadFailed": "Não foi possível carregar as configurações salvas. Salvar fica desativado até que sejam carregadas; atualize a página para tentar novamente.",
     "saveFailed": "Não foi possível salvar as configurações de controle de tempo",
     "minSessionRange": "A duração mínima da sessão deve estar entre {{min}} e {{max}} segundos",
-    "mergeGapRange": "O intervalo de mesclagem deve estar entre {{min}} e {{max}} minutos"
+    "mergeGapRange": "O intervalo de mesclagem deve estar entre {{min}} e {{max}} minutos",
+    "locationEnabledLabel": "Sugerir um cronômetro quando um técnico chega ao local de um cliente",
+    "locationHelp": "Cada técnico também precisa permitir a localização no próprio celular. A localização é verificada no celular e nunca é enviada ao Breeze.",
+    "radiusLabel": "Raio de chegada padrão (m)",
+    "radiusRange": "O raio de chegada deve estar entre {{min}} e {{max}} metros",
+    "approval": {
+      "heading": "Aprovação de trabalho pelo cliente",
+      "description": "Pedir ao cliente que aprove o trabalho antes de ele ser lançado no orçamento ou fora do horário comercial. Este é o padrão do parceiro; as organizações podem substituí-lo.",
+      "enabledLabel": "Exigir aprovação do cliente para o trabalho",
+      "budgetTriggerLabel": "Perguntar quando o orçamento de um ticket seria excedido",
+      "afterHoursTriggerLabel": "Perguntar em trabalho fora do horário",
+      "enforcementLabel": "Aplicação",
+      "enforcementSoft": "Flexível (avisar, permitir o lançamento)",
+      "enforcementHard": "Rígida (bloquear até aprovar)",
+      "ttlLabel": "A solicitação de aprovação expira após (horas)",
+      "ttlRange": "A expiração deve ficar entre {{min}} e {{max}} horas",
+      "readOnly": "Você precisa de permissões de configuração em nível de parceiro para alterar esta política. Exibindo os valores atuais.",
+      "loadFailed": "Não foi possível carregar as configurações de aprovação do cliente.",
+      "source": {
+        "org": "Organização",
+        "partner": "Parceiro",
+        "default": "Padrão"
+      }
+    },
+    "savedApprovalFailed": "Configurações de tempo salvas, mas a política de aprovação do cliente não pôde ser salva"
   },
   "contactsCard": {
     "title": "Contatos",
@@ -6349,7 +6644,10 @@
     },
     "stepUp": {
       "title": "Confirme que é você",
-      "body": "Habilitar execuções sem supervisão exige uma nova verificação de segurança."
+      "body": "Habilitar execuções sem supervisão exige uma nova verificação de segurança.",
+      "ceilingBody": "Permitir ou ampliar execuções autônomas para suas organizações exige uma nova verificação de segurança. Confirme e selecione Salvar novamente.",
+      "wideningBody": "Ampliar o que as execuções autônomas podem fazer exige uma nova verificação de segurança. Confirme e selecione Salvar novamente.",
+      "noFactor": "Esta alteração exige uma verificação de segurança, mas sua conta não tem um app autenticador nem uma chave de acesso. Configure um no seu perfil e tente novamente."
     },
     "save": "Salvar",
     "saving": "Salvando…",
@@ -6385,7 +6683,8 @@
     "nameTaken": "Já existe um tipo de trabalho com esse nome.",
     "rename": "Renomear",
     "loadError": "Não foi possível carregar os tipos de trabalho.",
-    "empty": "Ainda não há tipos de trabalho. Adicione o primeiro acima."
+    "empty": "Ainda não há tipos de trabalho. Adicione o primeiro acima.",
+    "afterHours": "Fora do horário (exige aprovação do cliente quando ativado)"
   },
   "ticketCategories": {
     "defaultWorkType": "Tipo de trabalho padrão",
@@ -6462,5 +6761,19 @@
     "sourceDefault": "padrão do produto",
     "range": "Escolha entre {{min}} e {{max}} minutos.",
     "save": "Salvar"
+  },
+  "ticketPushover": {
+    "title": "Pushover para atribuições de chamados",
+    "description": "Adicione sua chave de usuário do Pushover para receber uma notificação quando um chamado for atribuído a você. Só você a recebe. Seu MSP precisa ter configurado um token de aplicativo do Pushover em Notificações.",
+    "statusSet": "Há uma chave do Pushover salva.",
+    "statusNotSet": "Nenhuma chave do Pushover salva.",
+    "placeholder": "Chave de usuário do Pushover com 30 caracteres",
+    "save": "Salvar chave",
+    "remove": "Remover chave",
+    "saved": "Chave do Pushover salva.",
+    "removed": "Chave do Pushover removida.",
+    "invalidKey": "Uma chave de usuário do Pushover tem 30 letras ou dígitos.",
+    "loadFailed": "Não foi possível carregar sua configuração do Pushover.",
+    "saveFailed": "Não foi possível salvar sua configuração do Pushover."
   }
 }

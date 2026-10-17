@@ -9,6 +9,7 @@ vi.mock('../../services/invoiceService', () => ({
   addCatalogLine: vi.fn(),
   addBundleLine: vi.fn(),
   updateLine: vi.fn(),
+  refreshDraftTimeLines: vi.fn(),
   removeLine: vi.fn(),
   deleteDraftInvoice: vi.fn(),
   updateInvoice: vi.fn(),
@@ -100,7 +101,7 @@ describe('invoice crud + lines routes', () => {
   beforeEach(() => vi.clearAllMocks());
 
   it('POST / creates a manual invoice', async () => {
-    (svc.createManualInvoice as any).mockResolvedValue({ id: INV_ID, status: 'draft' });
+    (svc.createManualInvoice as any).mockResolvedValue({ id: INV_ID, orgId: ORG_ID, status: 'draft' });
     const res = await app().request('/', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -110,6 +111,9 @@ describe('invoice crud + lines routes', () => {
     const body = await res.json();
     expect(body.data.id).toBe(INV_ID);
     expect(svc.createManualInvoice).toHaveBeenCalledOnce();
+    expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: ORG_ID, action: 'invoice.create', resourceType: 'invoice', resourceId: INV_ID,
+    }));
   });
 
   it('POST / rejects an invalid body (non-UUID orgId → 400, no service call)', async () => {
@@ -193,13 +197,55 @@ describe('invoice crud + lines routes', () => {
     expect(svc.updateInvoice).not.toHaveBeenCalled();
   });
 
+  it('#8604: PATCH /:id passes the line itemization override through, null = inherit', async () => {
+    (svc.updateInvoice as any).mockResolvedValue({ id: INV_ID, status: 'draft' });
+    const res = await app().request(`/${INV_ID}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ lineGrouping: 'day', lineShowDate: true, lineShowNote: null, lineShowWorkedTime: false })
+    });
+    expect(res.status).toBe(200);
+    expect(svc.updateInvoice).toHaveBeenCalledWith(
+      INV_ID,
+      { lineGrouping: 'day', lineShowDate: true, lineShowNote: null, lineShowWorkedTime: false },
+      expect.anything()
+    );
+  });
+
+  it('#8604: PATCH /:id accepts null (clear to billing default) for every override field', async () => {
+    (svc.updateInvoice as any).mockResolvedValue({ id: INV_ID, status: 'draft' });
+    const all = { lineGrouping: null, lineShowDate: null, lineShowNote: null, lineShowWorkedTime: null };
+    const res = await app().request(`/${INV_ID}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(all)
+    });
+    expect(res.status).toBe(200);
+    expect(svc.updateInvoice).toHaveBeenCalledWith(INV_ID, all, expect.anything());
+  });
+
+  it('#8604: PATCH /:id rejects an unknown grouping or a non-boolean toggle (400, no service call)', async () => {
+    for (const body of [{ lineGrouping: 'week' }, { lineShowDate: 'yes' }]) {
+      const res = await app().request(`/${INV_ID}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      expect(res.status).toBe(400);
+    }
+    expect(svc.updateInvoice).not.toHaveBeenCalled();
+  });
+
   it('DELETE /:id deletes a draft invoice', async () => {
-    (svc.deleteDraftInvoice as any).mockResolvedValue(undefined);
+    (svc.deleteDraftInvoice as any).mockResolvedValue({ id: INV_ID, orgId: ORG_ID });
     const res = await app().request(`/${INV_ID}`, { method: 'DELETE' });
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.data.ok).toBe(true);
     expect(svc.deleteDraftInvoice).toHaveBeenCalledWith(INV_ID, expect.anything());
+    expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: ORG_ID, action: 'invoice.delete', resourceType: 'invoice', resourceId: INV_ID,
+    }));
   });
 
   it('maps an InvoiceServiceError to its status (NOTHING_TO_INVOICE → 409)', async () => {
@@ -214,6 +260,44 @@ describe('invoice crud + lines routes', () => {
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.code).toBe('NOTHING_TO_INVOICE');
+  });
+});
+
+describe('POST /:id/refresh-time-lines (#8606)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('refreshes the draft, returns the per-line outcome and audits the counts', async () => {
+    const result = {
+      invoiceId: INV_ID, orgId: ORG_ID,
+      summary: { refreshed: 1, unchanged: 0, skipped: 1, quantityDrifted: 0 },
+      lines: [
+        { lineId: 'l1', status: 'refreshed', changed: ['description'] },
+        { lineId: 'l2', status: 'skipped', reason: 'billed_elsewhere' },
+      ],
+    };
+    (svc.refreshDraftTimeLines as any).mockResolvedValue(result);
+    const res = await app().request(`/${INV_ID}/refresh-time-lines`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toEqual(result);
+    expect(svc.refreshDraftTimeLines).toHaveBeenCalledWith(INV_ID, expect.objectContaining({ userId: 'u1', partnerId: 'p1' }));
+    expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      orgId: ORG_ID, action: 'invoice.time_lines.refreshed', resourceType: 'invoice', resourceId: INV_ID,
+      details: result.summary,
+    }));
+  });
+
+  it('maps a non-draft refusal to 409 NOT_A_DRAFT and writes no audit', async () => {
+    (svc.refreshDraftTimeLines as any).mockRejectedValue(new InvoiceServiceError('Invoice is not a draft', 409, 'NOT_A_DRAFT'));
+    const res = await app().request(`/${INV_ID}/refresh-time-lines`, { method: 'POST' });
+    expect(res.status).toBe(409);
+    expect((await res.json()).code).toBe('NOT_A_DRAFT');
+    expect(writeRouteAudit).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-UUID id with 400 and never calls the service', async () => {
+    const res = await app().request('/not-a-uuid/refresh-time-lines', { method: 'POST' });
+    expect(res.status).toBe(400);
+    expect(svc.refreshDraftTimeLines).not.toHaveBeenCalled();
   });
 });
 

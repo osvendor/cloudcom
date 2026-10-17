@@ -13,6 +13,7 @@ import DeviceCard from './DeviceCard';
 import DecommissionedHiddenHint from './DecommissionedHiddenHint';
 import ScriptPickerModal, { type Script, type ScriptRunAsSelection } from './ScriptPickerModal';
 import DeviceSettingsModal from './DeviceSettingsModal';
+import SendMessageDialog from '../endpointMessages/SendMessageDialog';
 import RemoveDeviceDialog from './RemoveDeviceDialog';
 import { BulkPurgeDialog } from './BulkPurgeDialog';
 import AddDeviceModal from './AddDeviceModal';
@@ -384,6 +385,8 @@ export default function DevicesPage() {
   // once for the whole (already manual-only) selection before the per-item
   // DELETE loop in runBulkDeleteManual.
   const [pendingBulkDeleteManual, setPendingBulkDeleteManual] = useState<Device[] | null>(null);
+  // Endpoint messaging: the agent devices a technician is composing a message for.
+  const [messageDevices, setMessageDevices] = useState<Device[] | null>(null);
   // #2787: bulk Delete permanently. The dialog asks for the count to be typed;
   // runBulkPurge then starts the async job and polls it.
   const [pendingBulkPurge, setPendingBulkPurge] = useState<Device[] | null>(null);
@@ -809,6 +812,7 @@ export default function DevicesPage() {
           // and sorts those rows last. Trend is validated against the known
           // enum rather than blind-cast, so an unexpected API value falls back
           // to null (no glyph) instead of leaking through the type.
+          reliabilityProvisional: d.reliabilityProvisional === true,
           reliabilityScore: typeof d.reliabilityScore === 'number' ? d.reliabilityScore : null,
           reliabilityTrend:
             d.reliabilityTrend === 'improving' ||
@@ -1304,6 +1308,19 @@ export default function DevicesPage() {
           // "wait for it to reconnect" story `queued_offline` tells; treat it
           // as sent, same as 'delivered', or an online device gets told it's
           // offline.
+          // 'cancelled' — the server refused it before delivery (e.g. the
+          // requester's access changed); it will never run, so never "sent".
+          if (result.delivery === 'cancelled') {
+            showToast({
+              type: 'error',
+              message: t('devicesPage.toasts.commandCancelled', {
+                action: label,
+                hostname: device.hostname,
+                reason: result.cancelReason ?? 'unknown',
+              }),
+            });
+            break;
+          }
           showToast({
             type: 'success',
             message: result.delivery !== 'queued_offline'
@@ -1634,6 +1651,11 @@ export default function DevicesPage() {
           ? t('devicesPage.toasts.nonAgentSkipped', { count: skippedNonAgentCount })
           : t('devicesPage.toasts.networkSkipped', { count: skippedNetworkCount }),
       });
+    }
+
+    if (action === 'send-message') {
+      setMessageDevices(selectedDevices);
+      return;
     }
 
     // Compare is navigation, not an agent command — nothing queues, so the
@@ -2549,6 +2571,15 @@ export default function DevicesPage() {
             reportMaintenanceEntryOutcome(maintenanceDialogDevices, result);
             void fetchDevices();
           }}
+        />
+      )}
+
+      {messageDevices && (
+        <SendMessageDialog
+          open
+          onClose={() => setMessageDevices(null)}
+          targets={{ deviceIds: messageDevices.map(d => d.id) }}
+          devices={messageDevices.map(d => ({ id: d.id, hostname: d.hostname, osType: d.os, agentVersion: d.agentVersion }))}
         />
       )}
 

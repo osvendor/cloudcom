@@ -22,6 +22,7 @@
     "adminSendingDomains": "Domaines d'envoi du partenaire",
     "adminUsersDetailDevices": "Appareils de l'utilisateur",
     "aiAgentsImpact": "Impact de l'IA",
+    "aiAgentsFixMemory": "Mémoire des correctifs",
     "aiAgentsRunsDetail": "Détail de l'exécution",
     "aiAgentsRuns": "Exécutions des agents",
     "aiForOffice": "IA pour Office",
@@ -93,6 +94,7 @@
     "policies": "Politiques",
     "policiesNew": "Nouvelle politique",
     "quick": "Support rapide",
+    "verify": "Vérifier une demande d’assistance",
     "registerPartner": "Enregistrez votre entreprise",
     "remoteFilesDevice": "Gestionnaire de fichiers distant",
     "remoteFiles": "Démarrer le transfert de fichiers",
@@ -172,7 +174,8 @@
     "settingsTicketing": "Paramètres de tickets",
     "securityScans": "Analyses IOC",
     "devicesTime": "Synchronisation de l’heure",
-    "adminAiModels": "Modèles d'IA"
+    "adminAiModels": "Modèles d'IA",
+    "billingAutopay": "Automatic payments"
   },
   "layout": {
     "metaDescription": "Breeze RMM - Supervision et gestion à distance",

@@ -164,34 +164,128 @@ export const graphRelationshipSchema = z.object({
 
 export const TOPOLOGY_NETWORK_CLASSES = ['lan', 'link_local', 'host', 'overlay', 'other'] as const;
 export type TopologyNetworkClass = typeof TOPOLOGY_NETWORK_CLASSES[number];
+/** Interface kinds an agent reports on its `interfaces` section rows (topologyCollection.ts). */
+export const TOPOLOGY_INTERFACE_KINDS = ['ethernet', 'wifi', 'tunnel', 'bridge', 'cellular', 'virtual', 'other', 'unknown'] as const;
+export type TopologyInterfaceKind = typeof TOPOLOGY_INTERFACE_KINDS[number];
+/**
+ * What an interface kind says about the networks on it (#7819):
+ * - `tunnel`: a point-to-point or overlay interface (tun/WireGuard/Tailscale, PPP, IPsec, VXLAN, TAP);
+ *   anything addressed on it is an overlay, whatever its CIDR looks like.
+ * - `link`: a link-layer LAN segment (Ethernet, Wi-Fi, a bridge); the CGNAT/Tailscale CIDR guess
+ *   never applies to it.
+ * - `unknown`: no usable evidence (`virtual` covers veth/macvlan/dummy as well as VPN adapters,
+ *   `cellular` is a carrier WAN uplink whose CGNAT address is not a site LAN, `other` is
+ *   unclassified, older or partial agents send `unknown`, a row may have no interface);
+ *   the CIDR heuristic decides.
+ */
+export function topologyInterfaceKindEvidence(kind: string | null | undefined): 'tunnel' | 'link' | 'unknown' {
+  switch (kind) {
+    case 'tunnel': return 'tunnel';
+    case 'ethernet': case 'wifi': case 'bridge': return 'link';
+    default: return 'unknown';
+  }
+}
 function ipv4Number(address: string): number | null {
   const parts = address.split('.');
   if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part) || Number(part) > 255)) return null;
   return parts.reduce((value, part) => value * 256 + Number(part), 0);
 }
 /**
- * Display class of a CIDR for the grouped overview. Only `lan` prefixes form visible
+ * Prefixes that consumer routers ship with by default. Many unrelated sites share them, so a
+ * "gateway matches" signal on one of these is not evidence of the same network (a visit needs a
+ * corroborated gateway MAC). Spec 2026-10-03 topology-site-location §6.5.
+ *
+ * Changing this list requires a reviewed PR: it changes presence classification for every org.
+ */
+export const TOPOLOGY_CONSUMER_DEFAULT_PREFIXES: readonly string[] = Object.freeze([
+  '192.168.0.0/24', '192.168.1.0/24', '192.168.2.0/24', '192.168.3.0/24', '192.168.4.0/24',
+  '192.168.8.0/24', '192.168.11.0/24', '192.168.31.0/24', '192.168.50.0/24', '192.168.68.0/22',
+  '192.168.86.0/24', '192.168.88.0/24', '192.168.100.0/24', '192.168.178.0/24',
+  '192.168.254.0/24', '10.0.0.0/24', '10.0.1.0/24', '10.1.10.0/24', '172.16.0.0/24',
+]);
+
+function ipv4Range(prefix: string): [number, number] | null {
+  const match = /^([^/]+)\/(\d{1,2})$/.exec(prefix);
+  if (!match) return null;
+  const length = Number(match[2]);
+  const value = ipv4Number(match[1]!);
+  if (value === null || length > 32) return null;
+  const size = 2 ** (32 - length);
+  const start = Math.floor(value / size) * size;
+  return [start, start + size - 1];
+}
+
+/** True when the IPv4 range of `prefix` overlaps (contains, or is contained by) a consumer default. Non-IPv4 or unparsable input is false. */
+export function isTopologyConsumerDefaultPrefix(prefix: string): boolean {
+  const range = ipv4Range(prefix);
+  if (!range) return false;
+  return TOPOLOGY_CONSUMER_DEFAULT_PREFIXES.some((entry) => {
+    const other = ipv4Range(entry);
+    return !!other && range[0] <= other[1] && other[0] <= range[1];
+  });
+}
+
+/**
+ * Display class of a network for the grouped overview. Only `lan` prefixes form visible
  * network cards by default; the rest are real but rarely what an operator means by
  * "the network" (link-local, single-host, overlay/VPN ranges, over-broad prefixes).
- * Overlay detection is a CIDR heuristic (Tailscale/CGNAT) until interface-kind evidence lands.
+ *
+ * The one classifier for the overview AND the neighbour-cache selector (#7819): the kind of
+ * the interface the prefix was observed on wins when it is known. A tunnel interface makes
+ * any prefix an overlay (a VPN on RFC1918 included); a link-layer interface disables the
+ * Tailscale/CGNAT range guess, so a genuine CGNAT LAN stays a LAN. Only an unknown kind
+ * falls back to that guess. Link-local scope, single-host and over-broad prefixes are
+ * properties of the address itself and apply to every kind (except that a tunnel's own
+ * single-host address is the overlay, not a host route).
  */
-export function topologyNetworkClass(prefix: string): TopologyNetworkClass {
+export function topologyNetworkClass(prefix: string, interfaceKind?: string | null): TopologyNetworkClass {
+  const evidence = topologyInterfaceKindEvidence(interfaceKind);
   const [address = '', lengthText = ''] = prefix.split('/');
   const length = Number(lengthText);
   if (address.includes(':')) {
     const head = address.toLowerCase();
     if (/^fe[89ab]/.test(head)) return 'link_local';
+    if (evidence === 'tunnel') return 'overlay';
     if (length === 128) return 'host';
-    if (head.startsWith('fd7a:115c:a1e0')) return 'overlay';
+    if (evidence === 'unknown' && head.startsWith('fd7a:115c:a1e0')) return 'overlay';
     return length < 16 ? 'other' : 'lan';
   }
   const value = ipv4Number(address);
   if (value === null) return 'other';
   if (Math.floor(value / 65_536) === 169 * 256 + 254) return 'link_local';
+  if (evidence === 'tunnel') return 'overlay';
   if (length === 32) return 'host';
-  if (Math.floor(value / 4_194_304) === (100 * 256 + 64) / 64) return 'overlay';
+  if (evidence === 'unknown' && Math.floor(value / 4_194_304) === (100 * 256 + 64) / 64) return 'overlay';
   return length < 8 ? 'other' : 'lan';
 }
+
+/**
+ * Neighbour-cache states that still map an address to a MAC (#7816, collection C:136).
+ * `incomplete`/`failed` carry no usable mapping and never corroborate anything.
+ */
+export const TOPOLOGY_NEIGHBOR_MAPPING_STATES = ['reachable', 'stale', 'delay', 'probe', 'permanent', 'unknown'] as const;
+export type TopologyNeighborMappingState = typeof TOPOLOGY_NEIGHBOR_MAPPING_STATES[number];
+/**
+ * Bounded provenance of a `neighbor_seen` placement: one observer's published ARP/NDP
+ * row held the endpoint's exact inventory IP+MAC pair. Inferred/low presentation
+ * evidence only — never a membership claim, a reachability fact or a verified identity.
+ */
+export const presentationNeighborEvidenceSchema = z.object({
+  method: z.literal('neighbor_cache'),
+  evidenceClass: z.literal('inferred'),
+  confidence: z.literal('low'),
+  observerNodeId: canonicalIdSchema,
+  observerLabel: z.string().max(255),
+  sourceId: canonicalIdSchema,
+  rowKey: z.string().max(255),
+  interfaceName: z.string().max(255).nullable(),
+  address: z.string().max(64),
+  mac: z.string().max(64),
+  state: z.enum(TOPOLOGY_NEIGHBOR_MAPPING_STATES),
+  /** Collection confirmation time of the cache read; ARP/NDP rows carry no per-peer last-seen. */
+  confirmedAt: utcTimestampSchema,
+  expiresAt: utcTimestampSchema,
+}).strict();
 
 export const presentationIdSchema = z.string().regex(
   /^presentation:(overview|physical|logical):[A-Za-z0-9_-]{1,128}:[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/,
@@ -212,10 +306,15 @@ export const presentationNodeSchema = z.object({
    * nodes stay in `nodes`; `canonicalNodeIds` are the ones this card folds and
    * `members` the visible endpoints drawn inside it. `address_match` members are an
    * unverified address-range placement, never a membership claim.
+   * A `hidden` group is never drawn (#7879): it names canonical nodes the overview leaves
+   * out — `decommissioned` devices, and orphan network/gateway nodes with
+   * `no_current_evidence` — so clients fold them away and can say how many.
+   * A `declared_site_network` card (site location W1) is the exception to "inferred": an
+   * administrator-declared prefix that no observer reports, drawn memberless.
    */
   group: z.object({
-    kind: z.enum(['network', 'gateway', 'unidentified']),
-    basis: z.enum(['inferred_site_prefix', 'reported_gateway', 'unidentified']),
+    kind: z.enum(['network', 'gateway', 'unidentified', 'hidden']),
+    basis: z.enum(['inferred_site_prefix', 'reported_gateway', 'unidentified', 'decommissioned', 'no_current_evidence', 'declared_site_network']),
     networkClass: z.enum(TOPOLOGY_NETWORK_CLASSES).nullable(),
     prefix: z.string().max(64).nullable(),
     address: z.string().max(64).nullable(),
@@ -224,11 +323,35 @@ export const presentationNodeSchema = z.object({
     observerCount: boundedCountSchema,
     members: z.array(z.object({
       nodeId: canonicalIdSchema,
-      placement: z.enum(['observed', 'address_match']),
+      placement: z.enum(['observed', 'address_match', 'neighbor_seen']),
       primary: z.boolean(),
       stale: z.boolean(),
-    }).strict()).max(1_000),
+      /** Present exactly when `placement` is `neighbor_seen` (#7816). */
+      neighbor: presentationNeighborEvidenceSchema.optional(),
+    }).strict().refine((member) => (member.placement === 'neighbor_seen') === !!member.neighbor, 'neighbor_seen requires neighbour provenance')).max(1_000),
     canonicalNodeIds: z.array(canonicalIdSchema).max(1_000),
+    /** Why a split card is split: different gateway addresses, or one address with conflicting fresh gateway MACs (#7817). */
+    conflictBasis: z.array(z.enum(['gateway_address', 'gateway_mac'])).max(2).optional(),
+    /** `limited` when neighbour evidence was truncated or bounded: a missing cache row never means absence. */
+    neighborCoverage: z.enum(['complete', 'limited']).optional(),
+    /** Gateway MACs corroborated by observers' published neighbour caches (gateway groups only, #7817). */
+    gatewayMacs: z.array(z.object({
+      address: z.string().max(64),
+      mac: z.string().max(64),
+      observerCount: boundedCountSchema,
+      confirmedAt: utcTimestampSchema,
+      expiresAt: utcTimestampSchema,
+    }).strict()).max(16).optional(),
+    /**
+     * Site location W1 (site-location spec S§9): whether this IPv4 `lan` card's prefix is declared for
+     * the viewed site by an enabled discovery profile or a network baseline (exact prefix equality,
+     * never containment). Absent on non-lan cards and IPv6 cards. A `declared_site_network` card is a
+     * declared prefix no observer reports: memberless, presentation only.
+     */
+    declaration: z.object({
+      state: z.enum(['declared', 'undeclared']),
+      sources: z.array(z.enum(['discovery_profile', 'network_baseline'])).max(2),
+    }).strict().optional(),
   }).strict().optional(),
 }).strict();
 
@@ -373,6 +496,8 @@ export const graphResponseSchema = z.object({
     canEdit: z.boolean(),
     canDiagnose: z.boolean(),
     canConfigureMonitoring: z.boolean(),
+    /** Site location W3: devices:write (live and request permissions), for the wrong-site suggestion actions. */
+    canMoveDevices: z.boolean(),
   }).strict(),
 }).strict();
 

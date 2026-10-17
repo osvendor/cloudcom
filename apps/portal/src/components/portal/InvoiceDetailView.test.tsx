@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { fireEvent, render, screen, cleanup } from '@testing-library/react';
+import { fireEvent, render, screen, cleanup, waitFor } from '@testing-library/react';
 import type { InvoiceDetail, InvoiceLine } from '@/lib/api';
 
 // Same stub the other portal component suites use: the real module reaches
@@ -9,7 +9,7 @@ vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
 
 import InvoiceDetailView from './InvoiceDetailView';
 
-afterEach(() => cleanup());
+afterEach(() => { cleanup(); vi.restoreAllMocks(); window.history.replaceState({}, "", "/"); });
 
 // #3319: the customer-facing surface where the dropped line name actually
 // showed up. The title/blurb derivation here must stay identical to
@@ -53,8 +53,10 @@ function detail(lines: InvoiceLine[]): InvoiceDetail {
   };
 }
 
-function renderDetail(lines: InvoiceLine[]) {
-  return render(<InvoiceDetailView detail={detail(lines)} />);
+function renderDetail(lines: InvoiceLine[], lineGrouping?: 'entry' | 'day') {
+  const d = detail(lines);
+  if (lineGrouping) d.invoice.lineGrouping = lineGrouping;
+  return render(<InvoiceDetailView detail={d} />);
 }
 
 describe('InvoiceDetailView line labels (#3319)', () => {
@@ -160,5 +162,173 @@ describe('InvoiceDetailView — payment unavailable', () => {
     const alert = await screen.findByTestId('invoice-pay-error');
     expect(alert).toHaveTextContent('Online payment is not available');
     expect(screen.getByTestId('invoice-pay-next-step')).toHaveTextContent(/how to pay this invoice/);
+  });
+});
+
+describe('InvoiceDetailView — autopay collection in flight (#7824)', () => {
+  it('offers no Pay and explains why while a collection is processing', async () => {
+    render(<InvoiceDetailView detail={{ ...detail([line()]), collectionInProgress: { amount: '100.00' } }} />);
+    expect(screen.queryByTestId('invoice-pay-button')).toBeNull();
+    const note = screen.getByTestId('invoice-collection-processing');
+    expect(note.textContent).toContain('$100.00 is being collected');
+  });
+
+  it('keeps the Pay button enabled when nothing is in flight (null)', () => {
+    render(<InvoiceDetailView detail={{ ...detail([line()]), collectionInProgress: null }} />);
+    expect((screen.getByTestId('invoice-pay-button') as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByTestId('invoice-collection-processing')).toBeNull();
+  });
+});
+
+it('future-card authorization starts unticked and is sent only with explicit consent', async () => {
+  const { portalApi } = await import('@/lib/api');
+  const pay = vi.spyOn(portalApi, 'payInvoice').mockResolvedValue({ error: 'Test payment was not started.', statusCode: 409 });
+  const input = detail([]);
+  input.autopay = { eligible: true, consentText: 'I authorize Example MSP for future invoices.',
+    consentVersion: '2026-10-01', disclosureHash: 'a'.repeat(64) };
+  render(<InvoiceDetailView detail={input} />);
+  fireEvent.click(screen.getByTestId('autopay-option-card_save'));
+  const box = screen.getByTestId('autopay-save-card');
+  expect((box as HTMLInputElement).checked).toBe(false);
+  fireEvent.click(box);
+  fireEvent.click(screen.getByTestId('invoice-pay-button'));
+  await vi.waitFor(() => expect(pay).toHaveBeenCalledWith(input.invoice.id, {}, {
+    saveForAutopay: true, consentAccepted: true, disclosureHash: 'a'.repeat(64) }));
+  expect(screen.getByTestId('autopay-save-card-text')).toHaveTextContent(input.autopay.consentText);
+  pay.mockRestore();
+});
+
+it('requires fresh consent when the invoice disclosure changes', async () => {
+  const { portalApi } = await import('@/lib/api');
+  const pay = vi.spyOn(portalApi, 'payInvoice').mockResolvedValue({ error: 'Payment unavailable', statusCode: 409 });
+  const input = detail([]);
+  input.autopay = { eligible: true, consentText: 'Original terms', consentVersion: '2026-10-01', disclosureHash: 'a'.repeat(64) };
+  const view = render(<InvoiceDetailView detail={input} />);
+  fireEvent.click(screen.getByTestId('autopay-option-card_save'));
+  fireEvent.click(screen.getByTestId('autopay-save-card'));
+  view.rerender(<InvoiceDetailView detail={{ ...input, autopay: { ...input.autopay, consentText: 'Changed terms', disclosureHash: 'b'.repeat(64) } }} />);
+  expect(screen.getByTestId('autopay-save-card')).not.toBeChecked();
+  expect(screen.getByTestId('invoice-pay-button')).toBeDisabled();
+  fireEvent.click(screen.getByTestId('autopay-option-card'));
+  fireEvent.click(screen.getByTestId('invoice-pay-button'));
+  await vi.waitFor(() => expect(pay).toHaveBeenCalledWith(input.invoice.id, {}, { saveForAutopay: false }));
+});
+
+it('does not send consent after eligibility is withdrawn', async () => {
+  const { portalApi } = await import('@/lib/api');
+  const pay = vi.spyOn(portalApi, 'payInvoice').mockResolvedValue({ error: 'Payment unavailable', statusCode: 409 });
+  const input = detail([]);
+  input.autopay = { eligible: true, consentText: 'Terms', consentVersion: '2026-10-01', disclosureHash: 'a'.repeat(64) };
+  const view = render(<InvoiceDetailView detail={input} />);
+  fireEvent.click(screen.getByTestId('autopay-option-card_save'));
+  fireEvent.click(screen.getByTestId('autopay-save-card'));
+  view.rerender(<InvoiceDetailView detail={{ ...input, autopay: { ...input.autopay, eligible: false } }} />);
+  expect(screen.queryByTestId('autopay-save-card')).toBeNull();
+  fireEvent.click(screen.getByTestId('invoice-pay-button'));
+  await vi.waitFor(() => expect(pay).toHaveBeenCalledWith(input.invoice.id, {}, { saveForAutopay: false }));
+});
+
+it('surfaces settlement request failures on checkout return', async () => {
+  const { portalApi } = await import('@/lib/api');
+  vi.spyOn(portalApi, 'settleInvoice').mockRejectedValue(new Error('offline'));
+  window.history.replaceState({}, '', '/?paid=1&session_id=cs_test');
+  render(<InvoiceDetailView detail={detail([])} />);
+  expect(await screen.findByTestId('invoice-pay-error')).toHaveTextContent('Could not confirm payment. Please try again.');
+  expect(screen.getByTestId('invoice-settle-failed')).toBeInTheDocument();
+});
+
+it('mounts bank pay only when the server offers it', () => {
+ const data=detail([]);
+ const view=render(<InvoiceDetailView detail={{...data,bankAutopay:{available:true,principal:'100.00',fee:'0.00',currency:'USD',consentText:'Authorize bank payment.',disclosureHash:'a'.repeat(64),methodStatus:null,methodLabel:null}}}/>);
+ fireEvent.click(screen.getByTestId('autopay-option-bank'));
+ expect(screen.getByTestId('autopay-bank-pay')).toBeTruthy();view.unmount();
+ render(<InvoiceDetailView detail={data}/>);expect(screen.queryByTestId('autopay-option-bank')).toBeNull();expect(screen.queryByTestId('autopay-bank-pay')).toBeNull();
+});
+
+describe('InvoiceDetailView — autopay payment waiting on the bank (off-session 3DS)', () => {
+  const waiting = () => ({ ...detail([line()]), collectionInProgress: { amount: '100.00', actionRequired: true } });
+
+  it('tells the truth instead of "no action needed" and offers the way out', () => {
+    render(<InvoiceDetailView detail={waiting()} />);
+    expect(screen.getByTestId('autopay-confirmation-notice').textContent).toContain('Your bank needs you to confirm this payment');
+    expect(screen.queryByTestId('invoice-collection-processing')).toBeNull();
+    expect(document.body.textContent).not.toContain('No action needed');
+    expect(screen.queryByTestId('invoice-pay-button')).toBeNull();
+  });
+
+  it('releases the off-session payment so the card Pay button works', async () => {
+    const { portalApi } = await import('@/lib/api');
+    const release = vi.spyOn(portalApi, 'releaseAutopayConfirmation').mockResolvedValue({ data: { outcome: 'released' }, statusCode: 200 });
+    const pay = vi.spyOn(portalApi, 'payInvoice').mockResolvedValue({ error: 'stop here', statusCode: 409 });
+    pay.mockClear();
+    render(<InvoiceDetailView detail={waiting()} />);
+    fireEvent.click(screen.getByTestId('autopay-confirmation-continue'));
+    await waitFor(() => expect(release).toHaveBeenCalledWith('inv-1'));
+    await waitFor(() => expect((screen.getByTestId('invoice-pay-button') as HTMLButtonElement).disabled).toBe(false));
+    expect(screen.queryByTestId('autopay-confirmation-notice')).toBeNull();
+    expect(screen.getByTestId('autopay-confirmation-released')).toHaveTextContent('Pay');
+    fireEvent.click(screen.getByTestId('invoice-pay-button'));
+    await waitFor(() => expect(pay).toHaveBeenCalled());
+  });
+});
+
+describe('InvoiceDetailView — paper and rail layout (visual QA 2026-10-05)', () => {
+  it('the payment rail sticks at lg from its grid item (V-4), and paper dates are long (V-27)', () => {
+    render(<InvoiceDetailView detail={detail([line()])} />);
+    const wrapper = screen.getByTestId('invoice-payment-panel').parentElement!;
+    expect(wrapper).toHaveClass('lg:sticky', 'lg:top-6', 'lg:self-start');
+    expect(screen.getByText('August 31, 2026')).toBeInTheDocument();
+  });
+  it('a long unbroken description wraps, and amounts never wrap (V-6)', () => {
+    const name = 'Firewall-renewal-for-https://very-long-unbroken-host-name.example.internal/path';
+    render(<InvoiceDetailView detail={detail([line({ name, lineTotal: '1234567.00', unitPrice: '1234567.00' })])} />);
+    expect(screen.getByText(name).closest('td')).toHaveClass('[overflow-wrap:anywhere]');
+  });
+});
+
+// #8604: work date under each line (entry mode) or a per-day header (day mode).
+describe('InvoiceDetailView line detail (#8604)', () => {
+  it('entry mode shows the work date under a dated line and none for an undated one', () => {
+    renderDetail([
+      line({ name: 'Dated', workDate: '2026-09-16' }),
+      line({ name: 'Undated', workDate: null }),
+    ]);
+    expect(screen.getByTestId('invoice-line-date-0').textContent).toBe('Sep 16, 2026');
+    expect(screen.queryByTestId('invoice-line-date-1')).toBeNull();
+  });
+
+  it('day mode renders ascending day headers with totals, no per-line dates, undated last', () => {
+    renderDetail([
+      line({ name: 'A', workDate: '2026-09-17', quantity: '1.00', lineTotal: '100.00' }),
+      line({ name: 'B', workDate: '2026-09-16', quantity: '1.50', lineTotal: '150.00' }),
+      line({ name: 'C', workDate: '2026-09-16', quantity: '0.50', lineTotal: '50.00' }),
+      line({ name: 'Part', workDate: null, lineTotal: '20.00' }),
+    ], 'day');
+    const h16 = screen.getByTestId('invoice-day-2026-09-16');
+    const h17 = screen.getByTestId('invoice-day-2026-09-17');
+    expect(h16.compareDocumentPosition(h17) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(h16.textContent).toContain('Sep 16, 2026');
+    expect(h16.textContent).toContain('2');
+    expect(h16.textContent).toContain('$200.00');
+    expect(screen.queryByTestId('invoice-line-date-0')).toBeNull();
+    expect(screen.queryByTestId('invoice-line-date-1')).toBeNull();
+    const part = screen.getByText('Part');
+    const a = screen.getByText('A');
+    expect(a.compareDocumentPosition(part) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(document.querySelectorAll('[data-testid^="invoice-day-"]')).toHaveLength(2);
+  });
+
+  it('default render carries no date or day markers', () => {
+    renderDetail([line({ name: 'Plain' })]);
+    expect(document.querySelectorAll('[data-testid^="invoice-line-date-"], [data-testid^="invoice-day-"]')).toHaveLength(0);
+  });
+
+  it('worked-vs-billed note renders when minutes differ and not when null', () => {
+    renderDetail([
+      line({ name: 'X', quantity: '1.00', workedMinutes: 30 }),
+      line({ name: 'Y', quantity: '1.00', workedMinutes: null }),
+    ]);
+    expect(screen.getByTestId('invoice-line-worked-vs-billed-0').textContent).toBe('0.50 h worked · 1.00 h billed');
+    expect(screen.queryByTestId('invoice-line-worked-vs-billed-1')).toBeNull();
   });
 });

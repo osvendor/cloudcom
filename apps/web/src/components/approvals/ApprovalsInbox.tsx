@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, Bot, Check, CheckCheck, Layers, Loader2, Search, ShieldCheck, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
-  AI_AGENT_KINDS,
+  AI_AGENT_ACTING_KINDS,
   APPROVAL_BATCH_MAX,
   type AiAgentGraduationDto,
   type AiAgentGraduationRowDto,
@@ -50,6 +50,8 @@ import {
   type RiskTier,
   type SortOrder,
 } from './approvalGrouping';
+import DiagnosticAccessApprovalDetails, { isDiagnosticAccessApproval } from './DiagnosticAccessApprovalDetails';
+import OperatorPlanApprovalCard, { isOperatorPlanApproval, isOperatorPlanReadable } from './OperatorPlanApprovalCard';
 
 const LIVE_REFETCH_DEBOUNCE_MS = 750;
 /** WS is only a nudge; polling is the guarantee. useEventStream gives up
@@ -71,7 +73,7 @@ const SERVER_PAGE_LIMIT_MAX = 50;
  *  30s poll without re-rendering the whole list every second. */
 const EXPIRY_TICK_MS = 10_000;
 /** Caps concurrent `GET /ai/agents/graduation` fan-out: each org issues up to
- *  AI_AGENT_KINDS.length (3) requests, so a batch of 5 orgs tops out at 15
+ *  AI_AGENT_ACTING_KINDS.length (4) requests, so a batch of 5 orgs tops out at 20
  *  concurrent requests regardless of how many distinct supervised orgs are on
  *  screen at once — see the graduation-queue comment near its refs. */
 const ALWAYS_ALLOW_ORG_BATCH_SIZE = 5;
@@ -133,7 +135,8 @@ function alwaysAllowOpKey(approval: PendingApproval): string | null {
   return approval.action !== null ? `${approval.actionToolName}:${approval.action}` : null;
 }
 
-/** One org's worth of graduation state, across every `AiAgentKind` that has
+/** One org's worth of graduation state, across every ACTING `AiAgentKind` (the
+ *  read-only, system-provisioned `research` kind has no actions to graduate) that has
  *  an active agent. Never throws — a failed or malformed response for one
  *  kind is skipped, because this affordance is additive and must never take
  *  the inbox (or even just Approve) down with it. */
@@ -141,7 +144,7 @@ async function fetchOrgGraduation(orgId: string): Promise<OrgGraduationInfo> {
   const eligible = new Map<string, AiAgentKind>();
   let policyDecideEnabled = false;
   await Promise.all(
-    AI_AGENT_KINDS.map(async (kind) => {
+    AI_AGENT_ACTING_KINDS.map(async (kind) => {
       try {
         const res = await fetchWithAuth(
           `/ai/agents/graduation?orgId=${encodeURIComponent(orgId)}&kind=${encodeURIComponent(kind)}`,
@@ -320,7 +323,7 @@ export default function ApprovalsInbox() {
   // Newly-discovered orgIds queue here and a single persistent worker drains
   // them ALWAYS_ALLOW_ORG_BATCH_SIZE at a time — this is what caps client fan-out
   // (a page with many distinct supervised orgs would otherwise fire
-  // AI_AGENT_KINDS.length requests per org all at once) and, because the worker
+  // AI_AGENT_ACTING_KINDS.length requests per org all at once) and, because the worker
   // is not tied to any one effect run's cleanup, a poll/WS-nudge re-render that
   // lands mid-fetch can never discard an in-flight org's result — the queue and
   // the "already requested" ref only ever grow.
@@ -1021,6 +1024,11 @@ export default function ApprovalsInbox() {
     // once the next poll removes it.
     const expired = isExpired(approval.expiresAt, now);
     const actionsDisabled = busy || expired;
+    // An operator_plan the card cannot render (malformed / zero effects) must
+    // not be approvable: the approver would be signing what they cannot read.
+    const approveDisabled =
+      actionsDisabled ||
+      (isOperatorPlanApproval(approval.actionToolName) && !isOperatorPlanReadable(approval.actionArguments));
     // W03 (#5612): only a run_script row fanned out from a proposal carries
     // this — every other tool keeps the plain risk-summary line.
     const proposalId =
@@ -1113,10 +1121,22 @@ export default function ApprovalsInbox() {
                 {t('targetDevice', { hostname: approval.targetDevice.hostname })}
               </p>
             )}
-            {approval.riskSummary && (
+            {isDiagnosticAccessApproval(approval.actionToolName) ? (
+              <DiagnosticAccessApprovalDetails args={approval.actionArguments} approvalId={approval.id} />
+            ) : approval.riskSummary && (
               <p className="mt-3 max-w-3xl text-sm text-foreground/80">
                 {approval.riskSummary}
               </p>
+            )}
+            {isOperatorPlanApproval(approval.actionToolName) && (
+              // Rendered INLINE, not behind a toggle like the script proposal:
+              // the script card fetches a body, this one is already in the
+              // arguments, and an approver must not be able to approve a
+              // multi-effect identity plan without the list on screen. Approve
+              // and deny stay on the existing buttons (no second mutation path).
+              <div data-testid={`approval-operator-plan-${approval.id}`}>
+                <OperatorPlanApprovalCard args={approval.actionArguments} />
+              </div>
             )}
             {proposalId && (
               <div className="mt-3">
@@ -1231,7 +1251,7 @@ export default function ApprovalsInbox() {
             <button
               type="button"
               onClick={() => void decide(approval, 'approve')}
-              disabled={actionsDisabled}
+              disabled={approveDisabled}
               // emerald-600 + white text is only ~3.8:1 (fails AA); emerald-700
               // clears 4.5:1 in both themes (this button carries no dark:
               // override — it is a solid fill, unaffected by page theme).
@@ -1249,7 +1269,7 @@ export default function ApprovalsInbox() {
               <button
                 type="button"
                 onClick={() => openAlwaysAllow(approval, alwaysAllow.opKey, alwaysAllow.kind)}
-                disabled={actionsDisabled}
+                disabled={approveDisabled}
                 className="inline-flex h-10 items-center gap-2 rounded-lg border border-emerald-600 px-3 text-sm font-medium text-emerald-700 transition-colors hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50 dark:text-emerald-300 dark:hover:bg-emerald-950/30"
                 data-testid={`approval-always-allow-${approval.id}`}
               >

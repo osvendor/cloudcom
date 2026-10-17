@@ -41,6 +41,7 @@ import {
   startIntentDenialCode,
   startIntentDenialMessage,
 } from '../services/remoteDesktopStartIntent';
+import { releaseDesktopStartInFlight } from '../services/desktopStartInFlight';
 import { webrtcOfferSchema } from './remote/schemas';
 import { sendCommandToAgent, isAgentConnected } from './agentWs';
 import { checkRemoteAccess, resolveDesktopSessionPolicy } from '../services/remoteAccessPolicy';
@@ -1030,7 +1031,7 @@ function createDesktopWsHandlers(
         const streamPrompt = streamPromptDecision.prompt;
 
         // Update only a still-open row, under the same row-locked start-intent
-        // commit the WebRTC paths use (SEC-038 W02). A prior owner may have made
+        // commit the WebRTC paths use. A prior owner may have made
         // the row terminal after validation but before this exact lease was
         // bound, and the generation orders this start against that decision.
         const streamStartCommandId = createDesktopStartCommandId(sessionId);
@@ -1983,7 +1984,7 @@ export function createDesktopWsRoutes(
 
       const promptMode = prompt?.mode === 'consent' || prompt?.mode === 'notify' ? prompt.mode : 'off';
       const startCommandId = createDesktopStartCommandId(sessionId);
-      // Row-locked start decision (SEC-038 W02): refuses a session whose
+      // Row-locked start decision: refuses a session whose
       // terminal intent has already committed, and bumps the generation the
       // agent fences on.
       const startIntent = await withSystemDbAccessContext(() =>
@@ -2008,69 +2009,88 @@ export function createDesktopWsRoutes(
             code: 'SESSION_TERMINAL',
           }, 409);
         }
+        if (startIntent.reason === 'start_in_flight') {
+          // #8947: a concurrent second offer for a start still waiting on its
+          // answer. Refused rather than superseding it: superseding orphaned
+          // the first peer and started a second capture on the agent.
+          return c.json({
+            error: startIntentDenialMessage(startIntent.reason),
+            code: startIntentDenialCode(startIntent.reason),
+          }, 409);
+        }
         return c.json({ error: 'Session state changed while submitting offer' }, 409);
       }
 
-      const startGeneration = startIntent.generation;
+      // Every exit below that does not hand the start to the agent — a refusal,
+      // an unreachable agent, or a throw — drops this start's in-flight marker,
+      // so the viewer's retry is not refused as a duplicate of a start the
+      // agent never received (#8947).
+      let dispatched = false;
+      try {
+        const startGeneration = startIntent.generation;
 
-      await logSessionAudit(
-        'session_offer_submitted',
-        access.user.id,
-        access.device.orgId,
-        {
-          sessionId,
-          type: access.session.type,
-          via: 'viewer_token',
-          startCommandId,
-          promptMode,
-          startGeneration: formatDesktopGeneration(startGeneration),
-        },
-        getTrustedClientIp(c, 'unknown')
-      );
-
-      // Pre-publication re-read — see the twin check on the JWT offer route.
-      const stillCurrent = await withSystemDbAccessContext(() =>
-        assertDesktopStartIntentCurrent(sessionId, startGeneration)
-      );
-      if (!stillCurrent.ok) {
-        return c.json({
-          error: 'This session was ended while the stream was starting',
-          code: startIntentDenialCode(stillCurrent.reason),
-        }, 409);
-      }
-
-      const agentReachable = sendCommandToAgent(access.device.agentId, {
-        id: startCommandId,
-        type: 'start_desktop',
-        payload: {
-          sessionId,
-          startGeneration: formatDesktopGeneration(startGeneration),
-          offer: data.offer,
-          iceServers: getIceServers({
+        await logSessionAudit(
+          'session_offer_submitted',
+          access.user.id,
+          access.device.orgId,
+          {
             sessionId,
-            userId: access.session.userId,
-            deviceId: access.session.deviceId,
-          }),
-          clipboard: desktopPolicy.clipboard,
-          idleTimeoutMinutes: desktopPolicy.idleTimeoutMinutes,
-          maxSessionDurationHours: desktopPolicy.maxSessionDurationHours,
-          revocationLease: offerLease.lease,
-          ...(data.displayIndex != null ? { displayIndex: data.displayIndex } : {}),
-          ...(data.targetSessionId != null ? { targetSessionId: data.targetSessionId } : {}),
-          ...(prompt ? { prompt } : {})
+            type: access.session.type,
+            via: 'viewer_token',
+            startCommandId,
+            promptMode,
+            startGeneration: formatDesktopGeneration(startGeneration),
+          },
+          getTrustedClientIp(c, 'unknown')
+        );
+
+        // Pre-publication re-read — see the twin check on the JWT offer route.
+        const stillCurrent = await withSystemDbAccessContext(() =>
+          assertDesktopStartIntentCurrent(sessionId, startGeneration)
+        );
+        if (!stillCurrent.ok) {
+          return c.json({
+            error: 'This session was ended while the stream was starting',
+            code: startIntentDenialCode(stillCurrent.reason),
+          }, 409);
         }
-      });
 
-      if (!agentReachable) {
-        console.warn(`[desktop-ws] Agent ${access.device.agentId} not connected, cannot send start_desktop for session ${sessionId}`);
-        return c.json({ error: 'Agent is not currently connected. Please verify the device is online and try again.' }, 502);
+        const agentReachable = sendCommandToAgent(access.device.agentId, {
+          id: startCommandId,
+          type: 'start_desktop',
+          payload: {
+            sessionId,
+            startGeneration: formatDesktopGeneration(startGeneration),
+            offer: data.offer,
+            iceServers: getIceServers({
+              sessionId,
+              userId: access.session.userId,
+              deviceId: access.session.deviceId,
+            }),
+            clipboard: desktopPolicy.clipboard,
+            idleTimeoutMinutes: desktopPolicy.idleTimeoutMinutes,
+            maxSessionDurationHours: desktopPolicy.maxSessionDurationHours,
+            revocationLease: offerLease.lease,
+            ...(data.displayIndex != null ? { displayIndex: data.displayIndex } : {}),
+            ...(data.targetSessionId != null ? { targetSessionId: data.targetSessionId } : {}),
+            ...(prompt ? { prompt } : {})
+          }
+        });
+
+        if (!agentReachable) {
+          console.warn(`[desktop-ws] Agent ${access.device.agentId} not connected, cannot send start_desktop for session ${sessionId}`);
+          return c.json({ error: 'Agent is not currently connected. Please verify the device is online and try again.' }, 502);
+        }
+        dispatched = true;
+
+        return c.json({
+          id: sessionId,
+          status: 'connecting',
+          webrtcOffer: data.offer,
+        });
+      } finally {
+        if (!dispatched) await releaseDesktopStartInFlight(sessionId, startCommandId);
       }
-
-      return c.json({
-        id: sessionId,
-        status: 'connecting',
-        webrtcOffer: data.offer,
-      });
     }
   );
 
@@ -2131,7 +2151,7 @@ export function createDesktopWsRoutes(
         return c.json({ error: access.error }, access.status);
       }
 
-      // SEC-038 W06: a terminal decision (server End, teardown, sweep, lease
+      // A terminal decision (server End, teardown, sweep, lease
       // revocation) commits before the agent acknowledges the stop, leaving
       // the row with terminationPhase='pending'. The viewer's answer poll
       // must never connect on a stale answer from such a row, so the answer

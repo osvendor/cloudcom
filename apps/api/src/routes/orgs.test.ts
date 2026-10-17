@@ -10,10 +10,30 @@ vi.mock('../services/mfaPolicyActivation', async (importOriginal) => ({
   countMfaPolicyLockouts: vi.fn().mockResolvedValue(0),
 }));
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+const trustServing = vi.hoisted(() => ({ scheduleServingRefreshForPartner: vi.fn() }));
+vi.mock('../services/trustPage/servingSet', () => trustServing);
 import { Hono } from 'hono';
 import { orgRoutes, createOrganizationSchema, updateOrganizationSchema } from './orgs';
+import { invalidateAgentOrgSettingsCaches } from '../services/agentOrgSettingsCache';
+
+beforeEach(() => {
+  defaultAssigneeSettingsErrorMock.mockReset();
+  defaultAssigneeSettingsErrorMock.mockResolvedValue(null);
+  listAssignableMock.mockReset();
+});
 
 vi.mock('../services', () => ({}));
+
+const { isAssignableInboundDefaultUserMock, listAssignableMock, defaultAssigneeSettingsErrorMock } = vi.hoisted(() => ({
+  isAssignableInboundDefaultUserMock: vi.fn(),
+  listAssignableMock: vi.fn(),
+  defaultAssigneeSettingsErrorMock: vi.fn(),
+}));
+vi.mock('../services/inboundEmail/defaultAssigneeEligibility', () => ({
+  isAssignableInboundDefaultUser: isAssignableInboundDefaultUserMock,
+  listAssignableInboundDefaultUsers: listAssignableMock,
+  defaultAssigneeSettingsError: defaultAssigneeSettingsErrorMock,
+}));
 
 vi.mock('../services/sentry', () => ({
   captureException: vi.fn(),
@@ -186,6 +206,11 @@ vi.mock('../services/tenantOffboarding', async (importOriginal) => ({
 vi.mock('../services/monitors/builtInMonitors', () => ({
   ensureBuiltInMonitorsForPartner: vi.fn(async () => ({ provisioned: true, monitorIds: [] })),
   ensureBuiltInMonitorsForAllPartners: vi.fn(async () => ({ provisioned: 0, skipped: 0, failed: 0 })),
+}));
+// #8053 — org/partner settings writes invalidate the agent heartbeat's per-org
+// caches; the cache itself is covered in hotPathCache.test.ts.
+vi.mock('../services/agentOrgSettingsCache', () => ({
+  invalidateAgentOrgSettingsCaches: vi.fn(),
 }));
 vi.mock('../db', () => ({
   db: {
@@ -616,6 +641,23 @@ describe('org routes', () => {
   });
 
   describe('POST /orgs/partners', () => {
+    it('refuses a default inbound assignee on a partner that has no members yet', async () => {
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) }) })
+      } as any);
+      defaultAssigneeSettingsErrorMock.mockResolvedValue('nope');
+
+      const res = await app.request('/orgs/partners', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Partner', slug: 'newp', settings: { ticketing: { inbound: { defaultAssigneeUserId: '44444444-4444-4444-8444-444444444444' } } } })
+      });
+
+      expect(res.status).toBe(400);
+      expect(defaultAssigneeSettingsErrorMock.mock.calls[0]![1]).toBeNull();
+      expect(db.transaction).not.toHaveBeenCalled();
+    });
+
     it("returns 409 when the new slug collides with an existing partner's inbound local part", async () => {
       vi.mocked(db.select).mockReturnValue({
         from: vi.fn().mockReturnValue({
@@ -635,7 +677,7 @@ describe('org routes', () => {
       });
 
       expect(res.status).toBe(409);
-      expect(await res.json()).toEqual({ error: 'That partner identifier is already in use' });
+      expect(await res.json()).toEqual({ error: 'That partner identifier is already in use', code: 'CONFLICT' });
       expect(db.transaction).not.toHaveBeenCalled();
     });
 
@@ -900,6 +942,30 @@ describe('org routes', () => {
   });
 
   describe('PATCH /orgs/partners/:id', () => {
+    it('refuses a default inbound assignee the partner cannot assign (free-form settings)', async () => {
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'partner-1', settings: { ticketing: { inbound: { defaultAssigneeUserId: null } } } }])
+          })
+        })
+      } as any);
+      defaultAssigneeSettingsErrorMock.mockResolvedValue('nope');
+      const settings = { ticketing: { inbound: { defaultAssigneeUserId: '44444444-4444-4444-8444-444444444444' } } };
+
+      const res = await app.request('/orgs/partners/partner-1', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ settings })
+      });
+
+      expect(res.status).toBe(400);
+      expect((await res.json()).code).toBe('DEFAULT_ASSIGNEE_NOT_ASSIGNABLE');
+      // Checked against THIS partner.
+      expect(defaultAssigneeSettingsErrorMock).toHaveBeenCalledWith(expect.objectContaining(settings), 'partner-1');
+      expect(db.update).not.toHaveBeenCalled();
+    });
+
     it('should reject empty updates', async () => {
       const res = await app.request('/orgs/partners/partner-1', {
         method: 'PATCH',
@@ -931,6 +997,8 @@ describe('org routes', () => {
       // #3996 — a name-only patch ends no drain: no tenant-row lock, no
       // device enumeration. See the org-side twin of this assertion.
       expect(abortPartnerOffboardingAroundStatusChange).not.toHaveBeenCalled();
+      // #8053 — no settings change, so the agent per-org caches are kept.
+      expect(invalidateAgentOrgSettingsCaches).not.toHaveBeenCalled();
     });
 
     it("returns 409 when the updated slug collides with another partner's inbound local part", async () => {
@@ -949,7 +1017,7 @@ describe('org routes', () => {
       });
 
       expect(res.status).toBe(409);
-      expect(await res.json()).toEqual({ error: 'That partner identifier is already in use' });
+      expect(await res.json()).toEqual({ error: 'That partner identifier is already in use', code: 'CONFLICT' });
       expect(db.update).not.toHaveBeenCalled();
     });
 
@@ -991,6 +1059,8 @@ describe('org routes', () => {
       expect(res.status).toBe(200);
       expect(capturedUpdateData.timezone).toBe('America/New_York');
       expect(capturedUpdateData.settings.timezone).toBe('America/New_York');
+      // #8053 — a partner settings write feeds every org: all per-org caches drop.
+      expect(invalidateAgentOrgSettingsCaches).toHaveBeenCalledWith();
     });
 
     // #1318 cosmetic: a lowercase 'utc' settings value canonicalizes to the
@@ -1514,6 +1584,65 @@ describe('org routes', () => {
       // The key guarantee is that the db write does NOT carry aiForOfficeEnabled.
       expect(res.status).toBe(200);
       expect(capturedUpdateData?.aiForOfficeEnabled).toBeUndefined();
+      // #8053 — a partner write feeds every org: all per-org caches drop.
+      expect(invalidateAgentOrgSettingsCaches).toHaveBeenCalledWith();
+    });
+
+    // trustPageUnbranded — operator-only flag, mirrors aiForOfficeEnabled.
+    it('passes trustPageUnbranded: true through to the db update payload (system scope)', async () => {
+      let capturedUpdateData: any;
+      vi.mocked(db.update).mockReturnValue({
+        set: vi.fn().mockImplementation((data: any) => {
+          capturedUpdateData = data;
+          return { where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ id: 'partner-1', name: 'P', trustPageUnbranded: true }]) }) };
+        })
+      } as any);
+      const res = await app.request('/orgs/partners/partner-1', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trustPageUnbranded: true })
+      });
+      expect(res.status).toBe(200);
+      expect(capturedUpdateData.trustPageUnbranded).toBe(true);
+    });
+
+    it('rejects a non-boolean trustPageUnbranded value with 400 (schema guard)', async () => {
+      const setSpy = vi.fn();
+      vi.mocked(db.update).mockReturnValue({ set: setSpy } as any);
+      const res = await app.request('/orgs/partners/partner-1', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trustPageUnbranded: 'yes' })
+      });
+      expect(res.status).toBe(400);
+      expect(setSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not let a partner-scope user set trustPageUnbranded via /partners/me (schema isolation)', async () => {
+      setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+      let capturedUpdateData: any;
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            orderBy: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) }),
+            limit: vi.fn().mockResolvedValue([{ id: 'partner-123', name: 'P', settings: {} }])
+          })
+        })
+      } as any);
+      vi.mocked(db.update).mockReturnValue({
+        set: vi.fn().mockImplementation((data: any) => {
+          capturedUpdateData = data;
+          return { where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ id: 'partner-123', name: 'P', settings: {} }]) }) };
+        })
+      } as any);
+      const res = await app.request('/orgs/partners/me', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ trustPageUnbranded: true })
+      });
+      // Zod strips the unknown key (same as aiForOfficeEnabled): 200, but never written.
+      expect(res.status).toBe(200);
+      expect(capturedUpdateData?.trustPageUnbranded).toBeUndefined();
     });
 
     describe('contact.website scheme allowlist', () => {
@@ -1792,6 +1921,99 @@ describe('org routes', () => {
       expect(getCaptured().settings.ticketing.inbound.defaultTriageOrgId).toBe(orgId);
     });
 
+    // defaultAssigneeUserId: a CHANGED value must pass isAssignableInboundDefaultUser
+    // (an active member of this partner with ticket access; its own real-Postgres
+    // suite covers the predicate). The route's job is to call it with the
+    // caller's partner and refuse before writing.
+    describe('defaultAssigneeUserId', () => {
+      const USER = '44444444-4444-4444-8444-444444444444';
+      beforeEach(() => {
+        isAssignableInboundDefaultUserMock.mockReset();
+      });
+
+      it('rejects a user the partner cannot assign (400, nothing written)', async () => {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        mockCurrentPartnerSelect({ ticketing: { inbound: { enabled: true } } });
+        isAssignableInboundDefaultUserMock.mockResolvedValue(false);
+        const getCaptured = mockUpdateCapture();
+
+        const res = await patchMe({ settings: { ticketing: { inbound: { enabled: true, defaultAssigneeUserId: USER } } } });
+
+        expect(res.status).toBe(400);
+        expect((await res.json()).code).toBe('DEFAULT_ASSIGNEE_NOT_ASSIGNABLE');
+        expect(isAssignableInboundDefaultUserMock).toHaveBeenCalledWith(USER, 'partner-123');
+        expect(getCaptured()).toBeUndefined();
+      });
+
+      it('stores an assignable user and reads it back in the written settings (200)', async () => {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        mockCurrentPartnerSelect({ ticketing: { inbound: { enabled: true } } });
+        isAssignableInboundDefaultUserMock.mockResolvedValue(true);
+        const getCaptured = mockUpdateCapture();
+
+        const res = await patchMe({ settings: { ticketing: { inbound: { enabled: true, defaultAssigneeUserId: USER } } } });
+
+        expect(res.status).toBe(200);
+        expect(getCaptured().settings.ticketing.inbound.defaultAssigneeUserId).toBe(USER);
+      });
+
+      it('re-checks an unchanged value on every save: a user who stopped qualifying is refused', async () => {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        mockCurrentPartnerSelect({ ticketing: { inbound: { enabled: true, defaultAssigneeUserId: USER } } });
+        isAssignableInboundDefaultUserMock.mockResolvedValue(false);
+        const getCaptured = mockUpdateCapture();
+
+        const res = await patchMe({ settings: { ticketing: { inbound: { enabled: false, defaultAssigneeUserId: USER } } } });
+
+        expect(res.status).toBe(400);
+        expect(isAssignableInboundDefaultUserMock).toHaveBeenCalledWith(USER, 'partner-123');
+        expect(getCaptured()).toBeUndefined();
+      });
+
+      it('clears the default with null without a check', async () => {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        mockCurrentPartnerSelect({ ticketing: { inbound: { enabled: true, defaultAssigneeUserId: USER } } });
+        const getCaptured = mockUpdateCapture();
+
+        const res = await patchMe({ settings: { ticketing: { inbound: { enabled: true, defaultAssigneeUserId: null } } } });
+
+        expect(res.status).toBe(200);
+        expect(isAssignableInboundDefaultUserMock).not.toHaveBeenCalled();
+        expect(getCaptured().settings.ticketing.inbound.defaultAssigneeUserId).toBeNull();
+      });
+
+      it('lists default-assignee candidates for a full-access partner admin', async () => {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        listAssignableMock.mockResolvedValue([{ id: USER, name: 'Tess', email: 't@msp.example' }]);
+
+        const res = await app.request('/orgs/partners/me/default-assignee-candidates');
+
+        expect(res.status).toBe(200);
+        expect((await res.json()).data).toEqual([{ id: USER, name: 'Tess', email: 't@msp.example' }]);
+        expect(listAssignableMock).toHaveBeenCalledWith('partner-123');
+      });
+
+      it('refuses the candidate list to a partner user without full partner access (403)', async () => {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123', partnerOrgAccess: 'selected' });
+
+        const res = await app.request('/orgs/partners/me/default-assignee-candidates');
+
+        expect(res.status).toBe(403);
+        expect(listAssignableMock).not.toHaveBeenCalled();
+      });
+
+      it('rejects a value that is not a uuid at the schema (400)', async () => {
+        setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+        mockCurrentPartnerSelect({ ticketing: { inbound: { enabled: true } } });
+        const getCaptured = mockUpdateCapture();
+
+        const res = await patchMe({ settings: { ticketing: { inbound: { enabled: true, defaultAssigneeUserId: 'bob' } } } });
+
+        expect(res.status).toBe(400);
+        expect(getCaptured()).toBeUndefined();
+      });
+    });
+
     it('skips the org check when defaultTriageOrgId is null (200)', async () => {
       setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
       // Only the current-partner select should be consumed; no org check select.
@@ -1887,9 +2109,36 @@ describe('org routes', () => {
       const res = await patchMe({ settings: { ml: { anomalies: { enabled: 'yes' } } } });
       expect(res.status).toBe(400);
     });
+
+    it('persists settings.networkProxy.dedicatedTunnelOrigin and rejects a non-boolean value (#8155)', async () => {
+      setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+      mockCurrentPartnerSelect({ ml: { rca: { enabled: true } } });
+      const getCaptured = mockUpdateCapture();
+
+      const ok = await patchMe({ settings: { networkProxy: { dedicatedTunnelOrigin: true } } });
+      expect(ok.status).toBe(200);
+      expect(getCaptured().settings.networkProxy).toEqual({ dedicatedTunnelOrigin: true });
+
+      const bad = await patchMe({ settings: { networkProxy: { dedicatedTunnelOrigin: 'yes' } } });
+      expect(bad.status).toBe(400);
+    });
   });
 
   describe('PATCH /orgs/partners/me — emailTemplates', () => {
+
+    it.each(['payment_reminder', 'payment_overdue'])('accepts %s', async (id) => {
+      setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+      mockCurrentPartnerSelect({});
+      const captured = mockUpdateCapture();
+      const fields = {
+        subject: 'Invoice {{invoice_number}}', heading: 'Payment reminder',
+        buttonLabel: 'Pay invoice', html: '<p>{{amount_due}} by {{due_date}}</p>',
+      };
+      const response = await patchMe({ settings: { emailTemplates: { [id]: fields } } });
+      expect(response.status).toBe(200);
+      expect(captured().settings.emailTemplates[id]).toEqual(fields);
+    });
+
     function mockCurrentPartnerSelect(settings: Record<string, unknown>) {
       vi.mocked(db.select).mockReturnValue({
         from: vi.fn().mockReturnValue({
@@ -1953,6 +2202,15 @@ describe('org routes', () => {
 
       expect(res.status).toBe(200);
       expect(getCaptured().settings.emailTemplates.quote_send).toEqual(fourFields);
+    });
+
+    it.each(['autopay_request', 'autopay_enrolled', 'autopay_stopped', 'card_expiring'])('accepts %s as a template id', async (id) => {
+      setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+      mockCurrentPartnerSelect({});
+      const getCaptured = mockUpdateCapture();
+      const res = await patchMe({ settings: { emailTemplates: { [id]: fourFields } } });
+      expect(res.status).toBe(200);
+      expect(getCaptured().settings.emailTemplates[id]).toEqual(fourFields);
     });
 
     it('rejects an unknown template id with 400 and never writes', async () => {
@@ -2464,6 +2722,63 @@ describe('org routes', () => {
       const written = getCaptured().settings.remoteAccessProviders;
       expect(written.defaultProviderId).toBe('mesh');
       expect(written.providers.map((p: any) => p.id)).toEqual(['rustdesk', 'mesh']);
+    });
+
+    // A kept (masked) launcher password must not follow the launcher to a new
+    // URL host: the same origin binding the log-forwarding credentials have.
+    describe('launcher password bound to the urlTemplate host', () => {
+      const storedTemplate = 'https://acme.screenconnect.com/Host#Access///{id}/Join';
+      function mockStoredPartner() {
+        vi.mocked(db.select).mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              orderBy: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) }),
+              limit: vi.fn().mockResolvedValue([{
+                id: 'partner-123',
+                name: 'P',
+                settings: { remoteAccessProviders: { providers: [provider('sc', { urlTemplate: storedTemplate, password: 'stored-pw' })] } },
+              }]),
+            }),
+          }),
+        } as any);
+      }
+
+      it('rejects a masked password submitted with a changed launcher host', async () => {
+        mockStoredPartner();
+        const setSpy = vi.fn();
+        vi.mocked(db.update).mockReturnValue({ set: setSpy } as any);
+
+        const res = await patchMe({ settings: { remoteAccessProviders: {
+          providers: [provider('sc', { urlTemplate: 'https://other.example.com/Host#Access///{id}/Join', password: '********' })],
+        } } });
+
+        expect(res.status).toBe(400);
+        expect(JSON.stringify(await res.json())).toContain('re-enter');
+        expect(setSpy).not.toHaveBeenCalled();
+      });
+
+      it('keeps the stored password when the launcher host is unchanged', async () => {
+        mockStoredPartner();
+        const getCaptured = mockUpdateCapture();
+
+        const res = await patchMe({ settings: { remoteAccessProviders: {
+          providers: [provider('sc', { urlTemplate: `${storedTemplate}?v=2`, password: '********' })],
+        } } });
+
+        expect(res.status).toBe(200);
+        expect(getCaptured().settings.remoteAccessProviders.providers[0].password).not.toBe('********');
+      });
+
+      it('accepts a changed launcher host when the password is re-entered', async () => {
+        mockStoredPartner();
+        mockUpdateCapture();
+
+        const res = await patchMe({ settings: { remoteAccessProviders: {
+          providers: [provider('sc', { urlTemplate: 'https://other.example.com/Host#Access///{id}/Join', password: 'new-pw' })],
+        } } });
+
+        expect(res.status).toBe(200);
+      });
     });
   });
 
@@ -3695,7 +4010,7 @@ describe('org routes', () => {
       const res = await app.request('/orgs/organizations/99999999-9999-9999-9999-999999999999');
 
       expect(res.status).toBe(404);
-      expect(await res.json()).toEqual({ error: 'Organization not found' });
+      expect(await res.json()).toEqual({ error: 'Organization not found', code: 'NOT_FOUND' });
       // The org row is never queried in the caller's own context. Since Wave 4
       // the handler does probe for an ARCHIVED org first — that probe is
       // hard-pinned to the caller's own partner and returns null here, so the
@@ -3830,7 +4145,7 @@ describe('org routes', () => {
       const res = await app.request('/orgs/organizations/not-a-uuid');
 
       expect(res.status).toBe(404);
-      expect(await res.json()).toEqual({ error: 'Organization not found' });
+      expect(await res.json()).toEqual({ error: 'Organization not found', code: 'NOT_FOUND' });
       expect(loadArchivedOrg).not.toHaveBeenCalled();
       expect(db.select).not.toHaveBeenCalled();
     });
@@ -3892,6 +4207,8 @@ describe('org routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.name).toBe('Updated');
+      // #8053 — the org's agents re-read its update policy / topology flags.
+      expect(invalidateAgentOrgSettingsCaches).toHaveBeenCalledWith('org-1');
     });
 
     // ── lifecycle-internal settings keys (review r3) ───────────────────────
@@ -4743,7 +5060,7 @@ describe('org routes', () => {
         const res = await patchOrg('org-draining', { status: 'active' });
 
         expect(res.status).toBe(404);
-        expect(await res.json()).toEqual({ error: 'Organization not found' });
+        expect(await res.json()).toEqual({ error: 'Organization not found', code: 'NOT_FOUND' });
         expect(db.update).not.toHaveBeenCalled();
         expect(restoreOrganizationTenantAccess).not.toHaveBeenCalled();
       });
@@ -4833,7 +5150,7 @@ describe('org routes', () => {
         const res = await app.request(`/orgs/organizations/${suspendedOrgId}`);
 
         expect(res.status).toBe(404);
-        expect(await res.json()).toEqual({ error: 'Organization not found' });
+        expect(await res.json()).toEqual({ error: 'Organization not found', code: 'NOT_FOUND' });
         expect(db.select).not.toHaveBeenCalled();
         // Wave 4's archived probe is the only extra lookup, and it is scoped to
         // ARCHIVED orgs of the caller's own partner — a SUSPENDED org resolves
@@ -5393,6 +5710,54 @@ describe('org routes', () => {
       .mockReturnValueOnce(mockSiteDeviceCounts([{ siteId: 'site-1', count: 4 }]));
   };
 
+  // Ruling 26 (I11): a slug or status change can make public trust pages appear or vanish; the serving
+  // set (Redis admission filter) is refreshed for the partner after the write commits.
+  describe('trust page serving-set refresh on slug/status changes', () => {
+    const updateReturning = (row: Record<string, unknown>) => vi.mocked(db.update).mockReturnValue({
+      set: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([row]) }) }),
+    } as any);
+    const req = (path: string, method: string, body?: unknown) => app.request(path, {
+      method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body),
+    });
+
+    it('org PATCH with a status change schedules a refresh for the org\'s partner', async () => {
+      setAuthContext({ scope: 'system', partnerId: null });
+      updateReturning({ id: 'org-1', name: 'O', status: 'suspended', partnerId: 'partner-9' });
+      expect((await req('/orgs/organizations/org-1', 'PATCH', { status: 'suspended' })).status).toBe(200);
+      expect(trustServing.scheduleServingRefreshForPartner).toHaveBeenCalledWith('partner-9', 'organization.update');
+    });
+    it('org PATCH of the name only does not touch the serving set', async () => {
+      setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+      updateReturning({ id: 'org-1', name: 'Updated', partnerId: 'partner-123' });
+      expect((await req('/orgs/organizations/org-1', 'PATCH', { name: 'Updated' })).status).toBe(200);
+      expect(trustServing.scheduleServingRefreshForPartner).not.toHaveBeenCalled();
+    });
+    it('org DELETE schedules a refresh', async () => {
+      setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+      updateReturning({ id: 'org-1', partnerId: 'partner-123' });
+      expect((await req('/orgs/organizations/org-1', 'DELETE')).status).toBe(200);
+      expect(trustServing.scheduleServingRefreshForPartner).toHaveBeenCalledWith('partner-123', 'organization.delete');
+    });
+    it.each([
+      [{ slug: 'northwind-it' }],
+      [{ status: 'suspended' }],
+    ])('partner PATCH %j schedules a refresh for that partner', async (body) => {
+      updateReturning({ id: 'partner-1', name: 'P', settings: {}, ...body });
+      expect((await req('/orgs/partners/partner-1', 'PATCH', body)).status).toBe(200);
+      expect(trustServing.scheduleServingRefreshForPartner).toHaveBeenCalledWith('partner-1', 'partner.update');
+    });
+    it('partner PATCH of the name only does not touch the serving set', async () => {
+      updateReturning({ id: 'partner-1', name: 'Updated' });
+      expect((await req('/orgs/partners/partner-1', 'PATCH', { name: 'Updated' })).status).toBe(200);
+      expect(trustServing.scheduleServingRefreshForPartner).not.toHaveBeenCalled();
+    });
+    it('partner DELETE schedules a refresh', async () => {
+      updateReturning({ id: 'partner-1' });
+      expect((await req('/orgs/partners/partner-1', 'DELETE')).status).toBe(200);
+      expect(trustServing.scheduleServingRefreshForPartner).toHaveBeenCalledWith('partner-1', 'partner.delete');
+    });
+  });
+
   describe('GET /orgs/sites', () => {
     // The list also runs a 4th grouped query for removedDeviceCount (#7471);
     // default it to "no removed devices" so count/page mocks stay focused.
@@ -5624,6 +5989,44 @@ describe('org routes', () => {
       expect(body.data).toEqual([]);
       expect(body.pagination.total).toBe(0);
       expect(db.select).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /orgs/sites/:id/location mount', () => {
+    it('is reachable under /orgs and sits behind authMiddleware (401 when unauthenticated)', async () => {
+      vi.mocked(authMiddleware).mockImplementation((c: any) => c.json({ error: 'Unauthorized' }, 401));
+      const res = await app.request('/orgs/sites/33333333-3333-4333-8333-333333333333/location', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ latitude: 1, longitude: 2 })
+      });
+      expect(res.status).toBe(401);
+    });
+  });
+
+  describe('POST /orgs/sites location columns', () => {
+    it('strips latitude/longitude from a create body (no unstamped pin)', async () => {
+      setAuthContext({ scope: 'system' });
+      const values = vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ id: 'site-new', name: 'N' }]) });
+      vi.mocked(db.insert).mockReturnValue({ values } as any);
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: '11111111-1111-1111-1111-111111111111', partnerId: 'partner-123' }])
+          })
+        })
+      } as any);
+      await app.request('/orgs/sites', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ orgId: '11111111-1111-1111-1111-111111111111', name: 'N', latitude: 1, longitude: 2, geofenceRadiusM: 100 })
+      });
+      expect(values).toHaveBeenCalled();
+      for (const call of values.mock.calls as any[][]) {
+        expect(call[0]).not.toHaveProperty('latitude');
+        expect(call[0]).not.toHaveProperty('longitude');
+        expect(call[0]).not.toHaveProperty('geofenceRadiusM');
+      }
     });
   });
 
@@ -5914,6 +6317,73 @@ describe('org routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.name).toBe('Updated');
+    });
+
+    describe('location fields', () => {
+      const ORG_ID = '11111111-1111-1111-1111-111111111111';
+      const patchSite = (body: unknown) => app.request('/orgs/sites/site-1', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const arrange = () => {
+        setAuthContext({ scope: 'organization', orgId: ORG_ID });
+        vi.mocked(db.select).mockReturnValue({
+          from: vi.fn().mockReturnValue({
+            where: vi.fn().mockReturnValue({
+              limit: vi.fn().mockResolvedValue([{ id: 'site-1', orgId: ORG_ID }])
+            })
+          })
+        } as any);
+        const set = vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([{ id: 'site-1', name: 'S' }])
+          })
+        });
+        vi.mocked(db.update).mockReturnValue({ set } as any);
+        return set;
+      };
+
+      it('stamps location_source=manual when lat/lng are set', async () => {
+        const set = arrange();
+        const res = await patchSite({ latitude: 40.5, longitude: -75.5, geofenceRadiusM: 300 });
+        expect(res.status).toBe(200);
+        const written = (set.mock.calls[0] as any[])[0];
+        expect(written).toMatchObject({
+          latitude: 40.5, longitude: -75.5, geofenceRadiusM: 300,
+          locationSource: 'manual', locationSetBy: 'user-123'
+        });
+        expect(written.locationSetAt).toBeInstanceOf(Date);
+      });
+
+      it('clearing lat+lng nulls source/setBy/setAt', async () => {
+        const set = arrange();
+        const res = await patchSite({ latitude: null, longitude: null });
+        expect(res.status).toBe(200);
+        expect((set.mock.calls[0] as any[])[0]).toMatchObject({
+          latitude: null, longitude: null,
+          locationSource: null, locationSetBy: null, locationSetAt: null
+        });
+      });
+
+      it('does not stamp location columns on an unrelated edit', async () => {
+        const set = arrange();
+        await patchSite({ name: 'Renamed' });
+        const written = (set.mock.calls[0] as any[])[0];
+        expect('locationSource' in written).toBe(false);
+        expect('latitude' in written).toBe(false);
+      });
+
+      it('400 when only latitude is sent', async () => {
+        const set = arrange();
+        expect((await patchSite({ latitude: 40 })).status).toBe(400);
+        expect(set).not.toHaveBeenCalled();
+      });
+
+      it('400 on out-of-range coordinates', async () => {
+        arrange();
+        expect((await patchSite({ latitude: 95, longitude: 0 })).status).toBe(400);
+      });
     });
 
     it('rejects an invalid IANA timezone on update', async () => {
@@ -8020,7 +8490,7 @@ describe('org routes', () => {
         });
 
         expect(res.status).toBe(403);
-        expect(await res.json()).toEqual({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE });
+        expect(await res.json()).toEqual({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE, code: 'ACCESS_DENIED' });
         expect(orgImportMocks.previewOrgImport).not.toHaveBeenCalled();
         expect(orgImportMocks.commitOrgImport).not.toHaveBeenCalled();
       },
@@ -8386,6 +8856,90 @@ describe('org routes', () => {
 
       expect(res.status).toBe(200);
       expect(lockReads).not.toHaveBeenCalled();
+    });
+  });
+
+  // #6111 — Session Timeout ceiling is 720 min (12 h) at every write path, and
+  // a stored value above it (written before the cap existed) reads back clamped.
+  describe('security.sessionTimeout ceiling (#6111)', () => {
+    function primeSelect(partnerSettings: Record<string, unknown> = {}) {
+      const whereRet: any = Promise.resolve([{ partnerId: 'partner-123', id: 'partner-123', name: 'P', settings: partnerSettings }]);
+      whereRet.limit = vi.fn().mockResolvedValue([{ id: 'partner-123', name: 'P', settings: partnerSettings }]);
+      whereRet.orderBy = vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) });
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue(whereRet) })
+      } as any);
+      vi.mocked(db.update).mockReturnValue({
+        set: vi.fn().mockImplementation((data: any) => ({
+          where: vi.fn().mockReturnValue({
+            returning: vi.fn().mockResolvedValue([{ id: 'x', name: 'N', settings: data.settings }])
+          })
+        }))
+      } as any);
+    }
+    function send(method: string, path: string, body: unknown) {
+      return app.request(path, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    }
+    const sec = (sessionTimeout: number) => ({ settings: { security: { sessionTimeout } } });
+
+    const PATHS: Array<[string, string, string, () => void]> = [
+      ['PATCH /partners/me', 'PATCH', '/orgs/partners/me', () => setAuthContext({ scope: 'partner', partnerId: 'partner-123' })],
+      ['PATCH /partners/:id (system)', 'PATCH', '/orgs/partners/partner-1', () => {}],
+      ['PATCH /organizations/:id', 'PATCH', '/orgs/organizations/org-1', () => setAuthContext({ scope: 'partner', partnerId: 'partner-123' })],
+    ];
+
+    describe.each(PATHS)('%s', (_name, method, path, auth) => {
+      beforeEach(() => { auth(); primeSelect(); });
+
+      it('rejects 721 with 400 and never writes', async () => {
+        const res = await send(method, path, sec(721));
+        expect(res.status).toBe(400);
+        expect(db.update).not.toHaveBeenCalled();
+      });
+
+      it('accepts 720', async () => {
+        const res = await send(method, path, sec(720));
+        expect(res.status).toBe(200);
+        expect(db.update).toHaveBeenCalled();
+      });
+    });
+
+    it.each([
+      ['POST /organizations', '/orgs/organizations', { name: 'O', slug: 'o', partnerId: '00000000-0000-4000-8000-000000000001' }],
+      ['POST /partners', '/orgs/partners', { name: 'P', slug: 'p' }],
+    ])('%s rejects security.sessionTimeout 721 with 400', async (_n, path, base) => {
+      setAuthContext({ scope: 'system' });
+      primeSelect();
+      const res = await send('POST', path, { ...base, ...sec(721) });
+      expect(res.status).toBe(400);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+
+    it('rejects a non-integer or zero timeout on the free-form paths, accepts null (unset)', async () => {
+      setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+      primeSelect();
+      expect((await send('PATCH', '/orgs/organizations/org-1', sec(0))).status).toBe(400);
+      expect((await send('PATCH', '/orgs/organizations/org-1', sec(60.5))).status).toBe(400);
+      expect((await send('PATCH', '/orgs/organizations/org-1', { settings: { security: { sessionTimeout: null } } })).status).toBe(200);
+    });
+
+    it('GET /partners/me clamps a stored 1440 to 720', async () => {
+      setAuthContext({ scope: 'partner', partnerId: 'partner-123' });
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([{ id: 'partner-123', name: 'P', settings: { security: { sessionTimeout: 1440, requireMfa: true } } }]),
+          }),
+        }),
+      } as any);
+      const res = await app.request('/orgs/partners/me');
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.settings.security).toEqual({ sessionTimeout: 720, requireMfa: true });
     });
   });
 

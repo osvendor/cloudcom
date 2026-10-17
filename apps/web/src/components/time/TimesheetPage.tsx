@@ -10,13 +10,16 @@ import AccessDenied from '../shared/AccessDenied';
 import { formatMinutes } from '../../lib/timeFormat';
 import { formatMoney } from '../billing/shared/format';
 import { ApproximateMoneyLine } from '../billing/shared/ApproximateMoneyLine';
-import { onTimerChanged } from '../../lib/timerActions';
+import { onTimerChanged, deleteTimeEntryAction } from '../../lib/timerActions';
+import { ConfirmDialog } from '../shared/ConfirmDialog';
 import WorkTypeSelect, { type WorkTypeOption } from '../shared/WorkTypeSelect';
 import { useHashState } from '@/lib/useHashState';
 // Initializes the shared i18next singleton. Islands hydrate independently, so
 // an island that hydrates before whichever other island happens to pull i18n in
 // would otherwise render raw keys (and mismatch the SSR markup).
 import '../../lib/i18n';
+import { replaceUrl } from '../../lib/replaceUrl';
+import { AwaitingApprovalChip, WriteOffHeldButton, isAwaitingApproval } from './HeldEntryControls';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -40,13 +43,15 @@ interface TsEntry extends BillingOutcomeStamp {
   currencyCode: string | null;
   /** `billed` locks startedAt/endedAt/isBillable/hourlyRate server-side (409 ENTRY_BILLED
    *  if any of them is PRESENT in a PATCH) — only the description may change. */
-  billingStatus?: 'not_billed' | 'billed' | 'no_charge' | 'contract';
+  billingStatus?: 'not_billed' | 'billed' | 'no_charge' | 'contract' | 'awaiting_approval';
   /** W06 (#3900) server-stamped provenance. Absent on an API predating the
    *  column — render nothing rather than guessing 'manual'. */
   source?: string | null;
   isApproved: boolean;
-  ticketId: string;
-  ticketNumber: string;
+  /** Null for a standalone entry (no ticket). */
+  ticketId: string | null;
+  /** Null for a standalone entry (the timesheet left-joins tickets). */
+  ticketNumber: string | null;
   ticketSubject: string;
   userName: string;
 }
@@ -148,7 +153,7 @@ function parseHash(hash: string): { week: string; tech: string | null } {
 function writeHash(week: string, tech: string | null): void {
   const parts: string[] = [`week=${week}`];
   if (tech) parts.push(`tech=${tech}`);
-  history.replaceState(null, '', `#${parts.join('&')}`);
+  replaceUrl(`#${parts.join('&')}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +164,16 @@ const FRIENDLY: Record<string, string> = {
   ADMIN_REQUIRED: 'friendly.adminRequired',
   APPROVED_IMMUTABLE: 'friendly.approvedImmutable',
   NOT_OWN_ENTRY: 'friendly.notOwnEntry',
+  ENTRY_BILLED: 'friendly.entryBilled',
+};
+
+// #8133: refusals of a DELETE. NOT_OWN_ENTRY needs delete wording (the edit
+// copy says "edit"); the rest reuse FRIENDLY.
+const DELETE_FRIENDLY: Record<string, string> = {
+  ...FRIENDLY,
+  NOT_OWN_ENTRY: 'friendly.notOwnEntryDelete',
+  ENTRY_DELETE_LOST: 'friendly.entryDeleteLost',
+  ENTRY_NOT_FOUND: 'friendly.entryNotFound',
 };
 
 // ---------------------------------------------------------------------------
@@ -169,6 +184,10 @@ export default function TimesheetPage() {
   const { t } = useTranslation('common');
   const { can } = usePermissions();
   const canManageBilling = can('time_entries', 'manage_billing');
+  // #8133: Delete is offered to anyone who can write time entries; the server
+  // still decides per entry (own + unapproved, or a manage-all admin) and its
+  // refusal is shown through FRIENDLY, exactly as for Edit.
+  const canWriteTime = can('time_entries', 'write');
   // SSR-safe hash adoption lives in the hook (#2421). parseHash's week already
   // falls back to the current Monday; tech → undefined keeps the null default.
   const [week, setWeek] = useHashState<string>(mondayUtc(new Date()), (h) => parseHash(h).week);
@@ -179,6 +198,19 @@ export default function TimesheetPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<EditForm>({ workTypeId: null, description: '', isBillable: true, hourlyRate: '' });
+  const [pendingDelete, setPendingDelete] = useState<TsEntry | null>(null);
+  // #8133: the entry whose DELETE is in flight. Tracked by id so a request
+  // that settles after the view changed only clears its own state, never a
+  // confirm the user has since opened for another entry.
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const deletingShown = deletingId !== null && deletingId === pendingDelete?.id;
+  // #8133: an open confirm must never outlive the sheet it was opened on —
+  // confirming after a week or technician switch would delete an entry the
+  // user is no longer looking at.
+  useEffect(() => { setPendingDelete(null); }, [week, tech]);
+  // The view on screen NOW, read by an in-flight delete when it settles.
+  const viewRef = useRef({ week, tech });
+  viewRef.current = { week, tech };
   const [loading, setLoading] = useState(true);
   // Monotonic id of the newest in-flight timesheet request (see loadSheet).
   const fetchSeq = useRef(0);
@@ -186,6 +218,10 @@ export default function TimesheetPage() {
   const [denied, setDenied] = useState(false);
   const friendly = useCallback((code: string): string | undefined => {
     const key = FRIENDLY[code];
+    return key ? t(/* i18n-dynamic */ `longTail.time.TimesheetPage.${key}`) : undefined;
+  }, [t]);
+  const deleteFriendly = useCallback((code: string): string | undefined => {
+    const key = DELETE_FRIENDLY[code];
     return key ? t(/* i18n-dynamic */ `longTail.time.TimesheetPage.${key}`) : undefined;
   }, [t]);
 
@@ -375,6 +411,50 @@ export default function TimesheetPage() {
     }
   }, [editForm, week, tech, loadSheet, canManageBilling]);
 
+  // #8133: delete one entry after the confirm dialog.
+  const confirmDelete = useCallback(async () => {
+    const entry = pendingDelete;
+    if (!entry) return;
+    const atWeek = week;
+    const atTech = tech;
+    let reloadedByTimerEvent = false;
+    setDeletingId(entry.id);
+    try {
+      await deleteTimeEntryAction(
+        entry,
+        {
+          errorFallback: t('longTail.time.TimesheetPage.errors.deleteEntryFailed'),
+          successMessage: t('longTail.time.TimesheetPage.toasts.entryDeleted'),
+        },
+        deleteFriendly,
+      );
+      // Deleting the running timer fires the timer event, whose listener
+      // above has already reloaded the sheet.
+      reloadedByTimerEvent = entry.endedAt == null;
+      if (editingId === entry.id) setEditingId(null);
+      setSelected((prev) => {
+        if (!prev.has(entry.id)) return prev;
+        const next = new Set(prev);
+        next.delete(entry.id);
+        return next;
+      });
+    } catch (err) {
+      handleActionError(err, t('longTail.time.TimesheetPage.errors.deleteEntryFailed'));
+    } finally {
+      // Refetch on success and on failure: a 404 means it is already gone, and
+      // a refusal may mean it was approved or invoiced since the sheet loaded.
+      // Only for the view the delete started on, and only if it is still the
+      // one on screen: after a week/technician switch the newer view has
+      // loaded itself, and reloading the old one would paint it over that.
+      setDeletingId((cur) => (cur === entry.id ? null : cur));
+      setPendingDelete((cur) => (cur?.id === entry.id ? null : cur));
+      const now = viewRef.current;
+      if (!reloadedByTimerEvent && now.week === atWeek && now.tech === atTech) {
+        void loadSheet(atWeek, atTech);
+      }
+    }
+  }, [pendingDelete, editingId, deleteFriendly, t, loadSheet, week, tech]);
+
   // Formatted week label
   const weekLabel = (() => {
     const [y, mo, d] = week.split('-').map(Number);
@@ -534,6 +614,9 @@ export default function TimesheetPage() {
                             placeholder={t('common:labels.description')}
                             className="min-w-0 flex-1 rounded-md border bg-background px-2 py-1 text-sm"
                           />
+                          <p className="mt-1 w-full text-xs text-muted-foreground" data-testid="time-entry-note-invoice-cue">
+                            {t('longTail.time.TimesheetPage.noteInvoiceCue')}
+                          </p>
                           <div className="w-full sm:w-40">
                             <WorkTypeSelect
                               value={editForm.workTypeId}
@@ -599,12 +682,14 @@ export default function TimesheetPage() {
                           />
                           <div className="flex min-w-0 flex-1 flex-col gap-0.5">
                             <div className="flex flex-wrap items-center gap-2">
-                              <a
-                                href={`/tickets/${entry.ticketId}`}
-                                className="text-sm font-medium text-primary hover:underline"
-                              >
-                                {entry.ticketNumber}
-                              </a>
+                              {entry.ticketId && (
+                                <a
+                                  href={`/tickets/${entry.ticketId}`}
+                                  className="text-sm font-medium text-primary hover:underline"
+                                >
+                                  {entry.ticketNumber}
+                                </a>
+                              )}
                               {entry.description ? (
                                 <span className="text-sm">{entry.description}</span>
                               ) : (
@@ -626,6 +711,7 @@ export default function TimesheetPage() {
                                   {t('longTail.time.TimesheetPage.approved')}
                                 </span>
                               )}
+                              {isAwaitingApproval(entry) && <AwaitingApprovalChip entryId={entry.id} />}
                               {!entry.isBillable && (
                                 <span className="text-xs text-muted-foreground">{t('longTail.time.TimesheetPage.nonBillable')}</span>
                               )}
@@ -660,6 +746,20 @@ export default function TimesheetPage() {
                             >
                               {t('common:actions.edit')}
                             </button>
+                            {isAwaitingApproval(entry) && (
+                              <WriteOffHeldButton entryId={entry.id} onDone={() => void loadSheet(week, tech)} />
+                            )}
+                            {canWriteTime && entry.billingStatus !== 'billed' && (
+                              <button
+                                type="button"
+                                onClick={() => setPendingDelete(entry)}
+                                data-testid={`timesheet-delete-${entry.id}`}
+                                aria-label={t('longTail.time.TimesheetPage.deleteEntry', { id: entry.id })}
+                                className="rounded-md border px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
+                              >
+                                {t('common:actions.delete')}
+                              </button>
+                            )}
                           </div>
                         </>
                       )}
@@ -706,6 +806,32 @@ export default function TimesheetPage() {
           />
         </div>
       )}
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        onClose={() => { if (!deletingShown) setPendingDelete(null); }}
+        onConfirm={() => void confirmDelete()}
+        title={t('longTail.time.TimesheetPage.deleteConfirmTitle')}
+        message={pendingDelete
+          ? (pendingDelete.ticketNumber
+            ? t('longTail.time.TimesheetPage.deleteConfirmMessage', {
+                duration: pendingDelete.endedAt == null
+                  ? t('tickets:ticketTimeBilling.running')
+                  : formatMinutes(pendingDelete.durationMinutes),
+                ticket: pendingDelete.ticketNumber,
+              })
+            : t('longTail.time.TimesheetPage.deleteConfirmMessageNoTicket', {
+                duration: pendingDelete.endedAt == null
+                  ? t('tickets:ticketTimeBilling.running')
+                  : formatMinutes(pendingDelete.durationMinutes),
+              }))
+          : ''}
+        confirmLabel={t('common:actions.delete')}
+        variant="destructive"
+        isLoading={deletingShown}
+        confirmTestId="timesheet-delete-confirm"
+        dialogTestId="timesheet-delete-dialog"
+      />
     </div>
   );
 }

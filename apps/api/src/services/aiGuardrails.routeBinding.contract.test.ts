@@ -330,7 +330,7 @@ const BINDINGS: readonly Binding[] = [
   // §2.5 — the per-action extra-permission map.
   { tool: 'manage_tickets', action: 'move_org', routeFile: 'tickets/moveOrg.ts', method: 'post', path: '/:id/move-org' },
 
-  // §2.4 — a registry read is an agent EXECUTION (SR5-01 precedent).
+  // §2.4 — a registry read is an agent EXECUTION (privileged-read precedent).
   { tool: 'registry_operations', action: 'read_key', routeFile: 'devices/commands.ts', method: 'post', path: '/:id/commands' },
 
   // Live device inspection: every /system-tools route dispatches to the agent,
@@ -432,6 +432,9 @@ const BINDINGS: readonly Binding[] = [
   },
   { tool: 'query_custom_fields', action: 'list_definitions', routeFile: 'customFields.ts', method: 'get', path: '/' },
   { tool: 'query_psa_status', routeFile: 'psa.ts', method: 'get', path: '/connections' },
+  { tool: 'query_webhooks', routeFile: 'webhooks.ts', method: 'get', path: '/' },
+  // includeDeliveries returns per-webhook delivery history, the data behind GET /:id/deliveries.
+  { tool: 'query_webhooks', input: { includeDeliveries: true }, routeFile: 'webhooks.ts', method: 'get', path: '/:id/deliveries' },
   { tool: 'search_script_library', routeFile: 'scripts.ts', method: 'get', path: '/' },
   { tool: 'list_scripts', routeFile: 'scripts.ts', method: 'get', path: '/' },
   { tool: 'get_script_details', routeFile: 'scripts.ts', method: 'get', path: '/:id' },
@@ -454,10 +457,6 @@ const UNBOUND: ReadonlyArray<{ tool: string; action?: string; reason: string }> 
   {
     tool: 'computer_control',
     reason: 'no single HTTP route: it rides an already-established remote session over the signalling channel, so its remote:access extra is inherited from create_remote_session rather than from a route of its own',
-  },
-  {
-    tool: 'query_webhooks',
-    reason: 'GET /webhooks (routes/webhooks.ts) carries no requirePermission at all — requireScope only — so there is no route permission set to bind against; the tool keeps its devices:read gate regardless. Route gap filed as a follow-up (#6755 PR).',
   },
   {
     tool: 'list_script_templates',

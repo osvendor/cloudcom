@@ -25,6 +25,9 @@ describe('isSelfManagedDbContextRoute', () => {
     // under the portal request transaction.
     ['POST', '/api/v1/portal/invoices/def-456/settle'],
     ['POST', '/api/v1/portal/invoices/def-456/settle/'],
+    // Invoice-page exit from an off-session 3DS payment cancels the PaymentIntent in Stripe.
+    ['POST', '/api/v1/portal/invoices/def-456/autopay-confirmation'],
+    ['POST', '/api/v1/invoices/public/tok-789/autopay-confirmation'],
     ['POST', '/api/v1/portal/quotes/def-456/pay/'],
     ['post', '/api/v1/portal/quotes/def-456/pay'], // method is case-insensitive
     ['GET', '/api/v1/portal/network/overview'],
@@ -524,7 +527,37 @@ it('self-manages POST /remediation-suggestions/:id/execute and no sibling route'
   expect(isSelfManagedDbContextRoute('POST', '/api/v1/remediation-suggestions/abc-123/execute/')).toBe(true);
   expect(isSelfManagedDbContextRoute('POST', '/api/v1/remediation-suggestions/abc-123/elevation-request')).toBe(false);
   expect(isSelfManagedDbContextRoute('PATCH', '/api/v1/remediation-suggestions/abc-123')).toBe(false);
-  expect(isSelfManagedDbContextRoute('POST', '/api/v1/remediation-suggestions/generate')).toBe(false);
+});
+
+// PR #7939 fix pass A2 — Generate and Research call requestResearch, which
+// provisions the research agent and admits a run in their own system
+// transactions; it refuses to run under a held request transaction. Their GET
+// siblings do no system work and keep the ambient tx.
+it('self-manages the two research-starting remediation POSTs and no sibling route', () => {
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/remediation-suggestions/generate')).toBe(true);
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/remediation-suggestions/research')).toBe(true);
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/remediation-suggestions/research/')).toBe(true);
+  expect(isSelfManagedDbContextRoute('GET', '/api/v1/remediation-suggestions/research')).toBe(false);
+  expect(isSelfManagedDbContextRoute('GET', '/api/v1/remediation-suggestions/memory')).toBe(false);
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/remediation-suggestions/abc-123/done')).toBe(false);
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/remediation-suggestions/generate/extra')).toBe(false);
+});
+
+// #7943 — the AI agents manual-run trigger admits through
+// createAndEnqueueAgentRun, which opens its own system transaction(s) and
+// enqueues after they commit. Only that POST opts out: the GET run list on the
+// same path and every sibling agent mutation keep the ambient request tx.
+it('self-manages POST /ai/agents/:id/runs and no sibling agent route', () => {
+  const ID = '11111111-1111-4111-8111-111111111111';
+  expect(isSelfManagedDbContextRoute('POST', `/api/v1/ai/agents/${ID}/runs`)).toBe(true);
+  expect(isSelfManagedDbContextRoute('POST', `/api/v1/ai/agents/${ID}/runs/`)).toBe(true);
+  expect(isSelfManagedDbContextRoute('GET', `/api/v1/ai/agents/${ID}/runs`)).toBe(false);
+  expect(isSelfManagedDbContextRoute('GET', '/api/v1/ai/agents/runs')).toBe(false);
+  expect(isSelfManagedDbContextRoute('GET', `/api/v1/ai/agents/runs/${ID}`)).toBe(false);
+  expect(isSelfManagedDbContextRoute('POST', `/api/v1/ai/agents/${ID}/enable`)).toBe(false);
+  expect(isSelfManagedDbContextRoute('POST', `/api/v1/ai/agents/${ID}/circuit/reset`)).toBe(false);
+  expect(isSelfManagedDbContextRoute('POST', `/api/v1/ai/agents/schedules/${ID}/runs`)).toBe(false);
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/ai/fleet-design/runs')).toBe(false);
 });
 
 // #3127 — the four chat message-send routes may settle a turn blocked on
@@ -632,4 +665,18 @@ it('W05: the continuation route manages its own DB context (it makes a provider 
   expect(isSelfManagedDbContextRoute('GET', '/api/v1/ai/sessions/11111111-1111-1111-1111-111111111111/continue')).toBe(false);
   expect(isSelfManagedDbContextRoute('POST', '/api/v1/ai/sessions/11111111-1111-1111-1111-111111111111/continue/extra')).toBe(false);
   expect(isSelfManagedDbContextRoute('POST', '/api/v1/ai/sessions//continue')).toBe(false);
+});
+
+it('only opts the network-bearing charge POST out of ambient context', () => {
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/invoices/abc/autopay/charge-now')).toBe(true);
+  expect(isSelfManagedDbContextRoute('PATCH', '/api/v1/invoices/abc/autopay')).toBe(false);
+});
+
+it('#8167 self-manages POST /edr/actions (commit before the vendor call) and no sibling EDR read', () => {
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/edr/actions')).toBe(true);
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/edr/actions/')).toBe(true);
+  expect(isSelfManagedDbContextRoute('GET', '/api/v1/edr/actions')).toBe(false);
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/edr/actions/abc-123')).toBe(false);
+  expect(isSelfManagedDbContextRoute('GET', '/api/v1/edr/endpoints')).toBe(false);
+  expect(isSelfManagedDbContextRoute('POST', '/api/v1/edr/connections/abc-123/sync')).toBe(false);
 });

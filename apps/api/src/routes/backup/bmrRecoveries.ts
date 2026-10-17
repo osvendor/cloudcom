@@ -17,6 +17,7 @@ import {
 } from '../../db/schema';
 import { requireMfa, requirePermission, requireScope } from '../../middleware/auth';
 import { writeAuditEvent } from '../../services/auditEvents';
+import { refreshReadinessAfterRecovery } from '../../services/bareMetalReadinessRefresh';
 import { PERMISSIONS } from '../../services/permissions';
 import { resolveScopedOrgId } from './helpers';
 import { authorizeRouteResilienceResources, resolveRouteAuthorizedDeviceIds } from './resilienceAuthorization';
@@ -30,6 +31,7 @@ import {
 } from '../../services/bareMetalRecoveryCodes';
 import {
   BareMetalRecoveryError,
+  RecoveryIntegrityRefusedError,
   cancelBareMetalRecovery,
   createBareMetalRecovery,
   reissueRecoveryCode,
@@ -46,11 +48,10 @@ import {
 } from '../../services/recoveryBootstrap';
 import { negotiateRecoveryCapabilities } from '../../services/recoveryCapabilities';
 import { readSnapshotFileIndexState } from '../../services/backupSnapshotFileIndex';
-import {
-  lookupIntegrityInformational,
-  recoveryBootstrapIntegrity,
-  resolveRestoreIntegrity,
-} from '../../services/backupRestoreIntegrity';
+import { evaluateRecoveryIntegrity } from '../../services/backupRecoveryIntegrityGate';
+import { RESTORE_INTEGRITY_MESSAGES } from '../../services/backupRestoreGate';
+import { CommandTypes } from '../../services/commandTypes';
+import { checkRestoreIntegrityRequest, recordRequestAuthorization } from './restoreIntegrityGate';
 import { enqueueSnapshotFileIndexHydration } from '../../jobs/backupSnapshotFileIndexWorker';
 import { normalizeStorageIdentity } from '../../jobs/backupRetention';
 import { BMR_PROGRESS_IP_LIMIT, enforcePublicRateLimit, enforceTokenRateLimit, runInRecoveryOrgContext } from './bmr';
@@ -154,10 +155,34 @@ bmrRecoveryRoutes.post(
         identity: payload.identity,
         createdBy: auth.user?.id ?? null,
         source: 'route',
+        // Integrity: a snapshot without a usable attestation needs a step-up;
+        // its authorization is bound to the recovery in this transaction, and
+        // the recovery's exchange and authentication check it.
+        integrity: async (snapshot) => {
+          const request = {
+            orgId,
+            snapshotDbId: snapshot.id,
+            targetDeviceId: snapshot.deviceId,
+            commandType: CommandTypes.BMR_RECOVER,
+            stepUpGrant: payload.stepUpGrant,
+            confirmUnattestedRestore: payload.confirmUnattestedRestore,
+          };
+          const check = await checkRestoreIntegrityRequest(c, request);
+          if (!check.ok) return check;
+          if (!check.authorizationReason) return { ok: true };
+          const reason = check.authorizationReason;
+          const confirmationMethod = check.confirmationMethod;
+          return {
+            ok: true,
+            bindRecovery: (recoveryId: string) =>
+              recordRequestAuthorization(c, request, reason, { recoveryId }, { inCurrentTransaction: true, confirmationMethod }),
+          };
+        },
       });
       const indexState = row.snapshotId ? await readSnapshotFileIndexState(row.snapshotId) : null;
       return c.json({ ...toRecoverySummary(row), code, fileIndex: { status: indexState?.status ?? 'none' } }, 201);
     } catch (err) {
+      if (err instanceof RecoveryIntegrityRefusedError) return c.json(err.body, err.status);
       if (err instanceof BareMetalRecoveryError) {
         if (err.code === 'snapshot_not_found') return c.json({ error: 'Snapshot not found' }, 404);
         return recoveryErrorResponse(c, err);
@@ -346,6 +371,8 @@ async function buildRecoveryExchangeBootstrap(
     authenticatedAt: Date | null;
   },
   recovery: { id: string; identity: 'original' | 'new'; deviceId: string; snapshotId: string | null; nonce: string },
+  /** The integrity block decided for this exchange (services/backupRecoveryIntegrityGate.ts). */
+  integrity: Record<string, unknown>,
   negotiated?: {
     grantedCapabilities: string[];
     fileIndex: { status: 'complete'; manifestSha256: string; externalCount: number; originSnapshotIds: string[] } | null;
@@ -373,14 +400,6 @@ async function buildRecoveryExchangeBootstrap(
     .from(devices)
     .where(eq(devices.id, tokenRow.deviceId))
     .limit(1);
-
-  // The snapshot's integrity expectation (informational in this release).
-  const integrity = recoveryBootstrapIntegrity(
-    await lookupIntegrityInformational(
-      { label: 'recovery bootstrap', snapshotRef: snapshot.id },
-      () => resolveRestoreIntegrity(snapshot.id),
-    ),
-  );
 
   return buildAuthenticatedBootstrapPayload({
     tokenId: tokenRow.id,
@@ -483,7 +502,7 @@ bmrRecoveryPublicRoutes.post(
       return c.json({ error: 'code_invalid' }, 404);
     }
 
-    const { capabilities: clientCapabilities, helperVersion } = c.req.valid('json');
+    const { capabilities: clientCapabilities, helperVersion, mediaPlatform, integrityProtocolVersion } = c.req.valid('json');
 
     // #5629: refuse recovery media older than the server floor BEFORE the
     // code is claimed. The console used to learn the floor only from the
@@ -513,7 +532,59 @@ bmrRecoveryPublicRoutes.post(
       );
     }
 
+    // W07a: refuse media for the wrong platform BEFORE the code is claimed
+    // (same terminal 409 shape as helper_version_too_old). Skipped for old
+    // media that omits mediaPlatform and for legacy rows with no platform.
+    if (mediaPlatform !== undefined && rec.platform && rec.platform !== mediaPlatform) {
+      writeAuditEvent(c, {
+        orgId: rec.orgId,
+        action: 'bmr.recovery.exchange',
+        resourceType: 'bare_metal_recovery',
+        resourceId: rec.id,
+        result: 'failure',
+        details: { reason: 'media_platform_mismatch', recoveryPlatform: rec.platform, mediaPlatform },
+      });
+      const want = rec.platform === 'windows' ? 'Windows' : 'Linux';
+      return c.json(
+        {
+          error: 'media_platform_mismatch',
+          message: `This recovery is for a ${want} backup; boot the Breeze ${want} recovery media instead. The recovery code was not used.`,
+          details: { recoveryPlatform: rec.platform, mediaPlatform },
+        },
+        409
+      );
+    }
+
     return runInRecoveryOrgContext(rec.orgId, async () => {
+      // Restore integrity (services/backupRecoveryIntegrityGate.ts), BEFORE
+      // the code is claimed: the recovery client must check restored bytes
+      // against the snapshot attestation, and a snapshot without a usable
+      // attestation needs a confirmed authorization bound to this recovery.
+      // A refusal is a terminal 409 that leaves the code unspent.
+      const integrityOutcome = rec.snapshotId
+        ? await evaluateRecoveryIntegrity({
+            snapshotDbId: rec.snapshotId,
+            targetDeviceId: rec.deviceId,
+            clientIntegrityProtocolVersion: integrityProtocolVersion,
+            recoveryId: rec.id,
+          })
+        : {
+            ok: false as const,
+            status: 409 as const,
+            body: { error: 'snapshot_unresolved', message: RESTORE_INTEGRITY_MESSAGES.snapshot_unresolved },
+          };
+      if (!integrityOutcome.ok) {
+        writeAuditEvent(c, {
+          orgId: rec.orgId,
+          action: 'bmr.recovery.exchange',
+          resourceType: 'bare_metal_recovery',
+          resourceId: rec.id,
+          result: 'failure',
+          details: { reason: integrityOutcome.body.error },
+        });
+        return c.json(integrityOutcome.body, integrityOutcome.status);
+      }
+
       // W09 (#6464) Task 5: capability negotiation runs BEFORE the code is
       // claimed (the db.transaction() below) — an incompatible or
       // not-yet-ready client is refused here, before codeUsedAt is written
@@ -653,6 +724,7 @@ bmrRecoveryPublicRoutes.post(
           snapshotId: rec.snapshotId,
           nonce,
         },
+        integrityOutcome.integrity,
         { grantedCapabilities: negotiation.granted, fileIndex: negotiation.fileIndex },
         resolvedSnapshot
       );
@@ -758,6 +830,9 @@ bmrRecoveryPublicRoutes.post(
       }
 
       await db.update(bareMetalRecoveries).set(set).where(eq(bareMetalRecoveries.id, rec.id));
+      if (targetStatus === 'completed' || targetStatus === 'failed') {
+        refreshReadinessAfterRecovery(rec.orgId, rec.deviceId);
+      }
 
       writeAuditEvent(c, {
         orgId: rec.orgId,

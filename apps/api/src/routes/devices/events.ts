@@ -440,7 +440,7 @@ const REDACTED_DETAILS_KEYS = ['aiSessionId', 'aiAgentRunId'] as const;
 
 function redactAiProvenance(details: unknown): Record<string, unknown> | null {
   if (!details || typeof details !== 'object') return details as null;
-  // #6577: also run the shared secret redaction (the #5570 / SEC-050 admin
+  // #6577: also run the shared secret redaction (the #5570 admin
   // history helper) — legacy rows and direct createAuditLog writers can hold
   // raw credentials in details.
   const redacted = { ...(redactPersistedToolInput(details) as Record<string, unknown>) };
@@ -495,6 +495,9 @@ const actionLabels: Record<string, string> = {
   'agent.filesystem.threshold_scan.queued': 'Disk threshold scan queued',
   'device.command.queue': 'Command queued',
   'device.update': 'Device updated',
+  'device.site_move': 'Device moved to another site',
+  'device.site_assignment_confirmed': 'Site assignment confirmed (suggestions off)',
+  'device.site_assignment_unconfirmed': 'Site assignment confirmation cleared (suggestions on)',
   'device.decommission': 'Device decommissioned',
   'device.agent_token.rotate': 'Agent token rotated',
   'device.patch.install.queue': 'Patch installation queued',
@@ -503,12 +506,15 @@ const actionLabels: Record<string, string> = {
   'device.filesystem.cleanup.preview': 'Disk cleanup previewed',
   'device.filesystem.cleanup.execute': 'Disk cleanup executed',
   'device.maintenance.enable': 'Maintenance mode enabled',
+  'device.reliability.baseline_set': 'Reliability baseline set',
+  'device.reliability.baseline_cleared': 'Reliability baseline cleared',
   'device.maintenance.extend': 'Maintenance mode extended',
   'device.maintenance.disable': 'Maintenance mode disabled',
   'device.recovery_key.reveal': 'Recovery key revealed',
   'device.recovery_key.rotate': 'Recovery key rotation requested',
   'agent.recovery_keys.submit': 'Recovery keys escrowed',
   'script.execute': 'Script executed',
+  'script.execute_group_target': 'Script run on device groups requested',
   'script.execution.cancel': 'Script execution cancelled',
   // #5022 / W05: written by scriptDispatch.ts at DISPATCH time (result:
   // 'dispatched'), same tense discipline as the agent.command.* rows below —

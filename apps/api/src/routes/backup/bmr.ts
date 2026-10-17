@@ -46,11 +46,9 @@ import {
   toIsoString,
 } from '../../services/recoveryBootstrap';
 import { getAuthenticatedRecoveryDownloadTarget } from '../../services/recoveryDownloadService';
-import {
-  lookupIntegrityInformational,
-  recoveryBootstrapIntegrity,
-  resolveRestoreIntegrity,
-} from '../../services/backupRestoreIntegrity';
+import { evaluateRecoveryIntegrity } from '../../services/backupRecoveryIntegrityGate';
+import { CommandTypes } from '../../services/commandTypes';
+import { checkRestoreIntegrityRequest, recordRequestAuthorization, restoreIntegrityResponse } from './restoreIntegrityGate';
 import {
   getRecoveryMediaArtifact,
   getRecoveryMediaDownloadTarget,
@@ -569,6 +567,21 @@ bmrRoutes.post(
       }
     }
 
+    // Integrity (routes/backup/restoreIntegrityGate.ts): a recovery restores
+    // the snapshot onto its own device. A snapshot without a usable
+    // attestation needs a step-up; its authorization is bound to the token in
+    // this request's transaction, and recovery authentication checks it.
+    const integrityRequest = {
+      orgId,
+      snapshotDbId: snapshot.id,
+      targetDeviceId: snapshot.deviceId,
+      commandType: CommandTypes.BMR_RECOVER,
+      stepUpGrant: payload.stepUpGrant,
+      confirmUnattestedRestore: payload.confirmUnattestedRestore,
+    };
+    const integrityCheck = await checkRestoreIntegrityRequest(c, integrityRequest);
+    if (!integrityCheck.ok) return restoreIntegrityResponse(c, integrityCheck);
+
     const plainToken = generateRecoveryToken();
     const tokenHash = hashRecoveryToken(plainToken);
     const expiresAt = new Date(Date.now() + payload.expiresInHours * 60 * 60 * 1000);
@@ -590,6 +603,15 @@ bmrRoutes.post(
 
     if (!row) {
       return c.json({ error: 'Failed to create recovery token' }, 500);
+    }
+    if (integrityCheck.authorizationReason) {
+      await recordRequestAuthorization(
+        c,
+        integrityRequest,
+        integrityCheck.authorizationReason,
+        { recoveryTokenId: row.id },
+        { inCurrentTransaction: true, confirmationMethod: integrityCheck.confirmationMethod },
+      );
     }
 
     const serverUrl = resolveServerUrl(c.req.url);
@@ -1241,10 +1263,35 @@ bmrPublicRoutes.post(
       // and the run was dead. Sliding is bounded by the token's own
       // expires_at (24 h for exchange-minted tokens) and by the per-token
       // authenticate rate limit above.
+      // Restore integrity (services/backupRecoveryIntegrityGate.ts): the
+      // recovery client must check restored bytes against the snapshot
+      // attestation, and a snapshot without a usable attestation needs a
+      // confirmed authorization bound to this token or its recovery. Runs on
+      // every (re-)authentication, before the status flips below, so a token
+      // issued before this check existed is covered at its next call.
+      const { capabilities: clientCapabilities, integrityProtocolVersion } = c.req.valid('json');
+      const integrityOutcome = await evaluateRecoveryIntegrity({
+        snapshotDbId: snapshot.id,
+        targetDeviceId: row.deviceId,
+        clientIntegrityProtocolVersion: integrityProtocolVersion,
+        recoveryTokenId: row.id,
+      });
+      if (!integrityOutcome.ok) {
+        writeAuditEvent(c, {
+          orgId: row.orgId,
+          action: 'bmr.recovery.authenticate',
+          resourceType: 'recovery_token',
+          resourceId: row.id,
+          details: { snapshotId: row.snapshotId, reason: integrityOutcome.body.error },
+          result: 'failure',
+          errorMessage: integrityOutcome.body.error,
+        });
+        return c.json(integrityOutcome.body, integrityOutcome.status);
+      }
+
       // W09 (#6464) Task 5: capability negotiation runs BEFORE the status
       // flips below. An incompatible or not-yet-ready client is refused
       // here, before authenticatedAt/status are ever written.
-      const { capabilities: clientCapabilities } = c.req.valid('json');
       // readSnapshotFileIndexState already resolves referencedFiles via the
       // snapshot's owning job (backupSnapshotFileIndex.ts loadReferencedFiles),
       // so a separate backupJobs query here would be redundant.
@@ -1378,13 +1425,7 @@ bmrPublicRoutes.post(
         .where(eq(bareMetalRecoveries.recoveryTokenId, row.id))
         .limit(1);
 
-      // The snapshot's integrity expectation (informational in this release).
-      const integrity = recoveryBootstrapIntegrity(
-        await lookupIntegrityInformational(
-          { label: 'recovery bootstrap', snapshotRef: snapshot.id },
-          () => resolveRestoreIntegrity(snapshot.id),
-        ),
-      );
+      const integrity = integrityOutcome.integrity;
 
       const authenticatedPayload = buildAuthenticatedBootstrapPayload({
         tokenId: row.id,
@@ -1875,6 +1916,7 @@ bmrPublicRoutes.post(
         return c.json({
           restoreJobId: existingRestoreJob?.id ?? null,
           status: existingRestoreJob?.status ?? 'completed',
+          tokenConsumed: true,
         });
       }
 
@@ -1911,8 +1953,40 @@ bmrPublicRoutes.post(
             ? 'partial'
             : 'failed';
 
+      // #5408: the token is consumed by the first completion that actually
+      // restored the machine (`completed` or `partial`), not by a failed
+      // attempt. The recovery binary reports every run here, including one
+      // that died mid-download on a network drop; consuming the token on that
+      // report meant the operator's retry answered "Token is used" and they
+      // had to mint a new token from the console they were trying to recover.
+      // A failed attempt is still recorded (restore job + audit event) and
+      // leaves the token authenticated, so a retry within the token's TTL
+      // re-authenticates with it. The single-use guarantee is unchanged: once
+      // a completion consumes the token, authenticate/download/complete all
+      // refuse it, and the token's expires_at stays the outer bound.
+      const consumesToken = restoreStatus !== 'failed';
       const completionTime = new Date();
-      const persistedRestoreJob = await db.transaction(async (tx) => {
+      const attemptTargetConfig = {
+        ...asRecord(row.targetConfig),
+        result: {
+          status: result.status,
+          filesRestored: result.filesRestored ?? null,
+          bytesRestored: result.bytesRestored ?? null,
+          stateApplied: result.stateApplied ?? null,
+          driversInjected: result.driversInjected ?? null,
+          validated: result.validated ?? null,
+          warnings: result.warnings ?? [],
+          error: result.error ?? null,
+          // D14: per-file failure count for a partially-successful
+          // recovery. Optional and left null (not 0) when an older agent
+          // build doesn't report it.
+          failedFiles: result.failedFiles ?? null,
+          // Outcome code (e.g. system_state_requires_rebuild); null for
+          // a helper that does not report one.
+          code: result.code ?? null,
+        },
+      };
+      const completion = await db.transaction(async (tx) => {
         const [restoreJob] = await tx
           .insert(restoreJobs)
           .values({
@@ -1921,26 +1995,7 @@ bmrPublicRoutes.post(
             deviceId: row.deviceId,
             restoreType: 'bare_metal',
             status: restoreStatus,
-            targetConfig: {
-              ...asRecord(row.targetConfig),
-              result: {
-                status: result.status,
-                filesRestored: result.filesRestored ?? null,
-                bytesRestored: result.bytesRestored ?? null,
-                stateApplied: result.stateApplied ?? null,
-                driversInjected: result.driversInjected ?? null,
-                validated: result.validated ?? null,
-                warnings: result.warnings ?? [],
-                error: result.error ?? null,
-                // D14: per-file failure count for a partially-successful
-                // recovery. Optional and left null (not 0) when an older agent
-                // build doesn't report it.
-                failedFiles: result.failedFiles ?? null,
-                // Outcome code (e.g. system_state_requires_rebuild); null for
-                // a helper that does not report one.
-                code: result.code ?? null,
-              },
-            },
+            targetConfig: attemptTargetConfig,
             recoveryTokenId: row.id,
             restoredSize: result.bytesRestored ?? null,
             restoredFiles: result.filesRestored ?? null,
@@ -1955,7 +2010,7 @@ bmrPublicRoutes.post(
             status: restoreJobs.status,
           });
 
-        const persisted =
+        let persisted =
           restoreJob ??
           (
             await tx
@@ -1968,7 +2023,47 @@ bmrPublicRoutes.post(
               .limit(1)
           )[0];
 
-        if (persisted) {
+        // restore_jobs is unique per recovery token, so a retry after a
+        // failed attempt lands on that attempt's row: overwrite it with this
+        // attempt's outcome. Only a `failed` row is overwritten (guarded in
+        // the UPDATE itself, so a concurrent completion that already moved it
+        // on wins); any other pre-existing row for the token — e.g. the
+        // pending job a VM rebuild pre-creates — is returned untouched, as
+        // before.
+        if (!restoreJob && persisted?.status === 'failed') {
+          const [overwritten] = await tx
+            .update(restoreJobs)
+            .set({
+              status: restoreStatus,
+              targetConfig: attemptTargetConfig,
+              restoredSize: result.bytesRestored ?? null,
+              restoredFiles: result.filesRestored ?? null,
+              completedAt: completionTime,
+              updatedAt: completionTime,
+            })
+            .where(and(eq(restoreJobs.id, persisted.id), eq(restoreJobs.status, 'failed')))
+            .returning({
+              id: restoreJobs.id,
+              status: restoreJobs.status,
+            });
+          if (overwritten) {
+            persisted = overwritten;
+          } else {
+            // Zero rows: a concurrent completion moved the row off `failed`
+            // after our SELECT. Re-read it so the response reports the row
+            // that actually won rather than the stale `failed` snapshot.
+            const [current] = await tx
+              .select({ id: restoreJobs.id, status: restoreJobs.status })
+              .from(restoreJobs)
+              .where(eq(restoreJobs.id, persisted.id))
+              .limit(1);
+            if (current) persisted = current;
+          }
+        }
+
+        if (!persisted) return { job: null, tokenConsumed: false };
+
+        if (consumesToken) {
           await tx
             .update(recoveryTokens)
             .set({
@@ -1982,11 +2077,28 @@ bmrPublicRoutes.post(
             .update(recoveryMediaArtifacts)
             .set({ status: 'expired' })
             .where(eq(recoveryMediaArtifacts.tokenId, row.id));
+          return { job: persisted, tokenConsumed: true };
         }
 
-        return persisted ?? null;
+        // This attempt failed, so it does not consume the token — but a
+        // concurrent completion may already have. Report the token's actual
+        // state rather than inferring it from this attempt's own result.
+        if (restoreJob || persisted.status === 'failed') {
+          return { job: persisted, tokenConsumed: false };
+        }
+        const [currentToken] = await tx
+          .select({ status: recoveryTokens.status, completedAt: recoveryTokens.completedAt })
+          .from(recoveryTokens)
+          .where(eq(recoveryTokens.id, row.id))
+          .limit(1);
+        return {
+          job: persisted,
+          tokenConsumed: currentToken?.status === 'used' && currentToken.completedAt != null,
+        };
       });
 
+      const persistedRestoreJob = completion.job;
+      const { tokenConsumed } = completion;
       writeAuditEvent(c, {
         orgId: row.orgId,
         action: 'bmr.recovery.complete',
@@ -1996,13 +2108,23 @@ bmrPublicRoutes.post(
           snapshotId: row.snapshotId,
           restoreJobId: persistedRestoreJob?.id ?? null,
           status: result.status,
+          tokenConsumed,
+          ...(result.error ? { error: result.error.slice(0, 500) } : {}),
         },
-        result: 'success',
+        result: restoreStatus === 'failed' ? 'failure' : 'success',
+        ...(restoreStatus === 'failed'
+          ? {
+              errorMessage: tokenConsumed
+                ? 'Recovery attempt failed; token was already consumed by a concurrent completion'
+                : 'Recovery attempt failed; token remains usable for a retry',
+            }
+          : {}),
       });
 
       return c.json({
         restoreJobId: persistedRestoreJob?.id ?? null,
         status: persistedRestoreJob?.status ?? restoreStatus,
+        tokenConsumed,
       });
     });
   }

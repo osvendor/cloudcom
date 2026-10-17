@@ -674,6 +674,42 @@ describe('migration filename conventions', () => {
     expect(hasNoTransactionDirective(readFileSync(path.join(dir, files[c]!), 'utf8'))).toBe(false);
   });
 
+  it('#4547 W01: the block-hours migrations sort 100000 < 100100 < 100200 < 100300; the enum file is one statement; only the time_entries file is no-transaction and validates its constraints', () => {
+    const dir = path.join(__dirname, '../../migrations');
+    const names = [
+      '2026-12-17-100000-contract-line-type-hour-block.sql',
+      '2026-12-17-100100-contract-lines-hour-block.sql',
+      '2026-12-17-100200-contract-hour-periods.sql',
+      '2026-12-17-100300-time-entries-contract-line.sql',
+    ];
+    const sorted = readdirSync(dir).filter((f) => /^\d{4}-.*\.sql$/.test(f)).sort((a, b) => a.localeCompare(b));
+    const at = names.map((n) => sorted.indexOf(n));
+    expect(at.every((i) => i > -1)).toBe(true);
+    expect([...at].sort((a, b) => a - b)).toEqual(at);
+    // The block-hours files sit after the ceiling they were implemented against.
+    expect(names[0]!.localeCompare('2026-12-15-100000-portal-hardware-inventory-flag.sql')).toBeGreaterThan(0);
+    const body = (n: string) => readFileSync(path.join(dir, n), 'utf8');
+    // A value added by ADD VALUE cannot be used in the same transaction, so this file holds nothing else.
+    expect(splitSqlStatements(body(names[0]!))).toEqual([
+      "ALTER TYPE public.contract_line_type ADD VALUE IF NOT EXISTS 'hour_block'",
+    ]);
+    expect(names.map((n) => hasNoTransactionDirective(body(n)))).toEqual([false, false, false, true]);
+    // The hot-table file adds NOT VALID and validates as separate statements.
+    const entries = splitSqlStatements(body(names[3]!));
+    expect(entries.filter((s) => /VALIDATE CONSTRAINT/.test(s))).toHaveLength(3);
+    expect(entries.some((s) => /\bNOT VALID\b/.test(s))).toBe(true);
+    expect(entries.some((s) => /^SET lock_timeout/i.test(s))).toBe(true);
+    // The CONCURRENTLY build runs without the timeout (RESET first), and an
+    // INVALID leftover makes the file fail instead of being recorded as applied.
+    const reset = entries.findIndex((s) => /^RESET lock_timeout/i.test(s));
+    const cic = entries.findIndex((s) => /CREATE INDEX CONCURRENTLY/i.test(s));
+    expect(reset).toBeGreaterThan(-1);
+    expect(cic).toBeGreaterThan(reset);
+    expect(entries.slice(cic + 1).some((s) => /NOT i\.indisvalid/.test(s) && /RAISE EXCEPTION/.test(s))).toBe(true);
+    // No file writes a row (no scope election needed).
+    for (const n of names) expect(body(n)).not.toMatch(/^\s*(INSERT\s+INTO|UPDATE\s+\w|DELETE\s+FROM)\b/im);
+  });
+
   it('adds no new migration to the closed 2026-08-06 reserved block', () => {
     const onDisk = listMigrationFilenames().filter((filename) =>
       filename.startsWith(RESERVED_MIGRATION_DATE),
@@ -977,6 +1013,19 @@ describe('migration ordering vs a remote ref (--against-ref, pre-push guard)', (
 });
 
 describe('core migration ordering', () => {
+  it('defers the immutable CloudCom index until its upstream column exists', () => {
+    const index = '2026-10-14-223000-cloudcom-monitor-lookup-indexes.sql';
+    const dependency = '2026-10-16-181300-monitor-coverage-kinds.sql';
+    const files = ['0001-baseline.sql', index, '2026-10-15-other.sql', dependency, '2026-10-17-other.sql'];
+    const original = [...files];
+    const names = planMigrations(files).map((entry) => entry.ledgerName);
+    expect(files).toEqual(original);
+    expect(names).toEqual([files[0], files[2], dependency, index, files[4]]);
+    expect(planMigrations(names).map((entry) => entry.ledgerName)).toEqual(names);
+    expect(() => planMigrations([index])).toThrow('Missing migration prerequisite');
+    expect(planMigrations(['0001-baseline.sql'])).toHaveLength(1);
+  });
+
   it('discovers the report site-scope migration exactly once in lexical order', () => {
     const ledgerNames = planMigrations(listMigrationFilenames()).map(
       (migration) => migration.ledgerName,
@@ -984,7 +1033,12 @@ describe('core migration ordering', () => {
     const reserved = '2026-08-06-a-report-site-scope.sql';
 
     expect(ledgerNames.filter((filename) => filename === reserved)).toHaveLength(1);
-    expect(ledgerNames).toEqual([...ledgerNames].sort((a, b) => a.localeCompare(b)));
+    const indexMigration = '2026-10-14-223000-cloudcom-monitor-lookup-indexes.sql';
+    const lexical = ledgerNames.filter((name) => name !== indexMigration);
+    expect(lexical).toEqual([...lexical].sort((a, b) => a.localeCompare(b)));
+    expect(ledgerNames.indexOf(indexMigration)).toBe(
+      ledgerNames.indexOf('2026-10-16-181300-monitor-coverage-kinds.sql') + 1,
+    );
     // This file opens the reserved block. The block's membership is guarded by
     // 'migration filename conventions' above — deliberately NOT here, so a
     // squatter reds a test whose name says what is wrong instead of this one.

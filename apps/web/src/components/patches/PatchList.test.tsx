@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import '@/lib/i18n';
 
 import PatchList, { type Patch } from './PatchList';
@@ -467,5 +467,48 @@ describe('PatchList install failure overlay (#4223)', () => {
     const desktop = within(screen.getByTestId('responsive-table-desktop'));
     expect(desktop.queryByTestId(`patch-row-${patch.id}-install-failed`)).toBeNull();
     expect(desktop.getByText('Pending')).toBeTruthy();
+  });
+});
+
+// #7800: a patch with no release date (every APT patch) said nothing true in
+// the Release column — it used to show the catalog import date instead.
+describe('PatchList release column (#7800)', () => {
+  it('renders "Unknown" for a patch with no release date, on both surfaces', () => {
+    const patch = makePatch({ id: 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee', releaseDate: '' });
+    render(<PatchList patches={[patch]} />);
+
+    const desktop = within(screen.getByTestId('responsive-table-desktop'));
+    expect(desktop.getByTestId(`patch-row-${patch.id}-release`).textContent).toBe('Unknown');
+    const mobile = within(screen.getByTestId('responsive-table-cards'));
+    expect(mobile.getByTestId(`patch-row-${patch.id}-release`).textContent).toBe('Unknown');
+  });
+
+  it('renders the formatted date when the patch has one', () => {
+    const patch = makePatch({ id: 'ffffffff-ffff-ffff-ffff-ffffffffffff', releaseDate: '2026-02-07T12:00:00.000Z' });
+    render(<PatchList patches={[patch]} />);
+
+    const desktop = within(screen.getByTestId('responsive-table-desktop'));
+    expect(desktop.getByTestId(`patch-row-${patch.id}-release`).textContent)
+      .toBe(new Date('2026-02-07T12:00:00.000Z').toLocaleDateString());
+  });
+});
+
+// Date-only ISO strings parse as UTC midnight, so west-of-UTC zones rendered the
+// release date one calendar day early (2026-09-15 -> 9/14/2026).
+describe('PatchList release date is timezone-stable for date-only values', () => {
+  const originalTz = process.env.TZ;
+  beforeAll(() => { process.env.TZ = 'America/Los_Angeles'; });
+  afterAll(() => {
+    if (originalTz === undefined) delete process.env.TZ; else process.env.TZ = originalTz;
+  });
+
+  it('renders 2026-09-15 as that calendar date in a US timezone', () => {
+    expect(new Date('2026-09-15T12:00:00Z').getTimezoneOffset()).toBeGreaterThan(0);
+    const patch = makePatch({ id: '11111111-aaaa-aaaa-aaaa-111111111111', releaseDate: '2026-09-15' });
+    render(<PatchList patches={[patch]} />);
+
+    const desktop = within(screen.getByTestId('responsive-table-desktop'));
+    expect(desktop.getByTestId(`patch-row-${patch.id}-release`).textContent)
+      .toBe(new Date(2026, 8, 15).toLocaleDateString());
   });
 });

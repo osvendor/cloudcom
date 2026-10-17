@@ -36,6 +36,13 @@ vi.mock('./ApproverDevicesSection', () => ({
   default: () => null,
 }));
 
+// TicketPushoverSettings fetches /users/me/ticket-pushover on mount; stub it so
+// it doesn't consume from this file's fetchWithAuth mocks. Its own behavior is
+// covered by TicketPushoverSettings.test.tsx.
+vi.mock('./TicketPushoverSettings', () => ({
+  default: () => null,
+}));
+
 const fetchWithAuthMock = vi.mocked(fetchWithAuth);
 
 const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500): Response =>
@@ -704,6 +711,9 @@ describe('ProfilePage — SSO re-authentication enrollment (#4018)', () => {
     ['provider_inactive', 'no longer available for this account'],
     ['config_changed', 'settings changed while you were verifying'],
     ['email_unverified', 'email address is not verified'],
+    // #8862: the IdP's id_token failed verification (e.g. Entra's already-
+    // expired max_age=0 token). Points at the server logs, where the claims are.
+    ['idp_verify_failed', 'could not verify the sign-in your identity provider returned'],
   ])('toasts a specific message for the %s callback error', async (code, fragment) => {
     window.history.replaceState(null, '', `/settings/profile?ssoReauthError=${code}`);
 

@@ -19,10 +19,7 @@ import {
   updateContractLineSchema,
 } from '@breeze/shared';
 import { zValidator } from '../../lib/validation';
-import {
-  withDbAccessContext,
-  type DbAccessContext,
-} from '../../db';
+import { hourBlockStampedKeyHook } from '../../services/contractHourBlockLocked';
 import {
   requirePartnerApiScope,
   type PartnerApiPrincipalContext,
@@ -38,21 +35,11 @@ import {
   contractLineAuditDetails,
 } from '../../services/contractService';
 import { ContractServiceError, type ContractActor, type ContractLineAudit } from '../../services/contractTypes';
+import { inPartnerContext } from './dbContext';
 
 const idParam = z.object({ id: z.string().uuid() });
 const lineParam = z.object({ id: z.string().uuid(), lineId: z.string().uuid() });
 const writeScope = requirePartnerApiScope('contracts:write');
-
-function partnerScopedDbContext(principal: PartnerApiPrincipalContext): DbAccessContext {
-  return {
-    scope: 'partner',
-    orgId: null,
-    accessibleOrgIds: principal.accessibleOrgIds,
-    accessiblePartnerIds: [principal.partnerId],
-    currentPartnerId: principal.partnerId,
-    userId: null,
-  };
-}
 
 function actorFrom(principal: PartnerApiPrincipalContext): ContractActor {
   return {
@@ -118,10 +105,6 @@ function auditLine(
     resourceName: a.contractName,
     details: contractLineAuditDetails(a),
   });
-}
-
-async function inPartnerContext<T>(principal: PartnerApiPrincipalContext, fn: () => Promise<T>): Promise<T> {
-  return withDbAccessContext(partnerScopedDbContext(principal), fn);
 }
 
 export const partnerContractRoutes = new Hono();
@@ -214,7 +197,7 @@ partnerContractRoutes.patch(
   '/contracts/:id/lines/:lineId',
   writeScope,
   zValidator('param', lineParam),
-  zValidator('json', updateContractLineSchema),
+  zValidator('json', updateContractLineSchema, hourBlockStampedKeyHook),
   async (c) => {
     const principal = c.get('partnerApiPrincipal');
     const p = c.req.valid('param');
@@ -242,7 +225,7 @@ partnerContractRoutes.delete(
         removeContractLine(p.id, p.lineId, actorFrom(principal)),
       );
       auditLine(c, principal, 'contract.line.removed', audit);
-      return c.json({ data: { ok: true } });
+      return c.json({ data: { ok: true, retired: audit.retired === true } });
     } catch (err) {
       return handleContractError(c, err);
     }

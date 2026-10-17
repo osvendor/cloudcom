@@ -19,6 +19,7 @@ vi.mock('@/lib/navigation', () => ({ navigateTo: vi.fn() }));
 // cost — neither the cost nor the hidden component may surface on the customer
 // document.
 const detail: InvoiceDetailData = {
+  autopay: null,
   invoice: {
     id: 'inv-1', invoiceNumber: 'INV-0007', orgId: 'org-1', siteId: null, status: 'sent',
     currencyCode: 'USD', issueDate: '2026-06-01', dueDate: '2026-06-30', sentAt: null, subtotal: '120.00',
@@ -213,5 +214,69 @@ describe('InvoiceDocument — ticket grouping and labeling (#3319)', () => {
     expect(screen.queryByText(/Ticket #/)).not.toBeInTheDocument();
     expect(screen.queryByText(/Ticket work/)).not.toBeInTheDocument();
     expect(screen.getByText('Cloud Backup')).toBeInTheDocument();
+  });
+});
+
+// #8604: labor line detail — date / note / worked-time / per-day grouping.
+describe('InvoiceDocument — time-entry line detail (#8604)', () => {
+  const base = detail.lines[0]!;
+  const te = (id: string, workDate: string | null, qty: string, total: string, extra: Record<string, unknown> = {}) => ({
+    ...base, id, sourceType: 'time_entry' as const, catalogItemId: null, name: null, description: `Note ${id}`,
+    quantity: qty, unitPrice: '100.00', lineTotal: total, workDate, ...extra,
+  });
+  const part = { ...base, id: 'part', sourceType: 'catalog' as const, name: 'Cable', description: 'Cat6 patch', workDate: null, sortOrder: 9 };
+  const mk = (lines: unknown[], lineDetail?: unknown) =>
+    ({ ...detail, lines, ...(lineDetail ? { lineDetail } : {}) }) as unknown as InvoiceDetailData;
+  const on = { grouping: 'entry', showDate: true, showNote: true, showWorkedTime: true };
+
+  it('without lineDetail renders exactly as before (no date, note, worked note)', () => {
+    render(<InvoiceDocument detail={mk([te('a', '2026-09-16', '1.50', '150.00', { workedMinutes: 110, sortOrder: 0 })])} customerName="Acme" />);
+    expect(screen.getByText('Note a')).toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-document-line-date-a')).not.toBeInTheDocument();
+    expect(screen.getByTestId('invoice-document-line-worked-vs-billed-a')).toBeInTheDocument();
+  });
+
+  it('showDate prints the date only on dated lines', () => {
+    render(<InvoiceDocument detail={mk([
+      te('a', '2026-09-16', '1.00', '100.00', { sortOrder: 0 }),
+      { ...part, sortOrder: 1 },
+    ], on)} customerName="Acme" />);
+    expect(screen.getByTestId('invoice-document-line-date-a')).toHaveTextContent('Sep 16, 2026');
+    expect(screen.queryByTestId('invoice-document-line-date-part')).not.toBeInTheDocument();
+  });
+
+  it('day grouping: ascending headers with day hours and amount, undated last, no per-line dates', () => {
+    render(<InvoiceDocument detail={mk([
+      te('a', '2026-09-17', '1.00', '100.00', { sortOrder: 0 }),
+      te('b', '2026-09-16', '1.50', '150.00', { sortOrder: 1 }),
+      te('c', '2026-09-16', '0.50', '50.00', { sortOrder: 2 }),
+      { ...part, sortOrder: 3 },
+    ], { ...on, grouping: 'day' })} customerName="Acme" />);
+    const d16 = screen.getByTestId('invoice-document-day-2026-09-16');
+    const d17 = screen.getByTestId('invoice-document-day-2026-09-17');
+    expect(d16).toHaveTextContent('Sep 16, 2026');
+    expect(d16).toHaveTextContent('$200.00');
+    expect(d16.querySelector('td:nth-child(2)')?.textContent).toBe('2');
+    expect(d16.compareDocumentPosition(d17) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.queryByTestId('invoice-document-line-date-a')).not.toBeInTheDocument();
+    expect(screen.getByText('Cable')).toBeInTheDocument();
+    expect(screen.queryByTestId('invoice-document-day-null')).not.toBeInTheDocument();
+  });
+
+  it('note OFF prints Labor for time-entry lines but leaves other lines alone', () => {
+    render(<InvoiceDocument detail={mk([
+      te('a', '2026-09-16', '1.00', '100.00', { sortOrder: 0 }),
+      { ...part, sortOrder: 1 },
+    ], { ...on, showNote: false })} customerName="Acme" />);
+    expect(screen.queryByText('Note a')).not.toBeInTheDocument();
+    expect(screen.getByText('Labor')).toBeInTheDocument();
+    expect(screen.getByText('Cable')).toBeInTheDocument();
+    expect(screen.getByText('Cat6 patch')).toBeInTheDocument();
+  });
+
+  it('worked time OFF hides the worked-vs-billed note', () => {
+    render(<InvoiceDocument detail={mk([te('a', '2026-09-16', '1.50', '150.00', { workedMinutes: 110, sortOrder: 0 })],
+      { ...on, showWorkedTime: false })} customerName="Acme" />);
+    expect(screen.queryByTestId('invoice-document-line-worked-vs-billed-a')).not.toBeInTheDocument();
   });
 });

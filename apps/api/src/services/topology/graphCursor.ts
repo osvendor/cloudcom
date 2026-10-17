@@ -20,13 +20,20 @@ export const nodeListQuerySchema = z.object({
 }).strict();
 export type NodeListQuery = z.input<typeof nodeListQuerySchema>;
 const filterSchema = z.union([graphQuerySchema, nodeListQuerySchema.omit({ cursor: true })]);
+/**
+ * A grouped-overview card (#7818): its kind and the SHA-256 of its internal grouping key
+ * (presentationGroups.ts). Membership is re-resolved from the complete site on use, under
+ * the same revision binding as every other claim; the token never carries member ids.
+ */
+const groupClaimSchema = z.object({ kind: z.enum(['network', 'gateway', 'unidentified', 'hidden']), key: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 const claimsSchema = topologyScopeSchema.extend({
   version: z.literal(1), kind: z.enum(['graph', 'nodes', 'evidence']), authority: z.string().regex(/^[a-f0-9]{64}$/),
   graphRevision: z.string().regex(/^(0|[1-9]\d*)$/), filter: filterSchema,
   after: z.string().uuid().optional(), edgeAfter: z.string().uuid().optional(),
   boundaryAfter: z.string().uuid().optional(), boundaryOnly: z.boolean().optional(),
-  relationshipId: z.string().uuid().optional(), expiresAt: z.number().int().nonnegative(),
-}).strict();
+  relationshipId: z.string().uuid().optional(), group: groupClaimSchema.optional(), expiresAt: z.number().int().nonnegative(),
+}).strict().refine((claims) => !claims.group || (claims.kind === 'graph' && 'view' in claims.filter
+  && claims.filter.view !== 'physical' && !claims.filter.focusNodeId), { message: 'A group claim scopes only an unfocused, grouped graph read' });
 export type GraphTokenClaims = z.infer<typeof claimsSchema>;
 const DOMAIN = 'topology-read-cursor:v1';
 const invalidToken = () => new GraphReadError('invalid_topology_cursor', 400, 'Invalid or expired topology cursor');
@@ -83,7 +90,12 @@ export async function graphAuthority(ctx: TopologyRequestContext) {
       orgs: sorted(p.allowedOrgIds), sites: sorted(p.allowedSiteIds),
     })),
   })).digest('hex');
-  return { digest, physical, interfaceHealth, canEdit: topologyPermissionPairs('write').every(([r, a]) => hasPermission(current, r, a) && hasPermission(ctx.permissions, r, a)) };
+  // `current` is the live permission re-read above; presence's site gate (presenceVisibility.ts) reuses it rather
+  // than fetching twice.
+  return { digest, physical, interfaceHealth, current, canEdit: topologyPermissionPairs('write').every(([r, a]) => hasPermission(current, r, a) && hasPermission(ctx.permissions, r, a)),
+    // Site location W3: gates "Move to <site>" / "Keep at <site>" in the UI. The routes re-check devices:write and MFA, plus
+    // both sites for a move and the device's own site for a confirmation.
+    canMoveDevices: hasPermission(current, 'devices', 'write') && hasPermission(ctx.permissions, 'devices', 'write') };
 }
 /** Weak validator ignores response assembly time; revisions, projection and authority remain included. */
 export function topologyReadEtag(authority: string, value: unknown): string {

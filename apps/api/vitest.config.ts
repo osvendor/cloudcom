@@ -5,7 +5,7 @@ import path from 'path';
 export default defineConfig({
   resolve: {
     alias: {
-      '@breeze/shared': path.resolve(__dirname, '../../packages/shared/src'),
+      '@breeze/shared': path.resolve(import.meta.dirname, '../../packages/shared/src'),
     },
   },
   test: {
@@ -16,8 +16,16 @@ export default defineConfig({
     maxWorkers: Math.max(1, Math.min(4, Math.floor(availableParallelism() / 2))),
     include: ['src/**/*.test.ts', 'scripts/**/*.test.ts'],
     exclude: [
+      'src/services/accounting/accountingFeePush.integration.test.ts',
+      'src/index.autopay.integration.test.ts',
+      'src/db/schema/autopaySetupAttempts.integration.test.ts',
+      'src/services/autopay/enrollmentService.integration.test.ts',
+      'src/services/autopay/cardExpiryCheck.integration.test.ts',
+      // Charging locks/replay require real PostgreSQL (never the unit DB mocks).
+      'src/services/autopay/charging.integration.test.ts',
       'src/services/autopay/**/*.integration.test.ts',
       'src/jobs/scriptVerifyReconciliation.integration.test.ts',
+      'src/services/scriptProposals/reviewConcurrency.integration.test.ts',
       'src/__tests__/integration/**',
       // Real bearer + PostgreSQL integration connection authority checks.
       'src/routes/integrationConnectionScope.integration.test.ts',
@@ -56,10 +64,14 @@ export default defineConfig({
       // Belongs to vitest.integration.config.ts.
       'src/services/hardwareHealth/**/*.integration.test.ts',
       'src/services/timeSync/**/*.integration.test.ts',
+      'src/services/workloads/**/*.integration.test.ts',
+      // Workload image currency W05 (#8194): real-DB pass + system-only cache proof.
+      'src/services/imageCurrency/**/*.integration.test.ts',
       // Hardware & RAID monitoring (W05 BMC in-band): use real PostgreSQL and
       // the integration setup.
       'src/services/discovery/agentReportedBmcLink.integration.test.ts',
       'src/jobs/discoveryWorker.bmc.integration.test.ts',
+      'src/jobs/discoveryWorker.dispatchAfterCommit.integration.test.ts',
       'src/services/topology/bmc.integration.test.ts',
       // Suppression-expiry reaper real-DB test: imports `__tests__/integration/setup`
       // (real postgres pool + autoMigrate in its beforeAll), so the unit runner's
@@ -195,6 +207,8 @@ export default defineConfig({
       'src/routes/installerRotationRevocation.integration.test.ts',
       // Disposable-database credential cutover proof uses the integration runner.
       'src/db/installerBootstrapCredentialGeneration.migration.integration.test.ts',
+      // Disposable-database proof for the quarantine execution-authority migration.
+      'src/db/securityQuarantineExecutionAuthorityMigration.integration.test.ts',
       // Hardware & RAID monitoring (W03): disposable-database replay proof for
       // the monitor-kind enum and alert subject-identity migrations. Belongs to
       // vitest.integration.config.ts (registered in its include list).
@@ -224,6 +238,12 @@ export default defineConfig({
       // not export it). Belongs to vitest.integration.config.ts (already in
       // its include list).
       'src/services/portal/networkVisibilityReadModel.integration.test.ts',
+      // #7731 portal hardware health: real-DB test, belongs to vitest.integration.config.ts.
+      'src/services/portal/hardwareHealthReadModel.integration.test.ts',
+      // #7732 portal hardware inventory: real-DB test, belongs to vitest.integration.config.ts.
+      'src/services/portal/hardwareInventoryReadModel.integration.test.ts',
+      // #7733 portal performance metrics: real-DB test, belongs to vitest.integration.config.ts.
+      'src/services/portal/performanceReadModel.integration.test.ts',
       // Canary for issue #4046: asserts the process observes a non-UTC
       // offset. It must ONLY run under the pinned non-UTC pass
       // (vitest.config.tz.ts, TZ=America/Denver), where it belongs — it is

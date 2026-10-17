@@ -2628,7 +2628,7 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
           '400': { description: 'Invalid input (e.g. target site not in target org, target org equals source)' },
           '403': { description: 'Access denied: target org or cross-partner move without system scope; `Interactive user session required` for machine principals; `MFA_REQUIRED` for a non-assured session; `STEP_UP_REQUIRED` when the step-up grant is missing, stale, mismatched or already consumed' },
           '404': { description: 'Device or target organization not found' },
-          '409': { description: 'Move blocked: `TICKET_MOVE_CURRENCY_BLOCKED` (unbilled ticket money in another currency; resend with acceptCurrencyMismatch), `DELIVERABLE_TICKET_PINNED`, or `PAM_DEVICE_MOVE_BLOCKED`' },
+          '409': { description: 'Move blocked: `TICKET_MOVE_CURRENCY_BLOCKED` (unbilled ticket money in another currency; resend with acceptCurrencyMismatch), `DELIVERABLE_TICKET_PINNED`, `HOUR_BLOCK_DRAWN_TIME` (a ticket carries time drawn from a block of prepaid hours), `APPROVAL_REQUEST_PENDING` (a ticket has a pending customer approval request), or `PAM_DEVICE_MOVE_BLOCKED`' },
           '503': { description: 'Step-up binding could not be established (auth state or session id unavailable); retry' },
         },
       },
@@ -4754,6 +4754,60 @@ API requests are rate-limited to ensure fair usage. Rate limit headers are inclu
               }
             }
           }
+        }
+      }
+    },
+    '/remote/devices/{deviceId}/active-sessions': {
+      get: {
+        operationId: 'listDeviceActiveRemoteSessions',
+        tags: ['Remote'],
+        summary: 'List live remote sessions on a device (all users)',
+        description:
+          'Informational: who is connected to the device right now (remote sessions plus live VNC tunnels; empty while the device is offline or its heartbeat is stale). Same org/site gate as starting a session. ' +
+          'Returns no session or user ids. Colleague emails are null unless the caller holds users:read.',
+        parameters: [
+          { name: 'deviceId', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } }
+        ],
+        responses: {
+          '200': {
+            description: 'Live sessions on the device, ordered by creation time, newest first (max 50 rows)',
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    data: {
+                      type: 'array',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          type: { type: 'string', enum: ['terminal', 'desktop', 'file_transfer', 'vnc'] },
+                          status: { type: 'string', enum: ['pending', 'connecting', 'active'] },
+                          elapsedSeconds: { type: 'integer', description: 'Server-computed seconds since the session was opened' },
+                          isCurrentUser: { type: 'boolean' },
+                          userKey: { type: 'integer', description: 'Opaque per-response key, one per distinct user (not a user id)' },
+                          user: {
+                            type: 'object',
+                            properties: {
+                              name: { type: 'string', nullable: true },
+                              email: { type: 'string', nullable: true }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          '400': { $ref: '#/components/responses/BadRequest' },
+          '401': { $ref: '#/components/responses/Unauthorized' },
+          '403': {
+            description: 'code ACCESS_DENIED: the device is outside the caller\'s site allowlist. code MFA_REQUIRED: the caller must complete MFA. No code: the caller lacks remote:access or devices:read, or the token scope is not allowed.',
+            content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } }
+          },
+          '404': { $ref: '#/components/responses/NotFound' }
         }
       }
     },

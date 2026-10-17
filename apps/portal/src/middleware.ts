@@ -148,10 +148,29 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // must never land in referrer headers, shared caches, or search indexes.
   // strict-origin-when-cross-origin (the base policy) still sends the full
   // token url on same-origin navigation — no-referrer does not.
-  if (pathname.startsWith('/quote/') || pathname.startsWith('/invoice/') || pathname === '/remote/native') {
+  if (pathname.startsWith('/quote/') || pathname.startsWith('/invoice/') || pathname === '/remote/native' || pathname.startsWith('/autopay/')) {
     headers.set('Referrer-Policy', 'no-referrer');
     headers.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
     headers.set('Cache-Control', 'no-store');
+  }
+
+  // Public trust pages (spec trust-center §8): shareable and cacheable, unlike token pages. The
+  // layout owns the robots meta from the page's search_indexable flag; the header mirrors the
+  // conservative default so a crawler that ignores meta still gets noindex unless the page opted in
+  // (the API sets X-Robots-Tag on the data itself). Previews are drafts: never cached, never indexed.
+  if (pathname.startsWith('/trust/preview/')) {
+    headers.set('Cache-Control', 'no-store');
+    headers.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    headers.set('Referrer-Policy', 'no-referrer');
+  } else if (pathname.startsWith('/trust/')) {
+    // Only a fully loaded card page is shareable-cacheable; 404s and the degraded
+    // shell (card fetch failed) must not be pinned in shared caches.
+    headers.set(
+      'Cache-Control',
+      response.status === 200 && context.locals.trustCacheable === true
+        ? 'public, max-age=300, stale-while-revalidate=600'
+        : 'no-store'
+    );
   }
 
   // #3906 — dev only: Astro hardcodes a few dev-server URLs straight into the

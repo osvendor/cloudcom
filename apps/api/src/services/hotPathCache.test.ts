@@ -1,0 +1,601 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const dbState = vi.hoisted(() => ({
+  inContext: false,
+  deferred: [] as Array<() => unknown>,
+  // Commit-only work (runAfterDbContextCommit): flush to model COMMIT, discard to model ROLLBACK.
+  committed: [] as Array<() => unknown>,
+  scope: undefined as 'system' | 'organization' | 'partner' | undefined,
+  ctx: undefined as Record<string, unknown> | undefined,
+}));
+
+vi.mock('../db', () => ({
+  hasDbAccessContext: () => dbState.inContext,
+  getCurrentDbAccessContext: () => dbState.ctx ?? (dbState.scope ? { scope: dbState.scope } : undefined),
+  // Inside a context the real helper defers until the transaction settles;
+  // tests flush `deferred` to model the COMMIT.
+  runAfterDbContextExit: (_label: string, work: () => unknown) => {
+    if (dbState.inContext) dbState.deferred.push(work);
+    else work();
+  },
+  runAfterDbContextCommit: (_label: string, work: () => unknown) => {
+    if (dbState.inContext) dbState.committed.push(work);
+    else work();
+  },
+}));
+
+import { DeferredCacheFills, HotPathTtlCache, fillScopeIsCacheable, __resetHotPathCachesForTests } from './hotPathCache';
+import { ClusterCacheBus, __setClusterCacheBusForTests } from './clusterCacheBus';
+import { getClusterCacheTarget } from './clusterCacheRegistry';
+import { metricsRegistry } from './metricsRegistry';
+
+const T0 = Date.parse('2026-10-07T12:00:00Z');
+
+function makeCache(overrides: Partial<{ ttlMs: number; maxEntries: number }> = {}) {
+  return new HotPathTtlCache<string, { v: string }>({
+    name: 'test',
+    ttlMs: overrides.ttlMs ?? 60_000,
+    maxEntries: overrides.maxEntries ?? 100,
+  });
+}
+
+describe('HotPathTtlCache (#8053)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(T0);
+    dbState.inContext = false;
+    dbState.deferred = [];
+    dbState.scope = undefined;
+    dbState.ctx = undefined;
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('serves a hit inside the TTL and reloads once it has elapsed', async () => {
+    const cache = makeCache();
+    const load = vi.fn()
+      .mockResolvedValueOnce({ v: 'first' })
+      .mockResolvedValueOnce({ v: 'second' });
+
+    expect(await cache.getOrLoad('k', load)).toEqual({ v: 'first' });
+    vi.setSystemTime(T0 + 59_999);
+    expect(await cache.getOrLoad('k', load)).toEqual({ v: 'first' });
+    expect(load).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(T0 + 60_000);
+    expect(await cache.getOrLoad('k', load)).toEqual({ v: 'second' });
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps keys apart: one key is never served for another', async () => {
+    const cache = makeCache();
+    await cache.getOrLoad('org-a', async () => ({ v: 'a' }));
+    expect(await cache.getOrLoad('org-b', async () => ({ v: 'b' }))).toEqual({ v: 'b' });
+    expect(await cache.getOrLoad('org-a', async () => ({ v: 'stale?' }))).toEqual({ v: 'a' });
+  });
+
+  it('invalidate(key) drops only that key; invalidate() drops everything', async () => {
+    const cache = makeCache();
+    await cache.getOrLoad('a', async () => ({ v: 'a1' }));
+    await cache.getOrLoad('b', async () => ({ v: 'b1' }));
+
+    cache.invalidate('a');
+    expect(await cache.getOrLoad('a', async () => ({ v: 'a2' }))).toEqual({ v: 'a2' });
+    expect(await cache.getOrLoad('b', async () => ({ v: 'b2' }))).toEqual({ v: 'b1' });
+
+    cache.invalidate();
+    expect(await cache.getOrLoad('b', async () => ({ v: 'b3' }))).toEqual({ v: 'b3' });
+  });
+
+  it('never caches a failed load', async () => {
+    const cache = makeCache();
+    const load = vi.fn()
+      .mockRejectedValueOnce(new Error('db down'))
+      .mockResolvedValueOnce({ v: 'ok' });
+
+    await expect(cache.getOrLoad('k', load)).rejects.toThrow('db down');
+    expect(await cache.getOrLoad('k', load)).toEqual({ v: 'ok' });
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it('honours shouldCache: a declined value is returned but reloaded next time', async () => {
+    const cache = new HotPathTtlCache<string, boolean>({ name: 'absence', ttlMs: 60_000, maxEntries: 10 });
+    const load = vi.fn().mockResolvedValue(true);
+    const onlyAbsence = { shouldCache: (present: boolean) => !present };
+
+    expect(await cache.getOrLoad('d', load, onlyAbsence)).toBe(true);
+    expect(await cache.getOrLoad('d', load, onlyAbsence)).toBe(true);
+    expect(load).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not store a load that an invalidation raced', async () => {
+    const cache = makeCache();
+    let release!: (value: { v: string }) => void;
+    const inFlight = cache.getOrLoad('k', () => new Promise((resolve) => { release = resolve; }));
+
+    cache.invalidate('k'); // a writer commits while the read is in flight
+    release({ v: 'pre-change' });
+    expect(await inFlight).toEqual({ v: 'pre-change' }); // its own caller still gets it
+
+    expect(await cache.getOrLoad('k', async () => ({ v: 'post-change' }))).toEqual({ v: 'post-change' });
+  });
+
+  it('invalidateAroundCommit drops again after the writer commits, beating a read of pre-commit rows', async () => {
+    const cache = makeCache();
+    await cache.getOrLoad('k', async () => ({ v: 'old' }));
+
+    // The writer, inside its transaction, invalidates before COMMIT.
+    dbState.inContext = true;
+    cache.invalidateAroundCommit('k');
+    dbState.inContext = false;
+
+    // A concurrent reader (outside any context) re-reads before the COMMIT
+    // lands and still sees the old row; it gets cached...
+    expect(await cache.getOrLoad('k', async () => ({ v: 'old' }))).toEqual({ v: 'old' });
+
+    // ...until the COMMIT settles and the deferred second drop runs.
+    for (const work of dbState.deferred.splice(0)) work();
+    expect(await cache.getOrLoad('k', async () => ({ v: 'new' }))).toEqual({ v: 'new' });
+  });
+
+  it('is bypassed entirely inside an ambient DB context (no read, no write)', async () => {
+    const cache = makeCache();
+    await cache.getOrLoad('k', async () => ({ v: 'top-level' }));
+
+    dbState.inContext = true;
+    // Not served from the cache: the caller's transaction (its RLS scope and
+    // its uncommitted writes) must answer...
+    expect(await cache.getOrLoad('k', async () => ({ v: 'in-tx' }))).toEqual({ v: 'in-tx' });
+    dbState.inContext = false;
+
+    // ...and that in-transaction read was not stored.
+    expect(await cache.getOrLoad('k', async () => ({ v: 'unused' }))).toEqual({ v: 'top-level' });
+  });
+
+  it('evicts the oldest entry past maxEntries', async () => {
+    const cache = makeCache({ maxEntries: 2 });
+    await cache.getOrLoad('a', async () => ({ v: 'a' }));
+    await cache.getOrLoad('b', async () => ({ v: 'b' }));
+    await cache.getOrLoad('c', async () => ({ v: 'c' }));
+
+    expect(cache.size).toBe(2);
+    expect(await cache.getOrLoad('a', async () => ({ v: 'a-reloaded' }))).toEqual({ v: 'a-reloaded' });
+    expect(await cache.getOrLoad('c', async () => ({ v: 'unused' }))).toEqual({ v: 'c' });
+  });
+
+  it('rejects a non-positive TTL or size', () => {
+    expect(() => new HotPathTtlCache({ name: 'bad', ttlMs: 0, maxEntries: 1 })).toThrow(/ttlMs/);
+    expect(() => new HotPathTtlCache({ name: 'bad', ttlMs: 1, maxEntries: 0 })).toThrow(/maxEntries/);
+  });
+
+  it('__resetHotPathCachesForTests empties every registered cache', async () => {
+    const a = makeCache();
+    const b = makeCache();
+    await a.getOrLoad('k', async () => ({ v: 'a' }));
+    await b.getOrLoad('k', async () => ({ v: 'b' }));
+
+    __resetHotPathCachesForTests();
+
+    expect(a.size).toBe(0);
+    expect(b.size).toBe(0);
+  });
+});
+
+describe('HotPathTtlCache deferred fills (#8053 W1a-1)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(T0);
+    dbState.inContext = false;
+    dbState.scope = undefined;
+    dbState.ctx = undefined;
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it('peek never loads and honours the TTL', async () => {
+    const cache = makeCache({ ttlMs: 1_000 });
+    expect(cache.peek('a')).toBeUndefined();
+    await cache.getOrLoad('a', async () => ({ v: '1' }));
+    expect(cache.peek('a')).toEqual({ v: '1' });
+    vi.setSystemTime(T0 + 1_001);
+    expect(cache.peek('a')).toBeUndefined();
+  });
+
+  it('fillIfCurrent stores only when no invalidate() ran since the ticket', () => {
+    const cache = makeCache();
+    const ticket = cache.ticket();
+    cache.fillIfCurrent('a', { v: '1' }, ticket);
+    expect(cache.peek('a')).toEqual({ v: '1' });
+
+    const stale = cache.ticket();
+    cache.invalidate('b');
+    cache.fillIfCurrent('a', { v: '2' }, stale);
+    expect(cache.peek('a')).toEqual({ v: '1' });
+  });
+
+  it('fillIfCurrent refuses to run inside a DB context (the load has not committed)', () => {
+    const cache = makeCache();
+    dbState.inContext = true;
+    expect(() => cache.fillIfCurrent('a', { v: '1' }, cache.ticket())).toThrow(/inside a DB context/);
+  });
+
+  it('through: a hit never loads; a miss in a SYSTEM context loads now and stores only on flush', async () => {
+    const cache = makeCache();
+    const fills = new DeferredCacheFills();
+    dbState.inContext = true;
+    dbState.scope = 'system';
+    const load = vi.fn(async () => ({ v: 'loaded' }));
+
+    await expect(fills.through(cache, 'org-1', load)).resolves.toEqual({ v: 'loaded' });
+    expect(cache.peek('org-1')).toBeUndefined();
+
+    dbState.inContext = false;
+    fills.flush();
+    expect(cache.peek('org-1')).toEqual({ v: 'loaded' });
+
+    dbState.inContext = true;
+    await fills.through(cache, 'org-1', load);
+    expect(load).toHaveBeenCalledTimes(1);
+  });
+
+  it('through under an ORG-scoped context loads but never caches (a narrower RLS answer)', async () => {
+    const cache = makeCache();
+    const fills = new DeferredCacheFills();
+    dbState.inContext = true;
+    dbState.scope = 'organization';
+    await fills.through(cache, 'org-1', async () => ({ v: 'partial' }));
+    dbState.inContext = false;
+    fills.flush();
+    expect(cache.peek('org-1')).toBeUndefined();
+  });
+
+  it('through: a failed load queues nothing; an invalidate before flush wins', async () => {
+    const cache = makeCache();
+    const fills = new DeferredCacheFills();
+    dbState.inContext = true;
+    dbState.scope = 'system';
+    await expect(fills.through(cache, 'org-1', async () => { throw new Error('boom'); })).rejects.toThrow('boom');
+    await fills.through(cache, 'org-2', async () => ({ v: 'pre-commit' }));
+    cache.invalidate('org-2');
+    dbState.inContext = false;
+    fills.flush();
+    expect(cache.peek('org-1')).toBeUndefined();
+    expect(cache.peek('org-2')).toBeUndefined();
+  });
+
+  it('flush: a throwing fill does not drop the fills queued after it', async () => {
+    dbState.inContext = true;
+    dbState.scope = 'system';
+    const bad = makeCache();
+    const good = makeCache();
+    const fills = new DeferredCacheFills();
+    await fills.through(bad, 'org-1', async () => ({ v: 'bad' }));
+    await fills.through(good, 'org-1', async () => ({ v: 'good' }));
+    vi.spyOn(bad, 'fillIfCurrent').mockImplementation(() => { throw new Error('fill boom'); });
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    dbState.inContext = false;
+    expect(() => fills.flush()).not.toThrow();
+    expect(good.peek('org-1')).toEqual({ v: 'good' });
+    expect(errSpy).toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+});
+
+describe('DeferredCacheFills — explicit org fill scope (#8142)', () => {
+  const ORG = 'org-1';
+  const PARTNER = 'partner-1';
+  const orgCtx = (over: Record<string, unknown> = {}) => ({
+    scope: 'organization', orgId: ORG, accessibleOrgIds: [ORG], accessiblePartnerIds: [], currentPartnerId: PARTNER, ...over,
+  });
+
+  beforeEach(() => {
+    dbState.inContext = false;
+    dbState.scope = undefined;
+    dbState.ctx = undefined;
+  });
+
+  it('fillScopeIsCacheable: system always; org only with an exact org + partner match', () => {
+    expect(fillScopeIsCacheable({ scope: 'system' } as never)).toBe(true);
+    expect(fillScopeIsCacheable(orgCtx() as never)).toBe(false);
+    expect(fillScopeIsCacheable(orgCtx() as never, { orgId: ORG, partnerId: PARTNER })).toBe(true);
+    expect(fillScopeIsCacheable(orgCtx() as never, { orgId: 'org-2', partnerId: PARTNER })).toBe(false);
+    expect(fillScopeIsCacheable(orgCtx({ currentPartnerId: 'partner-2' }) as never, { orgId: ORG, partnerId: PARTNER })).toBe(false);
+    expect(fillScopeIsCacheable(orgCtx({ currentPartnerId: null }) as never, { orgId: ORG, partnerId: PARTNER })).toBe(false);
+    expect(fillScopeIsCacheable(orgCtx({ accessibleOrgIds: [ORG, 'org-2'] }) as never, { orgId: ORG, partnerId: PARTNER })).toBe(false);
+    expect(fillScopeIsCacheable({ ...orgCtx(), scope: 'partner' } as never, { orgId: ORG, partnerId: PARTNER })).toBe(false);
+    expect(fillScopeIsCacheable(undefined, { orgId: ORG, partnerId: PARTNER })).toBe(false);
+  });
+
+  it('an org context carrying a partner-level grant never fills (wider view must not be cached for the org)', () => {
+    const scope = { orgId: ORG, partnerId: PARTNER };
+    expect(fillScopeIsCacheable(orgCtx({ accessiblePartnerIds: [PARTNER] }) as never, scope)).toBe(false);
+    expect(fillScopeIsCacheable(orgCtx({ accessiblePartnerIds: ['partner-9'] }) as never, scope)).toBe(false);
+    // null/undefined means no grant, same as empty
+    expect(fillScopeIsCacheable(orgCtx({ accessiblePartnerIds: null }) as never, scope)).toBe(true);
+    expect(fillScopeIsCacheable(orgCtx({ accessiblePartnerIds: undefined }) as never, scope)).toBe(true);
+  });
+
+  it('an org-scoped load with a matching fill scope is stored after flush', async () => {
+    const cache = makeCache();
+    const fills = new DeferredCacheFills();
+    dbState.ctx = orgCtx();
+    dbState.inContext = true;
+    await fills.through(cache, ORG, async () => ({ v: 'loaded' }), { orgId: ORG, partnerId: PARTNER });
+    dbState.inContext = false;
+    dbState.ctx = undefined;
+    fills.flush();
+    expect(cache.peek(ORG)).toEqual({ v: 'loaded' });
+  });
+
+  it('a key that is not the fill scope org is loaded and returned but never stored', async () => {
+    const cache = makeCache();
+    const fills = new DeferredCacheFills();
+    dbState.ctx = orgCtx();
+    dbState.inContext = true;
+    expect(await fills.through(cache, 'org-B', async () => ({ v: 'narrowed' }), { orgId: ORG, partnerId: PARTNER })).toEqual({ v: 'narrowed' });
+    dbState.inContext = false;
+    dbState.ctx = undefined;
+    fills.flush();
+    expect(cache.peek('org-B')).toBeUndefined();
+  });
+
+  it('an org-scoped load WITHOUT a fill scope is returned but never stored (unchanged rule)', async () => {
+    const cache = makeCache();
+    const fills = new DeferredCacheFills();
+    dbState.ctx = orgCtx();
+    dbState.inContext = true;
+    expect(await fills.through(cache, ORG, async () => ({ v: 'loaded' }))).toEqual({ v: 'loaded' });
+    dbState.inContext = false;
+    dbState.ctx = undefined;
+    fills.flush();
+    expect(cache.peek(ORG)).toBeUndefined();
+  });
+
+  it('rejects empty-string fill scope fields, even when the context carries the same empties', () => {
+    expect(fillScopeIsCacheable(orgCtx({ orgId: '', accessibleOrgIds: [''] }) as never, { orgId: '', partnerId: PARTNER })).toBe(false);
+    expect(fillScopeIsCacheable(orgCtx({ currentPartnerId: '' }) as never, { orgId: ORG, partnerId: '' })).toBe(false);
+  });
+
+  it('an org context carrying a userId never fills (users self-read RLS branch)', () => {
+    const scope = { orgId: ORG, partnerId: PARTNER };
+    expect(fillScopeIsCacheable(orgCtx({ userId: 'user-1' }) as never, scope)).toBe(false);
+    expect(fillScopeIsCacheable(orgCtx({ userId: null }) as never, scope)).toBe(true);
+    expect(fillScopeIsCacheable(orgCtx({ userId: undefined }) as never, scope)).toBe(true);
+  });
+
+  // `through` end to end (not just fillScopeIsCacheable): the cache stays EMPTY.
+  for (const [label, ctx] of [
+    ['carries a userId', orgCtx({ userId: 'user-1' })],
+    ['is built for a different org', orgCtx({ orgId: 'org-2', accessibleOrgIds: ['org-2'] })],
+    ['is built for a different partner', orgCtx({ currentPartnerId: 'partner-2' })],
+  ] as const) {
+    it(`a context that ${label} returns the loaded value but leaves the cache empty after flush`, async () => {
+      const cache = makeCache();
+      const fills = new DeferredCacheFills();
+      dbState.ctx = ctx;
+      dbState.inContext = true;
+      expect(await fills.through(cache, ORG, async () => ({ v: 'narrowed' }), { orgId: ORG, partnerId: PARTNER })).toEqual({ v: 'narrowed' });
+      dbState.inContext = false;
+      dbState.ctx = undefined;
+      fills.flush();
+      expect(cache.peek(ORG)).toBeUndefined();
+    });
+  }
+
+  it('a throwing loader leaves the cache empty after flush', async () => {
+    const cache = makeCache();
+    const fills = new DeferredCacheFills();
+    dbState.ctx = orgCtx();
+    dbState.inContext = true;
+    await expect(
+      fills.through(cache, ORG, async () => { throw new Error('boom'); }, { orgId: ORG, partnerId: PARTNER }),
+    ).rejects.toThrow('boom');
+    dbState.inContext = false;
+    dbState.ctx = undefined;
+    fills.flush();
+    expect(cache.peek(ORG)).toBeUndefined();
+  });
+});
+
+describe('DeferredCacheFills — sub-org keys and shouldCache (#7970)', () => {
+  const ORG = 'org-1';
+  const PARTNER = 'partner-1';
+  const scope = { orgId: ORG, partnerId: PARTNER };
+  const orgCtx = () => ({
+    scope: 'organization', orgId: ORG, accessibleOrgIds: [ORG], accessiblePartnerIds: [], currentPartnerId: PARTNER,
+  });
+  const deviceCache = () => new HotPathTtlCache<string, boolean>({ name: 'test-device', ttlMs: 60_000, maxEntries: 10 });
+
+  async function throughInOrgContext(
+    cache: HotPathTtlCache<string, boolean>,
+    key: string,
+    value: boolean,
+    options: { keyOrgId?: string; shouldCache?: (v: boolean) => boolean },
+  ): Promise<boolean> {
+    const fills = new DeferredCacheFills();
+    dbState.ctx = orgCtx();
+    dbState.inContext = true;
+    const got = await fills.through(cache, key, async () => value, scope, options);
+    dbState.inContext = false;
+    dbState.ctx = undefined;
+    fills.flush();
+    return got;
+  }
+
+  beforeEach(() => {
+    dbState.inContext = false;
+    dbState.scope = undefined;
+    dbState.ctx = undefined;
+  });
+
+  it('a per-device key whose keyOrgId is the fill scope org is stored after flush', async () => {
+    const cache = deviceCache();
+    expect(await throughInOrgContext(cache, `${ORG}:dev-1`, false, { keyOrgId: ORG })).toBe(false);
+    expect(cache.peek(`${ORG}:dev-1`)).toBe(false);
+  });
+
+  it('a per-device key whose keyOrgId names another org is returned but never stored', async () => {
+    const cache = deviceCache();
+    expect(await throughInOrgContext(cache, 'org-B:dev-1', false, { keyOrgId: 'org-B' })).toBe(false);
+    expect(cache.peek('org-B:dev-1')).toBeUndefined();
+  });
+
+  it('a per-device key without keyOrgId is still bound to the org id and never stored', async () => {
+    const cache = deviceCache();
+    await throughInOrgContext(cache, `${ORG}:dev-1`, false, {});
+    expect(cache.peek(`${ORG}:dev-1`)).toBeUndefined();
+  });
+
+  it('shouldCache=false returns the value but stores nothing', async () => {
+    const cache = deviceCache();
+    expect(await throughInOrgContext(cache, `${ORG}:dev-1`, true, { keyOrgId: ORG, shouldCache: (present) => !present })).toBe(true);
+    expect(cache.peek(`${ORG}:dev-1`)).toBeUndefined();
+  });
+});
+
+describe('HotPathTtlCache cluster option (W05, #8144)', () => {
+  let published: Array<[string, string | null]>;
+  let bus: ClusterCacheBus;
+
+  function recordingBus(): ClusterCacheBus {
+    const b = new ClusterCacheBus({ origin: 'unit', getPublisher: () => null, createSubscriber: () => null });
+    vi.spyOn(b, 'publish').mockImplementation(async (cache: string, key: string | null) => {
+      published.push([cache, key]);
+      return 'published';
+    });
+    return b;
+  }
+
+  function clusterCache(name = 'test-cluster') {
+    return new HotPathTtlCache<string, string>({ name, ttlMs: 60_000, maxEntries: 100, cluster: { bus } });
+  }
+
+  async function seed(cache: HotPathTtlCache<string, string>, key: string, value = 'v') {
+    await cache.getOrLoad(key, async () => value);
+  }
+
+  beforeEach(() => {
+    published = [];
+    bus = recordingBus();
+    dbState.inContext = false;
+    dbState.deferred = [];
+    dbState.committed = [];
+    dbState.scope = undefined;
+    dbState.ctx = undefined;
+  });
+  afterEach(() => __setClusterCacheBusForTests(null));
+
+  it('invalidate() stays local: it publishes nothing', async () => {
+    const cache = clusterCache();
+    await seed(cache, 'org-1');
+    cache.invalidate('org-1');
+    expect(cache.peek('org-1')).toBeUndefined();
+    expect(published).toEqual([]);
+  });
+
+  it('invalidateAroundCommit(key) outside a context drops locally and publishes once', async () => {
+    const cache = clusterCache();
+    await seed(cache, 'org-1');
+    cache.invalidateAroundCommit('org-1');
+    expect(cache.peek('org-1')).toBeUndefined();
+    expect(published).toEqual([['test-cluster', 'org-1']]);
+  });
+
+  it('invalidateAroundCommit() publishes key null', () => {
+    clusterCache().invalidateAroundCommit();
+    expect(published).toEqual([['test-cluster', null]]);
+  });
+
+  it('inside a context publishes only on COMMIT', async () => {
+    const cache = clusterCache();
+    await seed(cache, 'org-1');
+    dbState.inContext = true;
+    cache.invalidateAroundCommit('org-1');
+    expect(published).toEqual([]);
+    dbState.inContext = false;
+    for (const w of dbState.committed.splice(0)) w();
+    expect(published).toEqual([['test-cluster', 'org-1']]);
+  });
+
+  it('a ROLLBACK publishes nothing but the local entry is still dropped', async () => {
+    const cache = clusterCache();
+    await seed(cache, 'org-1');
+    dbState.inContext = true;
+    cache.invalidateAroundCommit('org-1');
+    dbState.inContext = false;
+    dbState.committed = []; // rollback discards commit-only work
+    for (const w of dbState.deferred.splice(0)) w(); // exit-work still runs
+    expect(published).toEqual([]);
+    expect(cache.peek('org-1')).toBeUndefined();
+  });
+
+  it('a non-cluster cache never publishes', () => {
+    __setClusterCacheBusForTests(bus);
+    new HotPathTtlCache<string, string>({ name: 'plain', ttlMs: 1_000, maxEntries: 10 }).invalidateAroundCommit('k');
+    expect(published).toEqual([]);
+  });
+
+  it('a non-string key on a cluster cache clears the whole cache and publishes null, without throwing', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const cache = clusterCache();
+    await seed(cache, 'org-1');
+    await seed(cache, 'org-2');
+    expect(() => cache.invalidateAroundCommit(42 as never)).not.toThrow();
+    expect(cache.size).toBe(0);
+    expect(published).toEqual([['test-cluster', null]]);
+    expect(errorSpy).toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it('cluster: true registers by name and publishes through the bus installed after construction (D12)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const first = new HotPathTtlCache<string, string>({ name: 'late-bound', ttlMs: 1_000, maxEntries: 10, cluster: true });
+    const second = new HotPathTtlCache<string, string>({ name: 'late-bound', ttlMs: 1_000, maxEntries: 10, cluster: true });
+    expect(getClusterCacheTarget('late-bound')).toBe(second);
+    expect(first).not.toBe(second);
+    __setClusterCacheBusForTests(bus);
+    second.invalidateAroundCommit('org-9');
+    expect(published).toEqual([['late-bound', 'org-9']]);
+    warn.mockRestore();
+  });
+
+  it('counts hit, miss and bypass lookups per cache', async () => {
+    const cache = new HotPathTtlCache<string, string>({ name: 'lookup-count', ttlMs: 60_000, maxEntries: 10 });
+    await cache.getOrLoad('k', async () => 'v'); // miss
+    await cache.getOrLoad('k', async () => 'v'); // hit
+    dbState.inContext = true;
+    await cache.getOrLoad('k', async () => 'v'); // bypass
+    dbState.inContext = false;
+    const text = await metricsRegistry.getSingleMetricAsString('breeze_hot_path_cache_lookups_total');
+    expect(text).toContain('cache="lookup-count",result="miss"} 1');
+    expect(text).toContain('cache="lookup-count",result="hit"} 1');
+    expect(text).toContain('cache="lookup-count",result="bypass"} 1');
+  });
+
+  it('DeferredCacheFills.through counts hit, cacheable miss and uncacheable bypass', async () => {
+    const cache = new HotPathTtlCache<string, string>({ name: 'through-count', ttlMs: 60_000, maxEntries: 10 });
+    const fills = new DeferredCacheFills();
+    dbState.inContext = true;
+    dbState.scope = 'system';
+    await fills.through(cache, 'org-1', async () => 'v'); // miss (cacheable)
+    dbState.inContext = false;
+    fills.flush();
+    dbState.inContext = true;
+    await fills.through(cache, 'org-1', async () => 'v'); // hit
+    dbState.scope = 'partner';
+    await fills.through(cache, 'org-2', async () => 'v'); // bypass (not cacheable)
+    dbState.inContext = false;
+    const text = await metricsRegistry.getSingleMetricAsString('breeze_hot_path_cache_lookups_total');
+    expect(text).toContain('cache="through-count",result="miss"} 1');
+    expect(text).toContain('cache="through-count",result="hit"} 1');
+    expect(text).toContain('cache="through-count",result="bypass"} 1');
+  });
+
+  it('reports its size on the entries gauge', async () => {
+    const cache = new HotPathTtlCache<string, string>({ name: 'size-gauge', ttlMs: 60_000, maxEntries: 10 });
+    await seed(cache, 'a');
+    await seed(cache, 'b');
+    const text = await metricsRegistry.getSingleMetricAsString('breeze_hot_path_cache_entries');
+    expect(text).toContain('breeze_hot_path_cache_entries{cache="size-gauge"} 2');
+  });
+});

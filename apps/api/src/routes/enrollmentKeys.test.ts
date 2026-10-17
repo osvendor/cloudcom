@@ -72,7 +72,9 @@ vi.mock("../db/schema/installerBootstrapTokens", () => ({
 
 vi.mock("../services/installerBootstrapToken", () => ({
   generateBootstrapToken: vi.fn(() => "ABC1234567"),
-  bootstrapTokenExpiresAt: vi.fn(() => new Date("2026-04-20T00:00:00.000Z")),
+  hashBootstrapToken: vi.fn((t: string) => `hmac:${t}`),
+  bootstrapTokenTtlMinutes: vi.fn(() => 10080),
+  clampBootstrapTokenTtlMinutes: vi.fn((m: number) => Math.max(1, Math.min(Math.floor(m), 43200))),
   BOOTSTRAP_TOKEN_PATTERN: /^[A-Z0-9]{10}$/,
 }));
 
@@ -116,6 +118,11 @@ vi.mock("../services/permissions", () => ({
   ) =>
     userPerms.permissions.includes(`${resource}:${action}`) ||
     userPerms.permissions.includes("*:*"),
+}));
+
+vi.mock("../services/sentry", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/sentry")>()),
+  captureException: vi.fn(),
 }));
 
 vi.mock("../services/auditService", () => ({
@@ -203,7 +210,9 @@ import {
 } from "./enrollmentKeys";
 import { db, withSystemDbAccessContext } from "../db";
 import { createAuditLogAsync } from "../services/auditService";
-import { fetchMacosInstallerAppZip } from "../services/installerBuilder";
+import { assertMacosInstallerPkgsReachable, fetchMacosInstallerAppZip } from "../services/installerBuilder";
+import { ReleaseManifestTooOldError } from "../services/releaseArtifactManifest";
+import { captureException } from "../services/sentry";
 import { renameAppInZip } from "../services/installerAppZip";
 import * as installerBootstrapTokenIssuance from "../services/installerBootstrapTokenIssuance";
 
@@ -435,6 +444,40 @@ describe("POST /enrollment-keys/:id/installer-link", () => {
     expect(createAuditLogAsync).not.toHaveBeenCalled();
   });
 
+  // An installer link is not an installer: it keeps the lifetime the admin
+  // picked (up to a year). Each download from it carries a bootstrap token
+  // bounded separately, at issuance.
+  it("keeps an installer link's own lifetime above 30 days", async () => {
+    const parentRow = makeKeyRow();
+    const childRow = makeChildKeyRow();
+    vi.mocked(db.select)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([parentRow]) }),
+        }),
+      } as any)
+      .mockReturnValueOnce({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([]) }),
+        }),
+      } as any);
+    const values = vi.fn().mockReturnValue({
+      returning: vi.fn().mockResolvedValue([childRow]),
+    });
+    vi.mocked(db.insert).mockReturnValue({ values } as any);
+
+    const before = Date.now();
+    const res = await app.request(`/enrollment-keys/${KEY_ID}/installer-link`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ platform: "windows", ttlMinutes: 525_600 }),
+    });
+
+    expect(res.status).toBe(200);
+    const linkExpiry = (values.mock.calls[0]![0] as { expiresAt: Date }).expiresAt.getTime();
+    expect(linkExpiry).toBeGreaterThanOrEqual(before + 525_600 * 60_000 - 50);
+  });
+
   it("returns shortUrl in response", async () => {
     const parentRow = makeKeyRow();
     const childRow = makeChildKeyRow();
@@ -473,6 +516,67 @@ describe("POST /enrollment-keys/:id/installer-link", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.shortUrl).toMatch(/^https?:\/\/.+\/s\/[A-Za-z0-9]{10}$/);
+  });
+
+  // #7830: a pinned BINARY_VERSION whose signed manifest is too old to vouch
+  // for the macOS pkg used to surface only "macOS PKG not reachable" — the
+  // operator had no way to learn that raising the pin is the fix.
+  describe("macOS pre-flight failure", () => {
+    function mockParentKey() {
+      vi.mocked(db.select).mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockReturnValue({
+            limit: vi.fn().mockResolvedValue([makeKeyRow()]),
+          }),
+        }),
+      } as any);
+    }
+
+    function requestMacosLink() {
+      return app.request(`/enrollment-keys/${KEY_ID}/installer-link`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ platform: "macos" }),
+      });
+    }
+
+    it("tells the operator which release to pin when the pinned manifest is too old", async () => {
+      mockParentKey();
+      const tooOld = new ReleaseManifestTooOldError({
+        message:
+          "The signed release manifest for v0.104.0 predates the macOS publisher identity for breeze-agent-darwin-amd64.pkg (first recorded in v0.112.0). Set BINARY_VERSION to v0.112.0 or later.",
+        release: "v0.104.0",
+        minimumRelease: "v0.112.0",
+      });
+      vi.mocked(assertMacosInstallerPkgsReachable).mockRejectedValueOnce(
+        new Error("macOS amd64 installer package failed release verification", { cause: tooOld }),
+      );
+
+      const res = await requestMacosLink();
+
+      expect(res.status).toBe(503);
+      const body = await res.json();
+      expect(body.error).toMatch(/^macOS PKG not reachable: /);
+      expect(body.error).toContain("Set BINARY_VERSION to v0.112.0 or later");
+      expect(db.insert).not.toHaveBeenCalled();
+      // Operator configuration, not an outage: no Sentry event per click.
+      expect(captureException).not.toHaveBeenCalled();
+    });
+
+    it("keeps the generic message for any other verification failure", async () => {
+      mockParentKey();
+      vi.mocked(assertMacosInstallerPkgsReachable).mockRejectedValueOnce(
+        new Error("macOS arm64 installer package failed release verification", {
+          cause: new Error("Release artifact digest mismatch for breeze-agent-darwin-arm64.pkg"),
+        }),
+      );
+
+      const res = await requestMacosLink();
+
+      expect(res.status).toBe(503);
+      await expect(res.json()).resolves.toEqual({ error: "macOS PKG not reachable" });
+      expect(captureException).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("refuses to build an installer when parent key is within 60s of expiry", async () => {
@@ -2366,9 +2470,38 @@ describe("POST /:id/bootstrap-token", () => {
       .mockResolvedValue({
         id: "token-row-uuid-2",
         token: "ABCDE12345",
-        expiresAt: new Date(Date.now() + 129_600 * 60 * 1000),
+        expiresAt: new Date(Date.now() + 43_200 * 60 * 1000),
         parentKeyName: "Test Key",
       } as any);
+
+    const res = await app.request(
+      `/enrollment-keys/${KEY_ID}/bootstrap-token`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ maxUsage: 3, ttlMinutes: 43_200 }),
+      },
+    );
+
+    expect(res.status).toBe(200);
+    expect(issueSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ ttlMinutes: 43_200 }),
+    );
+
+    issueSpy.mockRestore();
+  });
+
+  // A bootstrap token lives at most 30 days. An explicit longer request is
+  // refused, never silently shortened.
+  it("rejects (400) a ttlMinutes above the 30-day bootstrap-token maximum", async () => {
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          limit: vi.fn().mockResolvedValue([makeKeyRow()]),
+        }),
+      }),
+    } as any);
+    const issueSpy = vi.spyOn(installerBootstrapTokenIssuance, "issueBootstrapTokenForKey");
 
     const res = await app.request(
       `/enrollment-keys/${KEY_ID}/bootstrap-token`,
@@ -2379,11 +2512,12 @@ describe("POST /:id/bootstrap-token", () => {
       },
     );
 
-    expect(res.status).toBe(200);
-    expect(issueSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ ttlMinutes: 129_600 }),
-    );
-
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toContain("43200");
+    expect(body.error).toContain("30 days");
+    expect(issueSpy).not.toHaveBeenCalled();
+    expect(db.insert).not.toHaveBeenCalled();
     issueSpy.mockRestore();
   });
 

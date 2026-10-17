@@ -85,8 +85,15 @@ const approvalConfig: Record<PatchApprovalStatus, { labelKey: string; color: str
   deferred: { labelKey: 'patchList.approval.deferred', color: 'bg-blue-500/20 text-blue-700 border-blue-500/40', icon: Clock }
 };
 
+const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
 function formatDate(dateString: string): string {
-  const date = new Date(dateString);
+  // A bare YYYY-MM-DD parses as UTC midnight, which renders a day early in
+  // zones west of UTC. Build it as a local calendar date instead.
+  const dateOnly = DATE_ONLY_RE.exec(dateString);
+  const date = dateOnly
+    ? new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]))
+    : new Date(dateString);
   if (Number.isNaN(date.getTime())) return dateString;
   return date.toLocaleDateString();
 }
@@ -343,6 +350,14 @@ export default function PatchList({
         <div className="text-xs text-muted-foreground">{patch.description}</div>
       )}
     </>
+  );
+
+  // A missing release date (every Linux patch, #7800) reads "Unknown" — never a
+  // stand-in date the vendor did not publish.
+  const renderReleaseDate = (patch: Patch) => (
+    <span data-testid={`patch-row-${patch.id}-release`}>
+      {patch.releaseDate ? formatDate(patch.releaseDate) : t('patchList.releaseUnknown')}
+    </span>
   );
 
   const renderSeverityBadge = (patch: Patch) => {
@@ -763,7 +778,7 @@ export default function PatchList({
                       <td className="px-4 py-3">{renderSeverityBadge(patch)}</td>
                       <td className="px-4 py-3 text-muted-foreground">{patch.source}</td>
                       <td className="px-4 py-3 text-muted-foreground">{patch.os}</td>
-                      <td className="px-4 py-3 text-muted-foreground">{formatDate(patch.releaseDate)}</td>
+                      <td className="px-4 py-3 text-muted-foreground">{renderReleaseDate(patch)}</td>
                       <td className="px-4 py-3">{renderApprovalBadge(patch)}</td>
                       <td className="px-4 py-3">{renderRowActions(patch)}</td>
                     </tr>
@@ -813,7 +828,7 @@ export default function PatchList({
                         <span className="text-muted-foreground">{patch.os}</span>
                       </CardField>
                       <CardField label={t('patchList.table.release')}>
-                        <span className="text-muted-foreground">{formatDate(patch.releaseDate)}</span>
+                        <span className="text-muted-foreground">{renderReleaseDate(patch)}</span>
                       </CardField>
                       <CardField label={t('patchList.table.approval')}>{renderApprovalBadge(patch)}</CardField>
                     </div>

@@ -15,6 +15,12 @@ import {
 } from './featureFlags';
 import { portalDashboardRoutes } from './dashboard';
 import { portalSecurityRoutes } from './security';
+import { portalHardwareHealthRoutes } from './hardwareHealth';
+import { portalHardwareInventoryRoutes } from './hardwareInventory';
+import { portalPerformanceRoutes } from './performance';
+import { portalSoftwareRoutes } from './software';
+import { portalPatchRoutes } from './patches';
+import { portalVulnerabilityRoutes } from './vulnerabilities';
 import { portalBackupRoutes } from './backups';
 import { portalReportRoutes } from './reports';
 import { portalServiceRoutes } from './service';
@@ -22,6 +28,8 @@ import { portalDocumentRoutes } from './documents';
 import { portalRemoteRoutes } from './remote';
 import { portalNativeExchangeRoutes } from './nativeLogin';
 import { portalNetworkRoutes } from './network';
+import { portalHourBlockRoutes } from './hourBlock';
+import { portalApprovalRoutes } from './approvals';
 
 export const portalRoutes = new Hono();
 
@@ -69,6 +77,24 @@ portalRoutes.use('/reports/lifecycle/*', createPortalFeatureGateStrict('enableLi
 // Service deliverables W04 — both new surfaces fail closed the same way.
 portalRoutes.use('/service/*', portalAuthMiddleware);
 portalRoutes.use('/service/*', createPortalFeatureGateStrict('enableService'));
+// Portal Advanced Visibility W01 (#7731): hardware health, fail-closed.
+portalRoutes.use('/hardware-health/*', portalAuthMiddleware);
+portalRoutes.use('/hardware-health/*', createPortalFeatureGateStrict('enableHardwareHealth'));
+// Portal Advanced Visibility W02 (#7732): hardware inventory, fail-closed.
+portalRoutes.use('/hardware-inventory/*', portalAuthMiddleware);
+portalRoutes.use('/hardware-inventory/*', createPortalFeatureGateStrict('enableHardwareInventory'));
+// Portal Advanced Visibility W03 (#7733): performance metrics, fail-closed.
+portalRoutes.use('/performance/*', portalAuthMiddleware);
+portalRoutes.use('/performance/*', createPortalFeatureGateStrict('enablePerformanceMetrics'));
+// W04 (#7734): independent of enableDevices.
+portalRoutes.use('/software/*', portalAuthMiddleware);
+portalRoutes.use('/software/*', createPortalFeatureGateStrict('enableSoftwareInventory'));
+// W05 (#7735): patch detail, sensitive (outside "Enable all"), fail-closed.
+portalRoutes.use('/patches/*', portalAuthMiddleware);
+portalRoutes.use('/patches/*', createPortalFeatureGateStrict('enablePatchDetail'));
+// W06 (#7736): vulnerability detail, sensitive (outside "Enable all"), fail-closed.
+portalRoutes.use('/vulnerabilities/*', portalAuthMiddleware);
+portalRoutes.use('/vulnerabilities/*', createPortalFeatureGateStrict('enableVulnerabilityDetail'));
 // Network Visibility has its own fail-closed availability response:
 // disabled or missing settings return dataStatus: 'not_enabled'.
 portalRoutes.use('/network/*', portalAuthMiddleware);
@@ -84,6 +110,15 @@ portalRoutes.use('/documents/*', async (c, next) =>
 // generic middleware below handle those.
 portalRoutes.use('/tickets/usage', portalAuthMiddleware);
 portalRoutes.use('/tickets/usage', createPortalFeatureGateStrict('enableSupportUsage'));
+
+// Block hours W04: the "Support hours" card lives inside the Support usage
+// section, so its endpoint requires BOTH fail-closed flags — auth first, then
+// enableSupportUsage, then its own enableHourBlock. A separate prefix on
+// purpose: nesting under `/tickets/*` would inherit the enable_tickets gate
+// that Support usage deliberately opts out of (see the exact-path wrappers above).
+portalRoutes.use('/support-usage/*', portalAuthMiddleware);
+portalRoutes.use('/support-usage/*', createPortalFeatureGateStrict('enableSupportUsage'));
+portalRoutes.use('/support-usage/*', createPortalFeatureGateStrict('enableHourBlock'));
 
 portalRoutes.use('/tickets/*', async (c, next) => {
   if (isTicketsUsagePath(c)) {
@@ -101,6 +136,13 @@ portalRoutes.use('/tickets/*', async (c, next) => {
   return portalTicketsEnabledMiddleware(c, next);
 });
 
+// Customer work approval (#4617 W04): a ticketing surface, so it carries the
+// same fail-open enable_tickets gate as `/tickets/*` (403
+// PORTAL_TICKETS_DISABLED) — no flag of its own. `/approvals/*` also matches
+// the bare `/approvals` list path (approvals.gate.test.ts pins both).
+portalRoutes.use('/approvals/*', portalAuthMiddleware);
+portalRoutes.use('/approvals/*', portalTicketsEnabledMiddleware);
+
 portalRoutes.route('/', deviceRoutes);
 portalRoutes.route('/', ticketRoutes);
 portalRoutes.route('/', assetRoutes);
@@ -109,9 +151,17 @@ portalRoutes.route('/', portalInvoiceRoutes);
 portalRoutes.route('/', portalQuoteRoutes);
 portalRoutes.route('/', portalDashboardRoutes);
 portalRoutes.route('/', portalSecurityRoutes);
+portalRoutes.route('/', portalHardwareHealthRoutes);
+portalRoutes.route('/', portalHardwareInventoryRoutes);
+portalRoutes.route('/', portalPerformanceRoutes);
+portalRoutes.route('/', portalSoftwareRoutes);
+portalRoutes.route('/', portalPatchRoutes);
+portalRoutes.route('/', portalVulnerabilityRoutes);
 portalRoutes.route('/', portalBackupRoutes);
 portalRoutes.route('/', portalReportRoutes);
 portalRoutes.route('/', portalServiceRoutes);
 portalRoutes.route('/', portalDocumentRoutes);
 portalRoutes.route('/', portalRemoteRoutes);
 portalRoutes.route('/', portalNetworkRoutes);
+portalRoutes.route('/', portalHourBlockRoutes);
+portalRoutes.route('/', portalApprovalRoutes);

@@ -59,6 +59,19 @@ export class SsrfBlockedError extends Error {
   }
 }
 
+/**
+ * A hop's host failed the caller's `allowHost` predicate
+ * (`safeFetchFollowingRedirects`). A subclass so callers can tell "this host
+ * is outside what I may contact" (a standing answer) from an address-policy
+ * refusal such as a private-range resolution (possibly transient).
+ */
+export class HostNotAllowedError extends SsrfBlockedError {
+  constructor(hostname: string) {
+    super(`host not allowed: ${hostname}`, { hostname });
+    this.name = 'HostNotAllowedError';
+  }
+}
+
 /** The response body exceeded the caller's `maxBytes` ceiling. The socket is destroyed. */
 export class ResponseTooLargeError extends Error {
   constructor(public readonly maxBytes: number) {
@@ -240,6 +253,12 @@ export function createGuardedLookup(opts?: SsrfGuardOptions): LookupFunction {
  * For SDKs that build their own HTTP client and therefore cannot go through
  * `safeFetch` (the AWS SDK is the motivating case), handing them these agents
  * applies the same connect-time policy to every request they make.
+ *
+ * These agents keep sockets alive, and a reused socket skips the lookup. That
+ * is sound only because every socket in a pair's pool was opened under the one
+ * `opts` the pair was built with. Never share a pair between callers with
+ * different policies — build a new pair per policy, as `createGuardedS3Client`
+ * does per client.
  */
 export function createGuardedHttpAgents(opts?: SsrfGuardOptions): {
   httpAgent: http.Agent;
@@ -654,7 +673,14 @@ export async function safeFetch(urlStr: string, init: SafeFetchInit = {}): Promi
     port,
     path: u.pathname + u.search,
     headers,
-    lookup: pinnedLookup
+    lookup: pinnedLookup,
+    // A fresh connection per request. Node's global agent keeps sockets alive
+    // and pools them by host:port alone, so a pooled socket would carry this
+    // request to whatever address an EARLIER request pinned — possibly under a
+    // looser policy (`allowPrivateNetwork` / `allowCarrierNat`) — without ever
+    // calling `pinnedLookup` or re-checking the address. `agent: false` makes
+    // every request dial through its own pinned, policy-checked lookup.
+    agent: false
     // No `rejectUnauthorized: false` — cert chain validation stays on.
     // Node's default `servername` for https.request is `host`, which is the
     // original hostname — so SNI and cert hostname check both work correctly.
@@ -834,7 +860,11 @@ export async function safeFetch(urlStr: string, init: SafeFetchInit = {}): Promi
       if (init.signal.aborted) {
         onAbort();
       } else {
-        init.signal.addEventListener('abort', onAbort, { once: true });
+        const signal = init.signal;
+        signal.addEventListener('abort', onAbort, { once: true });
+        // Drop the listener once the request is finished with, so a long-lived
+        // caller signal does not accumulate one closure per completed request.
+        req.once('close', () => signal.removeEventListener('abort', onAbort));
       }
     }
 
@@ -888,15 +918,34 @@ function stripCredentialHeaders(headers: SafeFetchInit['headers']): Record<strin
  * 301/302 on a non-GET/HEAD request) degrades to GET with no body, and
  * credential headers are dropped when the hop crosses to a different origin.
  */
+export interface FollowRedirectsOptions {
+  /**
+   * Optional host predicate, checked against EVERY hop (the first URL
+   * included) before that hop is resolved or dialed. A hop that fails it
+   * throws `SsrfBlockedError`. This narrows, never widens: the pinned-DNS
+   * address policy still applies to every hop that passes. Used by callers
+   * that may only talk to a fixed allowlist of hosts (the workload
+   * image-currency registry client).
+   */
+  allowHost?: (url: URL) => boolean;
+}
+
 export async function safeFetchFollowingRedirects(
   urlStr: string,
   init: SafeFetchInit = {},
-  maxRedirects: number = SAFE_FETCH_MAX_REDIRECTS
+  maxRedirects: number = SAFE_FETCH_MAX_REDIRECTS,
+  options: FollowRedirectsOptions = {}
 ): Promise<Response> {
   let currentUrl = urlStr;
   let currentInit: SafeFetchInit = init;
 
   for (let hop = 0; hop <= maxRedirects; hop++) {
+    if (options.allowHost) {
+      const target = new URL(currentUrl);
+      if (!options.allowHost(target)) {
+        throw new HostNotAllowedError(target.hostname);
+      }
+    }
     const response = await safeFetch(currentUrl, currentInit);
     if (!REDIRECT_STATUSES.has(response.status)) return response;
 

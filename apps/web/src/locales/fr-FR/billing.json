@@ -24,7 +24,8 @@
         "perDeviceRole": "Par rôle d'appareil",
         "perDeviceGroup": "Par groupe d'appareils",
         "perSeat": "Par utilisateur",
-        "manual": "Quantité manuelle"
+        "manual": "Quantité manuelle",
+        "hourBlock": "Forfait d'heures"
       },
       "dynamicGroup": "dynamique",
       "deletedGroup": "{{name}} (groupe supprimé)",
@@ -588,6 +589,62 @@
       "warnings": {
         "markupRemoved": "Enregistré, mais une mise en forme non prise en charge a été supprimée : {{tags}}. Le corps des conventions prend en charge les titres, le gras, l'italique, le soulignement, les listes et les liens."
       }
+    },
+    "hourBlock": {
+      "form": {
+        "hoursPerPeriod": "Heures incluses par période",
+        "extraRate": "Prix par heure supplémentaire",
+        "rolloverMode": "Heures non utilisées en fin de période",
+        "rolloverExpire": "Expirent",
+        "rolloverCarry": "Reportées",
+        "carryCap": "Plafond de report en heures (vide pour illimité)",
+        "alertPct": "Alerter à ce % du forfait consommé (facultatif)",
+        "required": "Saisissez les heures incluses et le prix par heure supplémentaire.",
+        "firstPeriod": "Les heures comptent à partir de la première période de facturation encore à facturer ; pour un contrat brouillon, elle est fixée à l'activation. Le temps antérieur est facturé comme d'habitude.",
+        "midPeriodEdit": "Les modifications s'appliquent à la période en cours ({{start}} – {{end}}) à sa clôture.",
+        "midPeriodEditNoDates": "Les modifications s'appliquent à la période en cours à sa clôture.",
+        "onlyOne": "Cette organisation a déjà un forfait actif. Retirez-le avant d'en ajouter un autre."
+      },
+      "row": {
+        "perPeriod": "{{hours}} heures par période",
+        "retiredBadge": "Retiré",
+        "startsOn": "Compte à partir du {{date}}"
+      },
+      "errors": {
+        "exists": "Cette organisation a déjà une ligne de forfait d'heures active. Retirez-la d'abord, puis ajoutez la nouvelle.",
+        "locked": "Ce champ ne peut pas être modifié sur une ligne de forfait d'heures."
+      },
+      "retire": {
+        "title": "Retirer le forfait d'heures",
+        "message": "« {{description}} » a un historique de facturation ; il est donc retiré au lieu d'être supprimé. Plus de nouvelles périodes ; les périodes déjà facturées sont toujours réglées. Les périodes clôturées restent dans le contrat.",
+        "confirm": "Retirer le forfait",
+        "toast": "Forfait d'heures retiré"
+      },
+      "detail": {
+        "title": "Forfait d'heures",
+        "usage": "{{used}} heures utilisées sur {{included}} · {{remaining}} restantes · la période se termine le {{end}}",
+        "carried": "Comprend {{hours}} heures reportées.",
+        "unapproved": "{{hours}} heures de ce temps ne sont pas encore approuvées.",
+        "foreign": "{{hours}} heures ont été saisies dans une autre devise ; elles décomptent quand même le forfait.",
+        "over": "{{hours}} heures au-delà du forfait → {{amount}} à la clôture de la période",
+        "advanceNote": "Le dépassement est facturé sur la facture suivante.",
+        "arrearsNote": "Le dépassement est facturé sur la facture de cette période.",
+        "lateEntry": "{{hours}} heures ont été saisies après la clôture de leur période et sont facturées séparément.",
+        "startsLater": "Le forfait commence le {{date}}.",
+        "extraRate": "Heures supplémentaires : {{rate}} chacune",
+        "loadFailed": "Impossible de charger la consommation du forfait."
+      },
+      "history": {
+        "title": "Périodes de forfait clôturées",
+        "empty": "Aucune période de forfait n'a encore été clôturée.",
+        "included": "Incluses",
+        "carriedIn": "Reportées en entrée",
+        "used": "Utilisées",
+        "over": "Dépassement",
+        "carriedOut": "Reportées en sortie",
+        "loadMore": "Charger plus",
+        "invoiceRemoved": "Facture du dépassement supprimée — heures non facturées"
+      }
     }
   },
   "agreements": {
@@ -911,7 +968,8 @@
         "skuHelp": "Votre référence de catalogue ou de distributeur pour cet article.",
         "skuOptional": "SKU (facultatif)",
         "tidyWithAi": "Peaufiner avec l'IA",
-        "unitCost": "Coût unitaire"
+        "unitCost": "Coût unitaire",
+        "partNumberRequiredHint": "Ajoutez une référence fabricant pour inclure cette ligne dans la commande de pièces."
       },
       "liveTotals": {
         "annualRecurring": "Récurrent annuel",
@@ -1049,6 +1107,7 @@
       "coverPage": {
         "title": "Page de couverture",
         "enable": "Afficher une page de couverture",
+        "showContents": "Ajouter une table des matières au PDF",
         "summaryOn": "Affichée comme première page de la proposition.",
         "summaryOff": "Aucune page de couverture — la proposition commence par son contenu.",
         "titleLabel": "Titre de la couverture",
@@ -1147,7 +1206,10 @@
         "tooManyRecipients": "Utilisez au maximum {{max}} adresses.",
         "zeroTotalWarning": "Ce devis totalise {{zero}} — vérifiez que ses lignes sont tarifées avant l'envoi.",
         "noBillingContactHint": "Aucun contact de facturation n'est enregistré pour cette organisation — saisissez un e-mail ou ajoutez-en un dans les <orgLink>paramètres de l'organisation</orgLink>.",
-        "revisionWarning": "L’envoi remplace {{number}} et désactive le lien que le client possède déjà."
+        "revisionWarning": "L’envoi remplace {{number}} et désactive le lien que le client possède déjà.",
+        "noPartNumberWarning_one": "{{count}} ligne de produit n'a pas de référence fabricant et ne sera pas ajoutée à la commande de pièces.",
+        "noPartNumberWarning_other": "{{count}} lignes de produit n'ont pas de référence fabricant et ne seront pas ajoutées à la commande de pièces.",
+        "sendAnyway": "Envoyer quand même"
       },
       "sendEmailWarning": {
         "noBillingContact": "Proposition marquée comme Envoyée, mais aucun e-mail n'a été remis — {{orgName}} n'a pas d'adresse e-mail de contact de facturation. Ajoutez-en une dans les paramètres de l'organisation, puis renvoyez.",
@@ -1320,7 +1382,9 @@
           "vendor": "Fournisseur"
         },
         "title": "À commander",
-        "unknownVendor": "Autre / fournisseur inconnu"
+        "unknownVendor": "Autre / fournisseur inconnu",
+        "excluded": "Absent de cette commande (aucune référence fabricant) : {{names}}",
+        "untitledLine": "Ligne sans titre"
       },
       "pax8Order": {
         "message_one": "Ce devis a préparé une commande Pax8 ({{count}} article) en attente des détails de provisionnement",
@@ -1707,7 +1771,8 @@
       "saveNotes": "Impossible d'enregistrer les notes.",
       "saveTerms": "Impossible d'enregistrer les conditions.",
       "updateLine": "Impossible de mettre à jour la ligne.",
-      "noPriceForCurrency": "Aucun prix en {{currency}} pour cet article. Ajoutez-en un dans le catalogue ou saisissez une ligne manuelle."
+      "noPriceForCurrency": "Aucun prix en {{currency}} pour cet article. Ajoutez-en un dans le catalogue ou saisissez une ligne manuelle.",
+      "saveLineDetail": "Impossible de mettre à jour l’impression des saisies de temps"
     },
     "fields": {
       "descriptionOptional": "Description (facultatif)",
@@ -1774,6 +1839,35 @@
     "linesScrollAria": "Lignes de la facture — faites défiler horizontalement pour plus de colonnes",
     "unsavedField": {
       "lines": "Lignes"
+    },
+    "lineDetail": {
+      "default": "Valeur par défaut de la facturation",
+      "grouping": "Présentation",
+      "groupingDay": "Regrouper par jour",
+      "groupingEntry": "Une ligne par saisie",
+      "help": "Remplace votre valeur de facturation par défaut pour ce brouillon uniquement.",
+      "hide": "Masquer",
+      "show": "Afficher",
+      "showDate": "Date du travail",
+      "showNote": "Note du technicien",
+      "showWorkedTime": "Temps travaillé et facturé",
+      "title": "Lignes de saisie de temps"
+    },
+    "refreshTimeLines": {
+      "billedElsewhere": "{{count}} lignes bloqueront l'émission : leurs saisies de temps ont été facturées sur une autre facture. Supprimez-les avant d'émettre :",
+      "billedElsewhere_one": "{{count}} ligne bloquera l'émission : sa saisie de temps a été facturée sur une autre facture. Supprimez-la avant d'émettre :",
+      "billedElsewhere_other": "{{count}} lignes bloqueront l'émission : leurs saisies de temps ont été facturées sur une autre facture. Supprimez-les avant d'émettre :",
+      "button": "Actualiser depuis les saisies de temps",
+      "drifted": "{{count}} lignes inchangées : le temps facturé de leurs saisies ne correspond plus à la quantité. Modifiez la quantité ou créez un nouveau brouillon.",
+      "drifted_one": "{{count}} ligne inchangée : le temps facturé de sa saisie ne correspond plus à la quantité. Modifiez la quantité ou créez un nouveau brouillon.",
+      "drifted_other": "{{count}} lignes inchangées : le temps facturé de leurs saisies ne correspond plus à la quantité. Modifiez la quantité ou créez un nouveau brouillon.",
+      "error": "Impossible d'actualiser depuis les saisies de temps",
+      "help": "Met à jour les notes, les dates travaillées et l'approbation depuis les saisies de temps. Les quantités, les prix et les descriptions modifiées à la main ne changent jamais.",
+      "running": "Actualisation…",
+      "skipped": "{{count}} lignes ignorées : leurs saisies de temps ont été facturées ailleurs, supprimées ou ne sont plus facturables sur ce brouillon.",
+      "skipped_one": "{{count}} ligne ignorée : sa saisie de temps a été facturée ailleurs, supprimée ou n'est plus facturable sur ce brouillon.",
+      "skipped_other": "{{count}} lignes ignorées : leurs saisies de temps ont été facturées ailleurs, supprimées ou ne sont plus facturables sur ce brouillon.",
+      "summary": "Actualisées : {{refreshed}} · Déjà à jour : {{unchanged}}"
     }
   },
   "invoiceActions": {
@@ -2021,6 +2115,7 @@
     "empty": "Cette facture ne contient encore aucune ligne.",
     "fallbackTitle": "Facture",
     "issued": "Émise",
+    "laborLine": "Main-d’œuvre",
     "preview": {
       "description": "Voici ce que votre client voit sur sa facture.",
       "downloadError": "Impossible de télécharger le PDF de la facture.",
@@ -2117,7 +2212,9 @@
       "sourceAria": "Source de facture",
       "title": "Nouvelle facture",
       "to": "À",
-      "working": "Traitement…"
+      "working": "Traitement…",
+      "heldForHourBlock_one": "{{count}} saisie de temps ({{hours}} heures) est retenue pour le forfait d'heures de cette organisation et sera facturée à la clôture de la période du forfait.",
+      "heldForHourBlock_other": "{{count}} saisies de temps ({{hours}} heures) sont retenues pour le forfait d'heures de cette organisation et seront facturées à la clôture de la période du forfait."
     },
     "empty": {
       "description": "Assemblez le temps et les pièces non facturés dans un brouillon ou démarrez une facture vierge.",
@@ -2277,15 +2374,26 @@
       "documentPageSize": "Format de page",
       "documentPageSizeA4": "A4",
       "documentPageSizeLetter": "Lettre",
-      "documentTheme": "Thème du document",
-      "documentThemeClassic": "Classique",
-      "documentThemeCondensed": "Condensé",
+      "documentTheme": "Polices des documents",
+      "documentThemeClassic": "Helvetica",
+      "documentThemeCondensed": "Barlow Condensed + DM Sans",
       "invoiceFooter": "Pied de facture",
       "invoiceFooterPlaceholder": "Instructions de paiement, message de remerciement, etc.",
       "invoiceNumberPrefix": "Préfixe de numéro de facture",
       "markupHelp": "Marge par défaut sur le coût distributeur, utilisée pour préremplir le prix de vente lors de l'import d'articles du catalogue. La marge brute résultante est affichée pendant l'import.",
       "paymentTermsDays": "Délai de paiement (jours)",
-      "title": "Valeurs par défaut de facturation"
+      "prefixInvalid": "Saisissez un préfixe de 1 à 12 caractères.",
+      "taxRateInvalid": "Saisissez un taux de taxe de 0 à 100.",
+      "termsDaysInvalid": "Saisissez un nombre entier de jours de 0 à 365.",
+      "title": "Valeurs par défaut de facturation",
+      "lineDetailTitle": "Lignes de saisie de temps sur les factures",
+      "lineDetailHelp": "Choisissez ce que les clients voient pour les saisies de temps. Un brouillon de facture peut remplacer ce choix ; il est figé à l’émission de la facture.",
+      "lineShowDate": "Afficher la date du travail",
+      "lineShowNote": "Afficher la note du technicien",
+      "lineShowWorkedTime": "Afficher le temps travaillé et le temps facturé",
+      "lineGrouping": "Présentation",
+      "lineGroupingEntry": "Une ligne par saisie",
+      "lineGroupingDay": "Regrouper par jour"
     },
     "loadError": "Échec du chargement des paramètres de facturation.",
     "loading": "Chargement des paramètres de facturation…",
@@ -2313,7 +2421,8 @@
     "defaults": "Valeurs par défaut",
     "documents": "Documents",
     "connections": "Connexions",
-    "rates": "Tarifs"
+    "rates": "Tarifs",
+    "payments": "Payments"
   },
   "billingConnectionsTab": {
     "accounting": {
@@ -2365,6 +2474,8 @@
     "setDefault": "Définir par défaut",
     "archive": "Archiver",
     "usageUnavailable": "L’utilisation par les organisations n’est pas disponible.",
+    "readOnlyNotice": "Vous disposez d'un accès en lecture seule aux tarifs de facturation. Demandez à un administrateur de les modifier.",
+    "readOnlyNoPartnerWideNotice": "Les tarifs de facturation s'appliquent à toutes les organisations ; les modifier exige un accès complet aux organisations du partenaire. Vous disposez d'un accès en lecture seule.",
     "edit": "Modifier le profil de facturation",
     "name": "Nom",
     "currency": "Devise",
@@ -2416,6 +2527,271 @@
       "summaryBillableUnpriced": "Facturable · sans prix",
       "summaryIncluded": "Inclus",
       "summaryNotBilled": "Non facturé"
+    }
+  },
+  "autopay": {
+    "chargeConfirmTitle": "Confirmer le paiement automatique",
+    "chargeConfirmMessage": "Prélever jusqu’à {{amount}}, frais de traitement compris, pour la facture {{invoice}} avec {{method}} ?",
+    "noticeQueued": "Avis de paiement automatique en attente d’envoi",
+    "requestDeliveryFailed": "Le courriel de demande n’a pas pu être envoyé. Renvoyez la demande.",
+    "skipNoContact": "Aucune adresse de facturation disponible. Ajoutez une adresse ou indiquez un destinataire.",
+    "skipStripeNotReady": "Stripe n’est pas prêt pour les paiements automatiques. Vérifiez la connexion et les autorisations.",
+    "skipAlreadyActive": "Les paiements automatiques sont déjà actifs ou suspendus.",
+    "title": "Paiement automatique",
+    "loading": "Chargement des paiements automatiques…",
+    "error": "Impossible de terminer cette action. Veuillez réessayer.",
+    "saved": "Paiement automatique mis à jour",
+    "save": "Enregistrer",
+    "invalid": "Saisissez un nombre entier de jours entre 0 et 60 et un plafond positif avec un code de devise à trois lettres.",
+    "offset-days": "Jours après émission",
+    "offset-rule": "Comparaison avec la date d’échéance",
+    "cap-enabled": "Plafond de paiement automatique",
+    "cap-amount": "Montant maximal",
+    "cap-currency": "Devise",
+    "ach-mode": "Moyens de paiement",
+    "inherit": "{{value}} — hérité de {{source}}",
+    "source": {
+      "org": "Organisation cliente",
+      "partner": "Valeur par défaut du partenaire",
+      "default": "Valeur par défaut de Breeze"
+    },
+    "option": {
+      "earlier": "La date la plus proche",
+      "later": "La date la plus tardive",
+      "false": "Sans limite",
+      "true": "Plafond activé",
+      "ach_preferred": "Compte bancaire privilégié ; cartes acceptées",
+      "ach_only": "Compte bancaire uniquement"
+    },
+    "achRisk": "Les paiements bancaires sont disponibles pour les comptes américains éligibles en USD. Votre entreprise est responsable des rejets ACH et des frais de rejet Stripe ; les rejets de comptes individuels peuvent survenir jusqu’à 60 jours plus tard.",
+    "stripeNotReady": "Les paiements automatiques ne sont pas disponibles. Vérifiez les autorisations Stripe : {{permissions}}.",
+    "stripeDisconnected": "Connectez d’abord Stripe",
+    "card": "Carte",
+    "bank": "Compte bancaire",
+    "done": "Demande terminée.",
+    "status": {
+      "not_requested": "Non demandé",
+      "requested": "Demandé",
+      "active": "Actif",
+      "paused": "En pause",
+      "cancelled": "Désactivé",
+      "needs_attention": "Intervention requise"
+    },
+    "pending": "La vérification bancaire est en attente. Aucun paiement automatique ne peut encore être effectué.",
+    "effective": "S’applique aux factures émises après le {{date}}",
+    "recipient": "Autre destinataire de la demande (facultatif)",
+    "request": "Envoyer la demande",
+    "resend": "Renvoyer la demande",
+    "pause": "Mettre en pause",
+    "resume": "Reprendre",
+    "turnOff": "Désactiver",
+    "cancel": "Annuler",
+    "processingWarning": "Les futurs paiements automatiques seront arrêtés. Un paiement bancaire déjà en cours de traitement ne peut pas être rappelé.",
+    "unasked_one": "{{count}} client pas encore sollicité",
+    "unasked_other": "{{count}} clients pas encore sollicités",
+    "sendNow": "Envoyer maintenant",
+    "dismiss": "Masquer",
+    "select": "Sélectionner",
+    "client": "Client facturé",
+    "statusLabel": "État",
+    "method": "Moyen de paiement",
+    "selectClient": "Sélectionner {{name}}",
+    "empty": "Aucun client trouvé.",
+    "requestedCount_one": "Demande envoyée à {{count}} client.",
+    "requestedCount_other": "Demandes envoyées à {{count}} clients.",
+    "chargeDate": "Prélèvement aux alentours du {{date}}",
+    "excludeInvoice": "Exclure cette facture des paiements automatiques",
+    "excludeRefusedProcessing": "Le paiement de cette facture est déjà en cours de traitement et ne peut pas être arrêté. Vous pourrez exclure la facture une fois le paiement abouti ou échoué.",
+    "excludeContract": "Exclure les factures comprenant ce contrat",
+    "failed": "Impossible de mettre à jour le paiement automatique. Veuillez réessayer.",
+    "states": {
+      "awaiting_notice": "En attente de l’avis",
+      "scheduled": "Programmé",
+      "collecting": "Prélèvement en cours",
+      "retry_scheduled": "Nouvelle tentative programmée",
+      "action_required": "Confirmation requise",
+      "succeeded": "Paiement reçu",
+      "failed": "Échec du paiement",
+      "skipped_by_client": "Ignoré par le client",
+      "excluded_by_msp": "Exclu par le prestataire",
+      "cancelled": "Annulé",
+      "not_needed": "Aucun paiement nécessaire",
+      "reserved": "Paiement réservé",
+      "created": "Paiement créé",
+      "confirming": "Confirmation du paiement en cours",
+      "processing": "Traitement du paiement en cours",
+      "requires_action": "Confirmation requise",
+      "canceled": "Annulé",
+      "unapplied": "Rapprochement du paiement nécessaire"
+    },
+    "reasons": {
+      "not_enrolled": "Non inscrit",
+      "enrolled_after_issue": "Inscrit après l’émission de la facture",
+      "method_not_usable": "Moyen de paiement indisponible",
+      "over_cap": "Plafond de paiement automatique dépassé",
+      "above_authorized_cap": "Au-dessus de la limite autorisée par le client",
+      "issued_before_authorization": "Émise avant l'autorisation mise à jour du client : à encaisser manuellement",
+      "cap_currency_mismatch": "La devise du plafond ne correspond pas",
+      "ach_currency_unsupported": "Devise non prise en charge pour les paiements bancaires",
+      "excluded_contract": "Contrat exclu",
+      "excluded_invoice": "Facture exclue",
+      "charging_disabled": "Prélèvement automatique désactivé",
+      "stripe_unavailable": "Stripe indisponible",
+      "bank_unverified": "Non prélevée : le compte bancaire du client n'a pas été vérifié à temps. À encaisser manuellement",
+      "charging_on_hold": "Non prélevée : les paiements automatiques sont restés désactivés. À encaisser manuellement",
+      "service_unavailable": "Non prélevée : Stripe est resté inaccessible. À encaisser manuellement",
+      "control_pending:skip": "Demande d’omission reçue; arrêt du paiement en attente",
+      "control_pending:exclude": "Exclusion demandée; arrêt du paiement en attente",
+      "control_pending:stop": "Arrêt demandé; arrêt du paiement en attente",
+      "control_pending:renotice": "Mise à jour de l’avis ; arrêt du paiement en attente",
+      "skip": "Ignoré par le client",
+      "exclude": "Exclu par le prestataire",
+      "stop": "Paiements automatiques arrêtés",
+      "client_request": "Demandé par le client",
+      "no_billing_contact": "Aucun contact de facturation",
+      "delivery_failed": "Échec de l’envoi de l’avis",
+      "consent_required": "L’autorisation de paiement est manquante. Demandez une nouvelle autorisation."
+    },
+    "noticeTemplate": "Facture avec avis de paiement automatique",
+    "chargeFailed": "Impossible de lancer le paiement. Réessayez.",
+    "chargeResultUnknown": "Nous n’avons pas pu confirmer ce qu’il est advenu de ce paiement. Actualisation de la facture pour afficher son état actuel.",
+    "chargeStarted": "Tentative de paiement lancée",
+    "chargeNow": "Prélever maintenant",
+    "noCharge": "Aucun prélèvement",
+    "noticeStuck": "Avis de paiement à vérifier",
+    "unapplied": "{{count}} paiement(s) nécessitent un rapprochement. Vérifiez les montants non rapprochés avant un nouveau prélèvement.",
+    "lastCharge": "Dernier prélèvement",
+    "attention": "À vérifier",
+    "attemptStates": {
+      "reserved": "Paiement réservé",
+      "created": "Paiement créé",
+      "confirming": "Confirmation du paiement en cours",
+      "processing": "Traitement du paiement en cours",
+      "succeeded": "Paiement reçu",
+      "failed": "Échec du paiement",
+      "requires_action": "Confirmation requise",
+      "canceled": "Annulé",
+      "unapplied": "Rapprochement du paiement nécessaire",
+      "returned": "Rejeté",
+      "refunded": "Remboursé",
+      "disputed": "Contesté"
+    },
+    "fees": {
+      "title": "Frais de traitement",
+      "cardBps": "Frais de carte de crédit (points de base, 0–300)",
+      "ach": "Frais de paiement bancaire (USD, 0.00–25.00)",
+      "inactive": "Les frais de carte restent inactifs tant que votre administrateur partenaire n’a pas confirmé les deux déclarations ci-dessous.",
+      "notified": "J’ai informé mon acquéreur (Stripe) et les réseaux de cartes il y a au moins 30 jours",
+      "cost": "Ces frais ne dépassent pas mon coût d’acceptation des cartes",
+      "rules": "Cartes de crédit uniquement. Aucun frais de carte en CA, CT, ME ou MA ; plafond de 2 % au Colorado. Les frais s’appliquent uniquement aux paiements automatiques américains éligibles en USD. Les liens de paiement ponctuel sont sans frais.",
+      "legal": "Breeze ne fournit pas de conseils juridiques. Vous êtes responsable de l’éligibilité des majorations, des avis et du traitement fiscal.",
+      "lowerAuthorization": "Clients ayant autorisé des conditions inférieures : {{count}}. Leur autorisation actuelle reste en vigueur jusqu’à l’acceptation des nouvelles conditions.",
+      "authorizedCard": "Autorisé : {{accepted}} points de base ; configuré : {{configured}}",
+      "authorizedAch": "Autorisé : USD {{accepted}} ; configuré : USD {{configured}}",
+      "authorizedCap": "Plafond autorisé : {{accepted}} ; configuré : {{configured}}",
+      "noCap": "aucun plafond",
+      "requestAuthorization": "Demander une nouvelle autorisation",
+      "requestFailed": "Impossible de demander une nouvelle autorisation. Vérifiez le contact de facturation et la disponibilité de Stripe.",
+      "requested": "Nouvelle autorisation demandée. L’autorisation actuelle reste en vigueur.",
+      "attestationOnFile": "Attestation enregistrée : {{name}} a confirmé les deux déclarations le {{date}}.",
+      "attestationOnFileUnknown": "Attestation enregistrée : les deux déclarations ont été confirmées le {{date}}.",
+      "reattestHelp": "Pour attester de nouveau, cochez les deux déclarations puis enregistrez. Une nouvelle attestation est enregistrée à votre nom avec la date du jour et remplace celle en place. Les frais autorisés par vos clients ne changent pas.",
+      "authorizedCardNone": "Aucune autorisation enregistrée ; configuré : {{configured}} points de base",
+      "authorizedAchNone": "Aucune autorisation enregistrée ; configuré : USD {{configured}}",
+      "lowerAuthorizationOrg": "Ce client n’a pas autorisé les conditions configurées. Toute autorisation existante reste en vigueur jusqu’à l’acceptation des nouvelles conditions.",
+      "blankPartner": "Un champ vide applique la valeur par défaut de Breeze (sans frais). Pour exonérer un client, saisissez 0 comme frais sur sa page Facturation.",
+      "blankOrg": "Un champ vide reprend la valeur par défaut du partenaire. Saisissez 0 pour exonérer ce client.",
+      "inactiveOrg": "Les frais de carte restent inactifs tant qu’un administrateur partenaire n’a pas confirmé les deux déclarations sur les frais dans l’onglet Payments des paramètres de facturation du partenaire.",
+      "missingAuthorization": "Aucune autorisation enregistrée : {{count}}. Les paiements automatiques ne peuvent pas prélever ces clients tant qu’ils n’ont pas autorisé leur moyen de paiement enregistré.",
+      "missingAuthorizationOrg": "Ce client n’a aucune autorisation pour le moyen de paiement enregistré. Les paiements automatiques ne peuvent pas le prélever tant qu’il ne l’a pas autorisé.",
+      "requestMissingAuthorization": "Demander une autorisation"
+    },
+    "enrollmentTitle": "Inscription au paiement automatique",
+    "requestSentTo": "Demande envoyée à {{email}}.",
+    "result": {
+      "paused": "Paiements automatiques suspendus.",
+      "resumed": "Paiements automatiques repris.",
+      "turnedOff": "Paiements automatiques désactivés."
+    },
+    "needsAttention": {
+      "method_unusable": "Le moyen de paiement enregistré ne peut pas être prélevé.",
+      "stripe_account_changed": "Le compte Stripe connecté a changé après l’inscription de ce client.",
+      "key_missing_permissions": "Il manque à la clé Stripe des autorisations nécessaires aux paiements automatiques.",
+      "verification_failed": "La vérification du compte bancaire a échoué."
+    },
+    "chargeOutcome": {
+      "succeeded": "Paiement reçu.",
+      "processing": "Paiement envoyé. Il est en cours de traitement ; la facture sera mise à jour une fois le paiement réglé.",
+      "requiresAction": "La banque du client exige qu’il confirme ce paiement. Si un contact de facturation est enregistré, il reçoit par e-mail un lien pour le confirmer.",
+      "declined": "Le paiement n’a pas abouti.",
+      "cardDeclined": "La carte a été refusée.",
+      "expiredCard": "La carte a expiré. Demandez au client de mettre à jour son moyen de paiement.",
+      "insufficientFunds": "Le paiement a été refusé pour provision insuffisante.",
+      "canceled": "Le paiement a été annulé avant d’aboutir.",
+      "unapplied": "Le paiement a été encaissé mais doit être rapproché. Vérifiez-le avant de prélever à nouveau."
+    },
+    "chargeRefused": {
+      "notice_lead": "Le délai de préavis du client n’est pas encore écoulé. La facture pourra être prélevée ensuite.",
+      "no_eligible_notice": "Cette facture n’a pas d’avis de paiement automatique ; elle ne peut donc pas être prélevée automatiquement.",
+      "renotice_required": "L’avis de paiement doit être renvoyé avant de pouvoir prélever cette facture.",
+      "collection_in_progress": "Un paiement est déjà en cours pour cette facture.",
+      "checkout_session_unrevoked": "Le client est peut-être en train de payer cette facture en ligne. Réessayez dans quelques minutes.",
+      "retry_not_due": "La prochaine nouvelle tentative n’est pas encore due.",
+      "not_payable": "Cette facture n’est pas ouverte au paiement.",
+      "nothing_to_pay": "Il ne reste rien à payer sur cette facture.",
+      "enrollment_inactive": "Les paiements automatiques ne sont pas actifs pour ce client.",
+      "schedule_inactive": "Cette facture n’est plus planifiée pour un paiement automatique.",
+      "generic": "Le paiement automatique n’a pas pu démarrer. Actualisez la facture pour voir son état actuel.",
+      "excluded_contract": "Le contrat de cette facture est exclu des paiements automatiques, donc rien n'a été prélevé. Si le client avait été prévenu de ce paiement, il a reçu un e-mail indiquant qu'il n'aura pas lieu."
+    },
+    "stepUp": {
+      "heading": "Confirmez que c'est bien vous",
+      "intro": {
+        "autopay_charge_now": "Prélever cette facture maintenant nécessite une nouvelle vérification à deux facteurs.",
+        "partner_payment_settings_update": "Modifier les paramètres de paiement nécessite une nouvelle vérification à deux facteurs pour ces valeurs précises.",
+        "org_payment_settings_update": "Modifier les paramètres de paiement de cette organisation nécessite une nouvelle vérification à deux facteurs pour ces valeurs précises.",
+        "autopay_request_recipient": "Envoyer la demande d'autorisation à une adresse autre que celle du contact de facturation nécessite une nouvelle vérification à deux facteurs."
+      },
+      "code": "Code d'authentification",
+      "passkey": "Vous confirmerez avec votre clé d'accès.",
+      "noFactor": "Ajoutez d'abord une application d'authentification ou une clé d'accès à votre compte.",
+      "noFactorSmsOnly": "Les codes par SMS ne peuvent pas confirmer cette action. Ajoutez d'abord une application d'authentification ou une clé d'accès à votre compte.",
+      "enrollLink": "Configurer un second facteur",
+      "confirm": "Confirmer",
+      "failed": "Échec de la vérification. Réessayez.",
+      "unavailable": "Impossible de démarrer la vérification"
+    }
+  },
+  "reminders": {
+    "title": "Rappels de paiement",
+    "description": "Envoyer des rappels de factures impayées au contact de facturation de l’organisation. Les rappels fonctionnent sans paiements automatiques.",
+    "enabled": "Envoyer des rappels de paiement",
+    "on": "Activés",
+    "off": "Désactivés",
+    "inherit": "Utiliser {{source}} : {{value}}",
+    "before": "Jours avant l’échéance",
+    "repeat": "Répéter avant l’échéance tous les (jours)",
+    "overdue": "Rappeler après l’échéance tous les (jours)",
+    "noRepeat": "Sans répétition",
+    "orgRepeatHelp": "Un champ vide reprend le paramètre du partenaire. Vous ne pouvez pas désactiver uniquement les répétitions avant l’échéance si le partenaire les a activées ; désactivez les rappels pour cette organisation pour tous les arrêter.",
+    "partnerRepeatHelp": "Laissez l’intervalle de répétition vide pour envoyer un seul rappel avant l’échéance. Les autres champs vides utilisent la valeur par défaut affichée.",
+    "cadenceHelp": "Aucun rappel n’est envoyé le jour de l’échéance. Le premier rappel de retard est envoyé un intervalle après l’échéance. Modifier les dates ou les intervalles ne renvoie pas les rappels déjà attribués.",
+    "invalid": "Saisissez un nombre entier de jours entre 1 et 31, ou laissez le champ vide pour hériter de la valeur.",
+    "sources": {
+      "org": "organisation",
+      "partner": "valeur par défaut du partenaire",
+      "default": "valeur par défaut de Breeze"
+    },
+    "save": "Enregistrer les paramètres de paiement",
+    "saving": "Enregistrement…",
+    "saved": "Paramètres de rappel enregistrés",
+    "saveFailed": "Impossible d’enregistrer les paramètres de rappel",
+    "loadFailed": "Impossible de charger les paramètres de rappel",
+    "retry": "Réessayer",
+    "loading": "Chargement des paramètres de paiement…",
+    "templates": {
+      "paymentReminder": "Rappel de paiement",
+      "paymentOverdue": "Rappel de paiement en retard"
     }
   }
 }

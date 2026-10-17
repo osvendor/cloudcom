@@ -142,6 +142,10 @@ const CLASSIFICATION: Record<string, Classification> = {
     kind: 'eligibility',
     reason: 'The dispatch read joins the device org type; a parked device fails the actuation before the raw insert',
   },
+  'routes/devices/pamReconciliation.ts': {
+    kind: 'chokepoint',
+    reason: 'insertQueuedCommandInTransaction checks parked-device delivery on the held transaction and the route returns its typed 409 refusal',
+  },
   'routes/devices/actuateElevation.ts': {
     kind: 'eligibility',
     reason: 'Asserted first in the actuation transaction, before the approval flip and the insert',
@@ -153,6 +157,10 @@ const CLASSIFICATION: Record<string, Classification> = {
   'routes/agents/helpers.ts': {
     kind: 'eligibility',
     reason: 'Threshold filesystem scans and the continuation fallback skip a parked device before inserting',
+  },
+  'jobs/backupWorker.ts': {
+    kind: 'eligibility',
+    reason: 'Dispatch refuses a parked device at precheck and before every send; the post-send backup_stop persists only through the gated insert',
   },
   'routes/devPush.ts': {
     kind: 'eligibility',
@@ -216,17 +224,20 @@ const CLASSIFICATION: Record<string, Classification> = {
     kind: 'chokepoint',
     reason: 'Pushes a diagnostic row only after claimPendingCommandForDelivery claimed it',
   },
+  'services/callerVerification/deliverers/workstation.ts': {
+    kind: 'chokepoint',
+    reason: 'caller_verify rows persist only through insertQueuedCommandInTransaction (parked refused as not-found); the post-commit dispatchCommandToAgent push sends only a row claimPendingCommandForDelivery claimed',
+  },
 
   // --- remote_gated ---------------------------------------------------------
   'routes/terminalWs.ts': { kind: 'remote_gated', reason: REMOTE_REASON },
   'routes/desktopWs.ts': { kind: 'remote_gated', reason: REMOTE_REASON },
   'routes/tunnelWs.ts': { kind: 'remote_gated', reason: REMOTE_REASON },
   'routes/tunnels.ts': { kind: 'remote_gated', reason: REMOTE_REASON },
-  'routes/tunnelHttp.ts': { kind: 'remote_gated', reason: REMOTE_REASON },
+  'routes/tunnelHttpCore.ts': { kind: 'remote_gated', reason: REMOTE_REASON },
   'routes/remote/sessions.ts': { kind: 'remote_gated', reason: REMOTE_REASON },
 
   // --- socket_only: rowless probes over the live socket ---------------------
-  'jobs/backupWorker.ts': { kind: 'socket_only', reason: SOCKET_ONLY_REASON },
   'jobs/discoveryWorker.ts': { kind: 'socket_only', reason: SOCKET_ONLY_REASON },
   'jobs/monitorWorker.ts': { kind: 'socket_only', reason: SOCKET_ONLY_REASON },
   'jobs/snmpWorker.ts': { kind: 'socket_only', reason: SOCKET_ONLY_REASON },
@@ -391,10 +402,10 @@ const GUARDS: Array<{ name: string; file: string; anchor: string; markers: strin
     markers: ['conn.parked', 'isParkedDeliverableCommandType('],
   },
   {
-    name: 'the single-row push claim cancels non-removal rows for a parked device',
+    name: 'the single-row push claim hands the device org type to the shared claim-time eligibility (which cancels non-removal rows for a parked device)',
     file: 'services/commandDispatch.ts',
-    anchor: 'export async function claimPendingCommandForDelivery(',
-    markers: ['organizations.type', 'isUnassignedPoolOrgType(', 'isParkedDeliverableCommandType('],
+    anchor: 'async function claimInSavepoint(',
+    markers: ['orgType: organizations.type', 'orgType: candidate.orgType', 'partitionClaimable('],
   },
   {
     name: 'the batch claim reads the device org type',

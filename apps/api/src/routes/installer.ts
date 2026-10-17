@@ -1,6 +1,6 @@
 import { Hono, type Context } from "hono";
 import type { HttpBindings } from "@hono/node-server";
-import { and, eq, inArray, lt, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import { createHash, randomBytes } from "node:crypto";
 import { db, withSystemDbAccessContext } from "../db";
 import { installerBootstrapTokens } from "../db/schema/installerBootstrapTokens";
@@ -9,8 +9,12 @@ import {
   hashEnrollmentKey,
   hashEnrollmentKeyCandidates,
 } from "../services/enrollmentKeySecurity";
-import { BOOTSTRAP_TOKEN_PATTERN } from "../services/installerBootstrapToken";
+import {
+  BOOTSTRAP_TOKEN_PATTERN,
+  hashBootstrapToken,
+} from "../services/installerBootstrapToken";
 import { getTrustedClientIp } from "../services/clientIp";
+import { ANONYMOUS_ACTOR_ID, writeAuditEvent } from "../services/auditEvents";
 import { clampTtlToCap } from "../services/enrollmentDefaults";
 import { envInt } from "../utils/envInt";
 import { getDefaultEnrollmentKeyTtlMinutes } from "../services/enrollmentKeyTtlDefault";
@@ -60,7 +64,7 @@ export function childEnrollmentKeyTtlMinutes(): number {
  * and the on-demand `POST /enrollment-keys/purge-expired` route behind the
  * web UI's "Delete expired" button share the exemption predicate in
  * services/enrollmentKeyPurgeGuards.ts, which skips any parent key that still
- * has a live, unexhausted bootstrap token. So a 30-day/1-year token cannot be
+ * has a live, unexhausted bootstrap token. So a token of up to 30 days cannot be
  * cascade-deleted out from under itself by either before its own expiry (or
  * full consumption). If you're reading this because you found one of those
  * purges and are wondering whether it re-clamps this TTL, it doesn't — see
@@ -134,10 +138,22 @@ async function redeemBootstrapToken(c: Context, token: string) {
 
   const result = await withSystemDbAccessContext(async () => {
     // ── 1. Look up token ──────────────────────────────────────────────
+    // Rows store a keyed hash of the token. Rows issued before hashing have
+    // token_hash NULL and keep their plaintext until they expire (the expiry
+    // check below refuses them after that); the plaintext branch is confined
+    // to exactly those rows so a hashed row can never match on `token`.
     const [row] = await db
       .select()
       .from(installerBootstrapTokens)
-      .where(eq(installerBootstrapTokens.token, token))
+      .where(
+        or(
+          eq(installerBootstrapTokens.tokenHash, hashBootstrapToken(token)),
+          and(
+            isNull(installerBootstrapTokens.tokenHash),
+            eq(installerBootstrapTokens.token, token),
+          ),
+        ),
+      )
       .limit(1);
 
     if (!row) {
@@ -146,6 +162,18 @@ async function redeemBootstrapToken(c: Context, token: string) {
         tokenHash: hashTokenForLog(token),
         ip,
       });
+      // Operator hint for the miss that is NOT a typo or a deleted key: tokens
+      // are matched by a keyed hash, so a well-formed token from a genuine
+      // installer also misses here when that installer came from somewhere
+      // this server's table/pepper can't see. Correlate by the same log hash;
+      // never the token or its stored digest.
+      console.warn(
+        "[installer] bootstrap token not found. If this installer was downloaded from this server, likely causes: "
+          + "it was issued by a newer API version that was then rolled back (re-download the installer); "
+          + "ENROLLMENT_KEY_PEPPER was changed since it was issued (every outstanding installer link is invalidated; re-download); "
+          + "or it belongs to a different Breeze server.",
+        { tokenHash: hashTokenForLog(token) },
+      );
       return null;
     }
 
@@ -281,9 +309,10 @@ async function redeemBootstrapToken(c: Context, token: string) {
       return null;
     }
 
-    // Success audit: consumed_at/consumed_from_ip on the token row only retain
-    // the LAST redeemer, so record each redemption's IP + running count here —
-    // this is the only per-device forensic trail for a multi-use token.
+    // consumed_at/consumed_from_ip on the token row only retain the LAST
+    // redeemer, so log each redemption's IP + running count. Operational log
+    // only — the durable per-device record is the installer.bootstrap_redeemed
+    // audit row written after this transaction commits (#7973).
     console.log("[installer] bootstrap redeemed", {
       reason: "redeemed",
       tokenId: row.id,
@@ -304,12 +333,50 @@ async function redeemBootstrapToken(c: Context, token: string) {
       rawChildKey,
       siteId: row.siteId,
       orgName: org?.name ?? "your organization",
+      audit: {
+        orgId: row.orgId,
+        tokenId: row.id,
+        enrollmentKeyId: row.parentEnrollmentKeyId,
+        childEnrollmentKeyId: childKey?.id ?? null,
+        platform: row.installerPlatform ?? null,
+        consumedCount: updated.consumedCount,
+        maxUsage: row.maxUsage,
+      },
     };
   });
 
   if (!result) {
     return c.json(INVALID_TOKEN_RESPONSE.body, INVALID_TOKEN_RESPONSE.status);
   }
+
+  // Audit trail for the redemption (#7973). Written only once the redeem
+  // transaction has committed, so every failure path (unknown / exhausted /
+  // expired / rotated parent / lost consume race) writes nothing. Carries ids
+  // only — never the bearer token, its log hash, or the minted child key.
+  const audit = result.audit;
+  writeAuditEvent(c, {
+    orgId: audit.orgId,
+    action: "installer.bootstrap_redeemed",
+    resourceType: "installer_bootstrap_token",
+    resourceId: audit.tokenId,
+    // Public endpoint: the token is the auth, there is no user to attribute.
+    actorType: "system",
+    actorId: ANONYMOUS_ACTOR_ID,
+    initiatedBy: "agent",
+    details: {
+      tokenId: audit.tokenId,
+      enrollmentKeyId: audit.enrollmentKeyId,
+      childEnrollmentKeyId: audit.childEnrollmentKeyId,
+      siteId: result.siteId,
+      platform: audit.platform,
+      consumedCount: audit.consumedCount,
+      maxUsage: audit.maxUsage,
+      remainingUsage: Math.max(0, audit.maxUsage - audit.consumedCount),
+      ip: ip === "unknown" ? null : ip,
+    },
+    ipAddress: ip === "unknown" ? undefined : ip,
+    result: "success",
+  });
 
   return c.json({
     serverUrl: process.env.PUBLIC_API_URL ?? process.env.API_URL ?? "",

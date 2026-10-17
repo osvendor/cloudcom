@@ -6,7 +6,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { nanoid } from 'nanoid';
 import { createHash } from 'crypto';
 import { db, withDbAccessContext, withSystemDbAccessContext } from '../../db';
-import { organizations, portalBranding, portalUsers, users } from '../../db/schema';
+import { organizations, partners, portalBranding, portalUsers, users } from '../../db/schema';
 import { hashPassword, isPasswordStrong, verifyPassword } from '../../services/password';
 import { getEmailService } from '../../services/email';
 import { getRedis } from '../../services/redis';
@@ -140,6 +140,14 @@ async function isPortalPasswordResetEnabled(orgId: string): Promise<boolean> {
 // Auth middleware
 // ============================================
 
+/**
+ * Scalar subquery for the organization's display name, folded into the portal
+ * user selects so login, session hydration and invite-accept all carry it
+ * without an extra round trip. A genuinely missing org yields null and
+ * buildPortalUserPayload falls back to the generic label.
+ */
+const portalOrgNameSql = () => sql<string | null>`(select o.name from organizations o where o.id = ${portalUsers.orgId})`;
+
 export async function portalAuthMiddleware(c: Context, next: Next) {
   sweepPortalState();
 
@@ -229,6 +237,7 @@ export async function portalAuthMiddleware(c: Context, next: Next) {
         status: portalUsers.status,
         authEpoch: portalUsers.authEpoch,
         accessMode: portalUsers.accessMode,
+        orgName: portalOrgNameSql(),
         // Signed out at logout (durable record, see sessionRevocation.ts).
         sessionRevoked: portalSessionRevokedSql(token),
       })
@@ -477,6 +486,7 @@ authRoutes.post('/auth/login', zValidator('json', loginSchema), async (c) => {
         receiveNotifications: portalUsers.receiveNotifications,
         status: portalUsers.status,
         authEpoch: portalUsers.authEpoch,
+        orgName: portalOrgNameSql(),
       })
       .from(portalUsers)
       .where(
@@ -644,9 +654,11 @@ authRoutes.post('/auth/forgot-password', zValidator('json', forgotPasswordSchema
         // no auth context and asserts the envelope that reaches the transport:
         // __tests__/integration/portalPasswordResetPartnerLane.integration.test.ts.
         partnerId: organizations.partnerId,
+        partnerName: partners.name,
       })
       .from(portalUsers)
       .innerJoin(organizations, eq(organizations.id, portalUsers.orgId))
+      .leftJoin(partners, eq(partners.id, organizations.partnerId))
       .where(
         orgId
           ? and(eq(portalUsers.orgId, orgId), eq(portalUsers.email, normalizedEmail), eq(portalUsers.authMethod, 'password'))
@@ -684,7 +696,8 @@ authRoutes.post('/auth/forgot-password', zValidator('json', forgotPasswordSchema
           to: user.email,
           resetUrl,
           purpose: 'portal.password_reset',
-          partnerId: user.partnerId ?? null
+          partnerId: user.partnerId ?? null,
+          partnerName: user.partnerName ?? null,
         });
       } catch (error) {
         console.error('[portal] Failed to send password reset email:', error);
@@ -855,6 +868,7 @@ authRoutes.post('/auth/accept-invite', zValidator('json', acceptInviteSchema), a
         receiveNotifications: portalUsers.receiveNotifications,
         status: portalUsers.status,
         authEpoch: portalUsers.authEpoch,
+        orgName: portalOrgNameSql(),
       })
       .from(portalUsers)
       .where(eq(portalUsers.id, portalUserId))

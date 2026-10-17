@@ -19,7 +19,7 @@ import { captureException } from './sentry';
 import { loadTenantVariableScope } from './tenantVariableResolution';
 import { scriptNeedsVariableScope } from './sourcedParameters';
 
-type ScriptExecutionAuth = {
+export type ScriptExecutionAuth = {
   user: { id: string };
   orgId: string | null;
   canAccessOrg: (orgId: string) => boolean;
@@ -103,6 +103,9 @@ export type ExecuteScriptOnDevicesResult = ExecuteScriptOnDevicesSuccess | Execu
  */
 const DISPATCH_CODES_ALREADY_RECORDED: ReadonlySet<string> = new Set([
   'agent_upgrade_required_recorded',
+  // The push's claim-time eligibility cancelled the command and its execution
+  // row (and advanced the batch counters) in one transaction.
+  'delivery_cancelled_recorded',
 ]);
 
 function ensureOrgAccess(orgId: string, auth: Pick<ScriptExecutionAuth, 'canAccessOrg'>) {

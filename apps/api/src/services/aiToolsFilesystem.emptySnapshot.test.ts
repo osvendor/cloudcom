@@ -15,6 +15,9 @@ const dbMockState = vi.hoisted(() => ({
 }));
 
 vi.mock('../db', () => ({
+  // These handlers run as under the per-call transaction: `inToolDbPhase`
+  // (#7918) joins it rather than opening a context of its own.
+  hasDbAccessContext: vi.fn(() => true),
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn((_context, fn) => fn()),
   db: {
@@ -63,6 +66,7 @@ vi.mock('./filesystemAnalysis', () => ({
     }
   }),
   setFilesystemScanGeneration: vi.fn(),
+  findInFlightFilesystemScan: vi.fn(async () => null),
   saveFilesystemSnapshot: vi.fn(async () => ({ id: 'snap-1' })),
   safeCleanupCategories: ['temp_files'],
 }));

@@ -18,6 +18,7 @@ import { writeAuditEvent } from '../services/auditEvents';
 import { captureException, withSentryRequestScope } from '../services/sentry';
 import { getEffectiveMfaPolicy } from '../services/mfaPolicy';
 import { ipAllowlistGuard } from './ipAllowlistGuard';
+import { markPermissionGate } from './permissionGate';
 import { isSelfManagedDbContextRoute } from './selfManagedDbContextRoutes';
 import { isReportHistoryReadRoute } from './reportHistoryRoutes';
 import {
@@ -54,7 +55,14 @@ import {
 export type PrincipalKind =
   | { kind: 'user_session' }
   | { kind: 'client_user' }
-  | { kind: 'api_key'; apiKeyId?: string }
+  // `partnerServicePrincipalId` is set only for a partner service principal
+  // (`brz_sp_` key) on the MCP endpoint. It is still an API-key-class machine
+  // caller everywhere (no interactive session, no approval surface), but
+  // `apiKeyId` is then a partner_service_principal_keys id, NOT an api_keys
+  // id: consumers that resolve `apiKeyId` against api_keys must check
+  // isPartnerServicePrincipal() first. `auth.user` is the principal's owner,
+  // borrowed for per-tool RBAC only; it never reaches breeze.user_id.
+  | { kind: 'api_key'; apiKeyId?: string; partnerServicePrincipalId?: string }
   | { kind: 'oauth_grant'; grantId?: string }
   | { kind: 'agent'; deviceId?: string }
   | { kind: 'helper'; deviceId?: string }
@@ -72,6 +80,11 @@ export type PrincipalKind =
  * present, including `oauth_grant` (which acts *for* a user but not *as* an
  * interactive session).
  */
+/** True for a partner service principal (`brz_sp_` key) caller. */
+export function isPartnerServicePrincipal(auth: Pick<AuthContext, 'principal'>): boolean {
+  return auth.principal?.kind === 'api_key' && Boolean(auth.principal.partnerServicePrincipalId);
+}
+
 export function isInteractiveUserSession(auth: Pick<AuthContext, 'principal'>): boolean {
   return auth.principal.kind === 'user_session';
 }
@@ -567,7 +580,12 @@ export function dbAccessContextFromAuth(auth: AuthContext): DbAccessContext {
     // every tool call rather than a benign null user id.
     // AI agents carry a synthetic user record for audit attribution only. It
     // must never reach breeze.user_id or satisfy Shape-6 user-scoped RLS.
-    userId: auth.principal?.kind === 'ai_agent' ? null : auth.user?.id ?? null,
+    // A partner service principal's `user` is its owner, borrowed for per-tool
+    // RBAC only; the machine must never read or write the owner's private
+    // (user-scoped) rows, so it gets no user id either.
+    userId: auth.principal?.kind === 'ai_agent' || isPartnerServicePrincipal(auth)
+      ? null
+      : auth.user?.id ?? null,
     // #6771: re-entering the request's context re-enters its report-history
     // grant too (only ever set on the report-history GET routes).
     reportHistoryOrgIds: auth.reportHistory?.orgIds,
@@ -971,7 +989,7 @@ export function requireOrg(c: Context, next: Next) {
 
 // Permission-based middleware
 export function requirePermission(resource: string, action: string) {
-  return async (c: Context, next: Next) => {
+  return markPermissionGate(async (c: Context, next: Next) => {
     const auth = c.get('auth');
 
     if (!auth) {
@@ -1007,7 +1025,7 @@ export function requirePermission(resource: string, action: string) {
     c.set('permissions', userPerms);
 
     await next();
-  };
+  }, `${resource}:${action}`);
 }
 
 /**

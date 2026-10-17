@@ -5,6 +5,7 @@ import {
   runOutsideDbContext,
   withDbAccessContext,
   withSystemDbAccessContext,
+  type DbAccessContext,
 } from '../db';
 import { deviceCommands, devices, auditLogs, users } from '../db/schema';
 import { sendCommandToAgent, isAgentConnected } from '../routes/agentWs';
@@ -16,6 +17,7 @@ import {
   releaseClaimedCommandDelivery,
 } from './commandDispatch';
 import { refreshClaimedPayloadForPush } from './commandDelivery';
+import { cancelledCommandError } from './commandCancelMessage';
 import { BACKUP_WRITE_CREDENTIAL_COMMAND_TYPES } from './backupCommandCredentials';
 import { commandAuditDetails } from './commandAudit';
 import {
@@ -24,6 +26,7 @@ import {
 } from './agentEditionCompat';
 import { assertDeviceExecuteAllowed, TrustDeniedError } from './partnerTrust.commands';
 import { backupReadHelperRefusal } from './backupReadHelperGate';
+import { restoreIntegrityHelperRefusal } from './backupRestoreGate';
 import { backupWriteHelperRefusal } from './backupWriteHelperGate';
 import {
   assertCommandDeliverable,
@@ -87,6 +90,12 @@ export interface CommandResult {
   stdout?: string;
   stderr?: string;
   error?: string;
+  /**
+   * Typed refusal code from the agent (#4026), persisted alongside `error`.
+   * Any string: an agent may be newer than this API. Narrow with
+   * isAgentCommandErrorCode before branching — classifyCommandFailure does.
+   */
+  errorCode?: string;
   durationMs?: number;
   data?: unknown;
   trust?: { capability: 'device_execute'; reason: string };
@@ -209,7 +218,7 @@ export type RearmIdempotentCommandResult =
   | { delivered: true }
   | {
       delivered: false;
-      reason: 'agent_disconnected' | 'delivery_failed' | 'command_conflict';
+      reason: 'agent_disconnected' | 'delivery_failed' | 'command_conflict' | 'command_cancelled';
     };
 
 /**
@@ -288,7 +297,12 @@ export async function rearmIdempotentCommandForDelivery(input: {
   const claimed = await withSystemDbAccessContext(() =>
     claimPendingCommandForDelivery(input.commandId),
   );
-  if (!claimed) {
+  // Claim-time eligibility terminalised the row: it will never be delivered,
+  // so do not report it as a retryable delivery failure.
+  if (claimed.status === 'cancelled') {
+    return { delivered: false, reason: 'command_cancelled' };
+  }
+  if (claimed.status !== 'claimed') {
     return { delivered: false, reason: 'delivery_failed' };
   }
   const delivered = sendCommandToAgent(prepared.agentId, {
@@ -417,6 +431,8 @@ const INTERACTIVE_COMMAND_TYPES: Set<string> = new Set([
   CommandTypes.FILE_LIST,
   CommandTypes.FILE_LIST_DRIVES,
   CommandTypes.FILE_READ,
+  CommandTypes.DIAG_FILE_LIST,
+  CommandTypes.DIAG_FILE_READ,
   CommandTypes.FILE_WRITE,
   CommandTypes.FILE_DELETE,
   CommandTypes.FILE_MKDIR,
@@ -850,8 +866,11 @@ export async function waitForCommandResult(
     const deferredUpdate = pendingAgentUpdateWaitResult(command as QueuedCommand);
     if (deferredUpdate) return deferredUpdate;
 
-    // Check if command is complete
-    if (command.status === 'completed' || command.status === 'failed') {
+    // Check if command is complete. `cancelled` is terminal too (a claim-time
+    // refusal, an operator cancel): nothing will ever complete it, so waiting
+    // out the timeout would only stall the caller and then overwrite the
+    // cancellation with a timeout.
+    if (command.status === 'completed' || command.status === 'failed' || command.status === 'cancelled') {
       return command as QueuedCommand;
     }
 
@@ -943,12 +962,19 @@ export async function queueCommandForExecution(
     offlinePolicy?: OfflinePolicy;
     /** #5022 W01 — who DECIDED this command, when an AI surface did. */
     aiOrigin?: AiOriginRef;
+    /**
+     * Reserve the command id up front: a restore confirmed with a step-up is
+     * authorized for exactly this id before the command exists
+     * (services/backupRestoreAuthorization.ts).
+     */
+    commandId?: string;
   } = {}
 ): Promise<QueueCommandForExecutionResult> {
   const res = await dispatchDeviceCommand({
     deviceId,
     type,
     payload,
+    ...(options.commandId !== undefined ? { commandId: options.commandId } : {}),
     ...(options.userId !== undefined ? { userId: options.userId } : {}),
     ...(options.aiOrigin !== undefined ? { aiOrigin: options.aiOrigin } : {}),
     ...(options.preferHeartbeat !== undefined ? { preferHeartbeat: options.preferHeartbeat } : {}),
@@ -962,6 +988,11 @@ export async function queueCommandForExecution(
       : { error: res.error };
   }
 
+  if (res.delivery === 'cancelled') {
+    // The push's claim-time eligibility check cancelled the row: it exists but
+    // will never run. Report it as the refusal it is, with the reason.
+    return { command: res.command, error: cancelledCommandError(res.cancelReason) };
+  }
   return { command: res.command, delivery: res.delivery, deliverBy: res.deliverBy };
 }
 
@@ -977,6 +1008,11 @@ export async function queueCommandForExecutionWithSystemPrecheck(
     return res.code === 'trust_denied' && res.trust
       ? { error: res.error, trust: res.trust }
       : { error: res.error };
+  }
+  if (res.delivery === 'cancelled') {
+    // The push's claim-time eligibility check cancelled the row: it exists but
+    // will never run. Report it as the refusal it is, with the reason.
+    return { command: res.command, error: cancelledCommandError(res.cancelReason) };
   }
   return { command: res.command, delivery: res.delivery, deliverBy: res.deliverBy };
 }
@@ -1221,6 +1257,7 @@ async function precheckCommandExecution(
       watchdogVersion: devices.watchdogVersion,
       backupReadProtocolVersion: devices.backupReadProtocolVersion,
       backupWriteProtocolVersion: devices.backupWriteProtocolVersion,
+      backupIntegrityProtocolVersion: devices.backupIntegrityProtocolVersion,
     })
     .from(devices)
     .where(eq(devices.id, deviceId))
@@ -1312,8 +1349,11 @@ async function precheckCommandExecution(
   // a helper that cannot use a storage session is refused before a row exists.
   // A backup to S3 storage is written only through a write-scoped storage
   // session, so a helper that cannot use one is refused the same way.
+  // A privileged restore also needs a helper that checks restored bytes
+  // against the snapshot attestation (services/backupRestoreGate.ts).
   const helperRefusal = backupReadHelperRefusal(type, payload, device.backupReadProtocolVersion)
-    ?? backupWriteHelperRefusal(type, payload, device.backupWriteProtocolVersion);
+    ?? backupWriteHelperRefusal(type, payload, device.backupWriteProtocolVersion)
+    ?? restoreIntegrityHelperRefusal(type, device.backupIntegrityProtocolVersion);
   if (helperRefusal) {
     return { ok: false, result: { status: 'failed', error: helperRefusal } };
   }
@@ -1527,7 +1567,13 @@ async function dispatchPreparedCommand(
     // and is picked up by the heartbeat claim query in heartbeat.ts.
     if (device.agentId && dispatchViaWs) {
       const claimed = await claimPendingCommandForDelivery(command.id);
-      if (claimed) {
+      if (claimed.status === 'cancelled') {
+        // Claim-time eligibility refused and terminalised the row: it will
+        // never reach the agent, so fail now with the reason instead of
+        // polling a terminal row until `timeoutMs`.
+        return { status: 'failed' as const, error: cancelledCommandError(claimed.reason), commandId: command.id };
+      }
+      if (claimed.status === 'claimed') {
         // Same late-binding preparation as the heartbeat claim and the
         // enqueue-time push: the registered refresher runs FIRST (it resolves
         // anything the row stores only by reference, e.g. a storage
@@ -1604,6 +1650,13 @@ async function dispatchPreparedCommand(
 
     // Poll for result
     const result = await waitForCommandResult(command.id, timeoutMs);
+
+    if (result.status === 'cancelled') {
+      // Cancelled while we waited (e.g. by the heartbeat claim's eligibility
+      // check). Its `result` is a cancellation record, not a CommandResult.
+      const reason = (result.result as { reason?: string } | null)?.reason;
+      return { status: 'failed' as const, error: cancelledCommandError(reason), commandId: command.id };
+    }
 
     const finalResult = result.result ?? {
       status: 'failed' as const,
@@ -1784,6 +1837,43 @@ export async function executeCommandWithSystemPrecheck(
         'commandQueue.executeCommandWithSystemPrecheck',
       ));
 
+  if (!precheck.ok) return precheck.result;
+  return dispatchPreparedCommand(precheck.device, deviceId, type, payload, options);
+}
+
+/**
+ * `executeCommand` for a caller that holds NO DB access context but must have
+ * the precheck gated by a specific TENANT's RLS — a self-managed AI tool
+ * handler (#7918; `AiTool.selfManagedDbContext`), which the chat wrapper,
+ * the MCP route and the intent-release worker deliberately run without a
+ * per-call transaction so the device wait below pins no connection.
+ *
+ * Same two phases as `executeCommandWithSystemPrecheck`, with the caller's own
+ * context in place of system scope: the precheck's `devices` read (and the
+ * trust/parked/edition checks on it) runs in a SHORT `withDbAccessContext`
+ * built from that context, which commits before anything waits; the dispatch
+ * and the `waitForCommandResult` poll then run at depth 0. A device outside
+ * the caller's tenant reads as "Device not found" exactly as it would under
+ * `executeCommand` inside the caller's request transaction.
+ *
+ * An ambient context is JOINED rather than nested, for the reasons spelled
+ * out in `executeCommandWithSystemPrecheck`. That is plain `executeCommand`
+ * behaviour, and the caller then owns the connection it pins for the wait.
+ */
+export async function executeCommandWithCallerPrecheck(
+  deviceId: string,
+  type: CommandType | string,
+  payload: CommandPayload,
+  precheckContext: DbAccessContext,
+  options: ExecuteCommandOptions = {},
+): Promise<CommandResult> {
+  assertBackupWriteDispatchedAfterCommit(type);
+  const precheck = getCurrentDbAccessContext()
+    ? await precheckCommandExecution(deviceId, type, payload, options)
+    : await withDbAccessContext(
+      precheckContext,
+      () => precheckCommandExecution(deviceId, type, payload, options),
+    );
   if (!precheck.ok) return precheck.result;
   return dispatchPreparedCommand(precheck.device, deviceId, type, payload, options);
 }

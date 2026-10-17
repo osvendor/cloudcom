@@ -78,6 +78,7 @@ export const DAILY_REPEAT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const JOB_SCHEDULES = {
   // Fine-grained billing outbox tick; intentionally outside the coarse collision grid.
   'billing-notice-dispatch': '* * * * *',
+  'autopay-card-expiry-check': '28 6 * * *',
   // ---------------------------------------------------------------- daily tier
   // Minutes ≡ 3 (mod 5), one job per (hour, minute).
   'device-metrics-retention': '3 0 * * *',
@@ -93,6 +94,9 @@ export const JOB_SCHEDULES = {
   'backup-weekly-test-restore': '38 3 * * 0',
   'stripe-account-cache-refresh': '48 3 * * *',
   'enrollment-key-cleanup': '8 4 * * *',
+  // Partner API ticket-write idempotency claims (design doc §4.4). Daily
+  // tier, minute ≡ 3 (mod 5), ten minutes after the enrollment-key sweep.
+  'partner-api-idempotency-retention': '18 4 * * *',
   'audit-chain-verify': '13 4 * * *',
   'pax8-sync': '28 4 * * *',
   'audit-chain-anchor': '48 4 * * *',
@@ -107,6 +111,7 @@ export const JOB_SCHEDULES = {
   'tdsynnex-sftp-sync': '38 5 * * *',
   'auth-browser-transition-cleanup': '58 5 * * *',
   'invoice-overdue-sweep': '8 6 * * *',
+  'invoice-reminder-sweep': '18 6 * * *',
   // AI model registry W01 (#7599): daily Anthropic model discovery for the platform key.
   'ai-model-discovery-sync': '38 6 * * *',
   // AI model registry W03 (#7601): daily fan-out of one discovery job per
@@ -128,6 +133,11 @@ export const JOB_SCHEDULES = {
   'vulnerability-msrc-sync': '3 9 * * *',
   'abuse-signals-digest': '18 9 * * 1',
   'vulnerability-nvd-sync': '3 10 * * *',
+  // Patch compliance report files past PATCH_REPORT_RETENTION_DAYS (default
+  // 30) are removed and their rows marked expired, then orphaned report files
+  // are swept. Daily against a 30-day window; hour 10 held only :03 in this
+  // lane, so :33 keeps the daily = 3 (mod 5) lane.
+  'patch-report-retention': '33 10 * * *',
   'vulnerability-kev-epss-sync': '3 11 * * *',
   'vulnerability-sofa-sync': '3 12 * * *',
   'vulnerability-correlate': '3 13 * * *',
@@ -140,6 +150,9 @@ export const JOB_SCHEDULES = {
   'exchange-rate-sync': '13 17 * * *',
   'ai-unattended-exposure-retention': '8 18 * * *',
   'ai-invocation-retention': '13 18 * * *',
+  // #4120: daily fold of expired llm_egress_events rows into daily rollups.
+  // Hour 18 daily (≡3 mod 5) lane held 8/13/28/33/48; :38 was free.
+  'llm-egress-retention': '38 18 * * *',
   // P2-5 (#4192, Task A2-3): daily graduation eligibility sweep. Runs after
   // the evidence-window's day has fully closed, same lane as its sibling
   // retention slot below (same queue/worker — Deviation #10).
@@ -172,6 +185,11 @@ export const JOB_SCHEDULES = {
   // never pruned). Hour 20 was entirely free; :03 keeps it in the
   // daily = 3 (mod 5) lane.
   'monitor-episode-retention': '3 20 * * *',
+  // #8164 (EDR provider framework, W02) — daily prune of terminal
+  // edr_detections rows (resolved/dismissed/false_positive/mitigated) past 180
+  // days; open/in_progress/unknown are never pruned. Hour 20 held :03 and :27;
+  // :08 keeps the daily = 3 (mod 5) lane.
+  'edr-detection-retention': '8 20 * * *',
   // Partner sending domains W03 (spec §6.4). ONE daily job doing two things:
   // the hosted drift report (listDomains vs local rows + outbox) and, on a
   // `static` instance, the re-check that a domain the operator removed from
@@ -193,6 +211,9 @@ export const JOB_SCHEDULES = {
   // it, or the two co-fire once a day (that was the #3793 128-second pool hold).
   'vulnerability-risk-score-refresh': '0 * * * *',
   'security-posture-scan': '7 * * * *',
+  // Runs 4 minutes after `security-posture-scan` (:07) so the hourly trust-page
+  // refresh sees the posture evidence that scan just wrote.
+  'trust-page-snapshot': '11 * * * *',
   // Share the :12 lane on alternate six-hour slots; no coarse collision.
   'script-verify-reconcile': '12 0,6,12,18 * * *',
   'snmp-retention': '12 1,7,13,19 * * *',
@@ -219,6 +240,8 @@ export const JOB_SCHEDULES = {
   // least one hour, so this takes :21, free in every hour and outside the
   // ≡0 (mod 5) minutes the fine-grained ticks land on.
   'parked-device-expiry': '21 * * * *',
+  // Autopay collection: :26 is free in every hour; the mod-5 sub-daily lane is full.
+  'autopay-collection-run': '26 * * * *',
   // Helper screenshot cleanup — sweeps ai_screenshots rows (and their files)
   // past their 24h retention. 4x/day is plenty against a 24h TTL; minute 27
   // on hours 1,7,13,19 is unused by any existing hour/minute combination in

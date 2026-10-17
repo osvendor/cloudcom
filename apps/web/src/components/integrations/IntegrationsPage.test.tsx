@@ -16,15 +16,19 @@ vi.mock("../../lib/authScope", () => ({
   getJwtClaims: () => ({ scope, orgId: orgState.jwtOrgId, partnerId: "partner-1" }),
   loginPathWithNext: () => "/login",
 }));
-// SEC-2026-09-05-057: the QuickBooks sub-tab and panel are gated on
-// `accounting:read`. This suite covers tab/sub-tab wiring, so it holds the
-// grant throughout; the negative branch lives in
-// IntegrationsPage.accountingPermissions.test.tsx.
+// The QuickBooks sub-tab and panel are gated on `accounting:read`, and the
+// Webhooks tab on `webhooks:read`. This suite covers tab/sub-tab wiring, so it
+// holds both grants throughout; the negative branches live in
+// IntegrationsPage.accountingPermissions.test.tsx and
+// IntegrationsPage.webhooksPermissions.test.tsx.
 vi.mock("../../lib/permissions", () => ({
   usePermissions: () => ({
-    permissions: [{ resource: "accounting", action: "read" }],
+    permissions: [
+      { resource: "accounting", action: "read" },
+      { resource: "webhooks", action: "read" },
+    ],
     can: (resource: string, action: string) =>
-      resource === "accounting" && action === "read",
+      (resource === "accounting" || resource === "webhooks") && action === "read",
   }),
 }));
 vi.mock("../../stores/orgStore", () => ({
@@ -66,6 +70,8 @@ vi.mock("./M365CustomerGraphReadCard", () => ({
     "consent_expired",
     "consent_state_mismatch",
     "consent_cancelled",
+    "conditional_access_blocked",
+    "consent_provider_error",
     "admin_role_required",
     "tenant_mismatch",
     "tenant_already_bound",
@@ -78,6 +84,7 @@ vi.mock("./M365CustomerGraphReadCard", () => ({
     "manifest_stale",
     "organization_probe_failed",
     "executor_unavailable",
+    "confirm-tenant",
   ],
   default: ({
     callbackResult,
@@ -101,6 +108,8 @@ vi.mock("./M365CustomerGraphActionsCard", () => ({
     "consent_expired",
     "consent_state_mismatch",
     "consent_cancelled",
+    "conditional_access_blocked",
+    "consent_provider_error",
     "admin_role_required",
     "tenant_mismatch",
     "tenant_already_bound",
@@ -112,6 +121,7 @@ vi.mock("./M365CustomerGraphActionsCard", () => ({
     "manifest_stale",
     "organization_probe_failed",
     "executor_unavailable",
+    "confirm-tenant",
   ],
   default: ({
     callbackResult,
@@ -193,6 +203,8 @@ const PUBLIC_RESULTS = [
   "consent_expired",
   "consent_state_mismatch",
   "consent_cancelled",
+  "conditional_access_blocked",
+  "consent_provider_error",
   "admin_role_required",
   "tenant_mismatch",
   "tenant_already_bound",
@@ -205,6 +217,8 @@ const PUBLIC_RESULTS = [
   "manifest_stale",
   "organization_probe_failed",
   "executor_unavailable",
+  // W03: the identity callback parks at the confirm-tenant interstitial.
+  "confirm-tenant",
 ] as const;
 
 describe("IntegrationsPage — M365 coexistence", () => {
@@ -402,6 +416,17 @@ describe("IntegrationsPage — Customer Graph Read callback fragment", () => {
       "data-callback-result",
       "active",
     );
+  });
+
+  it("captures the actions confirm-tenant interstitial and consumes the fragment", () => {
+    window.history.replaceState({}, "", "/integrations?org=org-1#m365/customer-graph-actions/confirm-tenant");
+    render(<IntegrationsPage />);
+
+    expect(screen.getByTestId("stub-customer-graph-actions")).toHaveAttribute(
+      "data-callback-result",
+      "confirm-tenant",
+    );
+    expect(window.location.hash).toBe("#m365");
   });
 
   it("uses the JWT organization fallback only for an organization-scoped session", () => {

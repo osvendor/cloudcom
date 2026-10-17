@@ -112,7 +112,30 @@ vi.mock('../db', () => ({
     insert: vi.fn(() => ({
       values: vi.fn(() => Promise.resolve(undefined)),
     })),
+    // The shared-identity detach runs in one transaction; hand the callback
+    // this same mock so its statements go through `execute` above.
+    transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
+      const mod = await import('../db');
+      return fn(mod.db);
+    }),
   },
+}));
+
+const authLifecycleMocks = vi.hoisted(() => ({
+  advanceUserEpochs: vi.fn(async () => ({})),
+  revokeAllRefreshFamilies: vi.fn(async () => undefined),
+  runPostCommitCleanup: vi.fn(async () => ({ redisOk: true, permissionCacheOk: true, oauthOk: true })),
+}));
+vi.mock('./authLifecycle', () => authLifecycleMocks);
+
+// PAM ownership epochs W5 (#8207): evidence holds are exercised in
+// orgEvidenceHold's own tests; here every org is un-held so the lookups do not
+// consume the queued db.execute row-count fixtures below.
+vi.mock('./orgEvidenceHold', async (importActual) => ({
+  ...(await importActual<typeof import('./orgEvidenceHold')>()),
+  findEvidenceHold: vi.fn(async () => null),
+  listHoldsBySurvivor: vi.fn(async () => []),
+  listHeldLineage: vi.fn(async () => []),
 }));
 
 const { deleteObjectKeysMock } = vi.hoisted(() => ({ deleteObjectKeysMock: vi.fn() }));
@@ -139,6 +162,45 @@ vi.mock('./auditService', () => ({
   createAuditLog: createAuditLogMock,
 }));
 
+// Backup storage fence capture and the policy-level legal-hold sources are
+// proven against real Postgres (backupErasureFence.integration.test.ts). Here
+// the fence step is a no-op, so the queued rowCount fixtures below line up
+// exactly as they did before the fence step existed.
+const { captureFenceMock } = vi.hoisted(() => ({
+  captureFenceMock: vi.fn(async () => ({ snapshotPrefixes: 0, recoveryMediaKeys: 0, unresolvedIdentity: 0 })),
+}));
+vi.mock('./backupErasureFence', () => ({
+  captureBackupErasureFence: captureFenceMock,
+  // Sets a transaction-local GUC the on-delete fence trigger reads; no row
+  // effect, so it must not consume a queued rowCount response.
+  setBackupErasureContext: vi.fn(async () => undefined),
+}));
+vi.mock('./erasureBackupLegalHold', () => ({
+  findActiveBackupLegalHold: vi.fn(async () => ((mockState.legalHoldRows ?? []).length > 0 ? 'snapshot' : null)),
+  findPolicyBackupLegalHoldInContext: vi.fn(async () => null),
+}));
+
+// #8117: helper screenshot files are removed after the ai_screenshots step
+// commits. The file side is proven on a real directory in
+// screenshotStorage.files.test.ts; here only the hand-off is asserted.
+const { removeScreenshotFilesMock } = vi.hoisted(() => ({
+  removeScreenshotFilesMock: vi.fn(async (_keys: readonly string[], _context: string) => ({ removed: 0, missing: 0, failed: 0 })),
+}));
+vi.mock('./screenshotFiles', () => ({
+  removeScreenshotFiles: removeScreenshotFilesMock,
+}));
+
+// Patch compliance report CSVs are removed after the patch_compliance_reports
+// step commits. The file side is proven on a real directory in
+// patchReportRetention.test.ts / patchReportFiles.test.ts; here only the
+// hand-off is asserted.
+const { removePatchReportFilesMock } = vi.hoisted(() => ({
+  removePatchReportFilesMock: vi.fn(async (_reports: ReadonlyArray<{ id: string; outputPath: string | null }>, _context: string) => ({ removed: 0, missing: 0, failed: 0, unresolvable: 0 })),
+}));
+vi.mock('./patchReportFiles', () => ({
+  removePatchReportFiles: removePatchReportFilesMock,
+}));
+
 import {
   getOrgCascadeDeleteOrder,
   cascadeDeleteOrg,
@@ -146,13 +208,16 @@ import {
   TenantCascadeRefusalError,
   __testOnly,
 } from './tenantCascade';
-import { db } from '../db';
+import { db, withSystemDbAccessContext } from '../db';
 import { getOrgMergePolicies } from './orgMergeRegistry';
 import { getTenantExportPolicyRegistry } from './tenantExportPolicyRegistry';
 import { getTableColumns } from 'drizzle-orm';
 import { staffNativeSessions } from '../db/schema/staffNative';
 
 const cascadeOrder = getOrgCascadeDeleteOrder();
+// Captured before any test swaps it out, so a later suite can delegate to it.
+const defaultExecuteImpl = vi.mocked(db.execute).getMockImplementation()!;
+const defaultSystemContextImpl = vi.mocked(withSystemDbAccessContext).getMockImplementation()!;
 
 describe('getOrgCascadeDeleteOrder()', () => {
   it('keeps staff native ownership fixed during merges and excludes admission material from exports', () => {
@@ -292,6 +357,26 @@ describe('topologicalCascadeOrder', () => {
     await expect(topologicalCascadeOrder()).rejects.toThrow(/cycle/i);
   });
 
+  // #4247: the ai_agent_runs -> report_runs -> ai_run_artifacts -> ai_agent_runs
+  // cycle is broken at the SET NULL artifact_id edge, and ONLY while it is SET NULL.
+  const cycle = (artifactDelType: string) => [
+    { child_table: 'ai_agent_runs', parent_table: 'report_runs', conname: 'ai_agent_runs_report_run_id_fkey', confdeltype: 'n' },
+    { child_table: 'report_runs', parent_table: 'ai_run_artifacts', conname: 'report_runs_artifact_id_ai_run_artifacts_id_fk', confdeltype: artifactDelType },
+    { child_table: 'ai_run_artifacts', parent_table: 'ai_agent_runs', conname: 'ai_run_artifacts_run_org_fk', confdeltype: 'c' },
+  ];
+
+  it('breaks the report_runs artifact cycle at the SET NULL edge', async () => {
+    mockState.fkEdges = cycle('n');
+    const order = await topologicalCascadeOrder();
+    expect(order.indexOf('ai_run_artifacts')).toBeLessThan(order.indexOf('ai_agent_runs'));
+    expect(order.indexOf('ai_agent_runs')).toBeLessThan(order.indexOf('report_runs'));
+  });
+
+  it.each(['a', 'c', 'r'])('re-detects the cycle when the break edge is no longer SET NULL (confdeltype %s)', async (t) => {
+    mockState.fkEdges = cycle(t);
+    await expect(topologicalCascadeOrder()).rejects.toThrow(/cycle/i);
+  });
+
   it('ignores edges between cascade and non-cascade tables', async () => {
     mockState.fkEdges = [
       { child_table: 'something_not_in_list', parent_table: 'users' },
@@ -379,6 +464,11 @@ describe('cascadeDeleteOrg', () => {
     // Provide a non-zero rowCount for the first few execute() calls;
     // device_commands is cleared first then the cascade walk begins.
     mockState.executeResponses = [
+      // Shared-identity detach runs before the pre-clears: the users UPDATE
+      // and the partner_users.org_ids cleanup. Neither is a deletion, so
+      // neither is summed into totalRowsDeleted.
+      [{ id: 'user-b' }, { id: 'user-a' }], // users detached (RETURNING id)
+      { rowCount: 1 }, // partner_users.org_ids
       { rowCount: 5 }, // device_commands
       // One extra: the accounting_entity_mappings entry also runs a
       // retained-count SELECT (the payment mappings that still owe QuickBooks a
@@ -392,6 +482,12 @@ describe('cascadeDeleteOrg', () => {
     );
     // 5 from device_commands + 3 per cascade table.
     expect(stats.totalRowsDeleted).toBe(5 + 3 * cascadeOrder.length);
+    expect(stats.usersDetached).toBe(2);
+    // Detached users go through the same session cutoff as a membership
+    // removal: epoch + refresh families in the transaction, cleanup after.
+    expect(authLifecycleMocks.advanceUserEpochs.mock.calls.map((c) => (c as unknown[])[1])).toEqual(['user-a', 'user-b']);
+    expect(authLifecycleMocks.revokeAllRefreshFamilies).toHaveBeenCalledTimes(2);
+    expect(authLifecycleMocks.runPostCommitCleanup.mock.calls.map((c) => (c as unknown[])[0])).toEqual(['user-a', 'user-b']);
   });
 
   it('tolerates a missing associated system-scoped table (42P01, FLAT shape)', async () => {
@@ -903,5 +999,160 @@ describe('cascadeDeleteOrg — artifact blob pre-clear (execution-plane W01, spe
       Object.assign(new Error('relation "ai_run_artifacts" does not exist'), { code: '42P01' }),
     );
     await expect(cascadeDeleteOrg(ORG, BY)).resolves.toBeDefined();
+  });
+});
+
+describe('cascadeDeleteOrg — helper screenshot files (#8117)', () => {
+  const ORG = '00000000-0000-0000-0000-000000000001';
+  const BY = '00000000-0000-0000-0000-000000000002';
+
+  beforeEach(() => {
+    mockState.executeResponses = [];
+    mockState.executedSql = [];
+    mockState.fkEdges = [];
+    mockState.legalHoldRows = [];
+    mockState.artifactKeyError = null;
+    removeScreenshotFilesMock.mockReset();
+    removeScreenshotFilesMock.mockResolvedValue({ removed: 0, missing: 0, failed: 0 });
+    vi.mocked(withSystemDbAccessContext).mockImplementation(defaultSystemContextImpl);
+    vi.mocked(db.execute).mockImplementation(defaultExecuteImpl);
+  });
+
+  function stubScreenshotDelete(events: string[], keys: string[]) {
+    vi.mocked(db.execute).mockImplementation(((q: unknown) => {
+      const text = sqlToText(q);
+      if (/DELETE FROM "?ai_screenshots"?/.test(text)) {
+        mockState.executedSql.push(text);
+        events.push('delete');
+        return Promise.resolve(Object.assign(keys.map((k) => ({ storage_key: k })), { count: keys.length }));
+      }
+      return defaultExecuteImpl(q as never);
+    }) as any);
+    vi.mocked(withSystemDbAccessContext).mockImplementation((async (fn: () => Promise<unknown>) => {
+      const result = await fn();
+      events.push('commit');
+      return result;
+    }) as any);
+  }
+
+  it('returns the storage keys from the row DELETE and removes the files only after that step commits', async () => {
+    const events: string[] = [];
+    stubScreenshotDelete(events, ['screenshots/a/b/c.jpg', 'screenshots/a/b/d.jpg']);
+    removeScreenshotFilesMock.mockImplementation(async () => {
+      events.push('unlink');
+      return { removed: 2, missing: 0, failed: 0 };
+    });
+
+    const stats = await cascadeDeleteOrg(ORG, BY);
+
+    const deleteSql = mockState.executedSql.find((t) => /DELETE FROM "?ai_screenshots"?/.test(t));
+    expect(deleteSql).toMatch(/RETURNING storage_key/);
+    expect(removeScreenshotFilesMock).toHaveBeenCalledTimes(1);
+    expect(removeScreenshotFilesMock).toHaveBeenCalledWith(
+      ['screenshots/a/b/c.jpg', 'screenshots/a/b/d.jpg'],
+      expect.stringContaining(ORG),
+    );
+    const del = events.indexOf('delete');
+    expect(events.slice(del, del + 3)).toEqual(['delete', 'commit', 'unlink']);
+    expect(stats.tablesDeleted.ai_screenshots).toBe(2);
+  });
+
+  it('does not fail or roll back the erasure when files cannot be removed', async () => {
+    stubScreenshotDelete([], ['screenshots/a/b/c.jpg']);
+    removeScreenshotFilesMock.mockResolvedValue({ removed: 0, missing: 0, failed: 1 });
+
+    const stats = await cascadeDeleteOrg(ORG, BY);
+
+    expect(removeScreenshotFilesMock).toHaveBeenCalledTimes(1);
+    expect(stats.tablesDeleted.ai_screenshots).toBe(1);
+    expect(stats.tablesDeleted.organizations).toBeDefined();
+  });
+
+  it('skips the file step when the org has no screenshots', async () => {
+    stubScreenshotDelete([], []);
+
+    await cascadeDeleteOrg(ORG, BY);
+
+    expect(removeScreenshotFilesMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('cascadeDeleteOrg — patch compliance report files', () => {
+  const ORG = '00000000-0000-0000-0000-000000000001';
+  const BY = '00000000-0000-0000-0000-000000000002';
+  const REPORT_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const REPORT_B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+
+  beforeEach(() => {
+    mockState.executeResponses = [];
+    mockState.executedSql = [];
+    mockState.fkEdges = [];
+    mockState.legalHoldRows = [];
+    mockState.artifactKeyError = null;
+    removePatchReportFilesMock.mockReset();
+    removePatchReportFilesMock.mockResolvedValue({ removed: 0, missing: 0, failed: 0, unresolvable: 0 });
+    vi.mocked(withSystemDbAccessContext).mockImplementation(defaultSystemContextImpl);
+    vi.mocked(db.execute).mockImplementation(defaultExecuteImpl);
+  });
+
+  function stubReportDelete(events: string[], rows: Array<{ id: string; output_path: string | null }>) {
+    vi.mocked(db.execute).mockImplementation(((q: unknown) => {
+      const text = sqlToText(q);
+      if (/DELETE FROM "?patch_compliance_reports"?/.test(text)) {
+        mockState.executedSql.push(text);
+        events.push('delete');
+        return Promise.resolve(Object.assign([...rows], { count: rows.length }));
+      }
+      return defaultExecuteImpl(q as never);
+    }) as any);
+    vi.mocked(withSystemDbAccessContext).mockImplementation((async (fn: () => Promise<unknown>) => {
+      const result = await fn();
+      events.push('commit');
+      return result;
+    }) as any);
+  }
+
+  it('returns each row\'s output path from the DELETE and removes the files only after that step commits', async () => {
+    const events: string[] = [];
+    stubReportDelete(events, [
+      { id: REPORT_A, output_path: `/data/patch-reports/${REPORT_A}.csv` },
+      { id: REPORT_B, output_path: null },
+    ]);
+    removePatchReportFilesMock.mockImplementation(async () => {
+      events.push('unlink');
+      return { removed: 1, missing: 0, failed: 0, unresolvable: 0 };
+    });
+
+    const stats = await cascadeDeleteOrg(ORG, BY);
+
+    const deleteSql = mockState.executedSql.find((t) => /DELETE FROM "?patch_compliance_reports"?/.test(t));
+    expect(deleteSql).toMatch(/RETURNING id, output_path/);
+    expect(removePatchReportFilesMock).toHaveBeenCalledTimes(1);
+    expect(removePatchReportFilesMock).toHaveBeenCalledWith(
+      [{ id: REPORT_A, outputPath: `/data/patch-reports/${REPORT_A}.csv` }],
+      expect.stringContaining(ORG),
+    );
+    const del = events.indexOf('delete');
+    expect(events.slice(del, del + 3)).toEqual(['delete', 'commit', 'unlink']);
+    expect(stats.tablesDeleted.patch_compliance_reports).toBe(2);
+  });
+
+  it('does not fail the erasure when report files cannot be removed', async () => {
+    stubReportDelete([], [{ id: REPORT_A, output_path: `/data/patch-reports/${REPORT_A}.csv` }]);
+    removePatchReportFilesMock.mockResolvedValue({ removed: 0, missing: 0, failed: 1, unresolvable: 0 });
+
+    const stats = await cascadeDeleteOrg(ORG, BY);
+
+    expect(removePatchReportFilesMock).toHaveBeenCalledTimes(1);
+    expect(stats.tablesDeleted.patch_compliance_reports).toBe(1);
+    expect(stats.tablesDeleted.organizations).toBeDefined();
+  });
+
+  it('skips the file step when no report row has a file', async () => {
+    stubReportDelete([], [{ id: REPORT_A, output_path: null }]);
+
+    await cascadeDeleteOrg(ORG, BY);
+
+    expect(removePatchReportFilesMock).not.toHaveBeenCalled();
   });
 });

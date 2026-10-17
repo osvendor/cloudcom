@@ -102,6 +102,8 @@ vi.mock('../services/permissions', async (importOriginal) => {
 
 import { PERMISSIONS } from '../services/permissions';
 import { partnerScriptCeilingResourceDigest } from '../services/mfaStepUpGrant';
+import { partnerScriptCeilingStepUpResource } from './auth/schemas';
+import { partnerScriptCeilingGrantResource } from '@breeze/shared';
 import { partnerAiScriptPolicyRoutes } from './partnerAiScriptPolicy';
 import { toScriptPolicyDto } from './ai/scriptPolicy';
 import type { AiScriptPolicyRow } from '../db/schema/aiScriptPolicies';
@@ -153,7 +155,6 @@ function partnerPolicyRow(overrides: Partial<AiScriptPolicyRow> = {}): AiScriptP
     unattendedAllowedClasses: ['services'],
     maxUnattendedPerHour: 5,
     protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] },
-    reviewerModel: null,
     unattendedEnabledBy: null,
     unattendedEnabledAt: null,
     createdBy: USER_ID,
@@ -197,7 +198,7 @@ describe('GET /', () => {
     selectQueue = [[]];
     const res = await getReq();
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ policy: null, canManage: false });
+    expect(await res.json()).toEqual({ policy: null, canManage: false, partnerId: PARTNER });
   });
 
   it('returns the DTO for a queued partner row', async () => {
@@ -208,6 +209,8 @@ describe('GET /', () => {
     expect(body.policy).toEqual(toScriptPolicyDto(partnerPolicyRow({ unattendedAllowed: true })));
     expect(body.policy.ownerScope).toBe('partner');
     expect(body.canManage).toBe(true);
+    // The web mints the ceiling's step-up grant with this id (#8112).
+    expect(body.partnerId).toBe(PARTNER);
   });
 
   it('returns policy:null when no partner row exists', async () => {
@@ -282,7 +285,6 @@ describe('PUT /', () => {
         unattendedAllowedClasses: [],
         maxUnattendedPerHour: 0,
         protectedResourcesEmptied: true,
-        reviewerModel: null,
         proposingEnabled: true,
       },
     }));
@@ -344,7 +346,6 @@ describe('PUT /', () => {
         unattendedAllowedClasses: ['services'],
         maxUnattendedPerHour: 5,
         protectedResourcesEmptied: false,
-        reviewerModel: null,
         proposingEnabled: true,
       },
     }));
@@ -357,14 +358,25 @@ describe('PUT /', () => {
     expect(consumeStepUpGrant).not.toHaveBeenCalled();
   });
 
-  it('strips reviewerModel (accept-and-ignore) and no longer treats it as a widening', async () => {
-    selectQueue = [[partnerPolicyRow({ unattendedAllowed: true, reviewerModel: 'old-model' })]];
-    const res = await putReq({ reviewerModel: 'anything' });
-    expect(res.status).toBe(200);
+  it('PUT /partner/ai/script-policy with reviewerModel → 400 naming the replacement; nothing is written', async () => {
+    for (const reviewerModel of ['claude-x', null]) {
+      selectQueue = [[partnerPolicyRow({ unattendedAllowed: true })]];
+      const res = await putReq({ maxUnattendedPerHour: 3, reviewerModel });
+      expect(res.status).toBe(400);
+      const text = JSON.stringify(await res.json());
+      expect(text).toContain('reviewerModel');
+      expect(text).toContain('script_reviewer');
+    }
     expect(consumeStepUpGrant).not.toHaveBeenCalled();
-    expect(writes).toHaveLength(1);
-    expect(writes[0]!.values).not.toHaveProperty('reviewerModel');
-    expect(writes[0]!.set).not.toHaveProperty('reviewerModel');
+    expect(writes).toHaveLength(0);
+    expect(auditLog).toHaveLength(0);
+  });
+
+  it('GET /partner/ai/script-policy no longer returns reviewerModel', async () => {
+    selectQueue = [[partnerPolicyRow({ reviewerModel: 'stale-model' } as unknown as Partial<AiScriptPolicyRow>)]];
+    const body = await (await getReq()).json();
+    expect(body.policy).not.toBeNull();
+    expect(body.policy).not.toHaveProperty('reviewerModel');
   });
 
   it('400s when the body carries unattendedEnabled (strict schema refuses the org grant on a partner row)', async () => {
@@ -379,5 +391,141 @@ describe('PUT /', () => {
     const res = await putReq({ maxUnattendedRiskTier: 'high' });
     expect(res.status).toBe(400);
     expect(writes).toHaveLength(0);
+  });
+});
+
+/**
+ * #8112: the web mints the ceiling grant from `partnerScriptCeilingGrantResource`
+ * (packages/shared). Round-trip it through the step-up route's own schema and
+ * digest (mint side) and this route's consume (redeem side), so the two can
+ * never drift apart silently.
+ */
+describe('mint → redeem round-trip with the shared partner ceiling resource (#8112)', () => {
+  const FULL_BODY = {
+    proposingEnabled: true,
+    maxUnattendedRiskTier: 'medium' as const,
+    unattendedAllowedClasses: ['temp_files', 'dns_cache'],
+    maxUnattendedPerHour: 7,
+    protectedResources: { services: [], paths: ['C:\\Keep'], registryKeys: [], deviceTags: [] },
+  };
+
+  function armConsumeFor(resource: unknown) {
+    const minted = partnerScriptCeilingStepUpResource.parse(resource);
+    const mintDigest = partnerScriptCeilingResourceDigest(minted);
+    consumeStepUpGrant.mockImplementation(async (_grantId: string, binding: { operation: string; resourceDigest: string }) =>
+      binding.operation === 'ai_partner_script_ceiling_grant' && binding.resourceDigest === mintDigest);
+  }
+
+  it('a grant minted for one set of values does not redeem a save of wider ones', async () => {
+    armConsumeFor(partnerScriptCeilingGrantResource({ partnerId: PARTNER, allowed: true, saved: null, body: FULL_BODY }));
+    const res = await putReq({ ...FULL_BODY, maxUnattendedPerHour: FULL_BODY.maxUnattendedPerHour + 1, unattendedAllowed: true, stepUpGrant: 'grant-1' });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'Step-up required', code: 'STEP_UP_REQUIRED' });
+    expect(writes).toHaveLength(0);
+  });
+
+  it('a grant minted for another partner does not redeem', async () => {
+    armConsumeFor(partnerScriptCeilingGrantResource({ partnerId: '44444444-4444-4444-8444-444444444444', allowed: true, saved: null, body: FULL_BODY }));
+    const res = await putReq({ ...FULL_BODY, unattendedAllowed: true, stepUpGrant: 'grant-1' });
+    expect(res.status).toBe(403);
+    expect(writes).toHaveLength(0);
+  });
+
+  it.each([
+    ['first-ever enable (no row yet)', null, FULL_BODY],
+    ['enable over an existing disallowed row with different values', partnerPolicyRow({ unattendedAllowed: false, maxUnattendedRiskTier: 'low', maxUnattendedPerHour: 3 }), FULL_BODY],
+    ['enable that saves empty protectedResources', partnerPolicyRow({ protectedResources: { services: ['spooler'], paths: [], registryKeys: [], deviceTags: [] } }),
+      { ...FULL_BODY, protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] } }],
+  ])('enable: %s', async (_label, row, body) => {
+    if (row) selectQueue = [[row]];
+    const saved = row ? toScriptPolicyDto(row) : null;
+    const resource = partnerScriptCeilingGrantResource({
+      partnerId: PARTNER,
+      allowed: true,
+      saved: saved ? { ...saved, unattendedAllowed: saved.unattendedAllowed ?? false } : null,
+      body,
+    });
+    expect(resource).not.toBeNull();
+    armConsumeFor(resource);
+
+    const res = await putReq({ ...body, unattendedAllowed: true, stepUpGrant: 'grant-1' });
+    expect(res.status).toBe(200);
+    expect(consumeStepUpGrant).toHaveBeenCalledTimes(1);
+    expect(writes).toHaveLength(1);
+  });
+
+  it.each([
+    ['raise the tier', {}, { maxUnattendedRiskTier: 'medium' as const }],
+    ['add a class', {}, { unattendedAllowedClasses: ['services', 'temp_files'] }],
+    ['raise the rate', {}, { maxUnattendedPerHour: 9 }],
+    ['turn proposing on', { proposingEnabled: false }, { proposingEnabled: true }],
+    ['empty protectedResources', { protectedResources: { services: ['spooler'], paths: [], registryKeys: [], deviceTags: [] } },
+      { protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] } }],
+  ])('widen an already-allowed ceiling: %s', async (_label, rowOverrides, change) => {
+    const row = partnerPolicyRow({ unattendedAllowed: true, ...rowOverrides });
+    selectQueue = [[row]];
+    const saved = toScriptPolicyDto(row);
+    // The page PUTs every field and omits the unchanged `unattendedAllowed`.
+    const body = {
+      proposingEnabled: saved.proposingEnabled,
+      maxUnattendedRiskTier: saved.maxUnattendedRiskTier as 'low' | 'medium',
+      unattendedAllowedClasses: saved.unattendedAllowedClasses as string[],
+      maxUnattendedPerHour: saved.maxUnattendedPerHour,
+      protectedResources: saved.protectedResources,
+      ...change,
+    };
+    const resource = partnerScriptCeilingGrantResource({
+      partnerId: PARTNER,
+      allowed: true,
+      saved: { ...saved, unattendedAllowed: true },
+      body,
+    });
+    expect(resource).not.toBeNull();
+    armConsumeFor(resource);
+
+    const res = await putReq({ ...body, stepUpGrant: 'grant-1' });
+    expect(res.status).toBe(200);
+    expect(consumeStepUpGrant).toHaveBeenCalledTimes(1);
+    expect(writes).toHaveLength(1);
+  });
+
+  it('a non-widening save of an allowed ceiling needs no grant on either side', async () => {
+    const row = partnerPolicyRow({ unattendedAllowed: true, maxUnattendedRiskTier: 'medium', maxUnattendedPerHour: 10 });
+    selectQueue = [[row]];
+    const saved = toScriptPolicyDto(row);
+    const body = {
+      proposingEnabled: saved.proposingEnabled,
+      maxUnattendedRiskTier: 'low' as const,
+      unattendedAllowedClasses: [] as string[],
+      maxUnattendedPerHour: 4,
+      protectedResources: saved.protectedResources,
+    };
+    expect(partnerScriptCeilingGrantResource({
+      partnerId: PARTNER, allowed: true, saved: { ...saved, unattendedAllowed: true }, body,
+    })).toBeNull();
+
+    const res = await putReq(body);
+    expect(res.status).toBe(200);
+    expect(consumeStepUpGrant).not.toHaveBeenCalled();
+  });
+
+  it('disabling needs no grant on either side', async () => {
+    const row = partnerPolicyRow({ unattendedAllowed: true });
+    selectQueue = [[row]];
+    const saved = toScriptPolicyDto(row);
+    const body = {
+      proposingEnabled: true,
+      maxUnattendedRiskTier: 'medium' as const,
+      unattendedAllowedClasses: ['services', 'temp_files'],
+      maxUnattendedPerHour: 50,
+      protectedResources: saved.protectedResources,
+    };
+    expect(partnerScriptCeilingGrantResource({
+      partnerId: PARTNER, allowed: false, saved: { ...saved, unattendedAllowed: true }, body,
+    })).toBeNull();
+
+    const res = await putReq({ ...body, unattendedAllowed: false });
+    expect(res.status).toBe(200);
+    expect(consumeStepUpGrant).not.toHaveBeenCalled();
   });
 });

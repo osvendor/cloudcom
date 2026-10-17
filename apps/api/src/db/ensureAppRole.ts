@@ -204,12 +204,44 @@ export async function ensureAppRole(): Promise<boolean> {
         IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='breeze_version_history') THEN
           REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE breeze_version_history FROM breeze_app;
         END IF;
+        -- PAM ownership-epoch lineage (#8203, migrations/2026-12-17-130000):
+        -- written ONLY by the SECURITY DEFINER devices triggers
+        -- breeze_device_ownership_epoch_init/_advance. A direct app-role
+        -- INSERT could forge an epoch and wedge the next move (PK clash) or,
+        -- once the PAM chain anchors to epochs (W2), fake an ownership era.
+        -- SELECT stays (RLS-filtered reads), DELETE stays (device permanent
+        -- deletion + org erasure).
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='device_ownership_epochs') THEN
+          REVOKE INSERT, UPDATE, TRUNCATE ON TABLE device_ownership_epochs FROM breeze_app;
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='device_ownership_epoch_closures') THEN
+          REVOKE INSERT, UPDATE, TRUNCATE ON TABLE device_ownership_epoch_closures FROM breeze_app;
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='pam_ledger_retirements') THEN
+          REVOKE INSERT, UPDATE, TRUNCATE ON TABLE pam_ledger_retirements FROM breeze_app;
+        END IF;
         -- Backup snapshot id tombstones: ids that may never be issued again.
         -- Only ever appended (by triggers on backup_snapshot_id_reservations
         -- and by storage reclaim); nothing may rewrite or remove one, or an
         -- id could be handed out twice.
         IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='backup_snapshot_id_tombstones') THEN
           REVOKE UPDATE, DELETE, TRUNCATE ON TABLE backup_snapshot_id_tombstones FROM breeze_app;
+        END IF;
+        -- Org-erasure backup fences: the record of what an erased org's backup
+        -- storage was. Storage GC never reclaims a fenced prefix/key, so a
+        -- rewrite or removal here would re-expose those objects to reclaim.
+        -- Append-only for the app role (services/backupErasureFence.ts).
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='backup_erasure_manifests') THEN
+          REVOKE UPDATE, DELETE, TRUNCATE ON TABLE backup_erasure_manifests FROM breeze_app;
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='backup_erasure_targets') THEN
+          REVOKE UPDATE, DELETE, TRUNCATE ON TABLE backup_erasure_targets FROM breeze_app;
+        END IF;
+        -- Its referenced-key cache may be updated (retry state) but never
+        -- deleted: removing a resolved row is harmless (GC re-reads), but the
+        -- table is not the app's to prune.
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='backup_erasure_fence_refs') THEN
+          REVOKE DELETE, TRUNCATE ON TABLE backup_erasure_fence_refs FROM breeze_app;
         END IF;
         -- #4371 — WRITER-PATH MATRIX for the six tables re-revoked below.
         --
@@ -335,6 +367,14 @@ export async function ensureAppRole(): Promise<boolean> {
         -- (AUDIT_ADMIN_REQUIRED_TABLES); org merge leaves it in place.
         IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='ai_operator_task_events') THEN
           REVOKE UPDATE, DELETE, TRUNCATE ON TABLE ai_operator_task_events FROM breeze_app;
+        END IF;
+        -- ai_operator_plan_approval_effects (Recipe Library E4, #6169,
+        -- 2026-12-23-190000): an approved effect set is evidence of what a
+        -- human authorized. UPDATE only — DELETE stays so the task cascade
+        -- and org erasure can reap it without an admin connection; a BEFORE
+        -- UPDATE trigger backs this up for every role.
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='ai_operator_plan_approval_effects') THEN
+          REVOKE UPDATE ON TABLE ai_operator_plan_approval_effects FROM breeze_app;
         END IF;
         -- ai_invocations (AI model registry W02, #7600, 2026-11-14-100300):
         -- append-only invocation ledger. Org erasure and retention delete it as

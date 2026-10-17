@@ -66,7 +66,7 @@ type Client struct {
 	scopes              []string
 	stopChan            chan struct{}
 	desktopMgr          *helperDesktopManager
-	// desktopFence is the helper half of the SEC-038 start fence: seeded from
+	// desktopFence is the helper half of the start fence: seeded from
 	// the service on connect, maintained from the starts and stops this helper
 	// sees. Zero value ready to use.
 	desktopFence helperDesktopFence
@@ -195,11 +195,20 @@ func (c *Client) Run() error {
 		}
 	}
 
+	// Hand each session's clipboard counters to the service for the central
+	// audit log (#1012). Sent once, from session teardown.
+	c.desktopMgr.mgr.OnClipboardSummary = func(sessionID string, summary ipc.ClipboardSummary) {
+		notice := ipc.DesktopClipboardSummaryNotice{SessionID: sessionID, Clipboard: summary}
+		if err := c.conn.SendTyped("desk-clip-"+sessionID, ipc.TypeDesktopClipboardSummary, notice); err != nil {
+			log.Warn("failed to send desktop clipboard summary via IPC", "session", sessionID, "error", err)
+		}
+	}
+
 	// Start TCC permission check loop (macOS only; no-op on other platforms).
 	// Skip capture probes while a live session is active to avoid contending
 	// with the streaming capturer in the same helper process.
 	safeGo("tcc_check", func() {
-		runTCCCheckLoop(c.conn, runDone, c.context, func() bool {
+		runTCCCheckLoop(c.conn, runDone, c.context, c.binaryKind, func() bool {
 			return !c.desktopMgr.hasActiveSessions()
 		})
 	})
@@ -1222,7 +1231,7 @@ func (c *Client) handleDesktopStart(env *ipc.Envelope) {
 		return
 	}
 
-	// SEC-038 start fence, checked before ANY side effect: a superseded or
+	// Start fence, checked before ANY side effect: a superseded or
 	// post-terminal start must not reach capture even in the helper.
 	if d := c.desktopFence.admitStart(req.SessionID, req.StartGeneration); !d.admitted {
 		log.Warn("refusing desktop_start at the helper start fence",
@@ -1531,6 +1540,9 @@ func detectCapabilities(binaryKind, desktopContext string) ipc.Capabilities {
 		caps.CanTray = false
 		caps.CanClipboard = false
 		if runtime.GOOS == "darwin" {
+			// A permission check: ProbeCaptureAccess never calls
+			// ScreenCaptureKit (#8058). The backend a real session uses is
+			// chosen when it opens its capturer.
 			granted, err := desktop.ProbeCaptureAccess(desktop.CaptureConfig{
 				DesktopContext: desktopContext,
 			})

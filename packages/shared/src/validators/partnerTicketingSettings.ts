@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { SITE_RADIUS_MIN_M, SITE_RADIUS_MAX_M } from './siteLocation';
 
 // Extracted verbatim from apps/api/src/routes/orgs.ts's route-local
 // `partnerSettingsSchema` (2026-09-17, settings-consolidation W02-API / M14) so
@@ -33,6 +34,16 @@ export const ticketingInboundSettingsSchema = z.object({
   // When true, senders failing the SPF/DKIM/DMARC gate are dropped silently
   // instead of quarantined. Default-off; applies to all unverified senders.
   dropUnverifiedSenders: z.boolean().optional(),
+  // When true, a new ticket forwarded in by one of the partner's own staff is
+  // filed under the customer mapped to the ORIGINAL sender's domain rather than
+  // the forwarder's. Default-off.
+  staffForwardRouting: z.boolean().optional(),
+  // Default assignee for every NEW ticket the inbound pipeline creates (a
+  // users.id of this partner). Null/absent = leave inbound tickets unassigned.
+  // PATCH /partners/me validates a changed value: an active member of this
+  // partner with ticket access. Ingest re-checks the user's eligibility for
+  // each ticket's org and leaves the ticket unassigned when it fails.
+  defaultAssigneeUserId: z.string().guid().nullable().optional(),
   autoresponseSubject: z.string().max(200).nullable().optional(),
   autoresponseBody: z.string().max(5000).nullable().optional(),
   // Reply-to-client content mode. Default (false/absent) keeps the existing
@@ -52,18 +63,22 @@ export const ticketingInboundSettingsSchema = z.object({
 export type TicketingInboundSettings = z.infer<typeof ticketingInboundSettingsSchema>;
 
 /**
- * `partners.settings.timeTracking` — the session-suggestion block (W06, #3900).
+ * `partners.settings.timeTracking` — owns both suggestion blocks:
+ * `sessionSuggestions` (W06, #3900) and `locationSuggestions` (#4186).
  *
- * `.strict()` on the inner object so a typo ("enabledd") is a 400 rather than a
- * silently stored no-op; `.passthrough()` on the wrapper so a sibling block
- * this schema does not own (e.g. `timeTracking.locationSuggestions`) is neither
- * rejected nor stripped.
+ * `.strict()` on each inner object so a typo ("enabledd") is a 400 rather than
+ * a silently stored no-op; `.passthrough()` on the wrapper so unknown sibling keys
+ * under `timeTracking` are neither rejected nor stripped.
  */
 export const timeTrackingSessionSuggestionsSchema = z.object({
   sessionSuggestions: z.object({
     enabled: z.boolean().optional(),
     minSessionSeconds: z.number().int().min(30).max(3600).optional(),
     mergeGapMinutes: z.number().int().min(0).max(120).optional(),
+  }).strict().optional(),
+  locationSuggestions: z.object({
+    enabled: z.boolean().optional(),
+    defaultRadiusM: z.number().int().min(SITE_RADIUS_MIN_M).max(SITE_RADIUS_MAX_M).optional(),
   }).strict().optional(),
 }).passthrough();
 export type TimeTrackingSessionSuggestionsSettings = z.infer<typeof timeTrackingSessionSuggestionsSchema>;
@@ -121,6 +136,23 @@ export function readTimeTrackingSessionSuggestions(partnerSettings: unknown): {
   if (parsed.success) return { settings: parsed.data.sessionSuggestions ?? {}, valid: true };
   return {
     settings: asRecord(raw) as NonNullable<TimeTrackingSessionSuggestionsSettings['sessionSuggestions']>,
+    valid: false,
+  };
+}
+
+/** Same contract as readTimeTrackingSessionSuggestions, for `timeTracking.locationSuggestions`. */
+export function readTimeTrackingLocationSuggestions(partnerSettings: unknown): {
+  settings: NonNullable<TimeTrackingSessionSuggestionsSettings['locationSuggestions']>;
+  valid: boolean;
+} {
+  const timeTracking = asRecord(partnerSettings).timeTracking;
+  const raw = asRecord(timeTracking).locationSuggestions;
+  if (raw === undefined || raw === null) return { settings: {}, valid: true };
+
+  const parsed = timeTrackingSessionSuggestionsSchema.safeParse({ locationSuggestions: raw });
+  if (parsed.success) return { settings: parsed.data.locationSuggestions ?? {}, valid: true };
+  return {
+    settings: asRecord(raw) as NonNullable<TimeTrackingSessionSuggestionsSettings['locationSuggestions']>,
     valid: false,
   };
 }

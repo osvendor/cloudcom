@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/breeze-rmm/agent/internal/atomicrename"
 	"github.com/google/uuid"
 )
 
@@ -39,19 +40,20 @@ const (
 )
 
 type LedgerEntry struct {
-	ActuationID            string       `json:"actuationId"`
-	RequestID              string       `json:"requestId"`
-	DeviceID               string       `json:"deviceId"`
-	OrgID                  string       `json:"orgId"`
-	Generation             uint64       `json:"generation"`
-	DesiredState           DesiredState `json:"desiredState"`
-	PID                    int          `json:"pid,omitempty"`
-	ProcessCreationTime    *time.Time   `json:"processCreationTime,omitempty"`
-	JobName                string       `json:"jobName,omitempty"`
-	BootID                 string       `json:"bootId,omitempty"`
-	CreatedAt              time.Time    `json:"createdAt"`
-	UpdatedAt              time.Time    `json:"updatedAt"`
-	BoundCommandDigest     string       `json:"boundCommandDigest,omitempty"`
+	ActuationID         string       `json:"actuationId"`
+	RequestID           string       `json:"requestId"`
+	DeviceID            string       `json:"deviceId"`
+	OrgID               string       `json:"orgId"`
+	Generation          uint64       `json:"generation"`
+	DesiredState        DesiredState `json:"desiredState"`
+	RecoveredFromActive bool         `json:"recoveredFromActive,omitempty"`
+	PID                 int          `json:"pid,omitempty"`
+	ProcessCreationTime *time.Time   `json:"processCreationTime,omitempty"`
+	JobName             string       `json:"jobName,omitempty"`
+	BootID              string       `json:"bootId,omitempty"`
+	CreatedAt           time.Time    `json:"createdAt"`
+	UpdatedAt           time.Time    `json:"updatedAt"`
+	BoundCommandDigest  string       `json:"boundCommandDigest,omitempty"`
 	LastFailureStage       string       `json:"lastFailureStage,omitempty"`
 	LastFailureCode        string       `json:"lastFailureCode,omitempty"`
 	LastFailureAt          *time.Time   `json:"lastFailureAt,omitempty"`
@@ -219,6 +221,57 @@ func (s *Store) ClearProcessIdentity(actuationID string, generation uint64) erro
 	return s.replaceLocked(actuationID, entry)
 }
 
+// MarkReconciledClean retains the generation tombstone so a replayed apply
+// cannot resurrect a grant after independent endpoint evidence proved it clean.
+func (s *Store) MarkReconciledClean(actuationID string, generation uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loadErr != nil {
+		return s.loadErr
+	}
+	entry, ok := s.entries[actuationID]
+	if !ok || entry.Generation != generation {
+		return errors.New("cannot reconcile a non-current generation")
+	}
+	// A compensated pre-launch failure has already advanced to a cleanup
+	// generation. Keep the same restart verification marker as an unlaunched
+	// active entry; an empty identity must never skip fresh token evidence.
+	preLaunchFailure := entry.LastFailureStage != "" && entry.PID == 0 && entry.ProcessCreationTime == nil && entry.JobName == ""
+	entry.RecoveredFromActive = entry.RecoveredFromActive || entry.DesiredState == DesiredActive || preLaunchFailure
+	entry.DesiredState = DesiredCleanup
+	entry.PID = 0
+	entry.ProcessCreationTime = nil
+	entry.JobName = ""
+	entry.BootID = ""
+	entry.UpdatedAt = time.Now().UTC()
+	return s.replaceLocked(actuationID, entry)
+}
+
+// Retire removes an entry the server reported `retired` (PAM ownership epochs,
+// #8202 W4): its actuation belongs to an earlier ownership epoch and is closed
+// or carries a retirement marker. The removal is persisted with fsync before
+// Retire returns; on a persist error the entry is restored and the error
+// returned, so a failed retirement keeps the entry reconcilable. An unknown id
+// is a no-op and writes nothing. Callers must decide whether retirement is
+// safe (no live job, nothing unresolved); the store only makes it durable.
+func (s *Store) Retire(actuationID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loadErr != nil {
+		return s.loadErr
+	}
+	previous, exists := s.entries[actuationID]
+	if !exists {
+		return nil
+	}
+	delete(s.entries, actuationID)
+	if err := s.persistLocked(); err != nil {
+		s.entries[actuationID] = previous
+		return fmt.Errorf("%w: %w", ErrLedgerPersist, err)
+	}
+	return nil
+}
+
 // RecordApplyFailure durably records the stage and cause of an apply failure.
 // It preserves any process identity already bound for this generation.
 func (s *Store) RecordApplyFailure(actuationID string, generation uint64, stage, code string) error {
@@ -343,7 +396,7 @@ func (s *Store) persistLocked() error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close PAM lifetime ledger: %w", err)
 	}
-	if err := replaceFile(tmpPath, s.path); err != nil {
+	if err := atomicrename.Replace(tmpPath, s.path); err != nil {
 		return fmt.Errorf("replace PAM lifetime ledger: %w", err)
 	}
 	if err := os.Chmod(s.path, 0o600); err != nil {

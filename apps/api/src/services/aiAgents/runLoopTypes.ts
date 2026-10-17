@@ -1,4 +1,6 @@
-import type { AnalysisOutcome, RemediationTriggerKind } from '@breeze/shared';
+import type { AnalysisOutcome, RemediationTriggerKind, ResearchOutcome } from '@breeze/shared';
+import type { ResearchRunContext } from './researchContext';
+import type { RunProvenFixes } from '../fixMemory/runMemory';
 /**
  * The run loop's internal shape contracts, split out of `runLoop.ts` (issue
  * #4451) so the loop itself and its per-profile finalizers (`runFinalizers.ts`)
@@ -79,9 +81,9 @@ export interface OutcomeExecutedAction {
    * `'(inline)'` when the ledger write itself failed — a ledger failure must
    * never block the tool call, so the call still executes and is recorded
    * with the placeholder id (see `executionLedger.ts` and the pre/post hooks
-   * below). Correlation between the pre and post hook is per-tool FIFO order
-   * (same assumption `allowedPending` already made) — genuine per-invocation
-   * ids need SDK hook support the loop doesn't have yet.
+   * below). The pre and post hook pair each call by the SDK's tool_use id
+   * (`AgentRunCallPairing` in runLoop.ts, #8163), falling back to per-tool
+   * FIFO order only for a call the SDK sent without one.
    */
   executionId: string;
   result: 'ok' | 'failed';
@@ -312,6 +314,8 @@ export interface AgentRunOutcome {
    * and `maxActionsPerRun` is 0.
    */
   analysis?: AnalysisOutcome;
+  /** AI Suggested Fixes W2 — the validated research submission (accepted items + recorded rejections). */
+  research?: ResearchOutcome;
   /** Sandbox compute charged to this run, in cents (spec §5.6). */
   computeCents?: number;
   /**
@@ -388,6 +392,13 @@ export interface RunRow {
   servedFundingSource?: 'platform' | 'partner_key' | null;
   servedFailoverHop?: number | null;
   servedFailoverCause?: string | null;
+  /**
+   * #7787 — the offering the run was routed to before its failover. When
+   * `servedOfferingId` equals `admittedOfferingId` the served_* columns are
+   * ADMISSION's provenance (the primary was cooling or ineligible at
+   * admission), not a hop: the run stays on hop 0's key (`startHopFor`).
+   */
+  servedFailoverFromOfferingId?: string | null;
 }
 
 export interface AgentRow {
@@ -478,6 +489,15 @@ export interface RunContext {
     siteId: string | null;
     evidence: DesignEvidence;
   } | null;
+  /** AI Suggested Fixes W2 — set only for a `remediation_research` run. Optional like `patch`. */
+  research?: ResearchRunContext | null;
+  /**
+   * AI Suggested Fixes W3 — proven fixes for this run's alert or correlation
+   * group. Set only for `verdict`/`full` runs whose org-pinned alert or group
+   * read resolved; null otherwise, and whenever memory is off, empty or
+   * unavailable. Optional (absent ≡ null) like `research`.
+   */
+  provenFixes?: RunProvenFixes | null;
   /**
    * AI patch agent W01 (#5747) — the schedule occurrence (or manual trigger)
    * and the bounded, org-pinned patch evidence a `patch`-profile run plans

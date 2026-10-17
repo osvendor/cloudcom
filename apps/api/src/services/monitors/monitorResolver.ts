@@ -1,7 +1,10 @@
-import { readPolicyDevice, readPolicyOrganization, readPolicyGroups } from '../devicePolicyReadSnapshot';
 import { monitorsInheritanceSchema, type MonitorsInheritance } from '@breeze/shared';
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { hierarchyFor } from '../deviceHierarchy';
+import { applicableCandidates, policySetFor, type ApplicabilityRule, type DevicePolicySetOpts } from '../devicePolicySet';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../../db';
+import { devices, deviceGroupMemberships } from '../../db/schema/devices';
+import { organizations } from '../../db/schema/orgs';
 import { isQuickSupportOrgType } from '../quickSupportOrg';
 import {
   configPolicyAssignments,
@@ -169,90 +172,13 @@ export function selectContributingAttachments(args: {
   return out;
 }
 
-/**
- * Every monitor that applies to this device, winner-per-monitor.
- *
- * Disabled winners are RETURNED, not filtered: the sweep filters them out, but
- * the API's "which monitors apply to this device" view has to be able to show
- * that a site policy explicitly turned one off.
- */
-export async function resolveMonitorsForDevice(
-  deviceId: string,
-  executor: DbExecutor = db,
-): Promise<MonitorResolution> {
-  const device = await readPolicyDevice(deviceId, executor);
-  if (!device) return { kind: 'device_missing' };
+/** #8142: monitors' own rules — raw partner for ownership, NO partner-level target for quick_support / unassigned_pool, SQL role/OS only. */
+const MONITOR_APPLICABILITY: ApplicabilityRule = {
+  ownership: 'orgOrPartner', partnerTarget: 'partnerUnlessQuickSupportOrUnassignedPool', roleOs: 'sql',
+};
 
-  const org = await readPolicyOrganization(deviceId, device.orgId, executor);
-  // Without the org row the partner-level assignments and partner-wide
-  // monitors below silently drop out, so a partial answer would pass for
-  // "resolved". Report it as unresolvable, like a vanished device (#2949).
-  if (!org) return { kind: 'device_missing' };
-
-  const groupRows = await readPolicyGroups(deviceId, executor);
-  const groupIds = groupRows.map((r) => r.groupId);
-
-  const targetConditions = [
-    and(eq(configPolicyAssignments.level, 'device'), eq(configPolicyAssignments.targetId, deviceId))!,
-    and(
-      eq(configPolicyAssignments.level, 'organization'),
-      eq(configPolicyAssignments.targetId, device.orgId),
-    )!,
-  ];
-  if (groupIds.length > 0) {
-    targetConditions.push(
-      and(
-        eq(configPolicyAssignments.level, 'device_group'),
-        inArray(configPolicyAssignments.targetId, groupIds),
-      )!,
-    );
-  }
-  if (device.siteId) {
-    targetConditions.push(
-      and(eq(configPolicyAssignments.level, 'site'), eq(configPolicyAssignments.targetId, device.siteId))!,
-    );
-  }
-  // A partner-level assignment must never reach an ephemeral Quick Support
-  // device — the hidden quick_support org is a stranger's own machine mid
-  // support session, not fleet the partner authored partner-wide policies
-  // against. Same exclusion as monitorScriptWorker.ts's partner-wide fan-out.
-  // Same for a device parked in its partner's holding org: not managed yet.
-  if (org?.partnerId && !isQuickSupportOrgType(org.type) && !isUnassignedPoolOrgType(org.type)) {
-    targetConditions.push(
-      and(
-        eq(configPolicyAssignments.level, 'partner'),
-        eq(configPolicyAssignments.targetId, org.partnerId),
-      )!,
-    );
-  }
-
-  const assignments = await executor
-    .select({
-      policyId: configurationPolicies.id,
-      parentPolicyId: configurationPolicies.parentPolicyId,
-      level: configPolicyAssignments.level,
-      priority: configPolicyAssignments.priority,
-      createdAt: configPolicyAssignments.createdAt,
-    })
-    .from(configPolicyAssignments)
-    .innerJoin(
-      configurationPolicies,
-      and(
-        eq(configPolicyAssignments.configPolicyId, configurationPolicies.id),
-        eq(configurationPolicies.status, 'active'),
-        // Org-owned policies for this device's org, OR partner-wide policies
-        // (org_id NULL) for this device's partner. RLS is the real boundary;
-        // this is the app-layer mirror of it.
-        org?.partnerId
-          ? sql`(${configurationPolicies.orgId} = ${device.orgId} OR (${configurationPolicies.orgId} IS NULL AND ${configurationPolicies.partnerId} = ${org.partnerId}))`
-          : eq(configurationPolicies.orgId, device.orgId),
-      ),
-    )
-    .where(and(
-      sql`(${sql.join(targetConditions, sql` OR `)})`,
-      ...buildRoleOsFilterConditions(device),
-    ));
-
+/** Cumulative/replace attachment resolution over the RAW links of each assigned policy and its parent (unchanged). */
+async function monitorsFromAssignments(assignments: AssignmentRow[], executor: DbExecutor): Promise<MonitorResolution> {
   if (assignments.length === 0) return { kind: 'resolved', monitors: [] };
 
   const policyIds = new Set<string>();
@@ -322,6 +248,129 @@ export async function resolveMonitorsForDevice(
     };
   });
   return { kind: 'resolved', monitors };
+}
+
+/**
+ * Every monitor that applies to this device, winner-per-monitor.
+ *
+ * Disabled winners are RETURNED, not filtered: the sweep filters them out, but
+ * the API's "which monitors apply to this device" view has to be able to show
+ * that a site policy explicitly turned one off.
+ */
+export async function resolveMonitorsForDevice(
+  deviceId: string,
+  executor: DbExecutor = db,
+  opts?: DevicePolicySetOpts,
+): Promise<MonitorResolution> {
+  // #8053 W1a-1: the heartbeat passes its hierarchy; other callers read below.
+  const passed = hierarchyFor(deviceId, opts);
+  const set = policySetFor(deviceId, opts);
+  if (set) {
+    if (!set.hierarchy.org) return { kind: 'device_missing' };
+    const applicable = applicableCandidates(set, MONITOR_APPLICABILITY);
+    // Exact, statement-free: no effective monitors link => no attachment rows.
+    if (!applicable.some((c) => c.links.monitors)) return { kind: 'resolved', monitors: [] };
+    return monitorsFromAssignments(applicable.map((c) => ({
+      policyId: c.policyId, parentPolicyId: c.parentPolicyId, level: c.level, priority: c.priority, createdAt: c.assignmentCreatedAt,
+    })), executor);
+  }
+  const [device] = passed
+    ? [{ id: passed.deviceId, orgId: passed.orgId, siteId: passed.siteId, deviceRole: passed.deviceRole, osType: passed.osType }]
+    : await executor
+      .select({
+        id: devices.id,
+        orgId: devices.orgId,
+        siteId: devices.siteId,
+        deviceRole: devices.deviceRole,
+        osType: devices.osType,
+      })
+      .from(devices)
+      .where(eq(devices.id, deviceId))
+      .limit(1);
+  if (!device) return { kind: 'device_missing' };
+
+  const [org] = passed
+    ? (passed.org ? [{ partnerId: passed.org.partnerId, type: passed.org.type }] : [])
+    : await executor
+      .select({ partnerId: organizations.partnerId, type: organizations.type })
+      .from(organizations)
+      .where(eq(organizations.id, device.orgId))
+      .limit(1);
+  // Without the org row the partner-level assignments and partner-wide
+  // monitors below silently drop out, so a partial answer would pass for
+  // "resolved". Report it as unresolvable, like a vanished device (#2949).
+  if (!org) return { kind: 'device_missing' };
+
+  const groupIds = passed
+    ? [...passed.groupIds]
+    : (await executor
+      .select({ groupId: deviceGroupMemberships.groupId })
+      .from(deviceGroupMemberships)
+      .where(eq(deviceGroupMemberships.deviceId, deviceId))).map((r) => r.groupId);
+
+  const targetConditions = [
+    and(eq(configPolicyAssignments.level, 'device'), eq(configPolicyAssignments.targetId, deviceId))!,
+    and(
+      eq(configPolicyAssignments.level, 'organization'),
+      eq(configPolicyAssignments.targetId, device.orgId),
+    )!,
+  ];
+  if (groupIds.length > 0) {
+    targetConditions.push(
+      and(
+        eq(configPolicyAssignments.level, 'device_group'),
+        inArray(configPolicyAssignments.targetId, groupIds),
+      )!,
+    );
+  }
+  if (device.siteId) {
+    targetConditions.push(
+      and(eq(configPolicyAssignments.level, 'site'), eq(configPolicyAssignments.targetId, device.siteId))!,
+    );
+  }
+  // A partner-level assignment must never reach an ephemeral Quick Support
+  // device — the hidden quick_support org is a stranger's own machine mid
+  // support session, not fleet the partner authored partner-wide policies
+  // against. Same exclusion as monitorScriptWorker.ts's partner-wide fan-out.
+  // Same for a device parked in its partner's holding org: not managed yet.
+  if (org?.partnerId && !isQuickSupportOrgType(org.type) && !isUnassignedPoolOrgType(org.type)) {
+    targetConditions.push(
+      and(
+        eq(configPolicyAssignments.level, 'partner'),
+        eq(configPolicyAssignments.targetId, org.partnerId),
+      )!,
+    );
+  }
+
+  const assignments = await executor
+    .select({
+      policyId: configurationPolicies.id,
+      parentPolicyId: configurationPolicies.parentPolicyId,
+      level: configPolicyAssignments.level,
+      priority: configPolicyAssignments.priority,
+      createdAt: configPolicyAssignments.createdAt,
+    })
+    .from(configPolicyAssignments)
+    .innerJoin(
+      configurationPolicies,
+      and(
+        eq(configPolicyAssignments.configPolicyId, configurationPolicies.id),
+        eq(configurationPolicies.status, 'active'),
+        // Org-owned policies for this device's org, OR partner-wide policies
+        // (org_id NULL) for this device's partner. RLS is the real boundary;
+        // this is the app-layer mirror of it.
+        org?.partnerId
+          ? sql`(${configurationPolicies.orgId} = ${device.orgId} OR (${configurationPolicies.orgId} IS NULL AND ${configurationPolicies.partnerId} = ${org.partnerId}))`
+          : eq(configurationPolicies.orgId, device.orgId),
+      ),
+    )
+    .where(and(
+      sql`(${sql.join(targetConditions, sql` OR `)})`,
+      ...buildRoleOsFilterConditions(device),
+    ))
+    .orderBy(asc(configPolicyAssignments.createdAt), asc(configPolicyAssignments.id));
+
+  return monitorsFromAssignments(assignments, executor);
 }
 
 export async function resolveMonitorOverrideForDevice(

@@ -44,7 +44,9 @@ import {
   reportKindSchema,
   topologyViewSchema,
 } from './topology';
-import { graphNodeSchema, topologyNetworkClass } from './topology';
+import { graphNodeSchema, TOPOLOGY_INTERFACE_KINDS, topologyInterfaceKindEvidence, topologyNetworkClass } from './topology';
+import { TOPOLOGY_CONSUMER_DEFAULT_PREFIXES, isTopologyConsumerDefaultPrefix } from './topology';
+import { topologyInterfaceRowSchema } from './topologyCollection';
 
 const SITE_ID = '11111111-1111-4111-8111-111111111111';
 const NODE_ID = '22222222-2222-4222-8222-222222222222';
@@ -178,7 +180,7 @@ const graphResponse = {
   },
   coverage: { state: 'limited', reasons: [{ code: 'projection_limit', message: 'Projection is bounded' }] },
   frontier: [{ token: 'opaque-frontier-token', label: 'More gateways', memberCount: 3 }],
-  permissions: { canEdit: true, canDiagnose: true, canConfigureMonitoring: false },
+  permissions: { canEdit: true, canDiagnose: true, canConfigureMonitoring: false, canMoveDevices: false },
 } as const;
 
 describe('graphQuerySchema', () => {
@@ -448,11 +450,49 @@ describe('grouped overview contract (2026-10-02)', () => {
     expect(presentationNodeSchema.safeParse({ ...groupNode, authority: true }).success).toBe(false);
   });
 
+  it('accepts a declared lan group and an empty declared card; rejects an unknown declaration state (site location W1)', () => {
+    expect(presentationNodeSchema.safeParse({ ...groupNode, group: { ...group, declaration: { state: 'declared', sources: ['discovery_profile'] } } }).success).toBe(true);
+    expect(presentationNodeSchema.safeParse({ ...groupNode, group: { ...group, declaration: { state: 'undeclared', sources: [] } } }).success).toBe(true);
+    expect(presentationNodeSchema.safeParse({ ...groupNode, memberCount: 0, group: { ...group, basis: 'declared_site_network', members: [], canonicalNodeIds: [],
+      gatewayAddresses: [], observerCount: 0, declaration: { state: 'declared', sources: ['network_baseline'] } } }).success).toBe(true);
+    expect(presentationNodeSchema.safeParse({ ...groupNode, group: { ...group, declaration: { state: 'maybe', sources: [] } } }).success).toBe(false);
+    expect(presentationNodeSchema.safeParse({ ...groupNode, group: { ...group, declaration: { state: 'declared', sources: ['dhcp_scope'] } } }).success).toBe(false);
+    expect(presentationNodeSchema.safeParse({ ...groupNode, group: { ...group, declaration: { state: 'declared', sources: [], extra: 1 } } }).success).toBe(false);
+  });
+
   it('labels aggregate edges with a presentation role without inventing authority', () => {
     const edge = { ...graphResponse.presentation.edges[0], role: 'routes_via' };
     expect(presentationEdgeSchema.safeParse(edge).success).toBe(true);
     expect(presentationEdgeSchema.safeParse({ ...edge, role: 'cable' }).success).toBe(false);
     expect(presentationEdgeSchema.safeParse({ ...edge, role: 'shared_devices', contributingRelationshipIds: [] }).success).toBe(false);
+  });
+
+  it('accepts neighbour-cache corroboration only with its bounded provenance (#7816)', () => {
+    const neighbor = { method: 'neighbor_cache', evidenceClass: 'inferred', confidence: 'low', observerNodeId: NODE_ID, observerLabel: 'DRT-HYG3',
+      sourceId: NODE_2_ID, rowKey: 'n:10.1.2.80', interfaceName: 'Ethernet', address: '10.1.2.80', mac: '00:11:22:33:44:55', state: 'stale',
+      confirmedAt: '2026-10-02T10:00:00.000Z', expiresAt: '2026-10-02T10:15:00.000Z' };
+    const seen = { nodeId: NODE_2_ID, placement: 'neighbor_seen', primary: true, stale: false, neighbor };
+    const withSeen = (member: unknown, extra: Record<string, unknown> = {}) => ({ ...groupNode, group: { ...group, members: [member], ...extra } });
+    expect(presentationNodeSchema.safeParse(withSeen(seen)).success).toBe(true);
+    // neighbor_seen needs provenance; other placements never carry it.
+    expect(presentationNodeSchema.safeParse(withSeen({ ...seen, neighbor: undefined })).success).toBe(false);
+    expect(presentationNodeSchema.safeParse(withSeen({ ...group.members[1], neighbor })).success).toBe(false);
+    // Never "verified", never a canonical method or confidence upgrade.
+    expect(presentationNodeSchema.safeParse(withSeen({ ...seen, neighbor: { ...neighbor, confidence: 'high' } })).success).toBe(false);
+    expect(presentationNodeSchema.safeParse(withSeen({ ...seen, neighbor: { ...neighbor, state: 'failed' } })).success).toBe(false);
+    expect(presentationNodeSchema.safeParse(withSeen({ ...seen, neighbor: { ...neighbor, observerLabel: 'x'.repeat(256) } })).success).toBe(false);
+    expect(presentationNodeSchema.safeParse(withSeen({ ...seen, neighbor: { ...neighbor, producerEpoch: 'e' } })).success).toBe(false);
+    expect(presentationNodeSchema.safeParse(withSeen(seen, { neighborCoverage: 'limited', conflictBasis: ['gateway_mac'] })).success).toBe(true);
+    expect(presentationNodeSchema.safeParse(withSeen(seen, { conflictBasis: ['gateway_vendor'] })).success).toBe(false);
+  });
+
+  it('accepts corroborated gateway MACs on a gateway group (#7817)', () => {
+    const gateway = { ...groupNode, role: 'gateway_group', group: { ...group, kind: 'gateway', basis: 'reported_gateway', networkClass: null, prefix: null,
+      address: '10.1.2.1', gatewayAddresses: [], members: [],
+      gatewayMacs: [{ address: '10.1.2.1', mac: '00:11:22:33:44:55', observerCount: 3, confirmedAt: '2026-10-02T10:00:00.000Z', expiresAt: '2026-10-02T10:15:00.000Z' }] } };
+    expect(presentationNodeSchema.safeParse(gateway).success).toBe(true);
+    expect(presentationNodeSchema.safeParse({ ...gateway, group: { ...gateway.group, gatewayMacs: Array(17).fill(gateway.group.gatewayMacs[0]) } }).success).toBe(false);
+    expect(presentationNodeSchema.safeParse({ ...gateway, group: { ...gateway.group, gatewayMacs: [{ ...gateway.group.gatewayMacs[0], verified: true }] } }).success).toBe(false);
   });
 
   it('round-trips a whole grouped response', () => {
@@ -468,5 +508,66 @@ describe('grouped overview contract (2026-10-02)', () => {
     ['0.0.0.0/0', 'other'], ['::/0', 'other'], ['10.0.0.0/7', 'other'],
   ])('classifies %s as %s', (prefix, expected) => {
     expect(topologyNetworkClass(prefix)).toBe(expected);
+  });
+
+  // #7819: the agent-reported interface kind wins; CIDR is only the fallback for an unknown kind.
+  it.each([
+    // A VPN on an ordinary RFC1918 range is an overlay, whatever its CIDR looks like.
+    ['10.8.0.0/24', 'tunnel', 'overlay'], ['192.168.50.0/24', 'tunnel', 'overlay'], ['fd00:1234::/64', 'tunnel', 'overlay'],
+    // A tunnel's own single-host address (Tailscale 100.x/32, WireGuard /32) is the overlay, not a host route.
+    ['100.101.102.103/32', 'tunnel', 'overlay'], ['fd7a:115c:a1e0::1/128', 'tunnel', 'overlay'],
+    // A genuine CGNAT LAN on a link-layer interface stays a LAN.
+    ['100.64.0.0/10', 'ethernet', 'lan'], ['100.100.0.0/16', 'wifi', 'lan'], ['100.72.0.0/16', 'bridge', 'lan'],
+    // A cellular uplink is a WAN, not a site LAN: a carrier CGNAT address keeps the CIDR guess.
+    ['100.80.0.0/12', 'cellular', 'overlay'], ['10.20.0.0/16', 'cellular', 'lan'],
+    ['fd7a:115c:a1e0::/48', 'ethernet', 'lan'],
+    // Address-shape facts are not heuristics: link-local scope and single-host prefixes still apply on a link.
+    ['169.254.0.0/16', 'tunnel', 'link_local'], ['fe80::/64', 'tunnel', 'link_local'], ['169.254.0.0/16', 'ethernet', 'link_local'],
+    ['10.1.2.3/32', 'ethernet', 'host'], ['0.0.0.0/0', 'ethernet', 'other'],
+    // Unknown/ambiguous kinds (and old rows with no kind) keep the CIDR heuristic exactly.
+    ['100.64.0.0/10', 'unknown', 'overlay'], ['100.64.0.0/10', 'virtual', 'overlay'], ['100.64.0.0/10', 'other', 'overlay'],
+    ['100.64.0.0/10', null, 'overlay'], ['100.64.0.0/10', undefined, 'overlay'], ['100.64.0.0/10', 'not-a-kind', 'overlay'],
+    ['10.8.0.0/24', 'unknown', 'lan'], ['10.8.0.0/24', null, 'lan'], ['100.124.30.54/32', 'virtual', 'host'],
+  ] as const)('classifies %s on a %s interface as %s', (prefix, kind, expected) => {
+    expect(topologyNetworkClass(prefix, kind)).toBe(expected);
+  });
+
+  it('maps every reportable interface kind to exactly one evidence class', () => {
+    expect(Object.fromEntries(TOPOLOGY_INTERFACE_KINDS.map((kind) => [kind, topologyInterfaceKindEvidence(kind)]))).toEqual({
+      ethernet: 'link', wifi: 'link', bridge: 'link', cellular: 'unknown', tunnel: 'tunnel', virtual: 'unknown', other: 'unknown', unknown: 'unknown',
+    });
+    expect(topologyInterfaceKindEvidence(null)).toBe('unknown');
+    expect(topologyInterfaceKindEvidence(undefined)).toBe('unknown');
+  });
+
+  it('accepts exactly the shared interface kinds on the agent interface row', () => {
+    const row = { rowKey: 'k', interfaceKey: 'k', osIndex: 1, name: 'eth0', adminState: 'up', operState: 'up', mtu: 1500, addresses: [] };
+    for (const kind of TOPOLOGY_INTERFACE_KINDS) expect(topologyInterfaceRowSchema.safeParse({ ...row, kind }).success).toBe(true);
+    expect(topologyInterfaceRowSchema.safeParse({ ...row, kind: 'wireguard' }).success).toBe(false);
+  });
+});
+
+describe('isTopologyConsumerDefaultPrefix', () => {
+  it('keeps the reviewed list frozen at 19 entries', () => {
+    expect(TOPOLOGY_CONSUMER_DEFAULT_PREFIXES).toHaveLength(19);
+    expect(Object.isFrozen(TOPOLOGY_CONSUMER_DEFAULT_PREFIXES)).toBe(true);
+  });
+  it.each([
+    ['192.168.1.0/24', true],
+    ['192.168.69.0/24', true],
+    ['192.168.68.0/24', true],
+    ['10.1.5.0/24', false],
+    ['10.0.0.0/24', true],
+    ['10.0.0.0/16', true],
+    ['172.16.5.0/24', false],
+    ['not-a-prefix', false],
+    ['', false],
+    ['192.168.1.0/33', false],
+    ['192.168.1.0', false],
+    ['fd00::/64', false],
+    ['fe80::/10', false],
+    ['300.1.1.0/24', false],
+  ])('isTopologyConsumerDefaultPrefix(%s) = %s', (prefix, expected) => {
+    expect(isTopologyConsumerDefaultPrefix(prefix)).toBe(expected);
   });
 });

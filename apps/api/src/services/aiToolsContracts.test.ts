@@ -15,10 +15,12 @@ vi.mock('./contractService', () => ({
   cancelContract: vi.fn(),
   contractLineAuditDetails: vi.fn(),
 }));
+vi.mock('./contractHourPeriodsRead', () => ({ listContractHourPeriods: vi.fn(async () => ({ items: [], nextCursor: null })) }));
 
 import { registerContractTools } from './aiToolsContracts';
 import * as contractService from './contractService';
 import { getContract } from './contractService';
+import { listContractHourPeriods } from './contractHourPeriodsRead';
 import type { AiTool } from './aiTools';
 import type { AuthContext } from '../middleware/auth';
 
@@ -76,6 +78,16 @@ describe('get_contract line shape (#3205 W03)', () => {
     });
     const out = JSON.parse(await getTool('get_contract').handler({ contractId: 'ct-1' }, auth));
     expect(out.lines[0]).toMatchObject({ site: { id: 'site-1', name: 'HQ' }, deviceGroup: null });
+  });
+});
+
+describe('get_contract hour-period history (#4547 W03)', () => {
+  it('appends hourPeriods from the same reader the HTTP route uses, newest first, capped at 24', async () => {
+    vi.mocked(getContract).mockResolvedValue({ contract: { id: 'ct-1', currencyCode: 'USD' }, lines: [], periods: [] } as never);
+    vi.mocked(listContractHourPeriods).mockResolvedValue({ items: [{ id: 'hp-1', periodStart: '2026-10-01' }] as never, nextCursor: null });
+    const out = JSON.parse(await getTool('get_contract').handler({ contractId: 'ct-1' }, auth));
+    expect(out.hourPeriods).toEqual([{ id: 'hp-1', periodStart: '2026-10-01' }]);
+    expect(listContractHourPeriods).toHaveBeenCalledWith('ct-1', { limit: 24 }, expect.objectContaining({ partnerId: 'p-1', accessibleOrgIds: ['org-1'] }));
   });
 });
 
@@ -181,4 +193,16 @@ describe('contract tool scope parity with the recurring-contract HTTP surface', 
     expect(JSON.parse(output)).toMatchObject({ code: 'PARTNER_SCOPE_REQUIRED' });
     expect(contractService.listContracts).not.toHaveBeenCalled();
   });
+});
+
+it('rejects autopay exclusion writes through the AI tool while keeping ordinary contract edits available', async () => {
+  vi.mocked(contractService.updateContract).mockClear();
+  vi.mocked(contractService.updateContract).mockResolvedValue({ id: 'ct-1' } as never);
+  const result = JSON.parse(await getTool('manage_contracts').handler({
+    action: 'update', contractId: 'ct-1', patch: { autopayExcluded: false },
+  }, auth));
+  expect(result).toMatchObject({ code: 'VALIDATION_ERROR' });
+  expect(contractService.updateContract).not.toHaveBeenCalled();
+  await getTool('manage_contracts').handler({ action: 'update', contractId: 'ct-1', patch: { name: 'Updated contract' } }, auth);
+  expect(contractService.updateContract).toHaveBeenCalledWith('ct-1', { name: 'Updated contract' }, expect.anything());
 });

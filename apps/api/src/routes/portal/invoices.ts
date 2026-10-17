@@ -1,8 +1,15 @@
-import { assertNoActiveCollection } from '../../services/autopay/reservation';
+import { captureException } from '../../services/sentry';
+import {invoicePaySchema,getBankAutopayOffer,startInvoiceBankSetup,collectAfterBankSetup} from '../../services/autopay/bankPayment';
+import { getTrustedClientIpOrUndefined } from '../../services/clientIp';
+import { getInvoiceAutopayOffer, prepareCardPayAndSave, cardSaveStripeFields, bindCardPayAndSave, withPaymentDescription } from '../../services/autopay/payAndSave';
+import { paymentIntentDescription } from '../../services/autopay/paymentDescription';
+import { assertNoActiveCollection, holdsClientMoney, readInFlightCollection } from '../../services/autopay/reservation';
+import { releaseInvoiceConfirmation } from '../../services/autopay/confirmPayment';
+import { getCustomerInvoiceAutopay } from '../../services/autopay/customerInvoiceStatus';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '../../lib/validation';
-import { and, desc, eq, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, getTableColumns, ne, sql } from 'drizzle-orm';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
 import { invoices, invoiceStripePayments, partners, stripeConnectAccounts } from '../../db/schema';
 import { portalBranding } from '../../db/schema/portal';
@@ -14,7 +21,7 @@ import {
   isEtagFresh,
   portalFinancialMutationGuard,
 } from './helpers';
-import { getCustomerInvoice, markViewed, toCustomerInvoiceLine } from '../../services/invoiceService';
+import { getCustomerInvoice, markViewed, projectCustomerInvoiceLine } from '../../services/invoiceService';
 import { getInvoicePdf, renderInvoicePdf } from '../../services/invoicePdf';
 import { portalBase } from '../../services/portalUrl';
 import { safeContentDispositionFilename } from '../../utils/httpHeaders';
@@ -22,7 +29,7 @@ import { InvoiceServiceError } from '../../services/invoiceTypes';
 import { getPartnerStripeClient, isPartnerOnlinePaymentAvailable, PartnerStripeError } from '../../services/partnerStripe';
 import { assertNoHeldDbContextForStripe, HeldDbContextForStripeError, settleCheckoutSession } from '../../services/stripeSettle';
 import { toMinorUnits } from '../../services/stripeMoney';
-import { computeChargeNow } from '@breeze/shared';
+import { computeChargeNow, ERROR_CODES } from '@breeze/shared';
 import { mapStripeCheckoutError, CUSTOMER_SAFE_CURRENCY_UNSUPPORTED_MESSAGE } from '../../services/stripeCheckoutErrors';
 import { checkoutSessionExpiry, checkCheckoutPublicationInTx } from '../../services/invoiceCheckout';
 import {
@@ -36,6 +43,10 @@ const settleSchema = z.object({ sessionId: z.string().trim().min(1).max(255) });
 
 // Invoice statuses that may be paid online. Drafts/paid/void are excluded.
 const PAYABLE = new Set(['sent', 'partially_paid', 'overdue']);
+// One body for a missing, other-org and draft invoice on the read, PDF, pay and
+// settle routes, so they never tell a portal user that an unissued invoice
+// exists. /autopay-confirmation does not use it yet (#8254).
+const INVOICE_NOT_FOUND_BODY = { error: 'Invoice not found', code: ERROR_CODES.NOT_FOUND };
 
 /**
  * The customer-facing name of an invoice, which carries no title column: the
@@ -114,12 +125,14 @@ invoiceRoutes.get('/invoices/:id', zValidator('param', ticketParamSchema), async
   try {
     result = await getCustomerInvoice(id, auth.user.orgId);
   } catch (err) {
-    if (err instanceof InvoiceServiceError) return c.json({ error: err.message }, err.status);
+    if (err instanceof InvoiceServiceError) {
+      return err.status === 404 ? c.json(INVOICE_NOT_FOUND_BODY, 404) : c.json({ error: err.message }, err.status);
+    }
     throw err;
   }
 
   // Drafts are never customer-visible even though getCustomerInvoice is org-scoped.
-  if (result.invoice.status === 'draft') return c.json({ error: 'Invoice not found' }, 404);
+  if (result.invoice.status === 'draft') return c.json(INVOICE_NOT_FOUND_BODY, 404);
 
   // Best-effort view stamp — never fail the read if the stamp write hiccups.
   try {
@@ -162,16 +175,70 @@ invoiceRoutes.get('/invoices/:id', zValidator('param', ticketParamSchema), async
     console.error('[portal/invoices] online-payment availability lookup failed', { invoiceId: id, partnerId: result.partnerId, err });
   }
 
+  // #7824: surface an in-flight autopay collection so the Pay button can be
+  // replaced by a "payment processing" state. Same reserving-state set the pay
+  // route's 409 uses; advisory only (the pay route still refuses). A failed read
+  // degrades to "nothing in flight" — the server refusal is the backstop.
+  let collectionInProgress: { amount: string; actionRequired: boolean } | null = null;
+  try {
+    const inFlight = await readInFlightCollection(db, id);
+    if (inFlight.inProgress) collectionInProgress = { amount: inFlight.amount, actionRequired: inFlight.actionRequired === true };
+  } catch (err) {
+    console.error('[portal/invoices] in-flight collection lookup failed', { invoiceId: id, err });
+  }
+
+  // D-4: how this invoice will be paid; an enrolled client is not offered setup again.
+  // R9: when the status can't be read, enrollment is unknown, so fail closed: offer nothing
+  // that saves a method (it could silently replace an enrolled client's).
+  let customerAutopay: Awaited<ReturnType<typeof getCustomerInvoiceAutopay>> = { enrolled: false, status: null };
+  let autopayKnown = true;
+  try {
+    customerAutopay = await getCustomerInvoiceAutopay(db, { invoiceId: id, orgId: auth.user.orgId });
+  } catch (err) {
+    autopayKnown = false;
+    console.error('[portal/invoices] autopay status lookup failed', { invoiceId: id, err });
+    captureException(err, undefined, { autopay_phase: 'invoice_status' });
+  }
+
   return c.json({
     invoice: result.invoice,
-    lines: result.lines.map(toCustomerInvoiceLine),
+    // Re-project the exact safe keyset (defense in depth over the service).
+    // Not toCustomerInvoiceLine: getCustomerInvoice already applied the #8604
+    // toggles from the frozen columns, and re-running it would apply defaults.
+    lines: result.lines.map(projectCustomerInvoiceLine),
     onlinePaymentAvailable,
+    collectionInProgress,
+    autopayStatus: customerAutopay.status,
+    autopayEnrolled: customerAutopay.enrolled,
+    autopay: customerAutopay.enrolled || !autopayKnown ? null : await getInvoiceAutopayOffer(auth.user.orgId, id),
+    bankAutopay: autopayKnown ? await runOutsideDbContext(()=>getBankAutopayOffer(id,auth.user.orgId)) : null,
     branding: {
       partnerName: partner?.name ?? null,
       logoUrl: brand?.logoUrl ?? null,
       primaryColor: brand?.primaryColor ?? null,
     },
   });
+});
+
+// POST /portal/invoices/:id/autopay-confirmation — the invoice page's way out of
+// an off-session payment waiting on bank authentication (3DS): cancels that
+// PaymentIntent and releases the reservation so the Pay button works. Self-managed
+// DB context (selfManagedDbContextRoutes.ts): the Stripe cancel runs outside any
+// transaction, and the service scopes every read to the portal user's org.
+invoiceRoutes.post('/invoices/:id/autopay-confirmation', zValidator('param', ticketParamSchema), async (c) => {
+  const auth = c.get('portalAuth');
+  const { id } = c.req.valid('param');
+  try {
+    return c.json(await releaseInvoiceConfirmation({ invoiceId: id, orgId: auth.user.orgId }));
+  } catch (err) {
+    if (err instanceof InvoiceServiceError && err.status === 404) {
+      // The service gives a missing, other-org and draft invoice one 404; answer
+      // it with the body the other portal invoice routes use (#8254).
+      return c.json({ error: 'Invoice not found', code: ERROR_CODES.NOT_FOUND }, 404);
+    }
+    if (err instanceof InvoiceServiceError && err.status < 500) return c.json({ error: err.message, code: err.code }, err.status);
+    throw err;
+  }
 });
 
 // GET /portal/invoices/:id/pdf — stream the stored PDF (render on demand if absent).
@@ -184,10 +251,12 @@ invoiceRoutes.get('/invoices/:id/pdf', zValidator('param', ticketParamSchema), a
   try {
     invoice = (await getCustomerInvoice(id, auth.user.orgId)).invoice;
   } catch (err) {
-    if (err instanceof InvoiceServiceError) return c.json({ error: err.message }, err.status);
+    if (err instanceof InvoiceServiceError) {
+      return err.status === 404 ? c.json(INVOICE_NOT_FOUND_BODY, 404) : c.json({ error: err.message }, err.status);
+    }
     throw err;
   }
-  if (invoice.status === 'draft') return c.json({ error: 'Invoice not found' }, 404);
+  if (invoice.status === 'draft') return c.json(INVOICE_NOT_FOUND_BODY, 404);
 
   let pdf = await getInvoicePdf(id);
   if (!pdf) {
@@ -220,24 +289,42 @@ invoiceRoutes.get('/invoices/:id/pdf', zValidator('param', ticketParamSchema), a
 // not rely on RLS scope: the invoice SELECT is explicitly filtered to the
 // authenticated `auth.user.orgId`, and the mapping INSERT runs inside a context
 // so it isn't a contextless 0-row no-op (#1375).
-invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), async (c) => {
+invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), zValidator('json',invoicePaySchema), async (c) => {
   const auth = c.get('portalAuth');
+  const body=c.req.valid('json');
   const { id } = c.req.valid('param');
 
   const [inv] = await withSystemDbAccessContext(() =>
-    db.select().from(invoices)
+    db.select({ ...getTableColumns(invoices), partnerName: partners.name }).from(invoices)
+      .leftJoin(partners, eq(partners.id, invoices.partnerId))
       .where(and(eq(invoices.id, id), eq(invoices.orgId, auth.user.orgId), ne(invoices.status, 'draft')))
       .limit(1)
   );
-  if (!inv) return c.json({ error: 'Invoice not found' }, 404);
-  if (!PAYABLE.has(inv.status)) return c.json({ error: 'Invoice is not payable' }, 409);
+  if (!inv) return c.json(INVOICE_NOT_FOUND_BODY, 404);
+  if (!PAYABLE.has(inv.status)) return c.json({ error: 'Invoice is not payable', code: ERROR_CODES.CONFLICT }, 409);
 
-  // SEC-150 producer gate — twin of createInvoicePayLink's. A session minted
+  if('methodType' in body && body.methodType==='us_bank_account'){
+    try{
+      const result=body.phase==='setup'
+        ? await startInvoiceBankSetup({invoiceId:inv.id,orgId:inv.orgId,terms:body,returnTo:'portal',
+          ip:getTrustedClientIpOrUndefined(c)??null,userAgent:c.req.header('user-agent')??null})
+        : await collectAfterBankSetup({invoiceId:inv.id,orgId:inv.orgId,setupSessionId:body.setupSessionId!});
+      if ('outcome' in result && result.outcome !== 'created') return c.json({error:'Payment has not started. Review the invoice payment status.',data:result,code:ERROR_CODES.CONFLICT},409);
+      return c.json(result);
+    }catch(error){if(error instanceof InvoiceServiceError)return c.json({error:error.message,code:error.code},error.status);throw error;}
+  }
+  // Producer gate — twin of createInvoicePayLink's. A session minted
   // while a revocation is in flight would not be covered by that revocation, so
   // the customer is asked to retry rather than handed a link nobody can kill.
   // Elects its own system scope — never wrap it in a bare context here (#5611).
   try {
-    await withSystemDbAccessContext(() => assertNoActiveCollection(db, inv.id));
+    await withSystemDbAccessContext(async () => {
+      await assertNoActiveCollection(db, inv.id);
+      // Twin of createInvoicePayLink's guard: no card Pay while captured money is unapplied (B1-2).
+      if (await holdsClientMoney(db, inv.id)) {
+        throw new InvoiceServiceError('A payment for this invoice was received and is being reviewed', 409, 'COLLECTION_IN_PROGRESS');
+      }
+    });
     await assertNoPendingRevocation(inv.id);
   } catch (err) {
     if (err instanceof InvoiceServiceError && (err.code === REVOCATION_PENDING_CODE || err.code === 'COLLECTION_IN_PROGRESS')) {
@@ -255,7 +342,24 @@ invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), 
   // Currency-aware minor units: zero-decimal currencies (JPY, KRW, …) must NOT be
   // multiplied by 100, or the customer is over-charged 100x (see stripeMoney.ts).
   const chargeMinor = toMinorUnits(chargeNow.amount, inv.currencyCode);
-  if (chargeMinor <= 0) return c.json({ error: 'Nothing to pay' }, 409);
+  if (chargeMinor <= 0) return c.json({ error: 'Nothing to pay', code: ERROR_CODES.CONFLICT }, 409);
+  const { expiresAt: providerExpiresAtEpoch, quantum: expiryQuantum } = checkoutSessionExpiry();
+  let capture: Awaited<ReturnType<typeof prepareCardPayAndSave>>;
+  try {
+    capture = await prepareCardPayAndSave(inv.id, auth.user.orgId, {
+      ...body, contactEmail: auth.user.email, ip: getTrustedClientIpOrUndefined(c) ?? null, userAgent: c.req.header('user-agent') ?? null,
+    }, `inv_${inv.id}_${chargeMinor}_${chargeNow.isDeposit ? 'dep' : 'bal'}_e${expiryQuantum}`);
+  } catch (err) {
+    if (err instanceof InvoiceServiceError) {
+      // Local compatibility translation until the shared autopay error mapper lands.
+      if (('saveForAutopay' in body && body.saveForAutopay) && err.status === 404 && err.code === 'INVALID_STATE'
+        && err.message === 'Automatic payments unavailable') {
+        return c.json({ error: 'Automatic payments are not enabled', code: 'autopay_not_enabled' }, 404);
+      }
+      return c.json({ error: err.message, code: err.code }, err.status);
+    }
+    throw err;
+  }
 
   // stripe_connect_accounts is a partner-axis table (reused by the #1610 API-key
   // model). This handler runs with NO ambient DB context (#1448 opt-out), and even
@@ -274,7 +378,7 @@ invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), 
     // A decrypt/unreadable-key fault is a real 500 — don't lie "not available" when
     // the key is actually corrupt/misconfigured (it's already logged in the service).
     if (err instanceof PartnerStripeError && err.code === 'NO_STRIPE_KEY') {
-      return c.json({ error: 'Online payment is not available' }, 409);
+      return c.json({ error: 'Online payment is not available', code: ERROR_CODES.CONFLICT }, 409);
     }
     if (err instanceof PartnerStripeError) {
       return c.json({ error: 'Could not initialize payment — please contact support' }, 500);
@@ -291,14 +395,13 @@ invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), 
 
   // Truly outside any DB context/transaction — no pooled connection is held
   // across this ~hundreds-of-ms round trip.
-  const { expiresAt: providerExpiresAtEpoch, quantum: expiryQuantum } = checkoutSessionExpiry();
 
   assertNoHeldDbContextForStripe('portal.invoicePay');
   let session;
   try {
     session = await runOutsideDbContext(() => stripe.checkout.sessions.create({
     mode: 'payment',
-    // SEC-150 defence in depth: an explicit provider-side death clock, so an
+    // Defence in depth: an explicit provider-side death clock, so an
     // unrevoked session cannot outlive the day even if every local control fails.
     expires_at: providerExpiresAtEpoch,
     // v1 is card-only. Restricting payment_method_types keeps the recorded
@@ -309,6 +412,8 @@ invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), 
     // to `revoked` on the strength of this pin. Adding a delayed method here
     // requires changing that mapping first. Mirror: services/invoiceCheckout.ts.
     payment_method_types: ['card'],
+    // FP-20: the PaymentIntent names the invoice and MSP, as autopay ones do.
+    ...withPaymentDescription(cardSaveStripeFields(capture), paymentIntentDescription(inv.invoiceNumber, inv.partnerName)),
     line_items: [{
       price_data: {
         currency: inv.currencyCode.toLowerCase(),
@@ -327,6 +432,7 @@ invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), 
     success_url: `${portalBaseUrl}/invoices/${inv.id}?paid=1&session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${portalBaseUrl}/invoices/${inv.id}`,
     metadata: {
+      ...(capture ? { autopay_setup_attempt_id: capture.id } : {}),
       invoice_id: inv.id,
       org_id: inv.orgId,
       partner_id: inv.partnerId,
@@ -341,10 +447,11 @@ invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), 
     // 50%-deposit invoice has the SAME chargeMinor for the deposit and the later
     // balance charge (different product name but equal amount), so the amount alone
     // can't disambiguate — the explicit dep/bal discriminator does.
-    // `_e<quantum>` (SEC-150): `expires_at` is part of the request and Stripe
+    // `_e<quantum>`: `expires_at` is part of the request and Stripe
     // refuses an idempotent replay whose parameters moved, so the hour quantum
     // is folded into the key — see checkoutSessionExpiry().
-    idempotencyKey: `inv_${inv.id}_${chargeMinor}_${chargeNow.isDeposit ? 'dep' : 'bal'}_e${expiryQuantum}`,
+    // `_pd`: the request carries a PaymentIntent description (see services/invoiceCheckout.ts).
+    idempotencyKey: `inv_${inv.id}_${chargeMinor}_${chargeNow.isDeposit ? 'dep' : 'bal'}${capture ? `_save_${capture.id}` : ''}_e${expiryQuantum}_pd`,
   }));
   } catch (err) {
     // Customer-facing path (spec §10): a currency the partner's account cannot
@@ -375,7 +482,7 @@ invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), 
     if (!currentConnection) {
       return false;
     }
-    // SEC-150: a transition may have recorded revocation intent while the Stripe
+    // A transition may have recorded revocation intent while the Stripe
     // round-trip was in flight. Never refuse before the mapping is written — a
     // session on Stripe with no mapping row is an orphan no revocation can find,
     // strictly worse than the race being closed. Commit, then revoke and refuse.
@@ -387,7 +494,7 @@ invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), 
         eq(invoiceStripePayments.revocationState, 'revocation_requested'),
       )).limit(1);
     raced = racedRevocation !== undefined || racedCollection || racedBalance;
-    await db.insert(invoiceStripePayments).values({
+    const [insertedMapping]=await db.insert(invoiceStripePayments).values({
       orgId: inv.orgId,
       invoiceId: inv.id,
       stripeAccountId,
@@ -400,7 +507,12 @@ invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), 
       providerExpiresAt: session.expires_at
         ? new Date(session.expires_at * 1000)
         : new Date(providerExpiresAtEpoch * 1000),
-    });
+    }).onConflictDoNothing({target:invoiceStripePayments.stripeObjectId}).returning({invoiceId:invoiceStripePayments.invoiceId});
+    if(!insertedMapping){
+      const [existingMapping]=await db.select().from(invoiceStripePayments).where(eq(invoiceStripePayments.stripeObjectId,session.id)).limit(1);
+      if(!existingMapping||existingMapping.invoiceId!==inv.id||existingMapping.stripeAccountId!==stripeAccountId)
+        throw new InvoiceServiceError('Checkout session belongs to a different invoice',409,'INVALID_STATE');
+    }
     if (raced) {
       // Intent on THIS transaction handle — escaping to re-take the invoice row
       // FOR UPDATE would self-deadlock against the FOR KEY SHARE the INSERT above
@@ -423,6 +535,7 @@ invoiceRoutes.post('/invoices/:id/pay', zValidator('param', ticketParamSchema), 
     }, 409);
   }
 
+  await bindCardPayAndSave(capture, session);
   return c.json({ url: session.url });
 });
 
@@ -466,7 +579,7 @@ invoiceRoutes.post('/invoices/:id/settle',
         .limit(1);
       return { inv, hasMapping: !!mapping };
     });
-    if (!owned) return c.json({ error: 'Invoice not found' }, 404);
+    if (!owned) return c.json(INVOICE_NOT_FOUND_BODY, 404);
     if (!owned.hasMapping) return c.json({ settled: false });
     const { inv } = owned;
 

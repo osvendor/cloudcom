@@ -46,6 +46,7 @@ import {
   type TicketActor,
 } from '../../services/ticketService';
 import type { OfficeAddinTechAuth } from '../../middleware/officeAddinTechAuth';
+import type { TicketType } from '@breeze/shared';
 import { draftSchema, fromEmailSchema, linkEmailSchema } from './schemas';
 
 /**
@@ -153,6 +154,7 @@ const SUMMARY_COLUMNS = {
   subject: tickets.subject,
   status: tickets.status,
   priority: tickets.priority,
+  ticketType: tickets.ticketType,
   updatedAt: tickets.updatedAt,
   submitterEmail: tickets.submitterEmail,
   emailThreadKey: tickets.emailThreadKey,
@@ -165,6 +167,7 @@ interface TicketRowForSummary {
   subject: string;
   status: string;
   priority: string | null;
+  ticketType?: TicketType;
   updatedAt: Date;
   submitterEmail: string | null;
   emailThreadKey?: string | null;
@@ -297,7 +300,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  * Settle one draft's spend through the single billing path: the invocation
  * ledger rows, the organization usage aggregates, the reservation close and,
  * for platform funding, the prepaid credit draw-down all happen inside
- * `settleInvocation` (SEC-111/142/143). Each attempt is billed under the model
+ * `settleInvocation`. Each attempt is billed under the model
  * it requested, from the rate snapshot the resolver bound before admission.
  *
  * Best effort throughout: the pane already has its draft, and a metering
@@ -418,10 +421,10 @@ officeAddinTicketRoutes.post(
       throw err;
     }
     const binding = turnBindingFrom(resolved);
-    // Admission first (SEC-111): the configured budget AND the prepaid platform
+    // Admission first: the configured budget AND the prepaid platform
     // credit balance, answered as the established 402 before any DLP evaluation
     // or provider contact, for the funding the resolver chose. The reservation
-    // below is the separate atomic organization-cap fence (SEC-142/143) — this
+    // below is the separate atomic organization-cap fence — this
     // check does not replace it.
     const budgetDenial = await checkBudgetDetailed(input.orgId, resolved.funding);
     if (budgetDenial) {
@@ -701,6 +704,8 @@ officeAddinTicketRoutes.post(
             submitterName: input.from.name ?? undefined,
             submittedBy,
             requesterContactId,
+            // #7900: omitted -> the service default (incident), unstamped.
+            ...(input.ticketType !== undefined ? { ticketType: input.ticketType } : {}),
           },
           actor
         );

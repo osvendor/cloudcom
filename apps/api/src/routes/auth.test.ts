@@ -253,10 +253,22 @@ vi.mock('../services/mfaStepUpGrant', () => ({
   // operation, and a dispatch that fell through to another digest function
   // would produce the wrong constant and fail the assertion below.
   moveOrgResourceDigest: vi.fn(() => 'sha256:m0ve0r9b0undd19e5700000000000000000000000000000000000000000000'),
+  // Unattested restore step-up: another distinct constant, same reason.
+  unattestedRestoreResourceDigest: vi.fn(() => 'sha256:b0c7a5c0e5700000000000000000000000000000000000000000000000000004'),
   // Parked-device assignment: two more distinct constants, same reason.
   parkedAssignResourceDigest: vi.fn(() => 'sha256:9a7ked0a551900000000000000000000000000000000000000000000000000001'),
   parkedBulkAssignResourceDigest: vi.fn(() => 'sha256:9a7ked0b01k000000000000000000000000000000000000000000000000000002'),
   preAssignmentEnableResourceDigest: vi.fn(() => 'sha256:9reass19ne00000000000000000000000000000000000000000000000000000003'),
+  // Script lane / partner ceiling (#8112): two more distinct constants, so a
+  // mint dispatch that swapped the two digest functions fails below.
+  scriptLanePolicyResourceDigest: vi.fn(() => 'sha256:5c719710a9e000000000000000000000000000000000000000000000000000004'),
+  partnerScriptCeilingResourceDigest: vi.fn(() => 'sha256:9a7c3111n9000000000000000000000000000000000000000000000000000005'),
+  // Autopay charge now / partner payment settings / redirected authorization
+  // request: three more distinct constants, same reason.
+  autopayChargeNowResourceDigest: vi.fn(() => 'sha256:c4a79e0000000000000000000000000000000000000000000000000000000006'),
+  partnerPaymentSettingsResourceDigest: vi.fn(() => 'sha256:9a75e77000000000000000000000000000000000000000000000000000000007'),
+  autopayRequestRecipientResourceDigest: vi.fn(() => 'sha256:7ec191e000000000000000000000000000000000000000000000000000000008'),
+  orgPaymentSettingsResourceDigest: vi.fn(() => 'sha256:0a95e77000000000000000000000000000000000000000000000000000000009'),
   // NB: the MAINTENANCE_MAX_* maxima are deliberately NOT restated here. They
   // live in services/maintenanceStepUpLimits.ts, which nothing mocks, so the
   // schemas under test bind the REAL 168/500 rather than a copy in this
@@ -479,7 +491,7 @@ import { hashRecoveryCode, encryptMfaSecret } from './auth/helpers';
 import { finalizeSsoPendingLink } from './auth/ssoLinkCompletion';
 import * as mfaPolicyModule from '../services/mfaPolicy';
 import { enforceIpAllowlist } from '../services/ipAllowlist';
-import { mintStepUpGrant, validateStepUpGrant, consumeStepUpGrant, maintenanceResourceDigest, moveOrgResourceDigest, parkedAssignResourceDigest, parkedBulkAssignResourceDigest, preAssignmentEnableResourceDigest } from '../services/mfaStepUpGrant';
+import { mintStepUpGrant, validateStepUpGrant, consumeStepUpGrant, maintenanceResourceDigest, moveOrgResourceDigest, parkedAssignResourceDigest, parkedBulkAssignResourceDigest, preAssignmentEnableResourceDigest, scriptLanePolicyResourceDigest, partnerScriptCeilingResourceDigest, unattestedRestoreResourceDigest, autopayChargeNowResourceDigest, partnerPaymentSettingsResourceDigest, autopayRequestRecipientResourceDigest, orgPaymentSettingsResourceDigest } from '../services/mfaStepUpGrant';
 import { verifyStepUpPasskeyAssertion } from './auth/passkeys';
 import { getTwilioService } from '../services/twilio';
 import { authMiddleware } from '../middleware/auth';
@@ -5135,6 +5147,77 @@ describe('auth routes', () => {
 			}));
 		});
 
+		it.each([
+			['autopay_charge_now', { invoiceId: '00000000-0000-4000-8000-000000000010' },
+				() => autopayChargeNowResourceDigest, 'sha256:c4a79e0000000000000000000000000000000000000000000000000000000006'],
+			['partner_payment_settings_update', { partnerId: '00000000-0000-4000-8000-000000000020',
+				settings: { autopayCapEnabled: true, autopayCapAmount: '500.00', autopayCapCurrency: 'USD' } },
+				() => partnerPaymentSettingsResourceDigest, 'sha256:9a75e77000000000000000000000000000000000000000000000000000000007'],
+			['autopay_request_recipient', { orgIds: ['00000000-0000-4000-8000-000000000030'], recipientOverride: 'accounts@example.test' },
+				() => autopayRequestRecipientResourceDigest, 'sha256:7ec191e000000000000000000000000000000000000000000000000000000008'],
+			['org_payment_settings_update', { orgId: '00000000-0000-4000-8000-000000000040',
+				settings: { cardFeeBps: 300, remindersEnabled: null } },
+				() => orgPaymentSettingsResourceDigest, 'sha256:0a95e77000000000000000000000000000000000000000000000000000000009'],
+		] as const)('mints a %s grant bound to its resource digest', async (operation, resource, digestFn, digest) => {
+			vi.mocked(verifyStepUpPasskeyAssertion).mockResolvedValueOnce(true);
+			vi.mocked(mintStepUpGrant).mockResolvedValueOnce(`grant-${operation}`);
+			const res = await app.request('/auth/mfa/step-up', {
+				method: 'POST',
+				headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
+				body: JSON.stringify({ method: 'passkey', credential: { id: 'credential-1' }, operation, resource }),
+			});
+			expect(res.status).toBe(200);
+			expect(digestFn()).toHaveBeenCalledWith(resource);
+			expect(mintStepUpGrant).toHaveBeenCalledWith(expect.objectContaining({ operation, resourceDigest: digest }));
+		});
+
+		it.each([
+			['autopay_charge_now', undefined],
+			['autopay_charge_now', { invoiceId: 'not-a-uuid' }],
+			['partner_payment_settings_update', { partnerId: '00000000-0000-4000-8000-000000000020', settings: { bogus: 1 } }],
+			['partner_payment_settings_update', { partnerId: '00000000-0000-4000-8000-000000000020', settings: { autopayCapEnabled: true } }],
+			['autopay_request_recipient', { orgIds: [], recipientOverride: 'accounts@example.test' }],
+			['autopay_request_recipient', { orgIds: ['00000000-0000-4000-8000-000000000030'], recipientOverride: 'not-an-email' }],
+			['org_payment_settings_update', { orgId: 'not-an-id', settings: { cardFeeBps: 300 } }],
+			['org_payment_settings_update', { orgId: '00000000-0000-4000-8000-000000000040', settings: { cardFeeBps: 301 } }],
+			// The partner-only fee attestation is not an organization setting.
+			['org_payment_settings_update', { orgId: '00000000-0000-4000-8000-000000000040',
+				settings: { feeAttestation: { acquirerAndNetworksNotified30DaysAgo: true, doesNotExceedAcceptanceCost: true } } }],
+		] as const)('refuses to mint %s without a valid resource (%j)', async (operation, resource) => {
+			const res = await app.request('/auth/mfa/step-up', {
+				method: 'POST',
+				headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
+				body: JSON.stringify({ method: 'passkey', credential: { id: 'credential-1' }, operation, ...(resource ? { resource } : {}) }),
+			});
+			expect(res.status).toBe(400);
+			expect(mintStepUpGrant).not.toHaveBeenCalled();
+		});
+
+		it('mints a backup_unattested_restore grant bound to the snapshot, target device and command type', async () => {
+			vi.mocked(verifyStepUpPasskeyAssertion).mockResolvedValueOnce(true);
+			vi.mocked(mintStepUpGrant).mockResolvedValueOnce('grant-unattested');
+			const resource = {
+				snapshotId: '00000000-0000-4000-8000-000000000010',
+				targetDeviceId: '00000000-0000-4000-8000-000000000020',
+				commandType: 'mssql_restore',
+			};
+			const res = await app.request('/auth/mfa/step-up', {
+				method: 'POST',
+				headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
+				body: JSON.stringify({ method: 'passkey', credential: { id: 'credential-1' }, operation: 'backup_unattested_restore', resource }),
+			});
+			expect(res.status).toBe(200);
+			expect(unattestedRestoreResourceDigest).toHaveBeenCalledWith({
+				snapshotDbId: resource.snapshotId,
+				targetDeviceId: resource.targetDeviceId,
+				commandType: resource.commandType,
+			});
+			expect(mintStepUpGrant).toHaveBeenCalledWith(expect.objectContaining({
+				operation: 'backup_unattested_restore',
+				resourceDigest: 'sha256:b0c7a5c0e5700000000000000000000000000000000000000000000000000004',
+			}));
+		});
+
 		it('mints a parked_device_assign grant bound to the single-assignment digest', async () => {
 			vi.mocked(verifyStepUpPasskeyAssertion).mockResolvedValueOnce(true);
 			vi.mocked(mintStepUpGrant).mockResolvedValueOnce('grant-parked');
@@ -5191,6 +5274,31 @@ describe('auth routes', () => {
 				operation: 'pre_assignment_enable',
 				resourceDigest: 'sha256:9reass19ne00000000000000000000000000000000000000000000000000000003',
 			}));
+		});
+
+		it.each([
+			['ai_partner_script_ceiling_grant', { partnerId: '00000000-0000-4000-8000-000000000040', unattendedAllowed: true }, 'sha256:9a7c3111n9000000000000000000000000000000000000000000000000000005'],
+			['ai_script_lane_grant', { orgId: '00000000-0000-4000-8000-000000000041', unattendedEnabled: true }, 'sha256:5c719710a9e000000000000000000000000000000000000000000000000000004'],
+		] as const)('mints a %s grant with that operation\'s own digest of the resource (#8112)', async (operation, base, digest) => {
+			vi.mocked(verifyStepUpPasskeyAssertion).mockResolvedValueOnce(true);
+			vi.mocked(mintStepUpGrant).mockResolvedValueOnce('grant-lane');
+			const widening = {
+				maxUnattendedRiskTier: 'medium',
+				unattendedAllowedClasses: ['temp_files'],
+				maxUnattendedPerHour: 7,
+				protectedResourcesEmptied: false,
+				proposingEnabled: true,
+			};
+			const resource = { ...base, widening };
+			const res = await app.request('/auth/mfa/step-up', {
+				method: 'POST',
+				headers: { Authorization: 'Bearer valid-token', 'Content-Type': 'application/json' },
+				body: JSON.stringify({ method: 'passkey', credential: { id: 'credential-1' }, operation, resource }),
+			});
+			expect(res.status).toBe(200);
+			const digestFn = operation === 'ai_partner_script_ceiling_grant' ? partnerScriptCeilingResourceDigest : scriptLanePolicyResourceDigest;
+			expect(digestFn).toHaveBeenCalledWith(expect.objectContaining({ ...base, widening }));
+			expect(mintStepUpGrant).toHaveBeenCalledWith(expect.objectContaining({ operation, resourceDigest: digest }));
 		});
 
 		it('refuses a pre_assignment_enable grant for enabled=false (disabling needs no step-up)', async () => {

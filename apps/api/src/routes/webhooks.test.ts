@@ -11,7 +11,9 @@ const { queueDeliveryMock, validateWebhookUrlSafetyWithDnsMock } = vi.hoisted(()
 }));
 
 const { permissionGate, mfaGate } = vi.hoisted(() => ({
-  permissionGate: { deny: false },
+  // `granted` null: every permission passes unless listed in `denied`.
+  // `granted` a set: only the listed resource:action pairs pass.
+  permissionGate: { deny: false, denied: new Set<string>(), granted: null as Set<string> | null },
   mfaGate: { deny: false }
 }));
 
@@ -87,8 +89,13 @@ vi.mock('../middleware/auth', () => ({
     return next();
   }),
   requireScope: vi.fn(() => async (_c: any, next: any) => next()),
-  requirePermission: vi.fn(() => async (c: any, next: any) => {
-    if (permissionGate.deny) {
+  requirePermission: vi.fn((resource: string, action: string) => async (c: any, next: any) => {
+    const key = `${resource}:${action}`;
+    if (
+      permissionGate.deny
+      || permissionGate.denied.has(key)
+      || (permissionGate.granted !== null && !permissionGate.granted.has(key))
+    ) {
       return c.json({ error: 'Forbidden' }, 403);
     }
     return next();
@@ -161,6 +168,8 @@ describe('webhook routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     permissionGate.deny = false;
+    permissionGate.denied.clear();
+    permissionGate.granted = null;
     mfaGate.deny = false;
     validateWebhookUrlSafetyWithDnsMock.mockResolvedValue([]);
 
@@ -1089,5 +1098,156 @@ describe('webhook routes', () => {
     expect(res.status).toBe(201);
     expect((valuesSpy.mock.calls as any[])[0][0].status).toBe('disabled');
     expect((await res.json()).status).toBe('paused');
+  });
+  describe('read routes require webhooks:read', () => {
+    const readRoutes = [
+      ['GET /webhooks', '/webhooks'],
+      ['GET /webhooks/:id', `/webhooks/${WEBHOOK_ID_1}`],
+      ['GET /webhooks/:id/deliveries', `/webhooks/${WEBHOOK_ID_1}/deliveries`]
+    ] as const;
+
+    it.each(readRoutes)('%s returns 403 without webhooks:read and never reads the db', async (_name, path) => {
+      permissionGate.denied.add('webhooks:read');
+
+      const res = await app.request(path, { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(403);
+      expect(db.select).not.toHaveBeenCalled();
+    });
+
+    it.each(readRoutes)('%s returns 403 with only organizations:read and never reads the db', async (_name, path) => {
+      permissionGate.granted = new Set(['organizations:read']);
+
+      const res = await app.request(path, { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(403);
+      expect(db.select).not.toHaveBeenCalled();
+    });
+
+    const storedWebhook = {
+      id: WEBHOOK_ID_1,
+      orgId: '11111111-1111-1111-1111-111111111111',
+      name: 'Hook',
+      url: 'https://example.com/hook',
+      secret: null,
+      events: ['device.created'],
+      headers: [],
+      status: 'active'
+    };
+
+    it('GET /webhooks returns 200 with only webhooks:read', async () => {
+      permissionGate.granted = new Set(['webhooks:read']);
+      vi.mocked(db.select)
+        .mockReturnValueOnce(mockSelectWhere([{ count: 1 }]) as any)
+        .mockReturnValueOnce(mockSelectList([storedWebhook]) as any);
+
+      const res = await app.request('/webhooks', { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toHaveLength(1);
+      expect(body.data[0].id).toBe(WEBHOOK_ID_1);
+    });
+
+    it('GET /webhooks/:id returns 200 with only webhooks:read', async () => {
+      permissionGate.granted = new Set(['webhooks:read']);
+      vi.mocked(db.select)
+        .mockReturnValueOnce(mockSelectLimit([storedWebhook]) as any)
+        .mockReturnValueOnce({
+          from: vi.fn(() => ({
+            where: vi.fn(() => ({ groupBy: vi.fn(() => Promise.resolve([{ status: 'delivered', count: 2 }])) }))
+          }))
+        } as any)
+        .mockReturnValueOnce(mockSelectOrderLimit([]) as any);
+
+      const res = await app.request(`/webhooks/${WEBHOOK_ID_1}`, { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.id).toBe(WEBHOOK_ID_1);
+      expect(body.deliveryStats.delivered).toBe(2);
+    });
+
+    it('GET /webhooks/:id/deliveries returns 200 with only webhooks:read', async () => {
+      permissionGate.granted = new Set(['webhooks:read']);
+      vi.mocked(db.select)
+        .mockReturnValueOnce(mockSelectLimit([storedWebhook]) as any)
+        .mockReturnValueOnce(mockSelectWhere([{ count: 0 }]) as any)
+        .mockReturnValueOnce(mockSelectList([]) as any);
+
+      const res = await app.request(`/webhooks/${WEBHOOK_ID_1}/deliveries`, { method: 'GET', headers: { Authorization: 'Bearer token' } });
+
+      expect(res.status).toBe(200);
+      expect((await res.json()).data).toEqual([]);
+    });
+
+    it('webhook writes still require organizations:write, not webhooks:read', async () => {
+      permissionGate.granted = new Set(['webhooks:read']);
+
+      const res = await app.request('/webhooks', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Hook', url: 'https://example.com/hook', events: ['device.created'] })
+      });
+
+      expect(res.status).toBe(403);
+      expect(db.insert).not.toHaveBeenCalled();
+    });
+  });
+
+  it('GET /:id/deliveries returns only the fields the delivery history renders', async () => {
+    vi.mocked(db.select)
+      .mockReturnValueOnce(mockSelectLimit([{
+        id: WEBHOOK_ID_1,
+        orgId: '11111111-1111-1111-1111-111111111111',
+        name: 'Hook',
+        url: 'https://example.com/hook',
+        secret: null,
+        events: ['device.created'],
+        headers: [],
+        status: 'active'
+      }]) as any)
+      .mockReturnValueOnce(mockSelectWhere([{ count: 1 }]) as any)
+      .mockReturnValueOnce(mockSelectList([{
+        id: DELIVERY_ID_1,
+        webhookId: WEBHOOK_ID_1,
+        eventType: 'device.created',
+        eventId: 'evt-1',
+        payload: { hostname: 'payload-marker' },
+        status: 'failed',
+        attempts: 2,
+        nextRetryAt: null,
+        responseStatus: 500,
+        responseBody: 'response-body-marker',
+        responseTimeMs: 120,
+        errorMessage: 'boom',
+        createdAt: new Date('2026-01-01T00:00:00Z'),
+        deliveredAt: null
+      }]) as any);
+
+    const res = await app.request(`/webhooks/${WEBHOOK_ID_1}/deliveries`, {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token' }
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.pagination.total).toBe(1);
+    expect(body.data).toHaveLength(1);
+    const row = body.data[0];
+    expect(row).toMatchObject({
+      id: DELIVERY_ID_1,
+      webhookId: WEBHOOK_ID_1,
+      status: 'failed',
+      event: 'device.created',
+      responseStatus: 500,
+      attempt: 2,
+      createdAt: '2026-01-01T00:00:00.000Z'
+    });
+    expect(row).not.toHaveProperty('payload');
+    expect(row).not.toHaveProperty('responseBody');
+    const text = JSON.stringify(body);
+    expect(text).not.toContain('payload-marker');
+    expect(text).not.toContain('response-body-marker');
   });
 });

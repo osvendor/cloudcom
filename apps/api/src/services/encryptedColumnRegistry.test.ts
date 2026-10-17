@@ -45,6 +45,20 @@ describe('encryptedColumnRegistry', () => {
     }
   });
 
+  it('registers the EDR provider secret columns with row-bound AAD (#8165)', () => {
+    // A ciphertext pasted into another partner's connection / tenant row must
+    // not decrypt, so every EDR secret column binds its AAD to the row id.
+    for (const [table, column] of [
+      ['edr_connections', 'credentials_encrypted'],
+      ['edr_connections', 'webhook_secret_encrypted'],
+      ['edr_tenants', 'installer_secret_encrypted'],
+    ] as const) {
+      const spec = encryptedColumnRegistry.find((c) => c.table === table && c.column === column);
+      expect(spec, `${table}.${column} missing from encryptedColumnRegistry`).toBeDefined();
+      expect(spec).toMatchObject({ kind: 'text', aadBinding: 'row' });
+    }
+  });
+
   it('transforms text columns from legacy ciphertext to the active v2 key id', () => {
     setEncryptionEnv({ APP_ENCRYPTION_KEY: 'legacy-key-material' });
     const legacyCiphertext = encryptSecret('legacy-secret');
@@ -279,26 +293,24 @@ describe('encryptedColumnRegistry', () => {
   });
 
   describe('partner AI connections keep the legacy partner_llm_configs AAD tag (#7600 W02)', () => {
-    const legacySpec = () => encryptedColumnRegistry.find((s) => s.table === 'partner_llm_configs' && s.column === 'api_key_encrypted')!;
     const connectionSpec = () => encryptedColumnRegistry.find((s) => s.table === 'partner_ai_connections' && s.column === 'api_key_encrypted')!;
     const rowId = '22222222-2222-4222-8222-222222222222';
 
     it('is registered row-bound under the legacy tag', () => {
       expect(connectionSpec()).toMatchObject({ kind: 'text', aadBinding: 'row', aadTag: 'partner_llm_configs.api_key_encrypted' });
       expect(columnAad(connectionSpec(), rowId)).toBe(`partner_llm_configs.api_key_encrypted:${rowId}`);
-      expect(columnAad(connectionSpec(), rowId)).toBe(columnAad(legacySpec(), rowId));
     });
 
     it('a legacy ciphertext decrypts under the connection spec for the same id, and only that id', () => {
       setEncryptionEnv({ APP_ENCRYPTION_KEY: 'current-key-material', APP_ENCRYPTION_KEY_ID: 'current' });
-      const sealed = transformEncryptedColumnValue(legacySpec(), 'sk-ant-api03-legacy', rowId) as string;
+      const sealed = transformEncryptedColumnValue(connectionSpec(), 'sk-ant-api03-legacy', rowId) as string;
       expect(decryptSecret(sealed, { aad: columnAad(connectionSpec(), rowId) })).toBe('sk-ant-api03-legacy');
       expect(() => decryptSecret(sealed, { aad: columnAad(connectionSpec(), '33333333-3333-4333-8333-333333333333') })).toThrow();
     });
 
     it('the rotation walker re-seals a connection key under the legacy tag + row id', async () => {
       setEncryptionEnv({ APP_ENCRYPTION_KEY: 'old-key-material', APP_ENCRYPTION_KEY_ID: 'old' });
-      const sealedOld = transformEncryptedColumnValue(legacySpec(), 'sk-ant-api03-rotate', rowId) as string;
+      const sealedOld = transformEncryptedColumnValue(connectionSpec(), 'sk-ant-api03-rotate', rowId) as string;
       setEncryptionEnv({
         APP_ENCRYPTION_KEY: 'current-key-material',
         APP_ENCRYPTION_KEY_ID: 'current',

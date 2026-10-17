@@ -2,8 +2,12 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 
 let canManageBilling = true;
-vi.mock('../../lib/permissions', () => ({ usePermissions: () => ({ can: () => canManageBilling }) }));
-beforeEach(() => { canManageBilling = true; });
+// #8133: time_entries:write gates the Delete action separately from billing.
+let canWriteTime = true;
+vi.mock('../../lib/permissions', () => ({
+  usePermissions: () => ({ can: (_r: string, action: string) => (action === 'write' ? canWriteTime : canManageBilling) }),
+}));
+beforeEach(() => { canManageBilling = true; canWriteTime = true; });
 const fetchWithAuth = vi.fn();
 vi.mock('../../stores/auth', () => ({ fetchWithAuth: (...a: unknown[]) => fetchWithAuth(...a) }));
 const showToast = vi.fn();
@@ -132,6 +136,17 @@ describe('TimesheetPage', () => {
     expect(screen.getByTestId('timesheet-rate-te-2').textContent).not.toContain('$');
     expect(screen.getByTestId('timesheet-rate-te-3').textContent).toBe('—');
     expect(screen.getByTestId('timesheet-entry-te-3').textContent).not.toContain('$');
+  });
+
+  it('#8604: the edit form tells the tech the note prints on the invoice', async () => {
+    fetchWithAuth.mockImplementation(async (url: string) => {
+      if (url.startsWith('/time-entries/timesheet')) return jsonRes(week);
+      if (url.startsWith('/users')) return jsonRes([]);
+      return jsonRes({});
+    });
+    render(<TimesheetPage />);
+    fireEvent.click(await screen.findByTestId(`timesheet-edit-${entry.id}`));
+    expect(screen.getByTestId('time-entry-note-invoice-cue')).toHaveTextContent(/on their invoice/i);
   });
 
   // Review #5 (#3776): a billed entry may still have its description edited, but
@@ -348,5 +363,208 @@ describe('worked vs billed hours on the timesheet (#4628 W03)', () => {
     render(<TimesheetPage />);
     await screen.findByTestId('timesheet-entry-te-1');
     expect(screen.queryByText(/h worked ·/)).toBeNull();
+  });
+});
+
+// #8133: delete an entry from the timesheet row.
+describe('TimesheetPage — delete entry (#8133)', () => {
+  beforeEach(() => { showToast.mockReset(); });
+  const sheetWith = (rows: unknown[]) => ({ ...week, days: [{ ...week.days[0], entries: rows }, ...week.days.slice(1)] });
+  const routeWith = (rows: unknown[], onDelete: (url: string) => Response) => {
+    fetchWithAuth.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return onDelete(url);
+      if (url.startsWith('/time-entries/timesheet')) return jsonRes(sheetWith(rows));
+      if (url.startsWith('/users')) return jsonRes([]);
+      return jsonRes({});
+    });
+  };
+
+  it('deletes an unbilled entry only after the confirm dialog, then reloads the week', async () => {
+    routeWith([entry], () => jsonRes({ deleted: true }));
+    render(<TimesheetPage />);
+    fireEvent.click(await screen.findByTestId('timesheet-delete-te-1'));
+    expect(fetchWithAuth).not.toHaveBeenCalledWith('/time-entries/te-1', expect.anything());
+    expect((await screen.findByTestId('timesheet-delete-dialog')).textContent).toContain('T-2026-0042');
+    const loads = () => fetchWithAuth.mock.calls.filter(([u]) => String(u).startsWith('/time-entries/timesheet'));
+    const loadsBefore = loads().length;
+    fireEvent.click(screen.getByTestId('timesheet-delete-confirm'));
+    await waitFor(() => expect(fetchWithAuth).toHaveBeenCalledWith('/time-entries/te-1', expect.objectContaining({ method: 'DELETE' })));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'success', message: 'Entry deleted' })));
+    await waitFor(() => expect(loads().length).toBe(loadsBefore + 1));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(loads().length).toBe(loadsBefore + 1);
+  });
+
+  it('reloads once (via the timer event) after deleting the running timer', async () => {
+    routeWith([{ ...entry, id: 'run-1', endedAt: null }], () => jsonRes({ deleted: true }));
+    render(<TimesheetPage />);
+    fireEvent.click(await screen.findByTestId('timesheet-delete-run-1'));
+    const loads = () => fetchWithAuth.mock.calls.filter(([u]) => String(u).startsWith('/time-entries/timesheet'));
+    const loadsBefore = loads().length;
+    fireEvent.click(await screen.findByTestId('timesheet-delete-confirm'));
+    await waitFor(() => expect(loads().length).toBe(loadsBefore + 1));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(loads().length).toBe(loadsBefore + 1);
+  });
+
+  it('does not reload the old week when a delete settles after the user moved on', async () => {
+    let resolveDelete: (r: Response) => void = () => {};
+    fetchWithAuth.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Promise<Response>((r) => { resolveDelete = r; });
+      if (url.startsWith('/time-entries/timesheet')) return jsonRes(sheetWith([entry]));
+      if (url.startsWith('/users')) return jsonRes([]);
+      return jsonRes({});
+    });
+    render(<TimesheetPage />);
+    fireEvent.click(await screen.findByTestId('timesheet-delete-te-1'));
+    fireEvent.click(await screen.findByTestId('timesheet-delete-confirm'));
+    await waitFor(() => expect(fetchWithAuth).toHaveBeenCalledWith('/time-entries/te-1', expect.objectContaining({ method: 'DELETE' })));
+    fireEvent.click(screen.getByTestId('timesheet-prev-week'));
+    await waitFor(() => expect(fetchWithAuth).toHaveBeenCalledWith(expect.stringContaining('weekStart=2026-06-01')));
+    const loads = () => fetchWithAuth.mock.calls.filter(([u]) => String(u).startsWith('/time-entries/timesheet'));
+    const settledBefore = loads().length;
+    resolveDelete(jsonRes({ deleted: true }));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'success' })));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(loads().length).toBe(settledBefore);
+    expect(String(loads().at(-1)?.[0])).toContain('weekStart=2026-06-01');
+  });
+
+  it('a delete that settles after a week switch leaves the new week\'s confirm open and usable', async () => {
+    let resolveDelete: (r: Response) => void = () => {};
+    const older = { ...entry, id: 'te-old', startedAt: '2026-06-01T09:00:00Z', endedAt: '2026-06-01T10:30:00Z' };
+    fetchWithAuth.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Promise<Response>((r) => { resolveDelete = r; });
+      if (url.startsWith('/time-entries/timesheet')) {
+        return jsonRes(url.includes('weekStart=2026-06-01')
+          ? { ...sheetWith([older]), weekStart: '2026-06-01', days: [{ ...week.days[0], date: '2026-06-01', entries: [older] }, ...week.days.slice(1)] }
+          : sheetWith([entry]));
+      }
+      if (url.startsWith('/users')) return jsonRes([]);
+      return jsonRes({});
+    });
+    render(<TimesheetPage />);
+    fireEvent.click(await screen.findByTestId('timesheet-delete-te-1'));
+    fireEvent.click(await screen.findByTestId('timesheet-delete-confirm'));
+    await waitFor(() => expect(fetchWithAuth).toHaveBeenCalledWith('/time-entries/te-1', expect.objectContaining({ method: 'DELETE' })));
+    fireEvent.click(screen.getByTestId('timesheet-prev-week'));
+    fireEvent.click(await screen.findByTestId('timesheet-delete-te-old'));
+    expect(await screen.findByTestId('timesheet-delete-dialog')).toBeInTheDocument();
+    expect((screen.getByTestId('timesheet-delete-confirm') as HTMLButtonElement).disabled).toBe(false);
+    resolveDelete(jsonRes({ deleted: true }));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'success' })));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.getByTestId('timesheet-delete-dialog')).toBeInTheDocument();
+    expect((screen.getByTestId('timesheet-delete-confirm') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('localizes the not-found refusal', async () => {
+    routeWith([entry], () => ({ ok: false, status: 404, json: async () => ({ error: 'Time entry not found', code: 'ENTRY_NOT_FOUND' }) }) as Response);
+    render(<TimesheetPage />);
+    fireEvent.click(await screen.findByTestId('timesheet-delete-te-1'));
+    fireEvent.click(await screen.findByTestId('timesheet-delete-confirm'));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({ type: 'error', message: 'This entry no longer exists.' })));
+  });
+
+  it('names no ticket for a standalone entry', async () => {
+    routeWith([{ ...entry, id: 'solo-1', ticketId: null, ticketNumber: null }], () => jsonRes({ deleted: true }));
+    render(<TimesheetPage />);
+    fireEvent.click(await screen.findByTestId('timesheet-delete-solo-1'));
+    const text = (await screen.findByTestId('timesheet-delete-dialog')).textContent ?? '';
+    expect(text).toContain('This permanently removes the 1h 30m entry. It can\'t be undone.');
+    expect(text).not.toContain('null');
+    // No dead link for an entry without a ticket.
+    const row = screen.getByTestId('timesheet-entry-solo-1');
+    expect(row.querySelector('a[href="/tickets/null"]')).toBeNull();
+  });
+
+  it('closes an open confirm when the week changes, deleting nothing', async () => {
+    routeWith([entry], () => jsonRes({ deleted: true }));
+    render(<TimesheetPage />);
+    fireEvent.click(await screen.findByTestId('timesheet-delete-te-1'));
+    expect(await screen.findByTestId('timesheet-delete-dialog')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('timesheet-prev-week'));
+    await waitFor(() => expect(screen.queryByTestId('timesheet-delete-dialog')).toBeNull());
+    expect(fetchWithAuth).not.toHaveBeenCalledWith('/time-entries/te-1', expect.objectContaining({ method: 'DELETE' }));
+  });
+
+  it('uses delete wording when the server says the entry is not the caller\'s', async () => {
+    routeWith([entry], () => ({ ok: false, status: 403, json: async () => ({ error: 'You can only manage your own time entries', code: 'NOT_OWN_ENTRY' }) }) as Response);
+    render(<TimesheetPage />);
+    fireEvent.click(await screen.findByTestId('timesheet-delete-te-1'));
+    fireEvent.click(await screen.findByTestId('timesheet-delete-confirm'));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'error',
+      message: 'You can only delete your own time entries.',
+    })));
+  });
+
+  it('offers no Delete on an invoiced entry', async () => {
+    routeWith([{ ...entry, id: 'billed-1', billingStatus: 'billed' }, { ...entry, id: 'open-1' }], () => jsonRes({}));
+    render(<TimesheetPage />);
+    expect(await screen.findByTestId('timesheet-delete-open-1')).toBeInTheDocument();
+    expect(screen.queryByTestId('timesheet-delete-billed-1')).toBeNull();
+  });
+
+  it('offers no Delete without time-entry write permission', async () => {
+    canWriteTime = false;
+    routeWith([entry], () => jsonRes({}));
+    render(<TimesheetPage />);
+    expect(await screen.findByTestId('timesheet-edit-te-1')).toBeInTheDocument();
+    expect(screen.queryByTestId('timesheet-delete-te-1')).toBeNull();
+  });
+
+  it('shows the friendly refusal when the server says the entry is invoiced', async () => {
+    routeWith([entry], () => ({ ok: false, status: 409, json: async () => ({ error: 'This entry has been invoiced and cannot be deleted; void the invoice first', code: 'ENTRY_BILLED' }) }) as Response);
+    render(<TimesheetPage />);
+    fireEvent.click(await screen.findByTestId('timesheet-delete-te-1'));
+    fireEvent.click(await screen.findByTestId('timesheet-delete-confirm'));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'error',
+      message: "This entry has been invoiced and can't be deleted. Void the invoice first.",
+    })));
+  });
+});
+
+// Customer work approval (#8196).
+describe('TimesheetPage held time', () => {
+  const heldEntry = { ...entry, id: 'held-1', billingStatus: 'awaiting_approval' };
+  const route = () => fetchWithAuth.mockImplementation(async (url: string) => {
+    if (url === '/billing-profiles/work-types') return { ok: true, json: async () => ({ workTypes: [] }) } as Response;
+    if (url.startsWith('/time-entries/timesheet')) {
+      return jsonRes({ ...week, days: [{ date: '2026-06-08', totalMinutes: 90, billableMinutes: 90, entries: [heldEntry, entry] }, ...week.days.slice(1)] });
+    }
+    if (url.startsWith('/users')) return jsonRes([]);
+    return jsonRes({});
+  });
+
+  it('chips held entries and offers Write off only to billing managers', async () => {
+    route();
+    const { unmount } = render(<TimesheetPage />);
+    expect(await screen.findByTestId('time-entry-awaiting-approval-held-1')).toBeInTheDocument();
+    expect(screen.queryByTestId('time-entry-awaiting-approval-te-1')).toBeNull();
+    expect(screen.getByTestId('time-entry-write-off-held-1')).toBeInTheDocument();
+    expect(screen.queryByTestId('time-entry-write-off-te-1')).toBeNull();
+    unmount();
+    canManageBilling = false;
+    render(<TimesheetPage />);
+    await screen.findByTestId('time-entry-awaiting-approval-held-1');
+    expect(screen.queryByTestId('time-entry-write-off-held-1')).toBeNull();
+  });
+
+  it('shows localized copy when the write-off is refused with ENTRY_NOT_RESOLVABLE', async () => {
+    fetchWithAuth.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return { ok: false, status: 409, json: async () => ({ error: 'x', code: 'ENTRY_NOT_RESOLVABLE' }) } as Response;
+      if (url === '/billing-profiles/work-types') return { ok: true, json: async () => ({ workTypes: [] }) } as Response;
+      if (url.startsWith('/time-entries/timesheet')) return jsonRes({ ...week, days: [{ date: '2026-06-08', totalMinutes: 90, billableMinutes: 90, entries: [heldEntry] }, ...week.days.slice(1)] });
+      return jsonRes([]);
+    });
+    render(<TimesheetPage />);
+    fireEvent.click(await screen.findByTestId('time-entry-write-off-held-1'));
+    fireEvent.click(await screen.findByTestId('time-entry-write-off-confirm-held-1'));
+    await waitFor(() => expect(showToast).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'error',
+      message: expect.stringMatching(/written off once its approval request/),
+    })));
   });
 });

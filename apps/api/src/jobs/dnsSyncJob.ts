@@ -19,10 +19,11 @@ import {
 } from '../db/schema';
 import { createDnsProvider, DnsProviderHttpError, type DnsEvent, type DnsEventSlice } from '../services/dnsProviders';
 import { getBullMQConnection } from '../services/redis';
-import { isReusableState } from '../services/bullmqUtils';
+import { bullmqJobId, isReusableState } from '../services/bullmqUtils';
 import { decryptForColumn } from '../services/secretCrypto';
 import { captureException } from '../services/sentry';
 import { redactLogMessage } from '../services/logRedaction';
+import { SsrfBlockedError } from '../services/urlSafety';
 import { publishEvent, EVENT_TYPES } from '../services/eventBus';
 import { attachWorkerObservability } from './workerObservability';
 
@@ -89,6 +90,10 @@ export function getDnsSyncQueue(): Queue<DnsSyncJobData> {
   return dnsSyncQueue;
 }
 
+/** Tenant-visible message for an integration host the SSRF guard blocked (#8023). */
+export const SSRF_BLOCKED_SYNC_ERROR =
+  'Host resolves to a private/blocked address — not reachable from the hosted service.';
+
 /** Max length persisted to a tenant-visible sync-error column. */
 const SYNC_ERROR_MAX_LENGTH = 2000;
 
@@ -107,6 +112,9 @@ const SYNC_ERROR_MAX_LENGTH = 2000;
  * Pi-hole error could echo back the `?auth=<apiKey>` secret).
  */
 export function tenantVisibleSyncError(error: unknown): string {
+  // #8023: an SSRF block is a configuration condition. Show an actionable
+  // message; never echo the resolved IPs (internal-address oracle).
+  if (error instanceof SsrfBlockedError) return SSRF_BLOCKED_SYNC_ERROR;
   const message =
     error instanceof DnsProviderHttpError
       ? error.message // "HTTP <status> <statusText>", body-free by construction
@@ -247,6 +255,25 @@ function normalizePolicyDomains(value: unknown): string[] {
   }
 
   return output;
+}
+
+/**
+ * Policy domains the provider may not have seen: never-synced policy, or a
+ * domain whose `addedAt` is after `lastSynced` (or unparseable). Pure.
+ */
+export function unsyncedPolicyDomains(value: unknown, lastSynced: Date | null | undefined): string[] {
+  if (!Array.isArray(value)) return [];
+  const cutoff = lastSynced ? lastSynced.getTime() : null;
+  const out: string[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const entry = item as DnsPolicyDomain;
+    const domain = normalizeDomain(entry.domain);
+    if (!domain) continue;
+    const added = entry.addedAt ? Date.parse(entry.addedAt) : NaN;
+    if (cutoff === null || Number.isNaN(added) || added > cutoff) out.push(domain);
+  }
+  return out;
 }
 
 function normalizeDomainList(domains: string[] | undefined): string[] {
@@ -405,7 +432,7 @@ export async function schedulePolicySync(
         }
         : undefined
     },
-    `sync-policy:${policyId}`,
+    bullmqJobId('sync-policy', policyId),
     { removeOnComplete: true, removeOnFail: true }
   );
 }
@@ -744,7 +771,8 @@ export async function processSyncIntegration(data: SyncIntegrationJobData): Prom
     // oracle) — neither may land in dnsFilterIntegrations.lastSyncError.
     // Record on a FRESH transaction so it survives Phase 3's rollback. Guard the
     // write itself so a failure to record the status can't mask the original
-    // sync error (which is re-thrown below regardless).
+    // sync error (which is re-thrown below, except a recorded SsrfBlockedError — #8023).
+    let recorded = false;
     try {
       await dbModule.runOutsideDbContext(() =>
         runWithSystemDbAccess(() =>
@@ -758,9 +786,17 @@ export async function processSyncIntegration(data: SyncIntegrationJobData): Prom
             .where(eq(dnsFilterIntegrations.id, integration.id))
         )
       );
+      recorded = true;
     } catch (dbErr) {
       console.error(`[DnsSyncJob] Failed to record sync error for integration ${integration.id}:`, dbErr);
       captureException(dbErr instanceof Error ? dbErr : new Error(String(dbErr)));
+    }
+    // #8023: a blocked host is user-visible configuration state (recorded
+    // above), not a job failure — don't fail the job / report to Sentry.
+    // Only when the status write succeeded; otherwise fall through and throw
+    // so the condition isn't lost.
+    if (error instanceof SsrfBlockedError && recorded) {
+      return { integrationId: integration.id, fetched: 0, inserted: 0 };
     }
     throw error;
   }
@@ -793,6 +829,9 @@ export async function processPolicySync(data: SyncPolicyJobData): Promise<{
   }
 
   const config = parseIntegrationConfig(row.integration.config);
+  // Stamped as last_synced on success: a domain added while this run is in
+  // flight has addedAt > this, so the next run still treats it as unsynced.
+  const syncStartedAt = new Date();
 
   try {
     const provider = createDnsProvider({
@@ -802,11 +841,29 @@ export async function processPolicySync(data: SyncPolicyJobData): Promise<{
       config
     });
 
-    const addDomains = data.operations
-      ? normalizeDomainList(data.operations.add)
-      : normalizePolicyDomains(row.policy.domains);
+    // #8404: reconcile only what the provider has not seen. Before #8337 policy
+    // sync jobs never enqueued, so earlier edits sat unsynced; a delta-only push
+    // would reach the provider for the latest edit, then mark the whole policy
+    // `synced` while older domains were never pushed. `sync_status` cannot tell
+    // us (every edit resets it to `pending`), so we compare each domain's
+    // `addedAt` against `last_synced`: a healthy policy yields no backlog and
+    // keeps today's delta-only push (no re-adds, O(delta) provider calls). A
+    // never-synced policy, or one whose last attempt failed (last_synced is not
+    // advanced on error), carries a backlog that is pushed alongside the delta.
+    const policyDomains = normalizePolicyDomains(row.policy.domains);
+    const stillPresent = new Set(policyDomains);
+    let addDomains: string[];
+    if (data.operations) {
+      const wanted = new Set([
+        ...normalizeDomainList(data.operations.add),
+        ...unsyncedPolicyDomains(row.policy.domains, row.policy.lastSynced)
+      ]);
+      addDomains = policyDomains.filter((domain) => wanted.has(domain));
+    } else {
+      addDomains = policyDomains;
+    }
     const removeDomains = data.operations
-      ? normalizeDomainList(data.operations.remove)
+      ? normalizeDomainList(data.operations.remove).filter((domain) => !stillPresent.has(domain))
       : [];
 
     // Phase 2 — push domain mutations to the provider with NO DB context held
@@ -835,7 +892,7 @@ export async function processPolicySync(data: SyncPolicyJobData): Promise<{
         .update(dnsPolicies)
         .set({
           syncStatus: 'synced',
-          lastSynced: new Date(),
+          lastSynced: syncStartedAt,
           syncError: null,
           updatedAt: new Date()
         })
@@ -852,8 +909,9 @@ export async function processPolicySync(data: SyncPolicyJobData): Promise<{
     // SERVER-SIDE log only; the tenant-visible column gets a body-free message.
     // Record on a FRESH transaction so it survives any Phase 3 rollback. Guard
     // the write itself so a failure to record the status can't mask the original
-    // sync error (which is re-thrown below regardless).
+    // sync error (which is re-thrown below, except a recorded SsrfBlockedError — #8023).
     logSyncFailureServerSide({ policyId: row.policy.id, orgId: row.integration.orgId }, error);
+    let recorded = false;
     try {
       await dbModule.runOutsideDbContext(() =>
         runWithSystemDbAccess(() =>
@@ -867,9 +925,14 @@ export async function processPolicySync(data: SyncPolicyJobData): Promise<{
             .where(eq(dnsPolicies.id, row.policy.id))
         )
       );
+      recorded = true;
     } catch (dbErr) {
       console.error(`[DnsSyncJob] Failed to record sync error for policy ${row.policy.id}:`, dbErr);
       captureException(dbErr instanceof Error ? dbErr : new Error(String(dbErr)));
+    }
+    // #8023: see processSyncIntegration — config condition, not a job failure.
+    if (error instanceof SsrfBlockedError && recorded) {
+      return { policyId: row.policy.id, added: 0, removed: 0 };
     }
     throw error;
   }

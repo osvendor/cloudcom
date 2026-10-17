@@ -8,6 +8,7 @@ import { AI_AGENT_RUN_STATUSES, TOPOLOGY_INTERFACE_METRIC_SERIES } from '@breeze
  */
 
 import { z } from 'zod';
+import { fixProblemSchema } from './fixMemory/problemSignature';
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import type { AuthContext } from '../middleware/auth';
 import { dbAccessContextFromAuth } from '../middleware/auth';
@@ -33,14 +34,15 @@ import {
 } from '../db/schema';
 import { CONFIG_FEATURE_TYPES } from './configFeatureTypes';
 import { CONTACT_ROLES } from './contacts/types';
-import { ACTOR_TYPES, AI_AGENT_KINDS, INVOICE_STATUSES } from '@breeze/shared';
+import { ACTOR_TYPES, AI_AGENT_ACTING_KINDS, INVOICE_STATUSES, monitorKindSchema } from '@breeze/shared';
 import { JOURNAL_VACUUM_MAX_BYTES, JOURNAL_VACUUM_MIN_BYTES, SYSTEM_CLEANUP_ACTION_IDS, scriptVerificationClaimSchema } from '@breeze/shared/validators';
 import { getToolTimeout, withToolTimeout } from './toolTimeouts';
 import { aiRunContextInputShape } from './scriptRunRequest';
-import { deliveryToolShape, executeCommandShape, setDeviceContextShape, toolInputSchemas } from './aiToolSchemas';
+import { deliveryToolShape, diagnosticAccessShapes, executeCommandShape, setDeviceContextShape, toolInputSchemas } from './aiToolSchemas';
 import { aiScriptAuthoringEnabled } from '../config/env';
 import { keysetZodShape, pageZodShape } from './aiToolPagination';
 import { captureMessage } from './sentry';
+import { postToolUseForCall, sdkToolUseIdFromExtra } from './aiToolUseCorrelation';
 import {
   m365LookupUserHandler, m365RecentSigninsHandler, m365ListGroupMembershipsHandler,
   m365DisableUserHandler, m365ResetPasswordHandler,
@@ -117,6 +119,15 @@ export type PreToolUseCallback = (
    * test run with "Tool 'run_script' is not allowed for this session" (#4883).
    */
   mcpToolName?: string,
+  /**
+   * The model's tool_use id for this call, as the SDK sent it to our MCP
+   * handler (`extra._meta['claudecode/toolUseId']`) — the SAME id the handler
+   * binds into this call's postToolUse (`postToolUseForCall`). A hook that
+   * keeps per-call state between pre and post keys it by this id, because the
+   * SDK runs calls concurrently and they can finish out of order (#8163).
+   * Absent only when the SDK sent none.
+   */
+  toolUseId?: string,
 ) => Promise<
   | { allowed: true; intentId?: string; context?: ToolExecutionContext }
   /**
@@ -158,6 +169,12 @@ export type PostToolUseCallback = (
    * failure as an approved, in-flight action.
    */
   handoff?: ToolHandoffStatus,
+  /**
+   * The model's tool_use id for this call, as the SDK sent it to our MCP
+   * handler (`extra._meta['claudecode/toolUseId']`). The result is paired with
+   * its tool_use by this id (#7931); absent only when the SDK sent none.
+   */
+  toolUseId?: string,
 ) => Promise<void>;
 
 // ============================================
@@ -168,6 +185,7 @@ export const TOOL_TIERS = {
   list_time_entries: 1,
   get_running_timer: 1,
   get_timesheet: 1,
+  get_ticket_approval_status: 1,
   // #6930. Base tier; the mutating actions are Tier 2 in aiGuardrails.
   manage_ticket_checklist: 1,
 
@@ -176,6 +194,7 @@ export const TOOL_TIERS = {
   get_device_details: 1,
   get_device_hardware_health: 1,
   get_device_time_status: 1,
+  query_device_workloads: 1,
   list_time_sync_issues: 1,
   analyze_metrics: 1,
   get_active_users: 1,
@@ -189,7 +208,10 @@ export const TOOL_TIERS = {
   manage_dns_policy: 2,
   get_s1_status: 1,
   get_s1_threats: 1,
+  get_edr_status: 1,
+  list_edr_detections: 1,
   s1_isolate_device: 3,
+  edr_endpoint_action: 3,
   s1_threat_action: 3,
   sync_huntress_data: 2,
   execute_command: 3,
@@ -221,6 +243,7 @@ export const TOOL_TIERS = {
   get_cis_device_report: 1,
   apply_cis_remediation: 3,
   get_fleet_health: 1,
+  get_fleet_device_stats: 1,
   // Fleet hygiene (Task 8) — read-only fleet-wide aggregation.
   get_fleet_findings: 1,
   analyze_fleet_metrics: 1,
@@ -254,6 +277,12 @@ export const TOOL_TIERS = {
   get_device_context: 1,
   set_device_context: 2,
   resolve_device_context: 2,
+  // Administrator-approved read-only diagnostic access
+  request_diagnostic_access: 2,
+  list_diagnostic_access_grants: 1,
+  revoke_diagnostic_access: 2,
+  diagnostic_list_directory: 2,
+  diagnostic_read_file: 2,
   // Boot performance & startup tools
   analyze_boot_performance: 1,
   manage_startup_items: 3,
@@ -647,7 +676,8 @@ function makeToolHandler(
 ) {
   const toolTimeout = getToolTimeout(toolName);
 
-  return async (args: Record<string, unknown>) => {
+  return async (args: Record<string, unknown>, extra?: unknown) => {
+    const postToolUse = postToolUseForCall(onPostToolUse, extra);
     // CRITICAL: Escape any inherited AsyncLocalStorage DB context from the SDK's
     // MCP callback chain. Without this, dbContextStorage.getStore() may return a
     // stale/committed transaction from a prior withDbAccessContext call,
@@ -674,7 +704,7 @@ function makeToolHandler(
         | { allowed: true; intentId?: string; context?: ToolExecutionContext }
         | { allowed: false; error: string; handoff?: ToolHandoffStatus };
       try {
-        check = await onPreToolUse(toolName, args);
+        check = await onPreToolUse(toolName, args, undefined, sdkToolUseIdFromExtra(extra));
       } catch (err) {
         // The guardrail path also touches the DB (approval records, rate limits),
         // so `reason` can be a raw driver message — sanitize before embedding it
@@ -698,7 +728,7 @@ function makeToolHandler(
       }
       if (!check.allowed) {
         const denial = preToolUseDenialResult(toolName, check);
-        await safePostToolUse(onPostToolUse, toolName, args, denial.text, denial.isError, 0, undefined, check.handoff);
+        await safePostToolUse(postToolUse, toolName, args, denial.text, denial.isError, 0, undefined, check.handoff);
         return {
           content: [{ type: 'text' as const, text: denial.text }],
           isError: denial.isError,
@@ -791,7 +821,7 @@ function makeToolHandler(
           } else if (parsed.imageBase64) {
             const imageBase64 = parsed.imageBase64;
             const durationMs = Date.now() - startTime;
-            await safePostToolUse(onPostToolUse, toolName, args, JSON.stringify({ actionExecuted: parsed.actionExecuted, width: parsed.width, height: parsed.height, format: parsed.format, sizeBytes: parsed.sizeBytes, capturedAt: parsed.capturedAt }), false, durationMs);
+            await safePostToolUse(postToolUse, toolName, args, JSON.stringify({ actionExecuted: parsed.actionExecuted, width: parsed.width, height: parsed.height, format: parsed.format, sizeBytes: parsed.sizeBytes, capturedAt: parsed.capturedAt }), false, durationMs);
             // MCP ImageContent format: { type: 'image', data: base64, mimeType: string }
             const contentBlocks: SdkToolResult['content'] = [
               {
@@ -843,7 +873,7 @@ function makeToolHandler(
       } catch { /* not JSON, treat as success */ }
 
       const durationMs = Date.now() - startTime;
-      await safePostToolUse(onPostToolUse, toolName, args, compactResult, isToolError, durationMs);
+      await safePostToolUse(postToolUse, toolName, args, compactResult, isToolError, durationMs);
       return { content: [{ type: 'text' as const, text: compactResult }], ...(isToolError ? { isError: true } : {}) };
     } catch (err) {
       const durationMs = Date.now() - startTime;
@@ -853,7 +883,7 @@ function makeToolHandler(
       // string for the stream (#2603).
       const message = sanitizeThrownToolError(toolName, err, { durationMs });
       const safeError = compactToolResultForChat(toolName, JSON.stringify({ error: message }));
-      await safePostToolUse(onPostToolUse, toolName, args, safeError, true, durationMs);
+      await safePostToolUse(postToolUse, toolName, args, safeError, true, durationMs);
       return {
         content: [{ type: 'text' as const, text: safeError }],
         isError: true,
@@ -893,7 +923,8 @@ function makeSessionAwareHandler(
 ) {
   const toolTimeout = getToolTimeout(toolName);
 
-  return async (args: Record<string, unknown>) => {
+  return async (args: Record<string, unknown>, extra?: unknown) => {
+    const postToolUse = postToolUseForCall(onPostToolUse, extra);
     // See makeHandler: escape any inherited AsyncLocalStorage DB context so all
     // DB ops (preToolUse approval writes, the tool call, postToolUse persistence)
     // start with a clean transaction context.
@@ -917,7 +948,7 @@ function makeSessionAwareHandler(
         | { allowed: true; intentId?: string }
         | { allowed: false; error: string; handoff?: ToolHandoffStatus };
       try {
-        check = await onPreToolUse(toolName, args);
+        check = await onPreToolUse(toolName, args, undefined, sdkToolUseIdFromExtra(extra));
       } catch (err) {
         // The guardrail path also touches the DB (approval records, rate limits),
         // so `reason` can be a raw driver message — sanitize before embedding it
@@ -927,7 +958,7 @@ function makeSessionAwareHandler(
       }
       if (!check.allowed) {
         const denial = preToolUseDenialResult(toolName, check);
-        await safePostToolUse(onPostToolUse, toolName, args, denial.text, denial.isError, 0, undefined, check.handoff);
+        await safePostToolUse(postToolUse, toolName, args, denial.text, denial.isError, 0, undefined, check.handoff);
         return {
           content: [{ type: 'text' as const, text: denial.text }],
           isError: denial.isError,
@@ -952,7 +983,7 @@ function makeSessionAwareHandler(
         toolName,
         JSON.stringify({ error: 'no_action_intent', message: SECRET_ACTION_REFUSED_TEXT }),
       );
-      await safePostToolUse(onPostToolUse, toolName, args, refusalText, true, 0);
+      await safePostToolUse(postToolUse, toolName, args, refusalText, true, 0);
       return {
         content: [{ type: 'text' as const, text: refusalText }],
         isError: true,
@@ -1018,7 +1049,7 @@ function makeSessionAwareHandler(
       } catch { /* not JSON, treat as success */ }
 
       const durationMs = Date.now() - startTime;
-      await safePostToolUse(onPostToolUse, toolName, args, compactResult, isToolError, durationMs, sealed);
+      await safePostToolUse(postToolUse, toolName, args, compactResult, isToolError, durationMs, sealed);
       return { content: [{ type: 'text' as const, text: compactResult }], ...(isToolError ? { isError: true } : {}) };
     } catch (err) {
       const durationMs = Date.now() - startTime;
@@ -1028,7 +1059,7 @@ function makeSessionAwareHandler(
       // string for the stream (#2603).
       const message = sanitizeThrownToolError(toolName, err, { durationMs });
       const safeError = compactToolResultForChat(toolName, JSON.stringify({ error: message }));
-      await safePostToolUse(onPostToolUse, toolName, args, safeError, true, durationMs);
+      await safePostToolUse(postToolUse, toolName, args, safeError, true, durationMs);
       return {
         content: [{ type: 'text' as const, text: safeError }],
         isError: true,
@@ -1404,6 +1435,7 @@ export function wrapExtraToolWithHooks(
   return {
     ...extraTool,
     handler: async (args: Record<string, unknown>, extra: unknown): Promise<SdkToolResult> => {
+      const postToolUse = postToolUseForCall(onPostToolUse, extra);
       // See makeHandler: escape any inherited AsyncLocalStorage DB context so
       // preToolUse/handler/postToolUse all start with a clean context rather
       // than a stale/committed one from the SDK's MCP callback chain.
@@ -1414,27 +1446,27 @@ export function wrapExtraToolWithHooks(
           | { allowed: true; context?: ToolExecutionContext }
           | { allowed: false; error: string; handoff?: ToolHandoffStatus };
         try {
-          check = await onPreToolUse(name, args);
+          check = await onPreToolUse(name, args, undefined, sdkToolUseIdFromExtra(extra));
         } catch (err) {
           const reason = sanitizeThrownToolError(`${name}:preToolUse`, err);
           check = { allowed: false, error: `Guardrails check failed: ${reason}` };
         }
         if (!check.allowed) {
           const denial = preToolUseDenialResult(name, check);
-          await safePostToolUse(onPostToolUse, name, args, denial.text, denial.isError, 0, undefined, check.handoff);
+          await safePostToolUse(postToolUse, name, args, denial.text, denial.isError, 0, undefined, check.handoff);
           return { content: [{ type: 'text' as const, text: denial.text }], isError: denial.isError };
         }
       }
       try {
         const result = await withToolTimeout(handler(args, extra), toolTimeout, name);
         const durationMs = Date.now() - startTime;
-        await safePostToolUse(onPostToolUse, name, args, extraToolResultText(result), result.isError === true, durationMs);
+        await safePostToolUse(postToolUse, name, args, extraToolResultText(result), result.isError === true, durationMs);
         return result;
       } catch (err) {
         const durationMs = Date.now() - startTime;
         const message = sanitizeThrownToolError(name, err, { durationMs });
         const safeError = compactToolResultForChat(name, JSON.stringify({ error: message }));
-        await safePostToolUse(onPostToolUse, name, args, safeError, true, durationMs);
+        await safePostToolUse(postToolUse, name, args, safeError, true, durationMs);
         return { content: [{ type: 'text' as const, text: safeError }], isError: true };
       }
       }); // end runOutsideDbContext
@@ -1519,7 +1551,7 @@ export function buildBreezeSdkTools(
         from: z.string().optional(),
         to: z.string().optional(),
         running: z.boolean().optional(),
-        billingStatus: z.enum(['not_billed', 'billed', 'no_charge', 'contract']).optional(),
+        billingStatus: z.enum(['not_billed', 'billed', 'no_charge', 'contract', 'awaiting_approval']).optional(),
         approved: z.boolean().optional(),
         limit: z.number().int().min(1).max(200).optional(),
         offset: z.number().int().min(0).optional(),
@@ -1537,6 +1569,12 @@ export function buildBreezeSdkTools(
       registryDescription('get_timesheet'),
       { weekStart: z.string(), userId: uuid.optional() },
       makeHandler('get_timesheet', getAuth, onPreToolUse, onPostToolUse)
+    ),
+    tool(
+      'get_ticket_approval_status',
+      registryDescription('get_ticket_approval_status'),
+      { ticketId: uuid },
+      makeHandler('get_ticket_approval_status', getAuth, onPreToolUse, onPostToolUse)
     ),
 
     tool(
@@ -1575,6 +1613,13 @@ export function buildBreezeSdkTools(
       registryDescription('get_device_time_status'),
       { deviceId: uuid },
       makeHandler('get_device_time_status', getAuth, onPreToolUse, onPostToolUse),
+    ),
+
+    tool(
+      'query_device_workloads',
+      registryDescription('query_device_workloads'),
+      inputShape('query_device_workloads'),
+      makeHandler('query_device_workloads', getAuth, onPreToolUse, onPostToolUse),
     ),
 
     tool(
@@ -1759,6 +1804,41 @@ export function buildBreezeSdkTools(
     ),
 
     tool(
+      'get_edr_status',
+      registryDescription('get_edr_status'),
+      {
+        orgId: uuid.optional(),
+      },
+      makeHandler('get_edr_status', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'list_edr_detections',
+      registryDescription('list_edr_detections'),
+      {
+        orgId: uuid.optional(),
+        deviceId: uuid.optional(),
+        severity: z.enum(['critical', 'high', 'medium', 'low', 'info']).optional(),
+        status: z.enum(['open', 'all']).optional(),
+        provider: z.string().max(30).optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+      },
+      makeHandler('list_edr_detections', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'edr_endpoint_action',
+      registryDescription('edr_endpoint_action'),
+      {
+        deviceId: uuid,
+        action: z.enum(['isolate', 'unisolate', 'scan']),
+        connectionId: uuid.optional(),
+        reason: z.string().max(500).optional(),
+      },
+      makeHandler('edr_endpoint_action', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
       's1_isolate_device',
       registryDescription('s1_isolate_device'),
       {
@@ -1807,7 +1887,10 @@ export function buildBreezeSdkTools(
         // validateToolInput enforces at dispatch. Deliberate asymmetry.
         scriptId: uuid.optional(),
         proposalId: uuid.optional(),
-        deviceIds: z.array(uuid).min(1).max(10),
+        // Exactly one of deviceIds / groupId (#8600) — enforced by the same
+        // toolInputSchemas.run_script refinement, for the same reason.
+        deviceIds: z.array(uuid).min(1).max(10).optional().describe('Device UUIDs to run on (max 10). Omit when groupId is given.'),
+        groupId: uuid.optional().describe('Saved device group UUID to run on instead of deviceIds. Its members are frozen when approval is requested and that list runs; refused above 10 devices.'),
         parameters: z.record(z.string(), z.unknown()).optional(),
         // #4888 — mirrors toolInputSchemas.run_script; see scriptRunRequest.ts
         // for why the shape is shared rather than repeated.
@@ -1986,6 +2069,13 @@ export function buildBreezeSdkTools(
     ),
 
     tool(
+      'get_fleet_device_stats',
+      registryDescription('get_fleet_device_stats'),
+      { orgId: uuid.optional() },
+      makeHandler('get_fleet_device_stats', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
       'get_fleet_health',
       registryDescription('get_fleet_health'),
       {
@@ -2148,7 +2238,7 @@ export function buildBreezeSdkTools(
       registryDescription('network_discovery'),
       {
         deviceId: uuid,
-        subnet: z.string().max(50).optional(),
+        subnet: z.string().max(50).regex(/^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/, 'Invalid CIDR notation'),
         scanType: z.enum(['ping', 'arp', 'full']).optional(),
       },
       makeHandler('network_discovery', getAuth, onPreToolUse, onPostToolUse)
@@ -2240,8 +2330,6 @@ export function buildBreezeSdkTools(
         deferUntil: z.string().optional(),
         notes: z.string().max(1000).optional(),
         configPolicyId: uuid.optional(),
-        autoApprove: z.boolean().optional(),
-        autoApproveSeverities: z.array(z.enum(['critical', 'important', 'moderate', 'low'])).optional(),
         scheduleFrequency: z.enum(['daily', 'weekly', 'monthly']).optional(),
         scheduleTime: z.string().optional(),
         rebootPolicy: z.enum(['if_required', 'always', 'never']).optional(),
@@ -2412,6 +2500,43 @@ export function buildBreezeSdkTools(
         contextId: uuid,
       },
       makeHandler('resolve_device_context', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    // Administrator-approved read-only diagnostic access
+
+    tool(
+      'request_diagnostic_access',
+      registryDescription('request_diagnostic_access'),
+      diagnosticAccessShapes.request_diagnostic_access,
+      makeHandler('request_diagnostic_access', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'list_diagnostic_access_grants',
+      registryDescription('list_diagnostic_access_grants'),
+      diagnosticAccessShapes.list_diagnostic_access_grants,
+      makeHandler('list_diagnostic_access_grants', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'revoke_diagnostic_access',
+      registryDescription('revoke_diagnostic_access'),
+      diagnosticAccessShapes.revoke_diagnostic_access,
+      makeHandler('revoke_diagnostic_access', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'diagnostic_list_directory',
+      registryDescription('diagnostic_list_directory'),
+      diagnosticAccessShapes.diagnostic_list_directory,
+      makeHandler('diagnostic_list_directory', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'diagnostic_read_file',
+      registryDescription('diagnostic_read_file'),
+      diagnosticAccessShapes.diagnostic_read_file,
+      makeHandler('diagnostic_read_file', getAuth, onPreToolUse, onPostToolUse)
     ),
 
     // Boot performance & startup tools
@@ -2724,6 +2849,15 @@ export function buildBreezeSdkTools(
         // `patch_policies.sources` is deprecated (#3150) — never advertised to
         // the model; the handler ignores it and `get` strips it from responses.
         autoApprove: z.record(z.string(), z.unknown()).optional(),
+        appRules: z.array(z.object({
+          source: z.enum(['third_party', 'custom']),
+          packageId: z.string().min(1).max(256),
+          action: z.enum(['block', 'pin']),
+          pinnedVersion: z.string().min(1).max(64).optional(),
+          displayName: z.string().max(255).optional(),
+        })).max(200).optional().describe(
+          'Per-app block/pin rules on the ring; pin requires pinnedVersion. Overrides manual approvals in patch jobs. Update replaces the list.'
+        ),
         enabled: z.boolean().optional(),
         limit: z.number().int().min(1).max(100).optional(),
       },
@@ -3170,7 +3304,8 @@ export function buildBreezeSdkTools(
       'manage_monitor_definitions',
       registryDescription('manage_monitor_definitions'),
       {
-        action: z.enum(['create', 'update', 'delete', 'enable', 'disable', 'attach', 'detach']),
+        action: z.enum(['describe', 'create', 'update', 'delete', 'enable', 'disable', 'attach', 'detach']),
+        kind: monitorKindSchema.optional(),
         monitorId: uuid.optional(),
         definition: z.record(z.string(), z.unknown()).optional(),
         configPolicyId: uuid.optional(),
@@ -3219,6 +3354,8 @@ export function buildBreezeSdkTools(
       {
         alertId: z.string().guid().optional(),
         anomalyEpisodeId: z.string().guid().optional(),
+        deviceId: z.string().guid().optional(),
+        problem: fixProblemSchema.optional(),
         limit: z.number().int().min(1).max(20).optional(),
       },
       makeHandler('find_proven_fixes', getAuth, onPreToolUse, onPostToolUse)
@@ -3465,7 +3602,7 @@ export function buildBreezeSdkTools(
       registryDescription('manage_ai_agents'),
       {
         action: z.enum(['authorize_supervised_key']),
-        kind: z.enum(AI_AGENT_KINDS),
+        kind: z.enum(AI_AGENT_ACTING_KINDS),
         opKey: z.string().min(3).max(120),
         // Required, and re-checked against the intent's own org at creation and
         // again at execution. It is here so the approval can PIN this org's
@@ -3519,7 +3656,7 @@ export function buildBreezeSdkTools(
         action: z.enum([
           'create_draft', 'add_manual_line', 'add_catalog_line', 'add_bundle_line', 'add_contract_line',
           'update_line', 'remove_line', 'update_header', 'delete_draft',
-          'assemble_from_org', 'assemble_from_ticket',
+          'assemble_from_org', 'assemble_from_ticket', 'refresh_time_lines',
           'issue', 'void', 'record_payment', 'void_payment', 'create_pay_link',
         ]),
         orgId: uuid.optional(),

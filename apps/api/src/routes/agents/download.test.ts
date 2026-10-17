@@ -13,6 +13,7 @@ vi.mock('../../services/installerBuilder', () => ({
 vi.mock('../../services/s3Storage', () => ({
   isS3Configured: vi.fn(() => false),
   getPresignedUrl: vi.fn(),
+  getObjectStream: vi.fn(),
   isS3NotFound: (err: unknown) => {
     const name = (err as { name?: string }).name;
     return name === 'NotFound' || name === 'NoSuchKey';
@@ -64,9 +65,10 @@ import { createHash } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import { downloadRoutes } from './download';
 import { getBinarySource, getGithubReleaseVersion, getGithubAgentUrl, getGithubHelperUrl, getGithubUserHelperUrl, getGithubWatchdogUrl, getGithubBackupUrl } from '../../services/binarySource';
-import { isS3Configured, getPresignedUrl } from '../../services/s3Storage';
+import { isS3Configured, getPresignedUrl, getObjectStream } from '../../services/s3Storage';
 import { getPromotedComponentVersion, getRegisteredComponentVersion } from '../../services/promotedAgentVersion';
 
 // File-scoped so every describe block below gets a permissive default for
@@ -668,8 +670,9 @@ describe('S3 transport failures surface as 500, not a masked 404 (issue #1802)',
   });
 
   it.each([
+    // watchdog streams from object storage instead of presigning (#7576) —
+    // its transport-fault/NotFound cases live in the #7576 describe below.
     ['agent', '/download/linux/amd64', '[agent-download]'],
-    ['watchdog', '/download/watchdog/linux/amd64', '[watchdog-download]'],
     ['user-helper', '/download/user-helper/windows/amd64', '[user-helper-download]'],
     ['backup', '/download/backup/linux/amd64', '[backup-download]'],
   ])('returns 500 for the %s route on a non-NotFound S3 error', async (_name, path, logTag) => {
@@ -687,7 +690,6 @@ describe('S3 transport failures surface as 500, not a masked 404 (issue #1802)',
 
   it.each([
     ['agent', '/download/linux/amd64', '[agent-download]', 'NotFound'],
-    ['watchdog', '/download/watchdog/linux/amd64', '[watchdog-download]', 'NotFound'],
     ['user-helper', '/download/user-helper/windows/amd64', '[user-helper-download]', 'NotFound'],
     ['backup', '/download/backup/linux/amd64', '[backup-download]', 'NotFound'],
   ])(
@@ -719,6 +721,153 @@ describe('S3 transport failures surface as 500, not a masked 404 (issue #1802)',
 
     expect(res.status).toBe(500);
     expect(console.error).toHaveBeenCalled();
+  });
+});
+
+describe('watchdog object-storage copies are served on the control-plane origin, never via a presigned redirect (#7576)', () => {
+  // A hosted agent's first-install watchdog bootstrap (`service install`)
+  // follows redirects only to GitHub release hosts and its own control plane.
+  // A 302 to a presigned object-storage URL is refused as "release redirect to
+  // untrusted origin", so the watchdog was never installed. The bytes must come
+  // back on the route's own origin; integrity is still bound by the signed
+  // release manifest the agent checks after the download.
+  const originalAgentDir = process.env.AGENT_BINARY_DIR;
+  const WATCHDOG_BYTES = Buffer.from('MZ-fake-watchdog-bytes-for-7576');
+  const PRESIGNED = 'https://storage.example.test/bucket/key?X-Amz-Signature=abc';
+
+  beforeEach(() => {
+    process.env.AGENT_BINARY_DIR = '/tmp/breeze-nonexistent-agent-binaries-7576';
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.mocked(getBinarySource).mockReturnValue('local');
+    vi.mocked(isS3Configured).mockReturnValue(true);
+    vi.mocked(getPresignedUrl).mockResolvedValue(PRESIGNED);
+  });
+
+  afterEach(() => {
+    if (originalAgentDir === undefined) delete process.env.AGENT_BINARY_DIR;
+    else process.env.AGENT_BINARY_DIR = originalAgentDir;
+    vi.restoreAllMocks();
+    vi.mocked(getBinarySource).mockReset();
+    vi.mocked(isS3Configured).mockReset();
+    vi.mocked(getPresignedUrl).mockReset();
+    vi.mocked(getObjectStream).mockReset();
+  });
+
+  it('streams the watchdog object on this origin with its exact bytes and length', async () => {
+    vi.mocked(getObjectStream).mockResolvedValue({
+      body: Readable.from([WATCHDOG_BYTES]),
+      contentLength: WATCHDOG_BYTES.length,
+    });
+
+    const res = await downloadRoutes.request('/download/watchdog/windows/amd64');
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('location')).toBeNull();
+    expect(res.headers.get('content-length')).toBe(String(WATCHDOG_BYTES.length));
+    expect(res.headers.get('content-disposition')).toContain('breeze-watchdog-windows-amd64.exe');
+    expect(Buffer.from(await res.arrayBuffer()).equals(WATCHDOG_BYTES)).toBe(true);
+    // The same key the presign path used: the agent store's prefix (#7515).
+    expect(getObjectStream).toHaveBeenCalledWith('agent/breeze-watchdog-windows-amd64.exe');
+    expect(getPresignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('omits Content-Length rather than guessing when object storage does not report one', async () => {
+    vi.mocked(getObjectStream).mockResolvedValue({
+      body: Readable.from([WATCHDOG_BYTES]),
+      contentLength: null,
+    });
+
+    const res = await downloadRoutes.request('/download/watchdog/linux/amd64');
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-length')).toBeNull();
+    expect(Buffer.from(await res.arrayBuffer()).equals(WATCHDOG_BYTES)).toBe(true);
+  });
+
+  it('falls back to disk (404 here) when the object is genuinely absent', async () => {
+    vi.mocked(getObjectStream).mockResolvedValue({ body: null, contentLength: null });
+
+    const res = await downloadRoutes.request('/download/watchdog/linux/amd64');
+
+    expect(res.status).toBe(404);
+    expect(console.error).not.toHaveBeenCalled();
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining('[watchdog-download] S3 object missing'),
+    );
+    expect(getPresignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('returns 500 on an object-storage transport fault instead of masking it as a disk 404', async () => {
+    vi.mocked(getObjectStream).mockRejectedValue(
+      Object.assign(new Error('credentials expired'), { name: 'CredentialsProviderError' }),
+    );
+
+    const res = await downloadRoutes.request('/download/watchdog/linux/amd64');
+    const body = await res.text();
+
+    expect(res.status).toBe(500);
+    expect(body).not.toContain('not available');
+    expect(body).not.toContain('/tmp');
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining('[watchdog-download] S3 fetch failed'),
+      expect.anything(),
+    );
+    expect(getPresignedUrl).not.toHaveBeenCalled();
+  });
+
+  function failingBody(err: Error): Readable {
+    let sent = false;
+    return new Readable({
+      read() {
+        if (!sent) {
+          sent = true;
+          this.push(WATCHDOG_BYTES);
+          return;
+        }
+        this.destroy(err);
+      },
+    });
+  }
+
+  it('logs an object-storage fault that breaks the stream mid-body', async () => {
+    vi.mocked(getObjectStream).mockResolvedValue({
+      body: failingBody(Object.assign(new Error('socket reset'), { code: 'ECONNRESET' })),
+      contentLength: WATCHDOG_BYTES.length * 2,
+    });
+
+    const res = await downloadRoutes.request('/download/watchdog/linux/amd64');
+    expect(res.status).toBe(200);
+    await expect(res.arrayBuffer()).rejects.toThrow();
+
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining('[watchdog-download] S3 stream error'),
+      expect.anything(),
+    );
+  });
+
+  it('does not report a client hang-up (AbortError) as an object-storage fault', async () => {
+    vi.mocked(getObjectStream).mockResolvedValue({
+      body: failingBody(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })),
+      contentLength: WATCHDOG_BYTES.length * 2,
+    });
+
+    const res = await downloadRoutes.request('/download/watchdog/linux/amd64');
+    await res.arrayBuffer().catch(() => undefined);
+
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['agent', '/download/linux/amd64'],
+    ['user-helper', '/download/user-helper/windows/amd64'],
+    ['backup', '/download/backup/linux/amd64'],
+  ])('leaves the %s route on the presigned redirect (bandwidth offload unchanged)', async (_name, path) => {
+    const res = await downloadRoutes.request(path);
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe(PRESIGNED);
+    expect(getObjectStream).not.toHaveBeenCalled();
   });
 });
 
@@ -1047,6 +1196,16 @@ describe('GET /install.sh — generated installer script', () => {
     expect(backupStepIdx).toBeGreaterThan(agentInstalledIdx);
   });
 
+  it('never appends the deprecated --site-id to the enroll command (#8474)', async () => {
+    const script = await fetchScript();
+    // Positive anchor: both the darwin and linux enroll blocks still exist.
+    expect(script.match(/ENROLL_ARGS=\(enroll --server "\$BREEZE_SERVER"\)/g)).toHaveLength(2);
+    // The arg parser keeps a `--site-id)` case (accept and ignore); no other
+    // `--site-id` may remain on any ENROLL_ARGS or enroll line.
+    expect(script).not.toMatch(/ENROLL_ARGS[^\n]*--site-id/);
+    expect(script).not.toMatch(/enroll[^\n]*--site-id/);
+  });
+
   it('accepts a --token argument for enrollment-key based enrollment', async () => {
     const script = await fetchScript();
     // Argument parser handles --token; the script's own $BREEZE_ENROLL_TOKEN
@@ -1125,6 +1284,74 @@ describe('GET /install.sh — generated installer script', () => {
   });
 });
 
+describe('install.sh — macOS enrolls with the binary the .pkg actually installed (#8778)', () => {
+  // The .pkg (agent/installer/macos/install-location.sh) installs to
+  // /Library/Breeze/bin when the agent is already there or /usr/local/bin is
+  // unsafe for a root daemon, else to /usr/local/bin. install.sh used to
+  // enroll with a hard-coded /usr/local/bin/breeze-agent. The resolver is run
+  // here against temp directories standing in for the two real ones.
+  let tmp: string;
+  let legacy: string;
+  let trusted: string;
+  let fn: string;
+
+  beforeEach(async () => {
+    const res = await downloadRoutes.request('/install.sh');
+    const script = await res.text();
+    const m = script.match(/^resolve_macos_agent_bin\(\) \{[\s\S]*?^\}$/m);
+    expect(m, 'install.sh defines resolve_macos_agent_bin').not.toBeNull();
+    fn = m![0];
+    tmp = mkdtempSync(join(tmpdir(), 'breeze-mac-bin-'));
+    legacy = join(tmp, 'usr-local-bin');
+    trusted = join(tmp, 'Library-Breeze-bin');
+    mkdirSync(legacy);
+    mkdirSync(trusted);
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  function resolve(): { code: number; out: string } {
+    const harness = `${fn}\nINSTALL_DIR='${legacy}'\nMACOS_TRUSTED_BIN_DIR='${trusted}'\nBINARY_NAME=breeze-agent\nresolve_macos_agent_bin`;
+    try {
+      return { code: 0, out: execFileSync('bash', ['-c', harness]).toString().trim() };
+    } catch (e) {
+      return { code: (e as { status?: number }).status ?? 1, out: '' };
+    }
+  }
+  const agent = (dir: string) => writeFileSync(join(dir, 'breeze-agent'), '#!/bin/sh\n', { mode: 0o755 });
+
+  it('uses /Library/Breeze/bin when the .pkg installed there (the reported case)', () => {
+    agent(trusted);
+    expect(resolve()).toEqual({ code: 0, out: join(trusted, 'breeze-agent') });
+  });
+
+  it('uses /usr/local/bin when the .pkg installed there', () => {
+    agent(legacy);
+    expect(resolve()).toEqual({ code: 0, out: join(legacy, 'breeze-agent') });
+  });
+
+  it('prefers /Library/Breeze/bin over a leftover pre-relocation /usr/local/bin copy', () => {
+    agent(legacy);
+    agent(trusted);
+    expect(resolve()).toEqual({ code: 0, out: join(trusted, 'breeze-agent') });
+  });
+
+  it('fails when neither location has an executable agent', () => {
+    expect(resolve().code).not.toBe(0);
+  });
+
+  it('enrolls through the resolved path, not a hard-coded /usr/local/bin', async () => {
+    const res = await downloadRoutes.request('/install.sh');
+    const script = await res.text();
+    const mac = script.slice(script.indexOf('installer -pkg'), script.indexOf('Agent enrolled successfully'));
+    expect(mac).toContain('MACOS_AGENT_BIN="$(resolve_macos_agent_bin)"');
+    expect(mac).toContain('"$MACOS_AGENT_BIN" "${ENROLL_ARGS[@]}"');
+    expect(mac).not.toContain('"$INSTALL_DIR/$BINARY_NAME" "${ENROLL_ARGS[@]}"');
+  });
+});
+
 describe('GET /uninstall.sh — generated uninstaller script', () => {
   async function fetchScript(): Promise<string> {
     const res = await downloadRoutes.request('/uninstall.sh');
@@ -1177,7 +1404,7 @@ describe('GET /uninstall.sh — generated uninstaller script', () => {
     const tmp = mkdtempSync(join(tmpdir(), 'breeze-uninstall-exec-'));
     const calls = join(tmp, 'calls');
     try {
-      for (const name of ['id', 'uname', 'launchctl', 'pkgutil', 'rm', 'ps']) {
+      for (const name of ['id', 'uname', 'launchctl', 'pkgutil', 'rm', 'rmdir', 'ps']) {
         let body = '#!/bin/sh\nprintf "%s %s\\n" "${0##*/}" "$*" >> "$FIXTURE_CALLS"\n';
         if (name === 'id') body += 'echo 0\n';
         if (name === 'uname') body += 'echo Darwin\n';
@@ -1205,7 +1432,13 @@ describe('GET /uninstall.sh — generated uninstaller script', () => {
       }
       for (const binary of ['breeze-agent', 'breeze-watchdog', 'breeze-backup', 'breeze-desktop-helper']) {
         expect(commands).toContain(`/usr/local/bin/${binary}`);
+        // #7831: both install locations, whichever one was live.
+        expect(commands).toContain(`/Library/Breeze/bin/${binary}`);
       }
+      // #7831: the empty trusted-dir tree goes, and a launchd disable left by
+      // self_uninstall is cleared so a reinstall's bootstrap does not hit EIO 5.
+      expect(commands).toContain('rmdir /Library/Breeze/pkg-staging /Library/Breeze/bin /Library/Breeze');
+      expect(commands).toContain('launchctl enable system/com.breeze.agent');
       expect(commands).not.toContain('rm -rf');
       expect(commands).not.toContain('com.breeze.agent-user');
       expect(commands).not.toContain('com.breeze.helper');

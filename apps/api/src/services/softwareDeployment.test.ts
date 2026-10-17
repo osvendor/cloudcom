@@ -30,6 +30,20 @@ vi.mock('./softwareDownloadPolicy', () => ({
 // to dispatchDeviceCommand.test.ts.
 vi.mock('./dispatchDeviceCommand', () => ({ dispatchDeviceCommand: dispatchDeviceCommandMock }));
 
+// #4756: Windows targets now resolve the System Restore checkpoint policy at
+// dispatch. This file's DB doubles do not model policies, so the resolver is
+// pinned to "no policy anywhere" -- the real chokepoint then returns null and
+// every payload below must stay exactly as it was before the feature. Stamping
+// is covered in softwareDeployment.restorePoint.test.ts.
+vi.mock('./featureConfigResolver', () => ({
+  resolveSystemProtectionForDevice: vi.fn(async () => ({
+    settings: { beforePatching: true, beforeScripts: false, beforeSoftwareInstall: false, labelPrefix: 'Breeze' },
+    policyRevision: null,
+    isPlatformDefault: true,
+    invalidStoredSettings: false,
+  })),
+}));
+
 vi.mock('../services/s3Storage', () => ({
   getPresignedUrl: vi.fn(async () => 'https://signed.example/pkg.exe'),
   isS3Configured: () => true,
@@ -248,6 +262,20 @@ describe('createSoftwareDeployment', () => {
     vi.unstubAllEnvs();
   });
 
+
+  it('dispatchSoftwareInstallToDevice refuses (throws with the reason) when the push claim cancels the install', async () => {
+    dispatchDeviceCommandMock.mockResolvedValue({
+      ok: true,
+      command: { id: 'cmd-dev-1', deviceId: 'dev-1', type: 'software_install', status: 'cancelled' },
+      delivery: 'cancelled',
+      cancelReason: 'requester_inactive',
+      deliverBy: new Date(),
+    });
+
+    await expect(
+      dispatchSoftwareInstallToDevice('dep-1', { id: 'dev-1', agentId: 'agent-1' }, { deploymentId: 'dep-1', retryCount: 0 }),
+    ).rejects.toThrow('requester_inactive');
+  });
 
   it('a dispatch failure on one device does not abort the fan-out for the rest', async () => {
     // #5128: dispatchSoftwareInstallToDevice now THROWS when the seam refuses

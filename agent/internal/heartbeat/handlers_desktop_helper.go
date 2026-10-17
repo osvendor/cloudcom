@@ -181,14 +181,29 @@ func (h *Heartbeat) rememberDesktopOwner(desktopSessionID, helperSessionID strin
 	if desktopSessionID == "" || helperSessionID == "" {
 		return
 	}
+	// A session switch re-owns the session on another helper; the previous
+	// one's Session is torn down by the switch and still sends its teardown
+	// report. Tombstone it before handing the session over.
+	if prev, ok := h.desktopOwners.Load(desktopSessionID); ok && prev != helperSessionID {
+		h.tombstoneDesktopOwner(desktopSessionID, prev)
+	}
 	h.desktopOwners.Store(desktopSessionID, helperSessionID)
+	h.endedDesktopOwners.Delete(desktopOwnerKey(desktopSessionID, helperSessionID))
 }
 
 func (h *Heartbeat) forgetDesktopOwner(desktopSessionID string) {
 	if desktopSessionID == "" {
 		return
 	}
-	h.desktopOwners.Delete(desktopSessionID)
+	h.sweepEndedDesktopOwners()
+	owner, ok := h.desktopOwners.Load(desktopSessionID)
+	if !ok {
+		return
+	}
+	// Tombstone first, then remove the owner: a teardown report checked in
+	// between must see one or the other.
+	h.tombstoneDesktopOwner(desktopSessionID, owner)
+	h.desktopOwners.CompareAndDelete(desktopSessionID, owner)
 }
 
 func (h *Heartbeat) desktopOwnerSession(desktopSessionID string) *sessionbroker.Session {
@@ -249,7 +264,7 @@ func (h *Heartbeat) startDesktopViaHelper(sessionID, offer string, iceServers []
 	clipViewerToHost := policy.ClipboardViewerToHost
 	req := ipc.DesktopStartRequest{
 		SessionID: sessionID,
-		// SEC-038: the helper runs its own fence, so it needs the generation
+		// The helper runs its own fence, so it needs the generation
 		// this start was admitted at. Forwarded verbatim as the canonical
 		// decimal string the server emitted — never re-encoded through a
 		// number.
@@ -385,7 +400,7 @@ func desktopStartLostHelper(err error) bool {
 // always-on path treats that as worth retrying against a freshly spawned
 // helper; every other failure is terminal and must be surfaced verbatim.
 func (h *Heartbeat) startDesktopOnSession(session *sessionbroker.Session, sessionID string, req ipc.DesktopStartRequest) (tools.CommandResult, bool) {
-	// SEC-038 readiness barrier: a helper must not be handed a
+	// Readiness barrier: a helper must not be handed a
 	// generation-bearing start before it has been seeded with what this
 	// service already knows. The seed is a REQUEST, so its reply — not merely
 	// its dispatch — is what orders it ahead of the start; a helper

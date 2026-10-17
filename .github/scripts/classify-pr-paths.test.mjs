@@ -352,7 +352,7 @@ test('every code job is gated on the classifier', () => {
   // and must keep running on a tooling-only PR, so they are never gated on
   // `app`. check-migrations is additionally api-gated (a tooling-only change
   // always sets api — pinned in ci-area-gating.test.mjs).
-  const codeOnly = new Set(['lint', 'security-audit']);
+  const codeOnly = new Set(['lint', 'security-audit', 'release-ledger']);
   // Per-area jobs carry an extra area clause AFTER the code/app gate; the exact
   // per-area `if:` lines are pinned by ci-area-gating.test.mjs. The prefix is
   // still required here, so a docs-only or tooling-only PR still skips them.
@@ -557,7 +557,7 @@ const heavyResultVars = [
   'TYPECHECK_RESULT', 'TEST_API_RESULT', 'TEST_M365_GRAPH_READ_EXECUTOR_RESULT',
   'TEST_M365_GRAPH_ACTIONS_EXECUTOR_RESULT', 'TEST_M365_COMMUNICATIONS_EXECUTOR_RESULT',
   'TEST_WEB_RESULT', 'TEST_MOBILE_RESULT', 'MOBILE_NATIVE_CHANGES_RESULT',
-  'TEST_PORTAL_RESULT', 'TEST_VIEWER_RESULT', 'TEST_OFFICE_ADDIN_CORE_RESULT',
+  'TEST_PORTAL_RESULT', 'TEST_VIEWER_RESULT', 'TEST_SHARED_RESULT', 'TEST_OFFICE_ADDIN_CORE_RESULT',
   'TEST_EXCEL_ADDIN_RESULT', 'TEST_WORD_ADDIN_RESULT', 'TEST_POWERPOINT_ADDIN_RESULT',
   'TEST_OUTLOOK_ADDIN_RESULT', 'BUILD_API_RESULT', 'BUILD_M365_GRAPH_READ_EXECUTOR_RESULT',
   'BUILD_M365_GRAPH_ACTIONS_EXECUTOR_RESULT', 'BUILD_M365_COMMUNICATIONS_EXECUTOR_RESULT',
@@ -568,7 +568,7 @@ const heavyResultVars = [
 ];
 const toolingOnlyPassing = {
   ...allOf('skipped'), // everything defaults to skipped for a tooling-only PR...
-  ...Object.fromEntries(['LINT_RESULT', 'CHECK_MIGRATIONS_RESULT', 'SECURITY_AUDIT_RESULT'].map((v) => [v, 'success'])),
+  ...Object.fromEntries(['LINT_RESULT', 'RELEASE_LEDGER_RESULT', 'CHECK_MIGRATIONS_RESULT', 'SECURITY_AUDIT_RESULT'].map((v) => [v, 'success'])),
   CHANGES_RESULT: 'success',
   CODE_CHANGED: 'true',
   APP_CHANGED: 'false',
@@ -585,11 +585,12 @@ for (const [label, env, passes] of [
   ['tooling-only PR, lint red', { ...toolingOnlyPassing, LINT_RESULT: 'failure' }, false],
   ['tooling-only PR, check-migrations red', { ...toolingOnlyPassing, CHECK_MIGRATIONS_RESULT: 'failure' }, false],
   ['tooling-only PR, security-audit red', { ...toolingOnlyPassing, SECURITY_AUDIT_RESULT: 'failure' }, false],
+  ['tooling-only PR, release-ledger red', { ...toolingOnlyPassing, RELEASE_LEDGER_RESULT: 'failure' }, false],
+  ['tooling-only PR, release-ledger skipped', { ...toolingOnlyPassing, RELEASE_LEDGER_RESULT: 'skipped' }, false],
   ['app change, all heavy jobs green', { ...appPassing }, true],
-  // check-migrations is NOT blocking for an application PR (unchanged policy: it
-  // is one of ciSuccessGatingContract's KNOWN GAP jobs). It is blocking only on
-  // the tooling-only path, where it is the sole validation of the release guards.
-  ['app change, check-migrations red: not blocking for an application PR', { ...appPassing, CHECK_MIGRATIONS_RESULT: 'failure' }, true],
+  // check-migrations blocks an application PR whenever api changed (#7032); `passing`
+  // sets API_CHANGED=true. The api=false/skipped legs live in ci-area-gating.test.mjs.
+  ['app change, check-migrations red: blocks an application PR (#7032)', { ...appPassing, CHECK_MIGRATIONS_RESULT: 'failure' }, false],
   ['tooling-only PR, a smoke job ran instead of skipping', { ...toolingOnlyPassing, SMOKE_TEST_RESULT: 'success' }, false],
   ['tooling-only PR, workspace-runtime ran instead of skipping', { ...toolingOnlyPassing, WORKSPACE_RUNTIME_RESULT: 'failure' }, false],
   // The topology gate is app-implying (every path it matches is outside the
@@ -609,7 +610,7 @@ for (const [label, env, passes] of [
 
 // A tooling-only PR where a single heavy job unexpectedly ran (success) or
 // failed must still fail closed — its `if:` should have skipped it.
-for (const resultVar of ['TEST_WEB_RESULT', 'BUILD_AGENT_RESULT', 'INTEGRATION_TEST_RESULT']) {
+for (const resultVar of ['TEST_WEB_RESULT', 'BUILD_AGENT_RESULT', 'INTEGRATION_TEST_RESULT', 'TEST_SHARED_RESULT']) {
   test(`CI Success (app-gate): tooling-only PR, ${resultVar} unexpectedly ran (success)`, () => {
     const execution = spawnSync('bash', ['-e', '-c', summaryScript], {
       encoding: 'utf8',
@@ -625,6 +626,15 @@ for (const resultVar of ['TEST_WEB_RESULT', 'BUILD_AGENT_RESULT', 'INTEGRATION_T
     assert.equal(execution.status, 1, execution.stdout + execution.stderr);
   });
 }
+
+// #8373: a red packages/shared suite must block CI Success on an app change.
+test('CI Success (app-gate): app change, TEST_SHARED_RESULT red', () => {
+  const execution = spawnSync('bash', ['-e', '-c', summaryScript], {
+    encoding: 'utf8',
+    env: { ...process.env, IS_PR: 'true', ...appPassing, TEST_SHARED_RESULT: 'failure' },
+  });
+  assert.equal(execution.status, 1, execution.stdout + execution.stderr);
+});
 
 // app=true with one heavy job unexpectedly skipped must fail closed.
 for (const resultVar of heavyResultVars) {

@@ -119,6 +119,16 @@ export const discoveryProfiles = pgTable('discovery_profiles', {
   timeout: integer('timeout'),
   concurrency: integer('concurrency'),
   alertSettings: jsonb('alert_settings').$type<DiscoveryProfileAlertSettings>(),
+  /**
+   * #7969: optional pinned scan agent (devices.id). NULL = automatic selection
+   * (online agent in the site, subnet-overlapping first). Set = only this device
+   * runs the profile's scans; offline fails the job, never falls back.
+   * Composite FK (pinned_device_id, org_id) -> devices(id, org_id)
+   * ON DELETE SET NULL (pinned_device_id) lives in
+   * migrations/2026-12-22-130000-discovery-profile-pinned-device.sql. Not named
+   * `device_id` on purpose — see that migration.
+   */
+  pinnedDeviceId: uuid('pinned_device_id'),
   createdBy: uuid('created_by').references(() => users.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
@@ -252,7 +262,7 @@ export const networkKnownGuests = pgTable('network_known_guests', {
   macAddress: varchar('mac_address', { length: 17 }).notNull(),
   label: varchar('label', { length: 255 }).notNull(),
   notes: text('notes'),
-  addedBy: uuid('added_by').references(() => users.id),
+  addedBy: uuid('added_by').references(() => users.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull()
 }, (table) => ({
@@ -275,7 +285,7 @@ export const networkBaselines = pgTable('network_baselines', {
     changed: true,
     rogueDevice: false
   }),
-  // SEC-2026-09-05-146 — creator-bound versioned authority envelope. A recurring
+  // Creator-bound versioned authority envelope. A recurring
   // scan_schedule is an effect that keeps firing long after the request that
   // armed it; without a durable record of WHO armed it the scheduler cannot tell
   // whether that authority still exists. Every arming path (REST create/update,

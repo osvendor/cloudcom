@@ -14,13 +14,16 @@ import { RegistryWriteError } from '../../services/aiModels/registryWriteErrors'
 import { getConnection, type PartnerAiConnection } from '../../services/aiModels/connections';
 import { ByoEndpointRejected } from '../../services/aiModels/gateway/byoEndpointPolicy';
 import { enqueueConnectionSync, enqueueOfferingVerification } from '../../jobs/aiModelDiscoveryWorker';
-import { PartnerLlmError } from '../../services/partnerLlmConfig';
+import { ConnectionCheckError } from '../../services/aiModels/connectionProbe';
 import { captureException } from '../../services/sentry';
+import { runOutsideDbContext } from '../../db';
+import { getRedis } from '../../services/redis';
+import { rateLimiter } from '../../services/rate-limit';
 
 // Fixed-length tuples, not MiddlewareHandler[]: Hono's typed route overloads
 // only accept a spread whose length is known.
 
-/** Partner registry reads: the /ai/provider gate (MFA is not required to read). */
+/** Partner registry reads: the gate the retired /ai/provider API used (MFA is not required to read). */
 export const partnerRead: readonly [MiddlewareHandler] = [
   requirePermission(PERMISSIONS.BILLING_MANAGE.resource, PERMISSIONS.BILLING_MANAGE.action),
 ];
@@ -31,7 +34,27 @@ export const partnerWrite: readonly [MiddlewareHandler, MiddlewareHandler] = [
   requireMfa(),
 ];
 
-/** Same gate as routes/aiProvider.ts: a partner token with orgAccess 'all' (or system with a partner context). */
+/**
+ * Per-partner sliding-window limit for registry actions that queue upstream
+ * work (discovery, fidelity harness). Runs after `partnerWrite`; a request with
+ * no partner context falls through to the handler, whose `requirePartnerWide`
+ * refuses it. The Redis round-trip runs outside the request's DB transaction.
+ */
+export function partnerRateLimit(bucket: string, limit: number, windowSeconds: number): MiddlewareHandler {
+  return async (c, next) => {
+    const partnerId = c.get('auth')?.partnerId;
+    if (partnerId) {
+      const result = await runOutsideDbContext(() => rateLimiter(getRedis(), `rl:ai-models:${bucket}:${partnerId}`, limit, windowSeconds));
+      if (!result.allowed) {
+        c.header('Retry-After', String(Math.max(1, Math.ceil((result.resetAt.getTime() - Date.now()) / 1000))));
+        return c.json({ error: 'Too many requests. Try again later.', code: 'rate_limited' }, 429);
+      }
+    }
+    await next();
+  };
+}
+
+/** The gate the retired /ai/provider API used: a partner token with orgAccess 'all' (or system with a partner context). */
 export function requirePartnerWide(c: Context): { partnerId: string; userId: string } {
   const auth = c.get('auth');
   if (!auth?.partnerId) throw new HTTPException(403, { message: 'Partner context required' });
@@ -77,7 +100,10 @@ export async function registryWrite(c: Context, partnerId: string, fn: () => Pro
       if (error.status >= 500 && error.code !== 'registry_busy') captureException(error, undefined, { service: 'aiModels' });
       return c.json({ error: error.message, code: error.code, ...(error.details ? { details: error.details } : {}) }, error.status);
     }
-    if (error instanceof PartnerLlmError) {
+    // An Anthropic connection write's verdict (probe rejection, stale write):
+    // its message and status are the response, exactly as the retired
+    // /ai/provider facade reported them.
+    if (error instanceof ConnectionCheckError) {
       if (error.status >= 500) captureException(error, undefined, { service: 'aiModels' });
       return c.json({ error: error.message }, error.status);
     }
@@ -90,13 +116,45 @@ export async function registryWrite(c: Context, partnerId: string, fn: () => Pro
   }
 }
 
+const NETWORK_ERROR_CODES = new Set([
+  'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT', 'ERR_TLS_CERT_ALTNAME_INVALID',
+]);
+// OpenSSL verification failures surface as plain string codes (CERT_HAS_EXPIRED,
+// DEPTH_ZERO_SELF_SIGNED_CERT, UNABLE_TO_VERIFY_LEAF_SIGNATURE, ...).
+const TLS_CODE = /CERT|SSL|TLS|SELF_SIGNED|UNABLE_TO_(GET|VERIFY)/;
+
+/** True for a network-level failure (DNS, connect, timeout, TLS) in the error or its cause chain; never for a programmer error. */
+export function isNetworkFailure(error: unknown): boolean {
+  for (let e: unknown = error, depth = 0; e && typeof e === 'object' && depth < 4; e = (e as { cause?: unknown }).cause, depth++) {
+    const code = (e as { code?: unknown }).code;
+    if (typeof code === 'string' && (NETWORK_ERROR_CODES.has(code) || TLS_CODE.test(code))) return true;
+  }
+  return false;
+}
+
+/**
+ * A BYO endpoint that cannot be resolved or reached is the admin's input
+ * problem: a 400 on `baseUrl`, not a 500. The raw error (it carries the
+ * resolver / socket text) goes to the server log only.
+ */
+export function endpointUnreachableResponse(c: Context, error: unknown, stage: string): Response | null {
+  if (!isNetworkFailure(error)) return null;
+  console.warn(`[aiModels] ${stage}: endpoint unreachable`, error instanceof Error ? error.message : String(error));
+  return c.json({
+    error: 'The endpoint host could not be resolved or reached. Check the base URL.',
+    code: 'endpoint_unreachable',
+    details: { field: 'baseUrl' },
+  }, 400);
+}
+
 /** A live connection the partner can change: missing, foreign and W03 soft-disconnected rows are all "absent". */
 export type OwnedConnection = PartnerAiConnection & { status: Exclude<PartnerAiConnection['status'], 'disconnected'> };
 
 /**
- * Any-kind ownership (W06). Call it INSIDE the registryWrite callback (same
- * reason as the compat-only ownConnectionId: a not-yet-cut-over partner gets
- * the recoverable 503 first). A disconnected connection is provenance only, so
+ * Any-kind ownership (W06; id-keyed for every kind since W08). Call it INSIDE
+ * the registryWrite callback, so a partner without its registry rows gets the
+ * recoverable 503 first. A disconnected connection is provenance only, so
  * it 404s exactly like another partner's id.
  */
 export async function ownConnection(partnerId: string, id: string): Promise<OwnedConnection> {

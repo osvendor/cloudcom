@@ -21,6 +21,7 @@
 import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination';
 import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import {
+  actionIntents,
   devices,
   organizations,
   scripts,
@@ -47,8 +48,10 @@ import { scriptNeedsVariableScope } from './sourcedParameters';
 import { deviceScopeCondition, siteScopeCondition } from './aiToolsSiteScope';
 import { shrinkToJsonBudget } from './aiToolOutput';
 import { sha256Content } from './scriptVersions';
-import { isDeniedRegistryTarget } from '../routes/systemTools/sensitiveTargets';
+import { isAgentConfigPath, isDeniedRegistryTarget } from '../routes/systemTools/sensitiveTargets';
 import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
+import { inToolDbPhase } from './aiToolDbContext';
+import { aiPathRefusal, PATH_BLOCKED_MESSAGE } from './aiPathRestriction';
 
 // Fix 4b: headroom under MAX_TOOL_RESULT_CHARS (8000) for the rest of the
 // get_script_execution envelope once stdout/stderr are counted at their
@@ -242,18 +245,94 @@ function callerMayUseVerifiedScript(
 }
 
 /**
+ * #8600 (device-group targets W03): a `run_script { groupId }` call runs only
+ * as the release of an approved action intent, and executes that intent's
+ * FROZEN arguments. `createActionIntent` resolved the group to concrete
+ * `deviceIds` before the approval was requested, so the approved set is the
+ * executed set. The handler NEVER resolves a group: membership that moved
+ * after approval must not reach the run.
+ *
+ * Why the row and not the raw input: the inline chat release executes with the
+ * model's own tool input (`makeToolHandler` hands `executeTool` the same args
+ * the preToolUse gate saw), which still says `groupId`. The durable release
+ * worker already passes the row's `arguments`, which carry no `groupId` and
+ * never reach this branch.
+ *
+ * Read under a system context like the other release-time reads; the caller's
+ * own authority is re-checked (`canAccessOrg` here, and per device by
+ * `verifyDeviceAccess` in the dispatch loops below).
+ */
+async function loadFrozenGroupTargetArguments(
+  input: Record<string, unknown>,
+  auth: AuthContext,
+  actionIntentId: string | undefined,
+): Promise<{ ok: true; args: Record<string, unknown> } | { ok: false; reason: string }> {
+  // One message back to the model for every mismatch (it can act on none of
+  // them differently); the specific cause is logged for the operator, since a
+  // refusal here on a genuine release would mean a release-path bug.
+  const refused = (reason: string, cause?: string) => {
+    if (cause) {
+      console.warn('[aiToolsScripts] run_script group release refused', { actionIntentId: actionIntentId ?? null, cause });
+    }
+    return { ok: false as const, reason };
+  };
+  if (!actionIntentId) {
+    return refused('a device-group run must be approved first; it executes only as the release of its approved action');
+  }
+  const [row] = await runOutsideDbContext(() => withSystemDbAccessContext(() => db
+    .select({
+      id: actionIntents.id,
+      orgId: actionIntents.orgId,
+      actionName: actionIntents.actionName,
+      status: actionIntents.status,
+      arguments: actionIntents.arguments,
+    })
+    .from(actionIntents)
+    .where(eq(actionIntents.id, actionIntentId))
+    .limit(1)));
+  const mismatch = 'the approved action does not match this call';
+  if (!row) return refused(mismatch, 'intent_missing');
+  if (row.actionName !== 'run_script') return refused(mismatch, 'intent_other_tool');
+  if (row.status !== 'executing') return refused(mismatch, `intent_status_${row.status}`);
+  if (!auth.canAccessOrg(row.orgId)) return refused(mismatch, 'intent_org_inaccessible');
+  const args = row.arguments && typeof row.arguments === 'object' ? row.arguments as Record<string, unknown> : null;
+  if (!args || args.groupId !== undefined) return refused(mismatch, 'intent_args_not_frozen');
+  const deviceIds = args.deviceIds;
+  if (!Array.isArray(deviceIds) || deviceIds.length === 0 || !deviceIds.every((id) => typeof id === 'string')) {
+    return refused(mismatch, 'intent_args_no_device_ids');
+  }
+  if ((args.scriptId ?? null) !== (input.scriptId ?? null) || (args.proposalId ?? null) !== (input.proposalId ?? null)) {
+    return refused(mismatch, 'intent_script_mismatch');
+  }
+  return { ok: true, args };
+}
+
+/**
  * The run_script handler, at module scope so the proposal branch is directly
  * testable through `__testOnly.runScriptHandler`. Registered below.
  */
 const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
+  // ---- #8600: device-group target — execute the approved, frozen list -------
+  if (input.groupId !== undefined && input.groupId !== null) {
+    const frozen = await loadFrozenGroupTargetArguments(input, auth, context?.actionIntentId);
+    if (!frozen.ok) {
+      return JSON.stringify({ error: `group_target_not_released: ${frozen.reason}` });
+    }
+    input = frozen.args;
+  }
+
   // ---- AI script authoring (spec §4.2): run_script { proposalId } ----------
   if (typeof input.proposalId === 'string') {
     if (!aiScriptAuthoringEnabled()) {
       return JSON.stringify({ error: 'feature_disabled: AI script authoring is not enabled on this deployment' });
     }
+    const proposalId = input.proposalId;
     const proposalDeviceIds = input.deviceIds as string[];
-    const runnable = await assertProposalRunnable(auth, {
-      proposalId: input.proposalId,
+    // #7918 — run_script is self-managed (no per-call transaction), so every
+    // read below opens its own short caller-scoped context and the device wait
+    // holds none. See `inToolDbPhase`.
+    const runnable = await inToolDbPhase(auth, () => assertProposalRunnable(auth, {
+      proposalId,
       deviceIds: proposalDeviceIds,
       runAs: input.runAs as string | undefined,
       timeoutSeconds: input.timeoutSeconds as number | undefined,
@@ -262,7 +341,7 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
       // at creation; without it every approved proposal would read as
       // `consumed` by itself.
       releasingIntentId: context?.actionIntentId,
-    });
+    }));
     // Never a silent fallback to scriptId (spec §4.2): running something
     // other than the reviewed artifact is the failure this design exists to
     // prevent, so a refusal is always surfaced as a tool error.
@@ -295,9 +374,12 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
     // Same cap and same wait as the library path below — a proposal is not a
     // reason to relax either.
     for (const deviceId of proposalDeviceIds.slice(0, 10)) {
-      const access = await verifyDeviceAccess(deviceId, auth, true);
-      if ('error' in access) { proposalResults[deviceId] = { error: access.error }; continue; }
       try {
+        // Inside the per-device try (like the library path): each check now
+        // takes its own short connection, and a throw for one device must not
+        // lose the results of devices this call already dispatched.
+        const access = await inToolDbPhase(auth, () => verifyDeviceAccess(deviceId, auth, true));
+        if ('error' in access) { proposalResults[deviceId] = { error: access.error }; continue; }
         const created = await runOutsideDbContext(() => withSystemDbAccessContext(() =>
           aiDispatchScriptToDevice(auth, 'run_script', {
             device: access.device,
@@ -407,7 +489,9 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
   }
 
   // Resolve script content upfront so the agent receives the full payload
-  const script = verified ? verified.scriptRow : await queryRunScriptRow(input.scriptId as string, auth);
+  const script = verified
+    ? verified.scriptRow
+    : await inToolDbPhase(auth, () => queryRunScriptRow(input.scriptId as string, auth));
 
   if (!script || !script.content) {
     return JSON.stringify({ error: 'Script not found or has no content' });
@@ -438,7 +522,7 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
   for (const deviceId of deviceIds.slice(0, 10)) { // Limit to 10 devices
     try {
       // Verify access
-      const access = await verifyDeviceAccess(deviceId, auth);
+      const access = await inToolDbPhase(auth, () => verifyDeviceAccess(deviceId, auth));
       if ('error' in access) {
         results[deviceId] = { error: access.error };
         continue;
@@ -477,30 +561,32 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
       }
 
       if (scriptPartnerId !== null) {
-        const [deviceOrg] = await db
+        const [deviceOrg] = await inToolDbPhase(auth, () => db
           .select({ partnerId: organizations.partnerId })
           .from(organizations)
           .where(eq(organizations.id, access.device.orgId))
-          .limit(1);
+          .limit(1));
         if (!deviceOrg || deviceOrg.partnerId !== scriptPartnerId) {
           results[deviceId] = { error: 'Device not found or access denied' };
           continue;
         }
       }
 
-      // Escape the ambient held transaction before dispatch + poll (#3409 C1).
+      // Escape any ambient held transaction before dispatch + poll (#3409 C1).
       //
-      // Every AI tool handler (this one included) runs inside ONE held
-      // Postgres transaction for the whole turn — aiAgentSdkTools.ts:400
-      // and jobs/intentReleaseWorker.ts:459 both wrap tool dispatch in
-      // withDbAccessContext (see db/index.ts:436-484 for what "held"
-      // means: a real `baseDb.transaction()` that doesn't commit until
-      // the callback returns). Everything above this point (the script
-      // select, verifyDeviceAccess, the partner-org lookup) is RLS-scoped
-      // read work that belongs in that ambient transaction. Dispatch does
-      // not: if the device_commands INSERT stayed inside it, the row
-      // would be invisible to the agent-WS handler that processes the
-      // result on a *different* connection — its `UPDATE device_commands
+      // run_script is self-managed (#7918): the SDK wrapper, the MCP route
+      // and the intent-release worker open NO per-call transaction for it,
+      // and everything above this point (the script select,
+      // verifyDeviceAccess, the partner-org lookup) ran in its own short
+      // caller-scoped context via `inToolDbPhase`. A caller that still
+      // wraps the call in `withDbAccessContext` (see db/index.ts for what
+      // "held" means: a real `baseDb.transaction()` that doesn't commit
+      // until the callback returns) is joined instead, and then it — not
+      // this handler — owns the connection it pins for the wait below.
+      // Dispatch must never run inside such a transaction: if the
+      // device_commands INSERT stayed inside it, the row would be
+      // invisible to the agent-WS handler that processes the result on a
+      // *different* connection — its `UPDATE device_commands
       // ... WHERE id = commandId` would match 0 rows, and
       // waitForCommandResult would burn the full 60s timeout per device
       // while holding a pooled connection the entire time.
@@ -656,7 +742,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
     deviceArgs: ['deviceId'],
     definition: {
       name: 'execute_command',
-      description: "Execute a system command on a device. list_processes/file_list/event_logs_list skip approval in auto-execute (audited); per-step needs inline confirm. Others, incl. file_read, need full approval. list_processes cpuPercent is per-core (100%=1 core).",
+      description: "Run a system command on a device. list_processes/file_list/event_logs_list, and in chat event_logs_query on System/Setup without query, run without approval (audited). Others, incl. file_read, need approval. list_processes cpuPercent is per-core (100%=1 core).",
       input_schema: {
         type: 'object' as const,
         properties: {
@@ -682,16 +768,26 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
         required: ['deviceId', 'commandType']
       }
     },
-    handler: async (input, auth) => {
+    handler: async (input, auth, context) => {
       const deviceId = input.deviceId as string;
       const commandType = input.commandType as string;
+
+      // #7906: a chat call the gate auto-executed as read-only carries the
+      // payload it was classified on. Dispatch exactly that — never the raw
+      // input payload — and refuse a pin that does not match the command.
+      const pinned = context?.pinnedEventLogsQuery;
+      if (pinned && commandType !== 'event_logs_query') {
+        return JSON.stringify({ error: 'A pinned event_logs_query payload cannot dispatch another commandType' });
+      }
 
       // Verify device access
       const access = await verifyDeviceAccess(deviceId, auth, true);
       if ('error' in access) return JSON.stringify({ error: access.error });
       const { device } = access;
 
-      const payload = { ...((input.payload as Record<string, unknown>) ?? {}) };
+      const payload: Record<string, unknown> = pinned
+        ? { ...pinned.payload }
+        : { ...((input.payload as Record<string, unknown>) ?? {}) };
 
       // The tool description tells the model to send { serviceName } for the
       // three service commands — the same key manage_services' own input
@@ -709,6 +805,36 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
         if (payload.name === undefined) payload.name = payload.serviceName;
         delete payload.serviceName;
       }
+
+      // file_list / file_read through execute_command used to skip BOTH the
+      // default AI path restriction (file_operations applies it in its schema)
+      // and the agent-config deny. Apply the same rules here, so the only
+      // route past the restriction is an approved diagnostic access grant.
+      // A diagnostic authorization can never be supplied by a caller either:
+      // it is minted by the server at delivery for diag_file_* only.
+      if (commandType === 'file_list' || commandType === 'file_read') {
+        const path = typeof payload.path === 'string' ? payload.path : '';
+        if (path.includes('\0') || path.split(/[\\/]/).includes('..')) {
+          return JSON.stringify({ error: 'Invalid path' });
+        }
+        if (isAgentConfigPath(path)) {
+          return JSON.stringify({ error: 'Access to this path is not permitted', condition: 'policy_denied' });
+        }
+        // Same check as the tool schema (aiPathRefusal), repeated here for
+        // callers that reach the handler directly. A restricted location gets
+        // the pointer to the approval flow; any other refusal (relative, UNC,
+        // short-name or stream spellings, empty) is returned as is.
+        const refusal = aiPathRefusal(path);
+        if (refusal === PATH_BLOCKED_MESSAGE) {
+          return JSON.stringify({
+            error:
+              'Access to this path is blocked by the default AI path restriction. For read-only troubleshooting, ask an administrator to approve it with request_diagnostic_access, then use diagnostic_list_directory / diagnostic_read_file.',
+            condition: 'policy_denied',
+          });
+        }
+        if (refusal) return JSON.stringify({ error: refusal, condition: 'policy_denied' });
+      }
+      delete payload.diagnosticAuthorization;
 
       // Import and use executeCommand from commandQueue
       const result = await aiExecuteCommand(auth, 'execute_command', deviceId, commandType, payload, {
@@ -729,15 +855,22 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
     domain: 'scripts',
     searchHint: 'script execution on devices from saved library scripts or reviewed proposals',
     deviceArgs: ['deviceIds'],
+    // Waits up to 60 s PER DEVICE for the agent's result. Under the default
+    // per-call transaction that pinned a pooled connection idle-in-transaction
+    // for the whole run, and production Postgres killed it after one minute
+    // while the script went on to complete (#7918). The handler opens its own
+    // short contexts instead; see `AiTool.selfManagedDbContext`.
+    selfManagedDbContext: true,
     definition: {
       name: 'run_script',
-      description: "Run a saved scriptId or reviewed proposalId from propose_script on devices; never both. A pending proposalId is refused with proposal_review_pending — poll get_script_proposal until it finishes, then retry. Maintenance-window suppression is deferred, not failure. Approval is required.",
+      description: "Run a saved scriptId or reviewed proposalId (from propose_script) on deviceIds or one groupId, max 10 devices; give one of each pair. A pending proposalId returns proposal_review_pending: poll get_script_proposal, then retry. Maintenance-window deferral is not failure. Needs approval.",
       input_schema: {
         type: 'object' as const,
         properties: {
           scriptId: { type: 'string', description: 'UUID of an existing library script to run' },
           proposalId: { type: 'string', description: 'UUID of a REVIEWED AI-authored proposal from propose_script; mutually exclusive with scriptId. If pending, poll get_script_proposal until done, then retry.' },
-          deviceIds: { type: 'array', items: { type: 'string' }, description: 'Device UUIDs to run on' },
+          deviceIds: { type: 'array', items: { type: 'string' }, description: 'Device UUIDs to run on (max 10). Give exactly one of deviceIds or groupId.' },
+          groupId: { type: 'string', description: 'Saved device group UUID to run on instead of deviceIds. Its members are frozen when approval is requested and that list runs; refused above 10 devices.' },
           parameters: { type: 'object', description: 'Script parameters (library scripts only)' },
           expectedContentSha256: { type: 'string', description: 'Optional: contentSha256 from get_script_details. If the script changed, nothing runs and it returns error script_content_mismatch.' },
           // #4888 — see services/scriptRunRequest.ts. Shared with the three
@@ -745,7 +878,9 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
           // express a run context on every surface, not just some of them.
           ...AI_RUN_CONTEXT_JSON_SCHEMA_PROPERTIES
         },
-        required: ['deviceIds']
+        // Exactly one of deviceIds / groupId; toolInputSchemas.run_script
+        // enforces it, so neither is listed as required here (#8600).
+        required: []
       }
     },
     handler: runScriptHandler,
@@ -1617,7 +1752,7 @@ export function registerScriptTools(aiTools: Map<string, AiTool>): void {
   // ============================================
   // registry_operations - Tier 2 base, with action escalation
   //
-  // Base raised 1 -> 2 (2026-09-17 AI tool ROLE audit §2.4, SR5-01 precedent):
+  // Base raised 1 -> 2 (2026-09-17 AI tool ROLE audit §2.4, privileged-read precedent):
   // every action dispatches a real agent command, whose HTTP path requires
   // devices:execute + MFA (routes/devices/commands.ts:49). read_key/get_value
   // are classified in TIER2_ACTIONS and the writes in TIER3_ACTIONS; the base

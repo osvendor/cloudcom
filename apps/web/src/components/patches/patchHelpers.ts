@@ -71,7 +71,12 @@ export function normalizePatch(raw: Record<string, unknown>, index: number): Pat
   const osTypesRaw = raw.osTypes ?? raw.os_types;
   const os = raw.os ?? raw.osType ?? raw.os_type ?? raw.platform
     ?? (Array.isArray(osTypesRaw) && osTypesRaw.length > 0 ? osTypesRaw[0] : undefined);
-  const releaseDate = raw.releaseDate ?? raw.releasedAt ?? raw.release_date ?? raw.createdAt ?? '';
+  // No createdAt fallback: that is when the catalog imported the patch, not
+  // when the vendor released it. Linux package managers (apt/dnf/yum) never
+  // supply a release date, so the
+  // fallback showed import dates as release dates (#7800). Empty renders as
+  // "Unknown" in PatchList.
+  const releaseDate = raw.releaseDate ?? raw.releasedAt ?? raw.release_date ?? '';
   const approvalStatus = raw.approvalStatus ?? raw.approval_status ?? raw.status;
   const vendor = raw.vendor ?? null;
   const cveIdsRaw = raw.cveIds ?? raw.cve_ids;
@@ -195,6 +200,10 @@ export function normalizeRing(raw: Record<string, unknown>): UpdateRingItem {
     gracePeriodHours: Number(raw.gracePeriodHours ?? 4),
     autoApprove: normalizeRingAutoApprove(raw.autoApprove),
     categoryRules: Array.isArray(raw.categoryRules) ? raw.categoryRules as UpdateRingItem['categoryRules'] : [],
+    // #8187: the ring's per-app block / pin rules. The editor round-trips this
+    // value, so anything that is not a list (missing on an older API, or a
+    // malformed row) loads as no rules rather than reaching the form.
+    appRules: Array.isArray(raw.appRules) ? raw.appRules as UpdateRingItem['appRules'] : [],
     deviceCount: raw.deviceCount != null ? Number(raw.deviceCount) : undefined,
     updatedAt: raw.updatedAt ? String(raw.updatedAt) : undefined,
   };
@@ -208,6 +217,8 @@ export type DevicePatchRow = {
   pendingPatches: number;
   approvedMissing: number;
   unapprovedMissing: number;
+  /** Outstanding patches whose latest install attempt failed (#7214). Disjoint from approved/unapprovedMissing. */
+  failedMissing: number;
   criticalMissing: number;
   importantMissing: number;
   osMissing: number;
@@ -215,6 +226,8 @@ export type DevicePatchRow = {
   lastInstalledAt?: string;
   lastScannedAt?: string;
   pendingReboot: boolean;
+  /** W06: distinct container images behind their registry tag; a stale image is an outstanding update. */
+  staleImages?: number;
   /** Device status from the /devices API ('online' | 'offline' | ...). Used to
    *  mute the pending-reboot badge for offline devices, whose reboot flag is
    *  frozen at the last heartbeat and may be stale (#2219). */
@@ -355,4 +368,13 @@ export function normalizeCompliance(raw: Record<string, unknown>): PatchComplian
     importantSummary,
     devicesNeedingPatches
   };
+}
+
+/**
+ * A device needs updates when it has an outstanding OS/software patch or a
+ * container image behind its registry tag (W06, spec §10.1 — the API's
+ * compliant-device count uses the same rule).
+ */
+export function deviceNeedsUpdates(device: Pick<DevicePatchRow, 'pendingPatches' | 'staleImages'>): boolean {
+  return device.pendingPatches > 0 || (device.staleImages ?? 0) > 0;
 }

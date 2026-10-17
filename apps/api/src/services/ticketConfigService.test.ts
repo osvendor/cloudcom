@@ -350,7 +350,20 @@ describe('getTicketConfig inbound block', () => {
     const cfg = await getTicketConfig('p-1');
     expect(cfg.inbound.unknownSenderMode).toBe('quarantine');
     expect(cfg.inbound.dropUnverifiedSenders).toBe(false);
+    expect(cfg.inbound.staffForwardRouting).toBe(false);
     expect(cfg.inbound.triageUnknownSenders).toBe(false);
+  });
+  it('surfaces staffForwardRouting=true so the card can read it back and preserve it', async () => {
+    enqueueForInbound({ slug: 'acme', settings: { ticketing: { inbound: { staffForwardRouting: true } } } });
+    const cfg = await getTicketConfig(PARTNER);
+    expect(cfg.inbound.staffForwardRouting).toBe(true);
+  });
+  it('surfaces defaultAssigneeUserId (null when unset) so the card can show and preserve it', async () => {
+    enqueueForInbound({ slug: 'acme', settings: {} });
+    expect((await getTicketConfig(PARTNER)).inbound.defaultAssigneeUserId).toBeNull();
+    const user = '55555555-5555-4555-8555-555555555555';
+    enqueueForInbound({ slug: 'acme', settings: { ticketing: { inbound: { defaultAssigneeUserId: user } } } });
+    expect((await getTicketConfig(PARTNER)).inbound.defaultAssigneeUserId).toBe(user);
   });
   it('surfaces an explicit unknownSenderMode=drop and dropUnverifiedSenders=true', async () => {
     enqueueForInbound({ slug: 'acme', settings: { ticketing: { inbound: { unknownSenderMode: 'drop', dropUnverifiedSenders: true } } } });
@@ -676,6 +689,27 @@ describe('convertEmailInbound', () => {
     expect(row.ticketId).toBe('t-9');
     expect(row.parseStatus).toBe('created');
   });
+  it('converts a MICROSOFT 365 row with its body and sender name (#8299)', async () => {
+    // Build `raw` with the real Graph normalizer, so the Convert path and the
+    // normalizer cannot drift apart again: Convert must read what Graph writes.
+    const { normalizeGraphMessage } = await import('./ticketMailbox/normalizeGraphMessage');
+    const raw = normalizeGraphMessage({
+      id: 'graph-1',
+      subject: 'printer down',
+      from: { emailAddress: { address: 'cust@client.example', name: 'Chris Customer' } },
+      body: { contentType: 'html', content: '<p>the printer is on fire</p>' },
+    }, 'p-1', 'help@client.example').raw;
+    dbMocks.selectResults.push([{ id: 'm-1', partnerId: 'p-1', parseStatus: 'quarantined', fromAddress: 'cust@client.example', subject: 'printer down', toAddress: 'help@client.example', raw }]);
+    dbMocks.selectResults.push([{ id: 'o-1' }]);
+    dbMocks.updateResult = [{ id: 'm-1', fromAddress: 'cust@client.example', toAddress: 'help@client.example', subject: 'printer down', parseStatus: 'created', error: null, ticketId: 't-9', createdAt: new Date() }];
+    createTicketMock.mockResolvedValue({ id: 't-9' });
+    await convertEmailInbound('p-1', 'm-1', 'o-1', ACTOR);
+    expect(createTicketMock).toHaveBeenCalledWith(
+      expect.objectContaining({ description: 'the printer is on fire', submitterName: 'Chris Customer', submitterEmail: 'cust@client.example' }),
+      ACTOR,
+    );
+  });
+
   it('converts a GMAIL row from its neutral raw keys (bodyText/fromName), not the Mailgun keys', async () => {
     // A Gmail row's raw has no stripped-text/body-plain/from; it carries neutral
     // bodyText + fromName (normalizeGmailMessage). Reading only the Mailgun keys

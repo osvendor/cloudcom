@@ -33,6 +33,29 @@ const FIXTURE_ROOT = resolve(__dirname, 'fixtures/no-silent-mutations/src');
 // WS-A "targeted set": files that have ADOPTED runAction and must not regress
 // to silent mutations. Grows as more handlers migrate (see the backlog).
 const TARGET_GLOBS = [
+  // Trust Center W1 (#8768): publish/unpublish/preview/partner-home are the public-exposure
+  // mutations; the sections (Task 16) add their own entries.
+  'src/components/trustCenter/TrustCenterTab.tsx',
+  'src/components/trustCenter/TrustStatusCard.tsx',
+  'src/components/trustCenter/TrustPublishDialog.tsx',
+  'src/components/trustCenter/TrustControlsSection.tsx',
+  'src/components/trustCenter/TrustContentSection.tsx',
+  'src/components/trustCenter/TrustDocumentsSection.tsx',
+  // Caller verification W04 (#6354): technician client + the three components that mutate through it.
+  'src/lib/api/callerVerification.ts',
+  'src/components/callerVerification/VerifyCallerModal.tsx',
+  'src/components/callerVerification/ContactVerificationDrawer.tsx',
+  'src/components/callerVerification/CallerVerificationPolicyForm.tsx',
+  // #8385: vault sync/deactivate/save mutations must surface failures (they were silently swallowed)
+  'src/components/backup/VaultDashboard.tsx',
+  'src/components/backup/VaultConfigDialog.tsx',
+  'src/components/settings/TicketPushoverSettings.tsx',
+  // Endpoint messaging W1 (#8741): the send POST goes through runAction from birth.
+  'src/lib/endpointMessages.ts',
+  'src/components/endpointMessages/SendMessageDialog.tsx',
+  'src/components/devices/DeviceSettingsModal.tsx', // device tags/name/site PATCH via runAction (success toast)
+  'src/components/billing/PaymentsSettingsTab.tsx',
+  'src/components/billing/autopayClient.ts',
   'src/components/monitoring/conversion/ConversionLedger.tsx',
   'src/components/monitoring/conversion/NeedsConversionPanel.tsx',
   'src/components/monitoring/conversion/ConversionPendingBanner.tsx',
@@ -202,6 +225,12 @@ const TARGET_GLOBS = [
   'src/components/billing/quotes/QuotesPage.tsx',
   'src/components/billing/quotes/QuoteEditor.tsx',
   'src/components/alerts/CorrelatedAlertGroups.tsx',
+  // M365 confirm-tenant interstitial (#7913 W03): continue/cancel are the
+  // last step before Microsoft consent — in the targeted set from birth, with
+  // the two cards that host it.
+  'src/components/integrations/M365ConfirmTenantPanel.tsx',
+  'src/components/integrations/M365CustomerGraphReadCard.tsx',
+  'src/components/integrations/M365CustomerGraphActionsCard.tsx',
   'src/components/integrations/SecurityIntegration.tsx',
   // Accounting entity mapping workbench (QuickBooks, and Xero from W02):
   // confirm/create/unlink/sync decisions
@@ -495,6 +524,11 @@ const TARGET_GLOBS = [
   // measured (or no longer is) when it is not.
   'src/components/topology/MonitoringPolicyPanel.tsx',
   'src/components/topology/InterfaceTelemetrySettings.tsx',
+  // Reliability baseline markers (#5876 W02 Task 12): "Mark work done" (POST)
+  // and Clear (DELETE). A silent failure leaves a tech believing the score
+  // restarted from their fix — or reverted to full history — when it did not.
+  'src/components/devices/ReliabilityBaselineDialog.tsx',
+  'src/components/devices/ReliabilityBaselineSection.tsx',
 ];
 
 const absoluteFiles: string[] = TARGET_GLOBS.map((rel) => resolve(WEB_ROOT, '..', rel));
@@ -890,7 +924,19 @@ describe('no silent mutations in targeted set', () => {
     // W05 #7603 Task 13 adds ai/AiContinuationPrompt.tsx: 212 -> 213.
     // W06 #7604 Task 14 adds aiModels/ManualModelForm.tsx: 213 → 214.
     // (connectionForms/*.tsx hold no fetch calls: ConnectionDrawer performs the connection mutations.)
-    expect(absoluteFiles.length).toBe(214);
+    // W02 autopay adds the settings writer and shared transport.
+    // M365 identity-first W03 #7913 adds M365ConfirmTenantPanel.tsx and the
+    // two Customer Graph cards that host it: 216 → 219.
+    // Ticket-assignment Pushover adds settings/TicketPushoverSettings.tsx: 219 → 220.
+    // Reliability baselines (#5876) add devices/ReliabilityBaseline{Dialog,Section}.tsx: 220 → 222.
+    // DeviceSettingsModal.tsx (tag/name/site save moved to runAction) makes 223.
+    // #8385 adds backup/VaultDashboard.tsx and backup/VaultConfigDialog.tsx: 223 → 225.
+    // Caller verification W04 (#6354) adds lib/api/callerVerification.ts and
+    // callerVerification/{VerifyCallerModal,ContactVerificationDrawer,CallerVerificationPolicyForm}.tsx: 225 → 229.
+    // Endpoint messaging W1 (#8741) adds lib/endpointMessages.ts and endpointMessages/SendMessageDialog.tsx: 229 → 231.
+    // Trust Center W1 (#8768) adds TrustCenterTab, TrustStatusCard, TrustPublishDialog: 231 → 234.
+    // Trust Center sections (Task 16) add Controls/Content/Documents sections: 234 → 237.
+    expect(absoluteFiles.length).toBe(237);
     for (const f of absoluteFiles) {
       expect(() => statSync(f)).not.toThrow();
     }

@@ -2,12 +2,15 @@ import { createHmac, timingSafeEqual } from 'crypto';
 import { toMinorUnits } from '@breeze/shared';
 import { runOutsideDbContext } from '../../db';
 import { parseQboFault, qboErrorToProviderError, qboFaultOf } from './quickbooksFault';
+import { adoptFeeEntry, feeEntryDocumentNumber, feeEntryError, feeEntryMarker, findFeeEntry, validateFeeEntry } from './accountingFeeEntry';
 import { AccountingProviderError } from './accountingProviderError';
 import { withProviderCallSlot } from './accountingRateLimit';
 import { parseRetryAfterMs } from './retryAfter';
+import { capWithSuffix } from './accountingLineDescription';
 import { captureException } from '../sentry';
 import { QBO_CLIENT_ID, QBO_CLIENT_SECRET, QBO_ENVIRONMENT, QBO_REDIRECT_URI } from '../../config/env';
 import type {
+  AccountingFeeEntryPayload,
   AccountingCustomerPayload,
   AccountingDeletePaymentPayload,
   AccountingEntityMapping,
@@ -39,6 +42,11 @@ const QBO_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer
 const QBO_SCOPE = 'com.intuit.quickbooks.accounting';
 const QBO_API_MINOR_VERSION = '70';
 const QBO_QUERY_PAGE_SIZE = 1000; // QBO hard cap per query page
+/**
+ * #8605: Intuit Invoice reference, SalesItemLine `Description`: "max
+ * character: Max 4000 chars". Applied in UTF-16 units (accountingLineDescription).
+ */
+export const QBO_LINE_DESCRIPTION_MAX = 4000;
 
 /**
  * Abort budget for the OPTIONAL home-currency capture. It is awaited inline in
@@ -602,6 +610,39 @@ export class QuickbooksProvider implements AccountingProvider {
     return this.boundary('QuickBooks invoice void', () => this.voidInvoiceRaw(conn, invoice, mapping));
   }
 
+  async postFeeEntry(conn:AccountingConnection,entry:AccountingFeeEntryPayload,hooks:import('./types').AccountingFeeEntryHooks={}):Promise<RemoteRef>{
+    return this.boundary('QuickBooks fee entry',async()=>{
+      validateFeeEntry('quickbooks',entry);
+      const entity=entry.direction==='receipt'?'SalesReceipt':'RefundReceipt';
+      const doc=feeEntryDocumentNumber(entry);
+      type Row={Id?:string;SyncToken?:string;PrivateNote?:string;TotalAmt?:number;CustomerRef?:{value?:string};CurrencyRef?:{value?:string}};
+      const query=`select * from ${entity} where DocNumber = '${doc}' maxresults 2`;
+      const adopted=await findFeeEntry('quickbooks',entry,async()=>{
+      const found=await this.qboRequest<{QueryResponse?:{SalesReceipt?:Row[];RefundReceipt?:Row[]}}>(conn,
+        `query?query=${encodeURIComponent(query)}&minorversion=${QBO_API_MINOR_VERSION}`,'QuickBooks fee lookup');
+      if(!found.QueryResponse)throw feeEntryError('quickbooks','Fee lookup could not be enumerated','transient');
+      return adoptFeeEntry('quickbooks',entry,(found.QueryResponse[entity]??[]).map(row=>({
+        id:row.Id??'',marker:row.PrivateNote??'',amount:String(row.TotalAmt),customerId:row.CustomerRef?.value??'',
+        currency:row.CurrencyRef?.value??conn.homeCurrency??'',remoteVersion:row.SyncToken,
+      })));
+      });
+      if(adopted)return adopted;
+      // Adoption remains possible even when the old payload lacks a cash account.
+      if(!entry.bankAccountRef)throw feeEntryError('quickbooks','Choose a processing fee payment account in Integrations');
+      const response=await this.boundary('QuickBooks fee create',()=>this.qboRequest<{SalesReceipt?:Row;RefundReceipt?:Row}>(conn,
+        `${entity.toLowerCase()}?minorversion=${QBO_API_MINOR_VERSION}&requestid=${encodeURIComponent(entry.operationId)}`,
+        'QuickBooks fee create',{method:'POST',body:JSON.stringify({DocNumber:doc,PrivateNote:feeEntryMarker(entry),
+          CustomerRef:{value:entry.remoteCustomerId},TxnDate:entry.txnDate,
+          ...(entry.bankAccountRef?{DepositToAccountRef:{value:entry.bankAccountRef}}:{}),
+          Line:[{Amount:Number(entry.amount),DetailType:'SalesItemLineDetail',Description:'Payment processing fee',
+            SalesItemLineDetail:{ItemRef:{value:entry.incomeRef},Qty:1,UnitPrice:Number(entry.amount),TaxCodeRef:{value:'NON'}}}],
+        })},hooks.beforeCreate));
+      const row=response[entity];
+      if(!row?.Id)throw feeEntryError('quickbooks','Fee response omitted its id','transient');
+      return {id:row.Id,remoteVersion:row.SyncToken};
+    });
+  }
+
   async createPayment(conn: AccountingConnection, payment: AccountingPaymentPayload): Promise<RemoteRef> {
     return this.boundary('QuickBooks payment create', () => this.createPaymentRaw(conn, payment));
   }
@@ -915,8 +956,16 @@ export class QuickbooksProvider implements AccountingProvider {
         // The wire-time Number() conversion — storage stays a major-unit
         // decimal string (spec §12); QBO wants a JSON number.
         Amount: Number(line.lineTotal),
-        Description: line.description,
+        // #8605: sent verbatim within QuickBooks' 4000-character limit (no
+        // trim, so every fitting description is unchanged). An over-limit one
+        // is truncated before the worked-vs-billed suffix, which stays whole;
+        // previously it was sent whole and QuickBooks refused the invoice.
+        Description: capWithSuffix(line.description, line.descriptionSuffix ?? '', QBO_LINE_DESCRIPTION_MAX),
         SalesItemLineDetail: {
+          // #8605: Intuit SalesItemLineDetail.ServiceDate (optional Date, "Date
+          // when the service is performed"). Present only when the invoice's
+          // frozen line detail shows dates; the date stays out of the text.
+          ...(line.serviceDate ? { ServiceDate: line.serviceDate } : {}),
           ItemRef: itemRef ? { value: itemRef.id } : undefined,
           Qty: Number(line.quantity),
           UnitPrice: Number(line.unitPrice),
@@ -1446,6 +1495,7 @@ export class QuickbooksProvider implements AccountingProvider {
     path: string,
     operation: string,
     init: RequestInit = {},
+    beforeSend?: () => Promise<void>,
   ): Promise<T> {
     if (!conn.realmId) throw new Error('QuickBooks connection is missing a realmId');
     if (!conn.accessToken) throw new Error('QuickBooks connection is missing an access token');
@@ -1455,6 +1505,7 @@ export class QuickbooksProvider implements AccountingProvider {
     // per request and never hold one while waiting for another, which would
     // deadlock at the per-connection concurrency cap.
     return withProviderCallSlot('quickbooks', this.limits.rate, conn.id, async () => {
+      await beforeSend?.();
       const response = await runOutsideDbContext(() => fetch(
         `${qboApiBase(conn.environment)}/v3/company/${conn.realmId}/${path}`,
         {

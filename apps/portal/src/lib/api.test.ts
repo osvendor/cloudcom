@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { buildPortalApiUrl, portalApi, publicApiPath } from './api';
+import { apiPost, buildPortalApiUrl, portalApi, publicApiPath } from './api';
 
 // Regression guard for the same-origin client API base (the deploy relies on it):
 // with PUBLIC_API_URL unset, the browser must issue RELATIVE /api/v1 requests so
@@ -467,5 +467,49 @@ describe('portalApi customer reports', () => {
       code: 'PORTAL_REPORT_NOT_GENERATED',
       statusCode: 404,
     });
+  });
+});
+
+// A refusal's structured reason (e.g. an autopay skip refused because the payment is
+// already processing) must reach the caller: the code alone is shared by other refusals.
+describe('error details', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('surfaces an error body\'s details separately from data', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      error: 'A payment is already processing', code: 'COLLECTION_IN_PROGRESS', details: { reason: 'payment_processing' },
+    }), { status: 409 })));
+    const result = await apiPost('/autopay/public/token/skip', {}, { redirectOnUnauthorized: false });
+    expect(result).toMatchObject({ code: 'COLLECTION_IN_PROGRESS', statusCode: 409, errorDetails: { reason: 'payment_processing' } });
+    expect(result.data).toBeUndefined();
+  });
+});
+
+describe('portalApi approvals (#8200)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('getApprovals hits /portal/approvals, with ?status=pending when pendingOnly', async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ data: [] }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await portalApi.getApprovals();
+    await portalApi.getApprovals({}, { pendingOnly: true });
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/\/portal\/approvals$/);
+    expect(String(fetchMock.mock.calls[1][0])).toMatch(/\/portal\/approvals\?status=pending$/);
+  });
+
+  it('approve and deny POST the decision body to the right path', async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ data: { status: 'approved' } }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const body = { revision: 3, signerName: 'Pat Doe', note: 'ok' };
+    await portalApi.approveApproval('abc', body);
+    await portalApi.denyApproval('abc', body);
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/\/portal\/approvals\/abc\/approve$/);
+    expect(String(fetchMock.mock.calls[1][0])).toMatch(/\/portal\/approvals\/abc\/deny$/);
+    expect(fetchMock.mock.calls[0][1].method).toBe('POST');
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual(body);
   });
 });

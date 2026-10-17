@@ -20,6 +20,8 @@ import {
   type DeliverableCommand,
 } from './sensitiveCommandPayload';
 import { captureException } from './sentry';
+import { prepareDiagnosticDelivery } from './diagnosticAccess/delivery';
+import { isStaleRestorePointPayload, refreshRestorePointForDelivery } from './restorePointRequest';
 
 export {
   CommandDeliveryDeferredError,
@@ -83,6 +85,12 @@ export function __resetDeliveryRefreshersForTests(): void {
   for (const key of Object.keys(deliveryRefreshers)) delete deliveryRefreshers[key];
 }
 
+// Administrator-approved diagnostic reads: the signed per-command
+// authorization is minted here, at delivery, after the grant is re-checked; it
+// is never stored in the queued payload (services/diagnosticAccess/delivery.ts).
+registerDeliveryRefresher('diag_file_list', (payload, ctx) => prepareDiagnosticDelivery('list', payload, ctx));
+registerDeliveryRefresher('diag_file_read', (payload, ctx) => prepareDiagnosticDelivery('read', payload, ctx));
+
 // Uploaded installers travel as an S3 key; the one-hour presigned URL is
 // minted at delivery so an install claimed six hours later still downloads.
 registerDeliveryRefresher('software_install', async (payload) => {
@@ -141,6 +149,22 @@ for (const [type, component] of [['update_agent', 'agent'], ['update_watchdog', 
     }
     return payload;
   });
+}
+
+/**
+ * The refresher to run for one claimed command: the type's registered
+ * refresher, followed -- only when the payload carries an EXPIRED
+ * `restorePoint` snapshot (#4609 W05) -- by the restore-point re-stamp step.
+ * Type-agnostic and composed rather than registered, because a type may have
+ * at most one registered refresher (software_install already does).
+ *
+ * Every payload without the key, and every fresh block (including transport
+ * redelivery of the same command id), takes exactly the pre-W05 path.
+ */
+function refresherForClaimedPayload(type: string, payload: unknown): DeliveryRefresher | undefined {
+  const base = deliveryRefreshers[type];
+  if (!isStaleRestorePointPayload(payload, new Date())) return base;
+  return async (p, ctx) => refreshRestorePointForDelivery(base ? await base(p, ctx) : p, ctx);
 }
 
 /**
@@ -305,6 +329,14 @@ async function expireRefusedClaim(
  * Release a claimed row whose refresher DEFERRED it, recording why. Best-effort
  * like the other release paths: a failure is reported, never thrown.
  */
+/**
+ * Recorded on a command whose delivery refresher failed for an ordinary
+ * reason (a lookup or storage error), so the stale reaper can say why it was
+ * never delivered. Operator-facing: the raw error stays in the log.
+ */
+export const DELIVERY_PREPARATION_FAILED_MESSAGE =
+  'Breeze could not prepare this command for delivery and will try again when the device next checks in.';
+
 async function releaseDeferredClaim(
   commandId: string,
   type: string,
@@ -370,7 +402,7 @@ async function refreshClaimedCommandPayloads(
 ): Promise<ClaimedCommand[]> {
   const out: ClaimedCommand[] = [];
   for (const cmd of claimed) {
-    const refresher = deliveryRefreshers[cmd.type];
+    const refresher = refresherForClaimedPayload(cmd.type, cmd.payload);
     if (!refresher) {
       out.push(cmd);
       continue;
@@ -413,7 +445,7 @@ async function refreshClaimedCommandPayloads(
         if (!cmd.executedAt) {
           throw new Error('claimed command row has no executedAt — cannot release');
         }
-        await releaseClaimedCommandDelivery(cmd.id, cmd.executedAt);
+        await releaseClaimedCommandDelivery(cmd.id, cmd.executedAt, DELIVERY_PREPARATION_FAILED_MESSAGE);
       } catch (releaseErr) {
         const releaseMessage = releaseErr instanceof Error ? releaseErr.message : String(releaseErr);
         console.error(
@@ -447,7 +479,7 @@ export async function refreshClaimedPayloadForPush(
   payload: Record<string, unknown>,
   ctx: DeliveryRefreshContext,
 ): Promise<PushRefreshOutcome> {
-  const refresher = deliveryRefreshers[type];
+  const refresher = refresherForClaimedPayload(type, payload);
   if (!refresher) return { ok: true, payload };
   try {
     return { ok: true, payload: await runRefresher(refresher, payload, ctx) };
@@ -477,6 +509,11 @@ export async function refreshClaimedPayloadForPush(
     // say) silently downgrades every direct push to a heartbeat wait, and
     // nothing else on this path surfaces that.
     captureException(err instanceof Error ? err : new Error(String(err)));
+    // Released here with an operator-facing reason, so the caller's own
+    // release is a 0-row no-op; the next claim tries again.
+    if (ctx.claimedAt) {
+      await releaseDeferredClaim(ctx.commandId, type, ctx.claimedAt, DELIVERY_PREPARATION_FAILED_MESSAGE);
+    }
     return { ok: false, refusal: null };
   }
 }

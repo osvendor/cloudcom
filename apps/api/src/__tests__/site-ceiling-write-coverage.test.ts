@@ -74,6 +74,9 @@ const GOVERNANCE_TABLE_NAMES = [
   // organization at once, and there is no per-site slice of it.
   'm365Connections',
   'googleWorkspaceConnections',
+  // A DNS allow/block policy is pushed to the org's DNS filtering provider and
+  // applies to every device behind it; the table has no site axis.
+  'dnsPolicies',
 ] as const;
 
 /**
@@ -133,6 +136,13 @@ const ALLOWED_WITHOUT_CEILING_CHECK: Record<string, string> = {
   'services/webhookDeliveryRecord.ts':
     'updates only successCount/failureCount/lastDeliveryAt after a delivery attempt, invoked from the delivery worker in system context (runWithSystemDbAccess) — no caller-scoped auth object reaches this path',
 
+  // Security-scan dispatch flips a grandfathered legacy link to 'revoked' when
+  // its policy creator no longer holds devices:execute. Runs in the scan
+  // worker's system context; it only ever narrows (stops auto-quarantine), and
+  // writes nothing but execution_authority_legacy.
+  'services/securityScanQuarantineAuthority.ts':
+    'sets only execution_authority_legacy grandfathered -> revoked from the security-scan dispatch worker (system context) — fail-safe narrowing, no caller-scoped auth object reaches this path',
+
   // configureDefaults creates a default notification channel as part of
   // MCP-invite PARTNER BOOTSTRAP — the caller is a freshly-minted partner
   // API key with no org-scoped `allowedSiteIds` at all (site ceilings only
@@ -142,8 +152,9 @@ const ALLOWED_WITHOUT_CEILING_CHECK: Record<string, string> = {
   // The M365 control-plane connection lifecycle (consent / upgrade-consent /
   // retest / sync / disconnect, for BOTH the customer-graph-read and
   // customer-graph-actions profiles). Every caller-facing entry point is
-  // gated by its ROUTE: routes/m365CustomerGraphRead.ts (5 POST handlers) and
-  // routes/m365CustomerGraphActions.ts (3) each call
+  // gated by its ROUTE: routes/m365CustomerGraphRead.ts (7 POST handlers, incl.
+  // the W03 confirm-tenant continue/cancel) and routes/m365CustomerGraphActions.ts
+  // (5) each call
   // canMutateOrgWideGovernance before they resolve the org. The only other
   // caller, routes/m365ConsentCallback.ts, is the Microsoft admin-consent
   // redirect landing — it runs no authMiddleware and never reads `auth` at
@@ -159,6 +170,14 @@ const ALLOWED_WITHOUT_CEILING_CHECK: Record<string, string> = {
   // which the walk itself excludes.
   'services/m365ControlPlane/__testHelpers__/seedActionsConnection.ts':
     'test-only fixture seeder for integration suites — inserts a connection row directly and is imported exclusively by *.test.ts files, so no caller-scoped auth ever reaches it',
+
+  // DNS policy sync worker: records syncStatus/lastSynced/syncError after
+  // pushing an already-saved policy to the provider. Runs in system context
+  // from the BullMQ job, reloading the policy by id; no caller-scoped auth
+  // object reaches it. The caller-facing writers (routes/dnsSecurity.ts,
+  // services/aiToolsDns.ts) gate before enqueueing.
+  'jobs/dnsSyncJob.ts':
+    'updates only syncStatus/lastSynced/syncError on a saved DNS policy from the sync worker in system context (runWithSystemDbAccess) — no caller-scoped auth object reaches this path',
 
   'modules/mcpInvites/tools/configureDefaults.ts':
     'creates the default admin-email notification channel during MCP-invite partner bootstrap — the caller is a partner-bootstrap key, not a site-restricted org-scope caller, and the target org is fixed by the bootstrap context, not caller-chosen',
@@ -310,6 +329,11 @@ describe('site-ceiling write coverage (contract-site-ceiling-gate)', () => {
       // route and its AI-tool twin.
       'routes/monitorDefinitions.ts',
       'services/aiToolsMonitors.ts',
+      // Org-wide user-risk policy (weights, thresholds, interventions).
+      'routes/userRisk.ts',
+      // Org-wide DNS allow/block policies (route + AI-tool twin).
+      'routes/dnsSecurity.ts',
+      'services/aiToolsDns.ts',
     ];
 
     for (const rel of fixed) {

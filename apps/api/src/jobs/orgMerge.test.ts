@@ -20,6 +20,9 @@ const {
   enqueueTenantErasureMock,
   createAuditLogMock,
   removeOrgFromPartnerOrderMock,
+  resolveMergePerformerRefusalMock,
+  findEvidenceHoldMock,
+  dbContextCalls,
   capturedWorkerProcessor,
 } = vi.hoisted(() => ({
   addMock: vi.fn(),
@@ -30,6 +33,9 @@ const {
   enqueueTenantErasureMock: vi.fn(),
   createAuditLogMock: vi.fn(),
   removeOrgFromPartnerOrderMock: vi.fn(),
+  resolveMergePerformerRefusalMock: vi.fn(),
+  findEvidenceHoldMock: vi.fn(),
+  dbContextCalls: [] as string[],
   capturedWorkerProcessor: {
     current: null as null | ((job: unknown) => Promise<unknown>),
   },
@@ -55,6 +61,27 @@ vi.mock('bullmq', () => ({
     close = () => workerCloseMock();
   },
   Job: class {},
+  UnrecoverableError: class UnrecoverableError extends Error {
+    constructor(message?: string) {
+      super(message);
+      this.name = 'UnrecoverableError';
+    }
+  },
+}));
+
+vi.mock('../db', () => ({
+  runOutsideDbContext: <T,>(fn: () => Promise<T>) => {
+    dbContextCalls.push('runOutsideDbContext');
+    return fn();
+  },
+  withSystemDbAccessContext: <T,>(fn: () => Promise<T>) => {
+    dbContextCalls.push('withSystemDbAccessContext');
+    return fn();
+  },
+}));
+
+vi.mock('../services/orgMergePerformerAuthority', () => ({
+  resolveMergePerformerRefusal: (...args: unknown[]) => resolveMergePerformerRefusalMock(...(args as [])),
 }));
 
 vi.mock('../services/redis', () => ({
@@ -75,6 +102,11 @@ vi.mock('./tenantErasure', () => ({
 
 vi.mock('../services/auditService', () => ({
   createAuditLog: (...args: unknown[]) => createAuditLogMock(...(args as [])),
+}));
+
+vi.mock('../services/orgEvidenceHold', async (importActual) => ({
+  ...(await importActual<typeof import('../services/orgEvidenceHold')>()),
+  findEvidenceHold: (...args: unknown[]) => findEvidenceHoldMock(...(args as [])),
 }));
 
 vi.mock('../services/orgOrdering', () => ({
@@ -116,6 +148,10 @@ describe('orgMerge worker', () => {
     enqueueTenantErasureMock.mockResolvedValue({ id: 'tenant-erasure-org-loser' });
     createAuditLogMock.mockResolvedValue(undefined);
     removeOrgFromPartnerOrderMock.mockResolvedValue(undefined);
+    resolveMergePerformerRefusalMock.mockResolvedValue(null);
+    // PAM ownership epochs W5 (#8207): no evidence hold unless a test says so.
+    findEvidenceHoldMock.mockResolvedValue(null);
+    dbContextCalls.length = 0;
     capturedWorkerProcessor.current = null;
   });
 
@@ -340,6 +376,39 @@ describe('orgMerge worker', () => {
         processor({ name: 'org-merge', id: 'org-merge-org-loser', data: PAYLOAD }),
       ).resolves.toBeDefined();
     });
+
+    it('hands a held shell to (scoped) erasure: deferred-evidence audit, enqueue, erasure_enqueued audit marked scoped, ordering cleanup still runs', async () => {
+      findEvidenceHoldMock.mockResolvedValueOnce({
+        loserOrgId: 'org-loser',
+        partnerId: 'partner-1',
+        survivorOrgId: 'org-survivor',
+        mergeEventId: 'merge-event-1',
+        reason: 'pam_evidence',
+      });
+      createOrgMergeWorker();
+      const processor = capturedWorkerProcessor.current!;
+      await processor({ name: 'org-merge', id: 'org-merge-org-loser', data: PAYLOAD });
+
+      expect(findEvidenceHoldMock).toHaveBeenCalledWith('org-loser');
+      expect(createAuditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orgId: null,
+          action: 'tenant.erasure.deferred_evidence_hold',
+          resourceId: 'org-loser',
+          details: expect.objectContaining({ stage: 'merge_phase_c', survivorOrgId: 'org-survivor' }),
+        }),
+      );
+      // #8746: the hold scopes the erasure (cascadeDeleteOrg keeps the
+      // evidence); it no longer keeps the shell out of erasure.
+      expect(enqueueTenantErasureMock).toHaveBeenCalledWith(expect.objectContaining({ orgId: 'org-loser' }));
+      expect(createAuditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'org.merge.erasure_enqueued',
+          details: expect.objectContaining({ evidenceHoldScoped: true }),
+        }),
+      );
+      expect(removeOrgFromPartnerOrderMock).toHaveBeenCalledWith('partner-1', 'org-loser');
+    });
   });
 
   describe('failure path', () => {
@@ -360,6 +429,89 @@ describe('orgMerge worker', () => {
         expect.objectContaining({ action: 'org.merge.erasure_enqueued' }),
       );
       expect(removeOrgFromPartnerOrderMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('performer re-check at execution time', () => {
+    it('re-checks the stored performer under a system context before the merge runs', async () => {
+      const order: string[] = [];
+      resolveMergePerformerRefusalMock.mockImplementation(async () => {
+        order.push('recheck');
+        return null;
+      });
+      executeOrgMergeMock.mockImplementation(async () => {
+        order.push('executeOrgMerge');
+        return MERGE_RESULT;
+      });
+      createOrgMergeWorker();
+      const processor = capturedWorkerProcessor.current!;
+      await processor({ name: 'org-merge', id: 'org-merge-org-loser', data: PAYLOAD });
+
+      expect(resolveMergePerformerRefusalMock).toHaveBeenCalledWith({
+        loserOrgId: 'org-loser',
+        survivorOrgId: 'org-survivor',
+        partnerId: 'partner-1',
+        performedBy: 'admin-1',
+        performedByEmail: 'admin@example.com',
+      });
+      expect(order).toEqual(['recheck', 'executeOrgMerge']);
+      // First pair: the performer re-check. Second pair: Phase C's evidence-hold lookup.
+      expect(dbContextCalls).toEqual([
+        'runOutsideDbContext',
+        'withSystemDbAccessContext',
+        'runOutsideDbContext',
+        'withSystemDbAccessContext',
+      ]);
+    });
+
+    it.each([
+      'performer_not_found',
+      'performer_inactive',
+      'performer_not_in_partner',
+      'performer_lacks_permission',
+      'performer_lacks_org_access',
+    ])('fails the job terminally without merging when the re-check returns %s', async (refusal) => {
+      resolveMergePerformerRefusalMock.mockResolvedValue(refusal);
+      createOrgMergeWorker();
+      const processor = capturedWorkerProcessor.current!;
+
+      const err = await processor({ name: 'org-merge', id: 'org-merge-org-loser', data: PAYLOAD })
+        .then(() => null, (e: unknown) => e as Error);
+      expect(err).toBeInstanceOf(Error);
+      expect(err!.name).toBe('UnrecoverableError');
+      expect(err!.message).toContain(refusal);
+
+      expect(executeOrgMergeMock).not.toHaveBeenCalled();
+      expect(enqueueTenantErasureMock).not.toHaveBeenCalled();
+      expect(removeOrgFromPartnerOrderMock).not.toHaveBeenCalled();
+      expect(createAuditLogMock).toHaveBeenCalledTimes(1);
+      expect(createAuditLogMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orgId: null,
+          actorId: 'admin-1',
+          action: 'org.merge.failed',
+          resourceType: 'organization',
+          resourceId: 'org-loser',
+          result: 'failure',
+          details: expect.objectContaining({
+            survivorOrgId: 'org-survivor',
+            reason: 'performer_no_longer_authorized',
+            performerCheck: refusal,
+          }),
+        }),
+      );
+    });
+
+    it('lets a re-check lookup failure fail the job without merging', async () => {
+      resolveMergePerformerRefusalMock.mockRejectedValue(new Error('lookup boom'));
+      createOrgMergeWorker();
+      const processor = capturedWorkerProcessor.current!;
+
+      await expect(
+        processor({ name: 'org-merge', id: 'org-merge-org-loser', data: PAYLOAD }),
+      ).rejects.toThrow(/lookup boom/);
+      expect(executeOrgMergeMock).not.toHaveBeenCalled();
+      expect(enqueueTenantErasureMock).not.toHaveBeenCalled();
     });
   });
 

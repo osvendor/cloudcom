@@ -9,11 +9,14 @@ export * from './assuranceLevel';
 export * from './ticketTemplate';
 export * from './alertTemplate';
 export * from './emailTemplates';
+export * from './paymentMethodLabel';
 export * from './hrefSafety';
 export * from './quoteMath';
 export * from './documentTerms';
 export * from './quoteFulfillment';
+export * from './quoteOrderability';
 export * from './depositMath';
+export * from './invoiceLineDetail';
 export * from './csvExport';
 export * from './reportSchedule';
 export * from './s3Region';
@@ -27,6 +30,7 @@ export * from './deviceLogSilence';
 export * from './aiToolHandoff';
 export * from './aiToolLabels';
 export * from './scriptSecurityPatterns';
+export * from './scriptLaneGrant';
 // Deliberately NOT `export *`. `compileExcludeMatcher` is a code-point port of
 // the agent's matcher and knowingly diverges from Go on mid-rune byte offsets
 // and Unicode special-casing (see matcherPortLimitations in
@@ -51,3 +55,5 @@ export * from './vulnerabilityManagement';
 export * from './cleanupRules';
 export * from './scanPath';
 export * from './securityScanSettings';
+export * from './paymentMethodLabel';
+export * from './discoverySubnetLimit';

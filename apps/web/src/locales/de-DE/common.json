@@ -66,6 +66,7 @@
     "aiAgents": "KI-Agenten",
     "aiAgentRuns": "KI-Agenten-Läufe",
     "aiImpact": "KI-Wirkung",
+    "fixMemory": "Fix-Gedächtnis",
     "fleetDesign": "Flottendesign",
     "customFields": "Benutzerdefinierte Felder",
     "savedFilters": "Gespeicherte Filter",
@@ -107,7 +108,13 @@
     "system": "System",
     "monitorConversion": "Monitor-Konvertierung",
     "timeSync": "Zeitsynchronisierung",
-    "aiModels": "KI-Modelle"
+    "aiModels": "KI-Modelle",
+    "autopay": "Autopay",
+    "payments": "Payments",
+    "ticketsIncidents": "Störungen",
+    "ticketsServiceRequests": "Serviceanfragen",
+    "ticketsProblems": "Probleme",
+    "ticketsChanges": "Änderungen"
   },
   "documentTitles": {
     "dashboard": "Dashboard",
@@ -405,7 +412,9 @@
       "unratedPending": "{{count}} unbewertete Patches ausstehend (werden nicht automatisch genehmigt)",
       "unratedPending_one": "{{count}} unbewerteter Patch ausstehend (wird nicht automatisch genehmigt)",
       "unratedPending_other": "{{count}} unbewertete Patches ausstehend (werden nicht automatisch genehmigt)",
-      "empty": "Noch keine Patch-Daten"
+      "empty": "Noch keine Patch-Daten",
+      "imagesNotChecked_one": "{{count}} Container-Image nicht geprüft",
+      "imagesNotChecked_other": "{{count}} Container-Images nicht geprüft"
     },
     "vuln": {
       "title": "Schwachstellen",
@@ -491,7 +500,9 @@
       "noGroups": "Keine Gerätegruppen verfügbar",
       "deviceCount": "{{count}} Geräte",
       "loadSaved": "Gespeicherten Filter laden:",
-      "select": "Auswählen"
+      "select": "Auswählen",
+      "dynamic": "Dynamisch",
+      "refusedGroup": "Als Ziel nicht verfügbar: Die Regeln dieser Gruppe beruhen auf Feldern, die ein Gerät selbst meldet ({{fields}})."
     },
     "preview": {
       "title": "Übereinstimmende Geräte",
@@ -1304,6 +1315,26 @@
           "ticketCreated": {
             "description": "Wird ausgelöst, wenn ein Ticket erstellt wird.",
             "label": "Ticket erstellt"
+          },
+          "ticketCommented": {
+            "description": "Wird ausgelöst, wenn ein Kommentar oder eine Notiz zu einem Ticket hinzugefügt wird.",
+            "label": "Ticket kommentiert"
+          },
+          "ticketStatusChanged": {
+            "description": "Wird ausgelöst, wenn sich der Status eines Tickets ändert.",
+            "label": "Ticketstatus geändert"
+          },
+          "ticketUpdated": {
+            "description": "Wird ausgelöst, wenn Ticketfelder bearbeitet werden.",
+            "label": "Ticket aktualisiert"
+          },
+          "ticketAssigned": {
+            "description": "Wird ausgelöst, wenn ein Ticket zugewiesen oder die Zuweisung aufgehoben wird.",
+            "label": "Ticket zugewiesen"
+          },
+          "migrationWindowClosed": {
+            "description": "Wird einmal pro Organisation ausgelöst, wenn ein Ticket-Migrationsfenster geschlossen wird, mit den importierten Zählungen.",
+            "label": "Migrationsfenster geschlossen"
           }
         },
         "fields": {
@@ -1428,6 +1459,7 @@
           "created": "Webhook erstellt",
           "disabled": "Webhook deaktiviert",
           "enabled": "Webhook aktiviert",
+          "retryQueued": "Erneute Zustellung in die Warteschlange gestellt",
           "testQueued": "Testzustellung in die Warteschlange gestellt",
           "updated": "Webhook aktualisiert"
         },
@@ -1639,18 +1671,24 @@
         "friendly": {
           "adminRequired": "Für die Genehmigung von Stundenzetteln ist eine Administratorrolle erforderlich.",
           "approvedImmutable": "Genehmigte Einträge können nur von einem Administrator geändert werden.",
-          "notOwnEntry": "Sie können nur Ihre eigenen Zeiteinträge bearbeiten."
+          "notOwnEntry": "Sie können nur Ihre eigenen Zeiteinträge bearbeiten.",
+          "entryBilled": "Dieser Eintrag wurde bereits abgerechnet und kann nicht gelöscht werden. Stornieren Sie zuerst die Rechnung.",
+          "notOwnEntryDelete": "Sie können nur Ihre eigenen Zeiteinträge löschen.",
+          "entryDeleteLost": "Der Eintrag wurde während des Löschens geändert. Neu laden und erneut versuchen.",
+          "entryNotFound": "Dieser Eintrag existiert nicht mehr."
         },
         "errors": {
           "bulkApprovalFailed": "Die Massengenehmigung ist fehlgeschlagen. Wiederholen.",
           "saveEntryFailed": "Eintrag konnte nicht gespeichert werden. Wiederholen.",
-          "loadTimesheetFailed": "Die Arbeitszeittabelle konnte nicht geladen werden. Wiederholen."
+          "loadTimesheetFailed": "Die Arbeitszeittabelle konnte nicht geladen werden. Wiederholen.",
+          "deleteEntryFailed": "Eintrag konnte nicht gelöscht werden. Wiederholen."
         },
         "toasts": {
           "bulkSkipped": "{{updated}} aktualisiert, {{skipped}} übersprungen ({{reasons}})",
           "bulkApproved": "{{count}} genehmigt",
           "bulkUnapproved": "{{count}} nicht genehmigt",
-          "entryUpdated": "Eintrag aktualisiert"
+          "entryUpdated": "Eintrag aktualisiert",
+          "entryDeleted": "Eintrag gelöscht"
         },
         "title": "Stundenzettel",
         "selectTechnician": "Techniker auswählen",
@@ -1675,7 +1713,12 @@
         "editEntry": "Eintrag {{id}} bearbeiten",
         "total": "Gesamt: {{duration}}",
         "billableTotal": "Abrechnungsfähig: {{duration}}",
-        "billedVsWorked": "{{worked}} Std. gearbeitet · {{billed}} Std. abgerechnet"
+        "billedVsWorked": "{{worked}} Std. gearbeitet · {{billed}} Std. abgerechnet",
+        "deleteEntry": "Eintrag {{id}} löschen",
+        "deleteConfirmTitle": "Zeiteintrag löschen?",
+        "deleteConfirmMessage": "Damit wird der Eintrag über {{duration}} im Ticket {{ticket}} endgültig entfernt. Dies kann nicht rückgängig gemacht werden.",
+        "deleteConfirmMessageNoTicket": "Damit wird der Eintrag über {{duration}} endgültig entfernt. Dies kann nicht rückgängig gemacht werden.",
+        "noteInvoiceCue": "Kunden sehen diese Notiz auf ihrer Rechnung, sofern Ihre Abrechnungseinstellungen Notizen nicht ausblenden."
       },
       "sourceBadge": {
         "timer": "Timer",
@@ -2162,7 +2205,8 @@
         "viewInSource": "Ansicht in {{source}}",
         "promoteFromEdr": "Aus EDR-Ansicht übernehmen",
         "pagination": "Seite {{page}} von {{totalPages}} ({{total}} insgesamt)",
-        "previous": "Zurück"
+        "previous": "Zurück",
+        "genericEdrProvider": "EDR-Anbieter"
       },
       "IncidentDetailPage": {
         "errors": {
@@ -2375,7 +2419,10 @@
           "script": "Skript",
           "template": "Vorlage",
           "playbook": "Spielbuch",
-          "diagnostic": "Diagnose"
+          "diagnostic": "Diagnose",
+          "builtin": "Integrierte Aktion",
+          "manualSteps": "Manuelle Schritte",
+          "scriptDraft": "Skriptentwurf"
         },
         "targetIdentifiers": {
           "script": "Skript {{id}}",
@@ -2384,7 +2431,8 @@
           "templateMissing": "Vorlage ohne Vorlagen-ID",
           "playbook": "Spielbuch {{id}}",
           "playbookMissing": "Playbook ohne Playbook-ID",
-          "diagnostic": "diagnostische Maßnahme"
+          "diagnostic": "diagnostische Maßnahme",
+          "builtin": "integrierte Aktion {{action}}"
         },
         "targetDevices": {
           "none": "In diesem Vorschlag ist kein Zielgerät enthalten",
@@ -2396,9 +2444,12 @@
           "generateFailed": "Vorgeschlagene Korrekturen konnten nicht generiert werden",
           "updateFailed": "Der vorgeschlagene Fix konnte nicht aktualisiert werden",
           "executeFailed": "Der vorgeschlagene Fix konnte nicht ausgeführt werden",
-          "approvalFailed": "Die Genehmigung konnte nicht angefordert werden"
+          "approvalFailed": "Die Genehmigung konnte nicht angefordert werden",
+          "researchFailed": "Recherche konnte nicht gestartet werden",
+          "draftFailed": "Der Skriptentwurf konnte nicht geöffnet werden."
         },
         "messages": {
+          "draftCopied": "Speicher ist blockiert — der Auftrag wurde kopiert; füge ihn im Skript-Builder ein.",
           "disabled": "Vorgeschlagene Korrekturen sind deaktiviert",
           "generated": "Vorgeschlagene Korrekturen generiert",
           "accepted": "Vorgeschlagener Fix akzeptiert",
@@ -2482,6 +2533,52 @@
             "inconclusive": "nicht eindeutig",
             "cancelled": "abgebrochen"
           }
+        },
+        "groups": {
+          "proven": "Bewährte Lösungen",
+          "ai": "KI-Vorschläge",
+          "similar": "Ähnliche Lösungen",
+          "legacy": "Frühere Stichwort-Treffer"
+        },
+        "badges": {
+          "aiResearched": "KI-recherchiert",
+          "aiWritten": "Von KI verfasst — vor dem Befolgen prüfen"
+        },
+        "track": {
+          "lastVerified": "zuletzt vor {{days}} Tagen bestätigt",
+          "neverVerified": "noch nicht bestätigt"
+        },
+        "research": {
+          "running": "Recherche läuft…",
+          "runningDeep": "Ausführliche Recherche läuft…",
+          "stalled": "Recherche läuft noch — schauen Sie in einigen Minuten wieder vorbei.",
+          "failed": "Recherche fehlgeschlagen.",
+          "noSafeFix": "Die KI hat für dieses Problem keine sichere Lösung gefunden.",
+          "checkBudget": "KI-Budget prüfen",
+          "deeper": "Tiefer recherchieren",
+          "retry": "Erneut versuchen",
+          "denial": {
+            "credits": "Die KI-Guthaben für diesen Abrechnungszeitraum sind aufgebraucht.",
+            "dailyBudget": "Das tägliche KI-Budget für Recherchen ist erreicht.",
+            "orgBudget": "Das KI-Budget dieser Organisation ist erreicht.",
+            "autoCap": "Das Limit für automatische Recherchen ist erreicht. Sie können weiterhin manuell recherchieren.",
+            "busy": "Die Recherche ist gerade ausgelastet. Versuchen Sie es in einigen Minuten erneut.",
+            "permission": "Sie haben keine Berechtigung, eine KI-Recherche zu starten.",
+            "unavailable": "Die KI-Recherche ist vorübergehend nicht verfügbar.",
+            "modelUnavailable": "Das KI-Modell für die Recherche ist nicht verfügbar.",
+            "notProvisioned": "Die KI-Recherche ist für diese Installation noch nicht eingerichtet."
+          }
+        },
+        "runBuiltin": "{{action}} ausführen",
+        "draftScript": "Skript entwerfen",
+        "emptyHint": "„Generieren“ prüft zuerst bewährte Lösungen und fragt dann die KI.",
+        "reviewed": {
+          "pickerLabel": "Geprüfte Schritte",
+          "asWritten": "Schritte wie geschrieben (nicht geteilt)",
+          "save": "Als geprüfte Schritte speichern",
+          "saved": "Als geprüfte Schritte gespeichert",
+          "failed": "Geprüfte Schritte konnten nicht gespeichert werden",
+          "stepsLabel": "Schritte (einer pro Zeile)"
         }
       }
     },
@@ -2540,5 +2637,66 @@
     "noneConfigured": "Kein {{source}} konfiguriert",
     "overriding": "Überschreibt {{source}}",
     "overridingWithValue": "Überschreibt {{source}} ({{value}})"
+  },
+  "fixMemoryPage": {
+    "title": "Fix-Gedächtnis",
+    "subtitle": "Fixes, die Ihr Team ausgeführt hat, und wie oft sie tatsächlich behoben blieben.",
+    "tabs": {
+      "fixes": "Fixes",
+      "steps": "Geprüfte Schritte"
+    },
+    "filters": {
+      "os": "Betriebssystem",
+      "anyOs": "Beliebiges Betriebssystem",
+      "status": "Status",
+      "anyStatus": "Beliebiger Status",
+      "scope": "Geltungsbereich",
+      "anyScope": "Beliebiger Geltungsbereich",
+      "condition": "Nach Bedingung suchen"
+    },
+    "columns": {
+      "fix": "Fix",
+      "record": "Erfolgsbilanz",
+      "rate": "Erfolgsquote",
+      "scope": "Geltungsbereich",
+      "os": "BS",
+      "condition": "Bedingung",
+      "lastVerified": "Zuletzt verifiziert",
+      "status": "Status",
+      "actions": "Aktionen"
+    },
+    "status": {
+      "active": "Aktiv",
+      "demoted": "Herabgestuft",
+      "retired": "Zurückgezogen",
+      "stale": "Veraltet"
+    },
+    "scope": {
+      "everyClient": "Alle Kunden",
+      "oneClient": "Dieser Kunde"
+    },
+    "signature": "Signatur {{prefix}}",
+    "retire": {
+      "action": "Zurückziehen",
+      "confirmTitle": "Diesen Fix zurückziehen?",
+      "confirmBody": "Zurückgezogene Fixes werden nicht mehr vorgeschlagen. Ihr Verlauf bleibt erhalten.",
+      "confirm": "Fix zurückziehen",
+      "success": "Fix zurückgezogen.",
+      "failed": "Der Fix konnte nicht zurückgezogen werden."
+    },
+    "steps": {
+      "heading": "Schritte",
+      "retire": "Schritte zurückziehen",
+      "success": "Schritte zurückgezogen.",
+      "failed": "Die Schritte konnten nicht zurückgezogen werden.",
+      "empty": "Noch keine geprüften Schritte. Speichern Sie Schritte aus einem Vorschlag, damit sie hier erscheinen."
+    },
+    "empty": "Noch keine Fixes gespeichert. Fixes erscheinen hier, nachdem sie ausgeführt und ihr Ergebnis beobachtet wurde.",
+    "loadMore": "Mehr laden",
+    "never": "Nie",
+    "retry": "Erneut versuchen",
+    "errors": {
+      "loadFailed": "Fix-Gedächtnis konnte nicht geladen werden."
+    }
   }
 }

@@ -66,6 +66,7 @@
     "aiAgents": "Agents IA",
     "aiAgentRuns": "Exécutions des agents IA",
     "aiImpact": "Impact de l’IA",
+    "fixMemory": "Mémoire des correctifs",
     "fleetDesign": "Conception de flotte",
     "customFields": "Champs personnalisés",
     "savedFilters": "Filtres enregistrés",
@@ -107,7 +108,13 @@
     "system": "Système",
     "monitorConversion": "Conversion des moniteurs",
     "timeSync": "Synchronisation de l’heure",
-    "aiModels": "Modèles d'IA"
+    "aiModels": "Modèles d'IA",
+    "autopay": "Autopay",
+    "payments": "Payments",
+    "ticketsIncidents": "Incidents",
+    "ticketsServiceRequests": "Demandes de service",
+    "ticketsProblems": "Problèmes",
+    "ticketsChanges": "Changements"
   },
   "documentTitles": {
     "dashboard": "Tableau de bord",
@@ -405,7 +412,9 @@
       "unratedPending": "{{count}} correctifs non évalués en attente (ne seront pas approuvés automatiquement)",
       "unratedPending_one": "{{count}} correctif non évalué en attente (ne sera pas approuvé automatiquement)",
       "unratedPending_other": "{{count}} correctifs non évalués en attente (ne seront pas approuvés automatiquement)",
-      "empty": "Aucune donnée de correctifs pour l'instant"
+      "empty": "Aucune donnée de correctifs pour l'instant",
+      "imagesNotChecked_one": "{{count}} image de conteneur non vérifiée",
+      "imagesNotChecked_other": "{{count}} images de conteneur non vérifiées"
     },
     "vuln": {
       "title": "Vulnérabilités",
@@ -491,7 +500,9 @@
       "noGroups": "Aucun groupe d’appareils disponible",
       "deviceCount": "{{count}} appareils",
       "loadSaved": "Charger le filtre enregistré :",
-      "select": "Sélectionner"
+      "select": "Sélectionner",
+      "dynamic": "Dynamique",
+      "refusedGroup": "Indisponible comme cible : les règles de ce groupe reposent sur des champs que l'appareil signale lui-même ({{fields}})."
     },
     "preview": {
       "title": "Dispositifs de correspondance",
@@ -1304,6 +1315,26 @@
           "ticketCreated": {
             "description": "Déclenché lors de la création d’un ticket.",
             "label": "Ticket créé"
+          },
+          "ticketCommented": {
+            "description": "Déclenché lorsqu’un commentaire ou une note est ajouté à un ticket.",
+            "label": "Ticket commenté"
+          },
+          "ticketStatusChanged": {
+            "description": "Déclenché lorsqu’un ticket change de statut.",
+            "label": "Statut du ticket modifié"
+          },
+          "ticketUpdated": {
+            "description": "Déclenché lorsque les champs d’un ticket sont modifiés.",
+            "label": "Ticket mis à jour"
+          },
+          "ticketAssigned": {
+            "description": "Déclenché lorsqu’un ticket est attribué ou désattribué.",
+            "label": "Ticket attribué"
+          },
+          "migrationWindowClosed": {
+            "description": "Déclenché une fois par organisation à la fermeture d'une fenêtre de migration de billets, avec les nombres importés.",
+            "label": "Fenêtre de migration fermée"
           }
         },
         "fields": {
@@ -1428,6 +1459,7 @@
           "created": "Webhook créé",
           "disabled": "Webhook désactivé",
           "enabled": "Webhook activé",
+          "retryQueued": "Nouvelle tentative de livraison mise en file d’attente",
           "testQueued": "Livraison de test mise en file d’attente",
           "updated": "Webhook mis à jour"
         },
@@ -1639,18 +1671,24 @@
         "friendly": {
           "adminRequired": "L’approbation des feuilles de temps nécessite un rôle administratif.",
           "approvedImmutable": "Les entrées approuvées ne peuvent être modifiées que par un administrateur.",
-          "notOwnEntry": "Vous ne pouvez modifier que vos propres entrées de temps."
+          "notOwnEntry": "Vous ne pouvez modifier que vos propres entrées de temps.",
+          "entryBilled": "Cette entrée a été facturée et ne peut pas être supprimée. Annulez d’abord la facture.",
+          "notOwnEntryDelete": "Vous ne pouvez supprimer que vos propres entrées de temps.",
+          "entryDeleteLost": "L’entrée a changé pendant sa suppression. Rechargez et réessayez.",
+          "entryNotFound": "Cette entrée n’existe plus."
         },
         "errors": {
           "bulkApprovalFailed": "L’approbation en masse a échoué. Réessayez.",
           "saveEntryFailed": "Impossible d’enregistrer l’entrée. Réessayez.",
-          "loadTimesheetFailed": "Impossible de charger la feuille de temps. Réessayez."
+          "loadTimesheetFailed": "Impossible de charger la feuille de temps. Réessayez.",
+          "deleteEntryFailed": "Impossible de supprimer l’entrée. Réessayez."
         },
         "toasts": {
           "bulkSkipped": "{{updated}} mis à jour, {{skipped}} sauté ({{reasons}})",
           "bulkApproved": "{{count}} approuvé",
           "bulkUnapproved": "{{count}} non approuvé",
-          "entryUpdated": "Entrée mise à jour"
+          "entryUpdated": "Entrée mise à jour",
+          "entryDeleted": "Entrée supprimée"
         },
         "title": "Feuille de temps",
         "selectTechnician": "Technicien sélectionné",
@@ -1675,7 +1713,12 @@
         "editEntry": "Modifier l’entrée {{id}}",
         "total": "Total : {{duration}}",
         "billableTotal": "Facturable : {{duration}}",
-        "billedVsWorked": "{{worked}} h travaillées · {{billed}} h facturées"
+        "billedVsWorked": "{{worked}} h travaillées · {{billed}} h facturées",
+        "deleteEntry": "Supprimer l’entrée {{id}}",
+        "deleteConfirmTitle": "Supprimer l’entrée de temps?",
+        "deleteConfirmMessage": "Cette action supprime définitivement l’entrée de {{duration}} du billet {{ticket}}. Elle est irréversible.",
+        "deleteConfirmMessageNoTicket": "Cette action supprime définitivement l’entrée de {{duration}}. Elle est irréversible.",
+        "noteInvoiceCue": "Les clients voient cette note sur leur facture, sauf si vos paramètres de facturation masquent les notes."
       },
       "sourceBadge": {
         "timer": "Minuteur",
@@ -2162,7 +2205,8 @@
         "viewInSource": "Vue en {{source}}",
         "promoteFromEdr": "Promouvoir du point de vue EDR",
         "pagination": "Page {{page}} de {{totalPages}} ({{total}} total)",
-        "previous": "Précédent"
+        "previous": "Précédent",
+        "genericEdrProvider": "Fournisseur EDR"
       },
       "IncidentDetailPage": {
         "errors": {
@@ -2375,7 +2419,10 @@
           "script": "Script",
           "template": "Modèle",
           "playbook": "Manuels",
-          "diagnostic": "Diagnostic"
+          "diagnostic": "Diagnostic",
+          "builtin": "Action intégrée",
+          "manualSteps": "Étapes manuelles",
+          "scriptDraft": "Ébauche de script"
         },
         "targetIdentifiers": {
           "script": "script {{id}}",
@@ -2384,7 +2431,8 @@
           "templateMissing": "modèle sans modèle ID",
           "playbook": "Livre de jeu {{id}}",
           "playbookMissing": "Manuels sans manuel ID",
-          "diagnostic": "Action diagnostique"
+          "diagnostic": "Action diagnostique",
+          "builtin": "action intégrée {{action}}"
         },
         "targetDevices": {
           "none": "Aucun dispositif ciblé dans cette suggestion",
@@ -2396,9 +2444,12 @@
           "generateFailed": "Impossible de générer les solutions suggérées",
           "updateFailed": "Impossible de mettre à jour la solution suggérée",
           "executeFailed": "Impossible d’exécuter la solution suggérée",
-          "approvalFailed": "Impossible de demander l’approbation"
+          "approvalFailed": "Impossible de demander l’approbation",
+          "researchFailed": "Impossible de lancer la recherche",
+          "draftFailed": "Impossible d’ouvrir le brouillon du script."
         },
         "messages": {
+          "draftCopied": "Le stockage est bloqué : le résumé a été copié; collez-le dans le générateur de scripts.",
           "disabled": "Les solutions proposées sont désactivées",
           "generated": "Corrections suggérées générées",
           "accepted": "Solution suggérée acceptée",
@@ -2482,6 +2533,52 @@
             "inconclusive": "non concluant",
             "cancelled": "annulé"
           }
+        },
+        "groups": {
+          "proven": "Correctifs éprouvés",
+          "ai": "Suggestions de l’IA",
+          "similar": "Correctifs similaires",
+          "legacy": "Anciennes correspondances par mots-clés"
+        },
+        "badges": {
+          "aiResearched": "Recherché par l’IA",
+          "aiWritten": "Rédigé par l’IA — à vérifier avant de suivre"
+        },
+        "track": {
+          "lastVerified": "dernière vérification il y a {{days}} j",
+          "neverVerified": "pas encore vérifié"
+        },
+        "research": {
+          "running": "Recherche en cours…",
+          "runningDeep": "Recherche approfondie en cours…",
+          "stalled": "Recherche toujours en cours — revenez dans quelques minutes.",
+          "failed": "La recherche a échoué.",
+          "noSafeFix": "L’IA n’a trouvé aucun correctif sûr pour ce problème.",
+          "checkBudget": "Vérifier le budget d’IA",
+          "deeper": "Approfondir la recherche",
+          "retry": "Réessayer",
+          "denial": {
+            "credits": "Les crédits d’IA de cette période de facturation sont épuisés.",
+            "dailyBudget": "Le budget quotidien d’IA pour la recherche est atteint.",
+            "orgBudget": "Le budget d’IA de cette organisation est atteint.",
+            "autoCap": "La limite de recherche automatique est atteinte. Vous pouvez toujours lancer une recherche manuellement.",
+            "busy": "La recherche est occupée en ce moment. Réessayez dans quelques minutes.",
+            "permission": "Vous n’avez pas la permission de lancer une recherche IA.",
+            "unavailable": "La recherche IA est temporairement indisponible.",
+            "modelUnavailable": "Le modèle d’IA pour la recherche n’est pas disponible.",
+            "notProvisioned": "La recherche IA n’est pas encore configurée pour cette installation."
+          }
+        },
+        "runBuiltin": "Exécuter {{action}}",
+        "draftScript": "Rédiger un script",
+        "emptyHint": "Générer vérifie d’abord les correctifs éprouvés, puis interroge l’IA.",
+        "reviewed": {
+          "pickerLabel": "Étapes révisées",
+          "asWritten": "Étapes telles qu’écrites (non partagées)",
+          "save": "Enregistrer comme étapes révisées",
+          "saved": "Enregistré comme étapes révisées",
+          "failed": "Impossible d’enregistrer les étapes révisées",
+          "stepsLabel": "Étapes (une par ligne)"
         }
       }
     },
@@ -2540,5 +2637,66 @@
     "noneConfigured": "Aucun {{source}} configuré",
     "overriding": "Remplace {{source}}",
     "overridingWithValue": "Remplace {{source}} ({{value}})"
+  },
+  "fixMemoryPage": {
+    "title": "Mémoire des correctifs",
+    "subtitle": "Les correctifs exécutés par votre équipe et la fréquence à laquelle ils ont réellement tenu.",
+    "tabs": {
+      "fixes": "Correctifs",
+      "steps": "Étapes révisées"
+    },
+    "filters": {
+      "os": "Système d’exploitation",
+      "anyOs": "Tout système d’exploitation",
+      "status": "Statut",
+      "anyStatus": "Tout statut",
+      "scope": "Portée",
+      "anyScope": "Toute portée",
+      "condition": "Rechercher par condition"
+    },
+    "columns": {
+      "fix": "Correctif",
+      "record": "Historique de résultats",
+      "rate": "Taux de réussite",
+      "scope": "Portée",
+      "os": "SE",
+      "condition": "Condition",
+      "lastVerified": "Dernière vérification",
+      "status": "Statut",
+      "actions": "Actions"
+    },
+    "status": {
+      "active": "Actif",
+      "demoted": "Rétrogradé",
+      "retired": "Retiré",
+      "stale": "Périmé"
+    },
+    "scope": {
+      "everyClient": "Tous les clients",
+      "oneClient": "Ce client"
+    },
+    "signature": "Signature {{prefix}}",
+    "retire": {
+      "action": "Retirer",
+      "confirmTitle": "Retirer ce correctif?",
+      "confirmBody": "Les correctifs retirés ne sont plus suggérés. Leur historique est conservé.",
+      "confirm": "Retirer le correctif",
+      "success": "Correctif retiré.",
+      "failed": "Impossible de retirer le correctif."
+    },
+    "steps": {
+      "heading": "Étapes",
+      "retire": "Retirer les étapes",
+      "success": "Étapes retirées.",
+      "failed": "Impossible de retirer les étapes.",
+      "empty": "Aucune étape révisée pour l’instant. Enregistrez des étapes à partir d’une suggestion pour les voir ici."
+    },
+    "empty": "Aucun correctif mémorisé pour l’instant. Les correctifs apparaissent ici après leur exécution et l’observation de leur résultat.",
+    "loadMore": "Charger plus",
+    "never": "Jamais",
+    "retry": "Réessayer",
+    "errors": {
+      "loadFailed": "Impossible de charger la mémoire des correctifs."
+    }
   }
 }

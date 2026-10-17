@@ -68,7 +68,7 @@ const T = new Date('2026-10-01T00:00:00.000Z');
 const conn = (o: Record<string, unknown>) => ({
   partnerId: P, name: 'x', inferenceGeo: null, providerConfig: null, keyLast4: '1234', catalogEntryId: null,
   baseUrl: null, status: 'active', lastError: null, verifiedAt: T, configVersion: 1, connectedBy: null,
-  lastDiscoveredAt: null, discoveryError: null, legacyDefaultModel: null, createdAt: T, updatedAt: T,
+  lastDiscoveredAt: null, discoveryError: null, createdAt: T, updatedAt: T,
   // Never read by the view: present to prove the DTO does not copy it through.
   apiKeyEncrypted: 'cipher', keyFingerprint: 'fp',
   ...o,
@@ -289,6 +289,12 @@ describe('buildPartnerModelsSnapshot', () => {
       // Anthropic-dialect and platform connections expose no base URL and are never env-managed here.
       expect(s.connections.find((c) => c.id === C)).toMatchObject({ baseUrl: null, managedBy: null, effectiveInferenceGeo: 'us' });
       expect(s.connections[0]).toMatchObject({ kind: 'platform', baseUrl: null, managedBy: null });
+    });
+
+    it('an Anthropic-dialect connection is never env-managed, even with a stray managedBy in provider_config', async () => {
+      h.connections = [conn({ id: C, kind: 'catalog', providerConfig: { managedBy: 'env', envReleasedAt: '2026-10-01T00:00:00.000Z' } })];
+      const s = await buildPartnerModelsSnapshot(P);
+      expect(s.connections.find((c) => c.id === C)).toMatchObject({ managedBy: null, envReleased: false });
     });
 
     it('a released env connection stays managedBy env (read-only) and is flagged envReleased (the partner may disconnect it)', async () => {

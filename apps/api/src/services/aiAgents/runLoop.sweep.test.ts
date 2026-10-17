@@ -77,6 +77,14 @@ function nextRows(table: string): unknown[] {
   throw new Error(`No queued rows for table ${table}`);
 }
 
+// AI Suggested Fixes W3 — loadRunContext's proven-fix lookup. Mocked so it never
+// consumes this file's queued db rows; returns null (no memory) by default.
+const loadProvenFixesForRun = vi.hoisted(() => vi.fn(async (): Promise<unknown> => null));
+vi.mock('../fixMemory/runMemory', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../fixMemory/runMemory')>()),
+  loadProvenFixesForRun,
+}));
+
 vi.mock('../../db', () => {
   const makeSelect = () => ({
     from: vi.fn((table: unknown) => {
@@ -253,7 +261,7 @@ const reserveAiBudget = vi.hoisted(() => vi.fn());
 const markAiBudgetReservationIndeterminate = vi.hoisted(() => vi.fn());
 vi.mock('../aiBudgetReservations', () => ({ reserveAiBudget, markAiBudgetReservationIndeterminate }));
 
-import { createAgentRunPostToolUse, createAgentRunPreToolUse, executeAgentRun } from './runLoop';
+import { createAgentRunCallPairing, createAgentRunPostToolUse, createAgentRunPreToolUse, executeAgentRun } from './runLoop';
 import { makeResolvedModel } from '../aiModels/__fixtures__/resolvedModel';
 import type { AgentRunOutcome } from './runLoop';
 import { SWEEP_TOOL_ALLOWLIST } from './sweepProfile';
@@ -265,7 +273,6 @@ function policy(overrides: Partial<AiAgentPolicy> = {}): AiAgentPolicy {
   return {
     enabled: true,
     mode: 'shadow',
-    model: 'claude-test-model',
     toolAllowlist: [],
     protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] },
     limits: { ...AI_AGENT_LIMIT_DEFAULTS },
@@ -494,10 +501,8 @@ describe('sweep profile outcome-tool gating (P2-2)', () => {
       },
       outcome,
       intentIds: [],
-      allowedPending: new Map<string, number>(),
       sessionId: null,
-      executionIdPending: new Map<string, Array<string | null>>(),
-      actPinPending: new Map<string, Array<unknown>>(),
+      pairing: createAgentRunCallPairing(),
       actReservation: { count: 0 },
       deadlineMs: Date.now() + 60_000,
     };
@@ -563,9 +568,7 @@ describe('sweep profile outcome-tool gating (P2-2)', () => {
     const outcome = emptyOutcome();
     const post = createAgentRunPostToolUse({
       outcome,
-      allowedPending: new Map<string, number>(),
-      executionIdPending: new Map<string, Array<string | null>>(),
-      actPinPending: new Map<string, Array<unknown>>(),
+      pairing: createAgentRunCallPairing(),
       run: { id: RUN_ID, orgId: ORG_ID, agentId: AGENT_ID, deviceId: null, profile: 'sweep' },
       agentUserId: USER_A,
     } as never);
@@ -581,9 +584,7 @@ describe('sweep profile outcome-tool gating (P2-2)', () => {
     const outcome = emptyOutcome();
     const post = createAgentRunPostToolUse({
       outcome,
-      allowedPending: new Map<string, number>(),
-      executionIdPending: new Map<string, Array<string | null>>(),
-      actPinPending: new Map<string, Array<unknown>>(),
+      pairing: createAgentRunCallPairing(),
       run: { id: RUN_ID, orgId: ORG_ID, agentId: AGENT_ID, deviceId: null, profile: 'full' },
       agentUserId: USER_A,
     } as never);
@@ -595,6 +596,12 @@ describe('sweep profile outcome-tool gating (P2-2)', () => {
 });
 
 describe('sweep profile exposure and context in the run loop (P2-2)', () => {
+  it('sweep run has no provenFixes lookup (Review Focus 5)', async () => {
+    seedRows({ effective: policy({ toolAllowlist: ['manage_services'] }), profile: 'sweep' });
+    await executeAgentRun(RUN_ID);
+    expect(loadProvenFixesForRun).not.toHaveBeenCalled();
+  });
+
   it('exposes the sweep floor + sweep outcome tool with the sweep limits', async () => {
     // Deliberately mismatched agent allowlist — the floor is served regardless.
     seedRows({ effective: policy({ toolAllowlist: ['manage_services'] }), profile: 'sweep' });

@@ -52,6 +52,12 @@ const DIRECT_READ_ALLOWLIST = new Set([
   // settings back onto the child.
   'services/monitors/monitorAttachments.ts',
 
+  // Auto-quarantine stored authority: reads the execution_authority_* columns
+  // of ONE link by id — the link the effective view already chose as winner
+  // (an inherited row keeps the parent's link id). The envelope columns are not
+  // projected by the view, so the authored row is the only place to read them.
+  'services/securityScanQuarantineAuthority.ts',
+
   // #6370 W05c1 — conversion operates on the policy's OWN authored rows: it
   // retires them and re-homes their alerts. The effective view would hand back
   // a PARENT policy's link for a feature the child does not override, and
@@ -93,6 +99,12 @@ const DIRECT_READ_ALLOWLIST = new Set([
   // pick an arbitrary row. Which rules apply to a device is decided upstream by
   // resolveComplianceRulesForDevice; this never decides what a device gets.
   'services/configComplianceAlertBridge.ts',
+  // Ownership lookup only: resolves the ONE authored link a generated software
+  // policy hangs on (managed_by_link_id) to name the owning config policy in the
+  // 409 refusal. Through the view one link id maps to the parent AND every
+  // inheriting child, so the owner would be ambiguous. Never decides what a
+  // device gets.
+  'services/securityAgents/managedSoftwarePolicyGuard.ts',
   // Reason text only: once resolveComplianceAssignmentForDevice (the view) has
   // decided a compliance rule no longer applies to a device, this looks up the
   // ONE authored link the alert was raised under to say why (rule set renamed,
@@ -103,7 +115,6 @@ const DIRECT_READ_ALLOWLIST = new Set([
   'services/alertCorrelationRca.ts',
   // AI tools operate on a policy's own links (create/update/remove/list).
   'services/aiToolsConfigPolicy.ts',
-  'services/aiToolsFleet.ts',
   'services/aiToolsBackup.ts',
   // Approval-digest content pin for the AI tool `manage_policy_feature_link:update`.
   // It pins the CURRENT content of the one authored row the approver evaluated,

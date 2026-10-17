@@ -5,7 +5,7 @@
   "private": true,
   "scripts": {
     "predev": "node scripts/make-icons.mjs && node scripts/generate-manifest.mjs",
-    "dev": "vite",
+    "dev": "node ../../scripts/dev/addin-dev.mjs",
     "prebuild": "node scripts/make-icons.mjs",
     "build": "tsc --noEmit && vite build && node scripts/generate-manifest.mjs",
     "test": "vitest",
@@ -23,7 +23,7 @@
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
     "@testing-library/react": "^16.3.3",
-    "@types/office-js": "^1.0.610",
+    "@types/office-js": "^1.0.611",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.0.2",

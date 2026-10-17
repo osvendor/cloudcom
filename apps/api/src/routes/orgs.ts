@@ -1,4 +1,5 @@
 import { deleteSiteTopologyAiSessions } from '../services/topology/siteTopologySessions';
+import { removeUnreferencedScreenshotFiles } from '../services/screenshotStorage';
 import { ensureDefaultProfile } from '../services/billingProfileService';
 import { lockMfaPolicySettings, countMfaPolicyLockouts, mfaPolicyLockoutResponse } from '../services/mfaPolicyActivation';
 import { MFA_ENROLLMENT_GRACE_DAYS_MAX } from '../services/mfaEnrollmentGrace';
@@ -9,7 +10,8 @@ import type { Context, Next } from 'hono';
 import { zValidator } from '../lib/validation';
 import { z } from 'zod';
 import { and, eq, ilike, inArray, isNull, ne, not, notInArray, or, sql } from 'drizzle-orm';
-import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import { scheduleServingRefreshForPartner } from '../services/trustPage/servingSet';
+import { db, runAfterDbContextExit, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { resolveAuditOrgIdForPartner } from '../services/auditOrgResolver';
 import { deleteSiteOwnedTopologyAlerts, lockSiteForDelete } from '../services/siteOwnedAlerts';
 import { partners, organizations, sites, devices, agentVersions, partnerUsers } from '../db/schema';
@@ -24,13 +26,21 @@ import { ORG_SLUG_UNIQUE_INDEX } from '../db/schema/orgs';
 // on the mock") before a single test runs.
 import { psaConnections } from '../db/schema/integrations';
 import { authMiddleware, requireMfa, requirePermission, requireScope, requirePartner, type AuthContext } from '../middleware/auth';
+import { markPermissionGate } from '../middleware/permissionGate';
 import { writeAuditEvent, writeRouteAudit } from '../services/auditEvents';
 import { getEffectiveOrgSettings, assertNotLocked } from '../services/effectiveSettings';
+import {
+  clampSessionTimeoutInSettings,
+  sessionTimeoutMinutesSchema,
+  sessionTimeoutSettingsError,
+} from '../services/sessionTimeoutLimits';
 import { getAiApprovalTimeout } from '../services/aiApprovalTimeout';
 import { normalizeAlertThresholds } from '../services/aiBudgetAlerts';
 import { enqueueAiBudgetEvaluationForPartner } from '../jobs/aiBudgetAlertDelivery';
 import { clearPartnerScopePolicyCache } from '../oauth/partnerScopePolicy';
+import { invalidateAgentOrgSettingsCaches } from '../services/agentOrgSettingsCache';
 import { PERMISSIONS, canAccessSite, type UserPermissions } from '../services/permissions';
+import { defaultAssigneeSettingsError, isAssignableInboundDefaultUser, listAssignableInboundDefaultUsers } from '../services/inboundEmail/defaultAssigneeEligibility';
 import {
   restoreOrganizationTenantAccess,
   restorePartnerTenantAccess,
@@ -59,6 +69,8 @@ import { encryptColumnValueForWrite } from '../services/encryptedColumnRegistry'
 import {
   LOG_FORWARDING_ORIGIN_CHANGE_MESSAGE,
   LOG_FORWARDING_SECRET_DESTINATIONS,
+  REMOTE_ACCESS_LAUNCHER_ORIGIN_CHANGE_MESSAGE,
+  REMOTE_ACCESS_LAUNCHER_SECRET_DESTINATIONS,
   SettingsSecretInputError,
   maskSettingsSecrets,
   restoreMaskedSettingsSecrets,
@@ -72,6 +84,8 @@ import { PG_UUID_REGEX } from '../utils/uuid';
 import { isPgUniqueViolation } from '../utils/pgErrors';
 import { isAllowedLauncherScheme, isValidIanaTimezone, canonicalizeTimezone, isValidMaintenanceWindow, MAINTENANCE_WINDOW_ERROR_MESSAGE, normalizeVersionPin, PINNABLE_COMPONENTS, agentVersionPinsSchema, enrollmentDefaultsSchema, aiApprovalSettingsSchema, httpUrlValue, httpUrlField, SUPPORTED_LOCALES, ticketingInboundSettingsSchema, timeTrackingSessionSuggestionsSchema, EMAIL_TEMPLATE_IDS, isBlankEmailTemplateHtml } from '@breeze/shared';
 import type { IpAllowlistStatus, ResolvedEnrollmentDefaults, SupportedLocale } from '@breeze/shared';
+import { ERROR_CODES, siteLocationFieldsShape, siteLocationPairIsConsistent, SITE_LOCATION_PAIR_MESSAGE } from '@breeze/shared';
+import { siteLocationRoutes } from './siteLocation';
 import { getEnrollmentDefaultsForOrg } from '../services/enrollmentDefaults';
 import { isValidIpOrCidr } from '../services/ipMatch';
 import { applyNewPartnerDefaultSettings } from '../services/partnerDefaultSettings';
@@ -93,6 +107,7 @@ import { writeOrgImportAudits } from '../services/orgImport/audit';
 import { commitImportRowSchema, importRowSchema } from '../services/orgImport/schemas';
 import { resolveImportPartnerId } from './importScope';
 import { registerOrgContactsRoutes } from './orgContacts';
+import { registerOrgContactResponsibilitiesRoutes } from './orgContactResponsibilities';
 import { registerOrgPortalSettingsRoutes } from './orgPortalSettings';
 import { registerOrgPortalUsersRoutes } from './orgPortalUsers';
 import { registerOrgTicketSettingsRoutes } from './orgTicketSettings';
@@ -235,7 +250,9 @@ const createPartnerSchema = z.object({
   // plan and maxDevices are managed by the billing service (via direct DB writes).
   // They are intentionally excluded from the API schema to prevent self-service changes.
   maxOrganizations: z.number().int().nullable().optional(),
-  settings: z.any().optional(),
+  settings: z.any().optional().refine((settings) => sessionTimeoutSettingsError(settings) === null, {
+    message: 'security.sessionTimeout must be an integer between 1 and 720 minutes (12 hours)',
+  }),
   billingEmail: z.string().email().optional()
 });
 
@@ -258,8 +275,13 @@ const updatePartnerSchema = createPartnerSchema.partial().extend({
   // Operator-only per-partner AI for Office entitlement. Settable here (system
   // scope) but NOT on /partners/me (partner scope) — partners can't self-enable.
   aiForOfficeEnabled: z.boolean().optional(),
+  // Operator-only: remove the "Powered by Breeze" attribution from this partner's
+  // public trust pages. Settable here (system scope), NOT on /partners/me.
+  trustPageUnbranded: z.boolean().optional(),
   settings: z.any().optional().refine(settingsAllowlistEntriesValid, {
     message: 'Each IP allowlist entry must be a valid IP address or CIDR range',
+  }).refine((settings) => sessionTimeoutSettingsError(settings) === null, {
+    message: 'security.sessionTimeout must be an integer between 1 and 720 minutes (12 hours)',
   }),
 });
 
@@ -295,7 +317,9 @@ export const createOrganizationSchema = z.object({
   type: z.enum(['customer', 'internal']).optional(),
   status: z.enum(['active', 'suspended', 'trial', 'churned']).optional(),
   // maxDevices is managed by the billing service — excluded from API schema
-  settings: z.any().optional(),
+  settings: z.any().optional().refine((settings) => sessionTimeoutSettingsError(settings) === null, {
+    message: 'security.sessionTimeout must be an integer between 1 and 720 minutes (12 hours)',
+  }),
   contractStart: z.string().nullable().optional(),
   contractEnd: z.string().nullable().optional(),
   billingContact: z.any().optional()
@@ -409,7 +433,17 @@ const createSiteSchema = siteBaseSchema.extend({
   timezone: z.string().refine(isValidIanaTimezone, 'Invalid IANA timezone').default('UTC')
 });
 
-const updateSiteSchema = siteBaseSchema.partial().omit({ orgId: true });
+// Location fields are PATCH-only: create never accepts them (zod strips them), so
+// POST /sites cannot write an unstamped pin. latitude/longitude are a pair.
+const updateSiteSchema = siteBaseSchema
+  .partial()
+  .omit({ orgId: true })
+  .extend(siteLocationFieldsShape)
+  .superRefine((v, ctx) => {
+    if (!siteLocationPairIsConsistent(v)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: SITE_LOCATION_PAIR_MESSAGE, path: ['latitude'] });
+    }
+  });
 
 function getPagination(query: { page?: string; limit?: string }) {
   const page = Math.max(1, Number.parseInt(query.page ?? '1', 10) || 1);
@@ -436,9 +470,9 @@ async function ensureOrgAccess(
 /**
  * Resolve an incoming `settings` value (organization, partner or site) against
  * the stored one before it is sealed and written: masked markers and omitted
- * secret keys keep the stored secret, and a log-forwarding destination may not
- * move to a new origin while a stored credential is kept rather than
- * re-entered. `stored` is undefined on create, where there is nothing to keep.
+ * secret keys keep the stored secret, and a log-forwarding destination or a
+ * remote-access launcher may not move to a new origin while a stored
+ * credential is kept rather than re-entered. `stored` is undefined on create, where there is nothing to keep.
  */
 function resolveIncomingSettingsSecrets(
   incoming: unknown,
@@ -446,6 +480,9 @@ function resolveIncomingSettingsSecrets(
 ): { ok: true; settings: unknown } | { ok: false; error: string } {
   if (settingsSecretWouldFollowNewOrigin(incoming, stored, LOG_FORWARDING_SECRET_DESTINATIONS, isMaskedIntegrationSecret)) {
     return { ok: false, error: LOG_FORWARDING_ORIGIN_CHANGE_MESSAGE };
+  }
+  if (settingsSecretWouldFollowNewOrigin(incoming, stored, REMOTE_ACCESS_LAUNCHER_SECRET_DESTINATIONS, isMaskedIntegrationSecret)) {
+    return { ok: false, error: REMOTE_ACCESS_LAUNCHER_ORIGIN_CHANGE_MESSAGE };
   }
   try {
     return { ok: true, settings: restoreMaskedSettingsSecrets(incoming, stored) };
@@ -456,6 +493,9 @@ function resolveIncomingSettingsSecrets(
 }
 
 orgRoutes.use('*', authMiddleware);
+
+// Mounted after authMiddleware so the pin route inherits authentication.
+orgRoutes.route('/', siteLocationRoutes);
 
 // GET / - List organizations accessible to the current user
 orgRoutes.get('/', requireScope('organization', 'partner', 'system'), requireOrgRead, async (c) => {
@@ -540,8 +580,13 @@ const partnerPublicColumns = () => ({
   defaultMarkupPercent: partners.defaultMarkupPercent,
   autoTaxHardware: partners.autoTaxHardware,
   invoiceDeviceAppendix: partners.invoiceDeviceAppendix,
+  invoiceLineGrouping: partners.invoiceLineGrouping,
+  invoiceLineShowDate: partners.invoiceLineShowDate,
+  invoiceLineShowNote: partners.invoiceLineShowNote,
+  invoiceLineShowWorkedTime: partners.invoiceLineShowWorkedTime,
   catalogAiStyle: partners.catalogAiStyle,
   aiForOfficeEnabled: partners.aiForOfficeEnabled,
+  trustPageUnbranded: partners.trustPageUnbranded,
   serviceManagementMode: partners.serviceManagementMode,
   serviceManagementPsaConnectionId: partners.serviceManagementPsaConnectionId,
   createdAt: partners.createdAt,
@@ -585,6 +630,12 @@ orgRoutes.post('/partners', requireScope('system'), requireOrgWrite, requireMfa(
   // otherwise it mints `{}`-settings partners that the inbound readers' legacy
   // absent-means-enabled fallback treats as opted IN (the #3608 regression).
   data.settings = applyNewPartnerDefaultSettings(data.settings);
+  // A partner being created has no members, so it cannot have a default
+  // inbound assignee yet (settings is free-form on this system route).
+  const createAssigneeError = await defaultAssigneeSettingsError(data.settings, null);
+  if (createAssigneeError) {
+    return c.json({ error: createAssigneeError, code: 'DEFAULT_ASSIGNEE_NOT_ASSIGNABLE' }, 400);
+  }
   const createSecrets = resolveIncomingSettingsSecrets(data.settings, undefined);
   if (!createSecrets.ok) {
     return c.json({ error: createSecrets.error }, 400);
@@ -599,7 +650,7 @@ orgRoutes.post('/partners', requireScope('system'), requireOrgWrite, requireMfa(
     ))
     .limit(1);
   if (clash[0]) {
-    return c.json({ error: 'That partner identifier is already in use' }, 409);
+    return c.json({ error: 'That partner identifier is already in use', code: ERROR_CODES.CONFLICT }, 409);
   }
 
   const [partner] = await db.transaction(async (tx) => {
@@ -755,7 +806,7 @@ const partnerSettingsSchema = z.object({
     // `allowedMethods` at write time (foldAllowedMfaMethodsAlias) and never
     // persisted as a second source of truth.
     allowedMfaMethods: z.object({ totp: z.boolean().optional(), sms: z.boolean().optional() }).optional(),
-    sessionTimeout: z.number().int().min(1).optional(),
+    sessionTimeout: sessionTimeoutMinutesSchema.optional(),
     maxSessions: z.number().int().min(1).optional(),
     ipAllowlist: z
       .array(z.string())
@@ -785,6 +836,7 @@ const partnerSettingsSchema = z.object({
     pushoverDefaultUser: z.string().max(30).optional(),
     pushoverDefaultSound: z.string().max(40).optional(),
     pushoverDefaultPriority: z.number().int().min(-2).max(2).optional(),
+    pushoverTicketAssignmentFallback: z.boolean().optional(),
   }).optional(),
   eventLogs: z.object({
     enabled: z.boolean().optional(),
@@ -951,6 +1003,10 @@ const partnerSettingsSchema = z.object({
   // only the feature block it owns (`ml.anomalies`, `ml.remediation_suggestions`)
   // and must send that block COMPLETE.
   ml: mlSettingsSchema.optional(),
+  // Network Proxy transport (#8155). Partner-only: no org override, since
+  // it chooses how every session of this partner is served. Read by
+  // services/tunnelOriginOptIn.ts. Replaced wholesale (one field).
+  networkProxy: z.object({ dedicatedTunnelOrigin: z.boolean().optional() }).strict().optional(),
 });
 
 const updatePartnerSettingsSchema = z.object({
@@ -988,11 +1044,30 @@ orgRoutes.get('/partners/me', requireScope('partner'), requirePartner, requireOr
     .limit(1);
 
   if (!partner) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
-  return c.json(withMaskedSettings(partner));
+  // #6111 — a session timeout stored above the 720-minute ceiling reads back clamped.
+  return c.json(withMaskedSettings({ ...partner, settings: clampSessionTimeoutInSettings(partner.settings) }));
 });
+
+// Candidates for the Inbound email card's default-assignee picker. Gated like
+// the PATCH that saves the setting (minus MFA, which gates writes), so anyone
+// who can save it can list who it accepts, without needing users:read.
+orgRoutes.get(
+  '/partners/me/default-assignee-candidates',
+  requireScope('partner'),
+  requirePartner,
+  requireOrgWrite,
+  async (c) => {
+    const auth = c.get('auth');
+    if (!canManagePartnerWidePolicies(auth)) {
+      return c.json({ error: 'Full partner access required', code: ERROR_CODES.ACCESS_DENIED }, 403);
+    }
+    const data = await listAssignableInboundDefaultUsers(auth.partnerId as string);
+    return c.json({ data });
+  },
+);
 
 orgRoutes.get('/partners/me/ip-allowlist/status', requireScope('partner'), requirePartner, requireOrgRead, async (c) => {
   const auth = c.get('auth');
@@ -1022,7 +1097,7 @@ orgRoutes.patch(
   requireMfa(),
   async (c, next) => {
     if (!canManagePartnerWidePolicies(c.get('auth'))) {
-      return c.json({ error: 'Full partner access required' }, 403);
+      return c.json({ error: 'Full partner access required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     await next();
   },
@@ -1054,7 +1129,7 @@ orgRoutes.patch(
     .limit(1);
 
   if (!current) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   // Merge settings (top-level shallow merge, except `security` and `ticketing` below)
@@ -1164,6 +1239,23 @@ orgRoutes.patch(
     }
   }
 
+  // Default inbound assignee: every save that carries a user must name an
+  // active member of THIS partner with ticket access
+  // (isAssignableInboundDefaultUser; its partner_id predicates are the tenant
+  // boundary), like defaultTriageOrgId above. The card re-sends the complete
+  // inbound object, so a user who stopped qualifying after being picked must be
+  // replaced or cleared before the card saves again; the card shows them as
+  // unavailable. Ingest also re-checks per ticket.
+  const nextDefaultAssignee = body.settings?.ticketing?.inbound?.defaultAssigneeUserId;
+  if (typeof nextDefaultAssignee === 'string') {
+    if (!(await isAssignableInboundDefaultUser(nextDefaultAssignee, auth.partnerId as string))) {
+      return c.json({
+        error: 'defaultAssigneeUserId must be an active member of your partner who can be assigned tickets',
+        code: 'DEFAULT_ASSIGNEE_NOT_ASSIGNABLE',
+      }, 400);
+    }
+  }
+
   // Enable-gate: turning the allowlist on (empty -> non-empty) requires that
   // the API can actually see real client IPs, otherwise enforcement would
   // silently fail open (false security).
@@ -1259,7 +1351,7 @@ orgRoutes.patch(
         ))
         .limit(1);
       if (clash[0]) {
-        return c.json({ error: 'That inbound address is already taken' }, 409);
+        return c.json({ error: 'That inbound address is already taken', code: ERROR_CODES.CONFLICT }, 409);
       }
       updateData.inboundLocalPart = candidate;
     }
@@ -1284,7 +1376,7 @@ orgRoutes.patch(
     .returning(partnerPublicColumns());
 
   if (!partner) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   // Invalidate the OAuth scope-policy cache so a change to
@@ -1292,6 +1384,9 @@ orgRoutes.patch(
   // next token mint without waiting for the 60s TTL.
   clearPartnerScopePolicyCache(partner.id);
   clearPartnerAllowlistCache(partner.id);
+  // Partner defaults feed every org's agent update policy and topology flags
+  // (#8053 heartbeat cache); a partner write can touch any of its orgs.
+  invalidateAgentOrgSettingsCaches();
 
   // Caps or rungs changed fleet-wide: re-evaluate every org off-request (spec
   // §4.2 #3). Compare the value actually PERSISTED (post-normalisation) against
@@ -1336,7 +1431,7 @@ orgRoutes.get('/partners/:id', requireScope('system'), requireOrgRead, async (c)
     .limit(1);
 
   if (!partner) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   return c.json(withMaskedSettings(partner));
@@ -1350,7 +1445,7 @@ orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requir
   const updates: Record<string, unknown> = { ...data, updatedAt: new Date() };
 
   if (Object.keys(data).length === 0) {
-    return c.json({ error: 'No updates provided' }, 400);
+    return c.json({ error: 'No updates provided', code: ERROR_CODES.NO_UPDATES_PROVIDED }, 400);
   }
 
   if (data.slug !== undefined) {
@@ -1364,7 +1459,7 @@ orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requir
       ))
       .limit(1);
     if (clash[0]) {
-      return c.json({ error: 'That partner identifier is already in use' }, 409);
+      return c.json({ error: 'That partner identifier is already in use', code: ERROR_CODES.CONFLICT }, 409);
     }
   }
 
@@ -1402,6 +1497,13 @@ orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requir
         const next = updates.settings as Record<string, unknown>;
         const stored = (currentPartner.settings as Record<string, unknown> | null)?.ai;
         if (stored === undefined) delete next.ai; else next.ai = stored;
+
+        // Same contract as PATCH /partners/me: a default inbound assignee
+        // must be an assignable member of THIS partner.
+        const assigneeError = await defaultAssigneeSettingsError(next, id);
+        if (assigneeError) {
+          return c.json({ error: assigneeError, code: 'DEFAULT_ASSIGNEE_NOT_ASSIGNABLE' }, 400);
+        }
       }
 
       // Keep the first-class `partners.timezone` column in sync with the
@@ -1463,8 +1565,11 @@ orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requir
     : await runPartnerUpdate();
 
   if (!partner) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
+
+  // Trust Center (Ruling 26): a slug/status change can publish or hide this partner's trust pages.
+  if (data.slug !== undefined || data.status !== undefined) scheduleServingRefreshForPartner(partner.id, 'partner.update');
 
   // Invalidate the OAuth scope-policy cache (settings may have changed).
   clearPartnerScopePolicyCache(partner.id);
@@ -1472,6 +1577,9 @@ orgRoutes.patch('/partners/:id', requireScope('system'), requireOrgWrite, requir
   // enforcement picks up the new list immediately (mirrors /partners/me).
   if (data.settings !== undefined) {
     clearPartnerAllowlistCache(partner.id);
+    // Partner defaults feed every org's agent update policy and topology flags
+    // (#8053 heartbeat cache).
+    invalidateAgentOrgSettingsCaches();
   }
   // Only the terminal-ish states sever the fleet. `pending` is reversible
   // (signup/billing limbo) and is already blocked for agents by the live
@@ -1529,10 +1637,11 @@ orgRoutes.delete('/partners/:id', requireScope('system'), requireOrgWrite, requi
   );
 
   if (!partner) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   await revokePartnerTenantAccess(partner.id);
+  scheduleServingRefreshForPartner(partner.id, 'partner.delete');
 
   const auditOrgId = auth.orgId ?? await resolveAuditOrgIdForPartner(id);
   writeAuditEvent(c, {
@@ -1862,7 +1971,7 @@ orgRoutes.patch(
   async (c) => {
     const auth = c.get('auth') as AuthContext;
     if (!canManagePartnerWidePolicies(auth)) {
-      return c.json({ error: 'Full partner access required' }, 403);
+      return c.json({ error: 'Full partner access required', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     const { orderedIds } = c.req.valid('json');
     const partnerId = auth.partnerId as string;
@@ -1893,7 +2002,7 @@ orgRoutes.patch(
       .where(and(eq(partners.id, partnerId), isNull(partners.deletedAt)))
       .limit(1);
     if (!current) {
-      return c.json({ error: 'Partner not found' }, 404);
+      return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
     }
     const currentSettings = (current.settings as Record<string, unknown>) || {};
     const newSettings = { ...currentSettings, organizationOrder: sanitized };
@@ -1907,7 +2016,7 @@ orgRoutes.patch(
       .where(and(eq(partners.id, partnerId), isNull(partners.deletedAt)))
       .returning();
     if (!partner) {
-      return c.json({ error: 'Partner not found' }, 404);
+      return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
     }
 
     const auditOrgId = await resolveAuditOrgIdForPartner(partnerId);
@@ -1964,7 +2073,7 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
       return c.json({ error: 'Partner context required to create organizations' }, 400);
     }
     if (data.partnerId && data.partnerId !== auth.partnerId) {
-      return c.json({ error: 'Access denied to this partner' }, 403);
+      return c.json({ error: 'Access denied to this partner', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     targetPartnerId = auth.partnerId;
   } else {
@@ -1980,7 +2089,7 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
     .where(and(eq(partners.id, targetPartnerId), isNull(partners.deletedAt)))
     .limit(1);
   if (!partnerRow) {
-    return c.json({ error: 'Partner not found' }, 404);
+    return c.json({ error: 'Partner not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   // Same cap `POST /partner-api/organizations` already enforces
@@ -1994,7 +2103,7 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
   if (partnerRow.maxOrganizations != null) {
     const orgCount = await countPartnerOrganizations(targetPartnerId);
     if (orgCount >= partnerRow.maxOrganizations) {
-      return c.json({ error: 'Organization quota reached for this partner' }, 409);
+      return c.json({ error: 'Organization quota reached for this partner', code: ERROR_CODES.LIMIT_REACHED }, 409);
     }
   }
 
@@ -2002,7 +2111,7 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
   // 23505 catch below, which is what actually closes the race.
   const slugConflict = await findOrgSlugConflict(targetPartnerId, data.slug);
   if (slugConflict) {
-    return c.json({ error: orgSlugConflictMessage(slugConflict) }, 409);
+    return c.json({ error: orgSlugConflictMessage(slugConflict), code: ERROR_CODES.CONFLICT }, 409);
   }
 
   const insertValues = {
@@ -2071,7 +2180,7 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
   } catch (error) {
     if (error instanceof OrgQuotaExceededError) {
       // The transaction (including the over-cap insert) has already rolled back.
-      return c.json({ error: 'Organization quota reached for this partner' }, 409);
+      return c.json({ error: 'Organization quota reached for this partner', code: ERROR_CODES.LIMIT_REACHED }, 409);
     }
     if (isPgUniqueViolation(error, ORG_SLUG_UNIQUE_INDEX)) {
       // Only reachable when a concurrent write claimed the slug between the
@@ -2079,7 +2188,7 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
       // pre-check has stopped working, and a bare 409 would look identical to
       // ordinary user error in Sentry.
       console.warn(`[orgs] ${ORG_SLUG_UNIQUE_INDEX} race lost — duplicate slug rejected by the index, not the pre-check`);
-      return c.json({ error: 'That organization slug is already in use' }, 409);
+      return c.json({ error: 'That organization slug is already in use', code: ERROR_CODES.CONFLICT }, 409);
     }
     throw error;
   }
@@ -2108,7 +2217,7 @@ orgRoutes.post('/organizations', requireScope('partner', 'system'), requireOrgWr
 const requireFullPartnerOrgImportAccess = async (c: Context, next: Next) => {
   const auth = c.get('auth') as AuthContext;
   if (!canManagePartnerWidePolicies(auth)) {
-    return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE }, 403);
+    return c.json({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE, code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
   return next();
 };
@@ -2178,7 +2287,7 @@ orgRoutes.get('/organizations/:id', requireScope('partner', 'system'), requireOr
   // A malformed id cannot name a real org, so it is a 404, same as a valid id
   // for an org that doesn't exist.
   if (!PG_UUID_REGEX.test(id)) {
-    return c.json({ error: 'Organization not found' }, 404);
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   // An archive-lifecycle org (`archived`, or mid-archive-drain `offboarding` —
@@ -2194,7 +2303,7 @@ orgRoutes.get('/organizations/:id', requireScope('partner', 'system'), requireOr
       ? await loadArchivedOrg({ orgId: id, scope: archivedScope })
       : null;
     if (archived) return c.json(withMaskedSettings(archived));
-    return c.json({ error: 'Organization not found' }, 404);
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   const conditions = and(eq(organizations.id, id), isNull(organizations.deletedAt));
@@ -2206,7 +2315,7 @@ orgRoutes.get('/organizations/:id', requireScope('partner', 'system'), requireOr
     .limit(1);
 
   if (!organization) {
-    return c.json({ error: 'Organization not found' }, 404);
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   // System scope never fails `canAccessOrg`, so an archive-lifecycle org
@@ -2245,10 +2354,10 @@ orgRoutes.get('/organizations/:id/effective-settings',
     const id = c.req.param('id')!;
 
     if (auth.scope === 'organization' && id !== auth.orgId) {
-      return c.json({ error: 'Access denied' }, 403);
+      return c.json({ error: 'Access denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     if (auth.scope === 'partner' && !auth.canAccessOrg(id)) {
-      return c.json({ error: 'Organization not found' }, 404);
+      return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
     }
 
     const result = await getEffectiveOrgSettings(id);
@@ -2404,13 +2513,13 @@ async function readOrgLifecycleStatus(orgId: string): Promise<string | null> {
 // and platformAdminMiddleware (/admin/*) already treats that flag as the
 // grant, so this mirrors the established authority model. Applied ONLY to the
 // org update route, not globally.
-const requireOrgWriteOrPlatformAdmin = async (c: Context, next: Next) => {
+const requireOrgWriteOrPlatformAdmin = markPermissionGate(async (c: Context, next: Next) => {
   const auth = c.get('auth') as AuthContext | undefined;
   if (auth?.scope === 'system' && auth.user?.isPlatformAdmin === true) {
     return next();
   }
   return requireOrgWrite(c, next);
-};
+}, 'orgs:write|platform-admin');
 
 const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPlatformAdmin, requireMfa(), zValidator('json', updateOrganizationSchema), async (c: any) => {
   const auth = c.get('auth') as AuthContext;
@@ -2424,7 +2533,7 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
   if (auth.scope === 'partner' && !auth.canAccessOrg(id)) {
     suspendedLifecycleOverride = await canApplySuspendedOrgLifecycleTransition(auth, id, data);
     if (!suspendedLifecycleOverride) {
-      return c.json({ error: 'Organization not found' }, 404);
+      return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
     }
   }
 
@@ -2506,6 +2615,12 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
       }
     }
 
+    // #6111 — security.sessionTimeout ceiling (the org settings blob is z.any()).
+    const sessionTimeoutError = sessionTimeoutSettingsError(settingsObj);
+    if (sessionTimeoutError) {
+      return c.json({ error: sessionTimeoutError }, 400);
+    }
+
     // Enforce partner locks on settings categories (after auth check).
     for (const category of ['security', 'notifications', 'eventLogs', 'defaults', 'branding']) {
       if (settingsObj[category] && typeof settingsObj[category] === 'object') {
@@ -2539,7 +2654,7 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
   }
 
   if (Object.keys(data).length === 0) {
-    return c.json({ error: 'No updates provided' }, 400);
+    return c.json({ error: 'No updates provided', code: ERROR_CODES.NO_UPDATES_PROVIDED }, 400);
   }
 
   // #3967 — same per-partner slug guard as create. The org's own partner is
@@ -2557,11 +2672,11 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
       )
     );
     if (!target) {
-      return c.json({ error: 'Organization not found' }, 404);
+      return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
     }
     const slugConflict = await findOrgSlugConflict(target.partnerId, data.slug, id);
     if (slugConflict) {
-      return c.json({ error: orgSlugConflictMessage(slugConflict) }, 409);
+      return c.json({ error: orgSlugConflictMessage(slugConflict), code: ERROR_CODES.CONFLICT }, 409);
     }
   }
 
@@ -2730,7 +2845,7 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
       // pre-check has stopped working, and a bare 409 would look identical to
       // ordinary user error in Sentry.
       console.warn(`[orgs] ${ORG_SLUG_UNIQUE_INDEX} race lost — duplicate slug rejected by the index, not the pre-check`);
-      return c.json({ error: 'That organization slug is already in use' }, 409);
+      return c.json({ error: 'That organization slug is already in use', code: ERROR_CODES.CONFLICT }, 409);
     }
     throw error;
   }
@@ -2749,7 +2864,15 @@ const updateOrgHandler = [requireScope('partner', 'system'), requireOrgWriteOrPl
         return c.json({ error: frozen, code: 'ORG_LIFECYCLE_FROZEN', currentStatus: raced }, 409);
       }
     }
-    return c.json({ error: 'Organization not found' }, 404);
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
+  }
+
+  // The org's agent update policy and topology flags are served to its agents
+  // from a per-org heartbeat cache (#8053).
+  invalidateAgentOrgSettingsCaches(organization.id);
+  // Trust Center (Ruling 26): a slug/status change can publish or hide this org's trust page.
+  if ((data.slug !== undefined || data.status !== undefined) && organization.partnerId) {
+    scheduleServingRefreshForPartner(organization.partnerId, 'organization.update');
   }
 
   if (data.status === 'offboarding') {
@@ -2801,13 +2924,15 @@ registerOrgBillingProfileRoutes(orgRoutes);
 registerOrgAuditRetentionSettingsRoutes(orgRoutes);
 // First-class contacts (contacts + the dedicated importer) — see routes/orgContacts.ts
 registerOrgContactsRoutes(orgRoutes);
+// Read-only who-to-contact resolution (Site / Device) — see routes/orgContactResponsibilities.ts
+registerOrgContactResponsibilitiesRoutes(orgRoutes);
 
 orgRoutes.delete('/organizations/:id', requireScope('partner', 'system'), requireOrgWrite, requireMfa(), async (c) => {
   const auth = c.get('auth') as AuthContext;
   const id = c.req.param('id')!;
 
   if (auth.scope === 'partner' && !auth.canAccessOrg(id)) {
-    return c.json({ error: 'Organization not found' }, 404);
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   // The unassigned-device holding org is managed by Breeze.
@@ -2834,10 +2959,11 @@ orgRoutes.delete('/organizations/:id', requireScope('partner', 'system'), requir
   );
 
   if (!organization) {
-    return c.json({ error: 'Organization not found' }, 404);
+    return c.json({ error: 'Organization not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   await revokeOrganizationTenantAccess(organization.id);
+  if (organization.partnerId) scheduleServingRefreshForPartner(organization.partnerId, 'organization.delete');
 
   writeRouteAudit(c, {
     orgId: organization.id,
@@ -2873,7 +2999,7 @@ orgRoutes.get('/sites', requireScope('organization', 'partner', 'system'), requi
     // Specific org requested - check access
     const allowed = await ensureOrgAccess(effectiveOrgId, auth);
     if (!allowed) {
-      return c.json({ error: 'Access to this organization denied' }, 403);
+      return c.json({ error: 'Access to this organization denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
     }
     conditions = eq(sites.orgId, effectiveOrgId);
   } else {
@@ -3039,7 +3165,7 @@ orgRoutes.post('/sites', requireScope('organization', 'partner', 'system'), requ
 
   const allowed = await ensureOrgAccess(data.orgId, auth);
   if (!allowed) {
-    return c.json({ error: 'Access to this organization denied' }, 403);
+    return c.json({ error: 'Access to this organization denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
 
   // The unassigned-device holding org is managed by Breeze.
@@ -3093,17 +3219,17 @@ orgRoutes.get('/sites/:id', requireScope('organization', 'partner', 'system'), r
     .limit(1);
 
   if (!site) {
-    return c.json({ error: 'Site not found' }, 404);
+    return c.json({ error: 'Site not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   const allowed = await ensureOrgAccess(site.orgId, auth);
   if (!allowed) {
-    return c.json({ error: 'Access to this site denied' }, 403);
+    return c.json({ error: 'Access to this site denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
 
   const permissions = c.get('permissions') as UserPermissions | undefined;
   if (permissions?.allowedSiteIds && !canAccessSite(permissions, site.id)) {
-    return c.json({ error: 'Access to this site denied' }, 403);
+    return c.json({ error: 'Access to this site denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
 
   return c.json(withMaskedSettings(site));
@@ -3115,7 +3241,7 @@ orgRoutes.patch('/sites/:id', requireScope('organization', 'partner', 'system'),
   const data = c.req.valid('json');
 
   if (Object.keys(data).length === 0) {
-    return c.json({ error: 'No updates provided' }, 400);
+    return c.json({ error: 'No updates provided', code: ERROR_CODES.NO_UPDATES_PROVIDED }, 400);
   }
 
   const [site] = await db
@@ -3125,12 +3251,12 @@ orgRoutes.patch('/sites/:id', requireScope('organization', 'partner', 'system'),
     .limit(1);
 
   if (!site) {
-    return c.json({ error: 'Site not found' }, 404);
+    return c.json({ error: 'Site not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   const allowed = await ensureOrgAccess(site.orgId, auth);
   if (!allowed) {
-    return c.json({ error: 'Access to this site denied' }, 403);
+    return c.json({ error: 'Access to this site denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
 
   // The unassigned-device holding org is managed by Breeze.
@@ -3140,12 +3266,21 @@ orgRoutes.patch('/sites/:id', requireScope('organization', 'partner', 'system'),
 
   const permissions = c.get('permissions') as UserPermissions | undefined;
   if (permissions?.allowedSiteIds && !canAccessSite(permissions, site.id)) {
-    return c.json({ error: 'Access to this site denied' }, 403);
+    return c.json({ error: 'Access to this site denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
 
   // Encrypt secret-bearing fields inside sites.settings before writing —
   // matches the registry walker so UI edits don't regress to plaintext.
   const writeData: Record<string, unknown> = { ...data, updatedAt: new Date() };
+  if (data.latitude !== undefined) {
+    // Coordinates changed through the generic edit path: stamp provenance as
+    // 'manual' (technician pins go through POST /sites/:id/location). Clearing
+    // the pair clears the provenance with it.
+    const pinned = data.latitude !== null;
+    writeData.locationSource = pinned ? 'manual' : null;
+    writeData.locationSetBy = pinned ? auth.user.id : null;
+    writeData.locationSetAt = pinned ? new Date() : null;
+  }
   if (writeData.settings !== undefined) {
     const resolvedSecrets = resolveIncomingSettingsSecrets(writeData.settings, site.settings);
     if (!resolvedSecrets.ok) {
@@ -3198,12 +3333,12 @@ orgRoutes.delete('/sites/:id', requireScope('organization', 'partner', 'system')
     .limit(1);
 
   if (!site) {
-    return c.json({ error: 'Site not found' }, 404);
+    return c.json({ error: 'Site not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
 
   const allowed = await ensureOrgAccess(site.orgId, auth);
   if (!allowed) {
-    return c.json({ error: 'Access to this site denied' }, 403);
+    return c.json({ error: 'Access to this site denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
 
   // The unassigned-device holding org is managed by Breeze.
@@ -3213,7 +3348,7 @@ orgRoutes.delete('/sites/:id', requireScope('organization', 'partner', 'system')
 
   const permissions = c.get('permissions') as UserPermissions | undefined;
   if (permissions?.allowedSiteIds && !canAccessSite(permissions, site.id)) {
-    return c.json({ error: 'Access to this site denied' }, 403);
+    return c.json({ error: 'Access to this site denied', code: ERROR_CODES.ACCESS_DENIED }, 403);
   }
 
   // The site's topology domain cascades with it, but two kinds of row point at
@@ -3250,7 +3385,7 @@ orgRoutes.delete('/sites/:id', requireScope('organization', 'partner', 'system')
     return { removedTopologyAlerts, topologyAiSessions };
   });
   if (removed === null) {
-    return c.json({ error: 'Site not found' }, 404);
+    return c.json({ error: 'Site not found', code: ERROR_CODES.NOT_FOUND }, 404);
   }
   if (removed.blocked) {
     const { removedDevices, otherDevices } = removed.blocked;
@@ -3268,7 +3403,18 @@ orgRoutes.delete('/sites/:id', requireScope('organization', 'partner', 'system')
       deviceCount: otherDevices,
     }, 409);
   }
-  const { removedTopologyAlerts, topologyAiSessions } = removed;
+  const { removedTopologyAlerts, topologyAiSessions: { screenshotStorageKeys, ...topologyAiSessions } } = removed;
+  // #8117 — remove the deleted investigations' screenshot files. Not here: the
+  // db.transaction above is a savepoint inside the request's transaction, which
+  // commits only after this handler returns. Deferred until that transaction
+  // settles, the helper re-checks the rows and unlinks only keys no row still
+  // references, so a rollback removes nothing. Any leftover is reclaimed by the
+  // screenshot orphan sweep.
+  if (screenshotStorageKeys.length > 0) {
+    const context = `site delete site=${site.id}`;
+    runAfterDbContextExit('siteDelete.screenshotFiles', () =>
+      removeUnreferencedScreenshotFiles(screenshotStorageKeys, context));
+  }
   const siteDeleteDetails = {
     ...(removedTopologyAlerts > 0 ? { removedTopologyAlerts } : {}),
     ...(topologyAiSessions.investigations > 0 ? { topologyInvestigationsDeleted: topologyAiSessions } : {}),

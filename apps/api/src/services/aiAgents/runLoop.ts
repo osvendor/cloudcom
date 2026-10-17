@@ -69,6 +69,7 @@ import { loadTaskFence, type TaskFence } from '../aiOperator/taskService';
 import { buildTaskOperationKey } from '../aiOperator/operationKey';
 import { TOOL_TIERS, createBreezeMcpServer, listChatSurfaceToolNames } from '../aiAgentSdkTools';
 import type { PostToolUseCallback, PreToolUseCallback } from '../aiAgentSdkTools';
+import { reportMissingSdkToolUseId } from '../aiToolUseCorrelation';
 import { checkBudgetDetailed, type AiBillingSource } from '../aiCostTracker';
 import {
   markAiBudgetReservationIndeterminate,
@@ -122,6 +123,7 @@ import {
   startHopFor,
   type NextAgentHop,
 } from './agentRunFailover';
+import { admissionFailoverOf } from './admissionFailover';
 import { AgentRunBlockedError, blockedOutcome, notifyModelBlocked } from './modelBlocked';
 import type { ToolExecutionContext } from '../toolExecutionContext';
 import { EXPORT_DEFAULT_MAX_BYTES } from '../aiToolsExport';
@@ -186,6 +188,10 @@ import { isTriageProfile, triageLimits, triageToolAllowlist } from './triageProf
 import { isDesignProfile, designLimits, designToolAllowlist } from './designProfile';
 import { AI_AGENT_LIMIT_DEFAULTS } from '@breeze/shared';
 import { isPatchProfile, patchLimits, patchToolAllowlist } from './patchProfile';
+import { isResearchProfile, researchDepthOf, researchLimits, researchToolAllowlist } from './researchProfile';
+import { loadResearchContext, ResearchContextUnavailableError } from './researchContext';
+import { loadProvenFixesForRun, profileConsultsFixMemory } from '../fixMemory/runMemory';
+import type { ResearchToolRefs } from './researchSubmission';
 import { analysisLimits, analysisToolAllowlist, isAnalysisProfile } from './analysisProfile';
 import { isToolAllowlisted } from './toolAllowlist';
 import { aiTools } from '../aiToolNames';
@@ -200,6 +206,7 @@ import { PatchEvidenceUnavailableError, loadPatchEvidence, patchEvidenceRefs } f
 import {
   finalizeFleetDesign,
   finalizePatchPlan,
+  finalizeResearch,
   finalizeNarrative,
   finalizeSweep,
   finalizeTicketTriage,
@@ -282,9 +289,17 @@ function isProviderFailureCause(cause: FailoverCause | null): cause is ProviderF
  * run rebuilds matches the one its hop reserved, and the ledger row keeps
  * `failover_hop` / `failover_cause` (Codex review 5).
  */
-function agentHopBinding(resolved: ResolvedModel, hop: number, cause: FailoverCause | null): TurnBinding {
+function agentHopBinding(
+  resolved: ResolvedModel,
+  hop: number,
+  cause: FailoverCause | null,
+  admissionFailover: TurnBinding['failover'] | null = null,
+): TurnBinding {
   const binding = turnBindingFrom(resolved);
-  if (hop === 0) return binding;
+  // #7787: hop 0 of a run ADMISSION put on a fallback (primary cooling or
+  // ineligible) records admission's provenance, as chat does — unless this
+  // re-resolution itself moved, whose provenance then describes the serve.
+  if (hop === 0) return binding.failover || !admissionFailover ? binding : { ...binding, failover: admissionFailover };
   const recordedCause = cause ?? binding.failover?.cause ?? null;
   if (!recordedCause) return binding;
   return { ...binding, failover: { fromOfferingId: binding.failover?.fromOfferingId ?? null, hop, cause: recordedCause } };
@@ -340,6 +355,8 @@ async function loadRunContext(runId: string): Promise<RunContext | null> {
         servedFundingSource: aiAgentRuns.servedFundingSource,
         servedFailoverHop: aiAgentRuns.servedFailoverHop,
         servedFailoverCause: aiAgentRuns.servedFailoverCause,
+        // #7787 — the failover source admission (or a hop) recorded.
+        servedFailoverFromOfferingId: aiAgentRuns.servedFailoverFromOfferingId,
       })
       .from(aiAgentRuns)
       .where(eq(aiAgentRuns.id, runId))
@@ -492,6 +509,25 @@ async function loadRunContext(runId: string): Promise<RunContext | null> {
       }
     }
 
+    // AI Suggested Fixes W3. Verdict and full runs only, and only when the
+    // ORG-PINNED alert or group read above resolved: the signature loader
+    // reads by id, so an alert or group that left this org must not be
+    // signatured for this run. Runs inside this same system context and opens
+    // none of its own; lookupFixes filters by run org + partner and re-checks
+    // script ownership itself (W1 Task 16). Never throws: null when memory is
+    // off, empty or unavailable.
+    let provenFixes: RunContext['provenFixes'] = null;
+    const memoryAlertId = alert ? run.alertId : null;
+    const memoryGroupId = correlationGroup ? run.correlationGroupId : null;
+    if (profileConsultsFixMemory(run.profile) && (memoryAlertId || memoryGroupId)) {
+      provenFixes = await loadProvenFixesForRun({
+        orgId: run.orgId,
+        partnerId: org.partnerId,
+        alertId: memoryAlertId,
+        correlationGroupId: memoryGroupId,
+      });
+    }
+
     // Phase 2 wave P2-2 (scheduled sweeps). Runs INSIDE this same system
     // context (`loadSweepEvidence`'s own header states it manages none of its
     // own) — the `org_id = run.orgId` predicate every one of its statements
@@ -603,6 +639,27 @@ async function loadRunContext(runId: string): Promise<RunContext | null> {
       };
     }
 
+    // AI Suggested Fixes W2. Runs INSIDE this same system context like the
+    // other evidence loaders; its catalog queries carry W1's explicit
+    // visibility condition. A device that left the org or has no supported OS
+    // fails the run with a typed code rather than researching the wrong box.
+    let research: RunContext['research'] = null;
+    if (isResearchProfile(run as RunRow)) {
+      // A device-less run must fail typed, not hand '' to a uuid column (22P02).
+      if (!run.deviceId) throw new AgentRunError('research_device_unavailable', 'remediation_research run has no device');
+      try {
+        research = await loadResearchContext({
+          orgId: run.orgId,
+          partnerId: org.partnerId,
+          deviceId: run.deviceId,
+          triggerRef: (run.triggerRef ?? {}) as Record<string, unknown>,
+        });
+      } catch (error) {
+        if (error instanceof ResearchContextUnavailableError) throw new AgentRunError(error.code, error.message);
+        throw error;
+      }
+    }
+
     return {
       run: run as RunRow,
       agent: agent as AgentRow,
@@ -616,6 +673,8 @@ async function loadRunContext(runId: string): Promise<RunContext | null> {
       narrative,
       design,
       patch,
+      research,
+      provenFixes,
       sessionId: null,
       workspace: null,
     };
@@ -626,6 +685,105 @@ function readToolAction(toolName: string, input: Record<string, unknown>): strin
   const key = TOOL_ACTION_INPUT_KEYS[toolName] ?? 'action';
   const value = input[key];
   return typeof value === 'string' ? value : undefined;
+}
+
+/**
+ * What the pre hook decided for one ALLOWED call, consumed by that call's post
+ * hook: its `ai_tool_executions` row (`null` when the ledger write failed or
+ * was skipped) and its act-mode asset pin (`null` for an ordinary allow).
+ */
+export interface AllowedCallState {
+  executionId: string | null;
+  actPin: ActAssetPin | null;
+}
+
+/**
+ * Pre → post correlation for one run's ALLOWED tool calls (#8163).
+ *
+ * The SDK runs MCP tool calls concurrently, so two calls of the same tool in
+ * one turn can finish in either order — and a denied call's result echo can
+ * arrive while an allowed same-name sibling is still running. Each call's
+ * state is therefore keyed by the model's tool_use id, which the SDK hands
+ * both hooks for the same call (`PreToolUseCallback`'s `toolUseId`, bound into
+ * postToolUse by `postToolUseForCall`). A post hook whose id is not in
+ * `byToolUseId` is not an allowed call (a denial or proposal echo) and is
+ * ignored.
+ *
+ * Only a call the SDK sent WITHOUT an id falls back to the per-name FIFOs —
+ * which pair by start order and so can mis-pair same-name calls that finish
+ * out of order. That fallback is warned and reported once per run.
+ */
+export interface AgentRunCallPairing {
+  /** Allowed calls that carried the SDK tool_use id, by that id. */
+  byToolUseId: Map<string, AllowedCallState>;
+  /** Fallback only (no SDK id): per-tool count of allowed calls. */
+  allowedPending: Map<string, number>;
+  /** Fallback only (no SDK id): per-tool FIFO of ledger ids, in lockstep with `actPinPending`. */
+  executionIdPending: Map<string, Array<string | null>>;
+  /**
+   * Fallback only (no SDK id): per-tool FIFO of act-mode asset pins, pushed in
+   * LOCKSTEP with `executionIdPending` (a `null` entry for every ordinary
+   * allowed call) — the SAME tool name can be BOTH in one run (e.g.
+   * `disk_cleanup` preview is a plain read-only allow, `disk_cleanup` execute
+   * is act-eligible), so this cannot be a separate independently-sized queue.
+   */
+  actPinPending: Map<string, Array<ActAssetPin | null>>;
+}
+
+export function createAgentRunCallPairing(): AgentRunCallPairing {
+  return {
+    byToolUseId: new Map(),
+    allowedPending: new Map(),
+    executionIdPending: new Map(),
+    actPinPending: new Map(),
+  };
+}
+
+function recordAllowedCall(
+  pairing: AgentRunCallPairing,
+  toolName: string,
+  toolUseId: string | undefined,
+  state: AllowedCallState,
+): void {
+  if (toolUseId) {
+    pairing.byToolUseId.set(toolUseId, state);
+    return;
+  }
+  reportMissingSdkToolUseId(pairing, toolName, 'agent_run');
+  pairing.allowedPending.set(toolName, (pairing.allowedPending.get(toolName) ?? 0) + 1);
+  const pending = pairing.executionIdPending.get(toolName) ?? [];
+  pending.push(state.executionId);
+  pairing.executionIdPending.set(toolName, pending);
+  const pinQueue = pairing.actPinPending.get(toolName) ?? [];
+  pinQueue.push(state.actPin);
+  pairing.actPinPending.set(toolName, pinQueue);
+}
+
+/** Returns the allowed call this result belongs to, or undefined for a denial/proposal echo. */
+function takeAllowedCall(
+  pairing: AgentRunCallPairing,
+  toolName: string,
+  toolUseId: string | undefined,
+): AllowedCallState | undefined {
+  if (toolUseId) {
+    const state = pairing.byToolUseId.get(toolUseId);
+    if (state) {
+      pairing.byToolUseId.delete(toolUseId);
+      return state;
+    }
+    // Not an id-keyed allowed call. Only a pre hook that got NO id for this
+    // call can have queued it by name; with ids flowing to both hooks the
+    // fallback queues stay empty and this is a denial/proposal echo.
+  } else {
+    reportMissingSdkToolUseId(pairing, toolName, 'agent_run');
+  }
+  const remaining = pairing.allowedPending.get(toolName) ?? 0;
+  if (remaining <= 0) return undefined;
+  pairing.allowedPending.set(toolName, remaining - 1);
+  return {
+    executionId: pairing.executionIdPending.get(toolName)?.shift() ?? null,
+    actPin: pairing.actPinPending.get(toolName)?.shift() ?? null,
+  };
 }
 
 /**
@@ -649,25 +807,13 @@ export function createAgentRunPreToolUse(args: {
   guardrailPolicy: AgentGuardrailPolicy;
   outcome: AgentRunOutcome;
   intentIds: string[];
-  /** Per-tool count of calls the gate ALLOWED, consumed by the post hook. */
-  allowedPending: Map<string, number>;
   /** The run's execution-ledger session, or `null` if session creation itself failed. */
   sessionId: string | null;
   /**
-   * Per-tool FIFO of `ai_tool_executions` ids (or `null` sentinels for a
-   * failed/skipped ledger write), shifted by the post hook. Same ordering
-   * assumption as `allowedPending`.
+   * Where each ALLOWED call's state (ledger id, act pin) waits for its post
+   * hook — the SAME object the post hook receives. See `AgentRunCallPairing`.
    */
-  executionIdPending: Map<string, Array<string | null>>;
-  /**
-   * Per-tool FIFO of act-mode asset pins, pushed in LOCKSTEP with
-   * `executionIdPending` (a `null` entry for every ordinary allowed call, a
-   * real `ActAssetPin` only for one that dispatched through the act branch)
-   * — the SAME tool name can be BOTH in one run (e.g. `disk_cleanup` preview
-   * is a plain read-only allow, `disk_cleanup` execute is act-eligible), so
-   * this cannot be a separate independently-sized queue.
-   */
-  actPinPending: Map<string, Array<ActAssetPin | null>>;
+  pairing: AgentRunCallPairing;
   /** In-run `maxActionsPerRun` reservation counter, shared across every
    *  act-mode call in this run (Task 3). */
   actReservation: ActReservationState;
@@ -704,10 +850,12 @@ export function createAgentRunPreToolUse(args: {
    * on every non-patch run.
    */
   patch?: PatchPlanToolRefs;
+  /** AI Suggested Fixes W2 — the SAME refs the SDK handler and post-hook receive. */
+  research?: ResearchToolRefs;
 }): PreToolUseCallback {
   const {
-    run, agentName, agentAuth, agentKind, guardrailPolicy, outcome, intentIds, allowedPending,
-    sessionId, executionIdPending, actPinPending, actReservation, deadlineMs, design, patch,
+    run, agentName, agentAuth, agentKind, guardrailPolicy, outcome, intentIds,
+    sessionId, pairing, actReservation, deadlineMs, design, patch, research,
     runTargets, stagedBytesRemaining,
   } = args;
 
@@ -835,20 +983,19 @@ export function createAgentRunPreToolUse(args: {
   }
 
   /** Shared by the ordinary 'allow' tail AND an act-mode 'ok' revalidation —
-   *  both write the SAME ledger row and per-tool FIFOs; only `actPin` (and
+   *  both write the SAME ledger row and call pairing; only `actPin` (and
    *  therefore the returned `context`) differs. */
   async function recordAllowedExecution(
     toolName: string,
     input: Record<string, unknown>,
     actPin: ActAssetPin | null,
+    toolUseId: string | undefined,
   ): Promise<{ allowed: true; context?: ToolExecutionContext }> {
-    allowedPending.set(toolName, (allowedPending.get(toolName) ?? 0) + 1);
-
     // Ledger write is best-effort: the tool call is already decided ALLOWED
     // above, and a failure here must never turn that into a denial. A failed
-    // (or skipped, when the session itself never got created) write pushes a
-    // `null` sentinel so the post hook's FIFO stays aligned with the calls
-    // that actually happened.
+    // (or skipped, when the session itself never got created) write records a
+    // `null` sentinel for THIS call, so its post hook completes no row rather
+    // than a sibling's.
     let executionId: string | null = null;
     if (sessionId) {
       try {
@@ -860,20 +1007,14 @@ export function createAgentRunPreToolUse(args: {
         executionId = null;
       }
     }
-    const pending = executionIdPending.get(toolName) ?? [];
-    pending.push(executionId);
-    executionIdPending.set(toolName, pending);
-
-    const pinQueue = actPinPending.get(toolName) ?? [];
-    pinQueue.push(actPin);
-    actPinPending.set(toolName, pinQueue);
+    recordAllowedCall(pairing, toolName, toolUseId, { executionId, actPin });
 
     return actPin?.toolExecutionContext
       ? { allowed: true, context: { ...runFrame, ...actPin.toolExecutionContext } }
       : { allowed: true, context: runFrame };
   }
 
-  return async (toolName, input) => {
+  return async (toolName, input, _mcpToolName, toolUseId) => {
     // No `.catch` — `isRunResourceScopeCurrent` already fails closed on a throw.
     if (args.revalidateResourceScope && (await args.revalidateResourceScope(toolName)) !== true) {
       const reason = 'This run\'s device is no longer within the agent\'s resource scope, '
@@ -956,12 +1097,31 @@ export function createAgentRunPreToolUse(args: {
         });
         return { allowed: false, error: 'not available on this run' };
       }
+      // AI Suggested Fixes W2 — first submission wins. A second call would
+      // otherwise replace an already-validated outcome with whatever the model
+      // sends next; tell it so it stops instead of retrying.
+      if (toolName === 'submit_suggestions' && outcome.research !== undefined) {
+        const reason = 'submit_suggestions was already submitted for this run; the first submission is final';
+        outcome.deniedActions.push({ tool: toolName, reason });
+        return { allowed: false, error: reason };
+      }
       try {
-        validateOutcomeToolInput(toolName, input, toolName === 'submit_patch_plan' ? patch : design);
+        validateOutcomeToolInput(toolName, input, toolName === 'submit_patch_plan' ? patch : toolName === 'submit_suggestions' ? research : design);
       } catch (e) {
         return { allowed: false, error: `invalid ${toolName} input: ${(e as Error).message}` };
       }
       return { allowed: true, context: runFrame };
+    }
+
+    // AI Suggested Fixes W2 — a research run may call ONLY its floor. The
+    // guardrail alone would let a read-classified tool outside the floor
+    // (e.g. `propose_script`, tier 1) through, and research must never draft
+    // or propose anything: the hand-off to the script builder is a human step.
+    // Exposure (`onlyTools`) already hides these; this is the authority backstop.
+    if (isResearchProfile(run) && !researchToolAllowlist([]).includes(toolName)) {
+      const reason = `${toolName} is not available to remediation_research runs`;
+      outcome.deniedActions.push({ tool: toolName, reason });
+      return { allowed: false, error: reason };
     }
 
     const guardrailContext = await loadProposalGuardrailContext(input, run.orgId);
@@ -1021,7 +1181,7 @@ export function createAgentRunPreToolUse(args: {
     // output channel is `submit_fleet_design`, handled above this branch.
     if (
       (isVerdictProfile(run) || isSweepProfile(run) || isNarrativeProfile(run) || isTriageProfile(run)
-        || isDesignProfile(run) || isPatchProfile(run))
+        || isDesignProfile(run) || isPatchProfile(run) || isResearchProfile(run))
       && check.disposition !== 'allow'
     ) {
       const reason = `${run.profile} runs are read-only`;
@@ -1099,9 +1259,9 @@ export function createAgentRunPreToolUse(args: {
         // step list to run turn-by-turn — never a rule-equivalent shape for
         // unattended act mode. The deterministic executor replaces it
         // entirely: it does NOT dispatch through `recordAllowedExecution`
-        // (the SDK tool never runs), so `actPinPending`/`executionIdPending`
-        // never see an entry for this call and the post-hook's FIFO guard
-        // (`remaining <= 0`) makes its no-op safe. The outcome is recorded
+        // (the SDK tool never runs), so `pairing` never sees an entry for
+        // this call and the post hook ignores its result echo as a
+        // non-allowed call (`takeAllowedCall`). The outcome is recorded
         // here, directly, in the SAME shape the post-hook would have used.
         const target = revalidated.pin.target as Extract<ActTarget, { kind: 'playbook' }>;
         const playbookDigest = revalidated.pin.playbookDigest;
@@ -1163,24 +1323,24 @@ export function createAgentRunPreToolUse(args: {
 
       // ok: the ONLY remaining path that actually dispatches — through the
       // normal tool implementation, exactly like a plain 'allow'.
-      return recordAllowedExecution(toolName, input, revalidated.pin);
+      return recordAllowedExecution(toolName, input, revalidated.pin, toolUseId);
     }
 
-    return recordAllowedExecution(toolName, input, null);
+    return recordAllowedExecution(toolName, input, null, toolUseId);
   };
 }
 
 /**
  * The post-tool-use hook. `makeHandler` fires postToolUse for REFUSED calls too
- * (with `isError: true`), so the counter written by the pre hook is what
- * separates a real execution from the echo of a denial or a proposal — without
- * it every denial would be recorded as a failed execution.
+ * (with `isError: true`), so the call state the pre hook recorded in `pairing`
+ * is what separates a real execution from the echo of a denial or a proposal —
+ * without it every denial would be recorded as a failed execution. Each result
+ * is paired with its own call's state by the SDK tool_use id (#8163).
  */
 export function createAgentRunPostToolUse(args: {
   outcome: AgentRunOutcome;
-  allowedPending: Map<string, number>;
-  executionIdPending: Map<string, Array<string | null>>;
-  actPinPending: Map<string, Array<ActAssetPin | null>>;
+  /** The SAME object the pre hook records into. See `AgentRunCallPairing`. */
+  pairing: AgentRunCallPairing;
   run: {
     id: string; orgId: string; agentId: string; deviceId: string | null; profile: AiAgentRunProfile;
     /** #5205 W06 — selects `submit_task_step` for capture (`outcomeToolsForRun`). */
@@ -1203,13 +1363,15 @@ export function createAgentRunPostToolUse(args: {
   design?: FleetDesignOutcomeRefs;
   /** AI patch agent W01 — see the pre-hook's `patch` param. */
   patch?: PatchPlanToolRefs;
+  /** AI Suggested Fixes W2 — see the pre-hook's `research` param. */
+  research?: ResearchToolRefs;
 }): PostToolUseCallback {
-  const { outcome, allowedPending, executionIdPending, actPinPending, run, agentUserId, design, patch } = args;
+  const { outcome, pairing, run, agentUserId, design, patch, research } = args;
 
-  return async (toolName, input, output, isError, durationMs) => {
+  return async (toolName, input, output, isError, durationMs, _sealed, _handoff, toolUseId) => {
     // Outcome tools (Phase 2 wave P2-1): never went through
     // `recordAllowedExecution` in the pre-hook, so they never touch
-    // `allowedPending`/the execution ledger/the act pipeline — capture the
+    // `pairing`/the execution ledger/the act pipeline — capture the
     // validated verdict and stop, before any of the ordinary accounting below.
     if (isOutcomeTool(toolName)) {
       // Stored BY TOOL NAME (wave P2-2, task 6), gated on the same
@@ -1274,6 +1436,13 @@ export function createAgentRunPostToolUse(args: {
           case 'submit_analysis':
             outcome.analysis = validateOutcomeToolInput(toolName, input);
             break;
+          case 'submit_suggestions':
+            // AI Suggested Fixes W2 — the SERVER-BUILT outcome: accepted items plus
+            // recorded rejections (kept for the run trace, never persisted).
+            // finalizeResearch persists; nothing here executes.
+            if (!research) throw new Error('[aiAgentRunLoop] submit_suggestions captured with no research refs');
+            outcome.research = validateOutcomeToolInput(toolName, input, research);
+            break;
           default: {
             const exhaustive: never = toolName;
             throw new Error(`[aiAgentRunLoop] unhandled outcome tool: ${String(exhaustive)}`);
@@ -1283,15 +1452,21 @@ export function createAgentRunPostToolUse(args: {
       return;
     }
 
-    const remaining = allowedPending.get(toolName) ?? 0;
-    if (remaining <= 0) return;
-    allowedPending.set(toolName, remaining - 1);
-
-    let executionId: string | null = null;
-    const pending = executionIdPending.get(toolName);
-    if (pending && pending.length > 0) {
-      executionId = pending.shift() ?? null;
+    const call = takeAllowedCall(pairing, toolName, toolUseId);
+    if (!call) {
+      // Denial, proposal and inline-playbook echoes all arrive as isError
+      // (`preToolUseDenialResult`), so they end here quietly. A SUCCESS with
+      // an id the pre hook never recorded means a real execution lost its
+      // ledger row and act pin — never let that look like a denial echo.
+      if (toolUseId && !isError) {
+        console.warn('[aiAgentRunLoop] tool result has no pre-call state for its tool_use id — not recorded as an execution', {
+          runId: run.id, toolName, toolUseId,
+        });
+      }
+      return;
     }
+    const { executionId, actPin } = call;
+
     if (executionId) {
       try {
         await completeToolExecution({ executionId, isError, durationMs });
@@ -1300,12 +1475,6 @@ export function createAgentRunPostToolUse(args: {
           toolName, executionId, error,
         });
       }
-    }
-
-    let actPin: ActAssetPin | null = null;
-    const pinQueue = actPinPending.get(toolName);
-    if (pinQueue && pinQueue.length > 0) {
-      actPin = pinQueue.shift() ?? null;
     }
 
     const action = readToolAction(toolName, input);
@@ -1582,6 +1751,11 @@ function patchOutcomeRefs(ctx: RunContext): PatchPlanToolRefs | undefined {
   };
 }
 
+/** AI Suggested Fixes W2 — computed once by loadResearchContext; shared by pre-hook, SDK tool and post-hook. */
+function researchOutcomeRefs(ctx: RunContext): ResearchToolRefs | undefined {
+  return ctx.research?.refs;
+}
+
 function promptContext(ctx: RunContext, effective: AiAgentPolicy): AgentRunPromptContext {
   return {
     analysis: ctx.run.profile === 'analysis'
@@ -1610,6 +1784,8 @@ function promptContext(ctx: RunContext, effective: AiAgentPolicy): AgentRunPromp
           focusDeviceId: ctx.patch.focusDeviceId ?? null,
         }
       : null,
+    research: ctx.research ?? null,
+    provenFixes: ctx.provenFixes ?? null,
   };
 }
 
@@ -1709,7 +1885,8 @@ export function declaredFullRunToolExposure(agentAllowlist: readonly string[]): 
   return fullRunToolExposure(agentAllowlist).filter((name) => declared.has(name));
 }
 
-type RunProfileRef = { profile: AiAgentRunProfile };
+/** `triggerRef` is read only by `remediation_research` (its depth); optional so every other call site stays valid. */
+type RunProfileRef = { profile: AiAgentRunProfile; triggerRef?: Record<string, unknown> | null };
 
 /**
  * The run's effective limits: each narrow profile pins its own turn, budget
@@ -1724,6 +1901,7 @@ export function resolveRunProfileLimits(run: RunProfileRef, limits: AiAgentLimit
   if (isTriageProfile(run)) return triageLimits(limits);
   if (isDesignProfile(run)) return designLimits(limits);
   if (isPatchProfile(run)) return patchLimits(limits);
+  if (isResearchProfile(run)) return researchLimits(limits, researchDepthOf(run.triggerRef));
   if (isAnalysisProfile(run)) return analysisLimits(limits);
   return limits;
 }
@@ -1740,6 +1918,7 @@ export function resolveRunProfileToolAllowlist(run: RunProfileRef, agentAllowlis
   if (isTriageProfile(run)) return triageToolAllowlist(agentAllowlist);
   if (isDesignProfile(run)) return designToolAllowlist(agentAllowlist);
   if (isPatchProfile(run)) return patchToolAllowlist(agentAllowlist);
+  if (isResearchProfile(run)) return researchToolAllowlist(agentAllowlist);
   if (isAnalysisProfile(run)) return analysisToolAllowlist(agentAllowlist);
   return null;
 }
@@ -1974,7 +2153,7 @@ async function driveSdkLoop(
   // Codex review 5: a hop > 0 carries the RUN's provenance (hop index and
   // cause from the run row), so a re-driven hop rebuilds the binding it
   // reserved and its ledger row keeps its failover provenance.
-  let binding = agentHopBinding(hopModel, hopIndex, hopCause);
+  let binding = agentHopBinding(hopModel, hopIndex, hopCause, admissionFailoverOf(run));
   // Provenance only (resolved_model, the execution-ledger session): the wire
   // id the SDK is sent comes from sdkModelOptions below.
   const model = agentModel.logicalModel;
@@ -1994,11 +2173,12 @@ async function driveSdkLoop(
   });
 
   // #5205 W06, spec §6.2: "Record the prompt template version and the resolved
-  // model on every task-linked run." Admission stamped the CONFIGURED model
-  // (`policySnapshot.effective.model`), which is null whenever the agent
-  // follows the `ai_agents` assignment default resolved above. This is
-  // the first and only moment the value actually used is known, so it is
-  // stamped here rather than guessed at admission.
+  // model on every task-linked run." Admission snapshots no model string (the
+  // agent policy model string was retired in W08 #7606): at most the bound
+  // offering id, and nothing when the agent follows the `ai_agents`
+  // assignment default resolved above. This is the first and only moment the
+  // model actually used is known, so it is stamped here rather than guessed
+  // at admission.
   //
   // Best-effort and non-fatal: a failed metadata write must never turn a
   // healthy run into a failed one. `resolved_model` is not in
@@ -2120,9 +2300,8 @@ async function driveSdkLoop(
     toolExecutionCount: 0,
   };
   const intentIds: string[] = [];
-  const allowedPending = new Map<string, number>();
-  const executionIdPending = new Map<string, Array<string | null>>();
-  const actPinPending = new Map<string, Array<ActAssetPin | null>>();
+  // ONE object shared by both hooks — see AgentRunCallPairing.
+  const pairing = createAgentRunCallPairing();
   // Shared across every act-mode call in THIS run — see actRevalidation.ts.
   const actReservation: ActReservationState = { count: 0 };
 
@@ -2133,10 +2312,11 @@ async function driveSdkLoop(
   // timestamps for the same run.
   const designRefs = designOutcomeRefs(ctx);
   const patchRefs = patchOutcomeRefs(ctx);
+  const researchRefs = researchOutcomeRefs(ctx);
   const preToolUse = createAgentRunPreToolUse({
     run, agentName: ctx.agent.name, agentAuth, agentKind: ctx.agent.kind, guardrailPolicy, outcome,
-    intentIds, allowedPending, sessionId: ctx.sessionId, executionIdPending, actPinPending,
-    actReservation, deadlineMs, design: designRefs, patch: patchRefs,
+    intentIds, sessionId: ctx.sessionId, pairing,
+    actReservation, deadlineMs, design: designRefs, patch: patchRefs, research: researchRefs,
     revalidateResourceScope: (toolName) => isRunResourceScopeCurrent(ctx, readCurrentPolicy, toolName),
     // W03 seeds the run frame from the single-device runs that exist today.
     // W04's `analysis` profile replaces both values with the admission-frozen
@@ -2149,7 +2329,7 @@ async function driveSdkLoop(
       : EXPORT_DEFAULT_MAX_BYTES,
   });
   const postToolUse = createAgentRunPostToolUse({
-    outcome, allowedPending, executionIdPending, actPinPending,
+    outcome, pairing,
     run: {
       id: run.id, orgId: run.orgId, agentId: run.agentId, deviceId: run.deviceId,
       profile: run.profile, taskId: run.taskId,
@@ -2158,6 +2338,7 @@ async function driveSdkLoop(
     agentUserId: agentAuth.user.id,
     design: designRefs,
     patch: patchRefs,
+    research: researchRefs,
   });
 
   // Exposure (`allowedTools`) and registration (`onlyTools`) — see
@@ -2175,7 +2356,7 @@ async function driveSdkLoop(
   const mcpServer = createBreezeMcpServer(() => agentAuth, preToolUse, postToolUse, undefined,
     buildOutcomeSdkTools(
       outcomeToolsForRun(run),
-      designRefs || patchRefs ? { design: designRefs, patch: patchRefs } : undefined,
+      designRefs || patchRefs || researchRefs ? { design: designRefs, patch: patchRefs, research: researchRefs } : undefined,
     ),
     onlyTools ? { onlyTools } : undefined);
 
@@ -2900,6 +3081,8 @@ export async function executeAgentRun(runId: string): Promise<void> {
     // `finishRun` serializes the outcome. At most one of the six codes below
     // is ever non-null.
     const patchPlanErrorCode = await finalizePatchPlan(ctx, result);
+    // AI Suggested Fixes W2 — seventh: persist the accepted research items.
+    const researchErrorCode = await finalizeResearch(ctx, result);
 
     // The loop threw after spending: record what it cost and what it managed to
     // do, then fail. `finishRun` writes cost/turns/outcome on every terminal
@@ -2961,6 +3144,8 @@ export async function executeAgentRun(runId: string): Promise<void> {
       // that called `submit_analysis` and only then hit `error_max_turns` has
       // produced exactly what it was admitted to produce.
       || outcome.analysis !== undefined
+      // AI Suggested Fixes W2 — same rule for a research run's ONE job.
+      || outcome.research !== undefined
       || result.summary.trim().length > 0;
 
     const ceiling = outcome.wallClockExceeded
@@ -2992,7 +3177,7 @@ export async function executeAgentRun(runId: string): Promise<void> {
       ctx,
       classifyIntentAwaitingApproval(intentIds, result.decidedIntentIds) ? 'awaiting_approval' : 'completed',
       verdictErrorCode ?? sweepErrorCode ?? narrativeErrorCode ?? ticketTriageErrorCode ?? fleetDesignErrorCode
-        ?? patchPlanErrorCode,
+        ?? patchPlanErrorCode ?? researchErrorCode,
       result,
     );
   } catch (error) {
@@ -3310,7 +3495,10 @@ async function finishRun(
   // (`TRIAGE_TOOL_ALLOWLIST`), so — exactly like sweep and narrative — it
   // executes nothing, and there is no fix whose regression `scheduleFixWatch`
   // could watch for.
-  const notifies = !isVerdictProfile(ctx.run);
+  // AI Suggested Fixes W2: a research run has no recipients (its agent is
+  // system-provisioned) and its result is the suggestion rows, so it neither
+  // notifies nor watches.
+  const notifies = !isVerdictProfile(ctx.run) && !isResearchProfile(ctx.run);
   // Fleet Designer W01 (#5651): `watches` gains the design exclusion, same
   // reasoning as sweep/narrative/triage — a design run executes nothing (its
   // tool floor is read-only and `designLimits` pins `maxActionsPerRun: 0`),
@@ -3321,7 +3509,8 @@ async function finishRun(
     && !isTriageProfile(ctx.run) && !isDesignProfile(ctx.run)
     // AI patch agent W01: a patch run executes nothing, so there is no fix
     // whose regression a fix-watch could watch for.
-    && !isPatchProfile(ctx.run);
+    && !isPatchProfile(ctx.run)
+    && !isResearchProfile(ctx.run);
 
   if (notifies) {
     try {
@@ -3414,6 +3603,9 @@ let resourceScopeRecheckClock: () => number = () => Date.now();
 export function __setResourceScopeRecheckClockForTests(clock: (() => number) | null): void {
   resourceScopeRecheckClock = clock ?? (() => Date.now());
 }
+
+/** TEST ONLY — real-Postgres suites drive the context load directly (fixMemoryTxSafety). */
+export const __loadRunContextForTests = (runId: string) => loadRunContext(runId);
 
 type CurrentPolicyReader = () => Promise<ResolvedAgent | null>;
 

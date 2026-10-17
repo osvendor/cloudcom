@@ -42,6 +42,16 @@ import {
 } from '../actionIntents/intentTargetScope';
 import { aiAgentRuns } from '../../db/schema/aiAgents';
 import { devices } from '../../db/schema/devices';
+import { organizations } from '../../db/schema/orgs';
+import { diagnosticAccessGrants } from '../../db/schema/diagnosticAccess';
+import {
+  auditDiagnosticDecision,
+  auditDiagnosticSelfApproval,
+  decideDiagnosticGrantInTx,
+  isEligibleApprover as isEligibleDiagnosticApprover,
+  resolveEligibleApprovers as resolveDiagnosticApprovers,
+  type GrantRow as DiagnosticGrantRow,
+} from '../diagnosticAccess/grants';
 import { checkToolPermission } from '../aiGuardrails';
 import { loadPartnerPolicy, isEnforcing } from '../authenticatorPolicy';
 import { getUserPermissions, hasPermission, userCanDecideApprovals, canAccessOrg } from '../permissions';
@@ -57,6 +67,9 @@ import {
   isFreshApproverFactor,
   requiresFreshApproverFactor,
 } from '../actionIntents/freshApproverFactor';
+
+/** Thrown inside the decide transaction to roll it back when a diagnostic grant is no longer pending. */
+class DiagnosticGrantNotPendingError extends Error {}
 
 /**
  * The approvals DECIDE core (P2-2 #4189), lifted verbatim out of
@@ -595,6 +608,72 @@ export async function decideApprovalRequest(
       !hasPermission(deciderPerms, 'pam', 'approve')
     ) {
       return { httpStatus: 403, body: { error: 'pam_approve_required' } };
+    }
+  }
+
+  // Diagnostic read grants (services/diagnosticAccess): the row was fanned out
+  // to every eligible approver at REQUEST time; eligibility is re-proved LIVE
+  // here for both approve and deny (same rule as the PAM branch above): active
+  // account with devices:execute + approvals:decide for the device's org, and
+  // access to the device's site. A Site-A administrator cannot decide a
+  // Site-B grant, even if the device moved after the request.
+  let diagnosticSelfApprove = false;
+  let diagnosticTarget: { orgId: string; deviceId: string } | null = null;
+  if (existing.diagnosticAccessGrantId && !existing.intentId) {
+    const target = await runOutsideDbContext(() =>
+      withSystemDbAccessContext(async () => {
+        const [row] = await db
+          .select({
+            orgId: diagnosticAccessGrants.orgId,
+            deviceId: diagnosticAccessGrants.deviceId,
+            status: diagnosticAccessGrants.status,
+            deviceOrgId: devices.orgId,
+            siteId: devices.siteId,
+            partnerId: organizations.partnerId,
+            requestedByUserId: diagnosticAccessGrants.requestedByUserId,
+          })
+          .from(diagnosticAccessGrants)
+          .innerJoin(devices, eq(devices.id, diagnosticAccessGrants.deviceId))
+          .innerJoin(organizations, eq(organizations.id, diagnosticAccessGrants.orgId))
+          .where(eq(diagnosticAccessGrants.id, existing.diagnosticAccessGrantId as string));
+        return row ?? null;
+      }),
+    );
+    if (!target) return { httpStatus: 404, body: { error: 'diagnostic_access_grant_not_found' } };
+    diagnosticTarget = { orgId: target.orgId, deviceId: target.deviceId };
+    if (target.deviceOrgId !== target.orgId) {
+      return { httpStatus: 409, body: { error: 'diagnostic_access_device_moved', finalStatus: 'expired' } };
+    }
+    if (target.status !== 'pending_approval') {
+      return { httpStatus: 409, body: { error: `Already ${target.status}`, finalStatus: 'expired' } };
+    }
+    const eligible = await isEligibleDiagnosticApprover(
+      userId,
+      { orgId: target.orgId, siteId: target.siteId },
+      target.partnerId ?? null,
+    );
+    if (!eligible) {
+      return { httpStatus: 403, body: { error: 'diagnostic_access_approver_required' } };
+    }
+    // Self-approval: allowed only for a genuine sole operator, re-derived
+    // live with the same filter the fan-out used. A deny is always allowed.
+    // The requester must be IN the live population and alone in it; an empty
+    // or disagreeing resolution refuses rather than admits.
+    if (status === 'approved' && target.requestedByUserId === userId) {
+      const eligibleNow = await resolveDiagnosticApprovers(
+        { orgId: target.orgId, siteId: target.siteId },
+        target.partnerId ?? null,
+      );
+      diagnosticSelfApprove = true;
+      if (!eligibleNow.includes(userId) || eligibleNow.some((id) => id !== userId)) {
+        return {
+          httpStatus: 403,
+          body: {
+            error: 'self_approval_forbidden',
+            message: 'This request needs an approver other than the person who requested it.',
+          },
+        };
+      }
     }
   }
 
@@ -1212,6 +1291,21 @@ export async function decideApprovalRequest(
     }
   }
 
+  // A sole operator approving their OWN diagnostic grant needs a fresh
+  // second factor: a hardware-backed assertion (>= L3) made for THIS
+  // decision, never a session tap or a reused step-up grant, whatever the
+  // partner policy or batch path. Deny is never gated.
+  if (
+    diagnosticSelfApprove
+    && !isFreshApproverFactor({
+      decidedVia: assurance.decidedVia,
+      decidedAssuranceLevel: assurance.decidedAssuranceLevel,
+      stepUpGrantReuse: assurance.stepUpGrantReuse === true,
+    })
+  ) {
+    return { httpStatus: 403, body: { error: 'step_up_required', requiredLevel: FRESH_APPROVER_FACTOR_MIN_LEVEL } };
+  }
+
   // Topology M4-D3 (#6000): a tool listed in FRESH_APPROVER_FACTOR_TOOLS is
   // approved only with a hardware-backed factor assertion (>= L3) made for
   // THIS decision — not a supervised session tap, not a reused step-up grant.
@@ -1246,6 +1340,27 @@ export async function decideApprovalRequest(
     };
   }
 
+  // Every diagnostic self-approval leaves a durable audit record, written
+  // BEFORE the grant can become active: if it cannot be written the decision
+  // is refused (retryable) rather than activating an unrecorded self-approval.
+  if (diagnosticSelfApprove && diagnosticTarget) {
+    try {
+      await auditDiagnosticSelfApproval({
+        grantId: existing.diagnosticAccessGrantId as string,
+        orgId: diagnosticTarget.orgId,
+        deviceId: diagnosticTarget.deviceId,
+        deciderUserId: userId,
+        approvalRequestId: id,
+        decidedAssuranceLevel: assurance.decidedAssuranceLevel ?? null,
+        decidedVia: assurance.decidedVia ?? null,
+        authenticatorDeviceId: assurance.authenticatorDeviceId ?? null,
+      });
+    } catch (err) {
+      console.error('[approvals] diagnostic self-approval audit failed; refusing the decision:', err);
+      return { httpStatus: 503, body: { error: 'audit_unavailable', retryable: true } };
+    }
+  }
+
   // Task 6: the ENTIRE decision write — approval-row CAS, the ai_tool_executions
   // mirror, and the action-intents fan-in (intent CAS + release_by stamp +
   // sibling expiry + intent_approved outbox insert) — commits as ONE
@@ -1277,6 +1392,7 @@ export async function decideApprovalRequest(
       };
 
   let writeResult: DecideWriteResult;
+  let decidedDiagnosticGrant: DiagnosticGrantRow | null = null;
   try {
     writeResult = await runOutsideDbContext(() =>
       withSystemDbAccessContext(() =>
@@ -1508,6 +1624,26 @@ export async function decideApprovalRequest(
               ));
           }
 
+          // Diagnostic read grant: activate (or deny) it in THIS transaction,
+          // first-wins against the other approvers and the request TTL. If the
+          // grant is no longer pending (revoked, lapsed, decided elsewhere) the
+          // whole decision rolls back rather than record an approval that
+          // activated nothing.
+          if (updated.diagnosticAccessGrantId) {
+            const decided = await decideDiagnosticGrantInTx(tx as unknown as typeof db, {
+              grantId: updated.diagnosticAccessGrantId,
+              approvalRequestId: updated.id,
+              deciderUserId: userId,
+              status,
+              reason: reason ?? null,
+              decidedAssuranceLevel: assurance.decidedAssuranceLevel ?? null,
+              decidedVia: assurance.decidedVia ?? null,
+              now: new Date(),
+            });
+            if (!decided) throw new DiagnosticGrantNotPendingError();
+            decidedDiagnosticGrant = decided;
+          }
+
           // If this approval row was created by the AI agent SDK (Breeze AI /
           // chat), it carries an `executionId` linking back to the
           // ai_tool_executions row that the SDK is blocked on via
@@ -1648,8 +1784,19 @@ export async function decideApprovalRequest(
       ),
     );
   } catch (err) {
+    if (err instanceof DiagnosticGrantNotPendingError) {
+      return { httpStatus: 409, body: { error: 'diagnostic_access_no_longer_pending', finalStatus: 'expired' } };
+    }
     console.error('[approvals] decide transaction failed (rolled back):', err);
     return { httpStatus: 500, body: { error: 'decide_failed', retryable: true } };
+  }
+
+  if (decidedDiagnosticGrant) {
+    try {
+      await auditDiagnosticDecision(decidedDiagnosticGrant, userId, id, { selfApproved: diagnosticSelfApprove });
+    } catch (auditErr) {
+      console.error('[approvals] diagnostic access decision audit failed:', auditErr);
+    }
   }
 
   if (writeResult.lostRace) {

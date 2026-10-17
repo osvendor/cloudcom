@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { writeEnvStack, readStackEnvValue, setStackEnvValues, pinWebAuthnForStack } from './env';
+import { writeEnvStack, readStackEnvValue, setStackEnvValues, pinWebAuthnForStack, caddyPortPin } from './env';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(path.join(tmpdir(), 'wt-')); });
@@ -42,6 +42,45 @@ describe('writeEnvStack', () => {
   it('disables the rate limiters that a parallel Playwright run trips', () => {
     const env = readFileSync(writeEnvStack(dir), 'utf8');
     expect(env).toContain('E2E_MODE=true');
+  });
+});
+
+// #8718 — `docker restart` re-allocates a random published port, so a storm run
+// that restarts caddy needs a fixed host port. Opt-in via BREEZE_WT_CADDY_PORT.
+describe('caddyPortPin (#8718)', () => {
+  it('is null when unset or empty (random port, unchanged behaviour)', () => {
+    expect(caddyPortPin({})).toBeNull();
+    expect(caddyPortPin({ BREEZE_WT_CADDY_PORT: '' })).toBeNull();
+  });
+  it('parses a valid port', () => {
+    expect(caddyPortPin({ BREEZE_WT_CADDY_PORT: '18080' })).toBe(18080);
+  });
+  it.each(['abc', '0', '70000', '80.5', '-1'])('rejects %s', (v) => {
+    expect(() => caddyPortPin({ BREEZE_WT_CADDY_PORT: v })).toThrow(/BREEZE_WT_CADDY_PORT/);
+  });
+});
+
+describe('worktree override caddy publish (#8718)', () => {
+  it('publishes caddy as ${BREEZE_WT_CADDY_PORT:-0}:80 (the :-0 keeps the random-port default)', () => {
+    const override = readFileSync(path.resolve(__dirname, '../../../docker-compose.override.yml.worktree'), 'utf8');
+    expect(override).toMatch(/^\s*-\s*"\$\{BREEZE_WT_CADDY_PORT:-0\}:80"\s*$/m);
+  });
+});
+
+describe('writeEnvStack caddy pin (#8718)', () => {
+  const prev = process.env.BREEZE_WT_CADDY_PORT;
+  afterEach(() => {
+    if (prev === undefined) delete process.env.BREEZE_WT_CADDY_PORT; else process.env.BREEZE_WT_CADDY_PORT = prev;
+  });
+  it('writes BREEZE_WT_CADDY_PORT when pinned', () => {
+    process.env.BREEZE_WT_CADDY_PORT = '18080';
+    expect(readFileSync(writeEnvStack(dir), 'utf8')).toMatch(/^BREEZE_WT_CADDY_PORT=18080$/m);
+  });
+  it('omits it when unset, and drops a stale pin on re-up', () => {
+    process.env.BREEZE_WT_CADDY_PORT = '18080';
+    writeEnvStack(dir);
+    delete process.env.BREEZE_WT_CADDY_PORT;
+    expect(readFileSync(writeEnvStack(dir), 'utf8')).not.toContain('BREEZE_WT_CADDY_PORT');
   });
 });
 
@@ -190,5 +229,31 @@ describe('writeEnvStack — DOCKER_PLATFORM', () => {
   it('adds nothing on an x64 host (the compose default is already native)', () => {
     const env = readFileSync(writeEnvStack(dir, { arch: 'x64' }), 'utf8');
     expect(env).not.toContain('DOCKER_PLATFORM=');
+  });
+});
+
+// A wt-stack is a throwaway QA stack: the developer's root .env carries a real
+// RESEND_API_KEY, which must never reach the stack's containers.
+describe('writeEnvStack — no live outbound mail', () => {
+  afterEach(() => { delete process.env.BREEZE_WT_STACK_LIVE_MAIL; });
+
+  it('blanks the mail provider keys over the root .env, across rewrites', () => {
+    writeFileSync(path.join(dir, '.env'),
+      'RESEND_API_KEY=re_live\nMAILGUN_API_KEY=mg_live\nSMTP_HOST=smtp.example.com\n');
+    writeEnvStack(dir);
+    for (const k of ['RESEND_API_KEY', 'MAILGUN_API_KEY', 'SMTP_HOST']) {
+      expect(readStackEnvValue(dir, k)).toBe('');
+    }
+    writeEnvStack(dir);
+    expect(readStackEnvValue(dir, 'RESEND_API_KEY')).toBe('');
+    expect(readFileSync(path.join(dir, '.env.stack'), 'utf8').match(/^RESEND_API_KEY=/gm)).toHaveLength(1);
+  });
+
+  it('leaves them untouched when BREEZE_WT_STACK_LIVE_MAIL=1', () => {
+    process.env.BREEZE_WT_STACK_LIVE_MAIL = '1';
+    writeFileSync(path.join(dir, '.env'), 'RESEND_API_KEY=re_live\n');
+    writeEnvStack(dir);
+    expect(readStackEnvValue(dir, 'RESEND_API_KEY')).toBe('re_live');
+    expect(readFileSync(path.join(dir, '.env.stack'), 'utf8')).not.toContain('RESEND_API_KEY');
   });
 });

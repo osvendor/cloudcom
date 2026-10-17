@@ -31,6 +31,14 @@ vi.mock('./OrgServiceTab', () => ({
   },
 }));
 
+const trustTabProps = vi.hoisted(() => vi.fn());
+vi.mock('@/components/trustCenter/TrustCenterTab', () => ({
+  default: (props: { orgId: string; orgFetch: unknown }) => {
+    trustTabProps(props);
+    return <div data-testid="org-trust-tab" />;
+  },
+}));
+
 // OverflowTabs (the tab strip this page renders into) measures button widths
 // via `offsetWidth` against the container's `clientWidth`; jsdom always
 // reports 0 for both, which its own computeVisible() collapses to "only the
@@ -217,6 +225,15 @@ describe('OrganizationRecordPage — happy path', () => {
     expect(typeof props.orgFetch).toBe('function');
   });
 
+  it('opens the Trust Center tab named in the URL hash and hands it the record orgFetch', async () => {
+    window.location.hash = '#trust';
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await waitFor(() => expect(screen.getByTestId('org-trust-tab')).toBeTruthy());
+    const props = trustTabProps.mock.calls.at(-1)?.[0] as { orgId: string; orgFetch: unknown };
+    expect(props.orgId).toBe(RECORD_ORG);
+    expect(typeof props.orgFetch).toBe('function');
+  });
+
   it('#contacts renders ContactsCard scoped to the record org', async () => {
     window.location.hash = '#contacts';
     render(<OrganizationRecordPage orgId={RECORD_ORG} />);
@@ -257,6 +274,24 @@ describe('OrganizationRecordPage — happy path', () => {
     await waitFor(() => expect(screen.getByTestId('org-record-work-here')).toBeTruthy());
     await user.click(screen.getByTestId('org-record-work-here'));
     expect(applyOrgSwitchMock).toHaveBeenCalledWith(RECORD_ORG, expect.stringContaining('Acme Dental'), '/');
+  });
+});
+
+describe('OrganizationRecordPage — archive (#8371)', () => {
+  it('refreshes the global org store after archiving so the header switcher drops the org', async () => {
+    routeFetch({
+      '/summary': () => json(SUMMARY_BODY),
+      '/archive': () => json({ status: 'offboarding', purgeAt: null }, 202),
+      [`/orgs/organizations/${RECORD_ORG}`]: () => json(ORG_BODY),
+    });
+    const storeFetch = vi.spyOn(useOrgStore.getState(), 'fetchOrganizations').mockResolvedValue(undefined);
+    useOrgStore.setState({ fetchOrganizations: storeFetch });
+    render(<OrganizationRecordPage orgId={RECORD_ORG} />);
+    await userEvent.click(await screen.findByTestId('org-record-more'));
+    await userEvent.click(await screen.findByTestId('org-record-archive'));
+    storeFetch.mockClear();
+    await userEvent.click(await screen.findByTestId('org-archive-submit'));
+    await waitFor(() => expect(storeFetch).toHaveBeenCalledTimes(1));
   });
 });
 

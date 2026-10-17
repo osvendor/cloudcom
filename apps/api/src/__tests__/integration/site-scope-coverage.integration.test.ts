@@ -60,6 +60,20 @@ import {
 // tracked for a follow-up sweep; see the audit narrative referenced by the
 // SP2 launch-readiness plan.
 const SITE_SCOPE_EXEMPT_HANDLERS: ReadonlySet<string> = new Set<string>([
+  // Customer-portal hardware health (#7731): the caller is a portal user bound to
+  // ONE customer org (orgId comes from portalAuth, never the request) and portal
+  // users have no site scope. The read model filters devices by that orgId, so a
+  // site gate would be dead code; same reasoning as routes/portal/assets.ts.
+  'routes/portal/hardwareHealth.ts:GET /hardware-health/devices/:deviceId',
+  // Customer-portal hardware inventory (#7732): same reasoning as hardware health
+  // above. The caller is a portal user bound to ONE customer org (orgId from
+  // portalAuth, never the request), portal users have no site scope, and the read
+  // model filters devices by that orgId.
+  'routes/portal/hardwareInventory.ts:GET /hardware-inventory/devices/:deviceId',
+  'routes/portal/performance.ts:GET /performance/devices/:deviceId',
+  // Portal session binds one org; portal users have no technician site scope.
+  'routes/portal/software.ts:GET /software/devices/:deviceId',
+  'routes/portal/patches.ts:GET /patches/devices/:deviceId',
   // -- routes/snmp -----------------------------------------------------------
   // Deprecated SNMP metric/threshold endpoints — every handler is a 4-line
   // stub that returns the deprecation payload (HTTP 410) and never reaches a
@@ -151,6 +165,10 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   // user permissions/allowedSiteIds context; rows clamped to the principal's
   // accessible orgs, device/rule/monitor/episode ids ownership-checked.
   'routes/partnerApi/alerts.ts:GET /alerts',
+  // Partner device-status feed (device-status:read, #7577): same machine
+  // service-principal auth, no user permissions/allowedSiteIds context; rows
+  // clamped to the principal's accessible orgs, siteId is only a filter.
+  'routes/partnerApi/deviceStatus.ts:GET /device-status',
   // Helper-token path (helperAuth on all helperRoutes): no user permissions
   // context, and the session lookup is pinned to the token's own device row
   // (eq(aiSessions.deviceId, device.id)) before any write. (W7 #2637.)
@@ -184,6 +202,10 @@ const SITE_SCOPE_INPUT_EXEMPT: ReadonlySet<string> = new Set<string>([
   // `eq(…, device.id)` for the agent authenticated by agentBearerAuthMiddleware.
   // Surfaced by #4019 — the writes sit well past the old 4000-byte window.
   'routes/agents/mtls.ts:POST /renew-cert',
+  // Agent-token route (requireAgentRole + agentAuthMiddleware on '/:id/*'); the
+  // device is the authenticated agent's own (c.get('agent').deviceId, :id is never
+  // read), so no user input selects devices.
+  'routes/agents/messageEvents.ts:POST /:id/message-events',
   // Agent-token security-status ingest (requireAgentRole + agentAuthMiddleware
   // on agentRoutes '/:id/*'). #4340's change-only audit added a pre-read of
   // `securityStatus` keyed on `device.id`, where `device` is resolved from the

@@ -216,7 +216,7 @@ vi.mock('./DeviceCard', () => ({
 // action over the FULL device array it was given (mirroring the real
 // DeviceList, which hands the unfiltered selection to onBulkAction). Tests use
 // the per-action buttons to drive DevicesPage.handleBulkAction directly.
-type StubDevice = { id: string; deviceClass?: string; hostname?: string; displayName?: string; watchdogVersion?: string | null; status?: string; wanIp?: string | null; lanIp?: string | null; lastLogAt?: string | null; hardwareHealth?: string | null; hardwareHealthSummary?: Record<string, number> | null };
+type StubDevice = { id: string; deviceClass?: string; hostname?: string; displayName?: string; watchdogVersion?: string | null; status?: string; wanIp?: string | null; lanIp?: string | null; lastLogAt?: string | null; hardwareHealth?: string | null; hardwareHealthSummary?: Record<string, number> | null; reliabilityProvisional?: boolean };
 vi.mock('./DeviceList', () => ({
   default: ({ devices, serverFilterIds, onBulkAction, onAction, onSelect, onShowDecommissioned, onHideDecommissioned, includeDecommissioned }: { devices: StubDevice[]; serverFilterIds?: Set<string> | null; onBulkAction?: (action: string, devices: StubDevice[]) => void; onAction?: (action: string, device: StubDevice) => void; onSelect?: (device: StubDevice) => void; onShowDecommissioned?: () => void; onHideDecommissioned?: () => void; includeDecommissioned?: boolean }) => (
     <div
@@ -232,6 +232,7 @@ vi.mock('./DeviceList', () => ({
       data-wan-ips={devices.map(d => d.wanIp ?? '').join(',')}
       data-lan-ips={devices.map(d => d.lanIp ?? '').join(',')}
       data-hardware-health={devices.map(d => d.hardwareHealth ?? '').join(',')}
+      data-reliability-provisional={devices.map(d => String(d.reliabilityProvisional)).join(',')}
       data-hardware-summary={JSON.stringify(devices.map(d => d.hardwareHealthSummary ?? null))}
     >
       {['maintenance-on', 'maintenance-off', 'decommission', 'reboot', 'run-script', 'link-vm-host', 'wake', 'deploy-software', 'compare', 'restore', 'permanent-delete'].map(action => (
@@ -412,6 +413,20 @@ describe('DevicesPage — advanced filter applies to BOTH views', () => {
 
     const list = await screen.findByTestId('device-list');
     expect(list.getAttribute('data-last-log-ats')).toBe(lastLogAt);
+  });
+
+  it('maps reliabilityProvisional from the API row onto the Device (strict boolean)', async () => {
+    vi.mocked(fetchAllDevices).mockResolvedValue({
+      data: [
+        { ...rawDevice(DEV_1, 'host-alpha'), reliabilityProvisional: true },
+        { ...rawDevice(DEV_2, 'host-beta') },
+      ],
+    } as never);
+
+    render(<DevicesPage />);
+
+    const list = await screen.findByTestId('device-list');
+    expect(list.getAttribute('data-reliability-provisional')).toBe('true,false');
   });
 
   it('grid view renders only the devices matching the advanced filter (not the raw list)', async () => {
@@ -1685,7 +1700,8 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
         // only the immediate socket push missed (no live session,
         // preferHeartbeat); distinct from both 'delivered' and
         // 'queued_offline'. Takes precedence over `delivered` when set.
-        delivery?: 'delivered' | 'queued_offline' | 'queued_live';
+        delivery?: 'delivered' | 'queued_offline' | 'queued_live' | 'cancelled';
+        cancelReason?: string;
       } = {},
     ) {
       const { sendDeviceCommand } = await import('../../services/deviceActions');
@@ -1703,6 +1719,7 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
         createdAt: '2026-09-01T00:00:00.000Z',
         delivery: opts.delivery ?? (delivered ? 'delivered' : 'queued_offline'),
         deliverBy,
+        ...(opts.cancelReason ? { cancelReason: opts.cancelReason } : {}),
       } as never);
 
       vi.mocked(fetchAllDevices).mockResolvedValue({
@@ -1756,6 +1773,14 @@ describe('DevicesPage — bulk agent commands gated on decommissioned only (#246
       fireEvent.click(await screen.findByTestId('confirm-device-action'));
       await waitFor(() => expect(vi.mocked(sendDeviceCommand)).toHaveBeenCalledTimes(1));
       expect(vi.mocked(sendDeviceCommand)).toHaveBeenCalledWith(DEV_1, 'reboot');
+    });
+
+    it('a cancelled result reports an error toast with the reason, never "sent"', async () => {
+      const toasts = await rebootDeviceWithStatus('online', { delivery: 'cancelled', cancelReason: 'device_moved_org', deliverBy: null });
+      expect(toasts.find(c => c.type === 'success')).toBeUndefined();
+      const error = toasts.find(c => c.type === 'error');
+      expect(error?.message).toMatch(/not sent to host-alpha/i);
+      expect(error?.message).toContain('device_moved_org');
     });
 
     it('online device: reports the command as sent, naming the device', async () => {

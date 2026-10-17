@@ -1,53 +1,52 @@
-export const PARTNER_SERVICE_PRINCIPAL_READ_SCOPES = Object.freeze([
-  'organizations:read',
-  'sites:read',
-  'devices:read',
-  'inventory:read',
-  'configuration:read',
-  'scripts:read',
-  'backup-configuration:read',
-  'custom-fields:read',
-] as const);
+import {
+  PARTNER_SERVICE_PRINCIPAL_MCP_SCOPES,
+  PARTNER_SERVICE_PRINCIPAL_OPT_IN_READ_SCOPES,
+  PARTNER_SERVICE_PRINCIPAL_READ_SCOPES,
+  PARTNER_SERVICE_PRINCIPAL_SCOPES,
+  PARTNER_SERVICE_PRINCIPAL_WRITE_SCOPES,
+  type PartnerServicePrincipalScope,
+} from '@breeze/shared';
 
-// Provisioning write scopes (#3243). Create/update only by design — deletion
-// of tenancy stays a human + MFA action on the main API and must never grow a
-// scope here. These are opt-in at principal creation and are deliberately NOT
-// part of any default scope set.
-export const PARTNER_SERVICE_PRINCIPAL_WRITE_SCOPES = Object.freeze([
-  'organizations:write',
-  'sites:write',
-  'enrollment-keys:write',
-  // Contract header + line mutations on the Partner API. Opt-in; never part of
-  // the Weavestream default. Does not grant lifecycle (activate/pause/cancel)
-  // or the human JWT `/api/v1/contracts` surface.
-  'contracts:write',
-  // Partner API tickets surface: create / update / status / assign / comment.
-  // Opt-in; never part of the Weavestream default. No delete, restore,
-  // move-org, bulk, attachments, time entries or mailbox — those stay human,
-  // MFA-gated actions on the main API. A principal acts as ITSELF here (no
-  // human owner is credited — see 2026-12-04-101100-ticket-comments-
-  // service-principal-origin.sql); it is not site-restricted.
-  'tickets:write',
-] as const);
+// The scope lists (and their rationale comments) live in
+// packages/shared/src/constants/partnerServicePrincipalScopes.ts (#8173) so the
+// web create dialog and its presets read the exact same registry. Re-exported
+// here so every API import site keeps its existing path.
+export {
+  PARTNER_SERVICE_PRINCIPAL_MCP_SCOPES,
+  PARTNER_SERVICE_PRINCIPAL_OPT_IN_READ_SCOPES,
+  PARTNER_SERVICE_PRINCIPAL_READ_SCOPES,
+  PARTNER_SERVICE_PRINCIPAL_SCOPES,
+  PARTNER_SERVICE_PRINCIPAL_WRITE_SCOPES,
+};
+export type { PartnerServicePrincipalScope };
 
-// Opt-in read scopes: grantable, but deliberately NOT in any default scope set.
-// alerts:read exposes operational alert titles/messages across every org the
-// principal can reach, so it must be requested explicitly.
-export const PARTNER_SERVICE_PRINCIPAL_OPT_IN_READ_SCOPES = Object.freeze([
-  'alerts:read',
-  // tickets:read exposes ticket subjects, descriptions and comments —
-  // customer-authored data — across every org the principal can reach.
-  'tickets:read',
-] as const);
+export type PartnerServicePrincipalMcpScope =
+  (typeof PARTNER_SERVICE_PRINCIPAL_MCP_SCOPES)[number];
 
-export const PARTNER_SERVICE_PRINCIPAL_SCOPES = Object.freeze([
-  ...PARTNER_SERVICE_PRINCIPAL_READ_SCOPES,
-  ...PARTNER_SERVICE_PRINCIPAL_OPT_IN_READ_SCOPES,
-  ...PARTNER_SERVICE_PRINCIPAL_WRITE_SCOPES,
-] as const);
+const PARTNER_SERVICE_PRINCIPAL_MCP_SCOPE_SET = new Set<string>(
+  PARTNER_SERVICE_PRINCIPAL_MCP_SCOPES,
+);
 
-export type PartnerServicePrincipalScope =
-  (typeof PARTNER_SERVICE_PRINCIPAL_SCOPES)[number];
+export const PARTNER_SERVICE_PRINCIPAL_MCP_READ_REQUIRED_ERROR =
+  'MCP scopes ai:write, ai:execute and ai:execute_admin require ai:read: every MCP request needs ai:read';
+
+/**
+ * Every MCP request requires ai:read (mcpServer.ts preflight), so a principal
+ * holding a higher MCP scope without it could authenticate but never make a
+ * request. Rejected at create/update and at MCP authentication.
+ */
+export function partnerServicePrincipalMcpScopesMissingRead(scopes: readonly string[]): boolean {
+  const mcp = partnerServicePrincipalMcpScopes(scopes);
+  return mcp.length > 0 && !mcp.includes('ai:read');
+}
+
+/** The MCP (ai:*) subset of a principal's scopes, in their stored order. */
+export function partnerServicePrincipalMcpScopes(
+  scopes: readonly string[],
+): PartnerServicePrincipalMcpScope[] {
+  return scopes.filter((scope): scope is PartnerServicePrincipalMcpScope =>
+    PARTNER_SERVICE_PRINCIPAL_MCP_SCOPE_SET.has(scope));
+}
 
 // Read-only on purpose: the Weavestream default existed before the write
 // scopes did, and silently widening a DEFAULT to include tenancy writes would

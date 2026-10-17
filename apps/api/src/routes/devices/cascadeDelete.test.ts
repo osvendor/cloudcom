@@ -1,7 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 import { getTableName } from 'drizzle-orm';
-import { PgTable } from 'drizzle-orm/pg-core';
+import { PgDialect, PgTable } from 'drizzle-orm/pg-core';
 
 // ---------------------------------------------------------------------------
 // Mocks for the behavior suite (hoisted above all imports). The static
@@ -13,6 +13,9 @@ vi.mock('../../db', () => ({
   runOutsideDbContext: vi.fn((fn) => fn()),
   withDbAccessContext: vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn()),
   withSystemDbAccessContext: vi.fn(async (fn: () => Promise<unknown>) => fn()),
+  // The cascade runs under withSystemDbAccessContext; fixMemory/store's
+  // deleteDeviceFixOutcomes (#7278) checks that ambient scope.
+  getCurrentDbAccessContext: vi.fn(() => ({ scope: 'system' })),
   db: {
     select: vi.fn(),
     execute: vi.fn(),
@@ -21,6 +24,19 @@ vi.mock('../../db', () => ({
     delete: vi.fn(),
     transaction: vi.fn(),
   },
+}));
+
+// #8117 — the device's screenshot keys are read inside the purge transaction and
+// the files removed after it commits (file side: screenshotStorage.files.test.ts).
+const screenshotMocks = vi.hoisted(() => ({
+  listDeviceScreenshotStorageKeys: vi.fn(async (_tx: unknown, _deviceId: string): Promise<string[]> => []),
+  removeScreenshotFiles: vi.fn(async (_keys: readonly string[], _context: string) => ({ removed: 0, missing: 0, failed: 0 })),
+}));
+vi.mock('../../services/screenshotStorage', () => ({
+  listDeviceScreenshotStorageKeys: screenshotMocks.listDeviceScreenshotStorageKeys,
+}));
+vi.mock('../../services/screenshotFiles', () => ({
+  removeScreenshotFiles: screenshotMocks.removeScreenshotFiles,
 }));
 
 vi.mock('../../services/deviceLinkGroups', () => ({
@@ -93,6 +109,7 @@ import * as schema from '../../db/schema';
 import {
   coreRoutes,
   getDeviceCascadeDeleteTables,
+  DEVICE_CASCADE_DELETE_PREDICATES,
   DEVICE_CASCADE_DELETE_TABLES,
   DEVICE_DETACH_DEVICE_ID_TABLES,
   DEVICE_LINKED_DEVICE_ID_TABLES,
@@ -206,6 +223,42 @@ describe('device hard-delete table coverage contract', () => {
     );
   });
 
+  it('every exact-epoch predicate table is also a cascade table (PAM ownership epochs W2, #8204)', () => {
+    const keys = [...DEVICE_CASCADE_DELETE_PREDICATES.keys()];
+    expect(keys.sort()).toEqual([
+      'device_ownership_epoch_closures',
+      'device_ownership_epochs',
+      'elevation_requests',
+      'pam_actuation_results',
+      'pam_actuations',
+    ]);
+    expect(keys.filter((t) => !deviceCascadeDeleteTables.includes(t))).toEqual([]);
+  });
+
+  it('deletes the PAM chain children-first and the epoch row last (#8204)', () => {
+    // Every chain FK targets the epoch row (elevation_requests' with NO ACTION),
+    // and results FK the actuation, so any other order raises 23503.
+    const order = [
+      'pam_actuation_results',
+      'pam_actuations',
+      'elevation_requests',
+      'device_ownership_epoch_closures',
+      'device_ownership_epochs',
+    ].map((t) => deviceCascadeDeleteTables.indexOf(t));
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+  });
+
+  it('exact-epoch predicates match the live device ownership, never device_id alone (#8204)', () => {
+    const dialect = new PgDialect();
+    for (const [table, predicate] of DEVICE_CASCADE_DELETE_PREDICATES) {
+      const q = dialect.sqlToQuery(predicate({ deviceId: 'd', orgId: 'o', ownershipEpoch: 3 }));
+      const epochColumn = table.startsWith('device_ownership_epoch') ? '"epoch"' : '"device_epoch"';
+      expect(q.sql, table).toContain(`(device_id, org_id, ${epochColumn})`);
+      expect(q.params, table).toEqual(['d', 'o', 3]);
+    }
+  });
+
   it('includes every table whose linked_device_id FK references devices.id', () => {
     const linkedSet = new Set<string>(DEVICE_LINKED_DEVICE_ID_TABLES);
     const missing: string[] = [];
@@ -306,6 +359,30 @@ describe('device hard-delete table coverage contract', () => {
     expect(DEVICE_DETACH_DEVICE_ID_TABLES).not.toContain('backup_provider_devices');
     expect(DEVICE_LINKED_DEVICE_ID_TABLES).not.toContain('backup_provider_devices');
   });
+
+  it.each(['edr_endpoints', 'edr_detections', 'edr_actions'])(
+    '%s needs no device-cascade entry — its link column is breeze_device_id',
+    (name) => {
+      // #8165 (EDR provider framework W01, spec D4). Same reasoning as
+      // backup_provider_devices above: these rows LINK to a Breeze device; their
+      // org_id comes from the vendor TENANT MAPPING, and the
+      // (breeze_device_id, org_id) -> devices(id, org_id) FK is
+      // ON DELETE SET NULL (breeze_device_id) (confdelsetcols pinned in
+      // edrProviderRls.integration.test.ts). A rename to device_id would enrol
+      // the tables in the generic device delete cascade (destroying detection
+      // history) and in the org-move SET org_id re-stamp loop.
+      const table = allSchemaTables().find((t) => getTableName(t) === name);
+      expect(table, `${name} missing from the Drizzle schema barrel`).toBeDefined();
+      const names = getTableColumns(table!).map((col) => col.name);
+      expect(names).toContain('breeze_device_id');
+      expect(names).not.toContain('device_id');
+      expect(names).not.toContain('linked_device_id');
+
+      expect(DEVICE_CASCADE_DELETE_TABLES).not.toContain(name);
+      expect(DEVICE_DETACH_DEVICE_ID_TABLES).not.toContain(name);
+      expect(DEVICE_LINKED_DEVICE_ID_TABLES).not.toContain(name);
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -706,6 +783,93 @@ describe('DELETE /devices/:id/permanent — tickets are detached, not destroyed'
     expect(
       statements.some((s) => s.startsWith('DELETE FROM psa_ticket_mappings WHERE'))
     ).toBe(true);
+  });
+
+  describe('helper screenshot files (#8117)', () => {
+    const KEYS = [`screenshots/org-123/${DEVICE.id}/a.jpg`, `screenshots/old-org/${DEVICE.id}/b.jpg`];
+
+    // Reset to the defaults both before AND after, so neither a leaked fixture
+    // from this block nor an emptied mock reaches the tests that follow it.
+    const resetScreenshotMocks = () => {
+      screenshotMocks.listDeviceScreenshotStorageKeys.mockReset();
+      screenshotMocks.listDeviceScreenshotStorageKeys.mockResolvedValue([]);
+      screenshotMocks.removeScreenshotFiles.mockReset();
+      screenshotMocks.removeScreenshotFiles.mockResolvedValue({ removed: 0, missing: 0, failed: 0 });
+    };
+    beforeEach(resetScreenshotMocks);
+    afterEach(resetScreenshotMocks);
+
+    it('reads the keys inside the purge transaction and removes the files only after it commits', async () => {
+      rigDeviceLookup(DEVICE);
+      const events: string[] = [];
+      vi.mocked(db.transaction).mockImplementation(async (cb: any) => {
+        events.push('tx:begin');
+        const tx = {
+          execute: vi.fn(async (q: any) => {
+            const text = sqlToText(q);
+            const rows: Record<string, unknown>[] = text.includes('FOR UPDATE')
+              ? [{ id: DEVICE.id, status: 'decommissioned', link_group_id: null }]
+              : text.includes('pg_settings') ? [{ prior_ms: '0' }] : [];
+            Object.defineProperty(rows, 'count', { value: rows.length, enumerable: false });
+            return rows;
+          }),
+          delete: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }),
+        };
+        const result = await cb(tx);
+        events.push('tx:commit');
+        return result;
+      });
+      screenshotMocks.listDeviceScreenshotStorageKeys.mockImplementation(async (_tx, deviceId) => {
+        events.push(`list:${deviceId}`);
+        return KEYS;
+      });
+      screenshotMocks.removeScreenshotFiles.mockImplementation(async () => {
+        events.push('unlink');
+        return { removed: 2, missing: 0, failed: 0 };
+      });
+
+      const res = await app.request(`/devices/${DEVICE.id}/permanent`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer t' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(events).toEqual(['tx:begin', `list:${DEVICE.id}`, 'tx:commit', 'unlink']);
+      expect(screenshotMocks.removeScreenshotFiles).toHaveBeenCalledWith(KEYS, expect.stringContaining(DEVICE.id));
+    });
+
+    it('removes no files when the purge rolls back', async () => {
+      rigDeviceLookup(DEVICE);
+      screenshotMocks.listDeviceScreenshotStorageKeys.mockResolvedValue(KEYS);
+      vi.mocked(db.transaction).mockImplementation(async () => {
+        throw Object.assign(new Error('Failed query'), {
+          cause: Object.assign(new Error('lock timeout'), { code: '55P03' }),
+        });
+      });
+
+      const res = await app.request(`/devices/${DEVICE.id}/permanent`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer t' },
+      });
+
+      expect(res.status).toBe(409);
+      expect(screenshotMocks.removeScreenshotFiles).not.toHaveBeenCalled();
+    });
+
+    it('still reports success when some files cannot be removed', async () => {
+      rigDeviceLookup(DEVICE);
+      rigDeleteTransaction();
+      screenshotMocks.listDeviceScreenshotStorageKeys.mockResolvedValue(KEYS);
+      screenshotMocks.removeScreenshotFiles.mockResolvedValue({ removed: 1, missing: 0, failed: 1 });
+
+      const res = await app.request(`/devices/${DEVICE.id}/permanent`, {
+        method: 'DELETE',
+        headers: { Authorization: 'Bearer t' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(screenshotMocks.removeScreenshotFiles).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('hard delete clears discovered_assets.link_source in the same UPDATE as the link (#3952)', async () => {

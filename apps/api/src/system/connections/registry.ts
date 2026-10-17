@@ -57,6 +57,8 @@ export const CONNECTION_REGISTRY: readonly ConnectionEntry[] = [
     vars: [
       { name: 'PUBLIC_APP_URL', secret: false, required: true },
       { name: 'PUBLIC_API_URL', secret: false, required: true },
+      { name: 'TUNNEL_ORIGIN_TEMPLATE', secret: false },
+      { name: 'TUNNEL_FRAME_ANCESTOR', secret: false },
       { name: 'DASHBOARD_URL', secret: false },
       { name: 'PUBLIC_URL', secret: false },
       { name: 'PUBLIC_PORTAL_URL', secret: false },
@@ -235,7 +237,6 @@ export const CONNECTION_REGISTRY: readonly ConnectionEntry[] = [
       { name: 'BREEZE_AI_AGENTS_POLICY_DECIDE_ENABLED', secret: false },
       { name: 'BREEZE_AI_AGENTS_SWEEP_ACT_ENABLED', secret: false },
       { name: 'BREEZE_AI_SCRIPT_AUTHORING_ENABLED', secret: false },
-      { name: 'BREEZE_AI_SCRIPT_REVIEWER_MODEL', secret: false },
       { name: 'AI_OPERATOR_TASKS_ENABLED', secret: false },
       { name: 'AI_OPERATOR_RECIPE_SERVICE_RECOVERY_ENABLED', secret: false },
     ],

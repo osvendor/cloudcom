@@ -4,9 +4,9 @@ const captureExceptionMock = vi.hoisted(() => vi.fn());
 vi.mock('./sentry', () => ({ captureException: captureExceptionMock }));
 import { expectedControlKey } from './backupAttestation';
 import {
+  controlObjectKey,
   evaluateRestoreIntegrity,
   indexFailedOnAttestation,
-  lookupIntegrityInformational,
   snapshotIntegrityFailed,
   indexMatchesAttestation,
   integrityPayload,
@@ -118,6 +118,19 @@ describe('evaluateRestoreIntegrity', () => {
   ])('a verified attestation whose snapshot row changed %s since is attestation_failed', (_label, change) => {
     expect(evaluateRestoreIntegrity(snapshot(change), attestation()))
       .toMatchObject({ mode: 'unattested', reason: 'attestation_failed' });
+  });
+
+  it('a prefixed_flat snapshot binds to its LOGICAL (legacy_flat) attestation (#7081 I6)', () => {
+    expect(evaluateRestoreIntegrity(snapshot({ keyLayout: 'prefixed_flat' }), attestation()))
+      .toMatchObject({ mode: 'attested', trust: 'server_verified' });
+    expect(evaluateRestoreIntegrity(snapshot({ keyLayout: 'prefixed_flat' }), attestation({ keyLayout: 'prefixed_flat' })))
+      .toMatchObject({ mode: 'unattested', reason: 'attestation_failed' });
+  });
+
+  it('control object keys stay logical whatever the key root (#7081)', () => {
+    expect(controlObjectKey(SNAP, 'manifest')).toBe(`snapshots/${SNAP}/manifest.json`);
+    expect(controlObjectKey(SNAP, 'layout')).toBe(`snapshots/${SNAP}/layout.json`);
+    expect(controlObjectKey(SNAP, 'system_state_manifest')).toBe(`snapshots/${SNAP}/system-state/manifest.json`);
   });
 
   it('a manifest recorded under any key other than the snapshot control key is attestation_failed', () => {
@@ -247,24 +260,3 @@ describe('indexMatchesAttestation with a refused statement and no row', () => {
   });
 });
 
-describe('lookupIntegrityInformational', () => {
-  it('returns the lookup result', async () => {
-    expect(await lookupIntegrityInformational({ label: 'x' }, async () => 42)).toBe(42);
-  });
-
-  it('reports a failure with the command, device and snapshot it was for, and continues', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    const err = new Error('statement timeout');
-    const out = await lookupIntegrityInformational(
-      { label: 'vm_instant_boot delivery', commandId: 'cmd-1', deviceId: 'dev-1', snapshotRef: SNAP },
-      async () => { throw err; },
-    );
-    expect(out).toBe('lookup_failed');
-    expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining('vm_instant_boot delivery'),
-      expect.objectContaining({ commandId: 'cmd-1', deviceId: 'dev-1', snapshotRef: SNAP, error: 'statement timeout' }),
-    );
-    expect(captureExceptionMock).toHaveBeenCalledWith(err);
-    warn.mockRestore();
-  });
-});

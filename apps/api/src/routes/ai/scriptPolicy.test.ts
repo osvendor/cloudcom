@@ -109,6 +109,8 @@ vi.mock('../../services/permissions', async (importOriginal) => {
 
 import { PERMISSIONS } from '../../services/permissions';
 import { scriptLanePolicyResourceDigest } from '../../services/mfaStepUpGrant';
+import { scriptLaneStepUpResource } from '../auth/schemas';
+import { scriptLaneEnableGrantResource, scriptLaneWideningGrantResource } from '@breeze/shared';
 import { aiScriptPolicyRoutes, toScriptPolicyDto } from './scriptPolicy';
 import type { AiScriptPolicyRow } from '../../db/schema/aiScriptPolicies';
 import type { AiScriptLaneStateRow } from '../../db/schema/aiScriptLaneState';
@@ -146,7 +148,6 @@ const DEFAULT_EFFECTIVE = {
   unattendedAllowedClasses: ['services', 'processes', 'temp_files', 'dns_cache', 'printing'],
   maxUnattendedPerHour: 10,
   protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] },
-  reviewerModel: null,
   source: { partnerRowId: null, orgRowId: null },
 };
 
@@ -162,7 +163,6 @@ function policyRow(overrides: Partial<AiScriptPolicyRow> = {}): AiScriptPolicyRo
     unattendedAllowedClasses: ['services'],
     maxUnattendedPerHour: 5,
     protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] },
-    reviewerModel: null,
     unattendedEnabledBy: null,
     unattendedEnabledAt: null,
     createdBy: USER_ID,
@@ -389,7 +389,7 @@ describe('PUT /script-policy', () => {
     expect(binding.operation).toBe('ai_script_lane_grant');
     // The enable-branch digest binds the FULL effective grant being saved in
     // this request, not just the boolean — a request that also raises the
-    // tier/classes/rate/reviewerModel in the same call must have those
+    // tier/classes/rate in the same call must have those
     // values bound in, so a grant minted only for "turn the lane on" cannot
     // be replayed against a wider save.
     expect(binding.resourceDigest).toBe(scriptLanePolicyResourceDigest({
@@ -400,7 +400,6 @@ describe('PUT /script-policy', () => {
         unattendedAllowedClasses: [],
         maxUnattendedPerHour: 0,
         protectedResourcesEmptied: true,
-        reviewerModel: null,
         proposingEnabled: true,
       },
     }));
@@ -427,6 +426,100 @@ describe('PUT /script-policy', () => {
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({ error: 'Step-up required', code: 'STEP_UP_REQUIRED' });
     expect(writes).toHaveLength(0);
+  });
+
+  it.each([
+    ['first-ever enable (no row yet)', false, ['C:\\Keep']],
+    ['re-enable over an existing row with different values', true, ['C:\\Keep']],
+    ['re-enable that empties protectedResources', true, []],
+  ])('round-trips the shared enable-grant resource: mint digest === redeem digest (#7873) — %s', async (_label, hasRow, paths) => {
+    resolvePartnerCeiling.mockResolvedValue({ ...DEFAULT_EFFECTIVE, maxUnattendedRiskTier: 'medium' });
+    if (hasRow) {
+      selectQueue = [[policyRow({
+        unattendedEnabled: false,
+        maxUnattendedRiskTier: 'low',
+        unattendedAllowedClasses: ['services'],
+        maxUnattendedPerHour: 5,
+        protectedResources: { services: ['spooler'], paths: [], registryKeys: [], deviceTags: [] },
+      })]];
+    }
+    // The exact body shape the web page PUTs (every field present).
+    const saveBody = {
+      proposingEnabled: true,
+      unattendedEnabled: true,
+      maxUnattendedRiskTier: 'medium' as const,
+      unattendedAllowedClasses: ['temp_files', 'dns_cache'],
+      maxUnattendedPerHour: 7,
+      protectedResources: { services: [], paths, registryKeys: [], deviceTags: [] },
+    };
+    // Mint side: the resource the web sends to /auth/mfa/step-up, parsed by
+    // the step-up route's schema and hashed exactly as that route hashes it.
+    const minted = scriptLaneStepUpResource.parse(scriptLaneEnableGrantResource(ORG_A, saveBody));
+    const mintDigest = scriptLanePolicyResourceDigest(minted);
+    consumeStepUpGrant.mockImplementation(async (_grantId: string, binding: { resourceDigest: string }) =>
+      binding.resourceDigest === mintDigest);
+
+    const res = await putReq({ ...saveBody, stepUpGrant: 'grant-1' });
+    expect(res.status).toBe(200);
+    expect(consumeStepUpGrant).toHaveBeenCalledTimes(1);
+    expect(writes).toHaveLength(1);
+  });
+
+  it.each([
+    ['raise the tier', {}, { maxUnattendedRiskTier: 'medium' as const }],
+    ['add a class', {}, { unattendedAllowedClasses: ['services', 'temp_files'] }],
+    ['raise the rate', {}, { maxUnattendedPerHour: 9 }],
+    ['turn proposing on', { proposingEnabled: false }, { proposingEnabled: true }],
+    ['empty protectedResources', { protectedResources: { services: ['spooler'], paths: [], registryKeys: [], deviceTags: [] } },
+      { protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] } }],
+  ])('round-trips the shared WIDENING grant resource: mint digest === redeem digest (#8096) — %s', async (_label, rowOverrides, change) => {
+    resolvePartnerCeiling.mockResolvedValue({ ...DEFAULT_EFFECTIVE, maxUnattendedRiskTier: 'medium' });
+    const row = policyRow({
+      unattendedEnabled: true,
+      maxUnattendedRiskTier: 'low',
+      unattendedAllowedClasses: ['services'],
+      maxUnattendedPerHour: 5,
+      ...rowOverrides,
+    });
+    selectQueue = [[row]];
+    const saved = toScriptPolicyDto(row);
+    // What the web PUTs for an already-enabled lane: every field, and no
+    // `unattendedEnabled` (an unchanged `true` would read as the enable branch).
+    const saveBody = {
+      proposingEnabled: saved.proposingEnabled,
+      maxUnattendedRiskTier: saved.maxUnattendedRiskTier as 'low' | 'medium',
+      unattendedAllowedClasses: saved.unattendedAllowedClasses as string[],
+      maxUnattendedPerHour: saved.maxUnattendedPerHour,
+      protectedResources: saved.protectedResources,
+      ...change,
+    };
+    const resource = scriptLaneWideningGrantResource(ORG_A, saved, saveBody);
+    expect(resource).not.toBeNull();
+    const mintDigest = scriptLanePolicyResourceDigest(scriptLaneStepUpResource.parse(resource));
+    consumeStepUpGrant.mockImplementation(async (_grantId: string, binding: { operation: string; resourceDigest: string }) =>
+      binding.operation === 'ai_script_lane_grant' && binding.resourceDigest === mintDigest);
+
+    const res = await putReq({ ...saveBody, stepUpGrant: 'grant-1' });
+    expect(res.status).toBe(200);
+    expect(consumeStepUpGrant).toHaveBeenCalledTimes(1);
+    expect(writes).toHaveLength(1);
+  });
+
+  it('the shared widening resource is null for a tightening save, and the route asks for no grant (#8096)', async () => {
+    const row = policyRow({ unattendedEnabled: true, maxUnattendedRiskTier: 'low', unattendedAllowedClasses: ['services', 'temp_files'], maxUnattendedPerHour: 5 });
+    selectQueue = [[row]];
+    const saved = toScriptPolicyDto(row);
+    const saveBody = {
+      proposingEnabled: saved.proposingEnabled,
+      maxUnattendedRiskTier: 'low' as const,
+      unattendedAllowedClasses: ['services'],
+      maxUnattendedPerHour: 2,
+      protectedResources: saved.protectedResources,
+    };
+    expect(scriptLaneWideningGrantResource(ORG_A, saved, saveBody)).toBeNull();
+    const res = await putReq(saveBody);
+    expect(res.status).toBe(200);
+    expect(consumeStepUpGrant).not.toHaveBeenCalled();
   });
 
   it('200s disabling without approvals:decide or a step-up grant, and audits ai.script_policy.updated', async () => {
@@ -470,7 +563,6 @@ describe('PUT /script-policy', () => {
         unattendedAllowedClasses: ['services'],
         maxUnattendedPerHour: 5,
         protectedResourcesEmptied: false,
-        reviewerModel: null,
         proposingEnabled: true,
       },
     }));
@@ -490,14 +582,25 @@ describe('PUT /script-policy', () => {
     expect(consumeStepUpGrant).not.toHaveBeenCalled();
   });
 
-  it('strips reviewerModel (accept-and-ignore) and no longer treats it as a widening', async () => {
-    selectQueue = [[policyRow({ unattendedEnabled: true, reviewerModel: 'old-model' })]];
-    const res = await putReq({ reviewerModel: 'anything' });
-    expect(res.status).toBe(200);
+  it('PUT /ai/script-policy with reviewerModel → 400 naming the replacement; nothing is written', async () => {
+    for (const reviewerModel of ['claude-x', null]) {
+      selectQueue = [[policyRow({ unattendedEnabled: true })]];
+      const res = await putReq({ proposingEnabled: false, reviewerModel });
+      expect(res.status).toBe(400);
+      const text = JSON.stringify(await res.json());
+      expect(text).toContain('reviewerModel');
+      expect(text).toContain('script_reviewer');
+    }
     expect(consumeStepUpGrant).not.toHaveBeenCalled();
-    expect(writes).toHaveLength(1);
-    expect(writes[0]!.values).not.toHaveProperty('reviewerModel');
-    expect(writes[0]!.set).not.toHaveProperty('reviewerModel');
+    expect(writes).toHaveLength(0);
+    expect(auditLog).toHaveLength(0);
+  });
+
+  it('GET /ai/script-policy no longer returns reviewerModel', async () => {
+    selectQueue = [[policyRow({ reviewerModel: 'stale-model' } as unknown as Partial<AiScriptPolicyRow>)], [laneRow()]];
+    const body = await (await getReq()).json();
+    expect(body.policy).not.toBeNull();
+    expect(body.policy).not.toHaveProperty('reviewerModel');
   });
 
   it('does not require a step-up grant to disable an enabled lane even if other fields also change', async () => {

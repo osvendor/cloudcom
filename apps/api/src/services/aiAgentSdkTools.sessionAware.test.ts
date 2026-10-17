@@ -90,9 +90,16 @@ describe('makeSessionAwareHandler (M365 enforcement routing)', () => {
       'm365_reset_password', getAuth, getActiveSession, sessionHandler, onPreToolUse, onPostToolUse,
     );
 
-    const res = (await handler({ userIdentifier: 'u@x.com', reason: 'r' })) as ToolResult;
+    const res = (await handler(
+      { userIdentifier: 'u@x.com', reason: 'r' },
+      { _meta: { 'claudecode/toolUseId': 'toolu_denied' } },
+    )) as ToolResult;
 
-    expect(onPreToolUse).toHaveBeenCalledWith('m365_reset_password', { userIdentifier: 'u@x.com', reason: 'r' });
+    expect(onPreToolUse).toHaveBeenCalledWith(
+      'm365_reset_password', { userIdentifier: 'u@x.com', reason: 'r' },
+      // No exposed-name override; then the call's own SDK tool_use id (#8163).
+      undefined, 'toolu_denied',
+    );
     expect(sessionHandler).not.toHaveBeenCalled();
     expect(res.isError).toBe(true);
     expect(firstText(res)).toContain('approval_required');
@@ -101,6 +108,8 @@ describe('makeSessionAwareHandler (M365 enforcement routing)', () => {
       // Trailing `undefined`s are `sealed` and `handoff` (#5107) — an ordinary
       // denial is neither a sealed-credential result nor an approval handoff.
       'm365_reset_password', expect.any(Object), expect.stringContaining('approval_required'), true, 0, undefined, undefined,
+      // The call's own SDK tool_use id, so the result pairs with it (#7931).
+      'toolu_denied',
     );
   });
 
@@ -113,7 +122,7 @@ describe('makeSessionAwareHandler (M365 enforcement routing)', () => {
       'm365_disable_user', getAuth, getActiveSession, sessionHandler, onPreToolUse, onPostToolUse,
     );
 
-    await handler({ userIdentifier: 'u@x.com', reason: 'r' });
+    await handler({ userIdentifier: 'u@x.com', reason: 'r' }, { _meta: { 'claudecode/toolUseId': 'toolu_ok' } });
 
     expect(onPostToolUse).toHaveBeenCalledTimes(1);
     expect(onPostToolUse).toHaveBeenCalledWith(
@@ -125,6 +134,8 @@ describe('makeSessionAwareHandler (M365 enforcement routing)', () => {
       // `sealed`, then `handoff` (#5107) — a normal success is neither.
       undefined,
       undefined,
+      // The call's own SDK tool_use id (#7931).
+      'toolu_ok',
     );
   });
 

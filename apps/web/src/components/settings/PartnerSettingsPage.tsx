@@ -24,6 +24,7 @@ import {
 import EmailTemplatesTab from './EmailTemplatesTab';
 import SettingsSectionNav from './SettingsSectionNav';
 import { fetchWithAuth } from '../../stores/auth';
+import { PartnerCallerVerificationPolicy } from '../callerVerification/CallerVerificationPolicyForm';
 import { getJwtClaims } from '../../lib/authScope';
 import { useOrgStore } from '../../stores/orgStore';
 import PartnerSecurityTab, { currentIpCovered } from './PartnerSecurityTab';
@@ -163,12 +164,12 @@ for (const t of ALL_TABS) {
 HASH_TO_TAB['ai-models'] = 'aiProvider'; // AI Providers & Models (W04 #7602) — canonical stays #ai-provider
 
 /**
- * Map a top-level URL hash to a partner settings tab. The Ticketing tab is
- * deep-linkable via `/settings/partner#ticketing` (the old `/settings/ticketing`
- * route redirects here), so honor that fragment on first render. Other fragments
- * fall back to the default Company tab. The nested ticketing sub-tab `#tab=…`
- * fragment is intentionally NOT used here — the embedded TicketingSettingsTabs
- * keeps its own local state so the two hash schemes don't collide.
+ * Map a top-level URL hash to a partner settings tab, honored on first render.
+ * Unknown fragments fall back to the default Company tab. `#ticketing` still
+ * resolves, but only to the link-out card: ticketing configuration lives on
+ * its own `/settings/ticketing` page (M0, #6233), which is a real page and not
+ * a redirect here. Until v0.115 that route was a 301 to `#ticketing`, and
+ * browsers that cached that 301 loop between the two (#7985).
  */
 function getTabFromHash(): TabKey | null {
   if (typeof window === 'undefined') return null;
@@ -393,8 +394,7 @@ export default function PartnerSettingsPage() {
   }, [currentPartnerId, contextLoading, fetchPartner, adoptPartnerId]);
 
   // Deep-link support: open the tab named in the URL hash on mount (e.g.
-  // `/settings/partner#ticketing`, which the legacy `/settings/ticketing` route
-  // redirects to). Seeded SSR-safe via the 'company' default above; the hash is
+  // `/settings/partner#security`). Seeded SSR-safe via the 'company' default above; the hash is
   // applied client-side here to avoid a hydration mismatch. Also tracks external
   // hash changes (back/forward, in-app links, the nav anchors below).
   useEffect(() => {
@@ -706,6 +706,13 @@ export default function PartnerSettingsPage() {
               <PartnerSecurityTab data={securityData} onChange={setSecurityData} status={ipStatus} statusUnavailable={ipStatusUnavailable} />
             </section>
           )}
+          {/* Caller verification (#6354): partner baseline, self-saving and
+              hidden unless the server flag is on. */}
+          {activeTab === 'security' && (
+            <div className="mt-4">
+              <PartnerCallerVerificationPolicy />
+            </div>
+          )}
 
           {activeTab === 'notifications' && (
             <section className="rounded-lg border bg-card p-6 shadow-xs">
@@ -733,7 +740,7 @@ export default function PartnerSettingsPage() {
 
           {/* Login Branding: self-contained card with its own load/save (the
               top-level "Save Settings" button does not apply here). */}
-          {activeTab === 'loginBranding' && <LoginBrandingCard />}
+          {activeTab === 'loginBranding' && <LoginBrandingCard partnerSlug={partner?.slug} />}
 
           {activeTab === 'aiBudgets' && (
             <section className="rounded-lg border bg-card p-6 shadow-xs">

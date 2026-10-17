@@ -48,6 +48,12 @@ import type { AuthContext } from '../../middleware/auth';
 import { CommandTypes, queueCommandForExecution } from '../commandQueue';
 import { terminalPayloadErasureSet } from '../sensitiveCommandPayload';
 import { captureException } from '../sentry';
+import {
+  buildRestorePointRequest,
+  discardRestorePointRequest,
+  linkRestorePointCommand,
+  restorePointPayloadField,
+} from '../restorePointRequest';
 import { checkScriptMaintenanceSuppression } from '../scriptMaintenanceGate';
 import { hasTenantVariableBoundParameters } from '../sourcedParameters';
 import { getFleetFinding } from './query';
@@ -312,10 +318,10 @@ export async function createRemediationRun(
     throw new RemediationRequestError(scriptCheck.error, 400);
   }
 
-  // Raw (unfiltered) membership — needed to distinguish "never a member"
-  // (not_member) from "is a member but this caller's site grant excludes it"
-  // (site_denied). getFleetFinding()'s `members` are already site-filtered,
-  // which would collapse that distinction.
+  // Raw membership is still needed to revalidate an explicitly requested id.
+  // Implicit expansion (no `deviceIds`) uses getFleetFinding()'s `members`,
+  // which are already narrowed to the finding's own org and the caller's
+  // site/device scope.
   const memberRows = await db
     .select({ deviceId: fleetFindingDevices.deviceId })
     .from(fleetFindingDevices)
@@ -335,7 +341,9 @@ export async function createRemediationRun(
   // route's zod schema also rejects `[]` with `.min(1)`, but this function is
   // called directly in tests/other callers too, so the guard lives here as
   // well — defense in depth, not just at the HTTP boundary).
-  const candidateIds = Array.from(new Set(req.deviceIds !== undefined ? req.deviceIds : Array.from(memberIds)));
+  const candidateIds = Array.from(
+    new Set(req.deviceIds !== undefined ? req.deviceIds : finding.members.map((m) => m.deviceId))
+  );
 
   const deviceRows =
     candidateIds.length > 0
@@ -373,8 +381,14 @@ export async function createRemediationRun(
       skipped.push({ deviceId, reason: 'not_member' });
       continue;
     }
-    if (auth.allowedSiteIds !== undefined && !auth.allowedSiteIds.includes(device.siteId)) {
-      skipped.push({ deviceId, reason: 'site_denied' });
+    // Out of the caller's site/device scope: reported exactly like a
+    // non-member, so the result does not reveal that a device the caller
+    // cannot see belongs to this finding.
+    if (
+      (auth.allowedSiteIds !== undefined && !auth.allowedSiteIds.includes(device.siteId))
+      || (auth.allowedDeviceIds !== undefined && !auth.allowedDeviceIds.includes(device.id))
+    ) {
+      skipped.push({ deviceId, reason: 'not_member' });
       continue;
     }
     if (device.status === 'decommissioned' || device.isEphemeral) {
@@ -438,7 +452,9 @@ export async function createRemediationRun(
         status: 'pending' as FleetTargetStatus,
       })),
       ...skipped.map((s) => {
-        const d = deviceById.get(s.deviceId);
+        // A not_member target records no live metadata: the device was
+        // missing, moved, outside the org, or outside the caller's scope.
+        const d = s.reason === 'not_member' ? undefined : deviceById.get(s.deviceId);
         return {
           runId: inserted.id,
           orgId: d?.orgId ?? finding.orgId,
@@ -607,8 +623,9 @@ export async function dispatchRunChunk(runId: string, chunkIndex: number): Promi
   // string would be brittle, and attempting the enqueue at all is wasted work.
   // One bounded query (the chunk is <= REMEDIATION_CHUNK_SIZE) instead.
   const liveness = new Map<string, string>();
+  const osTypes = new Map<string, string | null>();
   for (const row of await db
-    .select({ id: devices.id, status: devices.status })
+    .select({ id: devices.id, status: devices.status, osType: devices.osType })
     .from(devices)
     .where(
       inArray(
@@ -617,6 +634,7 @@ export async function dispatchRunChunk(runId: string, chunkIndex: number): Promi
       )
     )) {
     liveness.set(row.id, row.status);
+    osTypes.set(row.id, row.osType ?? null);
   }
 
   // An unexpected throw inside the per-target loop is the same defect
@@ -789,15 +807,32 @@ export async function dispatchRunChunk(runId: string, chunkIndex: number): Promi
         payload = (run.parameterSnapshot ?? {}) as Record<string, unknown>;
       }
 
+      // #4609 W05: this path builds its own script payload, so it stamps the
+      // restore-point decision through the same chokepoint as
+      // dispatchScriptToDevice. A resolution error lands in the catch below
+      // and fails the target visibly.
+      const restorePoint = type === CommandTypes.SCRIPT
+        ? await buildRestorePointRequest({
+          deviceId: target.targetDeviceUuid,
+          orgId: target.orgId,
+          osType: osTypes.get(target.targetDeviceUuid) ?? null,
+          trigger: 'script',
+          label: 'run remediation script',
+        })
+        : null;
+      if (restorePoint) payload = { ...payload, ...restorePointPayloadField(restorePoint) };
+
       const result = await queueCommandForExecution(target.targetDeviceUuid, type, payload, {
         userId: run.createdBy ?? undefined,
         expectedOrgId: target.orgId,
       });
 
       if (result.error || !result.command) {
+        await discardRestorePointRequest(restorePoint);
         await markTargetFailed(runId, target.targetDeviceUuid, result.error ?? 'Failed to queue command');
         continue;
       }
+      await linkRestorePointCommand(restorePoint, result.command.id);
 
       // The claim already flipped status/queuedAt; just attach the resulting
       // command id onto the now-`queued` row.

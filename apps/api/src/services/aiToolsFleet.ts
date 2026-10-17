@@ -7,6 +7,7 @@
  */
 
 import { pageEnvelope, pageParamSchema, readPageArgs } from './aiToolPagination';
+import { reportRunOwnerColumns } from './reportRunOwner';
 import type Anthropic from '@anthropic-ai/sdk';
 import { db } from '../db';
 import { pgErrorCode, pgErrorConstraint } from '../utils/pgErrors';
@@ -45,10 +46,6 @@ import {
   notificationChannels,
 } from '../db/schema/alerts';
 import {
-  configurationPolicies,
-  configPolicyFeatureLinks,
-} from '../db/schema/configurationPolicies';
-import {
   listEffectiveServiceMonitors,
   SERVICE_MONITOR_LIST_DEVICE_CAP,
 } from './monitors/listServiceMonitors';
@@ -58,11 +55,6 @@ import {
   EFFECTIVE_PATCH_CATEGORY_SQL,
   EFFECTIVE_PATCH_SEVERITY_SQL,
 } from './patchSeverityOverlay';
-import {
-  addFeatureLink,
-  updateFeatureLink,
-  policyAccessCondition,
-} from './configurationPolicy';
 import {
   reports,
   reportRuns,
@@ -214,6 +206,27 @@ function refuseFleetAgentPrincipal(action: string): string {
 
 function getOrgId(auth: AuthContext): string | null {
   return auth.orgId ?? auth.accessibleOrgIds?.[0] ?? null;
+}
+
+/**
+ * #7827: device-scoped actions must take the org from the device row itself.
+ * `getOrgId` falls back to `accessibleOrgIds[0]`, which for a partner-scope
+ * caller (null `auth.orgId`) is an arbitrary org — a device in any other org
+ * was reported "not found". The lookup is bounded by `auth.orgCondition`, so
+ * this never widens access; it only stops the arbitrary-org AND from denying.
+ */
+async function resolveDeviceOrg(
+  auth: AuthContext,
+  deviceId: string,
+): Promise<{ id: string; siteId: string | null; orgId: string } | null> {
+  const [device] = await db.select({ id: devices.id, siteId: devices.siteId, orgId: devices.orgId })
+    .from(devices)
+    .where(and(eq(devices.id, deviceId), orgWhere(auth, devices.orgId)))
+    .limit(1);
+  if (!device) return null;
+  // Site axis (app-layer only; RLS does NOT enforce it).
+  if (deviceSiteDenied(auth, device.siteId, device.id)) return null;
+  return device;
 }
 
 function orgWhere(auth: AuthContext, orgIdCol: ReturnType<typeof sql.raw> | any): SQL | undefined {
@@ -1090,8 +1103,6 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           deferUntil: { type: 'string', description: 'ISO date to defer until (for defer)' },
           notes: { type: 'string', description: 'Approval/decline notes' },
           configPolicyId: { type: 'string', description: 'Configuration policy UUID to attach patch settings to (for setup_auto_approval). If omitted, creates a new policy.' },
-          autoApprove: { type: 'boolean', description: 'Enable auto-approval of patches (for setup_auto_approval)' },
-          autoApproveSeverities: { type: 'array', items: { type: 'string', enum: ['critical', 'important', 'moderate', 'low'] }, description: 'Which severities to auto-approve (for setup_auto_approval)' },
           scheduleFrequency: { type: 'string', enum: ['daily', 'weekly', 'monthly'], description: 'Patch scan frequency (for setup_auto_approval, default: weekly)' },
           scheduleTime: { type: 'string', description: 'Time to run scans in HH:MM format (for setup_auto_approval, default: 02:00)' },
           rebootPolicy: { type: 'string', enum: ['if_required', 'always', 'never'], description: 'Reboot policy after patching (for setup_auto_approval, default: if_required)' },
@@ -1137,7 +1148,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
 
       if (action === 'setup_auto_approval') {
         return JSON.stringify({
-          error: 'Action "setup_auto_approval" is disabled. Patch policies must be managed through configuration policies. Use manage_policy_feature_link with featureType "patch" to configure auto-approval rules on a policy.',
+          error: 'Action "setup_auto_approval" is disabled. Auto-approval and per-app block/pin rules are configured on an Update Ring with manage_update_rings. Link the ring to a configuration policy with manage_policy_feature_link (featureType "patch", featurePolicyId = the ring id).',
         });
       }
 
@@ -1149,6 +1160,14 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (!orgId) return JSON.stringify({ error: 'Organization context required' });
 
         const deviceId = typeof input.deviceId === 'string' ? input.deviceId : undefined;
+        // #7827: a device-scoped list takes the org from the device row, not
+        // `accessibleOrgIds[0]` (arbitrary for partner-scope callers).
+        let listOrgId: string = orgId;
+        if (deviceId) {
+          const listDevice = await resolveDeviceOrg(auth, deviceId);
+          if (!listDevice) return JSON.stringify({ error: 'Device not found or access denied' });
+          listOrgId = listDevice.orgId;
+        }
         const page = readPageArgs('manage_patches', input, { defaultLimit: 25, maxLimit: 100 });
         if (!page.ok) return JSON.stringify({ error: page.error, code: page.code });
         const { limit, offset, fingerprint } = page;
@@ -1162,7 +1181,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         // mis-bucket most of a Windows-heavy fleet's patch volume, and would
         // disagree with what patchEligibility.ts's auto-approval check sees
         // for the same patch. Every query below is already pinned to
-        // `devicePatches.orgId = orgId` (and, for the device-scoped branch,
+        // `devicePatches.orgId = listOrgId` (and, for the device-scoped branch,
         // also `devicePatches.deviceId = deviceId`), so this never crosses a
         // tenant boundary.
         const catalogConds: SQL[] = [];
@@ -1172,7 +1191,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         // Both axes, independent of each other: a site-restricted human sees
         // their sites' patch inventory, a device-bound or device-LESS agent run
         // only its own devices'. `null` = unrestricted (no narrowing, no query).
-        const patchListAllowed = await resolveSiteAllowedDeviceIds(orgId, auth);
+        const patchListAllowed = await resolveSiteAllowedDeviceIds(listOrgId, auth);
         if (patchListAllowed && patchListAllowed.length === 0) {
           return JSON.stringify({ ...pageEnvelope({ key: 'patches', items: [], limit, offset, fingerprint }), note: SITE_SCOPE_EMPTY_NOTE });
         }
@@ -1195,7 +1214,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           const rows = await db.select({ ...patchCols, status: devicePatches.status })
             .from(devicePatches)
             .innerJoin(patches, eq(devicePatches.patchId, patches.id))
-            .where(and(eq(devicePatches.orgId, orgId), eq(devicePatches.deviceId, deviceId), ...patchListScope, ...catalogConds))
+            .where(and(eq(devicePatches.orgId, listOrgId), eq(devicePatches.deviceId, deviceId), ...patchListScope, ...catalogConds))
             .orderBy(desc(patches.createdAt), desc(patches.id))
             .limit(limit + 1)
             .offset(offset);
@@ -1209,7 +1228,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         // of the previous selectDistinct) and shows the most severe effective
         // value seen across the org's own devices reporting this patch (worst
         // case wins, never under-reports risk). Aggregated within this org's
-        // own device_patches rows only (`devicePatches.orgId = orgId`),
+        // own device_patches rows only (`devicePatches.orgId = listOrgId`),
         // never across orgs.
         const rows = await db.select({
           id: patches.id,
@@ -1224,13 +1243,13 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         })
           .from(patches)
           .innerJoin(devicePatches, eq(devicePatches.patchId, patches.id))
-          .where(and(eq(devicePatches.orgId, orgId), ...patchListScope, ...catalogConds))
+          .where(and(eq(devicePatches.orgId, listOrgId), ...patchListScope, ...catalogConds))
           .groupBy(patches.id, patches.source, patches.externalId, patches.title, patches.releaseDate, patches.requiresReboot, patches.createdAt)
           .orderBy(desc(patches.createdAt), desc(patches.id))
           .limit(limit + 1)
           .offset(offset);
 
-        return JSON.stringify({ ...pageEnvelope({ key: 'patches', items: rows, limit, offset, fingerprint }), scope: { orgId } });
+        return JSON.stringify({ ...pageEnvelope({ key: 'patches', items: rows, limit, offset, fingerprint }), scope: { orgId: listOrgId } });
       }
 
       if (action === 'compliance') {
@@ -1482,14 +1501,9 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         if (!Array.isArray(input.deviceIds) || input.deviceIds.length === 0) return JSON.stringify({ error: 'deviceIds is required for rollback' });
         if (!orgId) return JSON.stringify({ error: 'Organization context required' });
 
-        // Validate device belongs to this org
-        const [device] = await db.select({ id: devices.id, siteId: devices.siteId })
-          .from(devices)
-          .where(and(eq(devices.orgId, orgId), eq(devices.id, (input.deviceIds as string[])[0]!)))
-          .limit(1);
+        // Validate the device is accessible; its own org is authoritative (#7827).
+        const device = await resolveDeviceOrg(auth, (input.deviceIds as string[])[0]!);
         if (!device) return JSON.stringify({ error: 'Device not found or access denied' });
-        // Site axis (app-layer only; RLS does NOT enforce it).
-        if (deviceSiteDenied(auth, device.siteId, device.id)) return JSON.stringify({ error: 'Device not found or access denied' });
 
         const [rollback] = await db.insert(patchRollbacks).values({
           deviceId: device.id,
@@ -1512,14 +1526,8 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const deviceId = typeof input.deviceId === 'string' ? input.deviceId : undefined;
         if (!deviceId) return JSON.stringify({ error: 'deviceId is required for device_history' });
 
-        const [device] = await db.select({ id: devices.id, siteId: devices.siteId })
-          .from(devices)
-          .where(and(eq(devices.orgId, orgId), eq(devices.id, deviceId)))
-          .limit(1);
+        const device = await resolveDeviceOrg(auth, deviceId);
         if (!device) return JSON.stringify({ error: 'Device not found or access denied' });
-        // Site axis (app-layer only; RLS does NOT enforce it) — same check as rollback above.
-        if (deviceSiteDenied(auth, device.siteId, device.id)) return JSON.stringify({ error: 'Device not found or access denied' });
-
         const now = new Date();
         const DEFAULT_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
         const since = typeof input.since === 'string' && !Number.isNaN(Date.parse(input.since))
@@ -1531,7 +1539,7 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const limit = Math.min(Math.max(1, Number(input.limit) || 25), 100);
 
         const historyConds: SQL[] = [
-          eq(patchJobs.orgId, orgId),
+          eq(patchJobs.orgId, device.orgId),
           eq(patchJobResults.deviceId, deviceId),
           gte(patchJobResults.createdAt, since),
           lte(patchJobResults.createdAt, until),
@@ -1595,116 +1603,6 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
           until: until.toISOString(),
           history,
           showing: history.length,
-        });
-      }
-
-      if (action === 'setup_auto_approval') {
-        // NOTE: this whole action is currently unreachable (see the disabled
-        // early-return above) — defense-in-depth, kept correct so the block is
-        // not a trap if the gate is ever lifted (same convention as the
-        // canManagePartnerWidePolicies check a few lines below). This path
-        // inserts an org configuration_policies row + feature link, which is
-        // exactly the org-wide governance object this contract protects.
-        if (!canMutateOrgWideGovernance(auth)) {
-          return JSON.stringify({ error: SITE_CEILING_WRITE_DENIED_MESSAGE });
-        }
-        if (!orgId) return JSON.stringify({ error: 'Organization context required' });
-
-        const patchSettings = {
-          sources: Array.isArray(input.sources) ? input.sources as string[] : ['os'],
-          autoApprove: typeof input.autoApprove === 'boolean' ? input.autoApprove : true,
-          autoApproveSeverities: Array.isArray(input.autoApproveSeverities) ? input.autoApproveSeverities as string[] : ['critical', 'important'],
-          scheduleFrequency: typeof input.scheduleFrequency === 'string' ? input.scheduleFrequency : 'weekly',
-          scheduleTime: typeof input.scheduleTime === 'string' ? input.scheduleTime : '02:00',
-          rebootPolicy: typeof input.rebootPolicy === 'string' ? input.rebootPolicy : 'if_required',
-        };
-
-        const configPolicyId = input.configPolicyId as string | undefined;
-
-        if (configPolicyId) {
-          // Check if policy exists and user has access.
-          //
-          // NOTE: this whole action is currently unreachable — `setup_auto_approval`
-          // early-returns as disabled above (patch policies are managed through
-          // configuration policies). The two fixes below are defense-in-depth,
-          // kept correct so the block is not a trap if the gate is ever lifted
-          // — configuration policies own these writes.
-          //
-          // `policyAccessCondition`, not a bare org-equality (#3493): a
-          // partner-wide policy stores `org_id NULL`, so the org form would tell
-          // the partner-scoped tech who AUTHORED the policy it "was not found".
-          const policyConditions: SQL[] = [eq(configurationPolicies.id, configPolicyId)];
-          const oc = policyAccessCondition(auth);
-          if (oc) policyConditions.push(oc);
-          const [policy] = await db.select().from(configurationPolicies).where(and(...policyConditions)).limit(1);
-          if (!policy) return JSON.stringify({ error: 'Configuration policy not found or access denied' });
-
-          // Making a partner-wide policy REACHABLE is not the same as making it
-          // writable. Everything below mutates the policy's patch feature link,
-          // which lands on every org the policy covers — so it takes the same
-          // capability the HTTP feature-link route requires
-          // (routes/configurationPolicies/featureLinks.ts).
-          if (policy.orgId === null && !canManagePartnerWidePolicies(auth)) {
-            return JSON.stringify({ error: PARTNER_WIDE_WRITE_DENIED_MESSAGE });
-          }
-
-          // Check if patch feature link already exists
-          const existingLinks = await db.select()
-            .from(configPolicyFeatureLinks)
-            .where(and(
-              eq(configPolicyFeatureLinks.configPolicyId, configPolicyId),
-              eq(configPolicyFeatureLinks.featureType, 'patch'),
-            )).limit(1);
-
-          if (existingLinks.length > 0) {
-            // Update existing feature link
-            const updated = await updateFeatureLink(existingLinks[0]!.id, { inlineSettings: patchSettings }, configPolicyId);
-            if (!updated) return JSON.stringify({ error: 'Failed to update patch settings — the feature link may have been deleted. Try again.' });
-            return JSON.stringify({
-              success: true,
-              message: `Patch auto-approval settings updated on policy "${policy.name}"`,
-              configPolicyId,
-              featureLinkId: existingLinks[0]!.id,
-              settings: patchSettings,
-            });
-          }
-
-          // Add new patch feature link. addFeatureLink returns null (instead of
-          // throwing) on a duplicate; existingLinks was just checked above so
-          // this is effectively unreachable outside a race, but guard anyway.
-          const link = await addFeatureLink(configPolicyId, 'patch', null, patchSettings);
-          if (!link) return JSON.stringify({ error: 'Patch feature link already exists on this policy' });
-          return JSON.stringify({
-            success: true,
-            message: `Patch auto-approval configured on policy "${policy.name}"`,
-            configPolicyId,
-            featureLinkId: link.id,
-            settings: patchSettings,
-          });
-        }
-
-        // No configPolicyId — create a new config policy with patch settings
-        const [newPolicy] = await db.insert(configurationPolicies).values({
-          orgId,
-          name: `Patch Auto-Approval Policy`,
-          description: `Auto-approve ${patchSettings.autoApproveSeverities.join(', ')} patches on a ${patchSettings.scheduleFrequency} schedule`,
-          status: 'active',
-          createdBy: auth.user.id,
-        }).returning();
-
-        if (!newPolicy) return JSON.stringify({ error: 'Failed to create configuration policy' });
-
-        // newPolicy.id is freshly generated above, so a duplicate feature-link
-        // conflict is not realistically reachable; guard for type-safety only.
-        const link = await addFeatureLink(newPolicy.id, 'patch', null, patchSettings);
-        if (!link) return JSON.stringify({ error: 'Failed to configure patch auto-approval on the new policy' });
-        return JSON.stringify({
-          success: true,
-          message: `Created new policy "${newPolicy.name}" with patch auto-approval`,
-          configPolicyId: newPolicy.id,
-          featureLinkId: link.id,
-          settings: patchSettings,
-          hint: 'Use apply_configuration_policy to assign this policy to an organization, site, or device group.',
         });
       }
 
@@ -3061,9 +2959,10 @@ export function registerFleetTools(aiTools: Map<string, AiTool>): void {
         const reportId = reportDef?.id ?? null;
         let runId: string | null = null;
 
-        if (reportId) {
+        if (reportId && reportDef) {
           const [run] = await db.insert(reportRuns).values({
             reportId,
+            ...reportRunOwnerColumns(reportDef),
             status: 'pending',
             requestedByKind: 'user',
             requestedByUserId: auth.user.id,

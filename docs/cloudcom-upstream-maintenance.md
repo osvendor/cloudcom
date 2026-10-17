@@ -34,6 +34,40 @@ changes update offers, command delivery, readiness or worker scheduling.
 
 ## Change register
 
+### LanternOps v0.123.0 intake (2026-10-17)
+
+The intake pins upstream `v0.123.0` at `d721f0963d02a9ee8151fc31514666d596826d8d`
+and targets fork version `0.123.5` with paired verified native binaries `0.121.6`.
+Preserve the complete CloudCom workflow directory. Upstream heartbeat transaction
+scope and organization-scoped hierarchy/policy sets replace the superseded
+CloudCom `devicePolicyReadSnapshot`; remove that unused snapshot implementation.
+CloudCom update-capacity admission remains post-commit and shared by heartbeat,
+watchdog, command-delivery and edition-migration paths. The browser viewer was
+regenerated with the browser clipboard and credentials adapters. Preserve existing
+auth, tenant, native, PAM, credentials and Harmony policies. The API image must
+package the `ext-credentials` source manifest and web distribution. No Edge Store
+publication or automatic native fleet promotion is part of this intake.
+
+Fresh-bootstrap planning orders the already-shipped CloudCom monitor lookup-index
+migration after upstream's monitor-coverage column prerequisite. Their filenames,
+SQL bytes and existing ledger entries stay unchanged. Regression tests cover the
+explicit dependency, missing prerequisite, repeat planning and unchanged caller
+input. Restored-data upgrade applied 129 pending migrations, then a repeat was a
+no-op; fresh bootstrap also passed. Real PostgreSQL resolver/mailbox checks passed
+153 tests and the RLS catalog contract passed 105. The broader focused API, portal,
+extension and browser suites and all three application builds passed before image
+acceptance. Native PAM race tests retain both CloudCom failure evidence and the
+upstream restart/token-verification marker; the current fleet binary is unchanged.
+
+Local MSI serving now requires a signed artifact manifest. Stage a manifest for
+the verified current MSI using the established CloudCom release trust key and
+register that public key while retaining existing verifier keys. Keep the native
+component update manifests and target versions unchanged. The actual merged MSI
+fetch path passed against the current artifact. Database and image rollback must
+remain paired: keep a protected quiesced backup and previous configuration. Final
+image IDs, cutover acceptance and production state belong in private release
+evidence, not this public maintenance register.
+
 ### Independent local native release version (2026-10-16)
 
 `apps/api/src/services/binarySync.ts` resolves the expected local binary volume

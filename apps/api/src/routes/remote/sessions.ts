@@ -55,7 +55,9 @@ import {
   commitDesktopStartIntent,
   formatDesktopGeneration,
   startIntentDenialCode,
+  startIntentDenialMessage,
 } from '../../services/remoteDesktopStartIntent';
+import { releaseDesktopStartInFlight } from '../../services/desktopStartInFlight';
 import { revokeViewerSession } from '../../services/viewerTokenRevocation';
 import { captureException, captureMessage } from '../../services/sentry';
 import { ACTIVE_REMOTE_SESSION_STATUSES, teardownDisconnectedSessions } from '../../services/remoteSessionTeardown';
@@ -262,7 +264,7 @@ sessionRoutes.post(
     }
 
     // Fail fast on an agent that cannot hold a revocation lease or (behind
-    // REMOTE_DESKTOP_FENCE_REQUIRED, SEC-038 W06) does not keep the durable
+    // REMOTE_DESKTOP_FENCE_REQUIRED) does not keep the durable
     // start fence. The three desktop-start dispatch sites gate on this too
     // (that is the authoritative fail-closed check); doing it here as well
     // means the operator gets the "agent update required" answer on the click
@@ -760,7 +762,7 @@ sessionRoutes.get(
       userId: session.userId,
       type: session.type,
       status: session.status,
-      // SEC-038 W06: 'pending' = a terminal decision committed server-side but
+      // 'pending' = a terminal decision committed server-side but
       // the agent has not yet acknowledged the stop. The web UI must not
       // render such a session as connected.
       terminationPhase: session.terminationPhase ?? 'none',
@@ -1081,7 +1083,7 @@ sessionRoutes.post(
     const startCommandId = createDesktopStartCommandId(sessionId);
 
     // Publish the offer, prompt mode and one-off command identity together,
-    // under a row lock that also bumps the start generation (SEC-038 W02).
+    // under a row lock that also bumps the start generation.
     // A later re-offer replaces the identity, so an answer from the superseded
     // agent command cannot win the result compare-and-set; the generation is
     // what orders this start against a terminal decision.
@@ -1105,85 +1107,103 @@ sessionRoutes.post(
           code: 'SESSION_TERMINAL',
         }, 409);
       }
+      if (startIntent.reason === 'start_in_flight') {
+        // #8947: a concurrent second offer for a start still waiting on its
+        // answer — refused, not superseded (see the viewer-token twin).
+        return c.json({
+          error: startIntentDenialMessage(startIntent.reason),
+          code: startIntentDenialCode(startIntent.reason),
+        }, 409);
+      }
       return jsonError(c, 409, ERROR_CODES.CONFLICT, 'Session state changed while submitting offer');
     }
 
-    const startGeneration = startIntent.generation;
+    // Every exit below that does not hand the start to the agent — a refusal,
+    // an unreachable agent, or a throw — drops this start's in-flight marker,
+    // so the viewer's retry is not refused as a duplicate of a start the
+    // agent never received (#8947).
+    let dispatched = false;
+    try {
+      const startGeneration = startIntent.generation;
 
-    await logSessionAudit(
-      'session_offer_submitted',
-      auth.user.id,
-      device.orgId,
-      {
-        sessionId,
-        type: session.type,
-        startCommandId,
-        promptMode,
-        startGeneration: formatDesktopGeneration(startGeneration),
-      },
-      getTrustedClientIpOrUndefined(c)
-    );
+      await logSessionAudit(
+        'session_offer_submitted',
+        auth.user.id,
+        device.orgId,
+        {
+          sessionId,
+          type: session.type,
+          startCommandId,
+          promptMode,
+          startGeneration: formatDesktopGeneration(startGeneration),
+        },
+        getTrustedClientIpOrUndefined(c)
+      );
 
-    // Fail-closed revocation lease. Without a lease-capable agent there is no
-    // way to end this peer-to-peer session once authorization changes, so the
-    // start is refused rather than run unrevokable.
-    const leaseResult = await prepareRevocationLeaseForStart(sessionId);
-    if (!leaseResult.ok) {
-      if (leaseResult.reason === 'agent_upgrade_required') {
+      // Fail-closed revocation lease. Without a lease-capable agent there is no
+      // way to end this peer-to-peer session once authorization changes, so the
+      // start is refused rather than run unrevokable.
+      const leaseResult = await prepareRevocationLeaseForStart(sessionId);
+      if (!leaseResult.ok) {
+        if (leaseResult.reason === 'agent_upgrade_required') {
+          return c.json({
+            error: AGENT_UPGRADE_REQUIRED_MESSAGE,
+            code: AGENT_UPGRADE_REQUIRED_CODE,
+          }, 503);
+        }
         return c.json({
-          error: AGENT_UPGRADE_REQUIRED_MESSAGE,
-          code: AGENT_UPGRADE_REQUIRED_CODE,
+          error: 'Unable to authorize this remote session right now. Please try again.',
+          code: 'lease_unavailable',
         }, 503);
       }
-      return c.json({
-        error: 'Unable to authorize this remote session right now. Please try again.',
-        code: 'lease_unavailable',
-      }, 503);
-    }
 
-    // Re-read generation + phase immediately before publication. An End that
-    // committed while the lease was being minted supersedes this start, and the
-    // command must not go out at all. This narrows the window to microseconds;
-    // the endpoint fence (W04/W05) is what closes it.
-    const stillCurrent = await assertDesktopStartIntentCurrent(sessionId, startGeneration);
-    if (!stillCurrent.ok) {
-      return c.json({
-        error: 'This session was ended while the stream was starting',
-        code: startIntentDenialCode(stillCurrent.reason),
-      }, 409);
-    }
-
-    const agentReachable = sendCommandToAgent(device.agentId, {
-      id: startCommandId,
-      type: 'start_desktop',
-      payload: {
-        sessionId,
-        startGeneration: formatDesktopGeneration(startGeneration),
-        offer: data.offer,
-        iceServers: getIceServers({ sessionId, userId: session.userId, deviceId: session.deviceId }),
-        clipboard: desktopPolicy.clipboard,
-        idleTimeoutMinutes: desktopPolicy.idleTimeoutMinutes,
-        maxSessionDurationHours: desktopPolicy.maxSessionDurationHours,
-        revocationLease: leaseResult.lease,
-        ...(data.displayIndex != null ? { displayIndex: data.displayIndex } : {}),
-        ...(data.targetSessionId != null ? { targetSessionId: data.targetSessionId } : {}),
-        ...(gpuVendor ? { gpuVendor } : {}),
-        ...(prompt ? { prompt } : {})
+      // Re-read generation + phase immediately before publication. An End that
+      // committed while the lease was being minted supersedes this start, and the
+      // command must not go out at all. This narrows the window to microseconds;
+      // the endpoint fence (W04/W05) is what closes it.
+      const stillCurrent = await assertDesktopStartIntentCurrent(sessionId, startGeneration);
+      if (!stillCurrent.ok) {
+        return c.json({
+          error: 'This session was ended while the stream was starting',
+          code: startIntentDenialCode(stillCurrent.reason),
+        }, 409);
       }
-    });
 
-    if (!agentReachable) {
-      console.warn(`[Remote] Agent ${device.agentId} not connected, cannot send start_desktop for session ${sessionId}`);
-      // 503, not 502: the device is temporarily unreachable, which is exactly
-      // what 503 means — and unlike 502 the body survives Cloudflare.
-      return jsonError(c, 503, ERROR_CODES.DEVICE_UNREACHABLE, 'Agent is not currently connected. Please verify the device is online and try again.');
+      const agentReachable = sendCommandToAgent(device.agentId, {
+        id: startCommandId,
+        type: 'start_desktop',
+        payload: {
+          sessionId,
+          startGeneration: formatDesktopGeneration(startGeneration),
+          offer: data.offer,
+          iceServers: getIceServers({ sessionId, userId: session.userId, deviceId: session.deviceId }),
+          clipboard: desktopPolicy.clipboard,
+          idleTimeoutMinutes: desktopPolicy.idleTimeoutMinutes,
+          maxSessionDurationHours: desktopPolicy.maxSessionDurationHours,
+          revocationLease: leaseResult.lease,
+          ...(data.displayIndex != null ? { displayIndex: data.displayIndex } : {}),
+          ...(data.targetSessionId != null ? { targetSessionId: data.targetSessionId } : {}),
+          ...(gpuVendor ? { gpuVendor } : {}),
+          ...(prompt ? { prompt } : {})
+        }
+      });
+
+      if (!agentReachable) {
+        console.warn(`[Remote] Agent ${device.agentId} not connected, cannot send start_desktop for session ${sessionId}`);
+        // 503, not 502: the device is temporarily unreachable, which is exactly
+        // what 503 means — and unlike 502 the body survives Cloudflare.
+        return jsonError(c, 503, ERROR_CODES.DEVICE_UNREACHABLE, 'Agent is not currently connected. Please verify the device is online and try again.');
+      }
+      dispatched = true;
+
+      return c.json({
+        id: sessionId,
+        status: 'connecting',
+        webrtcOffer: data.offer,
+      });
+    } finally {
+      if (!dispatched) await releaseDesktopStartInFlight(sessionId, startCommandId);
     }
-
-    return c.json({
-      id: sessionId,
-      status: 'connecting',
-      webrtcOffer: data.offer,
-    });
   }
 );
 
@@ -1367,7 +1387,7 @@ sessionRoutes.post(
     // already-terminal case loses the write and is reported, not silently
     // clobbered.
     //
-    // Through the terminal-intent contract (SEC-038 W03): the same guarded
+    // Through the terminal-intent contract: the same guarded
     // UPDATE also bumps the generation every start bumps, records it as the
     // terminal one, and moves the phase to 'pending' until the agent's stop
     // result lands. The live-status guard is the contract's own.
@@ -1500,7 +1520,7 @@ sessionRoutes.post(
     // Still 200, not 202: callers that treat 200 as "ended" keep working. The
     // phase is additive — 'pending' until the agent acknowledges the stop,
     // 'confirmed' after — and the generation is a decimal string, never a
-    // JSON number (SEC-038 W03).
+    // JSON number.
     return c.json({
       id: updated.id,
       status: updated.status,

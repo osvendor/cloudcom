@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import type { SQL } from 'drizzle-orm';
 import { db, withSystemDbAccessContext } from '../../db';
+import { partners, organizations, contracts, contractLines } from '../../db/schema';
+import { isPgUniqueViolation } from '../../utils/pgErrors';
 import { getOrgCascadeDeleteOrder } from '../../services/tenantCascade';
 import { getOrgMergePolicies, __testOnly } from '../../services/orgMergeRegistry';
 import { buildRepointDedupe } from '../../services/orgMergeExecutors';
@@ -20,10 +22,12 @@ const EXTRA_REQUIRED = [
   // follows-parent).
   'device_commands', 'user_sso_identities', 'sso_sessions', 'psa_ticket_mappings',
   'deployment_results', 'software_versions',
-  // P2-3 (#4190): report_runs joined ASSOCIATED_SYSTEM_SCOPED_TABLES when the
-  // org-erasure FK gap on reports.report_id was closed. Parent-keyed, so it
-  // travels with its definition's repointed org_id.
-  'report_runs',
+  // (report_runs left this list in #4247: it has its own org_id now and is
+  // in getOrgCascadeDeleteOrder(), classified as a plain repoint.)
+  // Joined ASSOCIATED_SYSTEM_SCOPED_TABLES so org erasure clears items naming
+  // the org's roles (role_id keeps NO ACTION). Review/role/user-keyed, so it
+  // travels with its parents through a merge.
+  'access_review_items',
   'partner_export_configuration_org_state', 'partner_export_device_material_state',
   'partner_export_site_material_state',
 ];
@@ -189,6 +193,7 @@ const ORG_ID_BLOCKING_TRIGGERS: Readonly<Record<string, string>> = {
     'RAISEs 23514 when org_id changes; a native enrollment cannot move to another organization',
   'portal_remote_assignments.portal_remote_assignment_version':
     'RAISEs 23514 on org or principal/device identity changes; remote grants never transfer between organizations',
+  'autopay_setup_attempts.autopay_setup_attempts_immutable_authority': 'Accepted setup authority includes immutable org_id; leave-for-erasure preserves it on the loser.',
   'org_autopay_consents.org_autopay_consents_immutable': 'unconditional append-only RAISE; consent authority remains with the loser for erasure',
   'offline_transition_effects.offline_effect_source_guard': 'RAISEs iff immutable source org_id changes; historical intents remain with source until erasure',
   // Conditional immutability guards: RAISE iff org_id changed.
@@ -213,10 +218,22 @@ const ORG_ID_BLOCKING_TRIGGERS: Readonly<Record<string, string>> = {
   // and fire regardless.
   'pam_actuations.pam_actuations_transition_guard':
     'RAISEs 42501 iff org_id changed (apps/api/migrations/2026-09-25-pam-actuation-org-immutable.sql); generation/tombstone checks otherwise',
+  // PAM ownership epochs W2 (#8204, 2026-12-23-120000): RAISEs 42501 iff
+  // (device_id, org_id, device_epoch) changes. pam_actuations is blocks-merge,
+  // so a merge never writes it.
+  'pam_actuations.pam_actuations_epoch_guard':
+    'RAISEs 42501 iff (device_id, org_id, device_epoch) changes; blocks-merge table, never repointed',
   // PAM actuation results: unconditional append-only RAISE (42501) on UPDATE
   // — no bypass exists for any app role.
   'pam_actuation_results.pam_actuation_results_block_mutation':
     'unconditional append-only RAISE (42501) on UPDATE — no bypass exists for any app role',
+  // PAM ownership-epoch lineage (#8203, 2026-12-17-130000): unconditional
+  // append-only RAISE (42501) on UPDATE. Both tables are leave-for-erasure:
+  // the devices repoint appends survivor lineage via a trigger instead.
+  'device_ownership_epochs.device_ownership_epochs_block_update':
+    'unconditional append-only RAISE (42501) on UPDATE; leave-for-erasure',
+  'device_ownership_epoch_closures.device_ownership_epoch_closures_block_update':
+    'unconditional append-only RAISE (42501) on UPDATE; leave-for-erasure',
   // AI script proposals (2026-10-16-100100): RAISEs 42501 iff any content /
   // identity column changes, org_id included. Lifecycle columns (status,
   // decision_note, intent_id, …) stay writable — which is exactly what the
@@ -232,6 +249,9 @@ const ORG_ID_BLOCKING_TRIGGERS: Readonly<Record<string, string>> = {
   // 2026-10-26-160000): unconditional RAISE (55000) on UPDATE, same
   // retention-GUC-only bypass. Table is leave-for-erasure.
   'ai_operator_task_events.ai_operator_task_events_block_update': 'unconditional append-only RAISE',
+  // Recipe Library E4 (#6169): both plan-approval tables are leave-for-erasure.
+  'ai_operator_plan_approval_effects.ai_operator_plan_approval_effects_no_update': 'unconditional RAISE: approved effect rows are immutable evidence',
+  'ai_operator_plan_approvals.ai_operator_plan_approvals_immutable_trg': 'RAISEs on any org_id/content change (only lifecycle columns may move)',
 };
 
 /**
@@ -268,6 +288,44 @@ const ORG_ID_COLUMN_UPDATE_REPOINT_TABLES: Readonly<Record<string, string>> = {
 
 /** BENIGN = fires on the repoint but does not obstruct it. Reason per entry. */
 const ORG_ID_BENIGN_TRIGGERS: Readonly<Record<string, string>> = {
+  // Backup key root W01 (#8731, 2026-12-28-110000): BEFORE UPDATE OF key_layout, key_prefix.
+  'backup_snapshots.backup_snapshots_key_root_immutable': 'guards key_layout/key_prefix immutability only; never reads or reverts org_id',
+  'backup_snapshot_id_reservations.backup_snapshot_id_reservations_key_root_immutable': 'guards key_layout/key_prefix immutability only; never reads or reverts org_id',
+  'backup_snapshot_retirements.backup_snapshot_retirements_key_root_immutable': 'guards key_layout/key_prefix immutability only; never reads or reverts org_id',
+  // Trust Center W1 (2026-12-29-130100): BEFORE UPDATE immutability guard on
+  // the published snapshot. It RAISEs on any column change EXCEPT is_current
+  // and org_id, so a merge repoint (org_id only) passes. In practice the repoint
+  // sees zero rows: mergeTrustPages deletes the loser's page first and its
+  // snapshots go with it (ON DELETE CASCADE).
+  'trust_page_snapshots.trust_page_snapshots_immutable_trg': 'freezes every column except is_current and org_id; an org_id-only repoint passes',
+  // PAM ownership epochs W1 (#8203, 2026-12-17-130000). The advance trigger
+  // fires on the devices repoint and only APPENDS lineage (closes the loser
+  // epoch, opens survivor epoch +1, writes retirement markers); it never
+  // RAISEs and never reverts org_id. The write guard fires only when the
+  // UPDATE targets ownership_epoch, and passes whenever org_id changes too.
+  'devices.devices_ownership_epoch_advance': 'appends ownership lineage on an org_id change; never RAISEs or reverts org_id',
+  // Topology site location W2 (#7886, 2026-12-25-140000): deletes the device's presence read-model row and
+  // marks the affected orgs dirty on a site/org change; writes nothing on devices, never RAISEs.
+  'devices.breeze_topology_presence_device_moved': 'deletes the device\'s topology_device_presence row (and, outside a merge, its day rows on an org change) and marks presence dirty; never RAISEs or reverts org_id',
+  // Topology site location W3 (#7887, 2026-12-26-190000): clears NEW.site_assignment_confirmed_at on a site/org
+  // change; touches no other column, never RAISEs.
+  'devices.breeze_devices_site_assignment_confirmation_reset': 'clears site_assignment_confirmed_at on a site/org change; never RAISEs or reverts org_id',
+  'devices.devices_ownership_epoch_write_guard': 'fires only on UPDATE OF ownership_epoch and refuses an epoch change WITHOUT an org change; a merge repoint never targets ownership_epoch',
+  // Customer work approval (#4617, 2026-12-20-200200): freezes a DECIDED
+  // request, but org_id is in its exempt list (to_jsonb(NEW) - org_id …), so an
+  // org_id-only repoint, move or merge passes on every row, pending or decided.
+  'ticket_approval_requests.ticket_approval_requests_decided_immutable': 'freezes decided rows but exempts org_id by name; an org_id-only repoint always passes',
+  // Diagnostic access grants (2026-12-13-130000): on an org_id change, turns an
+  // active grant into revoked and a pending request into expired. Never blocks
+  // or reverts the org_id change itself; the merge fences these rows in its
+  // resolve phase first, so the repoint finds them already dead.
+  'diagnostic_access_grants.diagnostic_access_grants_fence_org_change': 'kills a live grant on org change; never reads-to-block or reverts org_id',
+  'diagnostic_access_grants.diagnostic_access_grants_expire_pending_approvals': 'BEFORE DELETE only: expires the grant\'s pending approval rows; never blocks or rewrites org_id',
+  // AI Suggested Fixes W2 (2026-12-07-100000): BEFORE INSERT OR UPDATE guard
+  // that compares only created_by / provisioned_by and RAISEs on a change
+  // outside the system scope. It never reads org_id, and org merge runs in the
+  // system scope anyway, so a repoint is never obstructed.
+  'ai_agents.ai_agents_provenance_guard': 'checks only created_by/provisioned_by changes (and passes everything in the system scope); an org_id repoint is exempt',
   // Topology M4-D2 (2026-11-06-220000): BEFORE UPDATE OF topology_site_id only;
   // RAISEs when the site pin changes. Merge repoints org_id (never the pin),
   // and the pin's composite FK to sites(id, org_id) is DEFERRABLE, so the
@@ -292,6 +350,7 @@ const ORG_ID_BENIGN_TRIGGERS: Readonly<Record<string, string>> = {
   // NEW.partner_feed_xid := pg_current_xact_id(). Never reads or blocks org_id;
   // an org repoint restamps the row, which correctly re-delivers it in the feed.
   'alerts.breeze_alerts_partner_feed_xid': 'only stamps partner_feed_xid; never reads or reverts org_id',
+  'tickets.breeze_tickets_partner_feed_xid': 'only stamps partner_feed_xid; never reads or reverts org_id',
   // #6488 (2026-10-31-100700): fires on an actual org_id/device_id change and
   // only drops a complete/hydrating file_index_status to 'none', so the
   // snapshot's origin provenance is re-verified under the new org. Never
@@ -302,6 +361,7 @@ const ORG_ID_BENIGN_TRIGGERS: Readonly<Record<string, string>> = {
   // the attested/binding columns and the status transition, and deliberately
   // leaves org_id out of both, so a device move or merge repoint passes.
   'backup_snapshot_attestations.backup_snapshot_attestations_guard': 'freezes attested columns and status transitions; org_id is excluded and may change',
+  'backup_restore_authorizations.backup_restore_authorizations_guard': 'freezes every column except org_id (and a user SET NULL); org_id is excluded and may change',
   // Recipe library E2 (2026-10-26-160000): fires only on UPDATE OF
   // device_id/ticket_id/contact_id and only stamps detached_at/_reason/state
   // when the last pointer goes null. Never reads or writes org_id; the table is
@@ -443,6 +503,24 @@ const ORG_ID_CONDITIONALLY_BLOCKING_TRIGGERS: Readonly<
     requiredPolicyKind: 'blocks-merge',
     note: 'RAISEs 23514 on any devices.org_id change while the device has a pam_actuations row; a loser org with such rows is refused by the blocks-merge policy before the devices repoint',
   },
+  // PAM ownership epochs W2 (#8204). Two branches on an org_id change:
+  //  - the request has a pam_actuations row: RAISE 42501 (evidence is frozen
+  //    to its epoch). A loser with such a row is refused by blocks-merge.
+  //  - no actuation: the row is re-anchored to its device's current epoch,
+  //    which requires the device to already be in the new org (else 23514).
+  //    The walk guarantees it even though elevation_requests sorts BEFORE
+  //    devices: the `sites` repoint (near the head of the walk) moves every
+  //    loser device through devices_site_org_fk ON UPDATE CASCADE (site_id is
+  //    NOT NULL, and PostgreSQL never defers a referential action), and that
+  //    devices UPDATE fires breeze_cascade_device_org_id, which restamps the
+  //    device's requests in the same statement. Pinned end to end by
+  //    orgMerge.integration.test.ts ('an un-actuated elevation request
+  //    follows its device into the survivor epoch').
+  'elevation_requests.elevation_requests_epoch_guard': {
+    dischargedBy: 'pam_actuations',
+    requiredPolicyKind: 'blocks-merge',
+    note: 'RAISEs 42501 on an org_id change of an actuated request (loser refused by blocks-merge); an un-actuated request is re-anchored to its device epoch, and follows its device via the devices repoint cascade',
+  },
 };
 
 /**
@@ -525,13 +603,15 @@ describe('Org merge policy registry contract', () => {
     }
   });
 
+  // Must match DROP_LOSER_OVERRIDE_SETTINGS_TABLES in services/orgMerge.ts.
+  const DUAL_AXIS_SETTINGS_TABLES = new Set(['billing_payment_settings', 'ticket_approval_settings']);
   it('every keep-survivor table has a UNIQUE constraint on exactly (org_id)', async () => {
     for (const [table, policy] of policies) {
       if (policy.kind !== 'keep-survivor') continue;
       const indexes = await getUniqueIndexes(table);
       // Dual-axis settings have one row per non-null org, plus partner-owned rows.
       // Their merge executor deletes source settings and never repoints them.
-      const expectedWhere = table === 'billing_payment_settings' ? normalizeSql('org_id IS NOT NULL') : null;
+      const expectedWhere = DUAL_AXIS_SETTINGS_TABLES.has(table) ? normalizeSql('org_id IS NOT NULL') : null;
       const match = indexes.find((ix) => ix.whereNormalized === expectedWhere && ix.nonOrgColumns.size === 0);
       expect(
         match,
@@ -886,5 +966,35 @@ describe('Org merge repoint-dedupe executors run against real Postgres', () => {
         throw new Error('org-merge-executors-smoke-rollback');
       })
     ).rejects.toThrow('org-merge-executors-smoke-rollback');
+  });
+});
+
+describe('contract_lines live-block index vs the merge registry (#4547 W03, Open Decision 14)', () => {
+  it('contract_lines is a plain repoint, and repointing a second live block onto the same org violates the live-block index — the reason orgMerge refuses such a pair before it fences anything', async () => {
+    expect(getOrgMergePolicies().get('contract_lines')).toMatchObject({ kind: 'repoint' });
+
+    const sfx = randomUUID().slice(0, 8);
+    const { a, b } = await withSystemDbAccessContext(async () => {
+      const [p] = await db.insert(partners).values({ name: `MB ${sfx}`, slug: `mb-${sfx}`, type: 'msp', plan: 'pro', status: 'active' }).returning({ id: partners.id });
+      const seed = async (tag: string) => {
+        const [o] = await db.insert(organizations).values({ partnerId: p!.id, name: `MB ${tag} ${sfx}`, slug: `mb-${tag}-${sfx}`, currencyCode: 'USD' }).returning({ id: organizations.id });
+        const [c] = await db.insert(contracts).values({ partnerId: p!.id, orgId: o!.id, name: 'Block', status: 'draft', intervalMonths: 1, startDate: '2026-12-01', currencyCode: 'USD', billingTiming: 'advance' }).returning({ id: contracts.id });
+        const [l] = await db.insert(contractLines).values({
+          contractId: c!.id, orgId: o!.id, lineType: 'hour_block', description: 'Block', unitPrice: '1.00', taxable: false,
+          includedQuantity: '1.00', overageMode: 'bill', overageUnitPrice: '1.00', rolloverPolicy: 'none', hourBlockFirstPeriodStart: '2026-12-01',
+        }).returning({ id: contractLines.id });
+        return { orgId: o!.id, lineId: l!.id };
+      };
+      return { a: await seed('a'), b: await seed('b') };
+    });
+
+    // What the registry's plain repoint does to the loser's block (constraints deferred, as the merge walk does).
+    // The failed statement aborts the transaction, so the error surfaces when the context
+    // exits: catch it outside. Nothing is committed either way.
+    const err = await withSystemDbAccessContext(async () => {
+      await db.execute(sql`SET CONSTRAINTS ALL DEFERRED`);
+      await db.execute(sql`UPDATE contract_lines SET org_id = ${b.orgId}::uuid WHERE id = ${a.lineId}::uuid`);
+    }).then(() => null, (e: unknown) => e);
+    expect(isPgUniqueViolation(err, 'contract_lines_one_live_hour_block_per_org_uq')).toBe(true);
   });
 });

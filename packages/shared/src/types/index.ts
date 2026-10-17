@@ -12,8 +12,10 @@ export * from './scriptAdmission';
 export * from './softwareInventoryObservation';
 export * from './scriptProposals';
 export * from './backupHealth';
+export * from './edr';
 export * from './aiModelRegistry';
 export * from './aiModelQuality';
+export * from './hourBlock';
 
 // ============================================
 // Multi-Tenancy Types
@@ -680,6 +682,8 @@ export interface InheritableNotificationSettings {
   pushoverDefaultUser?: string;
   pushoverDefaultSound?: string;
   pushoverDefaultPriority?: -2 | -1 | 0 | 1 | 2;
+  /** Ticket assignments for users with no personal Pushover key go to the default user or group key. */
+  pushoverTicketAssignmentFallback?: boolean;
 }
 
 export interface InheritableEventLogSettings {
@@ -882,6 +886,7 @@ export * from './orgNarrativeReport';
 export * from './fleetDesign';
 export * from './fleetDesignApply';
 export * from './aiPatchPlan';
+export * from './remediationResearch';
 export * from './devicePatchApproval';
 export * from './deviceFunction';
 export * from './sendingDomains';
@@ -1001,3 +1006,6 @@ export * from './businessReports';
 export * from './backupStatusReport';
 export * from './aiModelChoices';
 export * from './autopay';
+
+// Windows System Restore checkpoint requests (#4609 W05)
+export * from './restorePoint';

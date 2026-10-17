@@ -24,7 +24,8 @@
         "perDeviceRole": "Pro Geräterolle",
         "perDeviceGroup": "Pro Gerätegruppe",
         "perSeat": "Pro Sitzplatz",
-        "manual": "Manuelle Menge"
+        "manual": "Manuelle Menge",
+        "hourBlock": "Stundenkontingent"
       },
       "dynamicGroup": "dynamisch",
       "deletedGroup": "{{name}} (gelöschte Gruppe)",
@@ -588,6 +589,62 @@
       "warnings": {
         "markupRemoved": "Gespeichert, aber nicht unterstützte Formatierung wurde entfernt: {{tags}}. Vereinbarungstexte unterstützen Überschriften, Fett, Kursiv, Unterstrichen, Listen und Links."
       }
+    },
+    "hourBlock": {
+      "form": {
+        "hoursPerPeriod": "Enthaltene Stunden pro Zeitraum",
+        "extraRate": "Preis pro zusätzlicher Stunde",
+        "rolloverMode": "Ungenutzte Stunden am Zeitraumende",
+        "rolloverExpire": "Verfallen",
+        "rolloverCarry": "Übertragen",
+        "carryCap": "Übertragslimit in Stunden (leer für unbegrenzt)",
+        "alertPct": "Warnung bei % des Kontingents (optional)",
+        "required": "Geben Sie die enthaltenen Stunden und den Preis pro zusätzlicher Stunde ein.",
+        "firstPeriod": "Die Stunden zählen ab dem ersten Abrechnungszeitraum, der noch nicht abgerechnet wurde; bei einem Entwurf wird er bei der Aktivierung festgelegt. Frühere Zeit wird wie gewohnt abgerechnet.",
+        "midPeriodEdit": "Änderungen gelten für den laufenden Zeitraum ({{start}} – {{end}}) bei dessen Abschluss.",
+        "midPeriodEditNoDates": "Änderungen gelten für den laufenden Zeitraum bei dessen Abschluss.",
+        "onlyOne": "Diese Organisation hat bereits ein aktives Kontingent. Beenden Sie es, bevor Sie ein weiteres hinzufügen."
+      },
+      "row": {
+        "perPeriod": "{{hours}} Stunden pro Zeitraum",
+        "retiredBadge": "Beendet",
+        "startsOn": "Zählt ab {{date}}"
+      },
+      "errors": {
+        "exists": "Diese Organisation hat bereits eine aktive Stundenkontingent-Position. Beenden Sie sie zuerst und fügen Sie dann die neue hinzu.",
+        "locked": "Dieses Feld kann bei einer Stundenkontingent-Position nicht geändert werden."
+      },
+      "retire": {
+        "title": "Stundenkontingent beenden",
+        "message": "„{{description}}“ hat eine Abrechnungshistorie und wird daher beendet statt gelöscht. Keine neuen Zeiträume; bereits abgerechnete Zeiträume werden weiterhin abgeschlossen. Abgeschlossene Zeiträume bleiben im Vertrag.",
+        "confirm": "Kontingent beenden",
+        "toast": "Stundenkontingent beendet"
+      },
+      "detail": {
+        "title": "Stundenkontingent",
+        "usage": "{{used}} von {{included}} Stunden verbraucht · {{remaining}} verbleibend · Zeitraum endet am {{end}}",
+        "carried": "Enthält {{hours}} übertragene Stunden.",
+        "unapproved": "{{hours}} Stunden dieser Zeit sind noch nicht genehmigt.",
+        "foreign": "{{hours}} Stunden wurden in einer anderen Währung erfasst; sie verbrauchen das Kontingent trotzdem.",
+        "over": "{{hours}} Stunden über dem Kontingent → {{amount}} bei Zeitraumabschluss",
+        "advanceNote": "Mehrstunden werden auf der folgenden Rechnung abgerechnet.",
+        "arrearsNote": "Mehrstunden werden auf der Rechnung für diesen Zeitraum abgerechnet.",
+        "lateEntry": "{{hours}} Stunden wurden nach Abschluss ihres Zeitraums erfasst und werden separat abgerechnet.",
+        "startsLater": "Das Kontingent beginnt am {{date}}.",
+        "extraRate": "Zusätzliche Stunden: je {{rate}}",
+        "loadFailed": "Die Kontingentnutzung konnte nicht geladen werden."
+      },
+      "history": {
+        "title": "Abgeschlossene Kontingentzeiträume",
+        "empty": "Noch kein Kontingentzeitraum abgeschlossen.",
+        "included": "Enthalten",
+        "carriedIn": "Übertrag Eingang",
+        "used": "Verbraucht",
+        "over": "Darüber",
+        "carriedOut": "Übertrag Ausgang",
+        "loadMore": "Mehr laden",
+        "invoiceRemoved": "Mehrstunden-Rechnung entfernt – Stunden nicht abgerechnet"
+      }
     }
   },
   "agreements": {
@@ -911,7 +968,8 @@
         "skuHelp": "Ihre Katalog- oder Distributor-Lagernummer für diesen Artikel.",
         "skuOptional": "SKU (optional)",
         "tidyWithAi": "Mit KI überarbeiten",
-        "unitCost": "Stückkosten"
+        "unitCost": "Stückkosten",
+        "partNumberRequiredHint": "Fügen Sie eine Teilenummer hinzu, um diese Position in die Teilebestellung aufzunehmen."
       },
       "liveTotals": {
         "annualRecurring": "Jährlich wiederkehrend",
@@ -1049,6 +1107,7 @@
       "coverPage": {
         "title": "Deckblatt",
         "enable": "Deckblatt anzeigen",
+        "showContents": "Inhaltsverzeichnis im PDF anzeigen",
         "summaryOn": "Wird als erste Seite des Angebots angezeigt.",
         "summaryOff": "Kein Deckblatt — das Angebot beginnt mit seinem Inhalt.",
         "titleLabel": "Deckblatttitel",
@@ -1147,7 +1206,10 @@
         "tooManyRecipients": "Verwenden Sie höchstens {{max}} Adressen.",
         "zeroTotalWarning": "Dieses Angebot beträgt {{zero}} — prüfen Sie vor dem Senden, ob die Positionen bepreist sind.",
         "noBillingContactHint": "Für diese Organisation ist kein Rechnungskontakt hinterlegt – geben Sie eine E-Mail-Adresse ein oder ergänzen Sie eine in den <orgLink>Organisationseinstellungen</orgLink>.",
-        "revisionWarning": "Durch das Senden wird {{number}} ersetzt und der bereits vorhandene Kundenlink deaktiviert."
+        "revisionWarning": "Durch das Senden wird {{number}} ersetzt und der bereits vorhandene Kundenlink deaktiviert.",
+        "noPartNumberWarning_one": "{{count}} Produktposition hat keine Teilenummer und wird nicht in die Teilebestellung aufgenommen.",
+        "noPartNumberWarning_other": "{{count}} Produktpositionen haben keine Teilenummer und werden nicht in die Teilebestellung aufgenommen.",
+        "sendAnyway": "Trotzdem senden"
       },
       "sendEmailWarning": {
         "noBillingContact": "Vorschlag als Gesendet markiert, aber es wurde keine E-Mail zugestellt — {{orgName}} hat keine Rechnungskontakt-E-Mail. Fügen Sie eine in den Organisationseinstellungen hinzu und senden Sie dann erneut.",
@@ -1320,7 +1382,9 @@
           "vendor": "Anbieter"
         },
         "title": "Zu bestellen",
-        "unknownVendor": "Sonstige / unbekannter Anbieter"
+        "unknownVendor": "Sonstige / unbekannter Anbieter",
+        "excluded": "Nicht in dieser Bestellung (keine Teilenummer): {{names}}",
+        "untitledLine": "Unbenannte Position"
       },
       "pax8Order": {
         "message_one": "Dieses Angebot hat einen Pax8-Auftrag ({{count}} Position) bereitgestellt, für den noch Bereitstellungsdetails fehlen",
@@ -1707,7 +1771,8 @@
       "saveNotes": "Notizen konnten nicht gespeichert werden.",
       "saveTerms": "Die Bedingungen konnten nicht gespeichert werden.",
       "updateLine": "Position konnte nicht aktualisiert werden.",
-      "noPriceForCurrency": "Kein Preis in {{currency}} für dieses Element. Legen Sie einen im Katalog an oder erfassen Sie eine manuelle Position."
+      "noPriceForCurrency": "Kein Preis in {{currency}} für dieses Element. Legen Sie einen im Katalog an oder erfassen Sie eine manuelle Position.",
+      "saveLineDetail": "Die Darstellung der Zeiteinträge konnte nicht aktualisiert werden"
     },
     "fields": {
       "descriptionOptional": "Beschreibung (optional)",
@@ -1774,6 +1839,35 @@
     "linesScrollAria": "Rechnungspositionen – scrollen Sie seitwärts für weitere Spalten",
     "unsavedField": {
       "lines": "Positionen"
+    },
+    "lineDetail": {
+      "default": "Abrechnungsvorgabe",
+      "grouping": "Darstellung",
+      "groupingDay": "Nach Tag gruppieren",
+      "groupingEntry": "Eine Zeile pro Eintrag",
+      "help": "Überschreibt Ihre Abrechnungsvorgabe nur für diesen Entwurf.",
+      "hide": "Ausblenden",
+      "show": "Anzeigen",
+      "showDate": "Arbeitsdatum",
+      "showNote": "Notiz des Technikers",
+      "showWorkedTime": "Geleistete vs. abgerechnete Zeit",
+      "title": "Zeiteintragszeilen"
+    },
+    "refreshTimeLines": {
+      "billedElsewhere": "{{count}} Zeilen blockieren die Ausstellung: Ihre Zeiteinträge wurden auf einer anderen Rechnung abgerechnet. Vor dem Ausstellen entfernen:",
+      "billedElsewhere_one": "{{count}} Zeile blockiert die Ausstellung: Ihr Zeiteintrag wurde auf einer anderen Rechnung abgerechnet. Vor dem Ausstellen entfernen:",
+      "billedElsewhere_other": "{{count}} Zeilen blockieren die Ausstellung: Ihre Zeiteinträge wurden auf einer anderen Rechnung abgerechnet. Vor dem Ausstellen entfernen:",
+      "button": "Aus Zeiteinträgen aktualisieren",
+      "drifted": "{{count}} Zeilen unverändert: Die abgerechnete Zeit der Zeiteinträge passt nicht mehr zur Menge. Menge anpassen oder neuen Entwurf erstellen.",
+      "drifted_one": "{{count}} Zeile unverändert: Die abgerechnete Zeit des Zeiteintrags passt nicht mehr zur Menge. Menge anpassen oder neuen Entwurf erstellen.",
+      "drifted_other": "{{count}} Zeilen unverändert: Die abgerechnete Zeit der Zeiteinträge passt nicht mehr zur Menge. Menge anpassen oder neuen Entwurf erstellen.",
+      "error": "Aktualisierung aus Zeiteinträgen fehlgeschlagen",
+      "help": "Übernimmt Notizen, Arbeitsdatum und Freigabe aus den Zeiteinträgen. Mengen, Preise und von Hand bearbeitete Beschreibungen ändern sich nie.",
+      "running": "Wird aktualisiert…",
+      "skipped": "{{count}} Zeilen übersprungen: Die Zeiteinträge wurden anderweitig abgerechnet, entfernt oder sind für diesen Entwurf nicht mehr abrechenbar.",
+      "skipped_one": "{{count}} Zeile übersprungen: Der Zeiteintrag wurde anderweitig abgerechnet, entfernt oder ist für diesen Entwurf nicht mehr abrechenbar.",
+      "skipped_other": "{{count}} Zeilen übersprungen: Die Zeiteinträge wurden anderweitig abgerechnet, entfernt oder sind für diesen Entwurf nicht mehr abrechenbar.",
+      "summary": "Aktualisiert: {{refreshed}} · Bereits aktuell: {{unchanged}}"
     }
   },
   "invoiceActions": {
@@ -2021,6 +2115,7 @@
     "empty": "Diese Rechnung enthält noch keine Einzelposten.",
     "fallbackTitle": "Rechnung",
     "issued": "Ausgestellt",
+    "laborLine": "Arbeitszeit",
     "preview": {
       "description": "Das sieht Ihr Kunde auf seiner Rechnung.",
       "downloadError": "Die Rechnung PDF konnte nicht heruntergeladen werden.",
@@ -2117,7 +2212,9 @@
       "sourceAria": "Rechnungsquelle",
       "title": "Neue Rechnung",
       "to": "Zu",
-      "working": "Arbeiten…"
+      "working": "Arbeiten…",
+      "heldForHourBlock_one": "{{count}} Zeiteintrag ({{hours}} Stunden) wird für das Stundenkontingent dieser Organisation zurückgehalten und abgerechnet, sobald der Kontingentzeitraum abgeschlossen ist.",
+      "heldForHourBlock_other": "{{count}} Zeiteinträge ({{hours}} Stunden) werden für das Stundenkontingent dieser Organisation zurückgehalten und abgerechnet, sobald der Kontingentzeitraum abgeschlossen ist."
     },
     "empty": {
       "description": "Fassen Sie nicht abgerechnete Zeit und Teile in einem Entwurf zusammen oder erstellen Sie eine leere Rechnung.",
@@ -2277,15 +2374,26 @@
       "documentPageSize": "Seitengröße",
       "documentPageSizeA4": "A4",
       "documentPageSizeLetter": "US-Letter",
-      "documentTheme": "Dokumentdesign",
-      "documentThemeClassic": "Klassisch",
-      "documentThemeCondensed": "Kompakt",
+      "documentTheme": "Dokumentschriften",
+      "documentThemeClassic": "Helvetica",
+      "documentThemeCondensed": "Barlow Condensed + DM Sans",
       "invoiceFooter": "Fußzeile der Rechnung",
       "invoiceFooterPlaceholder": "Zahlungsanweisungen, Dankesschreiben usw.",
       "invoiceNumberPrefix": "Präfix der Rechnungsnummer",
       "markupHelp": "Standardaufschlag auf die Vertriebskosten, der zum Vorabfüllen des Verkaufspreises beim Importieren von Katalogartikeln verwendet wird. Die resultierende Bruttomarge wird beim Import angezeigt.",
       "paymentTermsDays": "Zahlungsbedingungen (Tage)",
-      "title": "Abrechnungsvorgaben"
+      "prefixInvalid": "Geben Sie ein Präfix mit 1 bis 12 Zeichen ein.",
+      "taxRateInvalid": "Geben Sie einen Steuersatz von 0 bis 100 ein.",
+      "termsDaysInvalid": "Geben Sie eine ganze Zahl von 0 bis 365 Tagen ein.",
+      "title": "Abrechnungsvorgaben",
+      "lineDetailTitle": "Zeiteintragszeilen auf Rechnungen",
+      "lineDetailHelp": "Legen Sie fest, was Kunden bei Zeiteinträgen sehen. Ein Rechnungsentwurf kann dies überschreiben; die Auswahl wird bei der Ausstellung der Rechnung festgeschrieben.",
+      "lineShowDate": "Arbeitsdatum anzeigen",
+      "lineShowNote": "Notiz des Technikers anzeigen",
+      "lineShowWorkedTime": "Geleistete und abgerechnete Zeit anzeigen",
+      "lineGrouping": "Darstellung",
+      "lineGroupingEntry": "Eine Zeile pro Eintrag",
+      "lineGroupingDay": "Nach Tag gruppieren"
     },
     "loadError": "Die Abrechnungseinstellungen konnten nicht geladen werden.",
     "loading": "Abrechnungseinstellungen werden geladen…",
@@ -2313,7 +2421,8 @@
     "defaults": "Standardwerte",
     "documents": "Dokumente",
     "connections": "Verbindungen",
-    "rates": "Tarife"
+    "rates": "Tarife",
+    "payments": "Payments"
   },
   "billingConnectionsTab": {
     "accounting": {
@@ -2365,6 +2474,8 @@
     "setDefault": "Als Standard festlegen",
     "archive": "Archivieren",
     "usageUnavailable": "Die Nutzung durch Organisationen ist nicht verfügbar.",
+    "readOnlyNotice": "Sie haben nur Lesezugriff auf die Abrechnungssätze. Bitten Sie eine Administratorin oder einen Administrator, sie zu ändern.",
+    "readOnlyNoPartnerWideNotice": "Die Abrechnungssätze gelten für alle Organisationen; zum Ändern ist voller Zugriff auf die Partnerorganisationen nötig. Sie haben nur Lesezugriff.",
     "edit": "Abrechnungsprofil bearbeiten",
     "name": "Profilname",
     "currency": "Währung",
@@ -2416,6 +2527,271 @@
       "summaryBillableUnpriced": "Abrechenbar · ohne Preis",
       "summaryIncluded": "Inklusive",
       "summaryNotBilled": "Nicht abgerechnet"
+    }
+  },
+  "autopay": {
+    "chargeConfirmTitle": "Automatische Zahlung bestätigen",
+    "chargeConfirmMessage": "Bis zu {{amount}} einschließlich etwaiger Bearbeitungsgebühren für Rechnung {{invoice}} über {{method}} einziehen?",
+    "noticeQueued": "Benachrichtigung zur automatischen Zahlung vorgemerkt",
+    "requestDeliveryFailed": "Die Anfrage-E-Mail konnte nicht zugestellt werden. Senden Sie sie erneut.",
+    "skipNoContact": "Keine E-Mail-Adresse für die Abrechnung vorhanden. Fügen Sie eine hinzu oder geben Sie einen Empfänger an.",
+    "skipStripeNotReady": "Stripe ist nicht für automatische Zahlungen bereit. Prüfen Sie Verbindung und Berechtigungen.",
+    "skipAlreadyActive": "Automatische Zahlungen sind bereits aktiv oder pausiert.",
+    "title": "Automatische Zahlung",
+    "loading": "Automatische Zahlungen werden geladen…",
+    "error": "Diese Aktion konnte nicht abgeschlossen werden. Bitte versuchen Sie es erneut.",
+    "saved": "Automatische Zahlung aktualisiert",
+    "save": "Speichern",
+    "invalid": "Geben Sie 0–60 ganze Tage und einen positiven Höchstbetrag mit einem dreistelligen Währungscode ein.",
+    "offset-days": "Tage nach Ausstellung",
+    "offset-rule": "Vergleich mit dem Fälligkeitsdatum",
+    "cap-enabled": "Limit für automatische Zahlungen",
+    "cap-amount": "Höchstbetrag",
+    "cap-currency": "Währung",
+    "ach-mode": "Zahlungsmethoden",
+    "inherit": "{{value}} — übernommen von {{source}}",
+    "source": {
+      "org": "Organisation",
+      "partner": "Partnerstandard",
+      "default": "Breeze-Standard"
+    },
+    "option": {
+      "earlier": "Das frühere Datum",
+      "later": "Das spätere Datum",
+      "false": "Unbegrenzt",
+      "true": "Limit aktiviert",
+      "ach_preferred": "Bankkonto bevorzugt; Karten akzeptiert",
+      "ach_only": "Nur Bankkonto"
+    },
+    "achRisk": "Bankzahlungen sind für berechtigte US-Konten in USD verfügbar. Ihr Unternehmen trägt die Verantwortung für ACH-Rückbuchungen und Stripe-Rückbuchungsgebühren; Rückbuchungen einzelner Konten können bis zu 60 Tage später eintreffen.",
+    "stripeNotReady": "Automatische Zahlungen sind nicht verfügbar. Prüfen Sie die Stripe-Berechtigungen: {{permissions}}.",
+    "stripeDisconnected": "Verbinden Sie zuerst Stripe",
+    "card": "Karte",
+    "bank": "Bankkonto",
+    "done": "Anfrage abgeschlossen.",
+    "status": {
+      "not_requested": "Nicht angefragt",
+      "requested": "Angefragt",
+      "active": "Aktiv",
+      "paused": "Pausiert",
+      "cancelled": "Aus",
+      "needs_attention": "Handlungsbedarf"
+    },
+    "pending": "Die Bankverifizierung steht aus. Automatische Zahlungen sind noch nicht möglich.",
+    "effective": "Gilt für Rechnungen, die nach {{date}} ausgestellt werden",
+    "recipient": "Abweichender Anfrageempfänger (optional)",
+    "request": "Anfrage senden",
+    "resend": "Anfrage erneut senden",
+    "pause": "Pausieren",
+    "resume": "Fortsetzen",
+    "turnOff": "Ausschalten",
+    "cancel": "Abbrechen",
+    "processingWarning": "Künftige automatische Zahlungen werden gestoppt. Eine bereits verarbeitete Bankzahlung kann nicht zurückgerufen werden.",
+    "unasked_one": "{{count}} Kunde noch nicht angefragt",
+    "unasked_other": "{{count}} Kunden noch nicht angefragt",
+    "sendNow": "Jetzt senden",
+    "dismiss": "Ausblenden",
+    "select": "Auswählen",
+    "client": "Kunde",
+    "statusLabel": "Zustand",
+    "method": "Zahlungsmethode",
+    "selectClient": "{{name}} auswählen",
+    "empty": "Keine Kunden gefunden.",
+    "requestedCount_one": "Anfrage an {{count}} Kunden gesendet.",
+    "requestedCount_other": "Anfragen an {{count}} Kunden gesendet.",
+    "chargeDate": "Abbuchung am oder um den {{date}}",
+    "excludeInvoice": "Diese Rechnung von automatischen Zahlungen ausschließen",
+    "excludeRefusedProcessing": "Die Zahlung für diese Rechnung wird bereits verarbeitet und kann nicht gestoppt werden. Sie können die Rechnung ausschließen, sobald die Zahlung abgeschlossen oder fehlgeschlagen ist.",
+    "excludeContract": "Rechnungen mit diesem Vertrag ausschließen",
+    "failed": "Automatische Zahlung konnte nicht aktualisiert werden. Bitte erneut versuchen.",
+    "states": {
+      "awaiting_notice": "Benachrichtigung ausstehend",
+      "scheduled": "Geplant",
+      "collecting": "Zahlung wird eingezogen",
+      "retry_scheduled": "Erneuter Versuch geplant",
+      "action_required": "Bestätigung erforderlich",
+      "succeeded": "Zahlung eingegangen",
+      "failed": "Zahlung fehlgeschlagen",
+      "skipped_by_client": "Vom Kunden übersprungen",
+      "excluded_by_msp": "Vom Anbieter ausgeschlossen",
+      "cancelled": "Abgebrochen",
+      "not_needed": "Keine Zahlung erforderlich",
+      "reserved": "Zahlung reserviert",
+      "created": "Zahlung angelegt",
+      "confirming": "Zahlung wird bestätigt",
+      "processing": "Zahlung wird verarbeitet",
+      "requires_action": "Bestätigung erforderlich",
+      "canceled": "Abgebrochen",
+      "unapplied": "Zahlung muss zugeordnet werden"
+    },
+    "reasons": {
+      "not_enrolled": "Nicht angemeldet",
+      "enrolled_after_issue": "Nach Rechnungsstellung angemeldet",
+      "method_not_usable": "Zahlungsmethode nicht verfügbar",
+      "over_cap": "Über dem Limit für automatische Zahlungen",
+      "above_authorized_cap": "Über dem vom Kunden autorisierten Limit",
+      "issued_before_authorization": "Vor der aktualisierten Autorisierung des Kunden ausgestellt: manuell einziehen",
+      "cap_currency_mismatch": "Währung des Limits stimmt nicht überein",
+      "ach_currency_unsupported": "Währung für Bankzahlungen nicht unterstützt",
+      "excluded_contract": "Vertrag ausgeschlossen",
+      "excluded_invoice": "Rechnung ausgeschlossen",
+      "charging_disabled": "Automatischer Einzug deaktiviert",
+      "stripe_unavailable": "Stripe nicht verfügbar",
+      "bank_unverified": "Nicht eingezogen: Das Bankkonto des Kunden wurde nicht rechtzeitig verifiziert. Manuell einziehen",
+      "charging_on_hold": "Nicht eingezogen: Automatische Zahlungen blieben ausgeschaltet. Manuell einziehen",
+      "service_unavailable": "Nicht eingezogen: Stripe blieb nicht erreichbar. Manuell einziehen",
+      "control_pending:skip": "Überspringen angefordert; ausstehende Zahlung wird gestoppt",
+      "control_pending:exclude": "Ausschluss angefordert; ausstehende Zahlung wird gestoppt",
+      "control_pending:stop": "Stopp angefordert; ausstehende Zahlung wird gestoppt",
+      "control_pending:renotice": "Mitteilung wird aktualisiert; ausstehende Zahlung wird gestoppt",
+      "skip": "Vom Kunden übersprungen",
+      "exclude": "Vom Anbieter ausgeschlossen",
+      "stop": "Automatische Zahlungen gestoppt",
+      "client_request": "Vom Kunden angefordert",
+      "no_billing_contact": "Kein Rechnungskontakt",
+      "delivery_failed": "Zustellung der Benachrichtigung fehlgeschlagen",
+      "consent_required": "Die Zahlungsautorisierung fehlt. Fordern Sie eine neue Autorisierung an."
+    },
+    "noticeTemplate": "Rechnung mit Benachrichtigung zur automatischen Zahlung",
+    "chargeFailed": "Die Zahlung konnte nicht gestartet werden. Bitte versuchen Sie es erneut.",
+    "chargeResultUnknown": "Wir konnten nicht bestätigen, was mit dieser Zahlung passiert ist. Die Rechnung wird aktualisiert, um ihren aktuellen Status anzuzeigen.",
+    "chargeStarted": "Zahlungsversuch gestartet",
+    "chargeNow": "Jetzt abbuchen",
+    "noCharge": "Noch keine Abbuchungen",
+    "noticeStuck": "Zahlungsankündigung prüfen",
+    "unapplied": "{{count}} Zahlung(en) müssen abgeglichen werden. Prüfen Sie ungeklärte Beträge vor einer weiteren Abbuchung.",
+    "lastCharge": "Letzte Abbuchung",
+    "attention": "Handlungsbedarf",
+    "attemptStates": {
+      "reserved": "Zahlung reserviert",
+      "created": "Zahlung angelegt",
+      "confirming": "Zahlung wird bestätigt",
+      "processing": "Zahlung wird verarbeitet",
+      "succeeded": "Zahlung eingegangen",
+      "failed": "Zahlung fehlgeschlagen",
+      "requires_action": "Bestätigung erforderlich",
+      "canceled": "Abgebrochen",
+      "unapplied": "Zahlung muss zugeordnet werden",
+      "returned": "Zurückgebucht",
+      "refunded": "Erstattet",
+      "disputed": "Angefochten"
+    },
+    "fees": {
+      "title": "Bearbeitungsgebühren",
+      "cardBps": "Kreditkartengebühr (Basispunkte, 0–300)",
+      "ach": "Bankzahlungsgebühr (USD, 0.00–25.00)",
+      "inactive": "Kartengebühren sind erst aktiv, wenn Ihr Partneradministrator beide folgenden Erklärungen bestätigt.",
+      "notified": "Ich habe meinen Acquirer (Stripe) und die Kartennetzwerke vor mindestens 30 Tagen benachrichtigt",
+      "cost": "Diese Gebühr übersteigt nicht meine Kosten für die Kartenakzeptanz",
+      "rules": "Nur Kreditkarten. Keine Kartengebühr in CA, CT, ME oder MA; in Colorado gilt eine Obergrenze von 2 %. Gebühren gelten nur für berechtigte automatische US-Zahlungen in USD. Einmalige Zahlungslinks sind gebührenfrei.",
+      "legal": "Breeze bietet keine Rechtsberatung. Sie sind für die Zulässigkeit von Zuschlägen, Hinweise und die steuerliche Behandlung verantwortlich.",
+      "lowerAuthorization": "Kunden mit niedrigeren autorisierten Bedingungen: {{count}}. Ihre bisherige Autorisierung gilt, bis sie aktualisierte Bedingungen akzeptieren.",
+      "authorizedCard": "Autorisiert: {{accepted}} Basispunkte; eingestellt: {{configured}}",
+      "authorizedAch": "Autorisiert: USD {{accepted}}; eingestellt: USD {{configured}}",
+      "authorizedCap": "Autorisiertes Limit: {{accepted}}; eingestellt: {{configured}}",
+      "noCap": "kein Limit",
+      "requestAuthorization": "Aktualisierte Autorisierung anfordern",
+      "requestFailed": "Aktualisierte Autorisierung konnte nicht angefordert werden. Prüfen Sie den Rechnungskontakt und die Stripe-Verfügbarkeit.",
+      "requested": "Aktualisierte Autorisierung angefordert. Die bisherige Autorisierung bleibt gültig.",
+      "attestationOnFile": "Bestätigung hinterlegt: {{name}} hat am {{date}} beide Erklärungen bestätigt.",
+      "attestationOnFileUnknown": "Bestätigung hinterlegt: Beide Erklärungen wurden am {{date}} bestätigt.",
+      "reattestHelp": "Für eine erneute Bestätigung aktivieren Sie beide Erklärungen und speichern. Dadurch wird eine neue Bestätigung mit Ihrem Namen und dem aktuellen Datum erfasst, die die hinterlegte ersetzt. Die autorisierten Gebühren Ihrer Kunden ändern sich dadurch nicht.",
+      "authorizedCardNone": "Keine Autorisierung hinterlegt; eingestellt: {{configured}} Basispunkte",
+      "authorizedAchNone": "Keine Autorisierung hinterlegt; eingestellt: USD {{configured}}",
+      "lowerAuthorizationOrg": "Dieser Kunde hat die eingestellten Bedingungen nicht autorisiert. Eine bestehende Autorisierung gilt weiter, bis er aktualisierte Bedingungen akzeptiert.",
+      "blankPartner": "Leer verwendet den Breeze-Standard (keine Gebühr). Um einen einzelnen Kunden auszunehmen, setzen Sie seine Gebühr auf dessen Abrechnungsseite auf 0.",
+      "blankOrg": "Leer übernimmt den Partnerstandard. Geben Sie 0 ein, um diesen Kunden auszunehmen.",
+      "inactiveOrg": "Kartengebühren sind erst aktiv, wenn ein Partneradministrator beide Gebührenerklärungen auf der Registerkarte „Payments“ der Partner-Abrechnungseinstellungen bestätigt.",
+      "missingAuthorization": "Keine Autorisierung hinterlegt: {{count}}. Automatische Zahlungen können diese Kunden erst belasten, wenn sie ihre gespeicherte Zahlungsmethode autorisieren.",
+      "missingAuthorizationOrg": "Für die gespeicherte Zahlungsmethode dieses Kunden ist keine Autorisierung hinterlegt. Automatische Zahlungen können ihn erst belasten, wenn er sie autorisiert.",
+      "requestMissingAuthorization": "Autorisierung anfordern"
+    },
+    "enrollmentTitle": "Anmeldung zur automatischen Zahlung",
+    "requestSentTo": "Anfrage an {{email}} gesendet.",
+    "result": {
+      "paused": "Automatische Zahlungen pausiert.",
+      "resumed": "Automatische Zahlungen fortgesetzt.",
+      "turnedOff": "Automatische Zahlungen deaktiviert."
+    },
+    "needsAttention": {
+      "method_unusable": "Die gespeicherte Zahlungsmethode kann nicht belastet werden.",
+      "stripe_account_changed": "Das verbundene Stripe-Konto hat sich nach der Anmeldung dieses Kunden geändert.",
+      "key_missing_permissions": "Dem Stripe-Schlüssel fehlen Berechtigungen, die automatische Zahlungen benötigen.",
+      "verification_failed": "Die Verifizierung des Bankkontos ist fehlgeschlagen."
+    },
+    "chargeOutcome": {
+      "succeeded": "Zahlung eingegangen.",
+      "processing": "Zahlung übermittelt. Sie wird verarbeitet; die Rechnung wird aktualisiert, sobald sie abgeschlossen ist.",
+      "requiresAction": "Die Bank des Kunden verlangt, dass er diese Zahlung bestätigt. Ist ein Rechnungskontakt hinterlegt, erhält er per E-Mail einen Link zur Bestätigung.",
+      "declined": "Die Zahlung wurde nicht ausgeführt.",
+      "cardDeclined": "Die Karte wurde abgelehnt.",
+      "expiredCard": "Die Karte ist abgelaufen. Bitten Sie den Kunden, seine Zahlungsmethode zu aktualisieren.",
+      "insufficientFunds": "Die Zahlung wurde wegen unzureichender Deckung abgelehnt.",
+      "canceled": "Die Zahlung wurde vor dem Abschluss storniert.",
+      "unapplied": "Die Zahlung wurde eingezogen, muss aber abgeglichen werden. Prüfen Sie sie, bevor Sie erneut abbuchen."
+    },
+    "chargeRefused": {
+      "notice_lead": "Die Ankündigungsfrist für den Kunden ist noch nicht abgelaufen. Danach kann die Rechnung abgebucht werden.",
+      "no_eligible_notice": "Für diese Rechnung gibt es keine Ankündigung einer automatischen Zahlung, daher kann sie nicht automatisch abgebucht werden.",
+      "renotice_required": "Die Zahlungsankündigung muss erneut gesendet werden, bevor diese Rechnung abgebucht werden kann.",
+      "collection_in_progress": "Für diese Rechnung läuft bereits eine Zahlung.",
+      "checkout_session_unrevoked": "Der Kunde bezahlt diese Rechnung möglicherweise gerade online. Versuchen Sie es in einigen Minuten erneut.",
+      "retry_not_due": "Der nächste Wiederholungsversuch ist noch nicht fällig.",
+      "not_payable": "Diese Rechnung ist nicht zur Zahlung offen.",
+      "nothing_to_pay": "Auf dieser Rechnung ist nichts mehr zu zahlen.",
+      "enrollment_inactive": "Automatische Zahlungen sind für diesen Kunden nicht aktiv.",
+      "schedule_inactive": "Diese Rechnung ist nicht mehr für eine automatische Zahlung geplant.",
+      "generic": "Die automatische Zahlung konnte nicht gestartet werden. Aktualisieren Sie die Rechnung, um ihren aktuellen Status zu sehen.",
+      "excluded_contract": "Der Vertrag dieser Rechnung ist von automatischen Zahlungen ausgenommen, daher wurde nichts belastet. Wurde der Kunde über diese Zahlung informiert, hat er eine E-Mail erhalten, dass sie nicht stattfindet."
+    },
+    "stepUp": {
+      "heading": "Bestätigen Sie, dass Sie es sind",
+      "intro": {
+        "autopay_charge_now": "Das sofortige Belasten dieser Rechnung erfordert eine erneute Zwei-Faktor-Prüfung.",
+        "partner_payment_settings_update": "Das Ändern der Zahlungseinstellungen erfordert eine erneute Zwei-Faktor-Prüfung für genau diese Werte.",
+        "org_payment_settings_update": "Das Ändern der Zahlungseinstellungen dieser Organisation erfordert eine erneute Zwei-Faktor-Prüfung für genau diese Werte.",
+        "autopay_request_recipient": "Das Senden der Autorisierungsanfrage an eine andere Adresse als den Rechnungskontakt erfordert eine erneute Zwei-Faktor-Prüfung."
+      },
+      "code": "Authenticator-Code",
+      "passkey": "Sie bestätigen mit Ihrem Passkey.",
+      "noFactor": "Fügen Sie Ihrem Konto zuerst eine Authenticator-App oder einen Passkey hinzu.",
+      "noFactorSmsOnly": "SMS-Codes können diese Aktion nicht bestätigen. Fügen Sie Ihrem Konto zuerst eine Authenticator-App oder einen Passkey hinzu.",
+      "enrollLink": "Zweiten Faktor einrichten",
+      "confirm": "Bestätigen",
+      "failed": "Verifizierung fehlgeschlagen. Versuchen Sie es erneut.",
+      "unavailable": "Verifizierung konnte nicht gestartet werden"
+    }
+  },
+  "reminders": {
+    "title": "Zahlungserinnerungen",
+    "description": "Erinnerungen für unbezahlte Rechnungen an den Rechnungskontakt der Organisation senden. Erinnerungen funktionieren auch ohne automatische Zahlungen.",
+    "enabled": "Zahlungserinnerungen senden",
+    "on": "Aktiviert",
+    "off": "Deaktiviert",
+    "inherit": "{{source}} verwenden: {{value}}",
+    "before": "Tage vor dem Fälligkeitsdatum",
+    "repeat": "Vor Fälligkeit wiederholen alle (Tage)",
+    "overdue": "Bei Überfälligkeit erinnern alle (Tage)",
+    "noRepeat": "Keine Wiederholung",
+    "orgRepeatHelp": "Ein leeres Feld übernimmt die Partnereinstellung. Wenn der Partner Erinnerungen vor Fälligkeit wiederholt, können Sie hier nicht nur diese Wiederholungen deaktivieren. Deaktivieren Sie Erinnerungen für diese Organisation, um alle Erinnerungen zu stoppen.",
+    "partnerRepeatHelp": "Lassen Sie das Wiederholungsintervall leer, um einmal vor Fälligkeit zu erinnern. Leere Felder verwenden ansonsten den angezeigten Standardwert.",
+    "cadenceHelp": "Am Fälligkeitstag wird keine Erinnerung gesendet. Die erste Erinnerung nach Fälligkeit wird nach Ablauf eines Überfälligkeitsintervalls gesendet. Änderungen an Daten oder Intervallen führen nicht zum erneuten Versand bereits zugeteilter Erinnerungen.",
+    "invalid": "Geben Sie ganze Tage von 1 bis 31 ein oder lassen Sie das Feld leer, um den Wert zu übernehmen.",
+    "sources": {
+      "org": "Organisation",
+      "partner": "Partnerstandard",
+      "default": "Breeze-Standard"
+    },
+    "save": "Zahlungseinstellungen speichern",
+    "saving": "Wird gespeichert…",
+    "saved": "Erinnerungseinstellungen gespeichert",
+    "saveFailed": "Erinnerungseinstellungen konnten nicht gespeichert werden",
+    "loadFailed": "Erinnerungseinstellungen konnten nicht geladen werden",
+    "retry": "Erneut versuchen",
+    "loading": "Zahlungseinstellungen werden geladen…",
+    "templates": {
+      "paymentReminder": "Zahlungserinnerung",
+      "paymentOverdue": "Erinnerung an überfällige Zahlung"
     }
   }
 }

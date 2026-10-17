@@ -2,9 +2,10 @@
  * Tests for buildPatchSourceConfigUpdate (#1872) — the heartbeat helper that
  * surfaces the sole-Windows-Update-source enforcement flag to the agent.
  *
- * resolvePatchConfigPolicyForDevice is mocked directly (its DB resolution is covered
- * by configPolicyPatching/featureConfigResolver tests), so this file pins only
- * the mapping the heartbeat relies on:
+ * resolvePatchConfigPolicyForDevice is mocked directly (its DB resolution is
+ * covered by configPolicyPatching/featureConfigResolver tests), so this file
+ * pins only the mapping the heartbeat relies on (#8053 W1a-1: the policy-only
+ * variant, never the timezone-resolving details path):
  *   - no patch policy resolved (null) → { exclusiveWindowsUpdate: false }
  *     (the revert-on-unassign contract — a device that loses its patch policy
  *     must be told to revert, not left enforced)
@@ -15,8 +16,9 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { resolvePatchConfigPolicyForDeviceMock } = vi.hoisted(() => ({
+const { resolvePatchConfigPolicyForDeviceMock, resolvePatchConfigForDeviceMock } = vi.hoisted(() => ({
   resolvePatchConfigPolicyForDeviceMock: vi.fn(),
+  resolvePatchConfigForDeviceMock: vi.fn(),
 }));
 
 vi.mock('../../db', () => ({
@@ -65,6 +67,7 @@ vi.mock('../../services/cloudflareMtls', () => ({ CloudflareMtlsService: vi.fn()
 vi.mock('../../services/softwarePolicyService', () => ({ recordSoftwarePolicyAudit: vi.fn() }));
 vi.mock('../../services/featureConfigResolver', () => ({
   resolvePatchConfigPolicyForDevice: resolvePatchConfigPolicyForDeviceMock,
+  resolvePatchConfigForDevice: resolvePatchConfigForDeviceMock,
 }));
 vi.mock('../../services/filesystemAnalysis', () => ({
   getFilesystemScanState: vi.fn(),
@@ -125,6 +128,15 @@ describe('buildPatchSourceConfigUpdate (#1872)', () => {
     const result = await buildPatchSourceConfigUpdate(DEVICE_ID);
 
     expect(result).toEqual({ exclusiveWindowsUpdate: false });
+  });
+
+  it('reads only the winning patch link, never the timezone-resolving details path (#8053)', async () => {
+    resolvePatchConfigPolicyForDeviceMock.mockResolvedValue({ settings: { exclusiveWindowsUpdate: true } });
+
+    await expect(buildPatchSourceConfigUpdate(DEVICE_ID)).resolves.toEqual({ exclusiveWindowsUpdate: true });
+
+    expect(resolvePatchConfigPolicyForDeviceMock).toHaveBeenCalledWith(DEVICE_ID, undefined);
+    expect(resolvePatchConfigForDeviceMock).not.toHaveBeenCalled();
   });
 });
 

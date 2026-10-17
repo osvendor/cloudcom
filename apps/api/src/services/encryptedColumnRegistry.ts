@@ -59,6 +59,7 @@ export const encryptedColumnRegistry: EncryptedColumnSpec[] = [
   { table: 'credentials_documents', column: 'payload_ciphertext', kind: 'text', aadBinding: 'row', description: 'Client documentation original and preview, bound to the record id' },
   { table: 'credentials_records', column: 'secret_ciphertext', kind: 'text', aadBinding: 'row', description: 'Client credential passwords, OTP seeds and notes, bound to the record id' },
   { table: 'billing_link_tokens', column: 'token_ct', kind: 'text', aadBinding: 'row', description: 'Autopay bearer link token, encrypted and bound to its row id' },
+  { table: 'caller_verifications', column: 'sealed_link_token', kind: 'text', aadBinding: 'row', description: 'Caller verification SMS/email link token (#6354 W03), sealed for post-commit (re)delivery and bound to its row id' },
 
   { table: 'sso_providers', column: 'client_secret', kind: 'text', description: 'OIDC client secret' },
   { table: 'user_sso_identities', column: 'access_token', kind: 'text', description: 'SSO access token' },
@@ -81,14 +82,12 @@ export const encryptedColumnRegistry: EncryptedColumnSpec[] = [
   { table: 'psa_connections', column: 'credentials', kind: 'json', description: 'PSA connection credentials' },
   { table: 'stripe_connect_accounts', column: 'credentials', kind: 'json', description: 'Stripe Connect OAuth token (deauthorize use)' },
   { table: 'stripe_connect_accounts', column: 'api_key', kind: 'text', description: 'Per-partner Stripe secret/restricted key (API-key billing model)' },
-  { table: 'partner_llm_configs', column: 'api_key_encrypted', kind: 'text', aadBinding: 'row', description: 'Per-partner Anthropic API key (#3228) — AAD bound to the row id' },
-  // AI model registry W02 (#7600, quorum #13): partner_llm_configs rows were
-  // copied to partner_ai_connections with the SAME id, so the AAD tag stays the
-  // legacy column's logical identity and every stored ciphertext decrypts
+  // AI model registry W02 (#7600, quorum #13): the retired legacy table's rows
+  // were copied to partner_ai_connections with the SAME id, so the AAD tag stays
+  // the legacy column's logical identity and every stored ciphertext decrypts
   // unchanged (the #6379 moved-column precedent). Row-bound: a blob pasted into
-  // another partner's connection does not decrypt. Both entries stay until W08
-  // drops the legacy table, so the rotation walker re-seals both copies.
-  { table: 'partner_ai_connections', column: 'api_key_encrypted', kind: 'text', aadBinding: 'row', aadTag: 'partner_llm_configs.api_key_encrypted', description: 'Per-partner AI connection key (#7600) — legacy partner_llm_configs AAD tag (id-preserving copy), bound to the row id' },
+  // another partner's connection does not decrypt. Never rename the tag.
+  { table: 'partner_ai_connections', column: 'api_key_encrypted', kind: 'text', aadBinding: 'row', aadTag: 'partner_llm_configs.api_key_encrypted', description: 'Per-partner AI connection key (#7600) — legacy AAD tag (id-preserving copy), bound to the row id' },
   { table: 'huntress_integrations', column: 'api_key_encrypted', kind: 'text', description: 'Huntress API key' },
   { table: 'huntress_integrations', column: 'webhook_secret_encrypted', kind: 'text', description: 'Huntress webhook secret' },
   { table: 'pax8_integrations', column: 'client_id_encrypted', kind: 'text', description: 'Pax8 OAuth client id' },
@@ -115,7 +114,11 @@ export const encryptedColumnRegistry: EncryptedColumnSpec[] = [
   { table: 'invoices', column: 'public_link_token_ct', kind: 'text', aadBinding: 'row', description: 'public invoice-link bearer token (row-bound: swapping ciphertext between invoices would move a live credential across tenants)' },
   { table: 'tool_sources', column: 'auth_config_encrypted', kind: 'text', aadBinding: 'row', description: 'external tool source credential JSON (#5216, spec 2026-09-07 §5.2) — AAD bound to the row id' },
   { table: 'backup_storage_credential_history', column: 'sealed_previous_secret', kind: 'text', aadBinding: 'row', description: 'replaced S3 backup destination connection settings (endpoint, bucket, key pair), kept only to check the old key is disabled — AAD bound to the row id' },
+  { table: 'ticket_push_preferences', column: 'pushover_user_key_encrypted', kind: 'text', idColumn: 'user_id', aadBinding: 'row', description: 'per-user Pushover user key for ticket-assignment pushes — AAD bound to the user id when an encryption key id is configured' },
   { table: 'backup_provider_connections', column: 'credentials_encrypted', kind: 'text', aadBinding: 'row', description: 'external backup provider console credentials JSON (#6008 W01) — AAD bound to the row id, so a blob pasted into another partner\'s connection does not decrypt' },
+  { table: 'edr_connections', column: 'credentials_encrypted', kind: 'text', aadBinding: 'row', description: 'EDR vendor console credential JSON (#8164 W01) — AAD bound to the row id' },
+  { table: 'edr_connections', column: 'webhook_secret_encrypted', kind: 'text', aadBinding: 'row', description: 'EDR push/webhook shared secret Breeze generates (#8164 W03) — AAD bound to the row id' },
+  { table: 'edr_tenants', column: 'installer_secret_encrypted', kind: 'text', aadBinding: 'row', description: 'per-vendor-tenant installer token / link (#8164 W06) — AAD bound to the row id' },
   // Sealed/opened by the column type itself (db/schema/backup.ts); listed here
   // so key rotation re-seals it.
   BACKUP_PROVIDER_CONFIG_COLUMN,

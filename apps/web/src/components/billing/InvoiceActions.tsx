@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { approvalFriendly } from '../../lib/ticketApproval';
 import { Loader2 } from 'lucide-react';
 import '../../lib/i18n';
 import { fetchWithAuth } from '../../stores/auth';
@@ -135,16 +136,19 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
         // /send owns draft issue + email as one lifecycle action. In particular,
         // it persists includeDeviceAppendix while the invoice is still a draft,
         // before issue freezes the PDF evidence choice.
-        const result = await runAction<{ data: { emailed: boolean } }>({
+        const result = await runAction<{ data: { emailed: boolean; reason?: string } }>({
           request: () => fetchWithAuth(`/invoices/${invoice.id}/send`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(opts ?? {}),
           }),
           errorFallback: stableT('invoiceActions.issueSendError'),
+          friendly: approvalFriendly(stableT), // 409 SOURCE_AWAITING_APPROVAL (#8196)
           onUnauthorized: UNAUTHORIZED,
         });
-        if (result?.data?.emailed) {
+        if (result?.data?.reason === 'notice_queued') {
+          showToast({ type: 'success', message: stableT('autopay.noticeQueued') });
+        } else if (result?.data?.emailed) {
           showToast({ type: 'success', message: stableT('invoiceActions.issueSentSuccess') });
         } else {
           showToast({ type: 'warning', message: stableT('invoiceActions.issueNoEmailWarning') });
@@ -154,6 +158,7 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
           request: () => fetchWithAuth(`/invoices/${invoice.id}/issue`, { method: 'POST' }),
           errorFallback: stableT('invoiceActions.issueError'),
           successMessage: stableT('invoiceActions.issueSuccess'),
+          friendly: approvalFriendly(stableT), // 409 SOURCE_AWAITING_APPROVAL (#8196)
           onUnauthorized: UNAUTHORIZED,
         });
       }
@@ -267,7 +272,7 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
       // out. Both routes swallow delivery failures into `reason`, so the
       // outcome is post-processed below — `emailed !== true` (not `=== false`)
       // so an unexpected response shape can't be read as success.
-      const result = await runAction<{ data?: { emailed?: boolean } }>({
+      const result = await runAction<{ data?: { emailed?: boolean; reason?: string } }>({
         request: () => fetchWithAuth(`/invoices/${invoice.id}/${neverEmailed ? 'send' : 'resend'}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -280,7 +285,9 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
       // A first send stamps sent_at (which flips this very button's label), and
       // even a re-send may reveal other stale detail — reconcile either way.
       refresh();
-      if (result?.data?.emailed !== true) {
+      if (result?.data?.reason === 'notice_queued') {
+        showToast({ type: 'success', message: stableT('autopay.noticeQueued') });
+      } else if (result?.data?.emailed !== true) {
         showToast({ type: 'warning', message: t('invoiceDetail.requestPayment.noEmailWarning') });
       } else {
         showToast({
@@ -299,7 +306,7 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
     } finally {
       setResending(false);
     }
-  }, [resending, invoice.id, neverEmailed, partiallyPaid, refresh, t]);
+  }, [resending, invoice.id, neverEmailed, partiallyPaid, refresh, t, stableT]);
 
   // Copy the customer-facing DURABLE view-and-pay link without emailing
   // anything — for pasting into a chat/SMS/reply by hand. Mirrors the quote's
@@ -571,6 +578,12 @@ export default function InvoiceActions({ detail, onChanged, variant, savePending
         onSend={(opts) => isDraft ? void issue(true, opts) : void resend(opts)}
         orgId={invoice.orgId}
         invoiceNumber={invoice.invoiceNumber}
+        dueDate={invoice.dueDate}
+        currencyCode={currency}
+        amountPaid={invoice.amountPaid}
+        balance={invoice.balance}
+        depositDue={invoice.depositDue ?? null}
+        documentLocale={invoice.documentLocale ?? null}
         isDraft={isDraft}
         title={isDraft
           ? t('invoiceActions.issueSendConfirm.title')

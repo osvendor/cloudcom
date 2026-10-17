@@ -4,6 +4,7 @@ import {
 } from 'drizzle-orm/pg-core';
 import type { FixKind, FixMemoryStatus, FixOutcomeState, FixVote } from '@breeze/shared';
 import { alerts } from './alerts';
+import { deviceFilesystemCleanupRuns } from './filesystem';
 import { metricAnomalyEpisodes } from './metricAnomalyEpisodes';
 import { organizations, partners } from './orgs';
 import { playbookDefinitions } from './playbooks';
@@ -41,6 +42,8 @@ export const fixOutcomes = pgTable('fix_outcomes', {
   playbookId: uuid('playbook_id').references(() => playbookDefinitions.id, { onDelete: 'set null' }),
   instructionsRef: varchar('instructions_ref', { length: 120 }),
   scriptExecutionId: uuid('script_execution_id').references(() => scriptExecutions.id, { onDelete: 'set null' }),
+  actionCommandId: uuid('action_command_id'),
+  actionCleanupRunId: uuid('action_cleanup_run_id').references(() => deviceFilesystemCleanupRuns.id, { onDelete: 'set null' }),
   state: varchar('state', { length: 30 }).$type<FixOutcomeState>().notNull().default('pending'),
   stateReason: varchar('state_reason', { length: 80 }),
   humanVote: varchar('human_vote', { length: 10 }).$type<FixVote>(),
@@ -98,6 +101,8 @@ export const fixMemory = pgTable('fix_memory', {
   staleSince: timestamp('stale_since', { withTimezone: true }),
   /** Durable org-erasure rebuild requests; stale_since cannot clear while non-empty (see migration). */
   rebuildPendingOrgIds: uuid('rebuild_pending_org_ids').array().notNull().default(sql`'{}'::uuid[]`),
+  /** When the sweeper last tried to rebuild this row's partner; rotates its retry order (#7278). */
+  rebuildAttemptedAt: timestamp('rebuild_attempted_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 }, (t) => ({

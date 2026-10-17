@@ -65,12 +65,16 @@ pointing at a database the api container can actually reach.
 
 | Variable | Default | Required | Description |
 |---|---|---|---|
-| `DB_ACCESS_CONTEXT_PROLOGUE_TIMEOUT_MS` | `15000` | | Timeout for the connection-setup work Breeze runs at the start of each request's database access (setting the row-level-security context). The request work that follows is never bounded by it. `0` disables the timeout; positive values below `1000` are clamped to `1000`. |
+| `DB_ACCESS_CONTEXT_PROLOGUE_TIMEOUT_MS` | `15000` | | Timeout for the connection-setup work Breeze runs at the start of each request's database access (setting the row-level-security context). The request work that follows is never bounded by it, and neither is the wait for a free pool connection before it (see `DB_POOL_ACQUIRE_TIMEOUT_MS`). `0` disables the timeout; positive values below `1000` are clamped to `1000`. |
+| `DB_POOL_ACQUIRE_TIMEOUT_MS` | `10000` | | How long a request waits for a free database pool connection before failing with `DbPoolAcquireTimeoutError`. Hitting it means the pool is saturated (every connection busy) or the API is CPU-starved, not that a connection is stuck, so it does not trigger wedged-backend reclamation. A connection that frees up after the timeout is returned to the pool unused. `0` disables the timeout (requests queue indefinitely); positive values below `1000` are clamped to `1000`. A request still waiting for a permit when the timeout hits never reaches the database. The default keeps this timeout plus `DB_ACCESS_CONTEXT_PROLOGUE_TIMEOUT_MS` and two `DB_TIMER_LAG_GRACE_MS` periods at 29 s, under the agent's 30 s HTTP timeout, for a request that opens one database context. A request whose work escalates into a second context (a nested system-scope or re-resolved transaction) gets a second acquire and setup budget on top, so its worst case is longer. |
+| `DB_TIMER_LAG_GRACE_MS` | `2000` | | When the pool-acquire or connection-setup timer fires at least 1 s late because the API was overloaded, it gets this one extra grace period so a database reply that already arrived is not discarded. `0` disables; capped at `10000`. |
+| `AGENT_BODY_RECEIVE_TIMEOUT_MS` | `15000` | | Agent uploads to routes that run inside a database context are received in full before that context opens, so a stalled upload never holds a pool connection. This is the longest the API waits for the next piece of an agent's request body (the first included). A body that stops arriving is refused with `408`. Non-positive or invalid values use the default. |
+| `AGENT_BODY_RECEIVE_TOTAL_TIMEOUT_MS` | `60000` | | Total time allowed to receive an agent's request body under the rule above, for a client that keeps sending a byte at a time. An incomplete body is refused with `408`. Non-positive or invalid values use the default. |
 | `DB_WEDGED_BACKEND_SCAN_DISABLED` | unset (scanning on) | | Set to disable the periodic scan that detects database connections stuck at session start. When the scan finds a connection stuck on the session-setup statement for at least 5 minutes, it requests a reclamation pass (subject to all the reclamation limits below). |
-| `DB_WEDGED_BACKEND_SCANNER_RECLAIM_DISABLED` | unset (scanner reclaim on) | | Set to make the periodic scan report stuck connections without requesting reclamation. Reclamation after a session-setup timeout still runs unless `DB_WEDGED_BACKEND_RECLAIM_DISABLED` is set. |
+| `DB_WEDGED_BACKEND_SCANNER_RECLAIM_DISABLED` | unset (scanner reclaim on) | | Set to make the periodic scan report stuck connections without requesting reclamation. Reclamation of permits still held by abandoned transactions (one setup budget after the timeout) still runs unless `DB_WEDGED_BACKEND_RECLAIM_DISABLED` is set. |
 | `DB_WEDGED_BACKEND_SCAN_INTERVAL_MS` | `300000` (5 min) | | How often the wedged-backend scan runs. |
 | `DB_WEDGED_BACKEND_MIN_AGE_MS` | `300000` (5 min) | | How long a backend must have been stuck before the scan reports it. |
-| `DB_WEDGED_BACKEND_RECLAIM_DISABLED` | unset (reclamation on) | | Set to detect wedged backends without terminating them. |
+| `DB_WEDGED_BACKEND_RECLAIM_DISABLED` | unset (reclamation on) | | Set to detect wedged backends without terminating them. With reclamation disabled, a pool permit held by a transaction abandoned at its session-setup timeout stays held for as long as its backend stays wedged, so the effective pool size drops by one per wedged backend (the API logs `[db-pool-admission]` warnings and `DbPoolPermitsHeldByAbandonedTransactions` fires). Deferred after-transaction work registered inside that abandoned transaction (`runAfterDbContextExit`) never runs. |
 | `DB_WEDGED_BACKEND_RECLAIM_MIN_INTERVAL_MS` | `60000` (1 min) | | Minimum time between reclamation passes. |
 | `DB_WEDGED_BACKEND_RECLAIM_MAX_PER_PASS` | `4` | | Maximum number of wedged backends reclaimed in a single pass. |
 | `DB_WEDGED_BACKEND_RECLAIM_TIMEOUT_MS` | `5000` | | Timeout for the reclamation connection itself. |
@@ -97,11 +101,11 @@ Together, these detect and reclaim database connections stuck at session start (
 | `APP_ENCRYPTION_KEY` | — | Yes | AES encryption key for sensitive data at rest |
 | `APP_ENCRYPTION_KEY_ID` | — | | Identifier for the active encryption key (letters, digits, `.`/`_`/`-`). Setting it enables versioned, context-bound ciphertext for newly stored secrets. **The API refuses to start without it** whenever `M365_GRAPH_ACTIONS_TOOLS_ENABLED=true` (since v0.106.0 — the write-action reveal path seals its temporary credential with key-bound ciphertext and fails closed) **or `BREEZE_ROLE` is `api` or `worker`** (the [worker split](/deploy/worker-split/) encrypts commands relayed between the two processes). **From v0.113.0, every other deployment gets a boot-time warning instead of a refusal when it is unset, and saving integration credentials fails with `503`** until it is set: the Discord, Teams, Grafana, OpsGenie, PagerDuty, monitoring-webhook, ticketing and PSA settings pages seal each credential with key-bound ciphertext and refuse to fall back to unbound ciphertext. Existing installs whose `guided-setup.sh` run predates this key keep running otherwise; generate any `[A-Za-z0-9._-]+` identifier (changing it later does not rotate `APP_ENCRYPTION_KEY`). Not present in older compose files: add it to `.env` **and** to the `api` (and `worker`) service `environment:` block. |
 | `MFA_ENCRYPTION_KEY` | — | Yes | Encryption key for MFA secrets |
-| `ENROLLMENT_KEY_PEPPER` | — | Yes | HMAC pepper for enrollment key hashing |
+| `ENROLLMENT_KEY_PEPPER` | — | Yes | Pepper for enrollment key and installer token hashing. Rotating it invalidates all outstanding installer links (no legacy-pepper fallback, unlike enrollment keys) |
 | `MFA_RECOVERY_CODE_PEPPER` | — | Yes | HMAC pepper for recovery code hashing |
 | `ENROLLMENT_KEY_DEFAULT_TTL_MINUTES` | `43200` (30 days) | | Default enrollment key expiry. Every path that mints a key shares this fallback — the Add Device modal, the Partner API, and installer child keys |
 | `CHILD_ENROLLMENT_KEY_TTL_MINUTES` | inherits `ENROLLMENT_KEY_DEFAULT_TTL_MINUTES` | | Fresh TTL (minutes) given to a "child" enrollment key minted at installer-download, installer-link, or short-code redemption time, measured from mint time rather than the parent key's remaining lifetime |
-| `INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES` | `1440` | | Base TTL (minutes) for a freshly-issued installer bootstrap token when no explicit `ttlMinutes` is supplied. The token's own expiry, not the parent enrollment key's, governs how long an installer has to complete enrollment — see [Enrollment Keys](/agents/enrollment-keys/#installer-bootstrap-tokens) |
+| `INSTALLER_BOOTSTRAP_TOKEN_TTL_MINUTES` | `10080` | | Base TTL (minutes) for a freshly-issued installer bootstrap token when no explicit `ttlMinutes` is supplied. Default 7 days; maximum `43200` (30 days) — a larger value is clamped, with a warning at API startup. Tokens already issued keep their original expiry. The token's own expiry, not the parent enrollment key's, governs how long an installer has to complete enrollment — see [Enrollment Keys](/agents/enrollment-keys/#installer-bootstrap-tokens) |
 | `INSTALLER_PARENT_MIN_REMAINING_SECONDS` | `60` | | Minimum remaining lifetime (seconds) a parent enrollment key must have to be used as an installer source. Guards against building an installer from a parent that expires before the download reaches the target machine |
 | `ENROLLMENT_KEY_CLEANUP_ENABLED` | `true` | | Set to `false` to disable the daily sweep that purges expired enrollment keys |
 | `ENROLLMENT_KEY_PURGE_AFTER_DAYS` | `7` | | Grace period (days past expiry) before an expired enrollment key is purged |
@@ -118,6 +122,10 @@ Together, these detect and reclaim database connections stuck at session start (
 | `AGENT_ENROLL_RATE_WINDOW_SECONDS` | `60` | | Window, in seconds, for `AGENT_ENROLL_RATE_LIMIT` |
 | `PARTNER_API_ENROLLMENT_KEY_WRITE_RATE_LIMIT` | `10` | | Enrollment-key creations per hour per service principal on the Partner API |
 | `PARTNER_API_ENROLLMENT_KEY_WRITE_PARTNER_RATE_LIMIT` | `100` | | Enrollment-key creations per hour per partner, across all of that partner's service principals |
+| `PARTNER_API_TICKET_WRITE_RATE_LIMIT_PER_HOUR` | `1200` | | Ticket writes (create, update, status, assign, comment) per hour per service principal on the Partner API, still capped by the key's own rate limit. Ticket writes have their own bucket, separate from the 120-per-hour provisioning writes. v0.122.1+ |
+| `PARTNER_API_TICKET_WRITE_PARTNER_RATE_LIMIT_PER_HOUR` | `6000` | | Ticket writes per hour per partner, across all of that partner's service principals. Never lower than the per-principal limit. v0.122.1+ |
+| `PARTNER_API_IDEMPOTENCY_RETENTION_ENABLED` | `true` | | Daily cleanup of stored `X-Idempotency-Key` claims for Partner API writes. `false` or `0` turns the cleanup off. v0.122.1+ |
+| `PARTNER_API_IDEMPOTENCY_RETENTION_DAYS` | `7` | | Days an idempotency claim is kept. A retry that arrives after the window creates a new resource instead of replaying the first response. v0.122.1+ |
 | `WEBAUTHN_RP_ID` | derived from `PUBLIC_APP_URL` | | Set only when the browser reaches the app on a different host than `PUBLIC_APP_URL` (for example `WEBAUTHN_RP_ID=localhost` on a local stack). Without a correct value, every passkey ceremony fails with "The RP ID ... is invalid for this domain." |
 | `WEBAUTHN_ORIGIN` | derived from `PUBLIC_APP_URL` | | Companion to `WEBAUTHN_RP_ID` — set together when passkeys are served from a non-default host. |
 | `WEBAUTHN_RP_NAME` | `Breeze RMM` | | Display name shown to the user during a passkey registration/sign-in ceremony. |
@@ -288,6 +296,7 @@ From v0.118.0 each user may request 30 TURN credentials per 10 minutes. Tune it 
 | `PROMETHEUS_PORT` | `9090` | Prometheus web UI port (monitoring stack) |
 | `ALERTMANAGER_PORT` | `9093` | Alertmanager web UI port (monitoring stack) |
 | `LOKI_PORT` | `3100` | Loki log aggregation API port (monitoring stack) |
+| `METRIC_ANOMALY_EPISODE_MIN_BUCKETS` | `3` | Number of 5-minute buckets a metric anomaly must span before it opens an episode; a shorter blip closes without one. The default was `2` before v0.122.1. |
 | `DEVICE_METRICS_RETENTION_DAYS` | `30` | Retention for the raw `device_metrics` series, clamped to 1–365. History charts are served from `metric_rollups` and are unaffected. **On first run after upgrading, older raw metrics are pruned — set this before starting the new version if you need more than 30 days.** |
 
 ### Background retention sweeps
@@ -311,6 +320,9 @@ Breeze prunes its own operational tables nightly so a long-running instance does
 | `AI_INVOCATIONS_RETENTION_DAYS` | `400` | Days to keep AI invocation ledger rows, capped at 3650 |
 | `AI_INVOCATIONS_RETENTION_BATCH_SIZE` | `5000` | Rows deleted per batch |
 | `AI_INVOCATIONS_RETENTION_MAX_BATCHES` | `200` | Maximum batches per daily run |
+| `LLM_EGRESS_EVENTS_RETENTION_DAYS` | `90` | Days to keep raw LLM egress audit rows before they are folded into per-org daily summaries, capped at 3650 |
+| `LLM_EGRESS_EVENTS_RETENTION_BATCH_SIZE` | `5000` | Rows folded per batch |
+| `LLM_EGRESS_EVENTS_RETENTION_MAX_BATCHES` | `200` | Maximum batches per daily run |
 | `CHANGE_LOG_RETENTION_DAYS` | `90` | Days to keep processed device change-log entries, clamped to 1–365 |
 | `CHANGE_LOG_RETENTION_BATCH_SIZE` | `10000` | Rows deleted per batch |
 | `CHANGE_LOG_RETENTION_MAX_BATCHES` | `200` | Maximum batches per nightly run |
@@ -442,6 +454,43 @@ an unauthenticated prober measure whether its own traffic is starving the
 instance. Readiness is also not gated on lag — starvation is a load symptom, and
 failing readiness under load would shift traffic onto peers and starve those too.
 
+### Agent admission control
+
+When the API falls behind — its event loop is slow, or requests queue for a
+database connection — it can refuse low-priority agent work before that work
+costs anything, and pace how fast agents reconnect their WebSockets. Refused
+requests get `503` with a `Retry-After`, which every agent since v0.64.3 honours;
+the agent keeps the data where it would on any failed send. Heartbeats, command
+results, event logs, token rotation and uninstall are never refused.
+
+`observe` is the default: the API computes everything and counts what it
+*would* refuse (`breeze_admission_decisions_total{outcome="would_shed"}`) but
+refuses nothing. Switch to `enforce` once those counters look right for your
+fleet. `off` disables it.
+
+Any database pool-acquire timeout or RLS-prologue timeout in the last 30
+seconds holds the level at 2 or higher and blocks recovery below it. Only
+agent WebSocket requests that carry `Upgrade: websocket` are paced; other
+requests to the WebSocket path are not counted against the connection budget.
+
+| Variable | Default | Description |
+|---|---|---|
+| `BREEZE_ADMISSION_MODE` | `observe` | `off`, `observe` or `enforce`. |
+| `BREEZE_ADMISSION_LAG_MS` | `100,250,600` | Median event-loop lag (ms) that raises the level to 1, 2 and 3. |
+| `BREEZE_ADMISSION_DB_WAIT_MS` | `75,200,600` | Time requests wait for a database connection (ms) that raises the level to 1, 2 and 3. |
+| `BREEZE_ADMISSION_EMERGENCY_MS` | `1000` | A single stall, or a database wait, this long jumps straight to level 3. |
+| `BREEZE_ADMISSION_BULK_MAX_IN_FLIGHT` | `15` | Inventory-type uploads processed at once. Applies in `enforce` mode only; `observe` counts but never refuses. |
+| `BREEZE_ADMISSION_WS_RATE_PER_SEC` | `10` | Agent WebSocket connections accepted per second at level 0 (halved at 1, a fifth at 2, a twentieth at 3). |
+| `BREEZE_ADMISSION_WS_BURST` | `20` | How many WebSocket connections can arrive at once before pacing starts. |
+| `BREEZE_ADMISSION_WS_MAX_SETUPS` | `8` | WebSocket connections being set up at the same time. |
+
+Level 1 refuses inventory-type uploads (hardware, software, disks, network,
+process samples, agent logs, UniFi). Level 2 also refuses periodic status
+uploads (security status, sessions, patches, monitoring results). Level 3 only
+paces WebSockets harder — if an instance stays at level 3 it needs more
+capacity, not more shedding. Invalid values fall back to the default with a
+startup warning; they never stop the API from booting.
+
 ### Database pool-health watchdog
 
 The API's Postgres driver (postgres.js) can leave a pooled connection permanently
@@ -477,6 +526,11 @@ and the log or `/metrics` as the detail. The numbers are exported on
 | `breeze_db_pool_health_last_check_timestamp_seconds` | When the last evaluation completed. `0` = never. |
 | `breeze_db_pool_health_check_failures` | Evaluations that threw before producing a verdict. |
 | `breeze_db_pool_health_probe_close_failures` | Probe clients whose close failed — each a possible leaked connection. |
+| `breeze_db_pool_admission_permits` / `_in_use` / `_waiting` | Request-transaction permits configured, held and waited for. `-1` when the process has no request pool. |
+| `breeze_db_pool_admission_abandoned` / `_effective_permits` | Permits held by transactions abandoned at their connection-setup deadline or after the pool-acquire budget expired (see `[db-pool-acquire]` and `[db-wedged-backend]` logs), and the permits actually available (`permits − abandoned`). |
+| `breeze_db_pool_admission_cancelled_waiters_total` | Requests that gave up waiting for a permit before ever reaching the database. |
+| `breeze_db_pool_admission_abandoned_total`, `breeze_db_pool_admission_abandoned_returned_total{how="…"}` | Permits abandoned, and returned by `rollback` (the slow statement finished) or `connection-closed` (a wedged connection was reclaimed). |
+| `breeze_db_pool_acquire_timeouts_total{timer="…"}`, `breeze_db_prologue_deadline_expiries_total{timer="…"}` | Pool-acquire and connection-setup timeouts; `timer="late"` means the API's event loop was stalled at the deadline. |
 
 **Alert on `breeze_db_pool_health{verdict="pool-degraded"} == 1`.** There is
 deliberately no `healthy` verdict: the quiet one is `below-threshold`, because
@@ -667,6 +721,8 @@ The four `OFFLINE_DETECTOR_REEVAL_*` variables were removed in v0.118.0. The job
 | `MAX_ACTIVE_REMOTE_SESSIONS_PER_ORG` | `10` | Concurrent remote sessions per org |
 | `MAX_ACTIVE_REMOTE_SESSIONS_PER_USER` | `5` | Concurrent remote sessions per user |
 | `PATCH_REPORT_STORAGE_PATH` | `./data/patch-reports` | Patch compliance report storage |
+| `PATCH_REPORT_RETENTION_DAYS` | `30` | Days a generated patch compliance report file is kept after it completes (minimum `1`). A daily job then removes the file and marks the report `expired`. A value that is not a plain integer falls back to the default. |
+| `PATCH_REPORT_ORPHAN_MIN_AGE_MS` | `3600000` (1 hour) | How old a `<uuid>.csv` file in `PATCH_REPORT_STORAGE_PATH` that no report owns (for example, left behind when an organization was erased and the file could not be removed at the time) must be before the daily job removes it. Never below 10 minutes. |
 
 ## Rollout Modes
 
@@ -715,6 +771,7 @@ with its own rollout gate. See [Rollout Modes](/deploy/rollout-modes/).
 | `USE_AGENT_SDK` | — | Use Claude Agent SDK for AI chat |
 | `PORTAL_STATE_BACKEND` | `memory` | Portal state backend: `memory` or `redis` (auto `redis` in production) |
 | `PUBLIC_ENABLE_EDR_INTEGRATIONS` | `false` | Surface the EDR UI: the `/security/edr` fleet page, the device Security-tab EDR panel, and the Security dashboard summary cards. Set `true` at web image build time to enable. |
+| `PUBLIC_ENABLE_ENDPOINT_MESSAGING` | `false` | Surface the **Send message** entry points (Devices bulk action, organization header, site header). Off by default because the per-device rollout flag cannot be switched on from the UI yet; set `true` at web image build time to show them. |
 | `PUBLIC_ENABLE_NETWORK_DEVICES_IN_LIST` | `true` | Surface network-discovered assets alongside agent endpoints in the Devices list view (on by default since v0.111). Set `false` at web image build time to return to the agent-only list. |
 | `BREEZE_WORKSPACE_ENABLED` | `false` in the production compose files (`true` in the dev override) | Load the built-in **AI Workspace** extension. Off by default — leave it unset unless you want Workspace. **Requires a PostgreSQL image that provides the `pgvector` extension** (see the aside below). |
 | `BREEZE_AI_AGENTS_ENABLED` | `false` | Surface **AI Agents** (Settings → AI Agents). Off by default — no agent exists, runs, or appears in the UI until this is `true`. Enabling the flag does not by itself let an agent change anything: every agent starts in **Off**, and moving one to **Act** is a separate, MFA-confirmed opt-in per agent. Must also be mapped in the `api` service's `environment:` block, not just set in `.env`. |
@@ -764,7 +821,7 @@ Both variables are validated when the API starts. An invalid mode or an unknown 
 | `MCP_MAX_SSE_SESSIONS_PER_KEY` | `5` | Max concurrent SSE sessions per API key |
 | `MCP_REQUIRE_EXECUTE_ADMIN` | `true` | In production, Tier 3+ tools require the `ai:execute_admin` scope. Set to `false` to fall back to `ai:execute`. No effect outside production. |
 | `MCP_EXECUTE_TOOL_ALLOWLIST` | — | Comma-separated allowed Tier 3 tools (empty = deny all) |
-| `MCP_UNATTENDED_TIER3_PRINCIPALS` | — | Operator opt-in, empty = nobody. By default every Tier 3 tool/action (and `collect_evidence`) is denied over MCP with `MCP_APPROVAL_REQUIRED` because MCP has no interactive approval step. Comma-separated `api_key:<api key id>` / `oauth_client_user:<client_id>/<user id>` entries (OAuth binds client AND user; a shared client_id alone never qualifies) lift only that deny, only for those principals (trusted unattended agents). `ai:execute`, `ai:execute_admin` (production), `MCP_EXECUTE_TOOL_ALLOWLIST` (production), RBAC, rate limits, the Tier 3 execution ledger and the audit log still apply, and `collect_evidence` is gated as Tier 3. Tier 4, tenant (BYO MCP) tools and the onboarding bootstrap tools stay approval-only. At startup the API logs a WARN listing the configured principals, and a separate WARN for any entry that is not well formed (it can never match). Each bypassed call's audit row carries `approvalBypass: "unattended_principal"` and `approvalBypassPrincipal` (the matched entry). |
+| `MCP_UNATTENDED_TIER3_PRINCIPALS` | — | Operator opt-in, empty = nobody. By default every Tier 3 tool/action (and `collect_evidence`) is denied over MCP with `MCP_APPROVAL_REQUIRED` because MCP has no interactive approval step. Comma-separated `api_key:<api key id>` / `oauth_client_user:<client_id>/<user id>` / `partner_sp:<partner service principal id>` entries (OAuth binds client AND user; a shared client_id alone never qualifies; a `partner_sp` entry names the principal, so key rotation keeps it, and like an OAuth entry it applies in every org the principal reaches) lift only that deny, only for those principals (trusted unattended agents). `ai:execute`, `ai:execute_admin` (production), `MCP_EXECUTE_TOOL_ALLOWLIST` (production), RBAC, rate limits, the Tier 3 execution ledger and the audit log still apply, and `collect_evidence` is gated as Tier 3. Tier 4, tenant (BYO MCP) tools and the onboarding bootstrap tools stay approval-only. At startup the API logs a WARN listing the configured principals, and a separate WARN for any entry that is not well formed (it can never match). Each bypassed call's audit row carries `approvalBypass: "unattended_principal"` and `approvalBypassPrincipal` (the matched entry). |
 
 ## Cloudflare mTLS
 
@@ -974,17 +1031,15 @@ It uses the same isolation model as Graph-read: the Entra certificate and Key Va
 
 | Variable | Default | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — | Anthropic API key for AI assistant (BYOK) |
+| `ANTHROPIC_API_KEY` | — | The platform Anthropic API key (hosted: Breeze's key; self-hosted: yours). Partners can add their own key under AI Providers & Models. |
 | `ANTHROPIC_BASE_URL` | — | **Self-hosted only.** Point the AI Agent at an Anthropic-compatible `/v1/messages` backend (vLLM 0.23+, LiteLLM). Must be an `http(s)` URL. Permitted only when `IS_HOSTED` is explicitly `false` (or `0`/`no`/`off`); refused at boot if `IS_HOSTED` is `true`, unset, or invalid. |
 | `ANTHROPIC_AUTH_TOKEN` | — | Bearer token for the custom backend (use instead of `ANTHROPIC_API_KEY` when `ANTHROPIC_BASE_URL` is set). |
-| `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | Override the default model id for a raw vLLM backend. Leave unset with a LiteLLM gateway that aliases `claude-sonnet-5-5` → your model (releases before the Sonnet 5.5 default used `claude-sonnet-4-6`; update the alias when you upgrade). |
+| `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | Override the default model id for a raw vLLM backend. Leave unset with a LiteLLM gateway that aliases `claude-sonnet-5-5` → your model (releases before the Sonnet 5.5 default used `claude-sonnet-4-6`; update the alias when you upgrade). On a self-hosted deployment it is also the default model new partners start with; if the registry does not list it, Breeze adds it once at the documented conservative rate (see below). |
 | `AI_PLATFORM_INFERENCE_GEO` | — | Optional. Inference geography sent to Claude for platform-key traffic, where the model and transport support it. Allowed values: `us` or `global`. Unset = the provider default. `eu` is **not** accepted by the platform key: setting it (or any other value) makes every platform model unavailable (`residency_unavailable`) rather than sending traffic elsewhere, and the API logs a warning at startup. EU residency is not available on the platform key. |
 | `AI_GATEWAY_HEADERS_TIMEOUT_SECONDS` | — | Optional. How long the AI model gateway waits for a bring-your-own OpenAI-compatible endpoint to start responding, in seconds. Defaults to 120 on self-hosted and 30 on hosted; clamped to 5–600. Raise it for slow or CPU-only local model servers with long prompt prefill. |
 | `AI_TOOL_SEARCH` | `auto` | AI chat tool loading. `auto`: on the Anthropic API, chat sends a small core tool set and loads the rest on demand through tool search; on any other `ANTHROPIC_BASE_URL` or BYO provider it sends every tool, because many gateways reject tool-search blocks. `on`: also use tool search on a custom base URL (only if your gateway forwards `tool_reference` blocks). `off`: always send every tool. Helper, scripts and AI agents always use a fixed tool set. |
 | `BREEZE_AI_SCRIPT_AUTHORING_ENABLED` | `true` | **v0.113.0+.** Lets the AI assistant and background agents write a script as a reviewed proposal ([AI Script Authoring](/features/ai-script-authoring/)). Set `false` to hide the `propose_script` / `get_script_proposal` tools and the `/api/v1/ai/script-proposals` routes entirely. Accepts `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off`; any other value stops the API from starting. The shipped Compose file defaults it to `true` as well. This flag does **not** control the unattended lane, which stays off until a partner raises its ceiling and an organization opts in. |
 | `BREEZE_AI_ARTIFACT_CAPTURE_ENABLED` | `false` | **v0.117.0+.** Store oversized AI tool results (redacted) in your object storage so the assistant can page back through them with `read_artifact`, instead of receiving a truncated result. Off by default because it writes blobs your organizations can download. Setting it `true` requires an artifact bucket and keys: `ARTIFACT_S3_BUCKET_US` / `ARTIFACT_S3_BUCKET_EU` (matching your region) or `S3_BUCKET`, plus `ARTIFACT_S3_ACCESS_KEY` / `ARTIFACT_S3_SECRET_KEY` or `S3_ACCESS_KEY` / `S3_SECRET_KEY`. Without them, or with a value that is not a boolean, the API refuses to start. |
-| `BREEZE_AI_SCRIPT_REVIEWER_MODEL` | — | **Deprecated.** The script reviewer's model is now the `script_reviewer` assignment in the AI model registry, and your value was migrated there. New partners inherit this value as their initial default; change it per partner under AI Providers & Models. A reviewer model set on a script-authoring policy no longer takes effect. |
-| `WORKSPACE_CONTENT_LLM_MODEL` | — | **Deprecated.** The extension and Workspace enrichment model is now the `extension_content` assignment in the AI model registry, and your value was migrated there. New partners inherit this value as their initial default; change it per partner under AI Providers & Models. |
 
 ### AI Operator (preview, off by default)
 
@@ -1073,7 +1128,7 @@ The warranty worker looks each physical device's serial number up against its ma
 |---|---|---|
 | `QBO_CLIENT_ID` | — | Intuit OAuth client ID for the QuickBooks Online integration |
 | `QBO_CLIENT_SECRET` | — | Intuit OAuth client secret |
-| `QBO_REDIRECT_URI` | — | OAuth callback URL registered with Intuit (e.g. `https://your-domain/accounting/quickbooks/callback`) |
+| `QBO_REDIRECT_URI` | — | OAuth callback URL registered with Intuit (e.g. `https://your-domain/api/v1/accounting/quickbooks/callback`) |
 | `QBO_ENVIRONMENT` | — | `sandbox` or `production` |
 | `QBO_WEBHOOK_VERIFIER_TOKEN` | — | Intuit app verifier token for `POST /api/v1/webhooks/quickbooks`. Optional. Without it the webhook endpoint answers `503` on every delivery (so Intuit keeps retrying) and payments arrive on the 15-minute reconcile sweep instead — the sweep is the guaranteed path either way, the webhook only makes it faster. Intuit allows one webhook endpoint per app, so a multi-region deployment can only point it at one region. |
 

@@ -35,11 +35,11 @@ The agent reports a `SecurityStatus` payload on each heartbeat. The payload incl
 | **`providerVersion`** | Version string of the installed AV product |
 | **`definitionsVersion`** | Virus definition / signature version |
 | **`definitionsDate`** | Timestamp of the most recent definitions update |
-| **`realTimeProtection`** | Whether real-time scanning is active |
+| **`realTimeProtection`** | Whether real-time scanning is active. `null` when the agent could not read it (collection failed or never reported); the UI shows **Unknown** and the device is not counted as protected or unprotected |
 | **`lastScan`** | Timestamp of the most recent completed scan |
 | **`lastScanType`** | Type of last scan: `quick`, `full`, or `custom` |
 | **`threatCount`** | Number of active threats on the device |
-| **`firewallEnabled`** | Whether the host firewall is active |
+| **`firewallEnabled`** | Whether the host firewall is active. `null` when the agent could not read it; shown as **Unknown** |
 | **`encryptionStatus`** | Disk encryption state: `encrypted`, `partial`, or `unencrypted` |
 | **`encryptionDetails`** | Per-volume encryption breakdown (method, mount point, protection status) |
 | **`localAdminSummary`** | Local administrator account inventory with issue flags |
@@ -114,6 +114,12 @@ ThreatDown (Malwarebytes' business brand) reports as `malwarebytes`. F-Secure pr
 </Aside>
 
 Quarantine, Remove and Restore send a command to the device; they do not change the threat on their own. Since v0.117.0 the threat keeps its current status until the agent reports the result, and only then shows **quarantined**, **removed** or **allowed**. If the device is offline, the threat keeps its previous status until the device comes back and runs the command. Earlier versions changed the status as soon as the action was queued, so a threat on an offline device could show as quarantined when nothing had happened on the device.
+
+### Auto-quarantine runs under an approving user
+
+IOC auto-quarantine (set on the **Security** feature of a configuration policy) moves files on every device the policy reaches with no one reviewing each scan, so it is treated as a device-execution grant. Saving Security settings with auto-quarantine on needs the `devices:execute` permission and MFA; with auto-quarantine off, `devices:write` is enough, and turning it off is never restricted. Because auto-quarantine is on by default, a technician with only `devices:write` must turn it off before the Security settings will save.
+
+Scheduled scans quarantine only while the user who approved auto-quarantine is active and still holds `devices:execute`. Policies that had auto-quarantine on before v0.122.1 keep running under the user who created them on the same terms. Otherwise the policy shows *Auto-quarantine is paused* and its scans run detect-only until a user with `devices:execute` and MFA saves the Security settings again. A scan you start by hand runs under your own permissions; without a completed MFA check in your session it runs detect-only.
 
 ## Threat Detection
 
@@ -388,7 +394,9 @@ GET /security/dashboard?orgId={orgId}
 | `removedThreats` | Threats that have been removed |
 | `securityScore` | Fleet-wide average posture score (0-100) |
 | `providers` | AV provider distribution with device counts and coverage percentages |
-| `firewallEnabled` / `firewallDisabled` | Firewall state counts |
+| `antivirus` | Real-time protection counts: `protected`, `unprotected`, and `unknown` (state could not be read) |
+| `firewall` | Firewall counts: `enabled`, `disabled`, and `unknown` |
+| `firewallEnabled` / `firewallDisabled` | Firewall state counts (devices with an unknown state are in neither) |
 | `encryption` | BitLocker and FileVault enabled counts |
 | `passwordPolicyCompliance` | Average password policy factor score |
 | `adminAudit` | Summary of default/weak/stale admin account issues with top affected devices |

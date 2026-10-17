@@ -3,7 +3,7 @@ import { statSync, createReadStream } from 'node:fs';
 import { Readable } from 'node:stream';
 import { join } from 'node:path';
 import { VALID_OS, VALID_ARCH } from './schemas';
-import { isS3Configured, getPresignedUrl, isS3NotFound } from '../../services/s3Storage';
+import { isS3Configured, getPresignedUrl, getObjectStream, isS3NotFound } from '../../services/s3Storage';
 import { binaryS3Key, binaryStoreDir, type BinaryStore } from '../../services/binaryStores';
 import { getBinarySource, getGithubReleaseVersion, getGithubAgentUrl, getGithubUserHelperUrl, getGithubWatchdogUrl, getGithubBackupUrl, getGithubRecoveryIsoUrl, HELPER_FILENAMES } from '../../services/binarySource';
 import { getPromotedComponentVersion, getRegisteredComponentVersion, type PromotedComponent } from '../../services/promotedAgentVersion';
@@ -103,10 +103,11 @@ async function enforcePublicAgentDownloadRateLimit(
 // ============================================
 // Shared component-binary download handler
 // ============================================
-// The agent/helper/watchdog/backup/user-helper routes below are five
+// The agent/watchdog/backup/recovery-iso/user-helper routes below were
 // near-verbatim copies of the same ~90-line shape: validate os/arch → GitHub
-// redirect (BINARY_SOURCE=github) → S3 presign (404-falls-to-disk,
-// non-404→500) → disk stream. registerComponentDownloadRoute hoists that
+// redirect (BINARY_SOURCE=github) → S3 presigned redirect, or an S3 stream
+// for objectStorageDelivery 'stream' (either way a NotFound falls through to
+// disk and any other fault is a 500) → disk stream. registerComponentDownloadRoute hoists that
 // shape into one place so a future fix (e.g. stream backpressure) lands
 // once. The .pkg and install.sh/uninstall.sh routes have real behavioral
 // differences (macOS-only, different validation/response shape) and are
@@ -139,6 +140,13 @@ interface ComponentDownloadConfig {
    * reads the object syncBinaries() uploaded for that file (#7515).
    */
   store: BinaryStore;
+  /**
+   * How a local-mode S3 copy reaches the caller. 'redirect' (the default) 302s
+   * to a presigned URL so the bytes bypass the API. 'stream' serves them from
+   * this origin: use it for a binary fetched by a client that refuses a
+   * redirect to an object-storage host (#7576).
+   */
+  objectStorageDelivery?: 'redirect' | 'stream';
 }
 
 // breeze-{component}-{os}-{arch}[.exe] — the shape shared by agent, watchdog,
@@ -313,9 +321,46 @@ function registerComponentDownloadRoute(config: ComponentDownloadConfig): void {
       }
     }
 
+    // Local mode, objectStorageDelivery 'stream': serve the S3 copy from this
+    // origin. Same key, same NotFound-falls-to-disk / fault-is-500 split as the
+    // presign branch below.
+    if (isS3Configured() && config.objectStorageDelivery === 'stream') {
+      const s3Key = binaryS3Key(config.store, filename);
+      let object: Awaited<ReturnType<typeof getObjectStream>>;
+      try {
+        object = await getObjectStream(s3Key);
+      } catch (err) {
+        console.error(`[${config.logTag}] S3 fetch failed for ${filename}:`, err);
+        return c.json({ error: 'Internal server error', message: 'Failed to retrieve binary file' }, 500);
+      }
+      if (object.body) {
+        const body = object.body;
+        // Headers are already sent by the time this fires, so all that is left
+        // is to log it: the client sees a truncated body, and the agent's
+        // signed-manifest size/SHA-256 check rejects it. A client that hangs
+        // up makes the server cancel the web stream, which destroys this one
+        // with an AbortError — that is not an object-storage fault, so it is
+        // not logged as one.
+        body.once('error', (err) => {
+          if (err?.name === 'AbortError') return;
+          console.error(`[${config.logTag}] S3 stream error while serving ${filename}:`, err);
+        });
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/octet-stream',
+          'Content-Disposition': `attachment; filename="${filename}"`,
+          'Cache-Control': 'no-cache',
+        };
+        if (object.contentLength !== null) {
+          headers['Content-Length'] = String(object.contentLength);
+        }
+        return new Response(Readable.toWeb(body) as ReadableStream, { status: 200, headers });
+      }
+      console.warn(`[${config.logTag}] S3 object missing for ${filename}, falling back to disk`);
+    }
+
     // Local mode: try S3 presigned redirect first (bandwidth offload). The key
     // comes from the file's store, the same one syncBinaries() uploaded it to.
-    if (isS3Configured()) {
+    if (isS3Configured() && config.objectStorageDelivery !== 'stream') {
       try {
         const s3Key = binaryS3Key(config.store, filename);
         const url = await getPresignedUrl(s3Key);
@@ -631,6 +676,17 @@ downloadRoutes.get('/download/helper/:os/:arch', async (c) => {
 // /agent-versions/:version/download?component=watchdog, which hands back this
 // same-origin URL so the downloader's host-match guard passes (see
 // buildServerRelativeAgentDownloadUrl + issue #646).
+//
+// objectStorageDelivery 'stream' (#7576): `breeze-agent service install` also
+// fetches this route to stage the watchdog on first install, and that client
+// follows redirects only to GitHub release hosts and the build's own control
+// planes. It refused the 302 to a presigned object-storage URL ("release
+// redirect to untrusted origin"), so hosted installs served from object
+// storage never got a watchdog. Serving the bytes from this origin fixes shipped agents without an
+// agent release and keeps that allowlist narrow. Integrity is unchanged: the
+// agent binds the bytes to the size and SHA-256 in the signed release manifest.
+// The cost is ~9 MB per watchdog fetch through the API instead of object
+// storage. BINARY_SOURCE=github still 302s to GitHub, which the client trusts.
 registerComponentDownloadRoute({
   path: '/download/watchdog/:os/:arch',
   logTag: 'watchdog-download',
@@ -639,6 +695,7 @@ registerComponentDownloadRoute({
   filenameFor: perArchFilename('watchdog'),
   githubUrlFor: getGithubWatchdogUrl,
   store: 'agent',
+  objectStorageDelivery: 'stream',
 });
 
 // ============================================
@@ -648,7 +705,8 @@ registerComponentDownloadRoute({
 // this as a non-fatal post-install step, and /agent-versions/:version/download
 // hands back this same-origin URL for component=backup so any future verified
 // self-heal fetch passes the downloader's host-match guard (see
-// buildServerRelativeAgentDownloadUrl). Mirrors the watchdog route exactly.
+// buildServerRelativeAgentDownloadUrl). Mirrors the watchdog route, except that
+// an object-storage copy is still handed out as a presigned redirect.
 registerComponentDownloadRoute({
   path: '/download/backup/:os/:arch',
   logTag: 'backup-download',
@@ -684,7 +742,7 @@ registerComponentDownloadRoute({
 // fetched by the agent's verified updater (component=user-helper). Without this
 // server-relative route the agent-versions response handed back the canonical
 // github.com asset URL, which the updater's host-equality check rejects (#1878).
-// Mirrors the watchdog route: github redirect / S3 presign / local disk.
+// Same shape as the agent route: github redirect / S3 presign / local disk.
 registerComponentDownloadRoute({
   path: '/download/user-helper/:os/:arch',
   logTag: 'user-helper-download',
@@ -810,14 +868,35 @@ breeze_stop_helpers() {
   done
 }
 
+# Callers stop every job and remove the live agent binary first. This removes
+# every Breeze binary from BOTH install directories: an agent relocated to
+# /Library/Breeze/bin can still leave a pre-relocation copy in /usr/local/bin.
+# Logs in /Library/Logs/Breeze are kept on purpose (they record the uninstall).
 breeze_remove_auxiliary() {
   rm -f /Library/LaunchDaemons/com.breeze.watchdog.plist \\
     /Library/LaunchAgents/com.breeze.desktop-helper-user.plist \\
     /Library/LaunchAgents/com.breeze.desktop-helper-loginwindow.plist \\
-    /usr/local/bin/breeze-watchdog /usr/local/bin/breeze-desktop-helper \\
-    /usr/local/bin/breeze-backup \\
-    /Library/Breeze/bin/breeze-watchdog /Library/Breeze/bin/breeze-backup \\
+    /usr/local/bin/breeze-agent /usr/local/bin/breeze-watchdog \\
+    /usr/local/bin/breeze-desktop-helper /usr/local/bin/breeze-backup \\
+    /Library/Breeze/bin/breeze-agent /Library/Breeze/bin/breeze-watchdog \\
+    /Library/Breeze/bin/breeze-desktop-helper /Library/Breeze/bin/breeze-backup \\
+    /Library/Breeze/pkg-staging/breeze-agent \\
+    /Library/Breeze/pkg-staging/breeze-watchdog \\
+    /Library/Breeze/pkg-staging/breeze-backup \\
     "/Library/Application Support/Breeze/agent.sock" || return 1
+  # Remove the tree only while empty: anything else in it is not ours to delete.
+  rmdir /Library/Breeze/pkg-staging /Library/Breeze/bin /Library/Breeze 2>/dev/null || true
+  if [ -d /Library/Breeze ]; then
+    echo "Note: left /Library/Breeze in place because it is not empty" >&2
+  fi
+  # self_uninstall disables the agent label so a reboot mid-teardown cannot
+  # restart it. With the plists gone that is no longer needed, and a label left
+  # disabled makes the next install's bootstrap fail with EIO 5 (#7831).
+  # POSIX sh has no \`local\`: prefixed names keep these out of callers' way.
+  for _breeze_label in com.breeze.agent com.breeze.watchdog; do
+    _breeze_out="$(launchctl enable "system/$_breeze_label" 2>&1)" ||
+      echo "Warning: could not clear the launchd disable for $_breeze_label ($_breeze_out); the .pkg and 'breeze-agent service install' re-enable it" >&2
+  done
   # Only forget this package's receipt; configuration and logs retain their policy.
   receipts="$(pkgutil --pkgs)" || return 1
   # Consume all input: grep -q can SIGPIPE printf under Bash pipefail.
@@ -838,6 +917,7 @@ uninstall_macos() {
   echo "Breeze Agent uninstalled."
   echo "Config at /Library/Application Support/Breeze/ was preserved."
   echo "To remove config: sudo rm -rf '/Library/Application Support/Breeze'"
+  echo "Logs at /Library/Logs/Breeze/ were kept. To remove them: sudo rm -rf /Library/Logs/Breeze"
 }
 
 uninstall_linux() {
@@ -1016,6 +1096,25 @@ else
   CONFIG_DIR="/etc/breeze"
 fi
 BINARY_NAME="breeze-agent"
+# The macOS .pkg installs the agent to /Library/Breeze/bin or /usr/local/bin
+# (agent/installer/macos/install-location.sh, #7211), so enrollment must use
+# the binary it actually installed (#8778).
+MACOS_TRUSTED_BIN_DIR="/Library/Breeze/bin"
+
+# resolve_macos_agent_bin: print the agent binary the .pkg installed. Mirrors
+# choose_bin_dir in install-location.sh: an agent already in the trusted dir
+# stays there (so it wins over a leftover pre-relocation copy), otherwise the
+# package used /usr/local/bin. Fails when neither holds an executable agent.
+resolve_macos_agent_bin() {
+  local p
+  for p in "\$MACOS_TRUSTED_BIN_DIR/\$BINARY_NAME" "\$INSTALL_DIR/\$BINARY_NAME"; do
+    if [[ -f "\$p" && ! -L "\$p" && -x "\$p" ]]; then
+      echo "\$p"
+      return 0
+    fi
+  done
+  return 1
+}
 DOWNLOAD_URL="\${BREEZE_SERVER}/api/v1/agents/download/\${OS}/\${ARCH}"
 PKG_URL="\${BREEZE_SERVER}/api/v1/agents/download/\${OS}/\${ARCH}/pkg"
 VERSION_METADATA_URL="\${BREEZE_SERVER}/api/v1/agent-versions/latest?platform=\${OS}&arch=\${ARCH}&component=agent"
@@ -1204,9 +1303,6 @@ if [[ "\$OS" == "darwin" ]]; then
   # Enroll agent
   info "Enrolling agent with Breeze server..."
   ENROLL_ARGS=(enroll --server "\$BREEZE_SERVER")
-  if [[ -n "\$BREEZE_SITE_ID" ]]; then
-    ENROLL_ARGS+=(--site-id "\$BREEZE_SITE_ID")
-  fi
   if [[ -n "\$BREEZE_DEVICE_ROLE" ]]; then
     ENROLL_ARGS+=(--device-role "\$BREEZE_DEVICE_ROLE")
   fi
@@ -1216,8 +1312,10 @@ if [[ "\$OS" == "darwin" ]]; then
   # read a process's argv (e.g. /proc/*/cmdline on Linux, ps on macOS), but
   # not another user's environment. Scoped with a VAR=value prefix so it only
   # applies to this one invocation, never exported into this shell.
+  MACOS_AGENT_BIN="\$(resolve_macos_agent_bin)" || \
+    fatal "The package installed, but no breeze-agent was found in \$MACOS_TRUSTED_BIN_DIR or \$INSTALL_DIR."
   if ! BREEZE_AGENT_ENROLLMENT_KEY="\$BREEZE_ENROLL_TOKEN" BREEZE_AGENT_ENROLLMENT_SECRET="\$BREEZE_ENROLLMENT_SECRET" \
-      "\$INSTALL_DIR/\$BINARY_NAME" "\${ENROLL_ARGS[@]}"; then
+      "\$MACOS_AGENT_BIN" "\${ENROLL_ARGS[@]}"; then
     fatal "Enrollment failed. Check the server URL and that the enrollment token is valid and not expired (plus the enrollment secret, if your server requires one)."
   fi
   success "Agent enrolled successfully"
@@ -1365,9 +1463,6 @@ success "Config directory ready"
 # ----- Enroll agent -----
 info "Enrolling agent with Breeze server..."
 ENROLL_ARGS=(enroll --server "\$BREEZE_SERVER")
-if [[ -n "\$BREEZE_SITE_ID" ]]; then
-  ENROLL_ARGS+=(--site-id "\$BREEZE_SITE_ID")
-fi
 if [[ -n "\$BREEZE_DEVICE_ROLE" ]]; then
   ENROLL_ARGS+=(--device-role "\$BREEZE_DEVICE_ROLE")
 fi

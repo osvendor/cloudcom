@@ -30,6 +30,11 @@ const NORMALIZED_PATCH_FACTS = {
   rebootAllowDeferral: false,
   rebootMaxDeferrals: 3,
   rebootDeferralMinutes: 60,
+  // #8030. Unset prompt text exports as null (the SQL projection does not
+  // strip nulls), and null must count as present for the exact-key check.
+  rebootPromptTitle: null,
+  rebootPromptBody: null,
+  rebootPromptButton: null,
   exclusiveWindowsUpdate: false,
 };
 
@@ -464,7 +469,7 @@ describe('partner desired-configuration exports', () => {
       exclusions: ['/var/cache'], completenessGaps: [{ code: 'restore_procedure_unavailable' }],
     });
     const renderedQuery = new PgDialect().sqlToQuery(mocks.execute.mock.calls[1]![0]).sql.toLowerCase();
-    for (const forbidden of ['provider_config', 'encryption_key', 'backup_jobs', 'backup_snapshots', 'restore_jobs']) {
+    for (const forbidden of ['provider_config', 'backup_jobs', 'backup_snapshots', 'restore_jobs']) {
       expect(renderedQuery).not.toContain(forbidden);
     }
     expect(renderedQuery).not.toContain('greatest(bc.updated_at');

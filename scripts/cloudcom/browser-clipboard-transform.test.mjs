@@ -47,3 +47,12 @@ test('native Copy is scoped to the active remote surface and uses the same dedup
   const keyboard = result.slice(result.indexOf('  const handleKeyDown'), result.indexOf('  const handleKeyUp'));
   assert.match(keyboard, /browserClipboardRef.current\?\.requestCopy\(\(\) =>/);
 });
+
+test('upstream clipboard sync is replaced by browser adapters without native clipboard imports', () => {
+  const result = applyBrowserClipboard(source);
+  assert.match(result, /const clipboardIO = \{/);
+  assert.match(result, /navigator\.clipboard\.write\(\[new ClipboardItem/);
+  assert.match(result, /text = await navigator\.clipboard\.readText\(\);/);
+  assert.doesNotMatch(result, /@tauri-apps\/plugin-clipboard-manager/);
+  assert.doesNotMatch(result, /ClipboardSync/);
+});

@@ -13,12 +13,13 @@ vi.mock('../sentry', () => ({
   captureException: captureExceptionMock,
 }));
 import {
+  PORTAL_SENSITIVE_FLAG_KEYS,
   PORTAL_VISIBILITY_FLAG_KEYS,
   onPortalFlagsChanged
 } from './portalFlags';
 
 describe('PORTAL_VISIBILITY_FLAG_KEYS', () => {
-  it('lists exactly the nine visibility flags', () => {
+  it('lists exactly the fourteen visibility flags', () => {
     expect(PORTAL_VISIBILITY_FLAG_KEYS).toEqual([
       'enableDashboard',
       'enableSecurity',
@@ -28,8 +29,46 @@ describe('PORTAL_VISIBILITY_FLAG_KEYS', () => {
       'enableService',
       'enableDocuments',
       'enableLifecycle',
-      'enableNetworkVisibility'
+      'enableHardwareHealth',
+      'enableHardwareInventory',
+      'enablePerformanceMetrics',
+      'enableSoftwareInventory',
+      'enableNetworkVisibility',
+      'enableEdrVisibility'
     ]);
+  });
+});
+
+describe('PORTAL_SENSITIVE_FLAG_KEYS', () => {
+  it('lists the flags that stay outside "Enable all"', () => {
+    expect(PORTAL_SENSITIVE_FLAG_KEYS).toEqual(['enableNetworkAlerts', 'enableHourBlock', 'enablePatchDetail', 'enableVulnerabilityDetail']);
+  });
+
+  it('keeps the billing-sensitive Support hours flag out of "Enable all"', () => {
+    // enableHourBlock (block hours W04) exposes a prepaid-hours balance and has
+    // its own fail-closed gate: switched on one org at a time.
+    expect(PORTAL_VISIBILITY_FLAG_KEYS).not.toContain('enableHourBlock');
+  });
+
+  it('keeps the sensitive patch detail flag out of "Enable all"', () => {
+    // enablePatchDetail (portal visibility W05) shows per-host missing patches.
+    expect(PORTAL_VISIBILITY_FLAG_KEYS).not.toContain('enablePatchDetail');
+  });
+
+  it('keeps managed endpoint protection IN "Enable all" (strict but not sensitive, EDR #8164)', () => {
+    expect(PORTAL_VISIBILITY_FLAG_KEYS).toContain('enableEdrVisibility');
+    expect(PORTAL_SENSITIVE_FLAG_KEYS).not.toContain('enableEdrVisibility');
+  });
+
+  it('keeps the sensitive vulnerability detail flag out of "Enable all"', () => {
+    // enableVulnerabilityDetail (portal visibility W06) shows per-host CVE findings.
+    expect(PORTAL_VISIBILITY_FLAG_KEYS).not.toContain('enableVulnerabilityDetail');
+  });
+
+  it('never overlaps the flags that "Enable all" turns on', () => {
+    for (const key of PORTAL_SENSITIVE_FLAG_KEYS) {
+      expect(PORTAL_VISIBILITY_FLAG_KEYS).not.toContain(key);
+    }
   });
 });
 
@@ -43,7 +82,12 @@ describe('onPortalFlagsChanged', () => {
     enableService: false,
     enableDocuments: false,
     enableLifecycle: false,
+    enableHardwareHealth: false,
+    enableHardwareInventory: false,
+    enablePerformanceMetrics: false,
+    enableSoftwareInventory: false,
     enableNetworkVisibility: false,
+    enableEdrVisibility: false,
   };
 
   beforeEach(() => {

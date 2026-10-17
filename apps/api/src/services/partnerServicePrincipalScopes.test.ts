@@ -1,12 +1,58 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import * as SHARED from '@breeze/shared';
 import {
   DEFAULT_WEAVESTREAM_PARTNER_SERVICE_PRINCIPAL_SCOPES,
+  PARTNER_SERVICE_PRINCIPAL_MCP_SCOPES,
   PARTNER_SERVICE_PRINCIPAL_SCOPES,
   hasPartnerServicePrincipalScope,
+  partnerServicePrincipalMcpScopes,
+  partnerServicePrincipalMcpScopesMissingRead,
   validatePartnerServicePrincipalScopes,
 } from './partnerServicePrincipalScopes';
+
+describe('partner service principal scope registry is the @breeze/shared one (#8173)', () => {
+  it('re-exports the shared lists so the API and the web UI cannot diverge', () => {
+    expect([...PARTNER_SERVICE_PRINCIPAL_SCOPES]).toEqual([...SHARED.PARTNER_SERVICE_PRINCIPAL_SCOPES]);
+    expect(PARTNER_SERVICE_PRINCIPAL_SCOPES).toBe(SHARED.PARTNER_SERVICE_PRINCIPAL_SCOPES);
+    expect(PARTNER_SERVICE_PRINCIPAL_MCP_SCOPES).toBe(SHARED.PARTNER_SERVICE_PRINCIPAL_MCP_SCOPES);
+  });
+
+  it('accepts every scope a shared preset can fill in', () => {
+    for (const preset of SHARED.PARTNER_SERVICE_PRINCIPAL_SCOPE_PRESETS) {
+      if (preset.scopes.length === 0) continue;
+      expect(validatePartnerServicePrincipalScopes([...preset.scopes]).ok, preset.id).toBe(true);
+    }
+  });
+});
+
+describe('partner service principal MCP scopes', () => {
+  it('are grantable but never in the default scope set', () => {
+    expect(validatePartnerServicePrincipalScopes([...PARTNER_SERVICE_PRINCIPAL_MCP_SCOPES]).ok).toBe(true);
+    for (const scope of PARTNER_SERVICE_PRINCIPAL_MCP_SCOPES) {
+      expect(DEFAULT_WEAVESTREAM_PARTNER_SERVICE_PRINCIPAL_SCOPES).not.toContain(scope);
+    }
+  });
+
+  it('flags any MCP scope set that lacks ai:read', () => {
+    for (const scope of ['ai:write', 'ai:execute', 'ai:execute_admin']) {
+      expect(partnerServicePrincipalMcpScopesMissingRead([scope])).toBe(true);
+      expect(partnerServicePrincipalMcpScopesMissingRead(['devices:read', scope])).toBe(true);
+      expect(partnerServicePrincipalMcpScopesMissingRead(['ai:read', scope])).toBe(false);
+    }
+    expect(partnerServicePrincipalMcpScopesMissingRead(['ai:read'])).toBe(false);
+    // No MCP scope at all is a Partner-API-only principal, not this error.
+    expect(partnerServicePrincipalMcpScopesMissingRead(['devices:read'])).toBe(false);
+  });
+
+  it('partnerServicePrincipalMcpScopes keeps only the ai:* subset, in order', () => {
+    expect(partnerServicePrincipalMcpScopes(['devices:read', 'ai:execute', 'tickets:write', 'ai:read'])).toEqual(['ai:execute', 'ai:read']);
+    expect(partnerServicePrincipalMcpScopes(['devices:read', 'organizations:read'])).toEqual([]);
+    // Lookalikes are not MCP scopes.
+    expect(partnerServicePrincipalMcpScopes(['ai:*', 'AI:READ', 'mcp:read'])).toEqual([]);
+  });
+});
 
 describe('partner partner-service-principal scopes', () => {
   it('accepts the exact eight supported read scopes', () => {
@@ -101,6 +147,16 @@ describe('partner partner-service-principal scopes', () => {
     });
     expect(DEFAULT_WEAVESTREAM_PARTNER_SERVICE_PRINCIPAL_SCOPES).not.toContain('tickets:read');
     expect(DEFAULT_WEAVESTREAM_PARTNER_SERVICE_PRINCIPAL_SCOPES).not.toContain('tickets:write');
+  });
+
+  it('accepts device-status:read as an explicit opt-in that never joins the default delegation', () => {
+    expect(validatePartnerServicePrincipalScopes(['devices:read', 'device-status:read'])).toEqual({
+      ok: true,
+      scopes: ['devices:read', 'device-status:read'],
+    });
+    expect(DEFAULT_WEAVESTREAM_PARTNER_SERVICE_PRINCIPAL_SCOPES).not.toContain('device-status:read');
+    // Not implied by devices:read: holding devices:read alone does not satisfy it.
+    expect(hasPartnerServicePrincipalScope(['devices:read'], 'device-status:read')).toBe(false);
   });
 
   it('never includes a write scope in the default delegation', () => {

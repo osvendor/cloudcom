@@ -168,7 +168,21 @@ export interface AccountingItemPayload {
 
 export interface AccountingInvoiceLinePayload {
   invoiceLineId: string;
+  /** The full line text: the title, then `descriptionSuffix` (if any). */
   description: string;
+  /**
+   * #8605: the tail of `description` that a provider's length cap must keep
+   * whole (the worked-vs-billed disclosure). Absent or '' when there is none.
+   * A provider truncating an over-limit description cuts the text BEFORE it.
+   */
+  descriptionSuffix?: string;
+  /**
+   * #8605: ISO date (YYYY-MM-DD) the line's work was done, partner-local.
+   * Set only when the invoice's frozen line detail shows dates and the line
+   * has a work date; absent otherwise. Each provider maps it (QuickBooks
+   * `ServiceDate`, Xero description text).
+   */
+  serviceDate?: string | null;
   /** Decimal string; never a float, so no binary rounding enters at this seam. */
   quantity: string;
   unitPrice: string;
@@ -270,6 +284,17 @@ export interface AccountingPaymentPayload {
    *  folds it into the idempotency `requestid` so a re-push after a hand
    *  deletion in QuickBooks is not answered from the 24h replay cache. */
   pushGeneration: number;
+}
+
+export interface AccountingFeeEntryHooks {
+  /** Persist the send timestamp after acquiring a provider slot, immediately before HTTP. */
+  beforeCreate?: () => Promise<void>;
+}
+
+export interface AccountingFeeEntryPayload {
+  operationId:string; remoteCustomerId:string; amount:string; currencyCode:string; txnDate:string;
+  direction:'receipt'|'refund'; incomeRef:string; bankAccountRef:string|null; exemptTaxCodeRef:string|null;
+  firstSubmittedAt:string;
 }
 
 export interface AccountingDeletePaymentPayload {
@@ -480,6 +505,8 @@ export interface AccountingProvider {
    * for invoices (QuickBooks) declares none.
    */
   findRemoteInvoice?(conn: AccountingConnection, invoiceId: string): Promise<{ id: string; remoteVersion?: string } | null>;
+  /** Post or adopt a separate cash entry for an already collected or refunded processing fee. */
+  postFeeEntry(conn: AccountingConnection, entry: AccountingFeeEntryPayload, hooks?: AccountingFeeEntryHooks): Promise<RemoteRef>;
   /**
    * CREATE ONLY — there is deliberately no `updatePayment`. Rewriting a
    * QuickBooks Payment's amount would rewrite receipt history, and Intuit models
@@ -571,3 +598,8 @@ export function isInvoiceRemoteDeletedMarker(lastError: string | null | undefine
 
 /** @deprecated pre-W01 name for the QuickBooks marker; kept for existing test imports. */
 export const INVOICE_REMOTE_DELETED_ERROR = 'Deleted in QuickBooks';
+
+export interface AccountingFeeJournalEntry {
+  connectionId:string; realmFingerprint:string; payload:AccountingFeeEntryPayload;
+  state:'pending'|'posted'|'needs_mapping'|'abandoned'; leaseToken:string|null; leaseUntil:string|null; remoteId:string|null; error:string|null;
+}

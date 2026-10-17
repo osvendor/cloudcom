@@ -87,6 +87,12 @@ const INTENTIONALLY_NO_ORG_ID: ReadonlySet<string> = new Set([
   // organization-move rewrite.
   'pam_actuations',
   'pam_actuation_results',
+  // PAM ownership-epoch lineage (#8203, spec §4.1/§4.2): never re-stamped.
+  // An org change appends a new epoch (and closes the old one) through the
+  // devices trigger; each epoch row keeps the org that owned it. Excluded
+  // from breeze_device_child_orgid_tables() too — see core.ts.
+  'device_ownership_epochs',
+  'device_ownership_epoch_closures',
   'automation_policy_compliance',
   'deployment_devices',
   'deployment_results',
@@ -206,6 +212,8 @@ describe('getDeviceOrgDenormalizedTables() coverage', () => {
       'software_inventory_observations',
       'agent_rollback_events',
       'peripheral_policy_delivery_events',
+      // #4755: composite (device_id, org_id) FK ON UPDATE CASCADE restamps it.
+      'device_restore_point_attempts',
     ]);
     expect(deviceOrgDenormalizedTables).toEqual(
       expect.arrayContaining([...DEVICE_ORG_FK_CASCADE_TABLES]),
@@ -689,6 +697,10 @@ describe('DEVICE_SITE_DENORMALIZED_TABLES coverage', () => {
       // record must retain its site snapshot too; invoice_line_devices is the
       // only such table that currently carries site_id.
       if (name === 'invoice_line_devices') continue;
+      // device_ownership_epochs.site_id is the site at epoch START (display
+      // only, spec §4.1) and the table is append-only — a site move must
+      // never rewrite it (#8203).
+      if (name === 'device_ownership_epochs') continue;
 
       const cols = getColumns(table);
       const hasDeviceId = cols.some((c) => c.name === 'device_id');
@@ -1476,4 +1488,48 @@ describe('device move severs cross-tenant AI origin pointers (#5022 W01)', () =>
       'breeze_cascade_device_org_id() must mirror the route, or a fix-up script that writes devices.org_id directly strands a cross-tenant pointer',
     ).toMatch(/UPDATE public\.script_executions SET ai_session_id = NULL, ai_agent_run_id = NULL/);
   });
+});
+
+/**
+ * ticket_links (#7900 W02) — the one ticket child the schema-derived
+ * completeness check above CANNOT see: it has two ticket legs
+ * (source_ticket_id, target_ticket_id) and no literal `ticket_id`, so it is
+ * neither re-stamped nor discovered. A link whose ticket moves would leave
+ * legs in two orgs, which its composite FKs forbid, so BOTH movers delete
+ * every link touching a moved ticket and defer both FKs by name (the device
+ * axis re-stamps tickets.org_id inside the devices UPDATE trigger, long
+ * before its child tail runs). Pinned statically here because a missing
+ * leg or a missing deferral only fails on a real move of a linked ticket.
+ */
+describe('ticket_links on both org movers (#7900 W02)', () => {
+  const flat = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8').replace(/\s+/g, ' ');
+  const sources = [
+    ['moveTicketOrg', flat('../../services/ticketService.ts')],
+    ['moveDeviceOrgInTransaction', flat('../../services/deviceOrgMove/moveDeviceOrgInTransaction.ts')],
+  ] as const;
+
+  it('the schema gives ticket_links two ticket legs and no ticket_id (why discovery misses it)', () => {
+    const cols = getTableConfig(schema.ticketLinks).columns.map((c) => c.name);
+    expect(cols).toEqual(expect.arrayContaining(['org_id', 'source_ticket_id', 'target_ticket_id']));
+    expect(cols).not.toContain('ticket_id');
+  });
+
+  for (const [axis, src] of sources) {
+    it(`${axis} defers both ticket_links FKs by name`, () => {
+      // The executed statements only (sql`…` templates), not prose comments.
+      const setConstraints = src.match(/sql`SET CONSTRAINTS [^`]* DEFERRED`/g) ?? [];
+      expect(setConstraints.length).toBeGreaterThan(0);
+      for (const stmt of setConstraints) {
+        expect(stmt).toContain('ticket_links_source_org_fk');
+        expect(stmt).toContain('ticket_links_target_org_fk');
+      }
+    });
+
+    it(`${axis} deletes links on BOTH legs of a moved ticket`, () => {
+      const del = src.match(/DELETE FROM ticket_links WHERE [^`]*/)?.[0] ?? '';
+      expect(del).toMatch(/source_ticket_id/);
+      expect(del).toMatch(/target_ticket_id/);
+      expect(del).toMatch(/RETURNING/);
+    });
+  }
 });

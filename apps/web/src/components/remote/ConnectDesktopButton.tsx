@@ -516,7 +516,7 @@ export default function ConnectDesktopButton({ viewerMode = 'browser', preferBui
             const sessionStatus = data.status ?? data.data?.status;
             const terminationPhase = data.terminationPhase ?? data.data?.terminationPhase;
             if (terminationPhase === 'pending') {
-              // SEC-038 W06: the server has already ended this session but the
+              // The server has already ended this session but the
               // agent has not yet acknowledged the stop. This is NOT "viewer
               // connected" — say so, and stop polling.
               setStatus('ending');
@@ -679,7 +679,7 @@ export default function ConnectDesktopButton({ viewerMode = 'browser', preferBui
     setStatus('idle');
   }, []);
 
-  // SEC-038 W06: shown when the session was ended server-side before the
+  // Shown when the session was ended server-side before the
   // viewer connected and the device has not yet confirmed the teardown.
   // Deliberately not the connected/idle state and not the denied card.
   const endingContent = status === 'ending' ? (

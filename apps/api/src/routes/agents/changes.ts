@@ -10,6 +10,7 @@ import { submitChangesSchema } from './schemas';
 import { getRedis } from '../../services/redis';
 import { checkAndConsumeIngestQuota } from '../../services/ingestQuota';
 import { envInt } from '../../utils/envInt';
+import { stripNul } from '../../utils/stripNul';
 
 // Async gunzip: a synchronous inflate blocks the event loop for every OTHER
 // agent's request for the duration of the decompression.
@@ -122,7 +123,9 @@ changesRoutes.put('/:id/changes', async (c) => {
       }))
     }, 400);
   }
-  const data = parsed.data;
+  // Strip, don't reject: a rejected batch would drop every other valid change
+  // (#8020). Unlike the memory-inventory schema (`noNul` in schemas.ts).
+  const data = { ...parsed.data, changes: stripNul(parsed.data.changes) };
 
   const [device] = await db
     .select()

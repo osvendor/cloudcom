@@ -79,12 +79,25 @@ vi.mock('../services/backupHealthReadModel', () => ({
 vi.mock('../db/schema', () => ({
   // services/patchSeverityOverlay.ts builds module-level SQL fragments from these at import time.
   patches: { severity: 'patches.severity', category: 'patches.category' },
+  OUTSTANDING_DEVICE_PATCH_STATUSES: ['pending'],
+  deviceVulnerabilities: {},
+  vulnerabilities: { severity: 'vulnerabilities.severity' },
   devicePatches: { reportedSeverity: 'device_patches.reported_severity', reportedCategory: 'device_patches.reported_category' },
+  // Software summary ordering is constructed when the portal routes load.
+  softwareInventory: { name: 'softwareInventory.name', version: 'softwareInventory.version', vendor: 'softwareInventory.vendor' },
   assetCheckouts: {},
   backupConfigs: {},
   backupJobs: {},
   backupSlaEvents: {},
   backupVerifications: {},
+  deviceDisks: {},
+  deviceConnections: {},
+  deviceHardware: {},
+  deviceMemoryModules: {},
+  deviceNetwork: {},
+  deviceHardwareComponents: {},
+  deviceHardwareEvents: {},
+  deviceHardwareHealth: {},
   devices: {},
   discoveredAssets: {},
   // networkBaseline.ts (pulled in transitively by the portal route graph) reads

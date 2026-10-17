@@ -79,6 +79,14 @@ function nextRows(table: string): unknown[] {
   throw new Error(`No queued rows for table ${table}`);
 }
 
+// AI Suggested Fixes W3 — loadRunContext's proven-fix lookup. Mocked so it never
+// consumes this file's queued db rows; returns null (no memory) by default.
+const loadProvenFixesForRun = vi.hoisted(() => vi.fn(async (): Promise<unknown> => null));
+vi.mock('../fixMemory/runMemory', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../fixMemory/runMemory')>()),
+  loadProvenFixesForRun,
+}));
+
 vi.mock('../../db', () => {
   const makeSelect = () => ({
     from: vi.fn((table: unknown) => {
@@ -253,7 +261,7 @@ const reserveAiBudget = vi.hoisted(() => vi.fn());
 const markAiBudgetReservationIndeterminate = vi.hoisted(() => vi.fn());
 vi.mock('../aiBudgetReservations', () => ({ reserveAiBudget, markAiBudgetReservationIndeterminate }));
 
-import { AgentRunError, createAgentRunPostToolUse, createAgentRunPreToolUse, executeAgentRun } from './runLoop';
+import { AgentRunError, createAgentRunCallPairing, createAgentRunPostToolUse, createAgentRunPreToolUse, executeAgentRun } from './runLoop';
 import { makeResolvedModel } from '../aiModels/__fixtures__/resolvedModel';
 import type { AgentRunOutcome } from './runLoop';
 import { PatchEvidenceUnavailableError, assemblePatchEvidence, patchEvidenceRefs, type RawPatchEvidence } from './patchEvidence';
@@ -266,7 +274,6 @@ function policy(overrides: Partial<AiAgentPolicy> = {}): AiAgentPolicy {
   return {
     enabled: true,
     mode: 'shadow',
-    model: 'claude-test-model',
     toolAllowlist: [],
     protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] },
     limits: { ...AI_AGENT_LIMIT_DEFAULTS },
@@ -473,9 +480,8 @@ function directPre(profile: AiAgentRunProfile, outcome: AgentRunOutcome, extra: 
       protectedResources: { services: [], paths: [], registryKeys: [], deviceTags: [] },
       deviceId: null, deviceSiteId: null,
     },
-    outcome, intentIds: [], allowedPending: new Map<string, number>(), sessionId: null,
-    executionIdPending: new Map<string, Array<string | null>>(),
-    actPinPending: new Map<string, Array<unknown>>(),
+    outcome, intentIds: [], sessionId: null,
+    pairing: createAgentRunCallPairing(),
     actReservation: { count: 0 }, deadlineMs: Date.now() + 60_000,
     ...extra,
   } as never);

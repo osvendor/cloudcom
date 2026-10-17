@@ -141,6 +141,8 @@ interface SecurityMiddlewareOptions {
    * prefix.
    */
   skipHeadersPathPrefix?: string;
+  /** Predicate form of skipHeadersPathPrefix (tunnel-host requests, spec 2026-10-06 §3). Headers only. */
+  skipHeadersWhen?: (c: Context) => boolean;
 }
 
 /**
@@ -248,7 +250,16 @@ export function securityMiddleware(options?: SecurityMiddlewareOptions): Middlew
         if (!canonicalHost) {
           // Never reflect an unrecognized Host into a redirect — reject
           // instead of redirecting to a domain the client didn't ask for.
-          return c.text('Bad Request', 400);
+          // A stable machine code makes the 400 diagnosable (#7875) without
+          // echoing the received or configured Host back to the caller.
+          c.set('rejectReason', 'force_https_non_canonical_host');
+          return c.json(
+            {
+              error: 'FORCE_HTTPS_NON_CANONICAL_HOST',
+              docs: 'https://docs.breezermm.com/deploy/tls/',
+            },
+            400,
+          );
         }
         const location = canonicalHttpsRedirect(c, publicApiUrl);
         if (location) {
@@ -257,7 +268,11 @@ export function securityMiddleware(options?: SecurityMiddlewareOptions): Middlew
       }
     }
 
-    if (!skipHeadersPathPrefix || !path.startsWith(skipHeadersPathPrefix)) {
+    // Truthiness guard: an empty prefix means "skip nothing" (every path
+    // startsWith ''), matching the pre-predicate behaviour of this option.
+    const skipHeaders = (!!skipHeadersPathPrefix && path.startsWith(skipHeadersPathPrefix))
+      || options?.skipHeadersWhen?.(c) === true;
+    if (!skipHeaders) {
       // --- Content Security Policy ---
       c.header('Content-Security-Policy', cspValue);
 

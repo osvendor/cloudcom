@@ -37,7 +37,7 @@ describe('listInboxDelta', () => {
     expect(fetchMock.mock.calls[0]![0]).toContain('/mailFolders/inbox/messages/delta');
     expect(fetchMock.mock.calls[0]![0]).toContain(SELECT);
     for (const [, options] of fetchMock.mock.calls) {
-      expect(options.headers.Prefer).toBe('odata.maxpagesize=100');
+      expect(options.headers.Prefer).toBe('odata.maxpagesize=200');
     }
   });
 
@@ -46,9 +46,9 @@ describe('listInboxDelta', () => {
     await expect(listInboxDelta('tok', 'support@a.com', null)).rejects.toThrow('no continuation or final cursor');
   });
 
-  it('rejects exhausted pagination without claiming a completed sync', async () => {
+  it('rejects repeated pagination without claiming a completed sync', async () => {
     fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ value: [], '@odata.nextLink': 'https://graph.microsoft.com/next' }) });
-    await expect(listInboxDelta('tok', 'support@a.com', null)).rejects.toThrow('pagination limit');
+    await expect(listInboxDelta('tok', 'support@a.com', null)).rejects.toThrow('nextLink repeated');
   });
 
   it('uses the stored deltaLink verbatim when provided', async () => {
@@ -104,6 +104,15 @@ describe('markRead', () => {
   });
 });
 
+describe('markRead failures', () => {
+  beforeEach(() => fetchMock.mockReset());
+
+  it('rejects with the HTTP status when Graph refuses the PATCH', async () => {
+    fetchMock.mockResolvedValue({ ok: false, status: 403, headers: new Map(), text: async () => 'denied' });
+    await expect(markRead('tok', 'support@a.com', 'm1')).rejects.toMatchObject({ status: 403 });
+  });
+});
+
 describe('listMessageAttachments (#6688)', () => {
   beforeEach(() => fetchMock.mockReset());
 
@@ -137,6 +146,17 @@ describe('listMessageAttachments (#6688)', () => {
   it('throws with the HTTP status on a non-OK response', async () => {
     fetchMock.mockResolvedValueOnce({ ok: false, status: 404, headers: new Map(), text: async () => 'gone' });
     await expect(listMessageAttachments('tok', 'support@a.com', 'm1')).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('refuses an attachments nextLink off the Graph origin instead of sending the token there', async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: new Map(),
+      json: async () => ({ value: [{ id: 'a1' }], '@odata.nextLink': 'https://attacker.example/att-page-2' }),
+    });
+    await expect(listMessageAttachments('tok', 'support@a.com', 'm1')).rejects.toThrow(/not on the Graph origin/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

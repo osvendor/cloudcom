@@ -1,11 +1,13 @@
 import { Hono } from 'hono';
 import { cloudcomRemoteAccessRoutes } from './cloudcomRemoteAccess';
 import { coreRoutes } from './core';
+import { siteAssignmentConfirmationRoutes } from './siteAssignmentConfirmation';
 import { metricsRoutes } from './metrics';
 import { processSamplesRoutes } from './processSamples';
 import { softwareRoutes } from './software';
 import { commandsRoutes } from './commands';
 import { hardwareRoutes } from './hardware';
+import { placementRoutes } from './placement';
 import { alertsRoutes } from './alerts';
 import { deviceMonitorsRoutes } from './monitors';
 import { anomaliesRoutes } from './anomalies';
@@ -17,6 +19,7 @@ import { eventsRoutes } from './events';
 import { eventLogsRoutes } from './eventlogs';
 import { hardwareHealthRoutes } from './hardwareHealth';
 import { timeStatusRoutes } from './timeStatus';
+import { deviceWorkloadsRoutes } from './workloads';
 import { filesystemSystemCleanupRoutes } from './filesystemSystemCleanup';
 import { filesystemRoutes } from './filesystem';
 import { sessionsRoutes } from './sessions';
@@ -24,12 +27,14 @@ import { diagnosticLogsRoutes } from './diagnosticLogs';
 import { tabCountsRoutes } from './tabCounts';
 import { watchdogLogsRoutes } from './watchdogLogs';
 import { bootMetricsRoutes } from './bootMetrics';
+import { deviceRestorePointAttemptsRoutes } from './restorePoints';
 import { diagnoseRoutes } from './diagnose';
 import { warrantyRoutes } from './warranty';
 import { billingRoutes } from './billing';
 import { provisionRoutes } from './provision';
 import { moveOrgRoutes } from './moveOrg';
 import { actuateElevationRoutes } from './actuateElevation';
+import { pamReconciliationRoutes } from './pamReconciliation';
 import { softwareActionsRoutes } from './softwareActions';
 import { homebrewBootstrapRoutes } from './homebrewBootstrap';
 import { networkRoutes } from './network';
@@ -137,6 +142,8 @@ deviceRoutes.route('/', removalConfigRoutes);
 deviceRoutes.route('/', bulkLifecycleRoutes);
 
 // Mount core routes (/, /:id, PATCH /:id, DELETE /:id)
+// Topology site location W3 (#7887): PUT/DELETE /:id/site-assignment-confirmation ("Keep at <site>").
+deviceRoutes.route('/', siteAssignmentConfirmationRoutes);
 deviceRoutes.route('/', coreRoutes);
 
 // Mount sub-resource routes
@@ -151,6 +158,8 @@ deviceRoutes.route('/', softwareActionsRoutes);
 deviceRoutes.route('/', softwareRoutes);
 deviceRoutes.route('/', commandsRoutes);
 deviceRoutes.route('/', hardwareRoutes);
+// GET/PUT/DELETE /:id/placement — physical placement (room/rack/U), #8134.
+deviceRoutes.route('/', placementRoutes);
 deviceRoutes.route('/', alertsRoutes);
 // #6371 W05c2: GET /:id/monitors — effective monitors for the device page.
 deviceRoutes.route('/', deviceMonitorsRoutes);
@@ -166,6 +175,7 @@ deviceRoutes.route('/', eventsRoutes);
 deviceRoutes.route('/', eventLogsRoutes);
 deviceRoutes.route('/', hardwareHealthRoutes);
 deviceRoutes.route('/', timeStatusRoutes);
+deviceRoutes.route('/', deviceWorkloadsRoutes);
 deviceRoutes.route('/', sessionsRoutes);
 deviceRoutes.route('/', diagnosticLogsRoutes);
 deviceRoutes.route('/', watchdogLogsRoutes);
@@ -176,7 +186,11 @@ deviceRoutes.route('/', warrantyRoutes);
 // index.test.ts so a later static sibling cannot silently reorder it.
 deviceRoutes.route('/', billingRoutes);
 deviceRoutes.route('/', bootMetricsRoutes);
+// #4759 W08: GET /:id/restore-point-attempts (System Restore request ledger, read-only).
+// :id-prefixed, so it cannot be shadowed by core's /:id matcher.
+deviceRoutes.route('/', deviceRestorePointAttemptsRoutes);
 deviceRoutes.route('/', actuateElevationRoutes);
+deviceRoutes.route('/', pamReconciliationRoutes);
 deviceRoutes.route('/', homebrewBootstrapRoutes);
 
 // Re-export helpers and schemas for potential use elsewhere

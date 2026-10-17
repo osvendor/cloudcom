@@ -230,6 +230,13 @@ describe('securityMiddleware', () => {
       expect(res.headers.get('Permissions-Policy')).toBeTruthy();
     });
 
+    it('treats an empty prefix as "skip nothing", not "skip every path"', async () => {
+      const app = createApp({ skipHeadersPathPrefix: '' });
+      const res = await app.request('/test');
+      expect(res.headers.get('Content-Security-Policy')).toBeTruthy();
+      expect(res.headers.get('Permissions-Policy')).toBeTruthy();
+    });
+
     it('still redirects HTTP to HTTPS for a path under the skipped prefix', async () => {
       const app = createApp({
         forceHttps: 'true',
@@ -404,6 +411,37 @@ describe('FORCE_HTTPS redirect warning (#3047)', () => {
     expect(String(warnSpy.mock.calls[0]?.[0])).toContain('canonicalHost=false');
   });
 
+  it('returns a stable reason code, never echoing the received Host (#7875)', async () => {
+    const res = await createApp(opts).request('http://wrong-host.example.net/test', {
+      headers: { host: 'wrong-host.example.net', 'x-forwarded-for': '203.0.113.9' },
+    });
+
+    expect(res.status).toBe(400);
+    const raw = await res.text();
+    expect(JSON.parse(raw)).toEqual({
+      error: 'FORCE_HTTPS_NON_CANONICAL_HOST',
+      docs: 'https://docs.breezermm.com/deploy/tls/',
+    });
+    expect(raw).not.toContain('wrong-host.example.net');
+    expect(raw).not.toContain('api.example.com');
+  });
+
+  it('publishes the reject reason on the context for the request logger (#7875)', async () => {
+    let reason: unknown;
+    // Outer observer: runs before security, sees the value after it returns.
+    const outer = new Hono();
+    outer.use('*', async (c, next) => {
+      await next();
+      reason = c.get('rejectReason');
+    });
+    outer.use('*', securityMiddleware(opts));
+    outer.get('/test', (c) => c.text('ok'));
+    await outer.request('http://wrong-host.example.net/test', {
+      headers: { host: 'wrong-host.example.net', 'x-forwarded-for': '203.0.113.9' },
+    });
+    expect(reason).toBe('force_https_non_canonical_host');
+  });
+
   it('suppresses repeats per peer so a redirect storm cannot flood the log', async () => {
     const app = createApp(opts);
     for (let i = 0; i < 5; i++) {
@@ -448,5 +486,15 @@ describe('FORCE_HTTPS redirect warning (#3047)', () => {
     expect(res.status).toBe(308);
     expect(warnSpy).toHaveBeenCalledTimes(1);
     expect(String(warnSpy.mock.calls[0]?.[0])).toContain('xForwardedProto=http');
+  });
+});
+
+describe('securityMiddleware skipHeadersWhen', () => {
+  it('skips its response headers when skipHeadersWhen returns true', async () => {
+    const app = new Hono();
+    app.use('*', securityMiddleware({ nodeEnv: 'production', skipHeadersWhen: (c) => c.req.header('host') === 'tunnel.test' }));
+    app.get('/', (c) => c.text('ok'));
+    expect((await app.request('/', { headers: { host: 'tunnel.test' } })).headers.get('content-security-policy')).toBeNull();
+    expect((await app.request('/', { headers: { host: 'app.test' } })).headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
   });
 });

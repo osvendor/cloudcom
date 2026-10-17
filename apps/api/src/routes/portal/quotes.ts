@@ -6,7 +6,7 @@ import { db, runOutsideDbContext, withSystemDbAccessContext } from '../../db';
 import { quotes, quoteBlocks, quoteLines, quoteRecipients, quoteAcceptances } from '../../db/schema/quotes';
 import { partners } from '../../db/schema/orgs';
 import { portalBranding } from '../../db/schema/portal';
-import { acceptQuoteSchema, declineQuoteSchema } from '@breeze/shared';
+import { acceptQuoteSchema, declineQuoteSchema, ERROR_CODES } from '@breeze/shared';
 import { markQuoteViewed, declineQuoteByActor } from '../../services/quoteLifecycle';
 import { acceptQuote, emitAcceptInvoiceIssued, autoEmailAcceptedInvoice } from '../../services/quoteAcceptService';
 import { notifyQuoteOutcome } from '../../services/quoteOutcomeNotify';
@@ -27,6 +27,7 @@ import { resolvePartnerDocumentLocale } from '../../services/documentLocale';
 import { resolveDocumentFooter } from '../../services/documentFooter';
 import { getTrustedClientIpOrUndefined } from '../../services/clientIp';
 import { normalizeEmail, portalFinancialMutationGuard } from './helpers';
+import { resolveDocumentBrand } from '../../services/partnerDocumentBrand';
 
 export const quoteRoutes = new Hono();
 quoteRoutes.use('*', portalFinancialMutationGuard);
@@ -50,7 +51,7 @@ quoteRoutes.get('/quotes', async (c) => {
 quoteRoutes.get('/quotes/:id', zValidator('param', idParam), async (c) => {
   const auth = c.get('portalAuth'); const { id } = c.req.valid('param');
   const [quote] = await db.select().from(quotes).where(and(eq(quotes.id, id), eq(quotes.orgId, auth.user.orgId))).limit(1);
-  if (!quote || quote.status === 'draft') return c.json({ error: 'Quote not found' }, 404);
+  if (!quote || quote.status === 'draft') return c.json({ error: 'Quote not found', code: ERROR_CODES.NOT_FOUND }, 404);
   const rawBlocks = sanitizeQuoteBlocksForRead(await db.select().from(quoteBlocks).where(eq(quoteBlocks.quoteId, id)).orderBy(quoteBlocks.sortOrder));
   const lines = toCustomerLines((await db.select().from(quoteLines).where(eq(quoteLines.quoteId, id)).orderBy(quoteLines.sortOrder)).filter((l) => l.customerVisible));
   try { await markQuoteViewed(id, auth.user.orgId); } catch (err) { console.error('[portal] quote markViewed failed', { id, err }); }
@@ -96,7 +97,7 @@ quoteRoutes.get('/quotes/:id', zValidator('param', idParam), async (c) => {
       .orderBy(desc(quoteAcceptances.signedAt))
       .limit(1);
     return c.json({ data: { quote: { ...quote, supersededByQuoteId: successor?.id ?? null, acceptanceOrigin: acceptance?.origin ?? null, dueOnAcceptanceTotal: totals.dueOnAcceptanceTotal, depositDueTotal: totals.depositDueTotal, categoryBreakdown: totals.categoryBreakdown }, blocks, lines: serializedLines, branding: {
-      partnerName: partner?.name ?? 'Proposal', logoUrl: brand?.logoUrl ?? null, primaryColor: brand?.primaryColor ?? null,
+      partnerName: partner?.name ?? 'Proposal', ...resolveDocumentBrand(brand, partner?.settings),
       supportEmail: brand?.supportEmail ?? null, supportPhone: brand?.supportPhone ?? null,
       theme, pageSize,
     }, presentation: { theme, pageSize } } });
@@ -111,7 +112,7 @@ quoteRoutes.get('/quotes/:id/pdf', zValidator('param', idParam), async (c) => {
   const auth = c.get('portalAuth'); const { id } = c.req.valid('param');
   try {
   const [quote] = await db.select().from(quotes).where(and(eq(quotes.id, id), eq(quotes.orgId, auth.user.orgId))).limit(1);
-  if (!quote || quote.status === 'draft') return c.json({ error: 'Quote not found' }, 404);
+  if (!quote || quote.status === 'draft') return c.json({ error: 'Quote not found', code: ERROR_CODES.NOT_FOUND }, 404);
   const blocks = sanitizeQuoteBlocksForRead(await db.select().from(quoteBlocks).where(eq(quoteBlocks.quoteId, id)).orderBy(quoteBlocks.sortOrder));
   const lines = toCustomerLines((await db.select().from(quoteLines).where(eq(quoteLines.quoteId, id)).orderBy(quoteLines.sortOrder)).filter((l) => l.customerVisible));
   // Same totals sweep as GET /quotes/:id: derive the amount due on acceptance
@@ -173,7 +174,7 @@ quoteRoutes.get('/quotes/:id/pdf', zValidator('param', idParam), async (c) => {
   // theme/pageSize columns.
   const presentationSnap = quote.presentationSnapshot as { theme?: string; pageSize?: string } | null;
   const branding = {
-    partnerName: partner?.name ?? 'Proposal', logoUrl: brand?.logoUrl ?? null, primaryColor: brand?.primaryColor ?? null,
+    partnerName: partner?.name ?? 'Proposal', ...resolveDocumentBrand(brand, partner?.settings),
     footer: resolveDocumentFooter({ documentTerms: quote.terms, partnerFooter: partner?.invoiceFooter ?? null, brandingFooter: brand?.footerText ?? null }), currencyCode: quote.currencyCode ?? partner?.currencyCode ?? 'USD',
     theme: resolveThemeId(presentationSnap?.theme ?? partner?.documentTheme),
     pageSize: resolvePageSize(presentationSnap?.pageSize ?? partner?.documentPageSize),
@@ -200,9 +201,9 @@ quoteRoutes.get('/quotes/:id/pdf', zValidator('param', idParam), async (c) => {
 quoteRoutes.get('/quotes/:id/images/:imageId', zValidator('param', imageParam), async (c) => {
   const auth = c.get('portalAuth'); const { id, imageId } = c.req.valid('param');
   const [quote] = await db.select({ id: quotes.id }).from(quotes).where(and(eq(quotes.id, id), eq(quotes.orgId, auth.user.orgId), ne(quotes.status, 'draft'))).limit(1);
-  if (!quote) return c.json({ error: 'Quote not found' }, 404);
+  if (!quote) return c.json({ error: 'Quote not found', code: ERROR_CODES.NOT_FOUND }, 404);
   const img = await readQuoteImage(imageId, id);
-  if (!img) return c.json({ error: 'Image not found' }, 404);
+  if (!img) return c.json({ error: 'Image not found', code: ERROR_CODES.NOT_FOUND }, 404);
   return new Response(new Uint8Array(img.data), { status: 200, headers: { 'Content-Type': img.mime, 'Content-Length': String(img.byteSize), 'Cache-Control': 'private, max-age=300' } });
 });
 
@@ -216,9 +217,9 @@ quoteRoutes.get('/quotes/:id/images/:imageId', zValidator('param', imageParam), 
 quoteRoutes.get('/quotes/:id/line-image/:lineId', zValidator('param', lineImageParam), async (c) => {
   const auth = c.get('portalAuth'); const { id, lineId } = c.req.valid('param');
   const [quote] = await db.select({ id: quotes.id }).from(quotes).where(and(eq(quotes.id, id), eq(quotes.orgId, auth.user.orgId), ne(quotes.status, 'draft'))).limit(1);
-  if (!quote) return c.json({ error: 'Quote not found' }, 404);
+  if (!quote) return c.json({ error: 'Quote not found', code: ERROR_CODES.NOT_FOUND }, 404);
   const img = await runOutsideDbContext(() => withSystemDbAccessContext(() => loadCustomerLineImage(id, lineId)));
-  if (!img) return c.json({ error: 'Image not found' }, 404);
+  if (!img) return c.json({ error: 'Image not found', code: ERROR_CODES.NOT_FOUND }, 404);
   return new Response(new Uint8Array(img.data), { status: 200, headers: { 'Content-Type': img.mime, 'Content-Length': String(img.byteSize), 'Cache-Control': 'private, max-age=300' } });
 });
 
@@ -229,11 +230,11 @@ quoteRoutes.get('/quotes/:id/line-image/:lineId', zValidator('param', lineImageP
 quoteRoutes.get('/quotes/:id/contract-file/:blockId', zValidator('param', blockFileParam), async (c) => {
   const auth = c.get('portalAuth'); const { id, blockId } = c.req.valid('param');
   const [quote] = await db.select({ id: quotes.id }).from(quotes).where(and(eq(quotes.id, id), eq(quotes.orgId, auth.user.orgId), ne(quotes.status, 'draft'))).limit(1);
-  if (!quote) return c.json({ error: 'Quote not found' }, 404);
+  if (!quote) return c.json({ error: 'Quote not found', code: ERROR_CODES.NOT_FOUND }, 404);
   const [block] = await db.select().from(quoteBlocks).where(and(eq(quoteBlocks.id, blockId), eq(quoteBlocks.quoteId, id), eq(quoteBlocks.blockType, 'contract'))).limit(1);
-  if (!block) return c.json({ error: 'Contract file not found' }, 404);
+  if (!block) return c.json({ error: 'Contract file not found', code: ERROR_CODES.NOT_FOUND }, 404);
   const [renderData] = await loadContractBlockRenderData([block], { includeFileData: true });
-  if (!renderData || renderData.sourceType !== 'uploaded' || !renderData.fileData) return c.json({ error: 'Contract file not found' }, 404);
+  if (!renderData || renderData.sourceType !== 'uploaded' || !renderData.fileData) return c.json({ error: 'Contract file not found', code: ERROR_CODES.NOT_FOUND }, 404);
   return new Response(new Uint8Array(renderData.fileData), { status: 200, headers: { 'Content-Type': 'application/pdf', 'Content-Length': String(renderData.fileData.length), 'Cache-Control': 'private, max-age=300' } });
 });
 
@@ -244,13 +245,13 @@ quoteRoutes.post('/quotes/:id/accept', zValidator('param', idParam), zValidator(
   const auth = c.get('portalAuth'); const { id } = c.req.valid('param');
   const signerName = c.req.valid('json').signerName?.trim() || auth.user.name || auth.user.email;
   const [quote] = await db.select({ id: quotes.id }).from(quotes).where(and(eq(quotes.id, id), eq(quotes.orgId, auth.user.orgId), ne(quotes.status, 'draft'))).limit(1);
-  if (!quote) return c.json({ error: 'Quote not found' }, 404);
+  if (!quote) return c.json({ error: 'Quote not found', code: ERROR_CODES.NOT_FOUND }, 404);
   const [recipient] = await db.select({ id: quoteRecipients.id }).from(quoteRecipients).where(and(
     eq(quoteRecipients.quoteId, id),
     eq(quoteRecipients.orgId, auth.user.orgId),
     eq(quoteRecipients.email, normalizeEmail(auth.user.email)),
   )).limit(1);
-  if (!recipient) return c.json({ error: 'You are not authorized to accept this quote' }, 403);
+  if (!recipient) return c.json({ error: 'You are not authorized to accept this quote', code: ERROR_CODES.ACCESS_DENIED }, 403);
   try {
     // Pre-fetch the contract-block render data BEFORE the accept transaction:
     // loadContractBlockRenderData resolves the pinned template versions under a
@@ -297,13 +298,13 @@ quoteRoutes.post('/quotes/:id/accept', zValidator('param', idParam), zValidator(
 quoteRoutes.post('/quotes/:id/decline', zValidator('param', idParam), zValidator('json', declineQuoteSchema), async (c) => {
   const auth = c.get('portalAuth'); const { id } = c.req.valid('param'); const { reason } = c.req.valid('json');
   const [quote] = await db.select({ id: quotes.id }).from(quotes).where(and(eq(quotes.id, id), eq(quotes.orgId, auth.user.orgId), ne(quotes.status, 'draft'))).limit(1);
-  if (!quote) return c.json({ error: 'Quote not found' }, 404);
+  if (!quote) return c.json({ error: 'Quote not found', code: ERROR_CODES.NOT_FOUND }, 404);
   const [recipient] = await db.select({ id: quoteRecipients.id }).from(quoteRecipients).where(and(
     eq(quoteRecipients.quoteId, id),
     eq(quoteRecipients.orgId, auth.user.orgId),
     eq(quoteRecipients.email, normalizeEmail(auth.user.email)),
   )).limit(1);
-  if (!recipient) return c.json({ error: 'You are not authorized to decline this quote' }, 403);
+  if (!recipient) return c.json({ error: 'You are not authorized to decline this quote', code: ERROR_CODES.ACCESS_DENIED }, 403);
   // Route through declineQuoteByActor so the portal shares the same status +
   // read-time expiry (410) guards as the public/internal decline paths — an
   // inline update here previously let an authed portal user decline an
@@ -337,7 +338,7 @@ quoteRoutes.post('/quotes/:id/pay', zValidator('param', idParam), async (c) => {
   const auth = c.get('portalAuth'); const { id } = c.req.valid('param');
   const [quote] = await withSystemDbAccessContext(() =>
     db.select({ id: quotes.id }).from(quotes).where(and(eq(quotes.id, id), eq(quotes.orgId, auth.user.orgId))).limit(1));
-  if (!quote) return c.json({ error: 'Quote not found' }, 404);
+  if (!quote) return c.json({ error: 'Quote not found', code: ERROR_CODES.NOT_FOUND }, 404);
   try {
     const link = await createQuotePayLink(id, { userId: null, partnerId: null, accessibleOrgIds: [auth.user.orgId] });
     return c.json({ data: { url: link.url } });

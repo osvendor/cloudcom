@@ -79,7 +79,7 @@ export type StepUpOperation =
   | 'ai_script_lane_grant'
   // Partner-wide sibling of `ai_script_lane_grant`: raising the PARTNER
   // ceiling (`unattended_allowed` and, while it is already true, any
-  // widening of tier/classes/rate/protected-resources/reviewerModel) fans
+  // widening of tier/classes/rate/protected-resources/proposing) fans
   // out to every org under the partner that has opted in, so it gets the
   // same fresh-MFA-plus-resource-binding treatment as the org-scope grant.
   | 'ai_partner_script_ceiling_grant'
@@ -108,7 +108,37 @@ export type StepUpOperation =
   // execution on customer machines to a stored frozen actor. Bound by
   // resourceDigest to the exact { siteId, action, subjectId } the operator saw,
   // so a grant for one policy/target can never arm another.
-  | 'topology_arm';
+  | 'topology_arm'
+  // Restoring a backup that has no usable integrity attestation (written
+  // before attestations existed, or a device-local backup restored onto
+  // another device). Bound by resourceDigest to exactly one { snapshotDbId,
+  // targetDeviceId, commandType }; consumed when the restore is requested,
+  // and recorded as a durable authorization with its audit event
+  // (services/backupRestoreAuthorization.ts).
+  | 'backup_unattested_restore'
+  // Charging a client now (autopay): an off-session payment the MSP starts by
+  // hand. Bound by resourceDigest to exactly one invoice; consumed right
+  // before the charge is reserved, so it can never pay a different invoice.
+  | 'autopay_charge_now'
+  // Saving the partner's payment settings (automatic-payment cap, schedule,
+  // fees, reminders). Bound to the partner AND to the exact values saved, so
+  // a grant minted for one change cannot save a different, wider one.
+  | 'partner_payment_settings_update'
+  // Sending a client's automatic-payment authorization request to an address
+  // other than its billing contact. Bound to the exact org set, recipient and
+  // request mode.
+  | 'autopay_request_recipient'
+  // Saving an organization's own payment settings, which override the
+  // partner's (cap, schedule, fees, payment methods, reminders). Asked for only
+  // when a saved value differs from the stored one; bound to the organization
+  // AND to the exact values saved, like partner_payment_settings_update.
+  | 'org_payment_settings_update'
+  // Ticket migration windows (#8313): opening a window widens a keyless
+  // partner service principal into import mode across the chosen orgs. Bound
+  // to the exact { partnerId, principalId, sorted orgIds, endsAt,
+  // writesPerHour } the admin confirmed, so a grant can never open a wider,
+  // longer or faster window than the one shown.
+  | 'migration_window_open';
 
 export interface StepUpGrant {
   id: string;
@@ -288,8 +318,26 @@ export interface ScriptLaneWideningDelta {
   unattendedAllowedClasses: string[];
   maxUnattendedPerHour: number;
   protectedResourcesEmptied: boolean;
-  reviewerModel: string | null;
   proposingEnabled: boolean;
+}
+
+/**
+ * The canonical, explicitly-picked form of a widening delta that both digests
+ * hash. Picking (rather than spreading the input) means the mint side (a
+ * client resource parsed by `routes/auth/schemas.ts`) and the redeem side (the
+ * delta the policy routes build server-side) hash the same keys in the same
+ * order, and a stray key — e.g. the retired `reviewerModel` from a cached
+ * pre-W08 client (#7606) — can never change the digest.
+ */
+function canonicalWidening(widening: ScriptLaneWideningDelta | undefined) {
+  if (!widening) return null;
+  return {
+    maxUnattendedRiskTier: widening.maxUnattendedRiskTier,
+    unattendedAllowedClasses: [...widening.unattendedAllowedClasses].sort(),
+    maxUnattendedPerHour: widening.maxUnattendedPerHour,
+    protectedResourcesEmptied: widening.protectedResourcesEmptied,
+    proposingEnabled: widening.proposingEnabled,
+  };
 }
 
 /** Bind a factor-removal grant to one exact server-side passkey row. */
@@ -298,7 +346,7 @@ export interface ScriptLaneWideningDelta {
  * value (`unattendedEnabled`), and to the lane-reset action when `reset` is
  * set. Same one-org-one-value shape as the maintenance digest. `widening`
  * additionally binds a grant minted for a WIDENING save (tier/classes/rate/
- * emptied protectedResources/reviewerModel/proposingEnabled changed while the
+ * emptied protectedResources/proposingEnabled changed while the
  * lane is already enabled) to the exact wider values being persisted.
  */
 export function scriptLanePolicyResourceDigest(input: {
@@ -311,9 +359,7 @@ export function scriptLanePolicyResourceDigest(input: {
     orgId: input.orgId,
     unattendedEnabled: input.unattendedEnabled,
     reset: input.reset === true,
-    widening: input.widening
-      ? { ...input.widening, unattendedAllowedClasses: [...input.widening.unattendedAllowedClasses].sort() }
-      : null,
+    widening: canonicalWidening(input.widening),
   });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
@@ -332,9 +378,7 @@ export function partnerScriptCeilingResourceDigest(input: {
   const canonical = JSON.stringify({
     partnerId: input.partnerId,
     unattendedAllowed: input.unattendedAllowed,
-    widening: input.widening
-      ? { ...input.widening, unattendedAllowedClasses: [...input.widening.unattendedAllowedClasses].sort() }
-      : null,
+    widening: canonicalWidening(input.widening),
   });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }
@@ -349,6 +393,120 @@ export function topologyArmResourceDigest(input: {
     action: input.action,
     siteId: input.siteId.toLowerCase(),
     subjectId: input.subjectId.toLowerCase(),
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Unattested-restore step-up binding: one snapshot, one target device, one
+ * restore command type. Keys in fixed order, ids lower-cased, so the mint
+ * route and every restore route produce byte-identical input.
+ */
+export function unattestedRestoreResourceDigest(input: {
+  snapshotDbId: string;
+  targetDeviceId: string;
+  commandType: string;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    commandType: input.commandType,
+    snapshotDbId: input.snapshotDbId.toLowerCase(),
+    targetDeviceId: input.targetDeviceId.toLowerCase(),
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Canonical JSON for an open settings object: keys sorted at every depth and
+ * `undefined` dropped, so two equivalent patches always hash the same.
+ */
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value as Record<string, unknown>).sort()
+      .filter(key => (value as Record<string, unknown>)[key] !== undefined)
+      .map(key => [key, canonicalValue((value as Record<string, unknown>)[key])]));
+  }
+  return value;
+}
+
+/** Charge-now step-up binding: one invoice. */
+export function autopayChargeNowResourceDigest(input: { invoiceId: string }): `sha256:${string}` {
+  const canonical = JSON.stringify({ kind: 'autopay_charge_now', invoiceId: input.invoiceId.toLowerCase() });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Partner payment-settings binding: the partner and every value in the saved
+ * patch (as parsed by the shared patch schema on both the mint and the write
+ * side), independent of key order.
+ */
+export function partnerPaymentSettingsResourceDigest(input: {
+  partnerId: string;
+  settings: Record<string, unknown>;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    kind: 'partner_payment_settings_update',
+    partnerId: input.partnerId.toLowerCase(),
+    settings: canonicalValue(input.settings),
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Organization payment-settings binding: the organization and every value in
+ * the saved patch (as parsed by the shared org patch schema on both the mint
+ * and the write side), independent of key order. Its own `kind`, so a partner
+ * grant never fits an organization save.
+ */
+export function orgPaymentSettingsResourceDigest(input: {
+  orgId: string;
+  settings: Record<string, unknown>;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    kind: 'org_payment_settings_update',
+    orgId: input.orgId.toLowerCase(),
+    settings: canonicalValue(input.settings),
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Migration window open binding (#8313): the partner, the principal, the
+ * deduplicated sorted org set, the end (normalised to ISO) and the throughput
+ * as requested (null when the admin left the default), independent of order.
+ */
+export function migrationWindowOpenResourceDigest(input: {
+  partnerId: string;
+  principalId: string;
+  orgIds: readonly string[];
+  endsAt: string;
+  writesPerHour?: number | null;
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    kind: 'migration_window_open',
+    partnerId: input.partnerId.toLowerCase(),
+    principalId: input.principalId.toLowerCase(),
+    orgIds: [...new Set(input.orgIds.map((id) => id.toLowerCase()))].sort(),
+    endsAt: new Date(input.endsAt).toISOString(),
+    writesPerHour: input.writesPerHour ?? null,
+  });
+  return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
+}
+
+/**
+ * Redirected authorization-request binding: the deduplicated, sorted org set,
+ * the exact recipient, and the mode (absent means 'request', as on the route).
+ */
+export function autopayRequestRecipientResourceDigest(input: {
+  orgIds: readonly string[];
+  recipientOverride: string;
+  mode?: 'request' | 'reauthorize';
+}): `sha256:${string}` {
+  const canonical = JSON.stringify({
+    kind: 'autopay_request_recipient',
+    mode: input.mode ?? 'request',
+    orgIds: [...new Set(input.orgIds.map(id => id.toLowerCase()))].sort(),
+    recipientOverride: input.recipientOverride,
   });
   return `sha256:${createHash('sha256').update(canonical).digest('hex')}`;
 }

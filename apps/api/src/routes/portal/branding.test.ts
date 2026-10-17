@@ -76,7 +76,15 @@ describe('GET /branding (authenticated)', () => {
       enableService: true,
       enableDocuments: false,
       enableLifecycle: true,
+      enableHardwareHealth: true,
+      enableHardwareInventory: true,
+      enablePerformanceMetrics: true,
+      enableSoftwareInventory: true,
       enableNetworkVisibility: true,
+      enableHourBlock: true,
+      enablePatchDetail: true,
+      enableVulnerabilityDetail: true,
+      enableEdrVisibility: true,
     }];
 
     const response = await authenticatedApp.request('/branding');
@@ -92,6 +100,14 @@ describe('GET /branding (authenticated)', () => {
         enableService: true,
         enableDocuments: false,
         enableLifecycle: true,
+        enableHardwareHealth: true,
+        enableHardwareInventory: true,
+        enablePerformanceMetrics: true,
+        enableSoftwareInventory: true,
+        enableHourBlock: true,
+        enablePatchDetail: true,
+        enableVulnerabilityDetail: true,
+        enableEdrVisibility: true,
       },
     });
 
@@ -114,7 +130,15 @@ describe('GET /branding (authenticated)', () => {
         'enableService',
         'enableDocuments',
         'enableLifecycle',
+        'enableHardwareHealth',
+        'enableHardwareInventory',
+        'enablePerformanceMetrics',
+        'enableSoftwareInventory',
         'enableNetworkVisibility',
+        'enableHourBlock',
+        'enablePatchDetail',
+        'enableVulnerabilityDetail',
+        'enableEdrVisibility',
       ]),
     );
   });
@@ -145,7 +169,15 @@ describe('GET /branding (authenticated)', () => {
     expect(body).not.toHaveProperty('enableService');
     expect(body).not.toHaveProperty('enableDocuments');
     expect(body).not.toHaveProperty('enableLifecycle');
+    expect(body).not.toHaveProperty('enableHardwareHealth');
+    expect(body).not.toHaveProperty('enableHardwareInventory');
+    expect(body).not.toHaveProperty('enablePerformanceMetrics');
+    expect(body).not.toHaveProperty('enableSoftwareInventory');
     expect(body).not.toHaveProperty('enableNetworkVisibility');
+    expect(body).not.toHaveProperty('enableHourBlock');
+    expect(body).not.toHaveProperty('enablePatchDetail');
+    expect(body).not.toHaveProperty('enableVulnerabilityDetail');
+    expect(body).not.toHaveProperty('enableEdrVisibility');
   });
 
   it('applies private cache headers scoped to the authenticated viewer', async () => {
@@ -210,7 +242,15 @@ describe('GET /branding/:domain (public)', () => {
     expect(body.branding).not.toHaveProperty('enableService');
     expect(body.branding).not.toHaveProperty('enableDocuments');
     expect(body.branding).not.toHaveProperty('enableLifecycle');
+    expect(body.branding).not.toHaveProperty('enableHardwareHealth');
+    expect(body.branding).not.toHaveProperty('enableHardwareInventory');
+    expect(body.branding).not.toHaveProperty('enablePerformanceMetrics');
+    expect(body.branding).not.toHaveProperty('enableSoftwareInventory');
     expect(body.branding).not.toHaveProperty('enableNetworkVisibility');
+    expect(body.branding).not.toHaveProperty('enableHourBlock');
+    expect(body.branding).not.toHaveProperty('enablePatchDetail');
+    expect(body.branding).not.toHaveProperty('enableVulnerabilityDetail');
+    expect(body.branding).not.toHaveProperty('enableEdrVisibility');
     expect(response.headers.get('Cache-Control')).toContain('public');
 
     // Same reasoning as the authenticated case: the mock ignores the
@@ -227,7 +267,15 @@ describe('GET /branding/:domain (public)', () => {
       'enableService',
       'enableDocuments',
       'enableLifecycle',
+      'enableHardwareHealth',
+      'enableHardwareInventory',
+      'enablePerformanceMetrics',
+      'enableSoftwareInventory',
       'enableNetworkVisibility',
+      'enableHourBlock',
+      'enablePatchDetail',
+      'enableVulnerabilityDetail',
+      'enableEdrVisibility',
     ]) {
       expect(Object.keys(dbState.selected ?? {})).not.toContain(flag);
     }

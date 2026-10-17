@@ -94,6 +94,7 @@ describe('navSections structure (#1321, #1324)', () => {
     // time is service-desk work, not billing document work).
     expect(hrefsOf('billing')).toEqual([
       '/billing/quotes',
+      '/billing/autopay',
       '/billing/invoices',
       '/contracts',
       // W03 — the agreement library left /contracts for its own area.
@@ -103,7 +104,15 @@ describe('navSections structure (#1321, #1324)', () => {
       // nav entry under Billing.
       '/settings/deliverable-templates',
     ]);
-    expect(hrefsOf('service-desk')).toEqual(['/tickets', '/timesheet']);
+    expect(hrefsOf('service-desk')).toEqual([
+      '/tickets',
+      // #7900 W3 — one entry per ticket type (filtered via the hash).
+      '/tickets#type=incident',
+      '/tickets#type=service_request',
+      '/tickets#type=problem',
+      '/tickets#type=change',
+      '/timesheet',
+    ]);
     expect(hrefsOf('fleet-management')).toEqual([
       '/devices/groups',
       // Parked devices awaiting assignment (full partner admins only).
@@ -120,7 +129,7 @@ describe('navSections structure (#1321, #1324)', () => {
 
   it('keeps every AI surface together and every platform-admin surface in Administration', () => {
     expect(hrefsOf('ai')).toEqual([
-      '/fleet', '/workspace', '/settings/ai-agents', '/ai-agents/runs', '/ai-agents/impact', '/ai-agents/fleet-design', '/settings/ai-usage', '/settings/ai-script-authoring', '/settings/tool-sources', '/ai-for-office',
+      '/fleet', '/workspace', '/settings/ai-agents', '/ai-agents/runs', '/ai-agents/impact', '/ai-agents/fix-memory', '/ai-agents/fleet-design', '/settings/ai-usage', '/settings/ai-script-authoring', '/settings/tool-sources', '/ai-for-office',
     ]);
     const admin = section('administration');
     expect(admin.items.length).toBeGreaterThan(0);

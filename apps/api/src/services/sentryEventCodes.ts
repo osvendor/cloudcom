@@ -94,7 +94,7 @@ export const SENTRY_EVENT_CODES = [
   /** The FX provider returned rows the sync could not use. */
   'exchange_rate_rows_rejected',
   /**
-   * One or more durable AI budget reservations (SEC-142/143) reached their TTL
+   * One or more durable AI budget reservations reached their TTL
    * without settling, so the expiry sweep reclaimed the capacity they were
    * holding. A reservation takes the organization's ENTIRE remaining cap, so
    * each of these is a window in which that tenant could not use AI at all —
@@ -224,6 +224,15 @@ export const SENTRY_EVENT_CODES = [
    */
   'ai_usage_snapshot_regressed',
   /**
+   * #7773: the pricing decision for an unbound BYOK refusal-fallback key could
+   * not be read or attested while SETTLING against a reservation (lock
+   * timeout, connection error). The key billed the bound rate instead; if the
+   * turn had already attested an offering rate, the ledger now disagrees with
+   * that attestation (or a retry hits a fingerprint conflict). Tags carry
+   * org_id + ai_reservation_id.
+   */
+  'ai_unbound_byok_rate_lookup_failed',
+  /**
    * Execution plane W04 (#5715): the sandbox backend's create circuit opened
    * after 5 consecutive failures — no analysis run can start in this region
    * until it closes.
@@ -231,6 +240,13 @@ export const SENTRY_EVENT_CODES = [
   'ai_workspace_breaker_open',
   /** A rejected partner AI key could not be stamped (config moved under us). */
   'ai_partner_key_error_stamp_stale',
+  /**
+   * AI model registry W08 (#7606): a partner without a registry row was
+   * bootstrapped onto the one Anthropic connection it already owned (only a
+   * deployment that skipped the W03 cutover release); its legacy model
+   * settings were never migrated.
+   */
+  'ai_registry_bootstrap_existing_connection',
   /**
    * Every in-memory AI session was mid-turn when the LRU cap was reached, so
    * nothing could be evicted and MAX_ACTIVE_SESSIONS was exceeded. Throttled by
@@ -264,6 +280,14 @@ export const SENTRY_EVENT_CODES = [
    * failing, so this is the only signal an operator gets.
    */
   'ai_agent_onlytools_unknown_name',
+  /**
+   * An AI chat tool call reached our handler without the SDK's tool_use id
+   * (`_meta['claudecode/toolUseId']`), so its result was paired by tool name
+   * instead (#7931). Reported once per session. Expected never to fire; if it
+   * does, the SDK/CLI stopped sending the id and same-name parallel calls can
+   * be mis-paired again.
+   */
+  'ai_tool_use_id_missing',
 
   // --- backup -----------------------------------------------------------
   /** A backup result matched no job row (deleted, or invisible under RLS). */
@@ -284,6 +308,19 @@ export const SENTRY_EVENT_CODES = [
    * would otherwise raise no alert on its own.
    */
   'tenant_erasure_refused_legal_hold',
+  /**
+   * Helper screenshot files could not be removed after their rows were
+   * deleted (org erasure, device purge, site delete) or by the orphan sweep
+   * (#8117). The rows are already gone, so the bytes are customer data with no
+   * owner left on disk until the next orphan sweep succeeds.
+   */
+  'screenshot_file_removal_failed',
+  /**
+   * Patch compliance report files could not be removed after their rows were
+   * deleted (org erasure) or by the retention job's orphan sweep. The bytes
+   * stay on disk with no row until a later sweep succeeds.
+   */
+  'patch_report_file_removal_failed',
 
   // --- agent binary serving ---------------------------------------------
   /** No promoted `agent_versions` row, so downloads fall back to the
@@ -297,6 +334,14 @@ export const SENTRY_EVENT_CODES = [
   'device_deletion_parent_lock_missing',
   /** Auto edition migration (#4072) dispatched its script to at least one stranded device this process lifetime. */
   'agent_edition_auto_migration_dispatched',
+  /** Auto edition migration (#5016): an org's canary device was dispatched and has not come back on the target edition, so the rest of the org is held. */
+  'agent_edition_auto_migration_canary_unresolved',
+
+  // --- restore checkpoint ledger (#4757) --------------------------------
+  /** An agent reported a restore-point status this API does not know (agent/API version skew); the ledger row stays `requested`. */
+  'restore_point_outcome_unknown_status',
+  /** An agent reported a restore-point outcome (other than skipped_disabled) for a request id the ledger has no row for. */
+  'restore_point_outcome_unrequested',
 
   // --- mcp transport ----------------------------------------------------
   /** A principal presented an `Mcp-Session-Id` owned by someone else (MED-1). */
@@ -334,7 +379,7 @@ export const SENTRY_EVENT_CODES = [
    *  but should be rare), or a caller is threading the wrong org. */
   'command_dispatch_cross_tenant_refused',
 
-  // --- remote desktop teardown (SEC-2026-09-05-038) ----------------------
+  // --- remote desktop teardown ----------------------
   /** `POST /remote/sessions/:id/end` marked the session terminal and revoked
    *  the viewer token, but the `stop_desktop` never reached the agent (the
    *  relay reported `offline`/`expired`/`owner_mismatch`/`indeterminate`).
@@ -348,6 +393,16 @@ export const SENTRY_EVENT_CODES = [
    *  `remote_desktop_stop_undelivered` because the actionable target is the
    *  relay (Redis/BullMQ), not the device. */
   'remote_desktop_stop_dispatch_failed',
+
+  // --- quotes / payments --------------------------------------------------
+  /** A public quote accept gave up waiting on the Stripe Checkout mint
+   *  (ACCEPT_CHECKOUT_TIMEOUT_MS) and sent the customer to the invoice page.
+   *  A run of these means Stripe (or the partner's account) is slow. */
+  'quote_accept_checkout_timeout',
+  /** #8603: a partner's stored `timezone` is not a zone Intl knows, so invoice
+   *  line work dates were computed in UTC instead (assembly never blocks on
+   *  it). Fix the partner's timezone setting; near-midnight lines may be a day off. */
+  'invoice_work_date_invalid_timezone',
 ] as const;
 
 /**

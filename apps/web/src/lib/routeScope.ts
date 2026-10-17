@@ -104,6 +104,7 @@ export const ROUTE_SCOPES: Array<{ pattern: RegExp; kind: RouteScopeKind }> = [
   // P2-6 (#4193): fleet value accounting — honours the org switcher (single
   // org) and aggregates across accessible orgs in All-organizations view.
   { pattern: /^\/ai-agents\/impact$/, kind: 'org-or-all' },
+  { pattern: /^\/ai-agents\/fix-memory$/, kind: 'org-or-all' },
   // Fleet Designer W03 (#5653): a Fleet Design belongs to exactly one org —
   // there is no fleet-wide aggregation of "what to watch on this device".
   // The page carries its own org picker (independent of the global switcher,
@@ -173,6 +174,8 @@ export const ROUTE_SCOPES: Array<{ pattern: RegExp; kind: RouteScopeKind }> = [
   // Public Quick Support landing page. The one-time code in the URL is the only
   // credential — an end user reaching it has no Breeze account at all.
   { pattern: /^\/quick$/, kind: 'auth' },
+  // Public caller-verification card. The URL token is the only credential.
+  { pattern: /^\/verify\/[^/]+$/, kind: 'auth' },
 ];
 
 function normalize(pathname: string): string {

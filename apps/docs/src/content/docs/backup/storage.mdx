@@ -63,9 +63,12 @@ The storage configuration wizard walks you through four steps:
      snapshot's own row stays deferred on that device's destination until every device sharing it has
      upgraded — update the agent to enable full reclamation.
 
-     Deleting a device or an organization also reclaims its backups: the underlying restore points are
-     removed immediately, and the storage sweep collects their now-unreferenced data once it has sat
-     idle for 9 days.
+     Permanently deleting (purging) a device or erasing an organization removes its restore points from
+     Breeze, but from v0.122.1 it does **not** reclaim their storage: the backup files stay in the storage
+     target, and the storage sweep never deletes them later, including data already past its retention
+     window. They are kept until an explicit backup-deletion feature ships. A legal hold on a snapshot,
+     on the backup policy it ran under, or in a configuration policy's backup settings blocks a device purge
+     (`409`, `BACKUP_PROTECTED`) and an organization erasure until the hold is released.
    </Aside>
 </Steps>
 
@@ -85,6 +88,24 @@ File backups are written to the target as one object per file, under a `snapshot
 On S3 storage the `.gz` suffix is only part of the object name. Expect an S3 target to use roughly as much space as the files you protect, and size buckets and quotas on that basis. If you download a file object directly from the bucket, it is the original file. Rename it to drop the `.gz` instead of running `gunzip` on it, which fails with `not in gzip format`.
 
 Breeze relies on this layout: restores, bare-metal recovery media, integrity verification and older agents all read S3 objects as raw bytes. Don't rename, compress or recompress objects in the bucket.
+
+### How destination credentials are stored
+
+From v0.121.0, the credentials in a storage configuration (access keys, secret keys, session tokens, and the equivalent Azure, Google Cloud Storage and Backblaze B2 fields) are stored encrypted with your instance's application encryption key. Bucket, region, endpoint and prefix stay readable. Existing configurations are encrypted by a background sweep on the first start after the upgrade, which logs one `[startup] Backup destination credentials sealed: …` line.
+
+<Aside type="caution" title="Roll forward only">
+  Once that sweep has run, do not roll back to a release older than v0.121.0. Older releases would hand the encrypted values to agents as storage credentials and S3 backups would fail. If you rotate `APP_ENCRYPTION_KEY`, follow [Secret Rotation](/security/secrets/#rotating-app-encryption-key); the re-encryption script covers these credentials.
+</Aside>
+
+### Recommended bucket settings for S3-compatible storage
+
+When backups go to a bucket you or your customer own on an S3-compatible service (AWS S3, Wasabi, Backblaze B2, iDrive e2 and similar), set the bucket up so that backup data cannot be silently removed with the same key Breeze uses to write it:
+
+- **Turn on Object Lock, or at least versioning.** Object Lock (often called immutable or WORM storage) keeps each object version for a retention period you choose, even if a delete request arrives. Most providers only let you enable it when the bucket is created, so decide before the first backup. If your provider or plan has no Object Lock, enable bucket versioning instead, so a deleted or overwritten object leaves a recoverable previous version.
+- **Add a lifecycle rule for old versions.** With Object Lock or versioning on, Breeze's retention sweep still sends deletes for expired restore points, but on a versioned bucket a delete only hides the object and the data is kept as a noncurrent version. Add a lifecycle rule that expires noncurrent versions after the number of days you want to keep them (no shorter than your Object Lock retention), or storage use keeps growing.
+- **Use a key scoped to that one bucket.** Create a dedicated access key for Breeze that can only reach the backup bucket (and, if you set one, its base path), with the object permissions listed above and nothing else: no access to other buckets, no permission to change bucket settings, Object Lock configuration or lifecycle rules, and no permission to bypass retention. If you use provider-enforced immutability on individual snapshots, the key also needs to read the bucket's Object Lock configuration and set object retention (`s3:GetBucketObjectLockConfiguration` and `s3:PutObjectRetention` on AWS).
+
+Breeze does not create buckets or manage these settings: it does not turn on Object Lock or versioning, write lifecycle rules, or create or scope access keys. Configure them in your storage provider's console. When Object Lock is already enabled on the bucket and a snapshot is made immutable with provider enforcement, by its backup policy or by hand (`POST /backup/snapshots/:id/immutability` with `"enforcement": "provider"`), Breeze places a Governance-mode retention date on that snapshot's objects. If the bucket does not have Object Lock enabled, the manual request is refused with `409`, and a policy-driven snapshot falls back to Breeze's own application-level immutability and records the reason on the snapshot (`immutabilityFallbackReason`).
 
 ---
 
@@ -114,8 +135,8 @@ Click the **Edit** action on any configuration to reopen the wizard. Changes are
 
 Click **Delete** on a configuration to remove it. Configurations that are actively referenced by a backup policy should have the policy reassigned first.
 
-<Aside type="caution" title="Known issue: destinations with job history">
-  In v0.120.0, deleting a configuration that has any backup job history fails with a server error. Disable it instead — reassign its policies, then set `"enabled": false` with `PATCH /backup/configs/:id` — rather than deleting it.
+<Aside type="caution" title="Destinations with job history">
+  A configuration that has any backup job history can't be deleted: Breeze returns `409` and names what blocks it (v0.120.0 returned a server error instead). Disable it — reassign its policies, then set `"enabled": false` with `PATCH /backup/configs/:id`.
 </Aside>
 
 <Aside type="caution">

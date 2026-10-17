@@ -30,7 +30,22 @@ export interface PlannedMigration {
  * planner never sees them and never applies them.
  */
 export function planMigrations(coreFilenames: string[]): PlannedMigration[] {
-  return coreFilenames.map((filename) => ({
+  const ordered = [...coreFilenames];
+  // This shipped CloudCom index predates its upstream column in filename order.
+  // Preserve its immutable SQL and ledger identity, but run it after the column
+  // on fresh databases. Existing installations still skip the applied ledger row.
+  const indexMigration = '2026-10-14-223000-cloudcom-monitor-lookup-indexes.sql';
+  const prerequisite = '2026-10-16-181300-monitor-coverage-kinds.sql';
+  const indexAt = ordered.indexOf(indexMigration);
+  if (indexAt >= 0) {
+    const prerequisiteAt = ordered.indexOf(prerequisite);
+    if (prerequisiteAt < 0) throw new Error(`Missing migration prerequisite: ${prerequisite}`);
+    if (indexAt < prerequisiteAt) {
+      ordered.splice(indexAt, 1);
+      ordered.splice(ordered.indexOf(prerequisite) + 1, 0, indexMigration);
+    }
+  }
+  return ordered.map((filename) => ({
     ledgerName: filename,
     filePath: path.join(resolveMigrationsDir(), filename),
   }));
@@ -175,6 +190,12 @@ export const CHECKSUM_RECONCILIATIONS: Record<
     to: 'e586cb0f8474e3a84d06638def12268896bba260d3c4568679e90935cc6e1a52',
     reason:
       "#3316: bound the two backfill projections with left(...) at the destination column widths. The original raises 22001 on a sites.contact / organizations.billing_contact value longer than varchar(255)/(320)/(64), which aborts the whole migration run. Equivalent for any DB that already applied the original: applying it successfully proves no value exceeded a limit, so left(...) would have returned those same strings unchanged — heal the recorded checksum rather than crashing the upgrade.",
+  },
+  '2026-12-12-120100-security-quarantine-execution-authority.sql': {
+    from: '1a2b018b817bf5e8a10b2b9efc02e68fec7d4f729a6fb1f6b0b2518a388386cc',
+    to: '70abfb92fbf75b96d5ed7788fdac76218403a71032ced4a4da853e7749641500',
+    reason:
+      'v0.122.1: SET CONSTRAINTS ALL IMMEDIATE after the grandfathering UPDATE. The UPDATE queues events on the deferred backup-settings parity trigger, so the ALTER TABLEs after it fail with "pending trigger events" on any DB with security feature links (v0.122.0 crash-looped there). The original only completed on DBs where the UPDATE matched no row, where firing zero pending events changes nothing; the hosted EU DB had the fixed file applied by hand under the original checksum. Heal the recorded checksum rather than crashing the upgrade.',
   },
 };
 

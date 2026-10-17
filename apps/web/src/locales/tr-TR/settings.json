@@ -120,8 +120,65 @@
     "revoked": "Anahtar iptal edildi",
     "revokeFailed": "Anahtar iptal edilemedi",
     "copyNow": "Bu anahtarı şimdi kopyalayın",
+    "copy": "Kopyala",
+    "copied": "Kopyalandı",
     "oneTimeWarning": "Bu düz metin anahtarı bir kez gösterilir ve daha sonra alınamaz.",
-    "done": "Bitti"
+    "done": "Bitti",
+    "owner": "Sahip",
+    "unknownOwner": "Bilinmeyen kullanıcı",
+    "ownerOnlyTooltip": "Yalnızca {{owner}} anahtar verebilir veya döndürebilir",
+    "ownerOnlyScopeTooltip": "Yalnızca {{owner}} kapsam ekleyebilir",
+    "ownerOnlyEditNotice": "Bu sorumluyu yeniden adlandırabilir, daraltabilir veya süresini kısaltabilirsiniz. Yalnızca {{owner}} kapsam ekleyebilir, süresini uzatabilir veya kaynak IP'lerini genişletebilir.",
+    "ownerOnlyWidening": "Yalnızca {{owner}} süreyi uzatabilir veya kaynak IP'lerini genişletebilir. Kaydetmek için bu değişiklikleri geri alın.",
+    "presetsHint": "Bir ön ayarla başlayın, ardından aşağıdaki kapsamları düzenleyin. Ön ayarlar yalnızca onay kutularını doldurur.",
+    "presets": {
+      "docs-sync": {
+        "label": "Salt okunur dokümantasyon / varlık eşitleme",
+        "description": "Kuruluşlara, sitelere, cihazlara, envantere, yapılandırmaya, betiklere, yedekleme yapılandırmasına ve özel alanlara okuma erişimi."
+      },
+      "provisioning": {
+        "label": "Kiracı sağlama",
+        "description": "Okuma kümesine ek olarak kuruluşları ve siteleri oluşturma ve kayıt anahtarları üretme. Kayıt anahtarları için son kullanma tarihi ve kaynak IP'ler gerekir."
+      },
+      "alert-feed": {
+        "label": "Uyarı akışı",
+        "description": "Kuruluşları ve uyarıları okuma."
+      },
+      "ticketing": {
+        "label": "Destek talebi entegrasyonu",
+        "description": "Kuruluşları okuma ile destek taleplerini okuma ve yazma."
+      },
+      "ai-mcp": {
+        "label": "AI / MCP istemcisi",
+        "description": "ai:read ile MCP erişimi. ai:write veya ai:execute kapsamlarını yalnızca istemcinin ihtiyacı varsa ekleyin."
+      },
+      "custom": {
+        "label": "Özel",
+        "description": "Seçimi temizleyin ve her kapsamı kendiniz seçin."
+      }
+    },
+    "scopeDescriptions": {
+      "organizations_read": "Sorumlunun erişebildiği tüm kuruluşların adları, slug'ları ve türleri.",
+      "sites_read": "Siteler (konumlar) ve ayrıntıları.",
+      "devices_read": "Cihaz kayıtları: ana bilgisayar adı, işletim sistemi, donanım ve grup üyeliği.",
+      "inventory_read": "Cihazlardan toplanan donanım ve yazılım envanteri.",
+      "configuration_read": "Yapılandırma ilkeleri ve atamaları.",
+      "scripts_read": "Betik içerikleri dahil betik kitaplığı girdileri.",
+      "backup-configuration_read": "Yedekleme yapılandırması ve zamanlamaları (yedek verileri değil).",
+      "custom-fields_read": "Özel alan tanımları ve cihazlarda ayarlanan değerler.",
+      "alerts_read": "Sorumlunun erişebildiği tüm kuruluşların uyarı başlıkları ve iletileri.",
+      "tickets_read": "Sorumlunun erişebildiği tüm kuruluşlardaki, müşteriler tarafından yazılan destek talebi konuları, açıklamaları ve yorumları.",
+      "device-status_read": "Canlı heartbeat durumu: çevrimiçi/çevrimdışı, son görülme zamanı ve aracı sürümü. devices:read içinde yer almaz.",
+      "organizations_write": "Kuruluş oluşturma. Güncelleme ve silme yapılamaz.",
+      "sites_write": "Site oluşturma. Güncelleme ve silme yapılamaz.",
+      "enrollment-keys_write": "Cihaz kayıt anahtarları oluşturma. Son kullanma tarihi ve en az bir kaynak IP veya CIDR gerekir.",
+      "contracts_write": "Sözleşme ve sözleşme satırlarını okuma, oluşturma ve düzenleme; satırları kaldırma. Etkinleştirme, duraklatma veya iptal yapılamaz.",
+      "tickets_write": "Destek taleplerini oluşturma, güncelleme, atama, durumunu değiştirme ve yorum ekleme. Talepler silinemez veya taşınamaz.",
+      "ai_read": "MCP uç noktasına bağlanma ve salt okunur araçları kullanma. Diğer tüm ai:* kapsamları için gereklidir.",
+      "ai_write": "Verileri değiştiren MCP araçları.",
+      "ai_execute": "Cihazlarda eylem çalıştıran MCP araçları.",
+      "ai_execute_admin": "Yönetim eylemleri çalıştıran MCP araçları. Yalnızca tamamen güvendiğiniz bir istemciye verin."
+    }
   },
   "language": {
     "title": "Dil",
@@ -230,6 +287,8 @@
       "add": "Bağlantı ekle",
       "edit": "Düzenle",
       "created": "Bağlantı eklendi",
+      "createdDiscoveryQueued": "Bağlantı eklendi. Modelleri şimdi keşfediliyor.",
+      "createdDiscoveryNotQueued": "Bağlantı eklendi ancak model keşfi sıraya alınamadı. Tekrar denemek için Yenile'yi kullanın.",
       "saved": "Bağlantı kaydedildi",
       "saveFailed": "Bağlantı kaydedilemedi.",
       "keyFailed": "API anahtarı değiştirilemedi.",
@@ -365,12 +424,14 @@
       "crossesFunding": "Bu yedek model farklı bir kaynaktan ödeniyor. Önce Breeze kredileri ile kendi API anahtarınız arasında yedeğe geçişe izin verin.",
       "egress_blocked": "Bu adrese izin verilmiyor.",
       "invalid_url": "Bu URL geçerli değil.",
+      "endpoint_unreachable": "Uç nokta ana bilgisayarı çözümlenemedi veya ona ulaşılamadı. Temel URL'yi kontrol edin.",
       "managed_by_env": "Bu bağlantı örneğin ortamı tarafından yönetiliyor ve burada değiştirilemez.",
       "connection_in_use": "Bir özellik hâlâ bu bağlantıdaki bir modeli kullanıyor. Önce başka bir varsayılan seçin.",
       "duplicate_model": "Bu model kimliği bu bağlantıda zaten var.",
       "geo_not_supported": "Bu bağlantı türü bir çıkarım bölgesi belirleyemez.",
       "key_required_for_new_endpoint": "Yeni URL için anahtarı girin (veya anahtarı kaldırın).",
-      "too_many_models": "Bu bağlantıda elle eklenen model sayısı zaten en fazla düzeyde."
+      "too_many_models": "Bu bağlantıda elle eklenen model sayısı zaten en fazla düzeyde.",
+      "not_removable": "Yalnızca elle eklenen modeller kaldırılabilir. Bunun yerine bu modeli devre dışı bırakın."
     },
     "org": {
       "title": "Varsayılan modeller",
@@ -456,6 +517,7 @@
     "offering": {
       "displayName": "Görünen ad",
       "displayNameHint": "Sağlayıcının adını kullanmak için boş bırakın. Model kimliği: {{modelId}}",
+      "envManaged": "Bu model MCP_LLM_* ortam değişkenleriyle yönetiliyor. Adı ve fiyatı orada belirlenir ve burada değiştirilemez.",
       "pricesTitle": "Fiyat",
       "pricesHint": "1 milyon token başına sent. Dördünü de doldurun veya fiyatsız bırakmak için hepsini boş bırakın (model etkinleştirilemez).",
       "prices": {
@@ -506,7 +568,12 @@
       "verify": "Doğrula",
       "verifyQueued": "Model denetimi sıraya alındı",
       "verifyFailed": "Model denetimi sıraya alınamadı.",
-      "verifyGatewayHint": "Uç noktanıza kısa bir araç çağırma testi uygular (birkaç bin token kullanır)."
+      "verifyGatewayHint": "Uç noktanıza kısa bir araç çağırma testi uygular (birkaç bin token kullanır).",
+      "remove": "Modeli kaldır",
+      "removeTitle": "Bu model kaldırılsın mı?",
+      "removeMessage": "“{{model}}” bu bağlantıdan silinecek. Geçmiş kullanım ve maliyet kayıtları korunur. Daha sonra yeniden ekleyebilirsiniz.",
+      "removed": "Model kaldırıldı",
+      "removeFailed": "Model kaldırılamadı. Yeniden deneyin."
     },
     "defaults": {
       "title": "Özellik başına varsayılanlar",
@@ -874,6 +941,8 @@
     "slackChannelPlaceholder": "#uyarılar",
     "pushoverDefaults": "Pushover Varsayılanlar",
     "pushoverDescription": "Eşleşme alanını boş bırakan herhangi bir kuruluş başına Pushover kanalı tarafından devralındı.",
+    "pushoverTicketAssignmentFallback": "Atanan kişinin Pushover anahtarı yoksa bilet atamalarını varsayılan anahtara gönder",
+    "pushoverTicketAssignmentFallbackHelp": "Her teknisyen profiline kendi Pushover kullanıcı anahtarını ekleyebilir; atamalar yalnızca ona ulaşır. Anahtarı olmayan teknisyenlerin atamalarını yukarıdaki varsayılan kullanıcı veya grup anahtarına göndermek için bunu açın.",
     "applicationToken": "Uygulama Jetonu",
     "defaultUserKey": "Varsayılan Kullanıcı veya Grup Anahtarı",
     "defaultSound": "Varsayılan Ses",
@@ -1159,7 +1228,9 @@
     "saved": "Giriş markası kaydedildi",
     "saveFailed": "Giriş markalaması kaydedilemedi",
     "title": "Giriş Yap",
-    "description": "Teknisyen giriş ekranını markalayın. Bu dağıtım tek bir ortağa çözümlendiğinde otomatik olarak gösterilir (tipik kendi kendine barındırılan kurulum).",
+    "description": "Teknisyen giriş ekranını markalayın. Bu dağıtım tek bir ortağa çözümlendiğinde otomatik olarak gösterilir (tipik kendi kendine barındırılan kurulum). Her iş ortağının ayrıca bunu her kurulumda gösteren kendi oturum açma sayfası (aşağıda) vardır.",
+    "signInPage": "Oturum açma sayfanız",
+    "signInPageHelp": "Bu bağlantıyı teknisyenlerinizle paylaşın. Markanızı ve SSO ile oturum açma düğmenizi, paylaşılan barındırılan kurulumlar dahil her kurulumda gösterir.",
     "loadFailed": "Mevcut markanız yüklenemedi; kaydetmeden önce sayfayı yeniden yükleyin, aksi takdirde mevcut ayarların üzerine yazabilirsiniz.",
     "logoUrl": "Logo URL'si",
     "logoPlaceholder": "https://cdn.example.com/logo.png",
@@ -1228,6 +1299,7 @@
     "fetchFailed": "Kayıt anahtarları alınamadı",
     "genericError": "Bir hata oluştu",
     "createFailed": "Kayıt anahtarı oluşturulamadı",
+    "expiresAtPast": "Son kullanma tarihi gelecekte olmalıdır.",
     "deleteFailed": "Kayıt anahtarı silinemedi",
     "deleted": "Kayıt anahtarı \"{{name}}\" silindi",
     "rotateFailed": "Kayıt anahtarı döndürülemedi",
@@ -1331,7 +1403,54 @@
       "invoice_number": "Fatura numarası",
       "due_date": "Vade tarihi",
       "invite_url": "Davet URL'si",
-      "cta_button": "Düğme"
+      "name": "Alıcının adı",
+      "inviter_name": "Davet edenin adı",
+      "expires_days": "Davetin sona ermesine kalan gün",
+      "cta_button": "Düğme",
+      "client_name": "Client name",
+      "setup_link": "Automatic payments setup link",
+      "ach_mode_text": "Available payment methods",
+      "payment_method": "Saved payment method",
+      "schedule_text": "Payment schedule",
+      "fee_text": "Processing fee terms",
+      "stopped_by": "Who stopped automatic payments",
+      "open_invoices_text": "Open invoice summary",
+      "expires_on": "Card expiry date",
+      "update_link": "Payment method update link",
+      "amount_due": "Ödenecek tutar",
+      "charge_date": "Tahsilat tarihi",
+      "fee_amount": "İşlem ücreti",
+      "invoice_link": "Fatura bağlantısı",
+      "amount_paid": "Ödenen tutar",
+      "total_charged": "Tahsil edilen toplam",
+      "paid_on": "Ödeme tarihi",
+      "balance_remaining": "Kalan bakiye",
+      "failure_text": "Hata ayrıntıları",
+      "action_link": "İşlem bağlantısı",
+      "action_label": "İşlem etiketi",
+      "days_overdue": "Gecikme günü",
+      "pay_link": "Ödeme bağlantısı",
+      "charge_total": "Toplam tahsilat",
+      "attempted_amount": "Denenen ödeme tutarı",
+      "approval_ask": "Onay talebi",
+      "approval_snapshot": "Onay rakamları",
+      "approval_expires": "Onay son tarihi",
+      "approval_status": "Onay durumu"
+    },
+    "billingPayments": "Billing & payments",
+    "supportPortal": "Support & portal",
+    "labels": {
+      "autopay_request": "Automatic payments request",
+      "autopay_enrolled": "Automatic payments confirmed",
+      "autopay_stopped": "Automatic payments stopped",
+      "autopay_paused": "Otomatik ödemeler duraklatıldı",
+      "autopay_resumed": "Otomatik ödemeler devam ediyor",
+      "card_expiring": "Saved card expiring",
+      "payment_receipt": "Çevrimiçi ödeme makbuzu",
+      "payment_failed": "Ödeme tamamlanamadı",
+      "ticket_approval_requested_approver": "İş onayı talebi (onaylayan)",
+      "ticket_approval_requested_notify": "İş onayı talebi (bilgi amaçlı)",
+      "ticket_approval_decided": "İş onayı kararı"
     }
   },
   "inboundEmail": {
@@ -1363,6 +1482,12 @@
     "dropDescription": "Bilet yok, inceleme kuyruğuna giriş yok, otomatik yanıt yok. Bir denetim satırı hâlâ kayıtlıdır. Eşlenmemiş spam'ı önceliklendirmenin ve inceleme kuyruğunun dışında tutmak için bunu kullanın.",
     "dropUnverified": "Gönderen kimlik doğrulamasını geçemeyen postaları bırakın (SPF/DKIM/DMARC)",
     "dropUnverifiedDescription": "Kapatıldığında, doğrulanmamış postalar incelenmek üzere karantinaya alınır. Açıkken sessizce bırakılır. Bu, <all>tümü</all> doğrulanmamış gönderenler için geçerlidir; bireysel mesajları kontrolde başarısız olan eşlenen müşteriler de dahil.",
+    "staffForwardRouting": "Personelin ilettiği e-postaları asıl gönderenin müşterisine kaydet",
+    "staffForwardRoutingDescription": "İş ortağı düzeyindeki personelinizden biri bir müşterinin e-postasını destek adresine ilettiğinde, yeni talep sizin kuruluşunuz yerine asıl gönderenin alan adıyla eşlenen kuruluşa kaydedilir. Personelin o kuruluşa erişimi olmalıdır. Yalnızca Gmail'de yapılan ve bağlı bir Gmail posta kutusuna ulaşan iletmelerde çalışır; yerel gelen adres, Microsoft 365 posta kutuları ve Outlook iletmeleri için çalışmaz.",
+    "defaultAssignee": "Yeni gelen talepler için varsayılan atanan kişi",
+    "defaultAssigneeDescription": "Gelen e-postadan oluşturulan her yeni talep, başka bir şekilde atanmadıysa bu kişiye atanır. Talebin kuruluşuna erişimi yoksa talep atanmamış kalır.",
+    "defaultAssigneeUnavailable": "Kullanılamayan kullanıcı",
+    "defaultAssigneeNotAssignable": "Bu kullanıcı varsayılan atanan kişi olamaz. Talep erişimi olan etkin bir ekip üyesi seçin.",
     "enableAutoresponse": "Yeni e-posta bildirimlerini onaylayan bir otomatik yanıt gönderin",
     "editEmailTemplates": "Onay e-postası E-posta şablonları altında düzenlenir.",
     "editEmailTemplatesLink": "E-posta şablonlarını düzenle",
@@ -1419,6 +1544,7 @@
     },
     "scopeMailbox": "Bu posta kutusunun kapsamını belirleyin (Uygulama Erişim Politikası)",
     "reauthRequired": "Microsoft 365 yoklama ve yanıtlara devam edilmeden önce yöneticinin yeniden onayı gereklidir.",
+    "pollFailing": "Bu posta kutusunun son {{failures}} denetimi geçici bir Microsoft 365 hatasıyla başarısız oldu. Breeze yeniden denemeye devam ediyor; Microsoft 365 yeniden yanıt verdiğinde yeni postalar alınacak.",
     "retest": "Yeniden test edin",
     "reconnect": "Yeniden bağlan",
     "disconnect": "Bağlantıyı kes",
@@ -1459,7 +1585,28 @@
     "namePlaceholder": "Destek",
     "connect": "Bağlan",
     "credentialOrg": "Kimlik bilgisi: {{org}} kuruluşunun Google Workspace bağlantısı",
-    "credentialOrgUnknown": "göremediğiniz bir kuruluş"
+    "credentialOrgUnknown": "göremediğiniz bir kuruluş",
+    "handling": {
+      "off": "Kapalı: posta, talebe dönüştükten sonra gelen kutusunda kalır.",
+      "onArchive": "Talebe dönüşen posta \"{{label}}\" Gmail etiketini alır ve gelen kutusundan arşivlenir.",
+      "onLabelOnly": "Talebe dönüşen posta \"{{label}}\" Gmail etiketini alır ve gelen kutusunda kalır.",
+      "edit": "Posta işlemeyi değiştir",
+      "labelField": "Talebe dönüşen posta için Gmail etiketi (kapatmak için boş bırakın)",
+      "labelPlaceholder": "Breeze/Talep",
+      "archiveField": "Ayrıca arşivle (gelen kutusundan kaldır)",
+      "scopeNote": "Etiketleme, kuruluşun alan genelinde yetkilendirmesinde bu ek kapsamı gerektirir. Posta okumak bunu gerektirmez, bu nedenle yoklama onsuz da çalışmaya devam eder.",
+      "saved": "Posta işleme kaydedildi",
+      "saveFailed": "Posta işleme kaydedilemedi.",
+      "error": {
+        "access_denied": "Etiketleme başarısız: Google erişimi reddetti. gmail.modify kapsamını alan genelinde yetkilendirmeye ekleyin.",
+        "rate_limited": "Etiketleme başarısız: Gmail hız sınırına ulaşıldı. Yeni postalar yeniden denenecek.",
+        "unavailable": "Etiketleme başarısız: Gmail zamanında yanıt vermedi. Yeni postalar yeniden denenecek.",
+        "label_invalid": "Etiketleme başarısız: bu etiket kullanılamaz. Farklı bir ad seçin.",
+        "no_credential": "Etiketleme başarısız: bu kuruluşun Google Workspace bağlantısı eksik veya etkin değil. Entegrasyonlar altında yeniden bağlayın.",
+        "not_queued": "Etiketleme atlandı: etiketleme kuyruğu kullanılamıyordu veya doluydu, bu nedenle bilete dönüşen bazı postalar etiketsiz olarak gelen kutusunda kaldı. Yeni postalar yeniden denenecek.",
+        "failed": "Etiketleme başarısız. Posta gelen kutusunda kalır."
+      }
+    }
   },
   "orgApprovalSecurityTab": {
     "title": "Onay Güvenliği",
@@ -1827,13 +1974,45 @@
           "label": "Donanım yaşam döngüsü",
           "description": "Müşterinizin cihazları için güncel değişim planını gösterir."
         },
+        "enableHardwareHealth": {
+          "label": "Donanım sağlığı",
+          "description": "Müşterinizin makinelerindeki bileşen sağlığını, olayları, diskleri ve pil durumunu gösterir."
+        },
+        "enableHardwareInventory": {
+          "label": "Donanım envanteri",
+          "description": "Müşterinizin makineleri için üretici, model, işlemci, bellek, ağ bağdaştırıcıları ve bağlantı sayılarını gösterir."
+        },
+        "enablePerformanceMetrics": {
+          "label": "Performans metrikleri",
+          "description": "Müşterinizin makineleri için CPU, bellek, disk ve ağ performansı eğilimlerini salt okunur olarak gösterir."
+        },
+        "enableSoftwareInventory": {
+          "label": "Yazılım envanteri",
+          "description": "Müşterinizin cihazlarındaki yazılımların adını, sürümünü, sağlayıcısını, kurulum tarihini ve son görülme zamanını gösterir."
+        },
         "enableNetworkVisibility": {
           "label": "Ağ görünürlüğü",
           "description": "Müşteri portalında ağ durumunu ve keşfedilen varlıkları salt okunur olarak gösterir."
         },
+        "enableEdrVisibility": {
+          "label": "Uç nokta koruması (EDR)",
+          "description": "Müşterilere genel bir “Yönetilen uç nokta koruması” durumunu ve bağlı EDR sağlayıcılarından gelen tehdit sayılarını gösterir. Sağlayıcı adları portalda asla gösterilmez."
+        },
         "enableNetworkAlerts": {
           "label": "Ağ uyarıları",
           "description": "Müşteri portalında ağ varlıklarındaki etkin uyarı sayısını ve bağlı açık talepleri gösterir."
+        },
+        "enablePatchDetail": {
+          "label": "Yama ayrıntısı",
+          "description": "Bu kuruluşun tüm portal girişlerine her cihazın bekleyen, yüklenen ve başarısız yamalarını (başlık, önem derecesi, sürüm, KB bağlantısı) gösterir. Hangi makinelerde yama eksik olduğunu açığa çıkarır. Tüm görünürlüğü etkinleştir seçeneğiyle açılmaz."
+        },
+        "enableVulnerabilityDetail": {
+          "label": "Güvenlik açığı ayrıntısı",
+          "description": "Bu kuruluşun her portal girişine, her cihazın CVE bulgularını ve önem derecesini gösterir (CVE kimliği, açıklama, önem derecesi, CVSS puanı, yama durumu, durum). Bu, hangi makinelerin savunmasız olduğunu ortaya çıkarır. Tüm görünürlüğü etkinleştir ile açılmaz."
+        },
+        "enableHourBlock": {
+          "label": "Destek saatleri",
+          "description": "Müşterinin destek kullanımı bölümünde ön ödemeli saat paketinin kullanılan ve kalan saatlerini gösterir. Destek kullanımı gerektirir. Tüm görünürlüğü etkinleştirdiğinizde açılmaz."
         }
       }
     },
@@ -2111,6 +2290,13 @@
     "failedToFetchReviewDetails": "İnceleme ayrıntıları getirilemedi",
     "noReviewerEmailsAvailableForNotifications": "Bildirimler için inceleme e-postası yok",
     "unableToLaunchEmailNotification": "E-posta bildirimi başlatılamıyor",
+    "reviewersEmailed": "Atanan gözden geçirici e-posta ile bilgilendirildi",
+    "assignedReviewerEmailedOnly": "Atanan gözden geçirici e-posta ile bilgilendirildi. Seçilen diğer gözden geçiriciler e-posta almadı — bir inceleme yalnızca tek bir atanmış gözden geçirici saklar.",
+    "fallbackToMailClient": "{{reason}} Bunun yerine e-posta istemciniz açılıyor.",
+    "fallbackEmailNotConfigured": "Bu sunucuda e-posta gönderimi yapılandırılmamış.",
+    "fallbackNoReviewerEmail": "Atanan gözden geçiricinin kayıtlı bir e-posta adresi yok.",
+    "fallbackSendFailed": "Sunucu e-postayı gönderemedi.",
+    "fallbackRequestFailed": "Bildirim isteği başarısız oldu.",
     "failedToCreateAccessReview": "Erişim incelemesi oluşturulamadı",
     "failedToUpdateDecision": "Karar güncellenemedi",
     "failedToFetchReviewForReport": "Rapor için inceleme getirilemedi",
@@ -2125,7 +2311,12 @@
     "sending": "Gönderiliyor...",
     "notifyReviewers": "İncelemecilere Bildir",
     "completing": "Tamamlanıyor...",
-    "completeReview": "İncelemeyi Tamamla"
+    "completeReview": "İncelemeyi Tamamla",
+    "selfDecided": "Kendi kararı",
+    "selfDecidedHint": "Başka hiçbir yönetici inceleyemediği için, ilgili kullanıcının kendisi tarafından karara bağlandı (tek yönetici istisnası).",
+    "ownItemBlocked": "Kendi erişiminiz hakkında karar veremezsiniz. Kullanıcı yönetimi yetkisi olan başka bir yönetici bu öğeyi incelemelidir.",
+    "ownItemBlockedShort": "Başka bir inceleyici gerekli",
+    "ownItemSelfDecisionWarning": "Bunu inceleyebilecek tek yönetici sizsiniz, bu yüzden kendi erişiminiz hakkında karar verebilirsiniz. Bu, kendi kararı olarak kaydedilecek."
   },
   "aiUsagePage": {
     "aIUsageBudget": "Yapay Zeka Kullanımı",
@@ -2287,7 +2478,8 @@
       "triage": "Yeni uyarıları inceler ve ne yapılacağını önerir.",
       "patch": "Eksik yamaları gözden geçirir ve nelerin kurulacağını önerir.",
       "helpdesk": "Talepleri üstlenir; yanıt ve sonraki adım önerir.",
-      "designer": "Tüm filoyu okur ve bir teknisyenin onaylaması için gerekçeli bir izleme tasarımı yazar."
+      "designer": "Tüm filoyu okur ve bir teknisyenin onaylaması için gerekçeli bir izleme tasarımı yazar.",
+      "research": "Yerleşik. Bir teknisyen istediğinde bir cihazdaki tek bir sorunu araştırır ve güvenli çözümler önerir. Asla bir şey çalıştırmaz."
     },
     "emptyState": {
       "title": "Henüz aracı yok",
@@ -2433,7 +2625,8 @@
       "triage": "Uyarı önceliklendirme",
       "patch": "Yama yönetimi",
       "helpdesk": "Yardım masası",
-      "designer": "Filo tasarımcısı"
+      "designer": "Filo tasarımcısı",
+      "research": "Çözüm araştırması"
     },
     "modes": {
       "off": "Kapalı",
@@ -2704,6 +2897,7 @@
           "blocked_by_app_rule": "Bir uygulama kuralı tarafından engellendi",
           "awaiting_manual_approval": "Manuel onay bekleniyor",
           "no_ring_resolved": "Cihazın güncelleme halkası yok",
+          "ring_reference_invalid": "İlkenin güncelleme halkası geçersiz",
           "device_not_in_org": "Cihaz bu organizasyona ait değil"
         },
         "failureClasses": {
@@ -3737,6 +3931,11 @@
           "blurb": "Tüm filoyu okur ve bir teknisyenin onaylaması için gerekçeli bir izleme tasarımı yazar.",
           "runsWhen": "bir kuruluş için Filo tasarımı başlattığınızda veya üç aylık bir zamanlamada",
           "recommended": "sıfırdan bir geçiş veya üç aylık bir yapılandırma denetimi"
+        },
+        "research": {
+          "blurb": "Yerleşik. Bir teknisyen istediğinde bir cihazdaki tek bir sorunu araştırır ve güvenli çözümler önerir. Asla bir şey çalıştırmaz.",
+          "runsWhen": "bir teknisyen bir cihaz sorunu için çözüm önerisi istediğinde",
+          "recommended": "her seferinde tek bir sorun için otomatik, salt okunur araştırma"
         }
       },
       "kindCard": {
@@ -3764,6 +3963,36 @@
       "title": "Bu aracı yalnızca okur ve rapor yazar",
       "body": "Bir Fleet Designer hiçbir zaman bir cihazda bir şey çalıştırmaz. Açık, çalışabileceği ve tasarımlarını seçtiğiniz alıcılara teslim edebileceği anlamına gelir.",
       "ack": "Bu aracının gözetimsiz çalıştığını ve Fleet Design teslim ettiğini anlıyorum."
+    },
+    "research": {
+      "capsTitle": "Araştırma limitleri",
+      "builtInNote": "Yerleşik ve yalnızca öneri sunar: hiçbir şey çalıştırmaz. Kapatabilir ve harcama limitlerini belirleyebilirsiniz.",
+      "caps": {
+        "maxConcurrentResearchRuns": {
+          "label": "Eşzamanlı araştırmalar",
+          "hint": "Aynı anda kaç araştırma çalışabilir."
+        },
+        "maxResearchRunsPerHour": {
+          "label": "Saatlik araştırma",
+          "hint": "Bir saatte başlatılan araştırmaların üst sınırı."
+        },
+        "maxAutoResearchRunsPerHour": {
+          "label": "Saatlik otomatik araştırma",
+          "hint": "Yüksek ve kritik uyarılardan otomatik başlatılan araştırmaların üst sınırı. 0 otomatik araştırmayı kapatır."
+        },
+        "researchQuickBudgetCentsPerRun": {
+          "label": "Hızlı araştırma bütçesi (sent)",
+          "hint": "Bir hızlı araştırma için harcama limiti."
+        },
+        "researchDeepBudgetCentsPerRun": {
+          "label": "Derin araştırma bütçesi (sent)",
+          "hint": "Bir derin araştırma için harcama limiti."
+        },
+        "maxBudgetCentsPerDay": {
+          "label": "Günlük araştırma harcaması (sent)",
+          "hint": "Bu ajanın tüm çalışmaları için günlük toplam harcama limiti."
+        }
+      }
     }
   },
   "apiKeyForm": {
@@ -4051,7 +4280,16 @@
     "partnerCurrencyUnavailable": "İş ortağınızın para birimi yüklenemedi.",
     "retry": "Yeniden dene",
     "priceCouldNotBeSavedRetry": "{{currency}} fiyatı kaydedilemedi. Yeniden deneyin.",
-    "priceCouldNotBeRemovedRetry": "{{currency}} fiyatı kaldırılamadı. Yeniden deneyin."
+    "priceCouldNotBeRemovedRetry": "{{currency}} fiyatı kaldırılamadı. Yeniden deneyin.",
+    "billing": "Faturalandırma",
+    "billingOneTime": "Tek seferlik",
+    "billingRecurring": "Yinelenen",
+    "billingFrequency": "Sıklık",
+    "frequencyMonthly": "Aylık",
+    "frequencyAnnual": "Yıllık",
+    "commitmentTerm": "Taahhüt süresi (ay)",
+    "commitmentTermPlaceholder": "ör. 12",
+    "commitmentTermRange": "Taahhüt süresi: 1 ile 120 ay arasında bir tam sayı girin."
   },
   "catalogItemsTab": {
     "itemArchived": "Öğe arşivlendi",
@@ -4151,7 +4389,8 @@
     "sessionInvalid": "Bağlantı tamamlanmadan oturumunuz değiştirildi. Lütfen tekrar oturum açın ve tekrar deneyin.",
     "providerInactive": "Bu tek oturum açma sağlayıcısı artık etkin değil. Yöneticinizle iletişime geçin.",
     "configChanged": "Bağlanırken tek oturum açma yapılandırması değişti. Lütfen tekrar deneyin.",
-    "emailUnverified": "Kimlik sağlayıcınız e-posta adresinizin doğrulandığını onaylamadı. Yöneticinizle iletişime geçin."
+    "emailUnverified": "Kimlik sağlayıcınız e-posta adresinizin doğrulandığını onaylamadı. Yöneticinizle iletişime geçin.",
+    "idpVerifyFailed": "Breeze, kimlik sağlayıcınızın döndürdüğü oturum açmayı doğrulayamadı. Lütfen tekrar deneyin."
   },
   "connectedAppsList": {
     "loadingConnectedApps": "Bağlı uygulamalar yükleniyor…",
@@ -4352,6 +4591,7 @@
     "ssoReauthProviderInactive": "Çoklu oturum açma bu hesap için artık kullanılamıyor. Yöneticinize danışın, sonra tekrar deneyin.",
     "ssoReauthConfigChanged": "Doğrulama sırasında çoklu oturum açma ayarlarınız değişti. Doğrulamayı yeniden başlatın.",
     "ssoReauthEmailUnverified": "Kimlik sağlayıcınız e-posta adresinizin doğrulanmadığını bildiriyor. Adresi orada doğrulayıp tekrar deneyin.",
+    "ssoReauthIdpVerifyFailed": "Breeze, kimlik sağlayıcınızın döndürdüğü oturum açmayı doğrulayamadı. Tekrar deneyin. Sorun devam ederse yöneticinizden sunucu günlüklerini kontrol etmesini isteyin.",
     "ssoReauthProofExpired": "Kimlik sağlayıcısı doğrulamanızın süresi doldu. Çok faktörlü kimlik doğrulama kurulumunu tamamlamak için yeniden doğrulayın.",
     "thisAccountSignsInThroughAnIdentityProviderVerifyBeforeAddingAPasskey": "Bu hesap bir kimlik sağlayıcı üzerinden oturum açıyor ve parolası yok. Geçiş anahtarı eklemeden önce sağlayıcınızda yeniden doğrulayın.",
     "yourIdentityIsVerifiedNameThisPasskeyAndContinue": "Kimliğiniz doğrulandı. Bu geçiş anahtarına bir ad verin ve devam edin.",
@@ -5389,7 +5629,8 @@
     "loading": "Bilet ayarları yükleniyor…",
     "errors": {
       "load": "Bilet ayarları yüklenemedi.",
-      "save": "Bilet ayarları kaydedilemedi"
+      "save": "Bilet ayarları kaydedilemedi",
+      "savedApprovalFailed": "Talep ayarları kaydedildi, ancak müşteri onay politikası kaydedilemedi"
     },
     "toasts": {
       "saved": "Bilet ayarları kaydedildi"
@@ -5415,6 +5656,28 @@
       "inherit": "Devral",
       "billableOption": "Faturalandırılabilir",
       "nonBillableOption": "Faturalandırılamaz"
+    },
+    "approval": {
+      "title": "Müşteri iş onayı",
+      "description": "Bu kuruluş için iş ortağı varsayılanını geçersiz kılar. İş ortağı varsayılanını kullanmak için Devral’ı seçin.",
+      "enabled": "Müşteri onayı iste",
+      "budgetTrigger": "Bir talep bütçesi aşılacağında sor",
+      "afterHoursTrigger": "Mesai dışı iş için sor",
+      "enforcement": "Uygulama",
+      "enforcementSoft": "Esnek (uyar, kayda izin ver)",
+      "enforcementHard": "Katı (onaylanana kadar engelle)",
+      "ttl": "Onay isteği şu süre sonra sona erer (saat)",
+      "ttlRange": "Sona erme süresi {{min}} ile {{max}} saat arasında olmalıdır",
+      "on": "Açık",
+      "off": "Kapalı",
+      "inherit": "Devral",
+      "inheritValue": "Devral ({{value}})",
+      "clear": "Geçersiz kılmayı kaldır (devral)",
+      "pendingInherit": "Kaydettikten sonra varsayılanı devralacak",
+      "loadFailed": "Müşteri onayı ayarları yüklenemedi.",
+      "sourceOrg": "Kuruluş geçersiz kılması",
+      "sourcePartner": "İş ortağı varsayılanı",
+      "sourceDefault": "Yerleşik varsayılan"
     }
   },
   "organizationForm": {
@@ -5666,7 +5929,8 @@
       "title": "Adres"
     },
     "actions": {
-      "saveChanges": "Değişiklikleri kaydet"
+      "saveChanges": "Değişiklikleri kaydet",
+      "sendMessage": "Mesaj gönder"
     },
     "policies": {
       "assignedTitle": "Atanan Politikalar",
@@ -5862,7 +6126,12 @@
       "messagePrefix": "Silmek istediğinizden emin misiniz?",
       "messageSuffix": "Bu, alan tanımını ve cihazlarda depolanan tüm değerleri kaldıracaktır."
     },
-    "typeFilterLabel": "Alan türü"
+    "typeFilterLabel": "Alan türü",
+    "toasts": {
+      "created": "Özel alan oluşturuldu",
+      "updated": "Özel alan güncellendi",
+      "deleted": "Özel alan silindi"
+    }
   },
   "knownGuestsSettings": {
     "title": "Bilinen Misafirler",
@@ -5960,6 +6229,7 @@
     "accessDenied": "Kullanıcıları görüntüleme izniniz yok.",
     "title": "Kullanıcılar",
     "description": "Kullanıcı erişimini, rollerini ve izinlerini yönetin.",
+    "sessionTimeoutPointer": "Oturum boşta kalma zaman aşımı Güvenlik bölümünden yapılandırılır",
     "never": "Hiçbir zaman",
     "actions": {
       "tryAgain": "Tekrar deneyin",
@@ -6103,9 +6373,34 @@
     "mergeGapLabel": "Birleştirme aralığı (dakika)",
     "save": "Kaydet",
     "saved": "Zaman takibi ayarları kaydedildi",
+    "loadFailed": "Kayıtlı ayarlar yüklenemedi. Yüklenene kadar kaydetme devre dışıdır; yeniden denemek için sayfayı yenileyin.",
     "saveFailed": "Zaman takibi ayarları kaydedilemedi",
     "minSessionRange": "Minimum oturum süresi {{min}} ile {{max}} saniye arasında olmalıdır",
-    "mergeGapRange": "Birleştirme aralığı {{min}} ile {{max}} dakika arasında olmalıdır"
+    "mergeGapRange": "Birleştirme aralığı {{min}} ile {{max}} dakika arasında olmalıdır",
+    "locationEnabledLabel": "Bir teknisyen müşteri sahasına vardığında zamanlayıcı öner",
+    "locationHelp": "Her teknisyenin ayrıca telefonunda konum erişimine izin vermesi gerekir. Konum telefonda denetlenir ve asla Breeze’e gönderilmez.",
+    "radiusLabel": "Varsayılan varış yarıçapı (m)",
+    "radiusRange": "Varış yarıçapı {{min}} ile {{max}} metre arasında olmalıdır",
+    "approval": {
+      "heading": "Müşteri iş onayı",
+      "description": "İş, müşterinin bütçesine veya mesai saatleri dışına kaydedilmeden önce müşteriden onay iste. Bu, iş ortağı varsayılanıdır; kuruluşlar bunu geçersiz kılabilir.",
+      "enabledLabel": "İş için müşteri onayı iste",
+      "budgetTriggerLabel": "Bir talep bütçesi aşılacağında sor",
+      "afterHoursTriggerLabel": "Mesai dışı iş için sor",
+      "enforcementLabel": "Uygulama",
+      "enforcementSoft": "Esnek (uyar, kayda izin ver)",
+      "enforcementHard": "Katı (onaylanana kadar engelle)",
+      "ttlLabel": "Onay isteği şu süre sonra sona erer (saat)",
+      "ttlRange": "Sona erme süresi {{min}} ile {{max}} saat arasında olmalıdır",
+      "readOnly": "Bu ilkeyi değiştirmek için iş ortağı genelinde ayar yetkisine ihtiyacınız var. Geçerli değerler gösteriliyor.",
+      "loadFailed": "Müşteri onayı ayarları yüklenemedi.",
+      "source": {
+        "org": "Kuruluş",
+        "partner": "İş ortağı",
+        "default": "Varsayılan"
+      }
+    },
+    "savedApprovalFailed": "Zaman ayarları kaydedildi, ancak müşteri onay politikası kaydedilemedi"
   },
   "contactsCard": {
     "title": "Kişiler",
@@ -6349,7 +6644,10 @@
     },
     "stepUp": {
       "title": "Sizin olduğunuzu doğrulayın",
-      "body": "Gözetimsiz çalıştırmaları etkinleştirmek yeni bir güvenlik kontrolü gerektirir."
+      "body": "Gözetimsiz çalıştırmaları etkinleştirmek yeni bir güvenlik kontrolü gerektirir.",
+      "ceilingBody": "Kuruluşlarınız için gözetimsiz çalıştırmalara izin vermek veya bunları genişletmek yeni bir güvenlik denetimi gerektirir. Onaylayın, ardından Kaydet'i yeniden seçin.",
+      "wideningBody": "Gözetimsiz çalıştırmaların yapabileceklerini genişletmek yeni bir güvenlik denetimi gerektirir. Onaylayın, ardından Kaydet'i yeniden seçin.",
+      "noFactor": "Bu değişiklik bir güvenlik denetimi gerektirir, ancak hesabınızda kimlik doğrulayıcı uygulaması veya geçiş anahtarı yok. Profilinizden birini ayarlayıp yeniden deneyin."
     },
     "save": "Kaydet",
     "saving": "Kaydediliyor…",
@@ -6385,7 +6683,8 @@
     "nameTaken": "Bu ada sahip bir iş türü zaten var.",
     "rename": "Yeniden adlandır",
     "loadError": "İş türleri yüklenemedi.",
-    "empty": "Henüz iş türü yok. İlk iş türünüzü yukarıdan ekleyin."
+    "empty": "Henüz iş türü yok. İlk iş türünüzü yukarıdan ekleyin.",
+    "afterHours": "Mesai dışı (etkinse müşteri onayı gerektirir)"
   },
   "ticketCategories": {
     "defaultWorkType": "Varsayılan iş türü",
@@ -6462,5 +6761,19 @@
     "sourceDefault": "ürün varsayılanı",
     "range": "{{min}}-{{max}} dakika arasında seçin.",
     "save": "Kaydet"
+  },
+  "ticketPushover": {
+    "title": "Bilet atamaları için Pushover",
+    "description": "Size bir bilet atandığında bildirim almak için Pushover kullanıcı anahtarınızı ekleyin. Bildirimi yalnızca siz alırsınız. MSP'nizin Bildirimler altında bir Pushover uygulama belirteci ayarlamış olması gerekir.",
+    "statusSet": "Bir Pushover anahtarı kayıtlı.",
+    "statusNotSet": "Kayıtlı Pushover anahtarı yok.",
+    "placeholder": "30 karakterlik Pushover kullanıcı anahtarı",
+    "save": "Anahtarı kaydet",
+    "remove": "Anahtarı kaldır",
+    "saved": "Pushover anahtarı kaydedildi.",
+    "removed": "Pushover anahtarı kaldırıldı.",
+    "invalidKey": "Pushover kullanıcı anahtarı 30 harf veya rakamdan oluşur.",
+    "loadFailed": "Pushover ayarınız yüklenemedi.",
+    "saveFailed": "Pushover ayarınız kaydedilemedi."
   }
 }

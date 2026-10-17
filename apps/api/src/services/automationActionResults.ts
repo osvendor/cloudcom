@@ -400,6 +400,28 @@ async function reconcileInCurrentContext(
   }).from(automationRuns).where(eq(automationRuns.id, runId)).limit(1).for('update');
   if (!run) return [];
 
+  if (run.status === 'cancelled') {
+    // #8104 — a device whose `pending` result row was seeded but whose action
+    // rows never were (the cancel committed between the two seeds) can never
+    // gain an action row now: `seedAutomationActionResults` refuses to insert
+    // for a cancelled run. Nothing else would ever close it, and a `pending`
+    // device row keeps the run aggregate `running`, so the cancelled run would
+    // never get its completed_at. Settle it here, under the run lock.
+    await db.update(automationRunDeviceResults).set({
+      status: 'cancelled',
+      completedAt: new Date(),
+      updatedAt: new Date(),
+    }).where(and(
+      eq(automationRunDeviceResults.runId, runId),
+      eq(automationRunDeviceResults.status, 'pending'),
+      sql`NOT EXISTS (
+        SELECT 1 FROM automation_action_results aar
+        WHERE aar.run_id = ${automationRunDeviceResults.runId}
+          AND aar.device_id = ${automationRunDeviceResults.deviceId}
+      )`,
+    ));
+  }
+
   const actionRows = await db.select({
     id: automationActionResults.id,
     deviceId: automationActionResults.deviceId,
@@ -591,18 +613,43 @@ async function reconcileInCurrentContext(
   return buildPublications(aggregate.status);
 }
 
+/**
+ * Seed one `pending` ledger row per action for one device of a run.
+ *
+ * #8104 — the seed is itself a dispatch-side write, so it is FENCED against a
+ * run-wide cancel in the same transaction as the insert. `cancelAutomationRun`
+ * terminalises only rows that are `pending` when it commits; a row inserted
+ * after that commit would sit `pending` forever, since the runtime's next
+ * fence check just stops dispatching. The runtime's own pre-seed check runs in
+ * an earlier transaction and cannot close that window, so the run row is read
+ * here `FOR KEY SHARE`, which conflicts with the cancel's `FOR UPDATE`: either
+ * this seed commits first and the cancel's sweep sees its rows, or the cancel
+ * commits first and this returns `run_cancelled` without inserting anything.
+ * The run row is locked BEFORE the device row, matching the run-before-action
+ * order every other dispatch path uses.
+ */
 export async function seedAutomationActionResults(input: {
   trigger?: RemediationTrigger;
   runId: string;
   device: { id: string; orgId: string };
   actions: Array<{ actionIndex: number; actionType: string }>;
-}): Promise<void> {
+}): Promise<'seeded' | 'run_cancelled'> {
   const indexes = new Set(input.actions.map((action) => action.actionIndex));
   if (indexes.size !== input.actions.length) throw new Error('Automation action indexes must be unique per device');
   if (input.actions.some((action) => action.actionIndex < 0)) throw new Error('Automation action indexes must be non-negative');
-  if (input.actions.length === 0) return;
+  if (input.actions.length === 0) return 'seeded';
 
-  await inDeliberateSystemContext(async () => {
+  return inDeliberateSystemContext(async () => {
+    const runRows = await db.execute(sql`
+      SELECT status
+      FROM automation_runs
+      WHERE id = ${input.runId}::uuid
+      FOR KEY SHARE
+    `) as unknown as Array<{ status: string }>;
+    const run = runRows[0];
+    if (!run) throw new Error(`Automation run ${input.runId} not found`);
+    if (run.status === 'cancelled') return 'run_cancelled' as const;
+
     const locked = await db.execute(sql`
       SELECT id, org_id
       FROM devices
@@ -640,6 +687,7 @@ export async function seedAutomationActionResults(input: {
         throw new Error(`Automation action seed conflict at index ${action.actionIndex}`);
       }
     }
+    return 'seeded' as const;
   });
 }
 
@@ -689,6 +737,8 @@ export async function recordAutomationActionDispatch(input: {
 /** #3189 — what a replaying attempt needs to reuse an already-claimed action. */
 export type AutomationActionLedgerState = {
   status: AutomationActionResultStatus;
+  /** Who terminalised the row; `dispatch` means the runtime's own dispatch path. */
+  terminalSource: AutomationActionTerminalSource | null;
   commandId: string | null;
   scriptExecutionId: string | null;
   deploymentResultId: string | null;
@@ -706,6 +756,7 @@ async function readLedgerStates(
   const rows = await db.select({
     deviceId: automationActionResults.deviceId,
     status: automationActionResults.status,
+    terminalSource: automationActionResults.terminalSource,
     commandId: automationActionResults.commandId,
     scriptExecutionId: automationActionResults.scriptExecutionId,
     deploymentResultId: automationActionResults.deploymentResultId,
@@ -827,6 +878,53 @@ export async function claimAutomationActionDispatches(input: {
     claims.alreadyClaimed.set(deviceId, after);
   }
   return claims;
+}
+
+/**
+ * #7188 — claim the on-failure notification for one failed action.
+ *
+ * A single compare-and-swap: the UPDATE that sets `failure_notified_at` is the
+ * statement that decides to send, so of any number of attempts of the same run
+ * (a first attempt, a stalled-job replay, two of them racing) exactly one wins
+ * and sends. Returns `claimed` when this caller won and must send,
+ * `already_claimed` when another attempt did, and `missing` when the action
+ * has no ledger row (nothing can deduplicate the send, so the caller must not
+ * send and should report it).
+ *
+ * Claimed before sending, and never released: a worker that dies after this
+ * commits but before the channel accepts the message, or a send the channel
+ * rejects, still loses that alert. The claim narrows the crash window to the
+ * claim statement to the send, not (as before) everything between recording
+ * the failure and sending. Delivery retries are not this claim's job.
+ *
+ * Always runs in its own system-scoped transaction (never an ambient one), and
+ * locks only this one action row, so it cannot join the run-then-action lock
+ * order described at `lockRunForLedgerWrite`. Callers invoke it after the
+ * dispatch transaction that held this row's lock has committed. Deliberately
+ * leaves `updated_at` alone: it orders the action reaper, and a notification
+ * claim is not a ledger state change.
+ */
+export async function claimAutomationFailureNotification(input: {
+  runId: string;
+  deviceId: string;
+  actionIndex: number;
+}): Promise<'claimed' | 'already_claimed' | 'missing'> {
+  return runOutsideDbContext(() => withSystemDbAccessContext(async () => {
+    const where = and(
+      eq(automationActionResults.runId, input.runId),
+      eq(automationActionResults.deviceId, input.deviceId),
+      eq(automationActionResults.actionIndex, input.actionIndex),
+    );
+    const won = await db.update(automationActionResults)
+      .set({ failureNotifiedAt: new Date() })
+      .where(and(where, isNull(automationActionResults.failureNotifiedAt)))
+      .returning({ id: automationActionResults.id });
+    if (won.length === 1) return 'claimed';
+    // Lost the CAS, or there is no row to claim. Only the first is a dedupe.
+    const [row] = await db.select({ id: automationActionResults.id })
+      .from(automationActionResults).where(where).limit(1);
+    return row ? 'already_claimed' : 'missing';
+  }));
 }
 
 /** #3189 — single-device form of `claimAutomationActionDispatches`. */

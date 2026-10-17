@@ -1,5 +1,6 @@
-import { isPolicyFeatureAbsentInSnapshot, readPolicyDevice, readPolicyOrganization, readPolicyGroups } from '../devicePolicyReadSnapshot';
-import { and, eq, inArray, or } from 'drizzle-orm';
+import { and, asc, eq, inArray, or } from 'drizzle-orm';
+import { hierarchyFor } from '../deviceHierarchy';
+import { candidatesWithLink, policySetFor, type ApplicabilityRule, type DevicePolicySetOpts } from '../devicePolicySet';
 import { z } from 'zod';
 import {
   timeSyncInlineSettingsSchema,
@@ -11,10 +12,12 @@ import {
   configPolicyEffectiveFeatureLinks,
   configPolicyTimeSyncSettings,
   configurationPolicies,
+  devices,
+  deviceGroupMemberships,
+  organizations,
 } from '../../db/schema';
 import {
   policyOwnershipCondition,
-  withDevicePartnerPolicyVisibility,
 } from '../configPolicyOwnership';
 import {
   buildRoleOsFilterConditions,
@@ -51,13 +54,83 @@ const cacheSchema = z
   })
   .strict();
 
+const TIME_SYNC_APPLICABILITY: ApplicabilityRule = { ownership: 'orgOrPartner', partnerTarget: 'partner', roleOs: 'sql' };
+
+type TimeSyncRankRow = {
+  policyId: string; policyName: string | null; level: string; assignmentPriority: number; assignmentCreatedAt: Date;
+  roleFilter: readonly string[] | null; osFilter: readonly string[] | null;
+  enforceNtp: boolean; ntpServers: string[]; pollIntervalMinutes: number;
+  timezoneExpected: 'site' | 'pinned'; pinnedTimezone: string | null; timezoneAutoFix: boolean;
+};
+
+function timeSyncFromRows(orgId: string, rows: TimeSyncRankRow[], device: { deviceRole: string; osType: string }): ResolvedTimeSyncSettings {
+  const eligible = rows.filter((row) => matchesRoleOsFilter(row, device));
+  eligible.sort(
+    (a, b) =>
+      (levelPriority[b.level] ?? 0) - (levelPriority[a.level] ?? 0) ||
+      a.assignmentPriority - b.assignmentPriority ||
+      a.assignmentCreatedAt.getTime() - b.assignmentCreatedAt.getTime(),
+  );
+  const winner = eligible[0];
+  if (!winner) return { orgId, settings: timeSyncInlineSettingsSchema.parse({}), policy: null };
+  const settings = timeSyncInlineSettingsSchema.parse({
+    enforceNtp: winner.enforceNtp,
+    ntpServers: winner.ntpServers,
+    pollIntervalMinutes: winner.pollIntervalMinutes,
+    timezone: { expected: winner.timezoneExpected, pinnedTimezone: winner.pinnedTimezone, autoFix: winner.timezoneAutoFix },
+  });
+  return {
+    orgId,
+    settings,
+    policy: { policyId: winner.policyId, policyName: winner.policyName, expected: settings.timezone.expected, pinnedTimezone: settings.timezone.pinnedTimezone },
+  };
+}
+
 export async function resolveDeviceTimeSyncSettings(
   deviceId: string,
+  opts?: DevicePolicySetOpts,
 ): Promise<ResolvedTimeSyncSettings> {
-  const device = await readPolicyDevice(deviceId);
+  const passed = hierarchyFor(deviceId, opts);
+  const set = policySetFor(deviceId, opts);
+  if (set) {
+    return timeSyncFromRows(set.hierarchy.orgId, candidatesWithLink(set, 'time_sync', TIME_SYNC_APPLICABILITY).flatMap(({ candidate, link }) =>
+      link.timeSync
+        ? [{
+          policyId: candidate.policyId, policyName: candidate.policyName, level: candidate.level,
+          assignmentPriority: candidate.priority, assignmentCreatedAt: candidate.assignmentCreatedAt,
+          roleFilter: candidate.roleFilter, osFilter: candidate.osFilter,
+          enforceNtp: link.timeSync.enforceNtp, ntpServers: link.timeSync.ntpServers,
+          pollIntervalMinutes: link.timeSync.pollIntervalMinutes, timezoneExpected: link.timeSync.timezoneExpected,
+          pinnedTimezone: link.timeSync.pinnedTimezone, timezoneAutoFix: link.timeSync.timezoneAutoFix,
+        }]
+        : []), set.hierarchy);
+  }
+  const [device] = passed
+    ? [{ orgId: passed.orgId, siteId: passed.siteId, deviceRole: passed.deviceRole, osType: passed.osType }]
+    : await db
+      .select({
+        orgId: devices.orgId,
+        siteId: devices.siteId,
+        deviceRole: devices.deviceRole,
+        osType: devices.osType,
+      })
+      .from(devices)
+      .where(eq(devices.id, deviceId))
+      .limit(1);
   if (!device) throw new Error('Time sync device not visible');
-  const org = await readPolicyOrganization(deviceId, device.orgId);
-  const groups = await readPolicyGroups(deviceId);
+  const [org] = passed
+    ? (passed.org ? [{ partnerId: passed.org.partnerId }] : [])
+    : await db
+      .select({ partnerId: organizations.partnerId })
+      .from(organizations)
+      .where(eq(organizations.id, device.orgId))
+      .limit(1);
+  const groups = passed
+    ? passed.groupIds.map((groupId) => ({ groupId }))
+    : await db
+      .select({ groupId: deviceGroupMemberships.groupId })
+      .from(deviceGroupMemberships)
+      .where(eq(deviceGroupMemberships.deviceId, deviceId));
   const targets = [
     and(
       eq(configPolicyAssignments.level, 'device'),
@@ -92,18 +165,11 @@ export async function resolveDeviceTimeSyncSettings(
         ),
       ),
     );
-  // Same visibility rule as the hardware-monitoring resolver (routes/agents/helpers.ts):
-  // an org-scoped caller (device view, agent ingest) cannot see partner-wide policy rows
-  // without widening to the device's own partner. partnerId comes from the org row read
-  // above under the caller's RLS context, never from input.
-  if (await isPolicyFeatureAbsentInSnapshot(deviceId, 'time_sync')) {
-    return { orgId: device.orgId, settings: timeSyncInlineSettingsSchema.parse({}), policy: null };
-  }
-  const rows = await withDevicePartnerPolicyVisibility(
-    db,
-    org?.partnerId ?? null,
-    (executor) =>
-      executor
+  // #8142: read in the caller's own context. config_policy_time_sync_settings
+  // carries the SELECT-only partner-wide branch, so a context with
+  // currentPartnerId (the agent heartbeat, every user context) sees its own
+  // partner's partner-wide rows without widening accessible_partner_ids.
+  const rows = await db
         .select({
           policyId: configurationPolicies.id,
           policyName: configurationPolicies.name,
@@ -154,49 +220,24 @@ export async function resolveDeviceTimeSyncSettings(
               osType: device.osType,
             }),
           ),
-        ),
-  );
-  const eligible = rows.filter((row) => matchesRoleOsFilter(row, device));
-  eligible.sort(
-    (a, b) =>
-      (levelPriority[b.level] ?? 0) - (levelPriority[a.level] ?? 0) ||
-      a.assignmentPriority - b.assignmentPriority ||
-      // Same tie-break as resolveEffectiveConfig (services/configurationPolicy.ts ~2554).
-      a.assignmentCreatedAt.getTime() - b.assignmentCreatedAt.getTime(),
-  );
-  const winner = eligible[0];
-  if (!winner)
-    return {
-      orgId: device.orgId,
-      settings: timeSyncInlineSettingsSchema.parse({}),
-      policy: null,
-    };
-  const settings = timeSyncInlineSettingsSchema.parse({
-    enforceNtp: winner.enforceNtp,
-    ntpServers: winner.ntpServers,
-    pollIntervalMinutes: winner.pollIntervalMinutes,
-    timezone: {
-      expected: winner.timezoneExpected,
-      pinnedTimezone: winner.pinnedTimezone,
-      autoFix: winner.timezoneAutoFix,
-    },
-  });
-  return {
-    orgId: device.orgId,
-    settings,
-    policy: {
-      policyId: winner.policyId,
-      policyName: winner.policyName,
-      expected: settings.timezone.expected,
-      pinnedTimezone: settings.timezone.pinnedTimezone,
-    },
-  };
+        )
+        .orderBy(asc(configPolicyAssignments.createdAt), asc(configPolicyAssignments.id));
+  return timeSyncFromRows(device.orgId, rows, device);
 }
 
 export async function getDeviceTimeSyncSettings(
   deviceId: string,
+  opts?: DevicePolicySetOpts,
 ): Promise<ResolvedTimeSyncSettings> {
-  const device = await readPolicyDevice(deviceId);
+  const passed = hierarchyFor(deviceId, opts);
+  policySetFor(deviceId, opts);
+  const [device] = passed
+    ? [{ orgId: passed.orgId }]
+    : await db
+      .select({ orgId: devices.orgId })
+      .from(devices)
+      .where(eq(devices.id, deviceId))
+      .limit(1);
   if (!device) throw new Error('Time sync device not visible');
   const redis = getRedis();
   const key = `timesync:settings:device:${deviceId}`;
@@ -211,7 +252,7 @@ export async function getDeviceTimeSyncSettings(
       console.warn('[time-sync] settings cache read failed', error);
     }
   }
-  const resolved = await resolveDeviceTimeSyncSettings(deviceId);
+  const resolved = await resolveDeviceTimeSyncSettings(deviceId, opts);
   if (redis) {
     try {
       await redis.set(key, JSON.stringify(resolved), 'EX', 120);

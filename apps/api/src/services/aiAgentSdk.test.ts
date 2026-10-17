@@ -6,7 +6,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // this record, so the terminal return of a won release is asserted against it.
 const RELEASED_INTENT_DECISION = { approvalScope: 'four_eyes', decidedVia: 'session_tap' } as const;
 const RELEASED_CONTEXT = { releaseDecision: RELEASED_INTENT_DECISION };
-import { createSessionPostToolUse, createSessionPreToolUse, runPreFlightChecks, safeParseJson } from './aiAgentSdk';
+import { createSessionPostToolUse, createSessionPreToolUse, intentCreationRefusal, runPreFlightChecks, safeParseJson } from './aiAgentSdk';
+import { classifyChatReadOnlyEventLogsQuery } from './aiChatEventLogsReadOnly';
 import { db } from '../db';
 import { checkGuardrails, checkToolPermission, checkToolRateLimit, checkPermissionRequirements } from './aiGuardrails';
 import { checkTenantToolRateLimit } from './toolSources/guardrails';
@@ -68,14 +69,6 @@ vi.mock('./aiAgent', () => ({
   buildSystemPrompt: (...args: unknown[]) => mockBuildSystemPrompt(...args),
   waitForApproval: vi.fn(),
 }));
-
-vi.mock('./llm/llmAvailability', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('./llm/llmAvailability')>();
-  return {
-    ...actual,
-    llmUnusableCode: vi.fn(actual.llmUnusableCode),
-  };
-});
 
 // W06: an env OpenAI-compatible deployment (MCP_LLM_PROVIDER) is plain config;
 // chat on it resolves through the registry like every other surface.
@@ -1164,6 +1157,208 @@ describe('createSessionPreToolUse', () => {
     });
   });
 
+  describe('#7906: chat-only read-only event_logs_query (System/Setup, no XPath)', () => {
+    const pinned = { payload: Object.freeze({ logName: 'System', level: 'error' }) };
+    const eligibleCheck = {
+      allowed: true,
+      tier: 2,
+      requiresApproval: false,
+      readOnly: true,
+      pinnedEventLogsQuery: pinned,
+      description: 'Query System event log',
+    };
+    const input = { deviceId: 'd-1', commandType: 'event_logs_query', payload: { logName: 'System', level: 'error' } };
+    const chatAuth = () => makeAuth({ principal: { kind: 'user_session' } } as any);
+
+    it('an interactive user chat session opts in to the payload-aware classification', async () => {
+      vi.mocked(checkGuardrails).mockReturnValue(eligibleCheck as any);
+      mockInsertValues();
+      const session = makeActiveSession({ approvalMode: 'per_step', auth: chatAuth() });
+
+      await createSessionPreToolUse(session)('execute_command', input);
+
+      expect(checkGuardrails).toHaveBeenCalledWith(
+        'execute_command',
+        input,
+        expect.objectContaining({ chatSession: true }),
+      );
+    });
+
+    it.each([
+      ['no principal', () => makeAuth()],
+      ['an ai_agent principal', () => makeAuth({ principal: { kind: 'ai_agent' } } as any)],
+      ['an api_key principal', () => makeAuth({ principal: { kind: 'api_key' } } as any)],
+      ['a helper session', () => makeAuth({ principal: { kind: 'user_session' }, helperDeviceId: 'dev-h' } as any)],
+    ])('%s does NOT opt in (stays Tier 3)', async (_label, auth) => {
+      vi.mocked(checkGuardrails).mockReturnValue({ allowed: false, tier: 4, reason: 'stop' } as any);
+      const session = makeActiveSession({ approvalMode: 'per_step', auth: auth() });
+
+      await createSessionPreToolUse(session)('execute_command', input);
+
+      const ctx = vi.mocked(checkGuardrails).mock.calls[0]![2] as Record<string, unknown> | undefined;
+      expect(ctx?.chatSession).toBeUndefined();
+    });
+
+    it.each(['per_step', 'auto_approve'] as const)(
+      '%s: auto-executes with the audit row and hands the PINNED payload to dispatch',
+      async (approvalMode) => {
+        vi.mocked(checkGuardrails).mockReturnValue(eligibleCheck as any);
+        const values = mockInsertValues();
+        const session = makeActiveSession({ approvalMode, auth: chatAuth() });
+
+        const result = await createSessionPreToolUse(session)('execute_command', input);
+
+        expect(result).toEqual({ allowed: true, context: { pinnedEventLogsQuery: pinned } });
+        expect(values).toHaveBeenCalledWith(expect.objectContaining({
+          sessionId: 'session-1',
+          toolName: 'execute_command',
+          status: 'executing',
+        }));
+        expect(waitForApproval).not.toHaveBeenCalled();
+        expect(session.eventBus.publish).not.toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'approval_required' }),
+        );
+        expect(mockCreateActionIntent).not.toHaveBeenCalled();
+      },
+    );
+
+    it('a paused session still prompts for an eligible call', async () => {
+      vi.mocked(checkGuardrails).mockReturnValue(eligibleCheck as any);
+      mockInsertReturning({ id: 'exec-ev-1' });
+      vi.mocked(waitForApproval).mockResolvedValue(false);
+      const session = makeActiveSession({ approvalMode: 'per_step', isPaused: true, auth: chatAuth() });
+
+      const result = await createSessionPreToolUse(session)('execute_command', input);
+
+      expect(result).toEqual({ allowed: false, error: 'Tool execution was rejected or timed out' });
+      expect(waitForApproval).toHaveBeenCalled();
+    });
+
+    it('RBAC still applies: a caller without devices:execute is refused before any audit row', async () => {
+      vi.mocked(checkGuardrails).mockReturnValue(eligibleCheck as any);
+      vi.mocked(checkToolPermission).mockResolvedValue('Permission denied: devices:execute');
+      const values = mockInsertValues();
+      const session = makeActiveSession({ approvalMode: 'auto_approve', auth: chatAuth() });
+
+      const result = await createSessionPreToolUse(session)('execute_command', input);
+
+      expect(result).toEqual({ allowed: false, error: 'Permission denied: devices:execute' });
+      expect(checkToolPermission).toHaveBeenCalledWith('execute_command', input, session.auth);
+      expect(values).not.toHaveBeenCalled();
+    });
+
+    it('a plan-matched eligible call also carries the pinned payload to dispatch', async () => {
+      vi.mocked(checkGuardrails).mockReturnValue(eligibleCheck as any);
+      mockInsertValues();
+      const session = makeActiveSession({
+        approvalMode: 'action_plan',
+        activePlanId: 'plan-1',
+        auth: chatAuth(),
+        approvedPlanSteps: new Map([[0, { toolName: 'execute_command', input }]]),
+      });
+
+      const result = await createSessionPreToolUse(session)('execute_command', input);
+
+      expect(result).toEqual({ allowed: true, context: { pinnedEventLogsQuery: pinned } });
+      expect(session.currentPlanStepIndex).toBe(1);
+    });
+
+    it('paused then approved: the approval exit still carries the pinned payload to dispatch', async () => {
+      vi.mocked(checkGuardrails).mockReturnValue(eligibleCheck as any);
+      mockInsertReturning({ id: 'exec-ev-2' });
+      vi.mocked(waitForApproval).mockResolvedValue(true);
+      const mockSet = vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) }));
+      vi.mocked(db.update).mockReturnValue({ set: mockSet } as any);
+      const session = makeActiveSession({ approvalMode: 'per_step', isPaused: true, auth: chatAuth() });
+
+      const result = await createSessionPreToolUse(session)('execute_command', input);
+
+      expect(waitForApproval).toHaveBeenCalled();
+      expect(result).toEqual(expect.objectContaining({ allowed: true, context: { pinnedEventLogsQuery: pinned } }));
+    });
+
+    // The real aiGuardrails module cannot load under this file's db/schema
+    // mocks, so the stand-in below reproduces checkGuardrails' #7906 branch
+    // (pinned by aiGuardrails.chatEventLogsReadOnly.test.ts against the real
+    // module) on top of the REAL classifier. What this proves is the wiring:
+    // the gate passes the chat opt-in and the raw input, and what it hands to
+    // dispatch is exactly what the real classifier parsed.
+    describe('with the real classifier (gate ↔ classifier integration)', () => {
+      beforeEach(() => {
+        vi.mocked(checkGuardrails).mockImplementation((toolName, toolInput, ctx) => {
+          const pinnedEventLogsQuery = ctx?.chatSession
+            ? classifyChatReadOnlyEventLogsQuery(toolName, toolInput)
+            : null;
+          return pinnedEventLogsQuery
+            ? { allowed: true, tier: 2, requiresApproval: false, readOnly: true, pinnedEventLogsQuery, description: 'q' }
+            : { allowed: true, tier: 3, requiresApproval: true, approvalScope: 'supervised', description: 'q' };
+        });
+      });
+
+      it.each(['per_step', 'auto_approve'] as const)(
+        '%s: an eligible System query auto-executes and pins the parsed payload',
+        async (approvalMode) => {
+          const values = mockInsertValues();
+          const session = makeActiveSession({ approvalMode, auth: chatAuth() });
+
+          const result = await createSessionPreToolUse(session)('execute_command', input);
+
+          expect(result).toEqual({
+            allowed: true,
+            context: { pinnedEventLogsQuery: { payload: { logName: 'System', level: 'error' } } },
+          });
+          expect(values).toHaveBeenCalledWith(expect.objectContaining({ status: 'executing' }));
+          expect(waitForApproval).not.toHaveBeenCalled();
+        },
+      );
+
+      it.each([
+        ['a QueryList selecting Security', { logName: 'System', query: '<QueryList><Query><Select Path="Security">*</Select></Query></QueryList>' }],
+        ['Application', { logName: 'Application' }],
+      ])('%s does not auto-execute and pins nothing', async (_label, payload) => {
+        mockInsertReturning({ id: 'exec-ev-3' });
+        vi.mocked(waitForApproval).mockResolvedValue(false);
+        const session = makeActiveSession({ approvalMode: 'auto_approve', auth: chatAuth() });
+
+        const result = await createSessionPreToolUse(session)('execute_command', { ...input, payload });
+
+        expect(result).toMatchObject({ allowed: false });
+        expect((result as any).context).toBeUndefined();
+        expect(mockCreateActionIntent).toHaveBeenCalled();
+      });
+
+      it.each([
+        ['an ai_agent principal', () => makeAuth({ principal: { kind: 'ai_agent' } } as any)],
+        ['no user_session principal', () => makeAuth()],
+      ])('%s with an eligible payload does not auto-execute', async (_label, auth) => {
+        mockInsertReturning({ id: 'exec-ev-4' });
+        vi.mocked(waitForApproval).mockResolvedValue(false);
+        const session = makeActiveSession({ approvalMode: 'auto_approve', auth: auth() });
+
+        const result = await createSessionPreToolUse(session)('execute_command', input);
+
+        expect(result).toMatchObject({ allowed: false });
+        expect(mockCreateActionIntent).toHaveBeenCalled();
+      });
+    });
+
+    it('postToolUse resolves the SAME tier as the gate (chat opt-in passed there too)', async () => {
+      vi.mocked(checkGuardrails).mockReturnValue(eligibleCheck as any);
+      mockInsertValues();
+      const mockSet = vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) }));
+      vi.mocked(db.update).mockReturnValue({ set: mockSet } as any);
+      const session = makeActiveSession({ approvalMode: 'per_step', auth: chatAuth() });
+
+      await createSessionPostToolUse(session)('execute_command', input, JSON.stringify({ status: 'completed' }), false, 3);
+
+      expect(checkGuardrails).toHaveBeenCalledWith(
+        'execute_command',
+        input,
+        expect.objectContaining({ chatSession: true }),
+      );
+    });
+  });
+
   describe('Tier 3: durable action-intents backing (spec §6.1)', () => {
     beforeEach(() => {
       mockCreateActionIntent.mockReset();
@@ -1277,6 +1472,49 @@ describe('createSessionPreToolUse', () => {
         chosenByAssistant: true,
         targetSessionId: null,
       });
+    });
+
+    // #8600 — a device-group run_script: the intent froze the group's resolved
+    // deviceIds, and the chat approver must read THAT (plus the count + id
+    // hash folded into the stored reason), never the model's `{ groupId }`.
+    it('shows the frozen resolved deviceIds, not the raw groupId, on a device-group run_script card', async () => {
+      vi.mocked(checkGuardrails).mockReturnValue({
+        allowed: true,
+        tier: 3,
+        requiresApproval: true,
+        description: 'Run script abcd1234...',
+      } as any);
+      mockResolveScriptRunContext.mockResolvedValue(null);
+      mockInsertReturning({ id: 'exec-grp' });
+      mockCreateActionIntent.mockResolvedValue(makeIntentSnapshot({ id: 'intent-grp', approvalRequestIds: ['appr-grp'] }));
+      mockWaitForIntentDecision.mockResolvedValue('rejected');
+      vi.mocked(db.update).mockReturnValue({
+        set: vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) })),
+      } as any);
+      const frozenArgs = { scriptId: 'abcd1234-0000-0000-0000-000000000000', deviceIds: ['d-1', 'd-2'] };
+      const frozenReason = 'Run script abcd1234.... Device group 44444444... resolved to 2 devices (ids sha256 0123456789ab)';
+      vi.mocked(db.select).mockImplementation(((projection?: Record<string, unknown>) => ({
+        from: vi.fn(() => ({
+          where: vi.fn(() => ({
+            limit: vi.fn().mockResolvedValue(
+              projection && 'arguments' in projection ? [{ arguments: frozenArgs, reason: frozenReason }] : [],
+            ),
+          })),
+        })),
+      })) as any);
+      const session = makeActiveSession({ approvalMode: 'auto_approve' });
+
+      await createSessionPreToolUse(session)('run_script', {
+        scriptId: 'abcd1234-0000-0000-0000-000000000000',
+        groupId: '44444444-4444-4444-8444-444444444444',
+      });
+
+      const published = (vi.mocked(session.eventBus.publish).mock.calls as unknown[][])
+        .map((call): Record<string, unknown> => call[0] as Record<string, unknown>)
+        .find((event: Record<string, unknown>) => event.type === 'approval_required')!;
+      expect(published.input).toEqual(frozenArgs);
+      expect(published.input).not.toHaveProperty('groupId');
+      expect(published.description).toBe(frozenReason);
     });
 
     it('leaves a non-script tool\'s approval untouched — no run-context sentence, no structured field', async () => {
@@ -4163,6 +4401,43 @@ describe('Task 3: a plan aborts when a tier-3 step does not execute', () => {
   // that gap, one exit per test.
   // ----------------------------------------------------------------------
 
+  // #7918: a second run_script on a proposal an earlier intent already
+  // claimed used to come back as the generic "Failed to create approval
+  // record", which told the model nothing — it reported that nothing ran.
+  it('tells the model why a run_script proposal cannot be run again instead of a generic failure (#7918)', async () => {
+    vi.mocked(checkGuardrails).mockReturnValue({
+      allowed: true, tier: 3, requiresApproval: true, description: 'Run script',
+    } as any);
+    mockInsertReturning({ id: 'exec-7918' });
+    mockCreateActionIntent.mockRejectedValue(Object.assign(
+      new Error('Proposal p-7918 is not runnable: it is not reviewed, has expired, or has already been claimed by another intent'),
+      { name: 'ActionIntentError', code: 'proposal_not_runnable' },
+    ));
+    const session = makeActiveSession({});
+
+    const res = await createSessionPreToolUse(session)('run_script', { proposalId: 'p-7918', deviceIds: ['d1'] });
+
+    expect(res.allowed).toBe(false);
+    const error = (res as { error: string }).error;
+    expect(error).toMatch(/^proposal_not_runnable: /);
+    expect(error).toContain('p-7918');
+    expect(error).toContain('get_script_proposal');
+    expect(error).toContain('get_script_execution');
+    expect(error).not.toContain('Failed to create approval record');
+  });
+
+  it('keeps the generic message for any other intent-creation failure (#7918)', async () => {
+    vi.mocked(checkGuardrails).mockReturnValue({
+      allowed: true, tier: 3, requiresApproval: true, description: 'Run script',
+    } as any);
+    mockInsertReturning({ id: 'exec-7918b' });
+    mockCreateActionIntent.mockRejectedValue(new Error('connection reset'));
+
+    const res = await createSessionPreToolUse(makeActiveSession({}))('run_script', { proposalId: 'p-1', deviceIds: ['d1'] });
+
+    expect(res).toEqual({ allowed: false, error: 'Failed to create approval record' });
+  });
+
   it('aborts the plan when creating the approval ledger record throws', async () => {
     vi.mocked(checkGuardrails).mockReturnValue({
       allowed: true,
@@ -4551,5 +4826,28 @@ describe('safeParseJson', () => {
 
   it('returns { raw: ... } for invalid JSON', () => {
     expect(safeParseJson('not json')).toEqual({ raw: 'not json' });
+  });
+});
+
+// #8600 — a device-group run_script refused at intent creation must tell the
+// model WHY (too large, not found, empty, out of scope), not a generic
+// failure: the messages are existence-neutral and say what to do instead.
+describe('intentCreationRefusal — device-group run_script refusals', () => {
+  const refusal = (code: string, message: string) => Object.assign(new Error(message), { code });
+
+  it.each([
+    'group_target_too_large',
+    'group_target_not_found',
+    'group_target_no_targets',
+    'group_target_out_of_scope',
+    'group_target_invalid',
+  ])('passes the %s message through for run_script', (code) => {
+    const message = `the reason for ${code}`;
+    expect(intentCreationRefusal('run_script', { groupId: 'g' }, refusal(code, message))).toBe(`${code}: ${message}`);
+  });
+
+  it('keeps the generic message for any other code or tool', () => {
+    expect(intentCreationRefusal('run_script', {}, refusal('org_resolution_failed', 'x'))).toBe('Failed to create approval record');
+    expect(intentCreationRefusal('execute_command', {}, refusal('group_target_too_large', 'x'))).toBe('Failed to create approval record');
   });
 });

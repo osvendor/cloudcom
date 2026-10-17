@@ -27,18 +27,19 @@ export const SUPPORTED_EXTENSION_CAPABILITIES = [
  * are root-mounted so a change there cannot slip past unnoticed.
  */
 export const RESERVED_ROUTE_NAMESPACES = new Set([
+  'browser-companion', 'companion-scripts', 'companion-work',
   'access-reviews', 'accounting', 'action-intents', 'admin', 'agent-versions', 'agent-ws',
   'agents', 'ai', 'alert-templates', 'alerts', 'analytics', 'api-keys',
-  'approvals', 'audit-baselines', 'audit-logs', 'auth', 'authenticator', 'automations',
+  'approvals', 'audit-baselines', 'audit-logs', 'auth', 'authenticator', 'automations', 'autopay',
   'backup', 'billing', 'billing-profiles', 'browser-security', 'c2c', 'catalog', 'changes',
   'cis',
-  'client-ai', 'config', 'configuration-policies', 'contracts',
+  'client-ai', 'config', 'configuration-policies', 'connection-health', 'contracts',
   'custom-fields', 'deliverable-templates', 'deployments', 'desktop-ws', 'dev', 'device-groups',
-  'devices', 'discovery', 'dns-security', 'docs', 'dr', 'enrollment-keys',
-  'events', 'ext', 'extensions', 'filters', 'fleet', 'google', 'groups', 'helper',
+  'devices', 'discovery', 'dns-security', 'docs', 'dr', 'edr', 'endpoint-messages', 'enrollment-keys',
+  'events', 'ext', 'extensions', 'filters', 'fix-memory', 'fleet', 'google', 'groups', 'helper',
   'huntress',
   'incidents', 'installer', 'integrations', 'internal', 'invoices', 'logs',
-  'm365', 'maintenance', 'mcp', 'me', 'metrics', 'mobile', 'monitor-definitions',
+  'm365', 'maintenance', 'mcp', 'me', 'metrics', 'migration-windows', 'mobile', 'monitor-definitions',
   'monitoring', 'monitors', 'network', 'notifications', 'oauth', 'office-addin',
   'onedrive', 'orgs',
   'native-target', 'pam', 'partner', 'partner-api', 'partner-service-principals', 'partners',
@@ -50,9 +51,9 @@ export const RESERVED_ROUTE_NAMESPACES = new Set([
   'snmp', 'software',
   'software-inventory', 'software-policies', 'sso', 'support',
   'staff-native', 'system', 'system-tools', 'tags', 'tenant-variables', 'third-party-catalog',
-  'ticket-categories', 'ticket-checklist-templates', 'ticket-config', 'ticket-forms',
-  'ticket-response-templates', 'tickets', 'time-entries', 'time-status', 'tool-sources', 'topology', 'tunnel-http', 'tunnel-ws',
-  'tunnels', 'unifi', 'update-rings', 'user-risk', 'users', 'viewers',
+  'ticket-approval-requests', 'ticket-categories', 'ticket-checklist-templates', 'ticket-config', 'ticket-forms',
+  'ticket-response-templates', 'ticketing', 'tickets', 'time-entries', 'time-status', 'tool-sources', 'topology', 'trust', 'tunnel-http', 'tunnel-ws',
+  'tunnels', 'unifi', 'update-rings', 'user-risk', 'users', 'verify', 'viewers',
   'vnc-exchange', 'vnc-viewer', 'vulnerabilities', 'webhooks',
 ]);
 

@@ -24,7 +24,8 @@
         "perDeviceRole": "Per ruolo dispositivo",
         "perDeviceGroup": "Per gruppo di dispositivi",
         "perSeat": "Per postazione",
-        "manual": "Quantità manuale"
+        "manual": "Quantità manuale",
+        "hourBlock": "Monte ore"
       },
       "dynamicGroup": "dinamico",
       "deletedGroup": "{{name}} (gruppo eliminato)",
@@ -588,6 +589,62 @@
       "warnings": {
         "markupRemoved": "Salvato, ma è stata rimossa una formattazione non supportata: {{tags}}. Il corpo degli accordi supporta titoli, grassetto, corsivo, sottolineato, elenchi e collegamenti."
       }
+    },
+    "hourBlock": {
+      "form": {
+        "hoursPerPeriod": "Ore incluse per periodo",
+        "extraRate": "Prezzo per ora aggiuntiva",
+        "rolloverMode": "Ore non utilizzate a fine periodo",
+        "rolloverExpire": "Scadono",
+        "rolloverCarry": "Riportate",
+        "carryCap": "Limite di ore riportabili (vuoto per nessun limite)",
+        "alertPct": "Avvisa al % del monte ore utilizzato (facoltativo)",
+        "required": "Inserisci le ore incluse e il prezzo per ora aggiuntiva.",
+        "firstPeriod": "Le ore contano dal primo periodo di fatturazione ancora da fatturare; in un contratto in bozza viene stabilito all'attivazione. Il tempo precedente viene fatturato come di consueto.",
+        "midPeriodEdit": "Le modifiche si applicano al periodo aperto corrente ({{start}} – {{end}}) alla sua chiusura.",
+        "midPeriodEditNoDates": "Le modifiche si applicano al periodo aperto corrente alla sua chiusura.",
+        "onlyOne": "Questa organizzazione ha già un monte ore attivo. Ritiralo prima di aggiungerne un altro."
+      },
+      "row": {
+        "perPeriod": "{{hours}} ore per periodo",
+        "retiredBadge": "Ritirato",
+        "startsOn": "Conta dal {{date}}"
+      },
+      "errors": {
+        "exists": "Questa organizzazione ha già una riga di monte ore attiva. Ritirala prima, poi aggiungi quella nuova.",
+        "locked": "Questo campo non può essere modificato su una riga di monte ore."
+      },
+      "retire": {
+        "title": "Ritira il monte ore",
+        "message": "«{{description}}» ha uno storico di fatturazione, quindi viene ritirato anziché eliminato. Nessun nuovo periodo; i periodi già fatturati vengono comunque regolati. I periodi chiusi restano nel contratto.",
+        "confirm": "Ritira monte ore",
+        "toast": "Monte ore ritirato"
+      },
+      "detail": {
+        "title": "Monte ore",
+        "usage": "{{used}} di {{included}} ore usate · {{remaining}} rimanenti · il periodo termina il {{end}}",
+        "carried": "Include {{hours}} ore riportate.",
+        "unapproved": "{{hours}} ore di questo tempo non sono ancora approvate.",
+        "foreign": "{{hours}} ore sono state registrate in un'altra valuta; consumano comunque il monte ore.",
+        "over": "{{hours}} ore oltre il monte ore → {{amount}} alla chiusura del periodo",
+        "advanceNote": "L'eccedenza viene fatturata nella fattura successiva.",
+        "arrearsNote": "L'eccedenza viene fatturata nella fattura di questo periodo.",
+        "lateEntry": "{{hours}} ore sono state inserite dopo la chiusura del loro periodo e vengono fatturate separatamente.",
+        "startsLater": "Il monte ore inizia il {{date}}.",
+        "extraRate": "Ore aggiuntive: {{rate}} ciascuna",
+        "loadFailed": "Impossibile caricare l'utilizzo del monte ore."
+      },
+      "history": {
+        "title": "Periodi di monte ore chiusi",
+        "empty": "Nessun periodo di monte ore è ancora stato chiuso.",
+        "included": "Incluse",
+        "carriedIn": "Riportate in ingresso",
+        "used": "Usate",
+        "over": "Eccedenza",
+        "carriedOut": "Riportate in uscita",
+        "loadMore": "Carica altro",
+        "invoiceRemoved": "Fattura dell'eccedenza rimossa — ore non fatturate"
+      }
     }
   },
   "agreements": {
@@ -887,7 +944,8 @@
         "showLess": "Mostra meno",
         "showMore": "Mostra altro",
         "skuHelp": "Il tuo numero di catalogo o del distributore per questo elemento.",
-        "tidyWithAi": "Sistema con AI"
+        "tidyWithAi": "Sistema con AI",
+        "partNumberRequiredHint": "Aggiungi un codice articolo per includerla nell'ordine dei componenti."
       },
       "liveTotals": {
         "annualRecurring": "Ricorrente annuale",
@@ -1012,6 +1070,7 @@
       "coverPage": {
         "title": "Copertina",
         "enable": "Mostra una copertina",
+        "showContents": "Aggiungi un indice al PDF",
         "summaryOn": "Mostrata come prima pagina della proposta.",
         "summaryOff": "Nessuna copertina: la proposta inizia con il suo contenuto.",
         "titleLabel": "Titolo copertina",
@@ -1147,7 +1206,10 @@
         "tooManyRecipients": "Usa al massimo {{max}} indirizzi.",
         "zeroTotalWarning": "Il totale di questo preventivo è {{zero}}: verifica che gli elementi abbiano un prezzo prima dell'invio.",
         "noBillingContactHint": "Nessun contatto di fatturazione è salvato per questa organizzazione — inserisci un'email oppure aggiungine uno nelle <orgLink>impostazioni dell'organizzazione</orgLink>.",
-        "revisionWarning": "L’invio sostituisce {{number}} e disattiva il link che il cliente possiede già."
+        "revisionWarning": "L’invio sostituisce {{number}} e disattiva il link che il cliente possiede già.",
+        "noPartNumberWarning_one": "{{count}} riga di prodotto non ha un codice articolo e non verrà aggiunta all'ordine dei componenti.",
+        "noPartNumberWarning_other": "{{count}} righe di prodotto non hanno un codice articolo e non verranno aggiunte all'ordine dei componenti.",
+        "sendAnyway": "Invia comunque"
       },
       "sendEmailWarning": {
         "noBillingContact": "Proposta contrassegnata come Inviata, ma nessuna email è stata consegnata: {{orgName}} non ha un'email di contatto per la fatturazione. Aggiungine una nelle impostazioni dell'organizzazione, poi invia di nuovo.",
@@ -1320,7 +1382,9 @@
           "vendor": "Fornitore"
         },
         "title": "Da ordinare",
-        "unknownVendor": "Altro / fornitore sconosciuto"
+        "unknownVendor": "Altro / fornitore sconosciuto",
+        "excluded": "Non inclusi in questo ordine (nessun codice articolo): {{names}}",
+        "untitledLine": "Riga senza titolo"
       },
       "pax8Order": {
         "message_one": "Questo preventivo ha preparato un ordine Pax8 ({{count}} elemento) in attesa dei dettagli di provisioning",
@@ -1707,7 +1771,8 @@
       "saveNotes": "Impossibile salvare le note.",
       "saveTerms": "Impossibile salvare i termini.",
       "updateLine": "Impossibile aggiornare la riga.",
-      "noPriceForCurrency": "Nessun prezzo in {{currency}} per questo elemento. Aggiungine uno nel catalogo o inserisci una riga manuale."
+      "noPriceForCurrency": "Nessun prezzo in {{currency}} per questo elemento. Aggiungine uno nel catalogo o inserisci una riga manuale.",
+      "saveLineDetail": "Impossibile aggiornare la stampa dei tempi registrati"
     },
     "fields": {
       "descriptionOptional": "Descrizione (facoltativa)",
@@ -1774,6 +1839,35 @@
     "linesScrollAria": "Righe della fattura — scorri lateralmente per altre colonne",
     "unsavedField": {
       "lines": "Righe"
+    },
+    "lineDetail": {
+      "default": "Predefinito di fatturazione",
+      "grouping": "Disposizione",
+      "groupingDay": "Raggruppa per giorno",
+      "groupingEntry": "Una riga per registrazione",
+      "help": "Sostituisce l’impostazione predefinita di fatturazione solo per questa bozza.",
+      "hide": "Nascondi",
+      "show": "Mostra",
+      "showDate": "Data del lavoro",
+      "showNote": "Nota del tecnico",
+      "showWorkedTime": "Tempo lavorato e fatturato",
+      "title": "Righe dei tempi registrati"
+    },
+    "refreshTimeLines": {
+      "billedElsewhere": "{{count}} righe bloccheranno l'emissione: le registrazioni ore sono state fatturate su un'altra fattura. Rimuovile prima di emettere:",
+      "billedElsewhere_one": "{{count}} riga bloccherà l'emissione: la registrazione ore è stata fatturata su un'altra fattura. Rimuovila prima di emettere:",
+      "billedElsewhere_other": "{{count}} righe bloccheranno l'emissione: le registrazioni ore sono state fatturate su un'altra fattura. Rimuovile prima di emettere:",
+      "button": "Aggiorna dalle registrazioni ore",
+      "drifted": "{{count}} righe invariate: il tempo fatturato delle registrazioni non corrisponde più alla quantità. Modifica la quantità o crea una nuova bozza.",
+      "drifted_one": "{{count}} riga invariata: il tempo fatturato della registrazione non corrisponde più alla quantità. Modifica la quantità o crea una nuova bozza.",
+      "drifted_other": "{{count}} righe invariate: il tempo fatturato delle registrazioni non corrisponde più alla quantità. Modifica la quantità o crea una nuova bozza.",
+      "error": "Impossibile aggiornare dalle registrazioni ore",
+      "help": "Aggiorna note, date di lavoro e approvazione dalle registrazioni ore. Quantità, prezzi e descrizioni modificate a mano non cambiano mai.",
+      "running": "Aggiornamento…",
+      "skipped": "{{count}} righe saltate: le registrazioni ore sono state fatturate altrove, rimosse o non sono più fatturabili in questa bozza.",
+      "skipped_one": "{{count}} riga saltata: la registrazione ore è stata fatturata altrove, rimossa o non è più fatturabile in questa bozza.",
+      "skipped_other": "{{count}} righe saltate: le registrazioni ore sono state fatturate altrove, rimosse o non sono più fatturabili in questa bozza.",
+      "summary": "Aggiornate: {{refreshed}} · Già aggiornate: {{unchanged}}"
     }
   },
   "invoiceActions": {
@@ -2021,6 +2115,7 @@
     "empty": "Questa fattura non contiene ancora righe.",
     "fallbackTitle": "Fattura",
     "issued": "Emessa",
+    "laborLine": "Manodopera",
     "preview": {
       "description": "Questo è ciò che il cliente vede sulla fattura.",
       "downloadError": "Impossibile scaricare il PDF della fattura.",
@@ -2117,7 +2212,9 @@
       "sourceAria": "Origine fattura",
       "title": "Nuova fattura",
       "to": "A",
-      "working": "Elaborazione…"
+      "working": "Elaborazione…",
+      "heldForHourBlock_one": "{{count}} registrazione di tempo ({{hours}} ore) è trattenuta per il monte ore di questa organizzazione e verrà fatturata alla chiusura del periodo del monte ore.",
+      "heldForHourBlock_other": "{{count}} registrazioni di tempo ({{hours}} ore) sono trattenute per il monte ore di questa organizzazione e verranno fatturate alla chiusura del periodo del monte ore."
     },
     "empty": {
       "description": "Componi tempo e parti non fatturati in una bozza oppure parti da una fattura vuota.",
@@ -2277,15 +2374,26 @@
       "documentPageSize": "Formato pagina",
       "documentPageSizeA4": "A4",
       "documentPageSizeLetter": "Lettera",
-      "documentTheme": "Tema documento",
-      "documentThemeClassic": "Classico",
-      "documentThemeCondensed": "Condensato",
+      "documentTheme": "Caratteri del documento",
+      "documentThemeClassic": "Helvetica",
+      "documentThemeCondensed": "Barlow Condensed + DM Sans",
       "invoiceFooter": "Piè di pagina fattura",
       "invoiceFooterPlaceholder": "Istruzioni di pagamento, nota di ringraziamento, ecc.",
       "invoiceNumberPrefix": "Prefisso numero fattura",
       "markupHelp": "Ricarico predefinito sul costo del distributore, usato per precompilare il prezzo di vendita quando importi elementi di catalogo. Il margine lordo risultante viene mostrato durante l'importazione.",
       "paymentTermsDays": "Termini di pagamento (giorni)",
-      "title": "Valori predefiniti di fatturazione"
+      "prefixInvalid": "Inserisci un prefisso da 1 a 12 caratteri.",
+      "taxRateInvalid": "Inserisci un'aliquota fiscale da 0 a 100.",
+      "termsDaysInvalid": "Inserisci un numero intero di giorni da 0 a 365.",
+      "title": "Valori predefiniti di fatturazione",
+      "lineDetailTitle": "Righe dei tempi registrati nelle fatture",
+      "lineDetailHelp": "Scegli cosa vedono i clienti per i tempi registrati. Una bozza di fattura può sostituire questa scelta; viene bloccata all’emissione della fattura.",
+      "lineShowDate": "Mostra la data del lavoro",
+      "lineShowNote": "Mostra la nota del tecnico",
+      "lineShowWorkedTime": "Mostra tempo lavorato e fatturato",
+      "lineGrouping": "Disposizione",
+      "lineGroupingEntry": "Una riga per registrazione",
+      "lineGroupingDay": "Raggruppa per giorno"
     },
     "loadError": "Impossibile caricare le impostazioni di fatturazione.",
     "loading": "Caricamento impostazioni di fatturazione…",
@@ -2313,7 +2421,8 @@
     "defaults": "Predefiniti",
     "documents": "Documenti",
     "connections": "Connessioni",
-    "rates": "Tariffe"
+    "rates": "Tariffe",
+    "payments": "Payments"
   },
   "billingConnectionsTab": {
     "accounting": {
@@ -2365,6 +2474,8 @@
     "setDefault": "Imposta come predefinito",
     "archive": "Archivia",
     "usageUnavailable": "L’utilizzo da parte delle organizzazioni non è disponibile.",
+    "readOnlyNotice": "Hai accesso in sola lettura alle tariffe di fatturazione. Chiedi a un amministratore di modificarle.",
+    "readOnlyNoPartnerWideNotice": "Le tariffe di fatturazione si applicano a tutte le organizzazioni, quindi modificarle richiede l'accesso completo alle organizzazioni del partner. Hai accesso in sola lettura.",
     "edit": "Modifica profilo di fatturazione",
     "name": "Nome",
     "currency": "Valuta",
@@ -2416,6 +2527,271 @@
       "summaryBillableUnpriced": "Fatturabile · senza prezzo",
       "summaryIncluded": "Incluso",
       "summaryNotBilled": "Non fatturato"
+    }
+  },
+  "autopay": {
+    "chargeConfirmTitle": "Conferma pagamento automatico",
+    "chargeConfirmMessage": "Addebitare fino a {{amount}}, incluse eventuali commissioni di elaborazione, per la fattura {{invoice}} tramite {{method}}?",
+    "noticeQueued": "Avviso di pagamento automatico in coda",
+    "requestDeliveryFailed": "Impossibile recapitare l’e-mail di richiesta. Inviala di nuovo.",
+    "skipNoContact": "Nessun indirizzo e-mail di fatturazione disponibile. Aggiungine uno o indica un destinatario.",
+    "skipStripeNotReady": "Stripe non è pronto per i pagamenti automatici. Controlla la connessione e le autorizzazioni.",
+    "skipAlreadyActive": "I pagamenti automatici sono già attivi o sospesi.",
+    "title": "Pagamento automatico",
+    "loading": "Caricamento dei pagamenti automatici…",
+    "error": "Impossibile completare questa azione. Riprova.",
+    "saved": "Pagamento automatico aggiornato",
+    "save": "Salva",
+    "invalid": "Inserisci da 0 a 60 giorni interi e un importo massimo positivo con un codice valuta di tre lettere.",
+    "offset-days": "Giorni dall’emissione",
+    "offset-rule": "Confronto con la data di scadenza",
+    "cap-enabled": "Limite di pagamento automatico",
+    "cap-amount": "Importo massimo",
+    "cap-currency": "Valuta",
+    "ach-mode": "Metodi di pagamento",
+    "inherit": "{{value}} — ereditato da {{source}}",
+    "source": {
+      "org": "Organizzazione",
+      "partner": "Valore predefinito del partner",
+      "default": "Valore predefinito di Breeze"
+    },
+    "option": {
+      "earlier": "La data precedente",
+      "later": "La data successiva",
+      "false": "Illimitato",
+      "true": "Limite attivato",
+      "ach_preferred": "Conto bancario preferito; carte accettate",
+      "ach_only": "Solo conto bancario"
+    },
+    "achRisk": "I pagamenti bancari sono disponibili per i conti statunitensi idonei in USD. La tua azienda è responsabile degli storni ACH e delle commissioni di storno Stripe; gli storni dei singoli conti possono arrivare fino a 60 giorni dopo.",
+    "stripeNotReady": "I pagamenti automatici non sono disponibili. Controlla le autorizzazioni Stripe: {{permissions}}.",
+    "stripeDisconnected": "Collega prima Stripe",
+    "card": "Carta",
+    "bank": "Conto bancario",
+    "done": "Richiesta completata.",
+    "status": {
+      "not_requested": "Non richiesto",
+      "requested": "Richiesto",
+      "active": "Attivo",
+      "paused": "In pausa",
+      "cancelled": "Disattivato",
+      "needs_attention": "Richiede attenzione"
+    },
+    "pending": "La verifica bancaria è in sospeso. Non è ancora possibile effettuare pagamenti automatici.",
+    "effective": "Si applica alle fatture emesse dopo {{date}}",
+    "recipient": "Destinatario alternativo della richiesta (facoltativo)",
+    "request": "Invia richiesta",
+    "resend": "Invia di nuovo la richiesta",
+    "pause": "Metti in pausa",
+    "resume": "Riprendi",
+    "turnOff": "Disattiva",
+    "cancel": "Annulla",
+    "processingWarning": "I pagamenti automatici futuri verranno interrotti. Un pagamento bancario già in elaborazione non può essere richiamato.",
+    "unasked_one": "{{count}} cliente non ancora contattato",
+    "unasked_other": "{{count}} clienti non ancora contattati",
+    "sendNow": "Invia ora",
+    "dismiss": "Nascondi",
+    "select": "Seleziona",
+    "client": "Cliente",
+    "statusLabel": "Stato",
+    "method": "Metodo di pagamento",
+    "selectClient": "Seleziona {{name}}",
+    "empty": "Nessun cliente trovato.",
+    "requestedCount_one": "Richiesta inviata a {{count}} cliente.",
+    "requestedCount_other": "Richieste inviate a {{count}} clienti.",
+    "chargeDate": "Addebito intorno al {{date}}",
+    "excludeInvoice": "Escludi questa fattura dai pagamenti automatici",
+    "excludeRefusedProcessing": "Il pagamento di questa fattura è già in elaborazione e non può essere interrotto. Puoi escludere la fattura quando il pagamento sarà completato o non riuscito.",
+    "excludeContract": "Escludi le fatture che contengono questo contratto",
+    "failed": "Impossibile aggiornare il pagamento automatico. Riprova.",
+    "states": {
+      "awaiting_notice": "In attesa dell’avviso",
+      "scheduled": "Programmato",
+      "collecting": "Riscossione in corso",
+      "retry_scheduled": "Nuovo tentativo programmato",
+      "action_required": "Conferma richiesta",
+      "succeeded": "Pagamento ricevuto",
+      "failed": "Pagamento non riuscito",
+      "skipped_by_client": "Saltato dal cliente",
+      "excluded_by_msp": "Escluso dal fornitore",
+      "cancelled": "Annullato",
+      "not_needed": "Nessun pagamento necessario",
+      "reserved": "Pagamento riservato",
+      "created": "Pagamento creato",
+      "confirming": "Conferma del pagamento in corso",
+      "processing": "Pagamento in elaborazione",
+      "requires_action": "Conferma richiesta",
+      "canceled": "Annullato",
+      "unapplied": "Il pagamento richiede riconciliazione"
+    },
+    "reasons": {
+      "not_enrolled": "Non iscritto",
+      "enrolled_after_issue": "Iscrizione successiva all’emissione della fattura",
+      "method_not_usable": "Metodo di pagamento non disponibile",
+      "over_cap": "Limite di pagamento automatico superato",
+      "above_authorized_cap": "Oltre il limite autorizzato dal cliente",
+      "issued_before_authorization": "Emessa prima dell'autorizzazione aggiornata del cliente: incassare manualmente",
+      "cap_currency_mismatch": "La valuta del limite non corrisponde",
+      "ach_currency_unsupported": "Valuta non supportata per i pagamenti bancari",
+      "excluded_contract": "Contratto escluso",
+      "excluded_invoice": "Fattura esclusa",
+      "charging_disabled": "Addebito automatico disattivato",
+      "stripe_unavailable": "Stripe non disponibile",
+      "bank_unverified": "Non addebitata: il conto bancario del cliente non è stato verificato in tempo. Incassare manualmente",
+      "charging_on_hold": "Non addebitata: i pagamenti automatici sono rimasti disattivati. Incassare manualmente",
+      "service_unavailable": "Non addebitata: Stripe è rimasto irraggiungibile. Incassare manualmente",
+      "control_pending:skip": "Richiesta di salto ricevuta; arresto del pagamento in sospeso",
+      "control_pending:exclude": "Esclusione richiesta; arresto del pagamento in sospeso",
+      "control_pending:stop": "Interruzione richiesta; arresto del pagamento in sospeso",
+      "control_pending:renotice": "Aggiornamento dell’avviso; interruzione del pagamento in sospeso",
+      "skip": "Saltato dal cliente",
+      "exclude": "Escluso dal fornitore",
+      "stop": "Pagamenti automatici interrotti",
+      "client_request": "Richiesto dal cliente",
+      "no_billing_contact": "Nessun contatto di fatturazione",
+      "delivery_failed": "Invio dell’avviso non riuscito",
+      "consent_required": "L’autorizzazione al pagamento è mancante. Richiedi una nuova autorizzazione."
+    },
+    "noticeTemplate": "Fattura con avviso di pagamento automatico",
+    "chargeFailed": "Impossibile avviare il pagamento. Riprova.",
+    "chargeResultUnknown": "Non è stato possibile confermare l’esito di questo pagamento. Aggiornamento della fattura per mostrarne lo stato attuale.",
+    "chargeStarted": "Tentativo di pagamento avviato",
+    "chargeNow": "Addebita ora",
+    "noCharge": "Nessun addebito",
+    "noticeStuck": "Avviso di pagamento da verificare",
+    "unapplied": "{{count}} pagamento/i richiedono riconciliazione. Verifica gli importi irrisolti prima di un nuovo addebito.",
+    "lastCharge": "Ultimo addebito",
+    "attention": "Da verificare",
+    "attemptStates": {
+      "reserved": "Pagamento riservato",
+      "created": "Pagamento creato",
+      "confirming": "Conferma del pagamento in corso",
+      "processing": "Pagamento in elaborazione",
+      "succeeded": "Pagamento ricevuto",
+      "failed": "Pagamento non riuscito",
+      "requires_action": "Conferma richiesta",
+      "canceled": "Annullato",
+      "unapplied": "Il pagamento richiede riconciliazione",
+      "returned": "Stornato",
+      "refunded": "Rimborsato",
+      "disputed": "Contestato"
+    },
+    "fees": {
+      "title": "Commissioni di elaborazione",
+      "cardBps": "Commissione carta di credito (punti base, 0–300)",
+      "ach": "Commissione pagamento bancario (USD, 0.00–25.00)",
+      "inactive": "Le commissioni sulle carte restano inattive finché l’amministratore del partner non conferma entrambe le dichiarazioni seguenti.",
+      "notified": "Ho informato il mio acquirer (Stripe) e i circuiti delle carte almeno 30 giorni fa",
+      "cost": "Questa commissione non supera il mio costo di accettazione delle carte",
+      "rules": "Solo carte di credito. Nessuna commissione sulle carte in CA, CT, ME o MA; in Colorado il limite è del 2%. Le commissioni si applicano solo ai pagamenti automatici statunitensi idonei in USD. I link di pagamento una tantum non prevedono commissioni.",
+      "legal": "Breeze non fornisce consulenza legale. Sei responsabile dell’ammissibilità dei supplementi, delle comunicazioni e del trattamento fiscale.",
+      "lowerAuthorization": "Clienti con termini autorizzati inferiori: {{count}}. L’autorizzazione attuale resta valida fino all’accettazione dei nuovi termini.",
+      "authorizedCard": "Autorizzati: {{accepted}} punti base; configurati: {{configured}}",
+      "authorizedAch": "Autorizzato: USD {{accepted}}; configurato: USD {{configured}}",
+      "authorizedCap": "Limite autorizzato: {{accepted}}; configurato: {{configured}}",
+      "noCap": "nessun limite",
+      "requestAuthorization": "Richiedi autorizzazione aggiornata",
+      "requestFailed": "Impossibile richiedere l’autorizzazione aggiornata. Verifica il contatto di fatturazione e la disponibilità di Stripe.",
+      "requested": "Autorizzazione aggiornata richiesta. L’autorizzazione attuale resta valida.",
+      "attestationOnFile": "Attestazione registrata: {{name}} ha confermato entrambe le dichiarazioni il {{date}}.",
+      "attestationOnFileUnknown": "Attestazione registrata: entrambe le dichiarazioni sono state confermate il {{date}}.",
+      "reattestHelp": "Per attestare di nuovo, seleziona entrambe le dichiarazioni e salva. Viene registrata una nuova attestazione a tuo nome con la data corrente, che sostituisce quella registrata. Le commissioni autorizzate dai clienti non cambiano.",
+      "authorizedCardNone": "Nessuna autorizzazione registrata; configurati: {{configured}} punti base",
+      "authorizedAchNone": "Nessuna autorizzazione registrata; configurato: USD {{configured}}",
+      "lowerAuthorizationOrg": "Questo cliente non ha autorizzato i termini configurati. Qualsiasi autorizzazione esistente resta valida fino all’accettazione dei nuovi termini.",
+      "blankPartner": "Se vuoto, si usa il valore predefinito di Breeze (nessuna commissione). Per esentare un cliente, imposta la sua commissione a 0 nella pagina Fatturazione del cliente.",
+      "blankOrg": "Se vuoto, si usa il valore predefinito del partner. Inserisci 0 per esentare questo cliente.",
+      "inactiveOrg": "Le commissioni sulle carte restano inattive finché un amministratore del partner non conferma entrambe le dichiarazioni sulle commissioni nella scheda Payments delle impostazioni di fatturazione del partner.",
+      "missingAuthorization": "Nessuna autorizzazione registrata: {{count}}. I pagamenti automatici non possono addebitare questi clienti finché non autorizzano il metodo di pagamento salvato.",
+      "missingAuthorizationOrg": "Questo cliente non ha un’autorizzazione registrata per il metodo di pagamento salvato. I pagamenti automatici non possono addebitarlo finché il cliente non lo autorizza.",
+      "requestMissingAuthorization": "Richiedi autorizzazione"
+    },
+    "enrollmentTitle": "Adesione al pagamento automatico",
+    "requestSentTo": "Richiesta inviata a {{email}}.",
+    "result": {
+      "paused": "Pagamenti automatici sospesi.",
+      "resumed": "Pagamenti automatici ripresi.",
+      "turnedOff": "Pagamenti automatici disattivati."
+    },
+    "needsAttention": {
+      "method_unusable": "Non è possibile addebitare il metodo di pagamento salvato.",
+      "stripe_account_changed": "L’account Stripe collegato è cambiato dopo l’adesione di questo cliente.",
+      "key_missing_permissions": "Alla chiave Stripe mancano autorizzazioni necessarie per i pagamenti automatici.",
+      "verification_failed": "La verifica del conto bancario non è riuscita."
+    },
+    "chargeOutcome": {
+      "succeeded": "Pagamento ricevuto.",
+      "processing": "Pagamento inviato. È in elaborazione e la fattura si aggiornerà quando verrà regolato.",
+      "requiresAction": "La banca del cliente richiede che confermi questo pagamento. Se è registrato un contatto di fatturazione, riceve via e-mail un link per confermarlo.",
+      "declined": "Il pagamento non è andato a buon fine.",
+      "cardDeclined": "La carta è stata rifiutata.",
+      "expiredCard": "La carta è scaduta. Chiedi al cliente di aggiornare il metodo di pagamento.",
+      "insufficientFunds": "Il pagamento è stato rifiutato per fondi insufficienti.",
+      "canceled": "Il pagamento è stato annullato prima del completamento.",
+      "unapplied": "Il pagamento è stato incassato ma richiede riconciliazione. Verificalo prima di addebitare di nuovo."
+    },
+    "chargeRefused": {
+      "notice_lead": "Il periodo di preavviso del cliente non è ancora terminato. La fattura potrà essere addebitata al termine.",
+      "no_eligible_notice": "Questa fattura non ha un avviso di pagamento automatico, quindi non può essere addebitata automaticamente.",
+      "renotice_required": "L’avviso di pagamento deve essere inviato di nuovo prima di poter addebitare questa fattura.",
+      "collection_in_progress": "Per questa fattura è già in corso un pagamento.",
+      "checkout_session_unrevoked": "Il cliente potrebbe star pagando questa fattura online in questo momento. Riprova tra qualche minuto.",
+      "retry_not_due": "Il prossimo tentativo non è ancora previsto.",
+      "not_payable": "Questa fattura non è aperta al pagamento.",
+      "nothing_to_pay": "Non resta nulla da pagare su questa fattura.",
+      "enrollment_inactive": "I pagamenti automatici non sono attivi per questo cliente.",
+      "schedule_inactive": "Questa fattura non è più programmata per il pagamento automatico.",
+      "generic": "Impossibile avviare il pagamento automatico. Aggiorna la fattura per vederne lo stato attuale.",
+      "excluded_contract": "Il contratto di questa fattura è escluso dai pagamenti automatici, quindi non è stato addebitato nulla. Se il cliente era stato avvisato di questo pagamento, ha ricevuto un'email che non avverrà."
+    },
+    "stepUp": {
+      "heading": "Conferma che sei tu",
+      "intro": {
+        "autopay_charge_now": "Addebitare ora questa fattura richiede una nuova verifica a due fattori.",
+        "partner_payment_settings_update": "Modificare le impostazioni di pagamento richiede una nuova verifica a due fattori per questi valori specifici.",
+        "org_payment_settings_update": "Modificare le impostazioni di pagamento di questa organizzazione richiede una nuova verifica a due fattori per questi valori specifici.",
+        "autopay_request_recipient": "Inviare la richiesta di autorizzazione a un indirizzo diverso dal contatto di fatturazione richiede una nuova verifica a due fattori."
+      },
+      "code": "Codice dell'autenticatore",
+      "passkey": "Confermerai con la tua passkey.",
+      "noFactor": "Aggiungi prima un'app di autenticazione o una passkey al tuo account.",
+      "noFactorSmsOnly": "I codici via SMS non possono confermare questa azione. Aggiungi prima un'app di autenticazione o una passkey al tuo account.",
+      "enrollLink": "Configura un secondo fattore",
+      "confirm": "Conferma",
+      "failed": "Verifica non riuscita. Riprova.",
+      "unavailable": "Impossibile avviare la verifica"
+    }
+  },
+  "reminders": {
+    "title": "Promemoria di pagamento",
+    "description": "Invia promemoria per le fatture non pagate al contatto di fatturazione dell’organizzazione. I promemoria funzionano anche senza pagamenti automatici.",
+    "enabled": "Invia promemoria di pagamento",
+    "on": "Attivati",
+    "off": "Disattivati",
+    "inherit": "Usa {{source}}: {{value}}",
+    "before": "Giorni prima della scadenza",
+    "repeat": "Ripeti prima della scadenza ogni (giorni)",
+    "overdue": "Ricorda dopo la scadenza ogni (giorni)",
+    "noRepeat": "Nessuna ripetizione",
+    "orgRepeatHelp": "Lasciando il campo vuoto si eredita l’impostazione del partner. Non è possibile disattivare solo le ripetizioni prima della scadenza se il partner le ha attivate; disattiva i promemoria per questa organizzazione per interromperli tutti.",
+    "partnerRepeatHelp": "Lascia vuoto l’intervallo di ripetizione per inviare un solo promemoria prima della scadenza. Gli altri campi vuoti usano il valore predefinito visualizzato.",
+    "cadenceHelp": "Non viene inviato alcun promemoria il giorno della scadenza. Il primo promemoria di ritardo viene inviato un intervallo dopo la scadenza. Modificare date o intervalli non invia nuovamente i promemoria già assegnati.",
+    "invalid": "Inserisci un numero intero di giorni da 1 a 31 oppure lascia il campo vuoto per ereditare il valore.",
+    "sources": {
+      "org": "organizzazione",
+      "partner": "valore predefinito del partner",
+      "default": "valore predefinito di Breeze"
+    },
+    "save": "Salva impostazioni di pagamento",
+    "saving": "Salvataggio…",
+    "saved": "Impostazioni dei promemoria salvate",
+    "saveFailed": "Impossibile salvare le impostazioni dei promemoria",
+    "loadFailed": "Impossibile caricare le impostazioni dei promemoria",
+    "retry": "Riprova",
+    "loading": "Caricamento delle impostazioni di pagamento…",
+    "templates": {
+      "paymentReminder": "Promemoria di pagamento",
+      "paymentOverdue": "Promemoria di pagamento scaduto"
     }
   }
 }

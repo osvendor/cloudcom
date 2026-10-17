@@ -26,7 +26,7 @@ const B = 'b'.repeat(64);
 const ctx = { orgId: 'org-a', partnerId: 'p-1', signatureKey: K, broadKey: B, broad: false, osFamily: 'windows' };
 const row = (over: Partial<MemoryCandidateRow> = {}): MemoryCandidateRow => ({
   id: 'm-1', orgId: null, partnerId: 'p-1', signatureKey: K, broadKey: B, osType: 'windows', fixKind: 'partner_script',
-  scriptId: 's-1', scriptVersionId: 'v-1', builtinAction: null, playbookId: null,
+  scriptId: 's-1', scriptVersionId: 'v-1', builtinAction: null, playbookId: null, instructionsRef: null, instructionsTitle: null,
   attempts: 4, verifiedCount: 4, failedCount: 0, recurredCount: 0, upVotes: 1, downVotes: 0,
   rollingSuccessRate: 1, recentOutcomes: ['verified', 'verified', 'verified', 'verified'], status: 'active',
   staleSince: null, lastVerifiedAt: new Date('2026-11-01T00:00:00Z'),
@@ -67,6 +67,13 @@ describe('classifyMemoryRows', () => {
     expect(classifyMemoryRows([pb], ctx, 5).proven).toHaveLength(1);
   });
 
+  it('reviewed manual steps are proven with their ref and title; a deleted reviewed row is not offered (W2 Task 16)', () => {
+    const steps = row({ fixKind: 'manual_steps', scriptId: null, scriptVersionId: null, script: null, scriptVersionNumber: null, instructionsRef: 'fi-1', instructionsTitle: 'Clear print queue' });
+    const out = classifyMemoryRows([steps], ctx, 5);
+    expect(out.proven[0]).toMatchObject({ fixKind: 'manual_steps', instructionsRef: 'fi-1', instructionsTitle: 'Clear print queue' });
+    expect(classifyMemoryRows([{ ...steps, instructionsTitle: null }], ctx, 5)).toEqual({ proven: [], similar: [] });
+  });
+
   it('a proven PARTNER entry whose script was re-scoped to org A is never offered to org B (Review Focus 5, system-scope attach)', () => {
     const rescoped = row({ script: { ...row().script!, orgId: 'org-a', partnerId: 'p-1' } });
     expect(classifyMemoryRows([rescoped], { ...ctx, orgId: 'org-b' }, 5)).toEqual({ proven: [], similar: [] });
@@ -97,6 +104,36 @@ describe('classifyMemoryRows', () => {
     const out = classifyMemoryRows([row({ signatureKey: B })], { ...ctx, signatureKey: B, broad: true }, 5);
     expect(out.proven).toEqual([]);
     expect(out.similar).toHaveLength(1);
+  });
+
+  it('a retired row is dropped even when it is an exact, otherwise-proven match (defence in depth behind the SQL filter)', () => {
+    expect(classifyMemoryRows([row({ status: 'retired' })], ctx, 5)).toEqual({ proven: [], similar: [] });
+    // and a broad-key-only retired row is not offered as similar either
+    expect(classifyMemoryRows([row({ status: 'retired', signatureKey: 'x'.repeat(64) })], ctx, 5)).toEqual({ proven: [], similar: [] });
+  });
+
+  it('a row whose own os_type differs from the target OS is dropped even if its script supports the target OS', () => {
+    const mismatched = row({ osType: 'linux', script: { ...row().script!, osTypes: ['windows', 'linux'] } });
+    expect(classifyMemoryRows([mismatched], ctx, 5)).toEqual({ proven: [], similar: [] });
+    // control: same row on the matching OS is proven, so the drop is due to os_type alone
+    expect(classifyMemoryRows([row({ osType: 'linux', script: { ...row().script!, osTypes: ['linux'] } })], { ...ctx, osFamily: 'linux' }, 5).proven).toHaveLength(1);
+  });
+
+  it('an org-owned row pointing at a SYSTEM script is hidden (org rows must reference an org-owned script)', () => {
+    const orgRowSystemScript = row({
+      orgId: 'org-a', partnerId: null, fixKind: 'org_script',
+      script: { ...row().script!, isSystem: true, orgId: null, partnerId: null },
+    });
+    expect(classifyMemoryRows([orgRowSystemScript], ctx, 5)).toEqual({ proven: [], similar: [] });
+    // a malformed script that is system AND carries the row's org id must still be refused (isSystem is the guard)
+    const malformed = row({
+      orgId: 'org-a', partnerId: null, fixKind: 'org_script',
+      script: { ...row().script!, isSystem: true, orgId: 'org-a', partnerId: null },
+    });
+    expect(classifyMemoryRows([malformed], ctx, 5)).toEqual({ proven: [], similar: [] });
+    // control: the same row against an org-owned script is proven
+    const control = row({ orgId: 'org-a', partnerId: null, fixKind: 'org_script', script: { ...row().script!, orgId: 'org-a' } });
+    expect(classifyMemoryRows([control], ctx, 5).proven).toHaveLength(1);
   });
 
   it('org-private rows are labelled "this client"', () => {

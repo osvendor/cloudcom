@@ -211,6 +211,8 @@ export interface CreateOrganizationOptions {
   deletedAt?: Date | null;
   /** ISO-4217 org billing currency (multi-currency wave 1). Defaults to 'USD'. */
   currencyCode?: string;
+  /** organizations.settings JSONB (e.g. `{ helper: { enabled: true } }`). Defaults to the column default. */
+  settings?: Record<string, unknown>;
 }
 
 export async function createOrganization(options: CreateOrganizationOptions) {
@@ -227,7 +229,8 @@ export async function createOrganization(options: CreateOrganizationOptions) {
       slug: options.slug || `test-org-${timestamp}-${rand}`,
       type: options.type || 'customer',
       status: options.status || 'active',
-      deletedAt: options.deletedAt ?? null
+      deletedAt: options.deletedAt ?? null,
+      ...(options.settings ? { settings: options.settings } : {}),
     })
     .returning();
 
@@ -306,6 +309,37 @@ export async function createSite(options: CreateSiteOptions) {
     .returning();
 
   return site;
+}
+
+// ============================================
+// Device Utilities
+// ============================================
+
+export interface CreateDeviceOptions {
+  orgId: string;
+  siteId: string;
+  hostname?: string;
+}
+
+/**
+ * Minimal device row, inserted over the superuser test connection (so every
+ * devices trigger — including the ownership-epoch init trigger — fires as it
+ * does in production).
+ */
+export async function createDevice(options: CreateDeviceOptions): Promise<{ id: string }> {
+  const id8 = randomUUID().slice(0, 8);
+  const [device] = await getTestDb().execute<{ id: string }>(sql`
+    INSERT INTO devices (
+      org_id, site_id, agent_id, hostname, os_type, os_version,
+      architecture, agent_version
+    ) VALUES (
+      ${options.orgId}, ${options.siteId}, ${`agent-${randomUUID()}`},
+      ${options.hostname ?? `host-${id8}`}, 'windows', '11', 'amd64', '2.0.0'
+    )
+    RETURNING id
+  `);
+  if (!device) throw new Error('createDevice: insert returned no row');
+  return { id: device.id };
 }
 
 // ============================================
@@ -399,6 +433,26 @@ export async function assignUserToPartner(
     .returning();
 
   return assignment;
+}
+
+/**
+ * A user's current session epochs (what their access token would carry as
+ * `aep` / `mep`) and credential epoch. Fixtures that issue partner service
+ * principal keys pass the session pair as `actorSessionEpochs`, and fixtures
+ * that insert key rows directly stamp the owner's credential / MFA epochs.
+ */
+export async function userEpochs(userId: string): Promise<{
+  authEpoch: number;
+  mfaEpoch: number;
+  credentialEpoch: number;
+}> {
+  const [row] = await getTestDb()
+    .select({ authEpoch: users.authEpoch, mfaEpoch: users.mfaEpoch, credentialEpoch: users.credentialEpoch })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+  if (!row) throw new Error(`userEpochs: user ${userId} not found`);
+  return row;
 }
 
 export async function assignUserToOrganization(

@@ -107,6 +107,27 @@ export function isEtagFresh(ifNoneMatchHeader: string | undefined, etag: string)
     .includes(etag);
 }
 
+export function respondWithPortalPrivateCache(c: Context, payload: unknown) {
+  applyPortalCacheHeaders(c, {
+    scope: 'private',
+    browserMaxAgeSeconds: 30,
+    staleWhileRevalidateSeconds: 0,
+    vary: ['Authorization', 'Cookie'],
+  });
+
+  // `asOf` changes on every request and does not describe the underlying data.
+  // Exclude it from the ETag so an unchanged payload can revalidate to 304.
+  const etagPayload = payload !== null && typeof payload === 'object' && !Array.isArray(payload)
+    ? { ...(payload as Record<string, unknown>), asOf: undefined }
+    : payload;
+  const etag = buildWeakEtag(etagPayload);
+  c.header('ETag', etag);
+  if (isEtagFresh(c.req.header('if-none-match'), etag)) {
+    return new Response(null, { status: 304, headers: c.res.headers });
+  }
+  return c.json(payload);
+}
+
 // ============================================
 // Cookie helpers
 // ============================================
@@ -466,7 +487,9 @@ export const portalFinancialMutationGuard: MiddlewareHandler = async (c, next) =
 
   const requiresJsonBody =
     /\/quotes\/[^/]+\/(?:accept|decline)$/.test(c.req.path)
-    || /\/invoices\/[^/]+\/settle$/.test(c.req.path);
+    || /\/invoices\/[^/]+\/(?:settle|autopay-confirmation)$/.test(c.req.path)
+    || /\/payment-methods\/(?:setup-session|setup-return)$/.test(c.req.path)
+    || /\/autopay\/stop$/.test(c.req.path);
   if (requiresJsonBody) {
     const contentType = c.req.header('content-type')?.toLowerCase() ?? '';
     if (!contentType.startsWith('application/json')) {

@@ -85,7 +85,7 @@ export function projectionGraph(name: ProjectionName, seed = TOPOLOGY_FIXTURE_SE
       omittedNodes: G10K_TOTAL.nodes - expected.nodes, omittedRelationships: G10K_TOTAL.edges - expected.edges,
     },
     coverage: { state: 'limited', reasons: [{ code: 'projection', message: 'Collapsed projection of a 10,000-node site' }] },
-    frontier: [], permissions: { canEdit: true, canDiagnose: true, canConfigureMonitoring: true },
+    frontier: [], permissions: { canEdit: true, canDiagnose: true, canConfigureMonitoring: true, canMoveDevices: false },
   };
   return { graph, body: JSON.stringify(graph), pinned: graph.layout.positions.length };
 }
@@ -200,9 +200,11 @@ export async function installProbes(context: BrowserContext) {
       }
     } as typeof Worker;
     document.addEventListener('securitypolicyviolation', (event) => probe.violations.push(`${event.violatedDirective}: ${event.blockedURI}`));
-    // The layout is applied when the explorer marks its draft dirty (the
+    // The layout is applied when the explorer marks `data-layout-applied` (the
     // result reached React state and the canvas). Two frames later it painted.
-    const applied = '[data-testid="topology-unsaved-layout"]';
+    // Not the unsaved indicator: the automatic arrangement on load is no longer
+    // an unsaved change (#7880).
+    const applied = '[data-testid="topology-explorer"][data-layout-applied]';
     const observer = new MutationObserver(() => {
       if (probe.appliedAt !== null || !document.querySelector(applied)) return;
       probe.appliedAt = performance.now();
