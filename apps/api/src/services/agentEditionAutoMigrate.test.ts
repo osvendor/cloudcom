@@ -16,6 +16,7 @@ vi.mock('../db', () => ({
 }));
 vi.mock('./binaryEdition', () => ({ getBinaryEdition: vi.fn(() => 'hosted') }));
 vi.mock('./binarySource', () => ({ getGithubReleaseVersion: vi.fn(() => '0.108.0') }));
+vi.mock('./agentRolloutAdmission', () => ({ admitAgentUpdate: vi.fn() }));
 vi.mock('./scriptDispatch', () => ({ dispatchScriptToDevice: vi.fn() }));
 vi.mock('./sentry', () => ({ captureException: vi.fn(), captureMessage: vi.fn() }));
 vi.mock('node:fs', () => ({ createReadStream: vi.fn(() => ({})) }));
@@ -30,6 +31,7 @@ import { createHash } from 'node:crypto';
 import { db } from '../db';
 import { getBinaryEdition } from './binaryEdition';
 import { getGithubReleaseVersion } from './binarySource';
+import { admitAgentUpdate } from './agentRolloutAdmission';
 import { dispatchScriptToDevice } from './scriptDispatch';
 import { captureException, captureMessage } from './sentry';
 import { stat } from 'node:fs/promises';
@@ -116,6 +118,7 @@ function primeHappyPath() {
 describe('maybeDispatchEditionMigration', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(admitAgentUpdate).mockResolvedValue({ allowed: true, reason: 'admitted' });
     __resetEditionAutoMigrateStateForTests();
     process.env.AGENT_EDITION_AUTO_MIGRATE_ENABLED = 'true';
     process.env.PUBLIC_API_URL = 'https://eu.example.app';
@@ -127,6 +130,32 @@ describe('maybeDispatchEditionMigration', () => {
   afterEach(() => {
     delete process.env.AGENT_EDITION_AUTO_MIGRATE_ENABLED;
     delete process.env.PUBLIC_API_URL;
+  });
+
+  it('defers before the permanent claim and retries after rollout capacity returns', async () => {
+    const claim = primeHappyPath();
+    vi.mocked(admitAgentUpdate).mockResolvedValueOnce({ allowed: false, reason: 'host-pressure' });
+    await maybeDispatchEditionMigration(baseArgs());
+    expect(admitAgentUpdate).toHaveBeenCalledWith({
+      deviceId: 'device-1', siteKey: 'org-1:site-1', targets: { agent: '0.108.0' },
+    });
+    expect(claim.set).not.toHaveBeenCalled();
+    expect(dispatchScriptToDevice).not.toHaveBeenCalled();
+    expect(captureException).not.toHaveBeenCalled();
+    await maybeDispatchEditionMigration(baseArgs());
+    expect(dispatchScriptToDevice).toHaveBeenCalledTimes(1);
+    expect(claim.set).toHaveBeenCalledTimes(1);
+  });
+
+  it('reserves no rollout permit before update eligibility and script availability are proven', async () => {
+    primeHappyPath();
+    await maybeDispatchEditionMigration(baseArgs({ updateGateAllows: false }));
+    expect(admitAgentUpdate).not.toHaveBeenCalled();
+    vi.mocked(db.select).mockReturnValue(selectResolving([]) as never);
+    await maybeDispatchEditionMigration(baseArgs());
+    expect(admitAgentUpdate).not.toHaveBeenCalled();
+    expect(db.update).not.toHaveBeenCalled();
+    expect(dispatchScriptToDevice).not.toHaveBeenCalled();
   });
 
   it('dispatches the system migration script with msi url, sha256, and target edition', async () => {

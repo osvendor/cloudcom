@@ -21,6 +21,7 @@ type DeviceStatus = {
     name: string;
     vendor: string;
   } | null;
+  cloudAntivirus?: { provider: "Check Point Harmony Endpoint"; source: "cloud"; stale: boolean } | null;
 };
 type DashboardStats = {
   totalDevices: number;
@@ -366,7 +367,8 @@ export default function AntivirusPage() {
                         {d.os}
                       </td>
                       <td className="px-4 py-3 text-sm">
-                        {d.provider?.name ?? t("securityAntivirusPage.unknown")}
+                        <div>{d.provider?.name ?? t("securityAntivirusPage.unknown")}</div>
+                        {d.cloudAntivirus && <span className="mt-1 inline-flex rounded-full border border-blue-500/30 bg-blue-500/10 px-2 py-0.5 text-xs text-blue-700">Harmony cloud{d.cloudAntivirus.stale ? " · stale" : ""}</span>}
                       </td>
                       <td className="px-4 py-3">
                         <span

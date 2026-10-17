@@ -1,4 +1,5 @@
 import { pgTable, uuid, varchar, text, timestamp, boolean, jsonb, pgEnum, integer, real, bigint, date, primaryKey, index, unique, uniqueIndex, foreignKey } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 import { ipClassEnum, organizations, sites } from './orgs';
 import { users } from './users';
 import { aiInitiatorKindEnum } from './aiInitiator';
@@ -723,7 +724,10 @@ export const deviceCommands = pgTable('device_commands', {
   aiInitiatorKind: aiInitiatorKindEnum('ai_initiator_kind'),
   aiSessionId: uuid('ai_session_id'),
   aiAgentRunId: uuid('ai_agent_run_id')
-});
+}, (table) => ({
+  executionLookupIdx: index('cloudcom_device_commands_execution_idx')
+    .on(table.type, sql`(${table.payload}->>'executionId')`),
+}));
 
 export const connectionProtocolEnum = pgEnum('connection_protocol', ['tcp', 'tcp6', 'udp', 'udp6']);
 

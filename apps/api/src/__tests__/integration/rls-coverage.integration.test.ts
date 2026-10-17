@@ -352,6 +352,7 @@ const PARTNER_TENANT_TABLES: ReadonlyMap<string, string> = new Map<string, strin
   // partner-axis (Shape 3). org_id is denormalized/nullable metadata only.
   // Also listed in ORG_AXIS_POLICY_EXCLUDED_TABLES (dual-list trap).
   ['s1_integrations', 'partner_id'],
+  ['harmony_integrations', 'partner_id'],
   ['s1_org_mappings', 'partner_id'],
   // UniFi Network integration (Phase 1): one integration per partner (MSP
   // holds the UniFi API key); sync_runs are per-integration, keyed by

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OS Companion Privacy Policy</title>
+  <style>
+    :root { color-scheme: light; font: 16px/1.6 system-ui, -apple-system, Segoe UI, sans-serif; }
+    body { max-width: 50rem; margin: 0 auto; padding: 2rem 1.25rem 4rem; color: #17202a; background: #fff; }
+    h1 { line-height: 1.2; } h2 { margin-top: 2rem; line-height: 1.3; }
+    a { color: #075985; } .meta { color: #475569; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>OS Companion Privacy Policy</h1>
+    <p class="meta">Effective date: October 8, 2026</p>
+    <p>OS Companion is a staff-only Microsoft Edge extension for authorized users of the CloudCom/Breeze service operated by OS Consultants LLC. It helps staff work with selected client records, devices, internal notes, work tickets, login records, and authorized device tools.</p>
+
+    <h2>Information the extension processes</h2>
+    <p>Depending on the workflow a staff member chooses, OS Companion processes:</p>
+    <ul>
+      <li>the signed-in staff identity, sign-in response, and a short-lived extension session;</li>
+      <li>the selected client, device identifiers and names, device status, operating-system information, and responses from authorized device tools;</li>
+      <li>work-ticket identifiers, subjects, client and device context, requested actions, and results from the curated Windows workflow;</li>
+      <li>note search terms and client-scoped note content that staff explicitly open; and</li>
+      <li>client-scoped login records, including a username, password, or one-time code when staff explicitly request a copy or fill action.</li>
+    </ul>
+
+    <h2>How credentials and web pages are handled</h2>
+    <p>For an explicit copy action, the extension requests the selected value from CloudCom/Breeze and writes the requested value to the browser clipboard. For a fill action, it checks the active tab’s HTTPS origin, the selected client and login result, the selected field, and the current tab before requesting the fill. It fills only the field selected by staff and does not submit the form.</p>
+    <p>The active website's URL/origin and limited login-field metadata are processed to check the selected destination. The extension does not capture passwords typed into websites, record website keystrokes, collect browsing history, read arbitrary pages in the background, or maintain an offline credential vault. Clipboard contents are not collected for analytics or retained by the extension. Commands and input that staff deliberately send through remote tools are transmitted to the selected device.</p>
+
+    <h2>Devices, tools, notes, and work tickets</h2>
+    <p>Staff may select an authorized client and device, view device status, open available processes, services, events, tasks, files, scripts, registry, command, PowerShell, WebRTC, or managed remote-desktop tools, and create or update internal work tickets. The service and endpoint authorization determine which client, device, and tool data can be returned. The curated “Clear stuck print jobs” workflow performs its service-defined preflight before execution.</p>
+
+    <h2>Where information goes</h2>
+    <p>Operational requests are sent to the configured HTTPS CloudCom/Breeze service at <a href="https://breeze.osbmsp.com">breeze.osbmsp.com</a>. Requested device operations may also reach the authorized endpoint agent or managed viewer path. The extension does not include unrelated analytics, advertising, or data-broker services. We do not sell extension user data or use it for advertising or lending decisions.</p>
+
+    <h2>Storage, retention, and access</h2>
+    <p>The extension stores its short-lived companion session and session-scoped client, device, and result caches in browser session storage while it is in use. Signing out clears extension session storage and asks the service to end the companion session. Expired sessions are removed when checked. Server-held records, audit data, access controls, and retention are managed by CloudCom/Breeze and the organization’s administrators.</p>
+
+    <h2>Who can use it</h2>
+    <p>OS Companion is intended for authorized CloudCom/Breeze staff. Authorization, client boundaries, device boundaries, tool permissions, and server-side audit behavior are enforced by the service and its organization configuration.</p>
+
+    <h2>Changes and contact</h2>
+    <p>We may update this policy when the extension’s processing changes. The effective date above identifies the current version.</p>
+    <p>Questions about this policy or OS Companion can be sent to <a href="mailto:support@osconsultants.net">support@osconsultants.net</a>.</p>
+  </main>
+</body>
+</html>

@@ -1,14 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { PgDialect } from 'drizzle-orm/pg-core';
 
 const { mockDb, dispatchMock, resolveMonitorsMock, txState, neSpy, eqSpy } = vi.hoisted(() => ({
   mockDb: { select: vi.fn() },
   dispatchMock: vi.fn(),
   resolveMonitorsMock: vi.fn(),
-  // How many system transactions are open right now (#3445).
-  txState: { depth: 0 },
+  // Model context reuse and transaction commit/rollback, including probe writes
+  // that must remain atomic and survive a failure on a subsequent device.
+  txState: {
+    depth: 0,
+    nextId: 0,
+    id: null as number | null,
+    staged: [] as string[],
+    committed: [] as string[],
+    failCommit: false,
+    events: [] as Array<{ id: number; event: 'begin' | 'commit' | 'rollback' }>,
+  },
   neSpy: vi.fn(),
   eqSpy: vi.fn(),
 }));
+
+const { canRunBackgroundWorkMock } = vi.hoisted(() => ({ canRunBackgroundWorkMock: vi.fn(() => true) }));
+vi.mock('../services/capacityGuard', () => ({ canRunBackgroundWork: canRunBackgroundWorkMock }));
 
 // Plain-string mocked schema columns below cannot round-trip through a real
 // drizzle SQL compiler (no Column/Table shape for PgDialect to read), so the
@@ -33,25 +46,50 @@ vi.mock('drizzle-orm', async (importOriginal) => {
 vi.mock('../db', () => ({
   db: mockDb,
   withSystemDbAccessContext: async (fn: () => unknown) => {
+    if (txState.depth > 0) return fn();
+    const id = ++txState.nextId;
+    txState.id = id;
+    txState.staged = [];
     txState.depth += 1;
+    txState.events.push({ id, event: 'begin' });
     try {
-      return await fn();
+      const result = await fn();
+      if (txState.failCommit) {
+        txState.failCommit = false;
+        throw new Error('commit failed');
+      }
+      txState.committed.push(...txState.staged);
+      txState.events.push({ id, event: 'commit' });
+      return result;
+    } catch (error) {
+      txState.events.push({ id, event: 'rollback' });
+      throw error;
     } finally {
       txState.depth -= 1;
+      txState.id = null;
+      txState.staged = [];
     }
   },
   runOutsideDbContext: async (fn: () => unknown) => {
     const saved = txState.depth;
+    const savedId = txState.id;
+    const savedStaged = txState.staged;
     txState.depth = 0;
+    txState.id = null;
+    txState.staged = [];
     try {
       return await fn();
     } finally {
       txState.depth = saved;
+      txState.id = savedId;
+      txState.staged = savedStaged;
     }
   },
 }));
 
-vi.mock('../db/schema', () => ({
+vi.mock('../db/schema', async () => {
+  const { pgTable, uuid, timestamp, text } = await import('drizzle-orm/pg-core');
+  return {
   monitorDefinitions: {
     id: 'monitorDefinitions.id',
     kind: 'monitorDefinitions.kind',
@@ -76,15 +114,23 @@ vi.mock('../db/schema', () => ({
     customFields: 'devices.customFields',
     isEphemeral: 'devices.isEphemeral',
   },
-  scriptExecutions: {
-    monitorId: 'scriptExecutions.monitorId',
-    deviceId: 'scriptExecutions.deviceId',
-    createdAt: 'scriptExecutions.createdAt',
-  },
+  configPolicyMonitors: pgTable('config_policy_monitors', {
+    monitorId: uuid('monitor_id'),
+    overrides: text('overrides'),
+  }),
+  // Real column metadata lets the guard test inspect the SQL sent to Postgres.
+  scriptExecutions: pgTable('script_executions', {
+    id: uuid('id'),
+    monitorId: uuid('monitor_id'),
+    deviceId: uuid('device_id'),
+    status: text('status'),
+    createdAt: timestamp('created_at'),
+  }),
   scripts: {
     id: 'scripts.id',
   },
-}));
+  };
+});
 
 vi.mock('../services/scriptDispatch', () => ({
   dispatchScriptToDevice: dispatchMock,
@@ -96,7 +142,7 @@ vi.mock('../services/monitors/monitorResolver', () => ({
   resolveMonitorsForDevice: resolveMonitorsMock,
 }));
 
-import { monitorDefinitions, organizations, devices, scriptExecutions, scripts } from '../db/schema';
+import { configPolicyMonitors, monitorDefinitions, organizations, devices, scriptExecutions, scripts } from '../db/schema';
 import { processScriptMonitorTick } from './monitorScriptWorker';
 
 const MONITOR_ID = 'monitor-1';
@@ -105,7 +151,8 @@ const ORG_ID = 'org-1';
 const SCRIPT_ID = '11111111-1111-4111-8111-111111111111';
 const NOW = new Date('2026-09-13T12:00:00.000Z');
 
-type TableRef = typeof monitorDefinitions | typeof organizations | typeof devices | typeof scriptExecutions | typeof scripts;
+type TableRef = typeof configPolicyMonitors | typeof monitorDefinitions | typeof organizations | typeof devices | typeof scriptExecutions | typeof scripts;
+type QueryResponse = unknown[] | (() => unknown[]);
 
 /**
  * Routes `db.select({...}).from(table)...` chains by the TABLE passed to
@@ -114,29 +161,39 @@ type TableRef = typeof monitorDefinitions | typeof organizations | typeof device
  * `...where().orderBy().limit()` shapes, matching what monitorScriptWorker
  * actually calls per table.
  */
-function setupDb(responses: Map<TableRef, unknown[]>) {
+function setupDb(responses: Map<TableRef, QueryResponse>) {
+  const queries: Array<{ table: TableRef; where: unknown; transactionId: number | null }> = [];
   mockDb.select.mockImplementation(() => {
-    let rows: unknown[] = [];
+    let response: QueryResponse = [];
+    let tableRef: TableRef;
+    const readRows = () => typeof response === 'function' ? response() : response;
     const builder = {
       from(table: TableRef) {
-        rows = responses.get(table) ?? [];
+        tableRef = table;
+        // Existing admission fixtures represent attached monitors. Tests for
+        // absence/overrides provide the complete inventory explicitly.
+        response = responses.get(table) ?? (table === configPolicyMonitors
+          ? [{ monitorId: MONITOR_ID, overrides: null }]
+          : []);
         return builder;
       },
-      where() {
+      where(predicate: unknown) {
+        queries.push({ table: tableRef, where: predicate, transactionId: txState.id });
         return builder;
       },
       orderBy() {
         return builder;
       },
       limit() {
-        return Promise.resolve(rows);
+        return Promise.resolve().then(readRows);
       },
       then(resolve: (v: unknown) => unknown, reject?: (e: unknown) => unknown) {
-        return Promise.resolve(rows).then(resolve, reject);
+        return Promise.resolve().then(readRows).then(resolve, reject);
       },
     };
     return builder;
   });
+  return queries;
 }
 
 function makeMonitorRow(overrides: Record<string, unknown> = {}) {
@@ -186,11 +243,31 @@ function minutesAgo(minutes: number): Date {
   return new Date(NOW.getTime() - minutes * 60_000);
 }
 
+function deferredProbe(deviceId: string, deliver: () => Promise<void>) {
+  return {
+    ok: true,
+    commandId: `command:${deviceId}`,
+    executionId: `execution:${deviceId}`,
+    delivered: false,
+    deliveryOutcome: 'deferred',
+    executedAt: null,
+    deliverBy: null,
+    ignoredParameters: [],
+    runAs: 'system',
+    targetSessionId: null,
+    deliver,
+  };
+}
+
 describe('processScriptMonitorTick', () => {
   beforeEach(() => {
+    canRunBackgroundWorkMock.mockReset().mockReturnValue(true);
     mockDb.select.mockReset();
     dispatchMock.mockReset();
     resolveMonitorsMock.mockReset();
+    Object.assign(txState, {
+      depth: 0, nextId: 0, id: null, staged: [], committed: [], failCommit: false, events: [],
+    });
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
 
@@ -223,7 +300,63 @@ describe('processScriptMonitorTick', () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.useRealTimers();
+  });
+
+  it('defers a pressured tick before opening a database context or marking any probe due', async () => {
+    canRunBackgroundWorkMock.mockReturnValue(false);
+    const result = await processScriptMonitorTick();
+    expect(result).toEqual({
+      monitorsConsidered: 0, devicesConsidered: 0, dispatched: 0, skipped: 0,
+      skippedUnattached: 0, skippedNotDue: 0, errors: 0, deferredForCapacity: true,
+    });
+    expect(mockDb.select).not.toHaveBeenCalled();
+    expect(resolveMonitorsMock).not.toHaveBeenCalled();
+    expect(dispatchMock).not.toHaveBeenCalled();
+    expect(txState.events).toEqual([]);
+    expect(txState.depth).toBe(0);
+  });
+
+  it('stops between devices after committed delivery and resumes the still-due device next tick', async () => {
+    const responses = new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow({ id: 'first' }), makeDeviceRow({ id: 'second' })]],
+      [scriptExecutions, []],
+      [scripts, [makeScriptRow()]],
+    ]);
+    setupDb(responses);
+    const delivered: string[] = [];
+    canRunBackgroundWorkMock.mockImplementation(() => {
+      expect(txState.depth).toBe(0);
+      return delivered.length === 0;
+    });
+    dispatchMock.mockImplementation(async ({ device }) => {
+      txState.staged.push(`execution:${device.id}`, `command:${device.id}`);
+      return deferredProbe(device.id, async () => {
+        expect(txState.depth).toBe(0);
+        expect(txState.committed).toContain(`command:${device.id}`);
+        delivered.push(device.id);
+      });
+    });
+    expect(await processScriptMonitorTick()).toMatchObject({
+      devicesConsidered: 1, dispatched: 1, skipped: 0, skippedNotDue: 0, errors: 0, deferredForCapacity: true,
+    });
+    expect(delivered).toEqual(['first']);
+    expect(txState.committed).toEqual(['execution:first', 'command:first']);
+    expect(resolveMonitorsMock).toHaveBeenCalledTimes(1);
+
+    // The first probe now exists; only the second remains due after recovery.
+    let historyReads = 0;
+    responses.set(scriptExecutions, () => ++historyReads === 1
+      ? [{ deviceId: 'first', id: 'execution:first', status: 'pending', createdAt: NOW }]
+      : []);
+    canRunBackgroundWorkMock.mockReturnValue(true);
+    const resumed = await processScriptMonitorTick();
+    expect(resumed).toMatchObject({ dispatched: 1, skipped: 1, skippedNotDue: 1, errors: 0 });
+    expect(resumed.deferredForCapacity).toBeUndefined();
+    expect(delivered).toEqual(['first', 'second']);
+    expect(txState.depth).toBe(0);
   });
 
   it('(a) does not redispatch when the newest execution is younger than the interval', async () => {
@@ -242,12 +375,14 @@ describe('processScriptMonitorTick', () => {
     expect(result).toMatchObject({ monitorsConsidered: 1, devicesConsidered: 1, dispatched: 0, skipped: 1 });
   });
 
-  it('(b) redispatches when the newest execution is older than the interval', async () => {
-    setupDb(
+  it('(b) allows old terminal history while guarding any active execution and the current cadence', async () => {
+    const queries = setupDb(
       new Map<TableRef, unknown[]>([
         [monitorDefinitions, [makeMonitorRow()]],
         [devices, [makeDeviceRow()]],
-        [scriptExecutions, [{ createdAt: minutesAgo(70) }]], // 70 min old, interval is 60
+        // The EXISTS-style lookup excludes terminal runs older than the
+        // interval, so Postgres returns no blocking rows for that history.
+        [scriptExecutions, []],
         [scripts, [makeScriptRow()]],
       ]),
     );
@@ -256,6 +391,63 @@ describe('processScriptMonitorTick', () => {
 
     expect(dispatchMock).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({ monitorsConsidered: 1, devicesConsidered: 1, dispatched: 1, skipped: 0 });
+
+    const predicate = queries.filter((query) => query.table === scriptExecutions).at(-1)!.where;
+    const compiled = new PgDialect().sqlToQuery(predicate as Parameters<PgDialect['sqlToQuery']>[0]);
+    expect(compiled.sql).toBe('("script_executions"."monitor_id" = $1 and "script_executions"."device_id" = $2 and ("script_executions"."status" in ($3, $4, $5, $6) or "script_executions"."created_at" > $7))');
+    expect(compiled.params).toEqual([
+      MONITOR_ID, DEVICE_ID, 'pending', 'queued', 'running', 'cancelling', minutesAgo(60).toISOString(),
+    ]);
+  });
+
+  it.each(['pending', 'queued', 'running', 'cancelling'])('does not replace an old %s execution with another probe', async (status) => {
+    setupDb(new Map<TableRef, unknown[]>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow()]],
+      // The guard is an existence lookup, so an old active row is returned
+      // even when newer completed/failed runs are present in the history.
+      [scriptExecutions, [{ id: 'active-run', status, createdAt: minutesAgo(1440) }]],
+      [scripts, [makeScriptRow()]],
+    ]));
+
+    const result = await processScriptMonitorTick();
+
+    expect(dispatchMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ dispatched: 0, skipped: 1, errors: 0 });
+  });
+
+  it.each(['offline', 'degraded', 'maintenance', 'decommissioned'])('skips a %s candidate before resolving policies or checking history', async (status) => {
+    const queries = setupDb(new Map<TableRef, unknown[]>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow({ status })]],
+      [scriptExecutions, []],
+      [scripts, [makeScriptRow()]],
+    ]));
+
+    const result = await processScriptMonitorTick();
+
+    expect(resolveMonitorsMock).not.toHaveBeenCalled();
+    expect(dispatchMock).not.toHaveBeenCalled();
+    expect(queries.some((query) => query.table === scriptExecutions)).toBe(false);
+    expect(result).toMatchObject({ devicesConsidered: 1, dispatched: 0, skipped: 1, errors: 0 });
+  });
+
+  it('requests a fresh offline rejection and treats a liveness race as a skipped probe', async () => {
+    setupDb(new Map<TableRef, unknown[]>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, []],
+      [scripts, [makeScriptRow()]],
+    ]));
+    dispatchMock.mockResolvedValue({ ok: false, code: 'device_offline', error: 'Device is offline' });
+
+    const result = await processScriptMonitorTick();
+
+    expect(dispatchMock).toHaveBeenCalledWith(expect.objectContaining({
+      device: expect.objectContaining({ status: 'online' }),
+      offlinePolicy: { kind: 'reject' },
+    }));
+    expect(result).toMatchObject({ dispatched: 0, skipped: 1, errors: 0 });
   });
 
   it('(c) does not dispatch when the resolver says this monitor is disabled for the device', async () => {
@@ -323,14 +515,59 @@ describe('processScriptMonitorTick', () => {
     expect(call.monitorId).toBe(MONITOR_ID);
     expect(call.device.id).toBe(DEVICE_ID);
     expect(call.timeoutSeconds).toBe(300);
+    expect(call.offlinePolicy).toEqual({ kind: 'reject' });
   });
 
-  // #3445: the tick runs in ONE system transaction and the probe's
-  // script_executions + device_commands rows are written in it. Sending inside
+  it('keeps effective scheduling overrides and rejects invalid overrides before dispatch', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const queries = setupDb(new Map<TableRef, unknown[]>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, []],
+      [scripts, [makeScriptRow()]],
+    ]));
+    const resolution = await resolveMonitorsMock();
+    resolveMonitorsMock.mockResolvedValue({
+      ...resolution,
+      monitors: [{ ...resolution.monitors[0], overrides: { intervalMinutes: 10, timeoutSeconds: 90 } }],
+    });
+
+    expect((await processScriptMonitorTick()).dispatched).toBe(1);
+    expect(dispatchMock).toHaveBeenCalledWith(expect.objectContaining({ timeoutSeconds: 90 }));
+    const guard = queries.filter((query) => query.table === scriptExecutions).at(-1)!.where;
+    expect(new PgDialect().sqlToQuery(guard as Parameters<PgDialect['sqlToQuery']>[0]).params)
+      .toContain(minutesAgo(10).toISOString());
+
+    dispatchMock.mockClear();
+    resolveMonitorsMock.mockResolvedValue({
+      ...resolution,
+      monitors: [{ ...resolution.monitors[0], overrides: { timeoutSeconds: -1 } }],
+    });
+    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 0, errors: 1 });
+    expect(dispatchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['maintenance_suppressed', 'maintenance_check_failed'])('preserves the dispatcher refusal %s', async (code) => {
+    setupDb(new Map<TableRef, unknown[]>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, []],
+      [scripts, [makeScriptRow()]],
+    ]));
+    dispatchMock.mockResolvedValue({ ok: false, code, error: 'Maintenance gate refused the probe' });
+
+    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 0, skipped: 1, errors: 0 });
+    expect(dispatchMock).toHaveBeenCalledWith(expect.objectContaining({ deferDelivery: true }));
+    expect(dispatchMock.mock.calls[0]![0].bypassMaintenanceWindow).toBeUndefined();
+    expect(txState.committed).toEqual([]);
+  });
+
+  // #3445: the probe's script_executions + device_commands rows are written
+  // together in the device admission transaction. Sending inside
   // that transaction lets a fast agent answer before the rows are visible to
   // the result path, which then drops the result and strands the execution
   // until the stale reaper times it out.
-  it('writes the probe rows inside the tick transaction and sends only after it commits (#3445)', async () => {
+  it('writes the probe rows inside one admission transaction and sends only after it commits (#3445)', async () => {
     setupDb(
       new Map<TableRef, unknown[]>([
         [monitorDefinitions, [makeMonitorRow()]],
@@ -368,6 +605,124 @@ describe('processScriptMonitorTick', () => {
       { event: 'rows_created', depth: 1 },
       { event: 'sent', depth: 0 },
     ]);
+  });
+
+  it('releases prior-device locks before the next policy read and rolls back only a failed admission', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    setupDb(new Map<TableRef, unknown[]>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, ['first', 'fails', 'last'].map((id) => makeDeviceRow({ id }))],
+      [scriptExecutions, []],
+      [scripts, [makeScriptRow()]],
+    ]));
+    const policyTransactions: number[] = [];
+    const delivered: string[] = [];
+    const resolution = await resolveMonitorsMock();
+    resolveMonitorsMock.mockClear();
+    resolveMonitorsMock.mockImplementation(async (id: string) => {
+      expect(txState.depth).toBe(1);
+      expect(txState.staged).toEqual([]);
+      if (id !== 'first') {
+        // These FK-holding writes already committed; they cannot remain open
+        // while this device resolves policy and maintenance on its connection.
+        expect(txState.committed).toEqual(['execution:first', 'command:first']);
+        expect(delivered).toEqual(['first']);
+        expect(txState.events).toContainEqual({ id: policyTransactions[0], event: 'commit' });
+      }
+      policyTransactions.push(txState.id!);
+      return resolution;
+    });
+    dispatchMock.mockImplementation(async ({ device, deferDelivery }) => {
+      expect(deferDelivery).toBe(true);
+      expect(txState.depth).toBe(1);
+      txState.staged.push(`execution:${device.id}`);
+      if (device.id === 'fails') throw new Error('command insert failed');
+      txState.staged.push(`command:${device.id}`);
+      return deferredProbe(device.id, async () => {
+        expect(txState.depth).toBe(0);
+        expect(txState.committed).toContain(`execution:${device.id}`);
+        expect(txState.committed).toContain(`command:${device.id}`);
+        delivered.push(device.id);
+      });
+    });
+
+    const result = await processScriptMonitorTick();
+
+    expect(result).toEqual({ monitorsConsidered: 1, devicesConsidered: 3, dispatched: 2, skipped: 0, skippedUnattached: 0, skippedNotDue: 0, errors: 1 });
+    expect(new Set(policyTransactions).size).toBe(3);
+    expect(txState.events).toContainEqual({ id: policyTransactions[1], event: 'rollback' });
+    expect(txState.committed).toEqual(['execution:first', 'command:first', 'execution:last', 'command:last']);
+    expect(delivered).toEqual(['first', 'last']);
+    expect(txState.depth).toBe(0);
+  });
+
+  it('does not count or deliver a probe whose transaction failed to commit', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    setupDb(new Map<TableRef, unknown[]>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, []],
+      [scripts, [makeScriptRow()]],
+    ]));
+    const deliver = vi.fn();
+    dispatchMock.mockImplementation(async () => {
+      txState.staged.push('execution:failed-commit', 'command:failed-commit');
+      txState.failCommit = true;
+      return deferredProbe(DEVICE_ID, deliver);
+    });
+
+    const result = await processScriptMonitorTick();
+
+    expect(result).toMatchObject({ dispatched: 0, skipped: 0, errors: 1 });
+    expect(txState.committed).toEqual([]);
+    expect(deliver).not.toHaveBeenCalled();
+  });
+
+  it('uses a fresh transaction rather than inheriting an outer sweep context', async () => {
+    setupDb(new Map<TableRef, unknown[]>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, []],
+      [scripts, [makeScriptRow()]],
+    ]));
+    txState.depth = 1;
+    txState.id = 999;
+    txState.staged = ['unrelated outer write'];
+    dispatchMock.mockImplementation(async () => {
+      expect(txState.id).not.toBe(999);
+      expect(txState.depth).toBe(1);
+      txState.staged.push('execution:own', 'command:own');
+      return deferredProbe(DEVICE_ID, async () => {
+        expect(txState.depth).toBe(0);
+        expect(txState.committed).toEqual(['execution:own', 'command:own']);
+      });
+    });
+
+    expect((await processScriptMonitorTick()).dispatched).toBe(1);
+    expect(txState.depth).toBe(1);
+    expect(txState.id).toBe(999);
+    expect(txState.staged).toEqual(['unrelated outer write']);
+  });
+
+  it('does not redispatch a committed admission when a later tick retries', async () => {
+    const responses = new Map<TableRef, unknown[]>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, []],
+      [scripts, [makeScriptRow()]],
+    ]);
+    setupDb(responses);
+    dispatchMock.mockImplementation(async () => {
+      txState.staged.push('execution:once', 'command:once');
+      return deferredProbe(DEVICE_ID, async () => {
+        expect(txState.committed).toEqual(['execution:once', 'command:once']);
+        responses.set(scriptExecutions, [{ id: 'execution:once', status: 'pending', createdAt: NOW }]);
+      });
+    });
+
+    expect((await processScriptMonitorTick()).dispatched).toBe(1);
+    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 0, skipped: 1, errors: 0 });
+    expect(dispatchMock).toHaveBeenCalledTimes(1);
   });
 
   it('a throwing deferred delivery does not fail the tick — the committed command waits for the heartbeat (#3445)', async () => {
@@ -414,7 +769,7 @@ describe('processScriptMonitorTick', () => {
     const result = await processScriptMonitorTick();
 
     expect(dispatchMock).not.toHaveBeenCalled();
-    expect(result).toEqual({ monitorsConsidered: 0, devicesConsidered: 0, dispatched: 0, skipped: 0, errors: 0 });
+    expect(result).toEqual({ monitorsConsidered: 0, devicesConsidered: 0, dispatched: 0, skipped: 0, skippedUnattached: 0, skippedNotDue: 0, errors: 0 });
   });
 
   it('excludes the hidden quick_support org from a partner-wide script monitor fan-out', async () => {
@@ -448,5 +803,314 @@ describe('processScriptMonitorTick', () => {
     await processScriptMonitorTick();
 
     expect(eqSpy).toHaveBeenCalledWith(devices.isEphemeral, false);
+  });
+
+  it('skips an unattached monitor without per-device policy/history reads and sees a new attachment next tick', async () => {
+    const responses = new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [configPolicyMonitors, []],
+      [devices, [makeDeviceRow(), makeDeviceRow({ id: 'offline', status: 'offline' })]],
+      [scriptExecutions, []],
+      [scripts, [makeScriptRow()]],
+    ]);
+    const queries = setupDb(responses);
+
+    expect(await processScriptMonitorTick()).toMatchObject({
+      devicesConsidered: 2, skipped: 2, skippedUnattached: 1, skippedNotDue: 0, errors: 0,
+    });
+    expect(resolveMonitorsMock).not.toHaveBeenCalled();
+    expect(queries.filter((query) => query.table === scriptExecutions)).toHaveLength(0);
+
+    responses.set(configPolicyMonitors, [{ monitorId: MONITOR_ID, overrides: null }]);
+    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 1, skippedUnattached: 0 });
+    expect(resolveMonitorsMock).toHaveBeenCalledTimes(1);
+    expect(queries.filter((query) => query.table === configPolicyMonitors)).toHaveLength(2);
+  });
+
+  it('preserves authored condition and owner/fan-out errors even when no attachment exists', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    setupDb(new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [
+        makeMonitorRow({ id: 'invalid', condition: { scriptId: SCRIPT_ID, intervalMinutes: 1 } }),
+        makeMonitorRow({ id: 'ownerless', orgId: null, partnerId: null }),
+        makeMonitorRow({ id: 'too-wide', orgId: null, partnerId: 'partner-1' }),
+      ]],
+      [configPolicyMonitors, []],
+      [organizations, Array.from({ length: 501 }, (_, i) => ({ id: `org-${i}` }))],
+    ]));
+
+    expect(await processScriptMonitorTick()).toMatchObject({
+      monitorsConsidered: 3, errors: 3, skippedUnattached: 0, dispatched: 0,
+    });
+    expect(resolveMonitorsMock).not.toHaveBeenCalled();
+  });
+
+  it('uses one history query for an idle fleet instead of resolving every device', async () => {
+    const fleet = Array.from({ length: 46 }, (_, i) => makeDeviceRow({ id: `fleet-${i}` }));
+    const queries = setupDb(new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, fleet],
+      [scriptExecutions, fleet.map((device) => ({
+        deviceId: device.id, status: 'completed', createdAt: minutesAgo(10),
+      }))],
+    ]));
+
+    expect(await processScriptMonitorTick()).toMatchObject({
+      devicesConsidered: 46, skipped: 46, skippedNotDue: 46, dispatched: 0, errors: 0,
+    });
+    expect(resolveMonitorsMock).not.toHaveBeenCalled();
+    expect(dispatchMock).not.toHaveBeenCalled();
+    expect(queries.filter((query) => query.table === configPolicyMonitors)).toHaveLength(1);
+    const historyQueries = queries.filter((query) => query.table === scriptExecutions);
+    expect(historyQueries).toHaveLength(1);
+    const compiled = new PgDialect().sqlToQuery(historyQueries[0]!.where as Parameters<PgDialect['sqlToQuery']>[0]);
+    expect(compiled.sql).toContain('"monitor_id" = $1');
+    expect(compiled.sql).toContain('"device_id" in (');
+    expect(compiled.params).toEqual([
+      MONITOR_ID, ...fleet.map((device) => device.id),
+      'pending', 'queued', 'running', 'cancelling', minutesAgo(60).toISOString(),
+    ]);
+  });
+
+  it.each(['pending', 'queued', 'running', 'cancelling'])('prefilters an old %s run even behind newer terminal history', async (status) => {
+    setupDb(new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, [
+        { deviceId: DEVICE_ID, status, createdAt: minutesAgo(1440) },
+        { deviceId: DEVICE_ID, status: 'completed', createdAt: minutesAgo(120) },
+      ]],
+    ]));
+
+    expect(await processScriptMonitorTick()).toMatchObject({ skippedNotDue: 1, dispatched: 0 });
+    expect(resolveMonitorsMock).not.toHaveBeenCalled();
+  });
+
+  it('includes shorter disabled/unassigned attachment overrides without changing final winner resolution', async () => {
+    let historyReads = 0;
+    const queries = setupDb(new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [configPolicyMonitors, [
+        { monitorId: MONITOR_ID, overrides: null },
+        { monitorId: MONITOR_ID, overrides: { intervalMinutes: 5 }, enabled: false, assigned: false },
+      ]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, () => ++historyReads === 1
+        ? [{ deviceId: DEVICE_ID, status: 'completed', createdAt: minutesAgo(10) }]
+        : []],
+      [scripts, [makeScriptRow()]],
+    ]));
+    const resolution = await resolveMonitorsMock();
+    resolveMonitorsMock.mockClear();
+    resolveMonitorsMock.mockResolvedValue({
+      ...resolution,
+      monitors: [{ ...resolution.monitors[0], overrides: { intervalMinutes: 5 }, inheritedFromParent: true }],
+    });
+
+    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 1, skippedNotDue: 0 });
+    expect(resolveMonitorsMock).toHaveBeenCalledTimes(1);
+    const inventory = queries.find((query) => query.table === configPolicyMonitors)!;
+    expect(new PgDialect().sqlToQuery(inventory.where as Parameters<PgDialect['sqlToQuery']>[0]).sql)
+      .toBe('"config_policy_monitors"."monitor_id" in ($1)');
+    for (const query of queries.filter((query) => query.table === scriptExecutions)) {
+      expect(new PgDialect().sqlToQuery(query.where as Parameters<PgDialect['sqlToQuery']>[0]).params)
+        .toContain(minutesAgo(5).toISOString());
+    }
+  });
+
+  it('retains the authored lower bound and exact due check when an attachment makes the interval longer', async () => {
+    const authored = makeMonitorRow();
+    authored.condition.intervalMinutes = 5;
+    const queries = setupDb(new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [authored]],
+      [configPolicyMonitors, [{ monitorId: MONITOR_ID, overrides: { intervalMinutes: 60 } }]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, [{ deviceId: DEVICE_ID, status: 'completed', createdAt: minutesAgo(10) }]],
+    ]));
+    const resolution = await resolveMonitorsMock();
+    resolveMonitorsMock.mockClear();
+    resolveMonitorsMock.mockResolvedValue({
+      ...resolution, monitors: [{ ...resolution.monitors[0], overrides: { intervalMinutes: 60 } }],
+    });
+
+    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 0, skipped: 1, skippedNotDue: 0 });
+    expect(resolveMonitorsMock).toHaveBeenCalledTimes(1);
+    const queriesWithCutoffs = queries.filter((query) => query.table === scriptExecutions)
+      .map((query) => new PgDialect().sqlToQuery(query.where as Parameters<PgDialect['sqlToQuery']>[0]).params);
+    expect(queriesWithCutoffs[0]).toContain(minutesAgo(5).toISOString());
+    expect(queriesWithCutoffs[1]).toContain(minutesAgo(60).toISOString());
+  });
+
+  it.each([
+    ['unknown key', { futureSetting: true }],
+    ['invalid interval', { intervalMinutes: 1 }],
+    ['fractional interval', { intervalMinutes: 5.5 }],
+    ['invalid timeout', { timeoutSeconds: -1 }],
+    ['array', []],
+    ['string', 'invalid'],
+    ['boolean', false],
+  ])('disables the prefilter for any %s override, even on a nonwinning attachment', async (_name, overrides) => {
+    const queries = setupDb(new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [configPolicyMonitors, [
+        { monitorId: MONITOR_ID, overrides: null },
+        { monitorId: MONITOR_ID, overrides, enabled: false },
+      ]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, [{ deviceId: DEVICE_ID, status: 'completed', createdAt: minutesAgo(1) }]],
+    ]));
+
+    expect(await processScriptMonitorTick()).toMatchObject({ skipped: 1, skippedNotDue: 0, errors: 0 });
+    expect(resolveMonitorsMock).toHaveBeenCalledTimes(1);
+    expect(queries.filter((query) => query.table === scriptExecutions)).toHaveLength(1);
+  });
+
+  it('does not hide an invalid winning override behind recent execution history', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const badOverride = { timeoutSeconds: -1 };
+    setupDb(new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [configPolicyMonitors, [{ monitorId: MONITOR_ID, overrides: badOverride }]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, [{ deviceId: DEVICE_ID, status: 'completed', createdAt: minutesAgo(1) }]],
+    ]));
+    const resolution = await resolveMonitorsMock();
+    resolveMonitorsMock.mockClear();
+    resolveMonitorsMock.mockResolvedValue({
+      ...resolution, monitors: [{ ...resolution.monitors[0], overrides: badOverride }],
+    });
+
+    expect(await processScriptMonitorTick()).toMatchObject({ errors: 1, skippedNotDue: 0, dispatched: 0 });
+    expect(resolveMonitorsMock).toHaveBeenCalledTimes(1);
+    expect(dispatchMock).not.toHaveBeenCalled();
+  });
+
+  it('sees a newly shortened interval on the next sweep without retaining a not-due decision', async () => {
+    let historyReads = 0;
+    const responses = new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [configPolicyMonitors, [{ monitorId: MONITOR_ID, overrides: null }]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, () => ++historyReads <= 2
+        ? [{ deviceId: DEVICE_ID, status: 'completed', createdAt: minutesAgo(10) }]
+        : []],
+      [scripts, [makeScriptRow()]],
+    ]);
+    setupDb(responses);
+    expect(await processScriptMonitorTick()).toMatchObject({ skippedNotDue: 1, dispatched: 0 });
+    expect(resolveMonitorsMock).not.toHaveBeenCalled();
+
+    responses.set(configPolicyMonitors, [{ monitorId: MONITOR_ID, overrides: { intervalMinutes: 5 } }]);
+    const resolution = await resolveMonitorsMock();
+    resolveMonitorsMock.mockClear();
+    resolveMonitorsMock.mockResolvedValue({
+      ...resolution, monitors: [{ ...resolution.monitors[0], overrides: { intervalMinutes: 5 } }],
+    });
+    expect(await processScriptMonitorTick()).toMatchObject({ skippedNotDue: 0, dispatched: 1 });
+    expect(resolveMonitorsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('rechecks recency after earlier admissions rather than freezing a long sweep cutoff', async () => {
+    let historyReads = 0;
+    setupDb(new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow({ id: 'first' }), makeDeviceRow({ id: 'almost-due' })]],
+      [scriptExecutions, () => ++historyReads === 1
+        ? [{ deviceId: 'almost-due', status: 'completed', createdAt: minutesAgo(59.5) }]
+        : []],
+      [scripts, [makeScriptRow()]],
+    ]));
+    dispatchMock.mockImplementation(async ({ device }) => {
+      if (device.id === 'first') vi.setSystemTime(new Date(NOW.getTime() + 60_000));
+      return { ok: true };
+    });
+
+    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 2, skippedNotDue: 0 });
+    expect(resolveMonitorsMock).toHaveBeenCalledTimes(2);
+    expect(historyReads).toBe(3); // One bulk read and both unchanged exact guards.
+  });
+
+  it('keeps monitor/device history separate across organizations in the same sweep', async () => {
+    let candidateReads = 0;
+    let historyReads = 0;
+    const queries = setupDb(new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow(), makeMonitorRow({ id: 'monitor-2', orgId: 'org-2' })]],
+      [configPolicyMonitors, [
+        { monitorId: MONITOR_ID, overrides: null },
+        { monitorId: 'monitor-2', overrides: null },
+      ]],
+      [devices, () => ++candidateReads === 1
+        ? [makeDeviceRow()]
+        : [makeDeviceRow({ id: 'device-2', orgId: 'org-2' })]],
+      [scriptExecutions, () => ++historyReads === 1
+        ? [{ deviceId: DEVICE_ID, status: 'pending', createdAt: NOW }]
+        : []],
+      [scripts, [makeScriptRow()]],
+    ]));
+    resolveMonitorsMock.mockResolvedValue({
+      kind: 'resolved', monitors: [{ monitorId: 'monitor-2', enabled: true, overrides: null }],
+    });
+
+    expect(await processScriptMonitorTick()).toMatchObject({
+      monitorsConsidered: 2, dispatched: 1, skippedNotDue: 1, errors: 0,
+    });
+    expect(resolveMonitorsMock).toHaveBeenCalledExactlyOnceWith('device-2');
+    expect(dispatchMock).toHaveBeenCalledWith(expect.objectContaining({
+      monitorId: 'monitor-2', device: expect.objectContaining({ id: 'device-2', orgId: 'org-2' }),
+    }));
+    const predicates = queries.filter((query) => query.table === scriptExecutions)
+      .map((query) => new PgDialect().sqlToQuery(query.where as Parameters<PgDialect['sqlToQuery']>[0]).params);
+    expect(predicates[0]!.slice(0, 2)).toEqual([MONITOR_ID, DEVICE_ID]);
+    expect(predicates[1]!.slice(0, 2)).toEqual(['monitor-2', 'device-2']);
+  });
+
+  it('still rejects a duplicate execution created after the bulk history read', async () => {
+    let historyReads = 0;
+    setupDb(new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, () => ++historyReads === 1
+        ? []
+        : [{ id: 'racing-run', deviceId: DEVICE_ID, status: 'pending', createdAt: NOW }]],
+      [scripts, [makeScriptRow()]],
+    ]));
+
+    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 0, skipped: 1, skippedNotDue: 0 });
+    expect(resolveMonitorsMock).toHaveBeenCalledExactlyOnceWith(DEVICE_ID);
+    expect(dispatchMock).not.toHaveBeenCalled();
+    expect(historyReads).toBe(2);
+  });
+
+  it.each(['attachments', 'history'])('reports a failed %s prefilter and performs full checks in a fresh transaction', async (failedRead) => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    let reads = 0;
+    let failedTransaction: number | null = null;
+    const responses = new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow()]],
+      [scriptExecutions, []],
+      [scripts, [makeScriptRow()]],
+    ]);
+    responses.set(failedRead === 'attachments' ? configPolicyMonitors : scriptExecutions, () => {
+      if (++reads === 1) {
+        failedTransaction = txState.id;
+        throw new Error('read failed');
+      }
+      return [];
+    });
+    setupDb(responses);
+    const resolution = await resolveMonitorsMock();
+    resolveMonitorsMock.mockClear();
+    resolveMonitorsMock.mockImplementation(async () => {
+      expect(txState.id).not.toBe(failedTransaction);
+      expect(txState.events).toContainEqual({ id: failedTransaction, event: 'rollback' });
+      return resolution;
+    });
+
+    expect(await processScriptMonitorTick()).toMatchObject({
+      dispatched: 1, errors: 1, skippedNotDue: 0, skippedUnattached: 0,
+    });
+    expect(resolveMonitorsMock).toHaveBeenCalledTimes(1);
   });
 });

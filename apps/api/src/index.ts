@@ -1,5 +1,10 @@
+import {companionWorkRoutes} from './routes/companionWork';
+import {startCompanionWorkReconciler,stopCompanionWorkReconciler} from './services/companionWork';
+import { companionScriptRoutes } from './routes/companionScripts';
+import { startCompanionScriptReconciler,stopCompanionScriptReconciler } from './services/companionScripts';
 import { nativeTargetRoutes } from './routes/nativeTarget';
 import { staffNativeRoutes } from './routes/staffNative';
+import { createBrowserCompanionTransport } from './routes/browserCompanion';
 import { config as loadDotenv } from 'dotenv';
 loadDotenv({ quiet: true });
 // Canonicalize NODE_ENV before any module reads it (some routes/services gate
@@ -328,6 +333,8 @@ import {
   type WorkerInitPhase
 } from './services/readiness';
 import { createReadinessHandler } from './routes/readiness';
+import { startCapacityGuard, stopCapacityGuard } from './services/capacityGuard';
+import { agentRolloutLimits } from './services/agentRolloutAdmission';
 import { resolveReadinessTiming } from './config/readinessConfig';
 
 const { db } = dbModule;
@@ -489,6 +496,9 @@ app.use(
 );
 app.use('*', globalRateLimit());
 app.use('*', prettyJSON());
+// The registered companion origins have a separate, narrowly scoped CORS
+// boundary. Browser authorization remains on the authenticated extension page.
+app.route('/api/v1/browser-companion', createBrowserCompanionTransport(async (request,env) => app.fetch(request,env)));
 app.use(
   '*',
   exceptTunnelHttp(
@@ -729,6 +739,8 @@ api.route('/devices', deviceRoutes);
 api.route('/time-status', timeStatusRoutes);
 api.route('/pam', pamRoutes);
 api.route('/scripts', scriptRoutes);
+api.route('/companion-scripts', companionScriptRoutes);
+api.route('/companion-work', companionWorkRoutes);
 api.route('/script-library', scriptLibraryRoutes);
 api.route('/automations/webhooks', automationWebhookRoutes);
 api.route('/automations', automationRoutes);
@@ -1296,11 +1308,14 @@ async function shutdownRuntime(signal: NodeJS.Signals): Promise<void> {
   shutdownInProgress = true;
   console.log(`[shutdown] Received ${signal}, shutting down gracefully...`);
 
+  stopCompanionScriptReconciler();
+  stopCompanionWorkReconciler();
   getWebhookWorker().stop();
   // The sampler is already unref'd, so this is tidiness rather than a
   // requirement — it just stops starvation warnings from being emitted about a
   // process that is deliberately winding down and no longer serving traffic.
   stopEventLoopMonitor();
+  stopCapacityGuard();
   // #3214. Also already unref'd, so this is tidiness — but it additionally stops
   // the watchdog opening a fresh probe connection while the pool is draining,
   // which would report `database-unreachable` about a process that is simply
@@ -1580,6 +1595,8 @@ async function bootstrap(): Promise<void> {
   // Validate configuration before anything else — fail fast on missing/insecure secrets.
   // The validated config is stored as a singleton; retrieve later via getConfig().
   const config = validateConfig();
+  agentRolloutLimits();
+  startCapacityGuard({ checkDependencies: async () => (await readiness.get()).ready });
 
   // #3214 — pool-health watchdog.
   //
@@ -1671,6 +1688,7 @@ async function bootstrap(): Promise<void> {
   }
 
   await runStartupChecks();
+  if (process.env.CLOUDCOM_CREDENTIALS_ENABLED === 'true') { startCompanionScriptReconciler(); startCompanionWorkReconciler(); }
 
   // #6452 — Redis memory watchdog. Started after runStartupChecks so the
   // client has had its first connect attempt; the watchdog itself tolerates

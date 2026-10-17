@@ -21,16 +21,19 @@
  *    cached for `ttlMs`, which bounds the backend cost to one probe pair per
  *    window no matter the request rate, while still being far shorter than any
  *    realistic uptime-check interval.
- * 2. **Single-flight.** Concurrent probes that miss the cache share one
- *    in-flight evaluation instead of stampeding the backends when the cache
- *    expires.
+ * 2. **Single-flight.** Concurrent cache misses share one evaluation. Each
+ *    underlying DB/Redis probe also retains its own slot until it actually
+ *    settles, including after its response deadline. Repeated health checks
+ *    must not accumulate queued SQL or Redis commands during an outage.
  * 3. **Bounded probes.** Every probe is raced against `probeTimeoutMs`. This is
  *    load-bearing, not defensive garnish: postgres.js has a connect timeout but
  *    no pool-acquire timeout, so a saturated pool leaves a query queued
- *    indefinitely. Without the race, one such evaluation would never settle,
- *    the single-flight slot would never clear, and *every* subsequent probe
- *    would await the same dead promise — `/ready` would go permanently silent,
- *    which is a worse latch than the one this module exists to remove.
+ *    indefinitely. The race releases the evaluation's response slot, so
+ *    subsequent requests still receive bounded not-ready responses. It does
+ *    not release the underlying operation's slot: a timeout is not cancellation.
+ *    Each underlying attempt reports at most one failure, and a diagnostic hook
+ *    throwing cannot prevent a readiness response. A settled operation releases
+ *    its slot so a later evaluation can observe recovery.
  *
  * Everything is injected so the behaviour — specifically "an unhealthy
  * dependency recovers and readiness flips back to true within one process
@@ -100,6 +103,7 @@ export function createReadinessEvaluator(
 
   let cached: { snapshot: ReadinessSnapshot; expiresAt: number } | null = null;
   let inFlight: Promise<ReadinessSnapshot> | null = null;
+  const probes = new Map<ReadinessProbeName, { pending: Promise<boolean>; failureReported: boolean }>();
   /**
    * Bumped by `invalidate()`. An evaluation that was already running when the
    * cache was invalidated must not write its now-stale result back, or a probe
@@ -113,10 +117,20 @@ export function createReadinessEvaluator(
     name: ReadinessProbeName,
     run: () => Promise<boolean>
   ): Promise<boolean> => {
+    let attempt = probes.get(name);
+    if (!attempt) {
+      // Wrap synchronous throws too. Keep ownership of the actual operation,
+      // never a deadline wrapper that can settle while that operation is queued.
+      attempt = { pending: Promise.resolve().then(run), failureReported: false };
+      probes.set(name, attempt);
+      const ownedAttempt = attempt;
+      const release = () => { if (probes.get(name) === ownedAttempt) probes.delete(name); };
+      void attempt.pending.then(release, release);
+    }
     let timer: NodeJS.Timeout | undefined;
     try {
       return await Promise.race([
-        run(),
+        attempt.pending,
         new Promise<never>((_, reject) => {
           timer = setTimeout(
             () => reject(new Error(`readiness ${name} probe exceeded ${options.probeTimeoutMs}ms`)),
@@ -127,7 +141,10 @@ export function createReadinessEvaluator(
         })
       ]);
     } catch (error) {
-      options.onProbeFailure?.(name, error);
+      if (!attempt.failureReported) {
+        attempt.failureReported = true;
+        try { options.onProbeFailure?.(name, error); } catch { /* Diagnostics cannot break readiness. */ }
+      }
       // An unknown dependency is a not-ready dependency.
       return false;
     } finally {

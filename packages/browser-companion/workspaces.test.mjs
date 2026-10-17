@@ -1,0 +1,31 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {openWorkspace,contextFor,workspaceMessage} from './workspaces.js';
+test('both workspace modes retain immutable client/device scope independently of selected client',async()=>{
+  let store={companionSession:{accessToken:'ccb1.'+'x'.repeat(43),expiresAt:Date.now()+3600000}},window,panel,opened;
+  const extension='a'.repeat(32),org='11111111-1111-4111-8111-111111111111',device='22222222-2222-4222-8222-222222222222';
+  globalThis.chrome={runtime:{getURL:p=>`chrome-extension://${extension}/${p}`},storage:{session:{get:async()=>store,set:async v=>{store={...store,...v}},remove:async k=>{delete store[k]}}},windows:{create:async v=>{window=v},getLastFocused:async()=>({id:3})},sidePanel:{setOptions:async v=>{panel=v},open:async v=>{opened=v}}};
+  const context={orgId:org,device:{id:device},tool:'processes'};
+  const first=await openWorkspace(context,'embedded');window={url:first.workspaceUrl};assert.equal(opened,undefined);
+  assert.deepEqual(await contextFor(window.url),context);
+  const second=await openWorkspace(context,'embedded');assert.notEqual(second.workspaceUrl,first.workspaceUrl);assert.equal(panel,undefined);
+  store.clientId='other-client';
+  globalThis.fetch=async(_url,options)=>{const body=JSON.parse(options.body);assert.equal(body.orgId,org);assert.equal(body.deviceId,device);return Response.json({data:[]});};
+  const sender={url:window.url};
+  const fullView=await workspaceMessage({type:'openWorkspace',tool:'events'},sender);
+  assert.deepEqual(await contextFor(fullView.workspaceUrl),{...context,tool:'events'});
+  await assert.rejects(workspaceMessage({type:'openWorkspace',tool:'arbitrary'},sender),/Unsupported/);
+  assert.deepEqual(await workspaceMessage({type:'toolRequest',path:`/system-tools/devices/${device}/processes`},sender),{data:[]});
+  await assert.rejects(workspaceMessage({type:'fill'},sender),/Unsupported/);
+  store={};await assert.rejects(contextFor(window.url),/expired/);
+});
+test('mutation ensures work while preview reads and explicit script tickets do not create duplicates',async()=>{
+ const org='11111111-1111-4111-8111-111111111111',device='22222222-2222-4222-8222-222222222222';let store={companionSession:{accessToken:'ccb1.'+'x'.repeat(43),expiresAt:Date.now()+3600000}};const calls=[];
+ globalThis.chrome={runtime:{getURL:p=>`chrome-extension://${'a'.repeat(32)}/${p}`},storage:{session:{get:async()=>store,set:async v=>{store={...store,...v}},remove:async()=>{}}}};
+ globalThis.fetch=async(_url,o)=>{const r=JSON.parse(o.body);calls.push(r);return Response.json(r.path.startsWith('/companion-work/')?{item:{id:'work-ticket'}}:{success:true});};
+ const context={orgId:org,device:{id:device}},view=await openWorkspace(context),sender={url:view.workspaceUrl},path=`/companion-scripts/orgs/${org}/devices/${device}/runs`;
+ await workspaceMessage({type:'toolRequest',path,method:'POST',body:{mode:'preview'}},sender);assert.equal(calls.length,1);calls.length=0;
+ await workspaceMessage({type:'toolRequest',path,method:'POST',body:{mode:'execute',createTicket:true}},sender);assert.equal(calls.length,2);assert.equal(calls[1].body.ticketId,'work-ticket');assert.equal(calls[1].body.createTicket,undefined);calls.length=0;
+ await workspaceMessage({type:'toolRequest',path,method:'POST',body:{mode:'execute',ticketId:'explicit'}},sender);assert.equal(calls.length,1);assert.equal(calls[0].body.ticketId,'explicit');calls.length=0;
+ await workspaceMessage({type:'toolRequest',path:`/system-tools/devices/${device}/registry`,method:'DELETE'},sender);assert.equal(calls.length,2);assert.equal(calls[0].body.deviceId,device);
+});

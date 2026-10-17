@@ -2,6 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 process.env.APP_ENCRYPTION_KEY = process.env.APP_ENCRYPTION_KEY || 'test-app-encryption-key-for-vitest';
 
+const { admitAgentUpdateMock } = vi.hoisted(() => ({
+  admitAgentUpdateMock: vi.fn(async () => ({ allowed: true, reason: 'admitted' })),
+}));
+vi.mock('./agentRolloutAdmission', () => ({ admitAgentUpdate: admitAgentUpdateMock }));
+
 const releaseClaimedCommandDeliveryMock = vi.fn(async () => undefined);
 const expireRefusedClaimedCommandDeliveryMock = vi.fn(async () => undefined);
 vi.mock('./commandDispatch', () => ({
@@ -41,6 +46,7 @@ import {
   deliveryRefreshers,
   prepareClaimedCommandsForDelivery,
   refreshPayloadForDelivery,
+  refreshClaimedPayloadForPush,
   registerDeliveryRefresher,
   __resetDeliveryRefreshersForTests,
 } from './commandDelivery';
@@ -51,6 +57,62 @@ import { deliverRecoveryCommandIntegrity } from './backupRecoveryCommandIntegrit
 const CLAIM_DEVICE = '99999999-9999-4999-8999-999999999999';
 
 const claimedAt = new Date('2026-07-13T00:00:00Z');
+
+describe('agent update rollout delivery admission', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    admitAgentUpdateMock.mockResolvedValue({ allowed: true, reason: 'admitted' });
+    failClaimedSecretCommandsMock.mockImplementation(async (claimed: unknown[]) => claimed);
+  });
+
+  it.each([
+    ['update_agent', 'agent'],
+    ['update_watchdog', 'watchdog'],
+  ])('defers %s without stranding the claim or withholding ordinary commands', async (type, component) => {
+    admitAgentUpdateMock.mockResolvedValue({ allowed: false, reason: 'host-pressure' });
+    const out = await prepareClaimedCommandsForDelivery([
+      { id: 'update', type, deviceId: CLAIM_DEVICE, payload: { version: '0.123.0', siteKey: 'untrusted' }, executedAt: claimedAt },
+      { id: 'ordinary', type: 'script', deviceId: CLAIM_DEVICE, payload: { scriptId: 's' }, executedAt: claimedAt },
+    ]);
+    expect(out.map(command => command.id)).toEqual(['ordinary']);
+    expect(admitAgentUpdateMock).toHaveBeenCalledWith({
+      deviceId: CLAIM_DEVICE, targets: { [component]: '0.123.0' },
+    });
+    expect(releaseClaimedCommandDeliveryMock).toHaveBeenCalledWith('update', claimedAt, 'Agent update deferred: host-pressure');
+    expect(expireRefusedClaimedCommandDeliveryMock).not.toHaveBeenCalled();
+    expect(captureExceptionMock).not.toHaveBeenCalled();
+  });
+
+  it('uses the same temporary deferral for direct push preparation', async () => {
+    admitAgentUpdateMock.mockResolvedValue({ allowed: false, reason: 'global-capacity' });
+    await expect(refreshClaimedPayloadForPush('update_agent', { version: '0.123.0' }, {
+      commandId: 'update', deviceId: CLAIM_DEVICE, type: 'update_agent', claimedAt,
+    })).resolves.toEqual({ ok: false, refusal: null });
+    expect(releaseClaimedCommandDeliveryMock).toHaveBeenCalledWith('update', claimedAt, 'Agent update deferred: global-capacity');
+    expect(captureExceptionMock).not.toHaveBeenCalled();
+  });
+
+  it('preserves admitted payloads and leaves rollback recovery exempt', async () => {
+    const payload = { version: '0.123.0' };
+    const out = await prepareClaimedCommandsForDelivery([
+      { id: 'update', type: 'update_agent', deviceId: CLAIM_DEVICE, payload, executedAt: claimedAt },
+      { id: 'rollback', type: 'agent_rollback_v1', deviceId: CLAIM_DEVICE, payload: { signed: true }, executedAt: claimedAt },
+    ]);
+    expect(out.map(command => command.id)).toEqual(['update', 'rollback']);
+    expect(out[0]?.payload).toEqual(payload);
+    expect(admitAgentUpdateMock).toHaveBeenCalledTimes(1);
+    expect(releaseClaimedCommandDeliveryMock).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, '', '   ', 42])('refuses an invalid version before admission (%s)', async version => {
+    const payload = { version };
+    await expect(refreshPayloadForDelivery('update_agent', payload, {
+      commandId: 'update', deviceId: CLAIM_DEVICE, type: 'update_agent', claimedAt,
+    })).resolves.toBeNull();
+    expect(admitAgentUpdateMock).not.toHaveBeenCalled();
+    expect(expireRefusedClaimedCommandDeliveryMock).toHaveBeenCalledWith('update', claimedAt, 'Agent update version is required');
+  });
+});
 
 // A well-formed-looking but undecryptable sensitive payload (e.g. after an
 // APP_ENCRYPTION_KEY rotation).

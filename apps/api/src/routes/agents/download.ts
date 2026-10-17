@@ -417,43 +417,70 @@ registerComponentDownloadRoute({
 // computed from the local staged file, and serving any other source could
 // hand out bytes that don't match it. BINARY_SOURCE=github deployments get a
 // 404 here and auto edition migration stays inert.
-downloadRoutes.get('/download/windows/amd64/msi', async (c) => {
-  const rateLimited = await enforcePublicAgentDownloadRateLimit(c, 'agent-msi-download');
-  if (rateLimited) return rateLimited;
+function registerDiskOnlyMsiDownloadRoute(config: {
+  path: string;
+  logTag: string;
+  filename: string;
+  downloadFilename: string;
+  entityLabel: string;
+  directory?: () => string;
+}): void {
+  downloadRoutes.get(config.path, async (c) => {
+    const rateLimited = await enforcePublicAgentDownloadRateLimit(c, config.logTag);
+    if (rateLimited) return rateLimited;
 
-  const binaryDir = binaryStoreDir('agent');
-  const filePath = join(binaryDir, 'breeze-agent.msi');
+    const binaryDir = config.directory?.() ?? binaryStoreDir('agent');
+    const filePath = join(binaryDir, config.filename);
 
-  let fileStat: ReturnType<typeof statSync>;
-  let stream: ReturnType<typeof createReadStream>;
-  try {
-    fileStat = statSync(filePath);
-    stream = createReadStream(filePath);
-  } catch (err) {
-    const isNotFound = err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT';
-    if (!isNotFound) {
-      console.error('[agent-msi-download] Failed to read breeze-agent.msi:', err);
-      return c.json({ error: 'Internal server error', message: 'Failed to read installer file' }, 500);
+    let fileStat: ReturnType<typeof statSync>;
+    let stream: ReturnType<typeof createReadStream>;
+    try {
+      fileStat = statSync(filePath);
+      stream = createReadStream(filePath);
+    } catch (err) {
+      const isNotFound = err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code === 'ENOENT';
+      if (!isNotFound) {
+        console.error(`[${config.logTag}] Failed to read ${config.filename}:`, err);
+        return c.json({ error: 'Internal server error', message: 'Failed to read installer file' }, 500);
+      }
+      console.warn(`[${config.logTag}] Staged MSI missing`, { filePath });
+      return c.json(
+        { error: 'Installer not found', message: `The ${config.entityLabel} MSI installer is not staged on this server.` },
+        404
+      );
     }
-    console.warn('[agent-msi-download] Staged MSI missing', { filePath });
-    return c.json(
-      { error: 'Installer not found', message: 'The agent MSI installer is not staged on this server.' },
-      404
-    );
-  }
 
-  // Readable.toWeb (not the hand-rolled bridge the older routes in this file
-  // still use) gets backpressure and zero-copy chunk transfer for free — same
-  // as the ticket-attachment streams.
-  return new Response(Readable.toWeb(stream) as ReadableStream, {
-    status: 200,
-    headers: {
-      'Content-Type': 'application/octet-stream',
-      'Content-Disposition': 'attachment; filename="breeze-agent.msi"',
-      'Content-Length': String(fileStat.size),
-      'Cache-Control': 'no-cache',
-    },
+    // Readable.toWeb (not the hand-rolled bridge the older routes in this file
+    // still use) gets backpressure and zero-copy chunk transfer for free — same
+    // as the ticket-attachment streams.
+    return new Response(Readable.toWeb(stream) as ReadableStream, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${config.downloadFilename}"`,
+        'Content-Length': String(fileStat.size),
+        'Cache-Control': 'no-cache',
+      },
+    });
   });
+}
+
+registerDiskOnlyMsiDownloadRoute({
+  path: '/download/windows/amd64/msi',
+  logTag: 'agent-msi-download',
+  filename: 'breeze-agent.msi',
+  downloadFilename: 'breeze-agent.msi',
+  entityLabel: 'agent',
+});
+
+registerDiskOnlyMsiDownloadRoute({
+  path: '/download/rustdesk/windows/amd64/msi',
+  logTag: 'rustdesk-host-msi-download',
+  filename: 'cloudcom-rustdesk-host.msi',
+  downloadFilename: 'cloudcom-rustdesk-host.msi',
+  entityLabel: 'RustDesk host',
+  // A separate persistent directory survives promotions of versioned agent binaries.
+  directory: () => process.env.CLOUDCOM_RUSTDESK_HOST_DIR || binaryStoreDir('agent'),
 });
 
 // ============================================

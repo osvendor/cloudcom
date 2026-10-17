@@ -1586,6 +1586,62 @@ describe('raw agent MSI download', () => {
   });
 });
 
+describe('public RustDesk host MSI download', () => {
+  const originalAgentDir = process.env.AGENT_BINARY_DIR;
+  const originalHostDir = process.env.CLOUDCOM_RUSTDESK_HOST_DIR;
+  beforeEach(() => { delete process.env.CLOUDCOM_RUSTDESK_HOST_DIR; });
+
+  afterEach(() => {
+    if (originalAgentDir === undefined) delete process.env.AGENT_BINARY_DIR;
+    else process.env.AGENT_BINARY_DIR = originalAgentDir;
+    if (originalHostDir === undefined) delete process.env.CLOUDCOM_RUSTDESK_HOST_DIR;
+    else process.env.CLOUDCOM_RUSTDESK_HOST_DIR = originalHostDir;
+    vi.restoreAllMocks();
+  });
+
+  it('serves the staged host MSI bytes verbatim', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'breeze-rustdesk-host-msi-test-'));
+    try {
+      const content = Buffer.from('fake-rustdesk-host-msi-bytes');
+      writeFileSync(join(dir, 'cloudcom-rustdesk-host.msi'), content);
+      process.env.AGENT_BINARY_DIR = dir;
+
+      const res = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi');
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-disposition')).toBe('attachment; filename="cloudcom-rustdesk-host.msi"');
+      expect(Buffer.from(await res.arrayBuffer()).equals(content)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('404s without disclosing the host MSI directory when the file is absent', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    process.env.AGENT_BINARY_DIR = '/tmp/breeze-secret-rustdesk-host-binaries';
+
+    const res = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi');
+    const body = await res.text();
+
+    expect(res.status).toBe(404);
+    expect(body).not.toContain('/tmp/breeze-secret-rustdesk-host-binaries');
+    expect(body).not.toContain('AGENT_BINARY_DIR');
+  });
+
+  it('keeps the managed host artifact independent of agent binary promotions', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'breeze-managed-host-stable-'));
+    try {
+      writeFileSync(join(dir, 'cloudcom-rustdesk-host.msi'), 'stable-host-package');
+      process.env.CLOUDCOM_RUSTDESK_HOST_DIR = dir;
+      process.env.AGENT_BINARY_DIR = '/missing/new-agent-release';
+      const res = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi');
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('stable-host-package');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('per-IP rate limiting on the remaining unauthenticated agent/helper download routes', () => {
   beforeEach(() => {
     rateLimiterMock.mockReset();

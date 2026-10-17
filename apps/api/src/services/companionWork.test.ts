@@ -1,0 +1,20 @@
+import {afterEach,beforeEach,describe,it,expect,vi} from 'vitest';
+import {PgDialect} from 'drizzle-orm/pg-core';
+const h=vi.hoisted(()=>({selectRows:[] as any[][],execute:vi.fn(),close:vi.fn(),comment:vi.fn(),permissions:vi.fn(),tenant:vi.fn(),update:vi.fn()}));
+vi.mock('../db/schema',()=>({devices:{id:'device_id',orgId:'org_id'},tickets:{id:'id',orgId:'org_id',deviceId:'device_id',deletedAt:'deleted_at',status:'status',customFields:'custom_fields',updatedAt:'updated_at'},users:{id:'id',status:'status',partnerId:'partner_id'}}));
+vi.mock('../db',()=>({runOutsideDbContext:(f:any)=>f(),withSystemDbAccessContext:(f:any)=>f(),db:{execute:h.execute,select:()=>{const rows=h.selectRows.shift()??[];const q:any={then:(resolve:any)=>Promise.resolve(rows).then(resolve)};for(const method of ['from','where','orderBy','limit','for'])q[method]=()=>q;return q;},update:()=>{const q:any={set:(data:any)=>{h.update(data);return q;},where:()=>q,returning:async()=>[ticket()],then:(resolve:any)=>Promise.resolve([]).then(resolve)};return q;}}}));
+vi.mock('./permissions',()=>({getUserPermissions:h.permissions,canAccessOrg:(p:any)=>p.orgAllowed!==false,hasPermission:(p:any,r:string,a:string)=>p.denied!==`${r}:${a}`}));
+vi.mock('./tenantStatus',()=>({getActiveOrgTenant:h.tenant}));
+vi.mock('./ticketService',()=>({createTicket:vi.fn(),changeTicketStatus:h.close,addTicketComment:h.comment,updateTicketFields:vi.fn()}));
+import {syncWork,reconcileCompanionWork} from './companionWork';
+function ticket(meta:any={}){return {id:'11111111-1111-4111-8111-111111111111',orgId:'22222222-2222-4222-8222-222222222222',deviceId:'33333333-3333-4333-8333-333333333333',status:'in_progress',customFields:{osCompanionWork:{actorId:'44444444-4444-4444-8444-444444444444',startedAt:'2026-10-08T09:00:00.000Z',autoClose:true,activities:[],...meta}}} as any;}
+function activityRows(pending:any[]=[]){h.execute.mockImplementation(async(query:any)=>{const text=new PgDialect().sqlToQuery(query).sql;if(text.includes('FROM audit_logs'))return [{id:'audit',action:'restart_service',timestamp:'2026-10-08T10:00:00.000Z',result:'success'}];if(text.includes('FROM device_commands'))return pending;return [];});}
+beforeEach(()=>{vi.clearAllMocks();h.execute.mockReset();h.selectRows=[];h.tenant.mockResolvedValue({partnerId:'partner'});h.permissions.mockResolvedValue({scope:'partner'});vi.spyOn(Date,'now').mockReturnValue(Date.parse('2026-10-08T11:00:00Z'));});
+afterEach(()=>vi.restoreAllMocks());
+describe('Work reconciler safety',()=>{
+ it('does not close an item without recorded activity',async()=>{h.selectRows=[[{id:'device'}]];h.execute.mockResolvedValue([]);await syncWork(ticket());expect(h.close).not.toHaveBeenCalled();});
+ it('blocks auto-close while an unmatched endpoint command remains unfinished',async()=>{h.selectRows=[[{id:'device'}]];activityRows([{id:'command'}]);await syncWork(ticket());expect(h.close).not.toHaveBeenCalled();expect(h.comment).toHaveBeenCalledWith(expect.anything(),expect.objectContaining({isPublic:false}),expect.anything());});
+ it('blocks auto-close after a fresh launch intent even when old actions succeeded',async()=>{h.selectRows=[[{id:'device'}]];activityRows();await syncWork(ticket({lastIntentAt:'2026-10-08T10:59:00.000Z'}));expect(h.close).not.toHaveBeenCalled();});
+ it('closes opted-in idle successful work',async()=>{h.selectRows=[[{id:'device'}],[ticket()]];activityRows();await syncWork(ticket());expect(h.close).toHaveBeenCalledWith(expect.anything(),{status:'closed'},expect.anything(),expect.anything());});
+ it.each(['disabled','tenant','tickets:write','tickets:read','devices:read','org','site'])('does not correlate or close when authority is revoked: %s',async(reason)=>{h.selectRows=[[ticket()],[{status:reason==='disabled'?'disabled':'active',partnerId:'partner'}]];if(reason==='tenant')h.tenant.mockResolvedValue(null);h.permissions.mockResolvedValue({scope:'partner',denied:reason,orgAllowed:reason!=='org',allowedSiteIds:reason==='site'?[]:undefined});await reconcileCompanionWork();expect(h.execute).not.toHaveBeenCalled();expect(h.close).not.toHaveBeenCalled();expect(h.comment).not.toHaveBeenCalled();});
+});

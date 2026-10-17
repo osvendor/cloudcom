@@ -24,6 +24,7 @@ export type WorkerInitializerClassification =
       initializer:
         | 'desktopSessionOrphanRecovery'
         | 'oauthRevocationRetryWorker'
+        | 'cloudCommandM365SnapshotWorker'
         | 'topologyOutboxWorker'
         | 'topologyReconcileWorker'
         | 'topologyCollectionRetentionWorker'
@@ -143,6 +144,9 @@ export const WORKER_READINESS_MANIFEST: readonly WorkerInitializerClassification
   consumers('s1SyncWorker'),
   consumers('huntressSyncWorker'),
   consumers('backupProviderSyncWorker'),
+  { kind: 'non_consumer', initializer: 'cloudCommandM365SnapshotWorker' },
+  // Always attaches a consumer; the feature flag gates schedule and processing.
+  consumers('harmonySyncWorker'),
   // The Worker is constructed unconditionally and attached unconditionally;
   // M365_TENANT_SYNC_ENABLED gates the TICK registration and the processor
   // body, not the construction. A flag-gated construction would need its own

@@ -56,6 +56,8 @@ export const SETTINGS_SECRET_JSON_PATHS: readonly (readonly string[])[] = [
 ];
 
 export const encryptedColumnRegistry: EncryptedColumnSpec[] = [
+  { table: 'credentials_documents', column: 'payload_ciphertext', kind: 'text', aadBinding: 'row', description: 'Client documentation original and preview, bound to the record id' },
+  { table: 'credentials_records', column: 'secret_ciphertext', kind: 'text', aadBinding: 'row', description: 'Client credential passwords, OTP seeds and notes, bound to the record id' },
   { table: 'billing_link_tokens', column: 'token_ct', kind: 'text', aadBinding: 'row', description: 'Autopay bearer link token, encrypted and bound to its row id' },
 
   { table: 'sso_providers', column: 'client_secret', kind: 'text', description: 'OIDC client secret' },
@@ -98,6 +100,7 @@ export const encryptedColumnRegistry: EncryptedColumnSpec[] = [
   { table: 'accounting_connections', column: 'refresh_token_encrypted', kind: 'text', description: 'Accounting provider OAuth refresh token (rotates)' },
   { table: 'accounting_connections', column: 'webhook_verifier_token_encrypted', kind: 'text', description: 'QBO webhook verifier token' },
   { table: 's1_integrations', column: 'api_token_encrypted', kind: 'text', description: 'SentinelOne API token' },
+  { table: 'harmony_integrations', column: 'credentials_encrypted', kind: 'text', aadBinding: 'row', description: 'Harmony Endpoint credentials, bound to the connection id' },
   { table: 'dns_filter_integrations', column: 'api_key', kind: 'text', description: 'DNS filter API key' },
   { table: 'dns_filter_integrations', column: 'api_secret', kind: 'text', description: 'DNS filter API secret' },
   { table: 'storage_encryption_keys', column: 'encrypted_private_key', kind: 'text', description: 'backup private key material' },

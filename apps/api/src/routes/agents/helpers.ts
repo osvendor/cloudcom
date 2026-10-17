@@ -1,3 +1,4 @@
+import { isPolicyFeatureAbsentInSnapshot, readPolicyDevice, readPolicyOrganization, readPolicyGroups } from '../../services/devicePolicyReadSnapshot';
 import { z } from 'zod';
 import { and, desc, eq, gte, inArray, isNull, or, sql } from 'drizzle-orm';
 import { randomBytes } from 'crypto';
@@ -58,7 +59,7 @@ import {
 } from '../../services/filesystemAnalysis';
 import { recordSoftwarePolicyAudit } from '../../services/softwarePolicyService';
 import {
-  resolvePatchConfigForDevice,
+  resolvePatchConfigPolicyForDevice,
   buildRoleOsFilterConditions,
   matchesRoleOsFilter,
 } from '../../services/featureConfigResolver';
@@ -1917,31 +1918,15 @@ const LEVEL_PRIORITY: Record<string, number> = {
 
 async function resolveDeviceEventLogSettings(deviceId: string): Promise<EventLogSettings> {
   // 1. Load device
-  const [device] = await db
-    .select({
-      orgId: devices.orgId,
-      siteId: devices.siteId,
-      deviceRole: devices.deviceRole,
-      osType: devices.osType,
-    })
-    .from(devices)
-    .where(eq(devices.id, deviceId))
-    .limit(1);
+  const device = await readPolicyDevice(deviceId);
 
   if (!device) return EVENT_LOG_DEFAULTS;
 
   // 2. Load org (for partnerId)
-  const [org] = await db
-    .select({ partnerId: organizations.partnerId })
-    .from(organizations)
-    .where(eq(organizations.id, device.orgId))
-    .limit(1);
+  const org = await readPolicyOrganization(deviceId, device.orgId);
 
   // 3. Load device group memberships
-  const groupRows = await db
-    .select({ groupId: deviceGroupMemberships.groupId })
-    .from(deviceGroupMemberships)
-    .where(eq(deviceGroupMemberships.deviceId, deviceId));
+  const groupRows = await readPolicyGroups(deviceId);
   const groupIds = groupRows.map((r) => r.groupId);
 
   // 4. Build target match conditions
@@ -1962,6 +1947,7 @@ async function resolveDeviceEventLogSettings(deviceId: string): Promise<EventLog
   }
 
   // 5. Single query: assignments → active policies → event_log feature link → settings
+  if (await isPolicyFeatureAbsentInSnapshot(deviceId, 'event_log')) return EVENT_LOG_DEFAULTS;
   const rows = await db
     .select({
       level: configPolicyAssignments.level,
@@ -2091,29 +2077,13 @@ type HardwareMonitoringPolicyView = { enabled: boolean; source: 'default' | 'pol
 async function resolveHardwareMonitoring(deviceId: string): Promise<{ settings: HardwareMonitoringInlineSettings; policy: HardwareMonitoringPolicyView }> {
   const fallback = { settings: { ...HARDWARE_MONITORING_DEFAULTS }, policy: { enabled: HARDWARE_MONITORING_DEFAULTS.enabled, source: 'default' as const } };
 
-  const [device] = await db
-    .select({
-      orgId: devices.orgId,
-      siteId: devices.siteId,
-      deviceRole: devices.deviceRole,
-      osType: devices.osType,
-    })
-    .from(devices)
-    .where(eq(devices.id, deviceId))
-    .limit(1);
+  const device = await readPolicyDevice(deviceId);
 
   if (!device) return fallback;
 
-  const [org] = await db
-    .select({ partnerId: organizations.partnerId })
-    .from(organizations)
-    .where(eq(organizations.id, device.orgId))
-    .limit(1);
+  const org = await readPolicyOrganization(deviceId, device.orgId);
 
-  const groupRows = await db
-    .select({ groupId: deviceGroupMemberships.groupId })
-    .from(deviceGroupMemberships)
-    .where(eq(deviceGroupMemberships.deviceId, deviceId));
+  const groupRows = await readPolicyGroups(deviceId);
   const groupIds = groupRows.map((r) => r.groupId);
 
   const targetConditions = [
@@ -2132,6 +2102,7 @@ async function resolveHardwareMonitoring(deviceId: string): Promise<{ settings: 
     );
   }
 
+  if (await isPolicyFeatureAbsentInSnapshot(deviceId, 'hardware_monitoring')) return fallback;
   const rows = await withDevicePartnerPolicyVisibility(db, org?.partnerId ?? null, async (executor) =>
     executor
       .select({
@@ -2542,25 +2513,12 @@ type PolicyCheckIntervalResult =
 
 async function resolvePolicyCheckInterval(deviceId: string): Promise<PolicyCheckIntervalResult> {
   // 1. Load device
-  const [device] = await db
-    .select({
-      orgId: devices.orgId,
-      siteId: devices.siteId,
-      deviceRole: devices.deviceRole,
-      osType: devices.osType,
-    })
-    .from(devices)
-    .where(eq(devices.id, deviceId))
-    .limit(1);
+  const device = await readPolicyDevice(deviceId);
 
   if (!device) return { kind: 'device_missing' };
 
   // 2. Load org (for partnerId)
-  const [org] = await db
-    .select({ partnerId: organizations.partnerId })
-    .from(organizations)
-    .where(eq(organizations.id, device.orgId))
-    .limit(1);
+  const org = await readPolicyOrganization(deviceId, device.orgId);
   // An org miss (deleted mid-race) would drop the partner-level target and
   // the partner-wide ownership branch below, so a device whose only policy
   // is partner-wide would resolve as `no_policy` and be sent the #2949 clear.
@@ -2568,10 +2526,7 @@ async function resolvePolicyCheckInterval(deviceId: string): Promise<PolicyCheck
   if (!org) return { kind: 'device_missing' };
 
   // 3. Load device group memberships
-  const groupRows = await db
-    .select({ groupId: deviceGroupMemberships.groupId })
-    .from(deviceGroupMemberships)
-    .where(eq(deviceGroupMemberships.deviceId, deviceId));
+  const groupRows = await readPolicyGroups(deviceId);
   const groupIds = groupRows.map((r) => r.groupId);
 
   // 4. Build target match conditions
@@ -3249,26 +3204,15 @@ async function resolveOrgPamFallback(orgId: string): Promise<PamSettings> {
 
 async function resolveDevicePamSettings(deviceId: string): Promise<PamSettings> {
   // 1. Load device
-  const [device] = await db
-    .select({ orgId: devices.orgId, siteId: devices.siteId })
-    .from(devices)
-    .where(eq(devices.id, deviceId))
-    .limit(1);
+  const device = await readPolicyDevice(deviceId);
 
   if (!device) return PAM_DEFAULTS;
 
   // 2. Load org (for partnerId)
-  const [org] = await db
-    .select({ partnerId: organizations.partnerId })
-    .from(organizations)
-    .where(eq(organizations.id, device.orgId))
-    .limit(1);
+  const org = await readPolicyOrganization(deviceId, device.orgId);
 
   // 3. Load device group memberships
-  const groupRows = await db
-    .select({ groupId: deviceGroupMemberships.groupId })
-    .from(deviceGroupMemberships)
-    .where(eq(deviceGroupMemberships.deviceId, deviceId));
+  const groupRows = await readPolicyGroups(deviceId);
   const groupIds = groupRows.map((r) => r.groupId);
 
   // 4. Build target match conditions
@@ -3380,8 +3324,8 @@ export interface PatchSourceSettings {
  * so a transient failure never triggers an unintended revert.
  */
 export async function buildPatchSourceConfigUpdate(deviceId: string): Promise<PatchSourceSettings> {
-  const patch = await resolvePatchConfigForDevice(deviceId);
-  return { exclusiveWindowsUpdate: patch?.exclusiveWindowsUpdate ?? false };
+  const patch = await resolvePatchConfigPolicyForDevice(deviceId);
+  return { exclusiveWindowsUpdate: patch?.settings.exclusiveWindowsUpdate ?? false };
 }
 
 // ============================================

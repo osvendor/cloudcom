@@ -1127,7 +1127,11 @@ export async function syncBinaries(): Promise<void> {
 
   const agentBinaryDir = binaryStoreDir("agent");
   const versionFile = process.env.BINARY_VERSION_FILE;
-  const expectedVersion = pairedBinariesVersion ?? process.env.BREEZE_VERSION;
+  // The local volume must follow the same explicit binary-release override
+  // as download validation. Native-only releases can advance independently
+  // of the server image; comparing against BREEZE_VERSION would discard the
+  // matching local release and try GitHub instead on every API restart.
+  const expectedVersion = getBinariesVersion();
 
   // Read version from VERSION file if available
   let version = "unknown";
@@ -1146,7 +1150,7 @@ export async function syncBinaries(): Promise<void> {
     );
   }
 
-  // Detect stale binaries volume: if BREEZE_VERSION is set but doesn't match
+  // Detect stale binaries volume: if the resolved binary version doesn't match
   // the VERSION file from the binaries-init container, the volume wasn't refreshed.
   // Fall back to GitHub sync so agents get the correct binary via direct download.
   if (
@@ -1176,10 +1180,10 @@ export async function syncBinaries(): Promise<void> {
     version !== expectedVersion
   ) {
     assertLocalGithubFallbackAllowed(
-      `stale binaries volume: v${version} but BREEZE_VERSION=${expectedVersion}`,
+      `stale binaries volume: v${version} but expected binary version=${expectedVersion}`,
     );
     console.warn(
-      `[binarySync] Stale binaries volume detected: volume has v${version} but BREEZE_VERSION=${expectedVersion}. ` +
+      `[binarySync] Stale binaries volume detected: volume has v${version} but expected binary version=${expectedVersion}. ` +
         `Falling back to GitHub release sync. To fix, run: docker compose up -d --force-recreate binaries-init`,
     );
     try {
@@ -1977,13 +1981,15 @@ function isVersionRegistrationComplete(state: VersionRegistrationState): boolean
 
 /**
  * Safety net: verify the agentVersions table has entries for the current
- * API version. If not, sync from GitHub. This catches stale Docker volumes,
+ * binary version (the API version unless explicitly overridden). If not, sync
+ * from GitHub. This catches stale Docker volumes,
  * missed CI syncs, and fresh deployments where binaries-init didn't run.
  * Full-release boots only: a server-only boot returns from syncBinaries()
  * before reaching this (it never writes agent_versions).
  */
 async function ensureCurrentVersionRegistered(): Promise<void> {
   const currentVersion = (
+    process.env.BINARY_VERSION?.trim() ||
     process.env.APP_VERSION ||
     process.env.BREEZE_VERSION ||
     ""

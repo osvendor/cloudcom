@@ -61,7 +61,7 @@ export function bodyLimitForPath(path: string): BodyLimitPolicy {
   // File browser uploads send base64-encoded content in JSON body (~33%
   // overhead). The agent caps file_write at 4MB decoded (~5.6MB base64, see
   // fileUploadBodySchema); 8MB covers that plus JSON envelope/escaping.
-  if (path.match(/^\/api\/v1\/system-tools\/devices\/[^/]+\/files\/upload$/)) {
+  if (path.match(/^\/api\/v1\/system-tools\/devices\/[^/]+\/files\/upload$/) || path === '/api/v1/browser-companion/request') {
     return { rule: 'file-upload', maxSize: 8 * 1024 * 1024, error: 'File too large (max 4MB)' };
   }
   // Chunked software package uploads (#2951): each chunk is a raw

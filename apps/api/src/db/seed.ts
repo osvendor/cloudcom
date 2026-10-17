@@ -126,6 +126,11 @@ export const DEFAULT_PERMISSIONS = [
   { resource: 'backup', action: 'cross_site_restore', description: 'Restore backup data across sites' },
 
   // Devices
+  // No implicit credential grants for technician or customer roles.
+  { resource: 'credentials', action: 'read', description: 'Search client credential metadata' },
+  { resource: 'credentials', action: 'reveal', description: 'Reveal client passwords' },
+  { resource: 'credentials', action: 'otp', description: 'Generate client one-time codes' },
+  { resource: 'credentials', action: 'import', description: 'Import client credentials' },
   { resource: 'devices', action: 'read', description: 'View devices and their details' },
   { resource: 'devices', action: 'write', description: 'Create and update devices' },
   { resource: 'devices', action: 'delete', description: 'Delete/decommission devices' },

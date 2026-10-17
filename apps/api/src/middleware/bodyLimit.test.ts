@@ -7,6 +7,11 @@ const MB = 1024 * 1024;
 const KB = 1024;
 
 describe('bodyLimitForPath', () => {
+  it('allows companion file envelopes only on its exact request transport', () => {
+    expect(bodyLimitForPath('/api/v1/browser-companion/request').maxSize).toBe(8 * MB);
+    expect(bodyLimitForPath('/api/v1/browser-companion/request/extra').maxSize).toBe(MB);
+    expect(bodyLimitForPath('/api/v1/browser-companion/exchange').maxSize).toBe(MB);
+  });
   it('keeps the 1MB default on the public Xero webhook (Xero W05 refinement 8)', () => {
     expect(bodyLimitForPath('/api/v1/webhooks/xero')).toMatchObject({ rule: 'default', maxSize: 1 * MB });
   });
@@ -298,6 +303,11 @@ const ROUTE_LEVEL_BODY_LIMITS: Record<
     note: string;
   }
 > = {
+  'browserCompanion.ts': {
+    paths: ['/api/v1/browser-companion/request'],
+    globalMaxSize: 8 * MB,
+    note: '4 MiB file upload encoded in a bounded JSON transport envelope.',
+  },
   'devPush.ts': {
     paths: ['/api/v1/dev/push'],
     globalMaxSize: 150 * MB,

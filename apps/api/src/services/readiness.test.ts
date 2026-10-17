@@ -8,6 +8,11 @@ import type {
   ConsumerReadinessState,
 } from './workerReadinessRegistry';
 
+// The evaluator adopts the injected promise before releasing its raw-probe
+// slot. Drain that complete reaction chain, rather than assuming one microtask
+// is enough, when a test specifically requires a NEW post-settlement attempt.
+const flushProbeSettlement = () => new Promise<void>(resolve => setImmediate(resolve));
+
 /**
  * Harness with a controllable clock and mutable dependency state, so a single
  * evaluator instance (one "process lifetime") can be walked through
@@ -358,15 +363,83 @@ describe('createReadinessEvaluator', () => {
     });
 
     it('keeps answering after a timed-out probe, and recovers when the probe does', async () => {
-      let hang = true;
-      const checkDb = vi.fn(() => (hang ? new Promise<boolean>(() => {}) : Promise.resolve(true)));
+      let release!: (ready: boolean) => void;
+      const pending = new Promise<boolean>(resolve => { release = resolve; });
+      const checkDb = vi.fn(() => pending);
       const { state, evaluator } = harness({ checkDb, probeTimeoutMs: 20 });
 
       expect(await evaluator.get()).toMatchObject({ ready: false, db: false });
 
-      hang = false;
+      // Changing how FUTURE probes behave cannot cancel the original pending
+      // query. Readiness stays bounded and closed until it actually settles.
+      checkDb.mockResolvedValue(true);
+      state.clock += 6_000;
+      expect(await evaluator.get()).toMatchObject({ ready: false, db: false });
+      expect(checkDb).toHaveBeenCalledTimes(1);
+      release(true);
+      await flushProbeSettlement();
       state.clock += 6_000;
       expect(await evaluator.get()).toMatchObject({ ready: true, db: true });
+      expect(checkDb).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(['db', 'redis'] as const)('retains one unresolved %s operation across cache expiry and invalidation without repeating failure logs', async name => {
+      const stuck = vi.fn(() => new Promise<boolean>(() => {}));
+      const { state, evaluator, onProbeFailure, checkDb, checkRedis } = harness({
+        ...(name === 'db' ? { checkDb: stuck } : { checkRedis: stuck }), probeTimeoutMs: 5,
+      });
+      for (let i = 0; i < 4; i++) {
+        if (i % 2 === 0) evaluator.invalidate();
+        else state.clock += 6_000;
+        const results = await Promise.all([evaluator.get(), evaluator.get()]);
+        expect(results.every(result => !result.ready && !result[name])).toBe(true);
+      }
+      expect(stuck).toHaveBeenCalledTimes(1);
+      expect(onProbeFailure).toHaveBeenCalledTimes(1);
+      expect(onProbeFailure).toHaveBeenCalledWith(name, expect.any(Error));
+      expect(name === 'db' ? checkRedis : checkDb).toHaveBeenCalledTimes(4);
+    });
+
+    it('releases a late-rejected raw probe without an unhandled rejection or duplicate timeout report', async () => {
+      let reject!: (error: Error) => void;
+      const pending = new Promise<boolean>((_resolve, fail) => { reject = fail; });
+      const checkDb = vi.fn(() => pending);
+      const { evaluator, onProbeFailure } = harness({ checkDb, probeTimeoutMs: 5, ttlMs: 0 });
+      expect(await evaluator.get()).toMatchObject({ db: false });
+      reject(new Error('late failure'));
+      await flushProbeSettlement();
+      checkDb.mockResolvedValue(true);
+      expect(await evaluator.get()).toMatchObject({ ready: true });
+      expect(checkDb).toHaveBeenCalledTimes(2);
+      expect(onProbeFailure).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps invalidation generation fencing while sharing a raw operation after a timeout', async () => {
+      let release!: (ready: boolean) => void;
+      const pending = new Promise<boolean>(resolve => { release = resolve; });
+      const checkDb = vi.fn(() => pending);
+      const { state, evaluator } = harness({ checkDb, probeTimeoutMs: 5 });
+      expect(await evaluator.get()).toMatchObject({ ready: false });
+      evaluator.invalidate();
+      const older = evaluator.get();
+      evaluator.invalidate();
+      state.workers = false;
+      release(true);
+      expect(await older).toMatchObject({ ready: false, db: true, workers: false });
+      state.workers = true;
+      checkDb.mockResolvedValue(true);
+      expect(await evaluator.get()).toMatchObject({ ready: true });
+      expect(checkDb).toHaveBeenCalledTimes(2);
+    });
+
+    it.each(['throw', 'timeout'] as const)('still responds when diagnostics throw on a probe %s', async failure => {
+      const checkDb = vi.fn(() => failure === 'timeout' ? new Promise<boolean>(() => {}) : Promise.reject(new Error('probe failed')));
+      const onProbeFailure = vi.fn(() => { throw new Error('reporter failed'); });
+      const { evaluator } = harness({ checkDb, onProbeFailure, probeTimeoutMs: 5 });
+      await expect(evaluator.get()).resolves.toMatchObject({ ready: false, db: false, redis: true });
+      evaluator.invalidate();
+      await expect(evaluator.get()).resolves.toMatchObject({ ready: false, db: false });
+      expect(onProbeFailure).toHaveBeenCalledTimes(failure === 'timeout' ? 1 : 2);
     });
 
     it('does not report a failure for a probe that finishes inside its deadline', async () => {

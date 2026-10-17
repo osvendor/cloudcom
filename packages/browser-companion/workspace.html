@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CloudCom Remote Tools</title>
+  <link rel="stylesheet" href="workspace.css">
+  <link rel="stylesheet" href="workspace-registry.css">
+  <link rel="stylesheet" href="workspace-events.css">
+  <link rel="stylesheet" href="workspace-scripts.css">
+  <link rel="stylesheet" href="vendor-xterm.css">
+</head>
+<body>
+  <main class="workspace" data-workspace="remote-tools">
+    <label class="label" for="toolSelect">Tool</label>
+    <select id="toolSelect" class="tool-select"><option value="processes">Processes</option><option value="services">Services</option><option value="ipscan">IP scan</option><option value="registry">Registry</option><option value="events">Events</option><option value="tasks">Tasks</option><option value="terminal">Terminal</option><option value="files">Files</option><option value="scripts">Scripts</option></select>
+    <div class="status" role="status" aria-live="polite" data-region="status">Select a remote tool to begin.</div>
+    <section class="content" data-region="tool-content" aria-live="polite">
+      <!-- The controller owns loading, errors, and tool-specific content. -->
+      <div class="content-placeholder"><span class="placeholder-icon" aria-hidden="true">◇</span><p data-bind="empty-message">Choose a tool above.</p></div>
+    </section>
+  </main>
+  <script type="module" src="workspace.js"></script>
+</body>
+</html>

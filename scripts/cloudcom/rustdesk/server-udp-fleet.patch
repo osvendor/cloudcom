@@ -1,0 +1,30 @@
+--- a/src/cloudcom_udp.rs
++++ b/src/cloudcom_udp.rs
+@@ -46,7 +46,10 @@
+     static ref TARGETS: Vec<String> = std::env::var("CLOUDCOM_UDP_TARGETS").unwrap_or_default()
+         .split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect();
+ }
+-pub fn enabled(id: &str) -> bool { TARGETS.iter().any(|v| v == id) }
++fn target_enabled(targets: &[String], id: &str) -> bool {
++    !id.is_empty() && targets.iter().any(|v| v == "*" || v == id)
++}
++pub fn enabled(id: &str) -> bool { target_enabled(&TARGETS, id) }
+ pub fn admit(addr: SocketAddr) {
+     if TARGETS.is_empty() { return; }
+     if let Ok(mut s) = STATE.lock() { s.admit(try_into_v4(addr).ip(), Instant::now()); }
+@@ -65,6 +68,15 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    #[test]
++    fn explicit_fleet_mode_preserves_disabled_and_canary_modes() {
++        assert!(!target_enabled(&[], "new-device"));
++        assert!(target_enabled(&["canary".into()], "canary"));
++        assert!(!target_enabled(&["canary".into()], "new-device"));
++        assert!(target_enabled(&["*".into()], "canary"));
++        assert!(target_enabled(&["*".into()], "new-device"));
++        assert!(!target_enabled(&["*".into()], ""));
++    }
+     #[test] fn probe_requires_tcp_admission_and_is_rate_limited() {
+         let mut s = State::default(); let now = Instant::now(); let ip = "192.0.2.1".parse().unwrap();
+         assert!(!s.probe(ip, now)); s.admit(ip, now);

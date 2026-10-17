@@ -26,6 +26,7 @@ import {
   PARKED_DEVICE_COMMAND_REFUSAL_MESSAGE,
 } from '../services/unassignedPool/deliveryEligibility';
 import { isUnassignedPoolOrgType } from '../services/unassignedPool/orgType';
+import { admitAgentUpdate } from '../services/agentRolloutAdmission';
 
 // #6621: staged uploads must never live under os.tmpdir() — the container's
 // /tmp is a small tmpfs shared with tsx's compile cache, so a ~34 MB Windows
@@ -273,6 +274,27 @@ devPushRoutes.post('/push', bodyLimit({ maxSize: 150 * 1024 * 1024, onError: (c)
     );
   }
 
+  // Validate the configured origin before reserving rollout capacity.
+  const downloadBaseUrl = resolveDownloadBaseUrl();
+  if (!downloadBaseUrl) {
+    return c.json({ error: 'PUBLIC_API_URL or BREEZE_SERVER must be set for dev push' }, 500);
+  }
+
+  const admission = await admitAgentUpdate({
+    deviceId: device.id,
+    siteKey: `${device.orgId}:${device.siteId ?? 'unassigned'}`,
+    targets: { [component === 'agent' ? 'agent' : 'helper']: version },
+  });
+  if (!admission.allowed) {
+    c.header('Retry-After', '60');
+    return c.json({
+      error: 'Agent update temporarily deferred; retry later',
+      code: 'AGENT_UPDATE_DEFERRED',
+      retryLater: true,
+      reason: admission.reason,
+    }, 429);
+  }
+
   // Stage the binary under the work dir (never os.tmpdir()).
   const workDir = resolveWorkDir();
   await mkdir(workDir, { recursive: true });
@@ -326,11 +348,6 @@ devPushRoutes.post('/push', bodyLimit({ maxSize: 150 * 1024 * 1024, onError: (c)
   pendingDownloads.set(downloadToken, { filePath, timer, agentId: device.agentId });
 
   // Build download URL from configured canonical origin (not request headers).
-  const downloadBaseUrl = resolveDownloadBaseUrl();
-  if (!downloadBaseUrl) {
-    cleanupDownload(downloadToken);
-    return c.json({ error: 'PUBLIC_API_URL or BREEZE_SERVER must be set for dev push' }, 500);
-  }
   const downloadUrl = `${downloadBaseUrl}/api/v1/dev/push/download/${downloadToken}`;
 
   // Send dev_update command to agent via WebSocket

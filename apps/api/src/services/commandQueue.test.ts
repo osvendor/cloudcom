@@ -109,6 +109,9 @@ vi.mock('../db/schema', async (importOriginal) => {
       id: 'id',
       deviceId: 'deviceId',
       status: 'status',
+      type: 'type',
+      executedAt: 'executedAt',
+      result: 'result',
       createdAt: 'createdAt'
     },
     devices: {
@@ -614,6 +617,70 @@ describe('command queue service', () => {
 
     expect(result).toEqual(completed);
     expect(limitMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['update_agent', 'update_watchdog'])('reports %s capacity deferral without completing the pending row', async type => {
+    const pending = {
+      id: 'deferred-update', type, status: 'pending', executedAt: null,
+      result: { deliveryDeferred: 'Agent update deferred: host-pressure' },
+    };
+    vi.mocked(db.select).mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({ limit: vi.fn().mockResolvedValue([pending]) }),
+      }),
+    } as any);
+    const result = await waitForCommandResult('deferred-update', 250, 100);
+    expect(result.status).toBe('pending');
+    expect(result.result).toMatchObject({
+      status: 'failed',
+      error: 'Agent update not started; queued for retry. Agent update deferred: host-pressure',
+      data: { deliveryDeferred: true },
+    });
+    expect(db.update).not.toHaveBeenCalled();
+    expect(pending.result).toEqual({ deliveryDeferred: 'Agent update deferred: host-pressure' });
+  });
+
+  it('preserves capacity deferral that races the final synchronous timeout write', async () => {
+    vi.useFakeTimers();
+    const pending = { id: 'race-update', type: 'update_agent', status: 'pending', executedAt: null };
+    const deferred = { ...pending, result: { deliveryDeferred: 'Agent update deferred: global-capacity' } };
+    const limit = vi.fn().mockResolvedValueOnce([pending]).mockResolvedValueOnce([deferred]);
+    vi.mocked(db.select).mockReturnValue({
+      from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit }) }),
+    } as any);
+    const where = vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([]) });
+    vi.mocked(db.update).mockReturnValue({ set: vi.fn().mockReturnValue({ where }) } as any);
+    const promise = waitForCommandResult('race-update', 50, 100);
+    await vi.advanceTimersByTimeAsync(100);
+    const result = await promise;
+    expect(result.status).toBe('pending');
+    expect(result.result).toMatchObject({ status: 'failed', data: { deliveryDeferred: true } });
+    const statement = new PgDialect().sqlToQuery(where.mock.calls[0]![0]);
+    expect(statement.sql).toContain("->>'deliveryDeferred'");
+    expect(statement.sql).toContain("like 'Agent update deferred: %'");
+    expect(statement.sql).toContain('not');
+    expect(statement.params).toEqual(expect.arrayContaining(['update_agent', 'update_watchdog']));
+  });
+
+  it.each([
+    { type: 'script', status: 'pending', executedAt: null, result: { deliveryDeferred: 'Agent update deferred: host-pressure' } },
+    { type: 'update_agent', status: 'sent', executedAt: new Date(), result: { deliveryDeferred: 'Agent update deferred: host-pressure' } },
+    { type: 'update_agent', status: 'pending', executedAt: null, result: null },
+  ])('retains ordinary timeouts for $type in $status without an active capacity deferral', async command => {
+    vi.useFakeTimers();
+    const timedOut = { ...command, id: 'normal-timeout', status: 'failed', result: { status: 'timeout' } };
+    const limit = vi.fn().mockResolvedValueOnce([{ ...command, id: 'normal-timeout' }]).mockResolvedValueOnce([timedOut]);
+    vi.mocked(db.select).mockReturnValue({
+      from: vi.fn().mockReturnValue({ where: vi.fn().mockReturnValue({ limit }) }),
+    } as any);
+    const set = vi.fn().mockReturnValue({
+      where: vi.fn().mockReturnValue({ returning: vi.fn().mockResolvedValue([{ id: 'normal-timeout', status: 'failed' }]) }),
+    });
+    vi.mocked(db.update).mockReturnValue({ set } as any);
+    const promise = waitForCommandResult('normal-timeout', 50, 100);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await promise).toEqual(timedOut);
+    expect(set).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed' }));
   });
 
   it('should mark commands as failed on timeout', async () => {

@@ -18,7 +18,7 @@ export async function lockNativeTarget(target: NativeTarget) {
   return row;
 }
 /** Credential lookup is the only system-scoped operation; callers establish the resolved org context next. */
-export async function authenticateNativeTarget(bearer: string | undefined): Promise<NativeTarget | null> {
+export async function authenticateNativeTarget(bearer: string | undefined): Promise<(NativeTarget & { partnerId: string }) | null> {
   if (!nativeAdmissionEnabled() || !bearer?.startsWith('Bearer cct1.')) return null;
   let hash: string;
   try { hash = hashNativeTicket(bearer.slice('Bearer cct1.'.length)); } catch { return null; }
@@ -26,10 +26,11 @@ export async function authenticateNativeTarget(bearer: string | undefined): Prom
     const [row] = await db.select({ target: portalNativeTargets, device: devices }).from(portalNativeTargets)
       .innerJoin(devices, and(eq(devices.id, portalNativeTargets.deviceId), eq(devices.orgId, portalNativeTargets.orgId)))
       .where(and(eq(portalNativeTargets.credentialHash, hash), eq(portalNativeTargets.enabled, true))).limit(1);
-    if (!row || row.device.status !== 'online' || row.device.agentTokenSuspendedAt || row.device.quarantinedAt
-      || !await getActiveOrgTenant(row.target.orgId)) return null;
+    if (!row || row.device.status !== 'online' || row.device.agentTokenSuspendedAt || row.device.quarantinedAt) return null;
+    const tenant = await getActiveOrgTenant(row.target.orgId);
+    if (!tenant) return null;
     return { id: row.target.id, orgId: row.target.orgId, deviceId: row.target.deviceId,
-      generation: row.target.generation, credentialHash: hash };
+      generation: row.target.generation, credentialHash: hash, partnerId: tenant.partnerId };
   }, 'nativeTarget.authenticate'));
 }
 /** Target persists its random credential before enrollment. Identical retries do not rotate or return secrets. */

@@ -1,5 +1,42 @@
 # RustDesk desired-state scripts
 
+## Current Breeze-only host enforcement
+
+Use `enforce-managed-host.ps1` for the custom unattended host. The older
+`probe.ps1` / `repair.ps1` password-based workflow documented below is legacy
+and must not be substituted for the Breeze-only host.
+
+The current script has Probe and Repair modes. It pins the MSI and installed
+EXE/DLL hashes for approved host 1.5.0.68, verifies the local Breeze organization,
+and checks private routing, automatic service startup, native enrollment, and
+application-bound firewall rules. The custom host requires Breeze native session
+admission; this workflow creates no shared RustDesk password. The Breeze agent
+performs its own enrollment, normally within ten minutes.
+
+Repair installs an absent host silently without requesting a reboot. Unknown,
+modified, or different existing payloads require review rather than automatic
+replacement. Failures have a fifteen-minute cooldown and three-attempt ceiling.
+Review the protected ProgramData/CloudCom/ManagedHostEnforcement journal before
+resetting attempts. A healthy probe does not prove an interactive desktop session.
+
+Deploy through a native Script Monitor with a fifteen-minute interval and a
+run-script repair response. Start with a device pilot, then assign the policy
+at organization level with a Windows filter to cover future enrollments. Keep
+organization and server values in private deployment records. For saved scripts,
+bundle the required common.ps1 functions after the parameter block.
+
+The API serves the exact pinned MSI at
+`/api/v1/agents/download/rustdesk/windows/amd64/msi`. Stage it in the persistent
+`CLOUDCOM_RUSTDESK_HOST_DIR` as `cloudcom-rustdesk-host.msi`; it contains no device
+enrollment secrets. Preserve this directory across agent binary promotions.
+Changing the approved host requires a reviewed hash update and another pilot.
+Disable the monitor/policy assignment to stop enforcement; do not delete native
+enrollment identities or uninstall hosts as an automatic rollback.
+
+`enforce-managed-host.Tests.ps1` tests probe behavior without executing Repair.
+
+## Legacy password-based host workflow
+
 These Windows PowerShell 5.1-compatible scripts use native Breeze Script Monitors and run as SYSTEM. They do not alter the Breeze MSI, agent, database, or application. The quiet profile is the default and has been validated on one Windows canary; do not infer fleet approval from this single-canary result. Configuration and credentials belong in private deployment records, never this directory.
 
 `probe.ps1` detects installation/version, service running and Automatic, service executable path, configured rendezvous/relay/public key, and protected SYSTEM-DPAPI credential presence/readability. It emits Breeze's explicit monitor marker and exits zero for a completed noncompliant check. It does not establish a remote connection or prove that RustDesk currently accepts the stored password.
@@ -23,3 +60,23 @@ The managed profile defaults to silent EXE installation, no shared desktop/Start
 The stock OSS client does not expose `hide-tray` as an ordinary TOML option. This profile suppresses its common Startup shortcut and terminates only a verified installed `--tray` process, rechecking process identity before termination. It does not terminate the service, server, main application, or active-session connection manager. Opening the main application can respawn the tray until the next successful policy repair. Active-session UI remains visible. A shortcut can exist briefly during installation before cleanup. Reboot/unattended connection acceptance passed on the Windows canary; do not describe this as a permanently invisible custom client.
 
 No Breeze MSI/core changes are required. Preserve the quiet-state probe and remediation hooks on upstream imports and revalidate vendor shortcut/CLI behavior on RustDesk upgrades. Removing this policy stops enforcement; reinstalling/repairing the vendor package restores its normal shortcuts. Credentials must be preserved during rollback.
+
+### Direct UDP server prerequisite
+
+Endpoint health alone does not establish direct connectivity. The custom hbbs
+UDP compatibility feature was originally restricted to one pilot RustDesk ID by
+`CLOUDCOM_UDP_TARGETS`. An enrolled, healthy host outside that list can still fail
+direct connections while the pilot works from the same viewer.
+
+`server-udp-fleet.patch` adds an explicit `CLOUDCOM_UDP_TARGETS=*` mode to that
+custom server module. Empty configuration remains disabled; exact-ID lists retain
+their canary behavior. The change does not bypass the rendezvous key, TCP admission,
+request correlation, rate/capacity bounds, replay checks, or Breeze host admission.
+Build and validate the server patch before using the wildcard; the older binary
+treats `*` as a literal ID and will not enable fleet support. Test disabled, exact-ID,
+fleet, and newly introduced target IDs in isolated wire tests before promotion.
+
+Rollout acceptance must cover server transport configuration plus actual desktop
+connectivity, separately from the endpoint installation/enrollment health probe.
+Keep the prior server binary and compose configuration for rollback. A running
+listener or healthy endpoint probe alone is not a successful remote session.

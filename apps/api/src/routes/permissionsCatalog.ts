@@ -10,6 +10,7 @@ permissionsCatalogRoutes.use('*', authMiddleware);
 // Kept here (not in the permissions registry itself) because the registry is
 // security-sensitive and labels are UI presentation only.
 const RESOURCE_LABELS: Record<string, string> = {
+  credentials: 'Client Credentials',
   backup: 'Backup & Recovery',
   devices: 'Devices',
   agent_rollback: 'Agent Rollback',
@@ -52,6 +53,9 @@ const RESOURCE_LABELS: Record<string, string> = {
 };
 
 const ACTION_LABELS: Record<string, string> = {
+  reveal: 'Reveal Passwords',
+  otp: 'Generate One-Time Codes',
+  import: 'Import',
   read: 'Read',
   write: 'Write',
   premium: 'Use Premium Models',

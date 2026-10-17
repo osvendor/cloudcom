@@ -145,13 +145,23 @@ function buildApiUrl(path: string): string {
 }
 
 async function bootstrapThenNavigate(url: string): Promise<void> {
-  const response = await fetch(buildApiUrl('/auth/browser-binding/bootstrap'), {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-  });
-  if (!response.ok) throw new Error('Authentication bootstrap failed');
-  window.location.assign(url);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const response = await fetch(buildApiUrl('/auth/browser-binding/bootstrap'), {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error('Authentication bootstrap failed');
+    window.location.assign(url);
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error('Sign-in preparation timed out. Please wait a moment and retry.');
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 interface LoginPageProps {
@@ -185,6 +195,11 @@ export default function LoginPage({ next, authenticate = apiLogin, skipAutomatic
   // entirely in the effect (client-only), keeping SSR and CSR initial output
   // identical (both render the placeholder).
   const [cfAccessRedirectChecked, setCfAccessRedirectChecked] = useState(false);
+  const [cfBootstrapError, setCfBootstrapError] = useState<string>();
+  const [cfRetryPending, setCfRetryPending] = useState(false);
+  const cfRetryInFlight = useRef(false);
+  const cfCallbackFailed = !skipAutomaticStaffSso && typeof window !== 'undefined'
+    && new URLSearchParams(window.location.search).get('error') === 'cf-access';
   const [partnerSso, setPartnerSso] = useState<{ providerName: string; loginUrl: string; enforceSSO: boolean } | null>(null);
   // Only meaningful once enforceSSO is true: lets the user reveal the password
   // form that's collapsed behind it (see the enforceSSO comment below).
@@ -233,6 +248,7 @@ export default function LoginPage({ next, authenticate = apiLogin, skipAutomatic
   // the user has an active session at the root app with the same IdP.
   useEffect(() => {
     if (cfAccessRedirectChecked) return;
+    if (cfBootstrapError) return;
     // Post-redirect bounce / explicit sign-out: skip the check and show the
     // form immediately (one tick after mount, so SSR and CSR still agree on the
     // initial placeholder render).
@@ -249,8 +265,7 @@ export default function LoginPage({ next, authenticate = apiLogin, skipAutomatic
           await bootstrapThenNavigate(`/api/v1/auth/cf-access-login${nextParam}`);
         } catch (caught) {
           if (!cancelled) {
-            setError(caught instanceof Error ? caught.message : 'Authentication bootstrap failed');
-            setCfAccessRedirectChecked(true);
+            setCfBootstrapError(caught instanceof Error ? caught.message : 'Authentication bootstrap failed');
           }
         }
         return;
@@ -258,7 +273,7 @@ export default function LoginPage({ next, authenticate = apiLogin, skipAutomatic
       setCfAccessRedirectChecked(true);
     });
     return () => { cancelled = true; };
-  }, [cfAccessRedirectChecked, safeNext, skipAutomaticStaffSso]);
+  }, [cfAccessRedirectChecked, cfBootstrapError, safeNext, skipAutomaticStaffSso]);
 
   const handleLogin = async (values: { email: string; password: string }) => {
     setLoading(true);
@@ -392,6 +407,27 @@ export default function LoginPage({ next, authenticate = apiLogin, skipAutomatic
     });
   }, []);
 
+  // A callback failure suppresses automatic redirects, but must not strand
+  // an SSO user on the password form. Retry only after an explicit action.
+  const handleCfRetry = async () => {
+    if (cfRetryInFlight.current) return;
+    cfRetryInFlight.current = true;
+    setCfRetryPending(true);
+    setCfBootstrapError(undefined);
+    try {
+      if (!await checkCfAccessLoginEnabled()) {
+        throw new Error('Single sign-on is unavailable. Please wait a moment and retry, or contact your administrator.');
+      }
+      const nextParam = safeNext === '/' ? '' : `?next=${encodeURIComponent(safeNext)}`;
+      await bootstrapThenNavigate(`/api/v1/auth/cf-access-login${nextParam}`);
+      // Keep the guard until navigation replaces this page.
+    } catch (caught) {
+      setCfBootstrapError(caught instanceof Error ? caught.message : 'Authentication bootstrap failed');
+      cfRetryInFlight.current = false;
+      setCfRetryPending(false);
+    }
+  };
+
   const handleOrgSso = async () => {
     if (!orgSso || ssoBootstrapping) return;
     const url = `${orgSso.loginUrl}${safeNext ? `?redirect=${encodeURIComponent(safeNext)}` : ''}`;
@@ -418,10 +454,12 @@ export default function LoginPage({ next, authenticate = apiLogin, skipAutomatic
     }
   };
 
-  // While the CF Access config check is in flight, render an empty placeholder
-  // so the user doesn't see the password form flash before a redirect kicks in.
+  // Keep slow bootstrap visible, and require an explicit retry after failure.
   if (!cfAccessRedirectChecked) {
-    return <div data-testid="login-cf-access-check" className="u-min-h-px-160" />;
+    return <div data-testid="login-cf-access-check" className="u-min-h-px-160 space-y-4" role="status">
+      <p>{cfBootstrapError ?? 'Preparing your sign-in…'}</p>
+      {cfBootstrapError && <button type="button" className="rounded-md border px-4 py-2" onClick={() => setCfBootstrapError(undefined)}>Retry sign-in</button>}
+    </div>;
   }
 
   if (mfaChallenge) {
@@ -480,6 +518,15 @@ export default function LoginPage({ next, authenticate = apiLogin, skipAutomatic
           className="mb-6 rounded-md border border-yellow-300 bg-yellow-50 px-4 py-3 text-sm text-yellow-800 dark:border-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-200"
         >
           {ssoLoginNotice}
+        </div>
+      )}
+      {cfCallbackFailed && (
+        <div className="mb-6 space-y-3" data-testid="cf-access-retry">
+          <p role="status">{cfRetryPending ? 'Preparing your sign-in…' : cfBootstrapError ?? 'Single sign-on could not complete. Wait a moment, then retry.'}</p>
+          <button type="button" onClick={handleCfRetry} disabled={cfRetryPending}
+            className="rounded-md border border-input px-4 py-2 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-60">
+            Retry single sign-on
+          </button>
         </div>
       )}
       {partnerSso && (

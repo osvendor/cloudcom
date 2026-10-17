@@ -12,6 +12,10 @@
 // NB: named PERMISSION_GRANTS (not PERMISSIONS) to avoid colliding with the
 // older nested PERMISSIONS constant in this package.
 export const PERMISSION_GRANTS = {
+  CREDENTIALS_READ: { resource: 'credentials', action: 'read' },
+  CREDENTIALS_REVEAL: { resource: 'credentials', action: 'reveal' },
+  CREDENTIALS_OTP: { resource: 'credentials', action: 'otp' },
+  CREDENTIALS_IMPORT: { resource: 'credentials', action: 'import' },
   // Backup / recovery
   BACKUP_READ: { resource: 'backup', action: 'read' },
   BACKUP_WRITE: { resource: 'backup', action: 'write' },

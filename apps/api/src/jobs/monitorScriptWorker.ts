@@ -22,13 +22,11 @@
  * could drift from the resolver's winner-per-monitor / override semantics
  * (config-policy attachment, closest-wins-per-monitor, parent inheritance).
  *
- * KNOWN INEFFICIENCY: O(candidate devices x resolveMonitorsForDevice's own
- * work) per tick, per monitor — every device in a monitor's owning org(s)
- * gets its FULL monitor set resolved just to check whether one monitor is a
- * winner for it. Acceptable given the monitor cadence (5-1440 minutes,
- * scriptKind's own schema) and the partner fan-out cap below; flagged for
- * the same treatment `monitorWorker.ts` already gives network-monitor
- * partner fan-out if this becomes hot.
+ * ADMISSION PREFILTER: a fresh attachment inventory can prove that a monitor
+ * is unattached, or establish the shortest possible cadence across ALL its
+ * attachments. Bulk execution history then skips candidates that cannot be
+ * due at that cadence. Every remaining candidate still gets the full device
+ * resolver and exact effective due check; the prefilter never grants a run.
  *
  * OVERRIDES: a config-policy attachment can override `intervalMinutes` /
  * `timeoutSeconds` per device (scriptKind.overridableKeys) — see
@@ -48,9 +46,9 @@
  * workerReadinessCoverage.test.ts / workerReadinessManifest.test.ts fail.
  */
 import { Queue, Worker } from 'bullmq';
-import { and, desc, eq, inArray } from 'drizzle-orm';
+import { and, eq, gt, inArray, or } from 'drizzle-orm';
 import * as dbModule from '../db';
-import { devices, monitorDefinitions, organizations, scriptExecutions, scripts } from '../db/schema';
+import { configPolicyMonitors, devices, monitorDefinitions, organizations, scriptExecutions, scripts } from '../db/schema';
 import { dispatchScriptToDevice } from '../services/scriptDispatch';
 import { resolveMonitorsForDevice } from '../services/monitors/monitorResolver';
 import { applyOverrides } from '../services/monitors/kinds';
@@ -62,6 +60,7 @@ import { excludeEphemeralDevices, excludeQuickSupportOrgs } from '../services/qu
 import { withQueueMeta, type QueueActorMeta } from './queueSchemas';
 import { attachWorkerObservability } from './workerObservability';
 import { captureException } from '../services/sentry';
+import { canRunBackgroundWork } from '../services/capacityGuard';
 import { notHoldingOrgCondition, notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 
 const { db } = dbModule;
@@ -78,11 +77,16 @@ const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
 const PARTNER_FANOUT_ORG_LIMIT = 500;
 
 export interface ScriptMonitorTickResult {
+  deferredForCapacity?: true;
   monitorsConsidered: number;
   devicesConsidered: number;
   dispatched: number;
   /** Not due yet, disabled for this device, or dispatchScriptToDevice's own skip (offline/maintenance/decommissioned/etc). */
   skipped: number;
+  /** Online candidates skipped using this sweep's complete attachment inventory. */
+  skippedUnattached: number;
+  /** Online candidates blocked even at the shortest possible effective interval. */
+  skippedNotDue: number;
   errors: number;
 }
 
@@ -90,6 +94,64 @@ type CandidateDevice = Pick<
   typeof devices.$inferSelect,
   'id' | 'orgId' | 'osType' | 'status' | 'agentId' | 'hostname' | 'siteId' | 'customFields'
 >;
+
+type ScriptCondition = ReturnType<(typeof scriptKind)['conditionSchema']['parse']>;
+type AttachmentOverrides = typeof configPolicyMonitors.$inferSelect.overrides;
+
+/** A lower bound only: even disabled/unassigned attachments must participate. */
+function minimumPossibleInterval(
+  authoredCondition: ScriptCondition,
+  attachmentOverrides: AttachmentOverrides[],
+): number | null {
+  let minimum = authoredCondition.intervalMinutes;
+  for (const overrides of attachmentOverrides) {
+    if (overrides !== null && (
+      typeof overrides !== 'object'
+      || Array.isArray(overrides)
+      || Object.keys(overrides).some((key) => !scriptKind.overridableKeys.some((allowed) => allowed === key))
+    )) return null;
+    try {
+      // Validate the whole merged condition, including timeout. An invalid
+      // attachment must reach normal resolution/error reporting, not be hidden
+      // behind a cached not-due decision.
+      minimum = Math.min(minimum, applyOverrides(scriptKind, authoredCondition, overrides).intervalMinutes);
+    } catch {
+      return null;
+    }
+  }
+  return minimum;
+}
+
+type ProbeHistory = Map<string, { active: boolean; latestCreatedAt: number }>;
+const ACTIVE_PROBE_STATUSES = ['pending', 'queued', 'running', 'cancelling'] as const;
+
+async function readBlockingProbeHistory(
+  monitorId: string,
+  onlineDeviceIds: string[],
+  minimumInterval: number,
+): Promise<ProbeHistory> {
+  const rows = await db.select({
+    deviceId: scriptExecutions.deviceId,
+    status: scriptExecutions.status,
+    createdAt: scriptExecutions.createdAt,
+  }).from(scriptExecutions).where(and(
+    eq(scriptExecutions.monitorId, monitorId),
+    inArray(scriptExecutions.deviceId, onlineDeviceIds),
+    or(
+      inArray(scriptExecutions.status, [...ACTIVE_PROBE_STATUSES]),
+      gt(scriptExecutions.createdAt, new Date(Date.now() - minimumInterval * 60_000)),
+    ),
+  ));
+  const history: ProbeHistory = new Map();
+  for (const row of rows) {
+    const previous = history.get(row.deviceId);
+    history.set(row.deviceId, {
+      active: previous?.active === true || ACTIVE_PROBE_STATUSES.some((status) => status === row.status),
+      latestCreatedAt: Math.max(previous?.latestCreatedAt ?? -Infinity, row.createdAt.getTime()),
+    });
+  }
+  return history;
+}
 
 /**
  * The orgs a `script` monitor row must be evaluated against: itself, for an
@@ -133,11 +195,10 @@ async function resolveCandidateOrgIds(monitor: {
 }
 
 /**
- * Whether this device's last dispatch attempt for this monitor is old enough
- * to redispatch. Throttles on `createdAt` (when the dispatch was INITIATED),
- * not `completedAt` — an in-flight run (`completedAt IS NULL`) must still
- * count as "recently dispatched" so this worker never fires a second probe
- * on top of one that just hasn't finished yet. This is a separate question
+ * A probe is due only when no active execution exists and the cadence has
+ * elapsed. Active runs block another probe regardless of age, including an
+ * older run behind a newer terminal execution. Throttle terminal runs on
+ * `createdAt` (when dispatch was initiated), not `completedAt`. This is a separate question
  * from the scriptMonitor condition handler's own staleness check (which
  * reads `completedAt` and asks "is the newest VERDICT too old"); throttling
  * dispatch and judging staleness are different concerns read off different
@@ -148,16 +209,20 @@ async function isDeviceDueForProbe(
   deviceId: string,
   intervalMinutes: number,
 ): Promise<boolean> {
-  const [latest] = await db
-    .select({ createdAt: scriptExecutions.createdAt })
+  const [blockingExecution] = await db
+    .select({ id: scriptExecutions.id })
     .from(scriptExecutions)
-    .where(and(eq(scriptExecutions.monitorId, monitorId), eq(scriptExecutions.deviceId, deviceId)))
-    .orderBy(desc(scriptExecutions.createdAt))
+    .where(and(
+      eq(scriptExecutions.monitorId, monitorId),
+      eq(scriptExecutions.deviceId, deviceId),
+      or(
+        inArray(scriptExecutions.status, [...ACTIVE_PROBE_STATUSES]),
+        gt(scriptExecutions.createdAt, new Date(Date.now() - intervalMinutes * 60_000)),
+      ),
+    ))
     .limit(1);
 
-  if (!latest) return true;
-  const ageMs = Date.now() - latest.createdAt.getTime();
-  return ageMs >= intervalMinutes * 60_000;
+  return !blockingExecution;
 }
 
 /**
@@ -167,31 +232,57 @@ async function isDeviceDueForProbe(
  * short of wiring a `Worker` around it.
  */
 export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResult> {
-  // #3445: the tick's system transaction stays open across every dispatch
-  // below, and each dispatch writes its script_executions + device_commands
-  // rows through it. The agent sends are deferred until that transaction has
-  // committed; sending inside it lets a fast agent answer against rows the
-  // result path cannot see yet, which drops the result and strands the probe
-  // until the stale reaper times it out.
-  const pendingDeliveries: Array<{ commandId: string; deviceId: string; deliver: () => Promise<unknown> }> = [];
-  const tick = await runWithSystemDbAccess(async () => {
+  // This worker owns its transaction boundaries. An inherited context would
+  // make withSystemDbAccessContext reuse one transaction across the sweep.
+  return dbModule.runOutsideDbContext(async () => {
     const result: ScriptMonitorTickResult = {
       monitorsConsidered: 0,
       devicesConsidered: 0,
       dispatched: 0,
       skipped: 0,
+      skippedUnattached: 0,
+      skippedNotDue: 0,
       errors: 0,
     };
 
-    const monitorRows = await db
+    // Nothing becomes complete/not-due when capacity defers this tick.
+    if (!canRunBackgroundWork()) return { ...result, deferredForCapacity: true };
+    const monitorRows = await runWithSystemDbAccess(() => db
       .select()
       .from(monitorDefinitions)
-      .where(and(eq(monitorDefinitions.kind, 'script'), eq(monitorDefinitions.enabled, true)));
+      .where(and(eq(monitorDefinitions.kind, 'script'), eq(monitorDefinitions.enabled, true))));
+
+    // No assignment/status filtering: inherited or disabled attachments can
+    // lower the bound too. This inventory is discarded at the end of the tick,
+    // so a newly attached/shortened monitor is observed on the next sweep.
+    let attachments: Map<string, AttachmentOverrides[]> | null = null;
+    if (monitorRows.length > 0) {
+      try {
+        const rows = await runWithSystemDbAccess(() => db.select({
+          monitorId: configPolicyMonitors.monitorId,
+          overrides: configPolicyMonitors.overrides,
+        }).from(configPolicyMonitors).where(inArray(configPolicyMonitors.monitorId, monitorRows.map((monitor) => monitor.id))));
+        attachments = new Map();
+        for (const row of rows) {
+          const overrides = attachments.get(row.monitorId) ?? [];
+          overrides.push(row.overrides);
+          attachments.set(row.monitorId, overrides);
+        }
+      } catch (err) {
+        // A failed inventory is NOT proof of absence. Its transaction has
+        // ended; retain normal per-device resolution in fresh transactions.
+        attachments = null;
+        result.errors++;
+        console.error('[monitorScriptWorker] attachment prefilter failed; using full admission checks', err);
+        captureException(err);
+      }
+    }
 
     for (const monitor of monitorRows) {
+      if (!canRunBackgroundWork()) return { ...result, deferredForCapacity: true };
       result.monitorsConsidered++;
 
-      let authoredCondition: ReturnType<(typeof scriptKind)['conditionSchema']['parse']>;
+      let authoredCondition: ScriptCondition;
       try {
         authoredCondition = scriptKind.conditionSchema.parse(monitor.condition);
       } catch (err) {
@@ -203,7 +294,7 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
         continue;
       }
 
-      const orgIds = await resolveCandidateOrgIds(monitor);
+      const orgIds = await runWithSystemDbAccess(() => resolveCandidateOrgIds(monitor));
       if (orgIds.length === 0) {
         // Either an ownerless row or a fan-out over the cap — both are logged
         // above, and both are operational problems rather than "nothing to do",
@@ -212,7 +303,7 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
         continue;
       }
 
-      const deviceRows: CandidateDevice[] = await db
+      const deviceRows: CandidateDevice[] = await runWithSystemDbAccess(() => db
         .select({
           id: devices.id,
           orgId: devices.orgId,
@@ -228,79 +319,135 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
         // an ephemeral (Quick Support session) device must never be a
         // candidate for an unattended monitor probe, same exclusion
         // automationWorker.ts/featureConfigResolver.ts apply.
-        .where(and(inArray(devices.orgId, orgIds), excludeEphemeralDevices(), notParkedDeviceCondition()));
+        .where(and(inArray(devices.orgId, orgIds), excludeEphemeralDevices(), notParkedDeviceCondition())));
+
+      const monitorAttachments = attachments?.get(monitor.id) ?? [];
+      const unattached = attachments !== null && monitorAttachments.length === 0;
+      const minimumInterval = attachments !== null && !unattached
+        ? minimumPossibleInterval(authoredCondition, monitorAttachments)
+        : null;
+      let history: ProbeHistory | null = null;
+      const onlineDeviceIds = deviceRows.filter((device) => device.status === 'online').map((device) => device.id);
+      if (minimumInterval !== null && onlineDeviceIds.length > 0) {
+        try {
+          history = await runWithSystemDbAccess(() => readBlockingProbeHistory(monitor.id, onlineDeviceIds, minimumInterval));
+        } catch (err) {
+          result.errors++;
+          console.error('[monitorScriptWorker] execution prefilter failed; using full admission checks', err);
+          captureException(err);
+        }
+      }
 
       for (const device of deviceRows) {
+        // Prior probes have committed/delivered. Never wait with a transaction held.
+        if (!canRunBackgroundWork()) return { ...result, deferredForCapacity: true };
         result.devicesConsidered++;
 
-        // Winner-per-monitor resolution (device-first, see header). A
-        // disabled-for-this-device winner (an explicit override lower in
-        // the hierarchy) contributes no dispatch, same as it contributes no
-        // alert rule on the evaluation side. A device that vanished between
-        // the query above and here (raced a delete) resolves as
-        // `device_missing`, not a fabricated "zero monitors" — same
-        // no-dispatch outcome for this tick either way (#5677).
-        const resolution = await resolveMonitorsForDevice(device.id);
-        const match =
-          resolution.kind === 'resolved'
-            ? resolution.monitors.find((m) => m.monitorId === monitor.id)
-            : undefined;
-        if (!match || !match.enabled) {
+        // Periodic probes describe current health, so missed offline checks
+        // must not accumulate for replay. Skip before expensive resolution;
+        // the dispatcher's reject policy rechecks liveness before writing.
+        if (device.status !== 'online') {
           result.skipped++;
           continue;
         }
 
-        let effectiveCondition: typeof authoredCondition;
+        if (unattached) {
+          result.skipped++;
+          result.skippedUnattached++;
+          continue;
+        }
+        const prior = history?.get(device.id);
+        // Re-evaluate recency now rather than freezing it when the bulk query
+        // ran: earlier admissions can take long enough for this device to be
+        // due. A completed old active run is reconsidered next tick.
+        if (prior && minimumInterval !== null && (
+          prior.active || prior.latestCreatedAt > Date.now() - minimumInterval * 60_000
+        )) {
+          result.skipped++;
+          result.skippedNotDue++;
+          continue;
+        }
+
+        let dispatchResult: Awaited<ReturnType<typeof dispatchScriptToDevice>> | null;
         try {
-          effectiveCondition = applyOverrides(scriptKind, authoredCondition, match.overrides);
+          // One admission per transaction: policy reads, the due guard, and
+          // script_executions + device_commands writes commit together. Child
+          // row inserts take device FK locks; they must be released before the
+          // next device's policy/maintenance resolution, not at sweep end.
+          dispatchResult = await runWithSystemDbAccess(async () => {
+            // Winner-per-monitor resolution (device-first, see header). A
+            // disabled-for-this-device winner (an explicit override lower in
+            // the hierarchy) contributes no dispatch, same as it contributes no
+            // alert rule on the evaluation side. A device that vanished between
+            // the query above and here (raced a delete) resolves as
+            // `device_missing`, not a fabricated "zero monitors" — same
+            // no-dispatch outcome for this tick either way (#5677).
+            const resolution = await resolveMonitorsForDevice(device.id);
+            const match =
+              resolution.kind === 'resolved'
+                ? resolution.monitors.find((m) => m.monitorId === monitor.id)
+                : undefined;
+            if (!match || !match.enabled) {
+              return null;
+            }
+
+            const effectiveCondition = applyOverrides(scriptKind, authoredCondition, match.overrides);
+
+            const due = await isDeviceDueForProbe(monitor.id, device.id, effectiveCondition.intervalMinutes);
+            if (!due) {
+              return null;
+            }
+
+            const [scriptRow] = await db.select().from(scripts).where(eq(scripts.id, effectiveCondition.scriptId)).limit(1);
+            if (!scriptRow) {
+              throw new Error(`Monitor ${monitor.id} references missing script ${effectiveCondition.scriptId}`);
+            }
+
+            // Keep manual scripts' default offline queueing unchanged. Monitors
+            // explicitly reject offline targets, including one that went offline
+            // since the candidate read. Maintenance/decommissioning gates remain
+            // in the shared dispatcher; a refusal is an ordinary skipped probe.
+            return dispatchScriptToDevice({
+              device,
+              offlinePolicy: { kind: 'reject' },
+              source: { kind: 'saved', script: scriptRow },
+              parameters: effectiveCondition.parameters,
+              triggerType: 'monitor',
+              monitorId: monitor.id,
+              timeoutSeconds: effectiveCondition.timeoutSeconds,
+              deferDelivery: true,
+            });
+          });
         } catch (err) {
-          console.error('[monitorScriptWorker] override merge failed validation', {
+          // This device's admission rolled back. Earlier devices have already
+          // committed and must not lose their probes because a later one fails.
+          result.errors++;
+          console.error('[monitorScriptWorker] probe admission failed', {
             monitorId: monitor.id,
             deviceId: device.id,
             error: err,
           });
-          result.errors++;
+          captureException(err, undefined, { monitorId: monitor.id, deviceId: device.id });
           continue;
         }
 
-        const due = await isDeviceDueForProbe(monitor.id, device.id, effectiveCondition.intervalMinutes);
-        if (!due) {
-          result.skipped++;
-          continue;
-        }
-
-        const [scriptRow] = await db.select().from(scripts).where(eq(scripts.id, effectiveCondition.scriptId)).limit(1);
-        if (!scriptRow) {
-          console.error('[monitorScriptWorker] monitor references a missing script', {
-            monitorId: monitor.id,
-            scriptId: effectiveCondition.scriptId,
-          });
-          result.errors++;
-          continue;
-        }
-
-        // Offline devices, maintenance windows, and decommissioning are ALL
-        // already handled inside dispatchScriptToDevice — never re-checked
-        // here. A refusal there (any `ok: false` code) is an ordinary skip
-        // from this worker's point of view, not an error.
-        const dispatchResult = await dispatchScriptToDevice({
-          device,
-          source: { kind: 'saved', script: scriptRow },
-          parameters: effectiveCondition.parameters,
-          triggerType: 'monitor',
-          monitorId: monitor.id,
-          timeoutSeconds: effectiveCondition.timeoutSeconds,
-          deferDelivery: true,
-        });
-
-        if (dispatchResult.ok) {
+        if (dispatchResult?.ok) {
           result.dispatched++;
           if (dispatchResult.deliver) {
-            pendingDeliveries.push({
-              commandId: dispatchResult.commandId,
-              deviceId: device.id,
-              deliver: dispatchResult.deliver,
-            });
+            // #3445: only send after BOTH probe rows committed. A fast agent
+            // can now report against visible rows. Deliver before considering
+            // the next device, so a later failure cannot strand earlier work.
+            try {
+              await dbModule.runOutsideDbContext(dispatchResult.deliver);
+            } catch (err) {
+              // The committed command remains available to heartbeat delivery.
+              console.error('[monitorScriptWorker] deferred probe delivery threw; the committed command stays queued', {
+                commandId: dispatchResult.commandId,
+                deviceId: device.id,
+                error: err instanceof Error ? err.message : String(err),
+              });
+              captureException(err, undefined, { commandId: dispatchResult.commandId, deviceId: device.id });
+            }
           }
         } else {
           result.skipped++;
@@ -310,23 +457,6 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
 
     return result;
   });
-
-  // Committed. A delivery that throws is not a tick failure: the command row
-  // exists, so the heartbeat claim delivers it when the agent next checks in.
-  for (const pending of pendingDeliveries) {
-    try {
-      await dbModule.runOutsideDbContext(pending.deliver);
-    } catch (err) {
-      console.error('[monitorScriptWorker] deferred probe delivery threw; the committed command stays queued', {
-        commandId: pending.commandId,
-        deviceId: pending.deviceId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      captureException(err, undefined, { commandId: pending.commandId, deviceId: pending.deviceId });
-    }
-  }
-
-  return tick;
 }
 
 

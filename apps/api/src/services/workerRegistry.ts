@@ -82,8 +82,8 @@ export interface StartWorkersHooks {
  * The 104-entry registry, in the exact order the entries used to appear in
  * `index.ts`'s `initializeWorkers()` array (`index.ts:1305-1433` as of the
  * commit that introduced this module). Order matters for the losslessness
- * contract test, not for runtime semantics — every selected entry's `init()`
- * runs concurrently via `Promise.allSettled`, same as today.
+ * contract test and the order in which startup slots are assigned. Selected
+ * entries load and initialize with bounded concurrency, isolating failures.
  */
 export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
   {
@@ -954,6 +954,14 @@ export const WORKER_REGISTRY: readonly WorkerRegistration[] = [
     },
   },
   {
+    name: 'harmonySyncWorker',
+    placement: 'global',
+    load: async () => {
+      const m = await import('../jobs/harmonySyncWorker');
+      return { init: m.initializeHarmonySyncWorker, shutdown: m.shutdownHarmonySyncWorker };
+    },
+  },
+  {
     // socket-owner, not global: its runtime import closure reaches
     // routes/agentWs.ts — jobs/m365SyncWorker.ts -> services/m365Sync/run.ts
     // -> services/m365ControlPlane/readActionService.ts ->
@@ -1761,29 +1769,58 @@ export function selectWorkers(role: BreezeRole): readonly WorkerRegistration[] {
  */
 const loadedShutdowns = new Map<string, () => Promise<void>>();
 
+/** Startup fan-out only; this does not change any worker's job concurrency. */
+export function getWorkerStartupConcurrency(): number {
+  const raw = process.env.WORKER_STARTUP_CONCURRENCY?.trim();
+  if (!raw || !/^[1-9]\d*$/.test(raw)) return 4;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? Math.min(value, 8) : 4;
+}
+
+async function runWithStartupConcurrency(
+  entries: readonly WorkerRegistration[],
+  run: (entry: WorkerRegistration) => Promise<void>,
+): Promise<void> {
+  // Loading modules can itself perform DB/Redis work, so reserve the slot
+  // before load(), not only before init(). Dequeue in registry order, but let
+  // any settled entry release its slot; one slow initializer must not hold up
+  // every later entry. Never retry an initializer that may have partially run.
+  let next = 0;
+  await Promise.allSettled(Array.from(
+    { length: Math.min(getWorkerStartupConcurrency(), entries.length) },
+    async () => {
+      while (next < entries.length) {
+        const entry = entries[next++]!;
+        // Keep the old per-entry allSettled isolation even if onResult throws.
+        // A failed result hook must not strand the remaining entries in a slot.
+        await Promise.allSettled([run(entry)]);
+      }
+    },
+  ));
+}
+
 async function runEntries(
   entries: readonly WorkerRegistration[],
   hooks: StartWorkersHooks,
 ): Promise<void> {
-  await Promise.allSettled(
-    entries.map(async (entry) => {
-      try {
-        const mod = await entry.load();
-        if (mod.shutdown) {
-          loadedShutdowns.set(entry.name, mod.shutdown);
-        }
-        await mod.init();
-        hooks.onResult(entry.name, true);
-      } catch (error) {
-        hooks.onResult(entry.name, false, error);
+  await runWithStartupConcurrency(entries, async (entry) => {
+    try {
+      const mod = await entry.load();
+      if (mod.shutdown) {
+        loadedShutdowns.set(entry.name, mod.shutdown);
       }
-    }),
-  );
+      await mod.init();
+      hooks.onResult(entry.name, true);
+    } catch (error) {
+      hooks.onResult(entry.name, false, error);
+    }
+  });
 }
 
 /**
- * Loads+inits every registry entry selected for `role`, with today's
- * `Promise.allSettled` semantics: one entry's failure never blocks another's,
+ * Loads+inits every registry entry selected for `role`, with bounded startup
+ * concurrency and `Promise.allSettled` semantics: one entry's failure never
+ * blocks another's,
  * and every outcome (success or failure, with the error) is reported via
  * `hooks.onResult` so the caller can drive `workerStatus`/Sentry capture
  * exactly as `index.ts` did with the old inline array.
@@ -1799,25 +1836,24 @@ async function runRedisIndependentEntries(
   entries: readonly WorkerRegistration[],
   hooks: StartWorkersHooks,
 ): Promise<void> {
-  await Promise.allSettled(
-    entries
-      .filter((entry) => entry.runsWithoutRedis)
-      .map(async (entry) => {
-        try {
-          const mod = await entry.load();
-          // Registered before the start call, for the same reason as runEntries.
-          if (mod.shutdown) {
-            loadedShutdowns.set(entry.name, mod.shutdown);
-          }
-          if (!mod.startWithoutRedis) {
-            throw new Error(`${entry.name} is flagged runsWithoutRedis but exports no startWithoutRedis`);
-          }
-          await mod.startWithoutRedis();
-          hooks.onResult(entry.name, true);
-        } catch (error) {
-          hooks.onResult(entry.name, false, error);
+  await runWithStartupConcurrency(
+    entries.filter((entry) => entry.runsWithoutRedis),
+    async (entry) => {
+      try {
+        const mod = await entry.load();
+        // Registered before the start call, for the same reason as runEntries.
+        if (mod.shutdown) {
+          loadedShutdowns.set(entry.name, mod.shutdown);
         }
-      }),
+        if (!mod.startWithoutRedis) {
+          throw new Error(`${entry.name} is flagged runsWithoutRedis but exports no startWithoutRedis`);
+        }
+        await mod.startWithoutRedis();
+        hooks.onResult(entry.name, true);
+      } catch (error) {
+        hooks.onResult(entry.name, false, error);
+      }
+    },
   );
 }
 

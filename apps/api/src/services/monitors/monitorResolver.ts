@@ -1,8 +1,7 @@
+import { readPolicyDevice, readPolicyOrganization, readPolicyGroups } from '../devicePolicyReadSnapshot';
 import { monitorsInheritanceSchema, type MonitorsInheritance } from '@breeze/shared';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '../../db';
-import { devices, deviceGroupMemberships } from '../../db/schema/devices';
-import { organizations } from '../../db/schema/orgs';
 import { isQuickSupportOrgType } from '../quickSupportOrg';
 import {
   configPolicyAssignments,
@@ -181,33 +180,16 @@ export async function resolveMonitorsForDevice(
   deviceId: string,
   executor: DbExecutor = db,
 ): Promise<MonitorResolution> {
-  const [device] = await executor
-    .select({
-      id: devices.id,
-      orgId: devices.orgId,
-      siteId: devices.siteId,
-      deviceRole: devices.deviceRole,
-      osType: devices.osType,
-    })
-    .from(devices)
-    .where(eq(devices.id, deviceId))
-    .limit(1);
+  const device = await readPolicyDevice(deviceId, executor);
   if (!device) return { kind: 'device_missing' };
 
-  const [org] = await executor
-    .select({ partnerId: organizations.partnerId, type: organizations.type })
-    .from(organizations)
-    .where(eq(organizations.id, device.orgId))
-    .limit(1);
+  const org = await readPolicyOrganization(deviceId, device.orgId, executor);
   // Without the org row the partner-level assignments and partner-wide
   // monitors below silently drop out, so a partial answer would pass for
   // "resolved". Report it as unresolvable, like a vanished device (#2949).
   if (!org) return { kind: 'device_missing' };
 
-  const groupRows = await executor
-    .select({ groupId: deviceGroupMemberships.groupId })
-    .from(deviceGroupMemberships)
-    .where(eq(deviceGroupMemberships.deviceId, deviceId));
+  const groupRows = await readPolicyGroups(deviceId, executor);
   const groupIds = groupRows.map((r) => r.groupId);
 
   const targetConditions = [

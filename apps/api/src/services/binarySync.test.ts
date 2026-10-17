@@ -3061,6 +3061,7 @@ describe("boot sync is pinned to the server's own release (#3742)", () => {
     delete process.env.BINARY_GITHUB_REPOSITORY;
     delete process.env.GITHUB_REPO;
     delete process.env.BINARY_VERSION;
+    delete process.env.BREEZE_BINARIES_VERSION;
     delete process.env.BREEZE_VERSION;
     delete process.env.APP_VERSION;
     delete process.env.BINARY_EDITION;
@@ -3160,6 +3161,92 @@ describe("boot sync is pinned to the server's own release (#3742)", () => {
     expect(fetchSpy).not.toHaveBeenCalledWith(
       `${apiBase}/releases/latest`,
       expect.anything(),
+    );
+  });
+
+  it("local-mode BINARY_VERSION registers all four signed Windows components without changing the server version", async () => {
+    process.env.BINARY_SOURCE = "local";
+    process.env.AGENT_BINARY_DIR = "/fake/agent/bin";
+    process.env.BINARY_VERSION_FILE = "/fake/version";
+    process.env.BINARY_VERSION = " 0.121.6 ";
+    process.env.BREEZE_VERSION = "0.121.5";
+    process.env.AGENT_AUTO_PROMOTE = "true";
+    fsMocks.readdir.mockResolvedValue([
+      "breeze-agent-windows-amd64.exe",
+      "breeze-user-helper-windows-amd64.exe",
+      "breeze-watchdog-windows-amd64.exe",
+      "breeze-backup-windows-amd64.exe",
+    ] as any);
+    fsMocks.stat.mockResolvedValue({ isFile: () => true, size: 4096 } as any);
+    mockReadFileVersionOnly("0.121.6\n");
+    const fetchSpy = stubNotFoundFetch();
+    dbMocks.select.mockReturnValue({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue([
+          { component: "agent", platform: "windows", architecture: "amd64", isLatest: true },
+          { component: "backup", platform: "windows", architecture: "amd64", isLatest: true },
+        ]),
+      }),
+    });
+
+    await syncBinaries();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(process.env.BREEZE_VERSION).toBe("0.121.5");
+    expect(drizzleSpies.eq.mock.calls.some(([, value]) => value === "0.121.6")).toBe(true);
+    expect(drizzleSpies.eq.mock.calls.some(([, value]) => value === "0.121.5")).toBe(false);
+    const rows = dbMocks.insertValues.mock.calls.map((call: any[]) => call[0]);
+    expect(rows.map((row) => row.component).sort()).toEqual([
+      "agent", "backup", "user-helper", "watchdog",
+    ]);
+    for (const row of rows) {
+      expect(row).toMatchObject({
+        version: "0.121.6", platform: "windows", architecture: "amd64",
+        edition: "self-host", isLatest: true,
+        manifestSignature: "test-signature-base64",
+        signingKeyId: "deploy-test-aaaaaaaa",
+      });
+      expect(JSON.parse(row.releaseManifest)).toMatchObject({
+        version: "0.121.6", component: row.component, checksum: row.checksum,
+      });
+    }
+  });
+
+  it("local-mode rejects a stale hosted volume even when it matches the server but not BINARY_VERSION", async () => {
+    process.env.BINARY_SOURCE = "local";
+    process.env.BINARY_EDITION = "hosted";
+    process.env.BINARY_VERSION_FILE = "/fake/version";
+    process.env.BINARY_VERSION = "0.121.6";
+    process.env.BREEZE_VERSION = "0.121.5";
+    mockReadFileVersionOnly("0.121.5");
+    const fetchSpy = stubNotFoundFetch();
+
+    await expect(syncBinaries()).rejects.toThrow(
+      /BINARY_EDITION=hosted refuses to fall back.*expected binary version=0\.121\.6/,
+    );
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(dbMocks.insertValues).not.toHaveBeenCalled();
+  });
+
+  it("the registration safety net follows BINARY_VERSION instead of the older API version", async () => {
+    process.env.BINARY_SOURCE = "local";
+    process.env.AGENT_BINARY_DIR = "/fake/agent/bin";
+    process.env.BINARY_VERSION_FILE = "/fake/version";
+    process.env.BINARY_VERSION = "0.121.6";
+    process.env.APP_VERSION = "0.121.5";
+    process.env.BREEZE_VERSION = "0.121.5";
+    fsMocks.readdir.mockResolvedValue(["breeze-agent-windows-amd64.exe"] as any);
+    fsMocks.stat.mockResolvedValue({ isFile: () => true, size: 4096 } as any);
+    mockReadFileVersionOnly("0.121.6");
+    dbMocks.select.mockReturnValue({
+      from: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue([]) }),
+    });
+    const fetchSpy = stubNotFoundFetch();
+
+    await syncBinaries();
+
+    expect(fetchSpy).toHaveBeenCalledExactlyOnceWith(
+      `${apiBase}/releases/tags/v0.121.6`, expect.anything(),
     );
   });
 });

@@ -71,7 +71,12 @@ describe('security UI smoke', () => {
           firewallEnabled: true,
           encryptionStatus: 'encrypted',
           status: 'protected',
-          threatsDetected: 0
+          threatsDetected: 0,
+          cloudAntivirus: {
+            provider: 'Check Point Harmony Endpoint', source: 'cloud', checkedAt: new Date().toISOString(), stale: true,
+            antiMalwareStatus: null, engineStatus: null, clientVersion: '8.1', realTimeProtection: null,
+            definitionsVersion: null, definitionsUpdatedAt: null, lastScanAt: null, isolationStatus: null
+          }
         }
       }))
       .mockResolvedValueOnce(makeJsonResponse({ data: { id: 'scan-2' } }, true, 202))
@@ -97,6 +102,9 @@ describe('security UI smoke', () => {
     render(<DeviceSecurityStatus showAvActions />);
 
     await screen.findByText(/FIN-WS-014/i);
+    expect(screen.getByTestId('harmony-cloud-evidence')).toHaveTextContent('Unknown');
+    expect(screen.getByTestId('harmony-cloud-evidence')).toHaveTextContent('Stale');
+    expect(screen.getByTestId('harmony-cloud-evidence')).toHaveTextContent('Real-time protection Unknown');
     fireEvent.click(screen.getByRole('button', { name: /quick scan/i }));
 
     await waitFor(() => {

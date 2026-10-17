@@ -675,6 +675,58 @@ describe('GET /cf-access-login', () => {
     expect(res.headers.get('Location')).toContain('reason=binding');
   });
 
+  it.each([
+    ['rotation', 'begin', 'invalid', 'AuthBindingRotationRequiredError', false],
+    ['unavailable', 'begin', 'logout_pending', 'AuthBindingUnavailableError', false],
+    ['unavailable', 'begin', 'private-reason-token', 'AuthBindingUnavailableError', false],
+    ['conflict', 'begin', undefined, 'AuthIssuanceConflictError', false],
+    ['capability', 'finish', undefined, 'AuthIssuanceCapabilityError', true],
+  ] as const)('logs only safe binding metadata for %s at %s (%s)', async (kind, phase, reason, errorClass, hadCapability) => {
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      envState.enabled = true;
+      transitionState.bindingValue = 'private-cookie-value';
+      verifyState.next = {
+        kind: 'claims',
+        claims: { email: activeUser.email, sub: 'private-cf-sub', aud: envState.audience,
+          iss: `https://${envState.teamDomain}`, exp: 999, iat: 1 },
+      };
+      dbState.userRow = { ...activeUser, authEpoch: 3, mfaEpoch: 2 };
+      const error = kind === 'rotation'
+        ? new transitionState.AuthBindingRotationRequiredError({ kind: 'browser', value: 'private-replacement' })
+        : kind === 'unavailable'
+          ? new transitionState.AuthBindingUnavailableError()
+          : kind === 'conflict'
+            ? new transitionState.AuthIssuanceConflictError()
+            : new transitionState.AuthIssuanceCapabilityError();
+      Object.assign(error, {
+        name: 'private-exception-name', message: 'private-exception-message',
+        reason, token: 'private-token', identity: activeUser,
+      });
+      if (phase === 'begin') transitionState.beginError = error;
+      else transitionState.finishError = error;
+
+      const res = await callGet('/cf-access-login', { 'Cf-Access-Jwt-Assertion': 'private-jwt' });
+      expect(res.status).toBe(302);
+      expect(res.headers.get('Location')).toBe('/login?error=cf-access&reason=binding');
+      expect(warning).toHaveBeenCalledExactlyOnceWith('[cf-access-redirect] binding issuance rejected', {
+        errorClass,
+        reason: reason === 'invalid' || reason === 'logout_pending' ? reason : 'unspecified',
+        phase,
+        elapsedMs: expect.any(Number),
+        hadBinding: true,
+        hadCapability,
+      });
+      const serialized = JSON.stringify(warning.mock.calls);
+      expect(serialized).not.toContain('private-');
+      expect(serialized).not.toContain(activeUser.email);
+      expect(serialized).not.toContain(activeUser.id);
+      expect(warning.mock.calls[0]?.[1].elapsedMs).toBeGreaterThanOrEqual(0);
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
   it('mints a session and redirects to / with cf-access-login=success on success', async () => {
     envState.enabled = true;
     verifyState.next = {

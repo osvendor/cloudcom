@@ -30,6 +30,8 @@ var (
 	procDeleteDC               = gdi32.NewProc("DeleteDC")
 	procDeleteObject           = gdi32.NewProc("DeleteObject")
 	procGetDIBits              = gdi32.NewProc("GetDIBits")
+	procCreateDIBSection       = gdi32.NewProc("CreateDIBSection")
+	procGdiFlush               = gdi32.NewProc("GdiFlush")
 )
 
 const (
@@ -71,6 +73,27 @@ func (winGDIFrameOps) GetDIBits(hdc, hbm uintptr, lines int, bits *byte, bi *bit
 	return int(copied), errno
 }
 
+type winGDIDIBSectionOps struct {
+	winGDIFrameOps
+	bits uintptr
+	size int
+}
+
+func (winGDIDIBSectionOps) Flush() (bool, error) {
+	ret, _, errno := procGdiFlush.Call()
+	return ret != 0, errno
+}
+
+func (ops winGDIDIBSectionOps) CopyPixels(dst []byte) error {
+	if ops.bits == 0 || ops.size <= 0 || len(dst) != ops.size {
+		return fmt.Errorf("%w: invalid DIB section pixel buffer", errGDIHandlesUnusable)
+	}
+	// The bitmap owns this memory. The capturer mutex and capture thread keep
+	// it alive until this copy completes; callers receive only owned Go pixels.
+	copy(dst, unsafe.Slice((*byte)(unsafe.Pointer(ops.bits)), ops.size))
+	return nil
+}
+
 // currentThreadID returns the calling OS thread's id, or 0 if it cannot be
 // read. See shouldRebuildGDIHandles for why the capturer tracks it.
 func currentThreadID() uint32 {
@@ -85,15 +108,18 @@ type gdiCapturer struct {
 	mu     sync.Mutex
 
 	// Persistent GDI handles
-	screenDC      uintptr
-	screenDCOwned bool // true if screenDC was created via CreateDC (must use DeleteDC)
-	memDC         uintptr
-	hBitmap       uintptr
-	oldBitmap     uintptr
-	bi            bitmapInfo
-	width         int
-	height        int
-	inited        bool
+	screenDC            uintptr
+	screenDCOwned       bool // true if screenDC was created via CreateDC (must use DeleteDC)
+	memDC               uintptr
+	hBitmap             uintptr
+	oldBitmap           uintptr
+	bi                  bitmapInfo
+	width               int
+	height              int
+	inited              bool
+	useDIBSection       bool
+	dibBits             uintptr // owned by hBitmap; never exposed outside the locked copy
+	readbackFallbackErr error   // original readback failure, retained until a good frame
 
 	// ownerThreadID is the OS thread that created the handles above. A display
 	// DC from CreateDC is documented to become invalid once its creating thread
@@ -137,6 +163,10 @@ func (c *gdiCapturer) ensureHandles() error {
 	// against the encoder's SetDimensions `h &^ 1` and every frame fails to
 	// encode with "frame size 1434888 doesn't match 1512x948".
 	width, height := AlignEven(int(w), int(h))
+	bufferSize, err := gdiFrameBufferSize(width, height)
+	if err != nil || uint64(bufferSize) > uint64(^uint32(0)) {
+		return fmt.Errorf("unsupported capture dimensions %dx%d", width, height)
+	}
 
 	tid := currentThreadID()
 	if !shouldRebuildGDIHandles(c.inited, c.width, c.height, width, height, c.ownerThreadID, tid) {
@@ -183,17 +213,33 @@ func (c *gdiCapturer) ensureHandles() error {
 		return err
 	}
 
-	// Create compatible bitmap
-	hBitmap, _, bitmapErrno := procCreateCompatibleBitmap.Call(hdc, uintptr(width), uintptr(height))
+	bi := newCaptureBitmapInfo(width, height)
+	var hBitmap, dibBits uintptr
+	var bitmapErrno error
+	bitmapOp := "CreateCompatibleBitmap"
+	if c.useDIBSection {
+		bitmapOp = "CreateDIBSection"
+		bi.BmiHeader.BiSizeImage = uint32(bufferSize)
+		hBitmap, _, bitmapErrno = procCreateDIBSection.Call(hdc, uintptr(unsafe.Pointer(&bi)),
+			dibRGBColors, uintptr(unsafe.Pointer(&dibBits)), 0, 0)
+	} else {
+		hBitmap, _, bitmapErrno = procCreateCompatibleBitmap.Call(hdc, uintptr(width), uintptr(height))
+	}
 	if hBitmap == 0 {
-		err := gdiCallError("CreateCompatibleBitmap", bitmapErrno)
+		err := gdiCallError(bitmapOp, bitmapErrno)
 		procDeleteDC.Call(memDC)
 		c.freeScreenDC(hdc)
 		return err
 	}
+	if c.useDIBSection && dibBits == 0 {
+		procDeleteObject.Call(hBitmap)
+		procDeleteDC.Call(memDC)
+		c.freeScreenDC(hdc)
+		return fmt.Errorf("CreateDIBSection returned no pixel buffer")
+	}
 
-	// Select bitmap into memory DC. It is deselected again around every
-	// readback — see captureGDIFrame — because GetDIBits requires it.
+	// Select bitmap into memory DC. The GetDIBits path deselects it around
+	// readback; a DIB section stays selected while its flushed pixels are copied.
 	oldBitmap, _, selectErrno := procSelectObject.Call(memDC, hBitmap)
 	if oldBitmap == 0 {
 		err := gdiCallError("SelectObject", selectErrno)
@@ -206,6 +252,7 @@ func (c *gdiCapturer) ensureHandles() error {
 	c.screenDC = hdc
 	c.memDC = memDC
 	c.hBitmap = hBitmap
+	c.dibBits = dibBits
 	c.oldBitmap = oldBitmap
 	c.width = width
 	c.height = height
@@ -213,8 +260,8 @@ func (c *gdiCapturer) ensureHandles() error {
 	c.inited = true
 
 	// Pre-allocate pixel buffer and BITMAPINFO
-	c.pixBuf = make([]byte, width*height*4)
-	c.bi = newCaptureBitmapInfo(width, height)
+	c.pixBuf = make([]byte, bufferSize)
+	c.bi = bi
 
 	return nil
 }
@@ -274,19 +321,26 @@ func (c *gdiCapturer) releaseHandles() {
 	c.screenDCOwned = false
 	c.memDC = 0
 	c.hBitmap = 0
+	c.dibBits = 0
 	c.oldBitmap = 0
 	c.ownerThreadID = 0
 }
 
 func (c *gdiCapturer) captureOnceLocked() (*image.RGBA, error) {
-	err := captureGDIFrame(winGDIFrameOps{}, gdiFrameHandles{
+	handles := gdiFrameHandles{
 		screenDC:  c.screenDC,
 		memDC:     c.memDC,
 		hBitmap:   c.hBitmap,
 		oldBitmap: c.oldBitmap,
 		width:     c.width,
 		height:    c.height,
-	}, &c.bi, c.pixBuf)
+	}
+	var err error
+	if c.useDIBSection {
+		err = captureGDIDIBSectionFrame(winGDIDIBSectionOps{bits: c.dibBits, size: len(c.pixBuf)}, handles, c.pixBuf)
+	} else {
+		err = captureGDIFrame(winGDIFrameOps{}, handles, &c.bi, c.pixBuf)
+	}
 	if err != nil {
 		// A selection failure leaves the memory DC holding something other
 		// than the capture bitmap; reusing it would blit into the DC's default
@@ -341,6 +395,7 @@ func (c *gdiCapturer) recordTeardownFailureLocked(failed []string) {
 func (c *gdiCapturer) resetCaptureFailuresLocked() {
 	c.consecutiveCaptureFailures = 0
 	c.lastCaptureErr = nil
+	c.readbackFallbackErr = nil
 }
 
 // LastCaptureError implements lastCaptureErrorReporter.
@@ -371,6 +426,12 @@ func (c *gdiCapturer) Capture() (*image.RGBA, error) {
 			return img, nil
 		}
 		lastErr = err
+		if shouldEnableDIBSectionFallback(c.useDIBSection, err) {
+			c.useDIBSection = true
+			c.readbackFallbackErr = err
+			c.releaseHandles()
+			slog.Warn("GDI bitmap readback unavailable; using DIB section capture", "error", err.Error())
+		}
 	}
 
 	// Secure-desktop transitions can invalidate DCs transiently. Treat this as
@@ -379,6 +440,9 @@ func (c *gdiCapturer) Capture() (*image.RGBA, error) {
 	// frames — and reads lastCaptureErr back out via LastCaptureError so the
 	// technician is told which Win32 call failed and with what code.
 	if lastErr != nil {
+		if c.readbackFallbackErr != nil {
+			lastErr = fmt.Errorf("%v; DIB section fallback: %w", c.readbackFallbackErr, lastErr)
+		}
 		c.recordCaptureFailureLocked(lastErr)
 	}
 	return nil, nil

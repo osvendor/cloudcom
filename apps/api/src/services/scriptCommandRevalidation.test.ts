@@ -1,6 +1,20 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const m = vi.hoisted(() => ({ getUserPermissions: vi.fn() }));
+const m = vi.hoisted(() => ({
+  getUserPermissions: vi.fn(),
+  requester: null as { partnerId: string } | null,
+}));
+vi.mock('../db', () => ({
+  db: {
+    select: () => ({
+      from: () => ({
+        where: () => ({ limit: async () => (m.requester ? [m.requester] : []) }),
+      }),
+    }),
+  },
+  runOutsideDbContext: <T>(fn: () => T) => fn(),
+  withSystemDbAccessContext: <T>(fn: () => T) => fn(),
+}));
 vi.mock('./permissions', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./permissions')>();
   return { ...actual, getUserPermissions: m.getUserPermissions };
@@ -32,6 +46,11 @@ function readerFor(device: { orgId: string; siteId: string } | undefined, reques
 }
 
 describe('revalidateScriptCommandAuthority', () => {
+  beforeEach(() => {
+    m.requester = { partnerId };
+    m.getUserPermissions.mockReset();
+  });
+
   it('does not revalidate a row with no requester identity (system/automation-issued)', async () => {
     const reader = { select: () => { throw new Error('must not read'); } } as never;
     await expect(revalidateScriptCommandAuthority(reader, { ...row, createdBy: null })).resolves.toBeNull();
@@ -39,6 +58,7 @@ describe('revalidateScriptCommandAuthority', () => {
   });
 
   it('cancels when the requester no longer holds scripts:execute for the device org', async () => {
+    m.requester = { partnerId };
     m.getUserPermissions.mockResolvedValue({
       permissions: [], partnerId, orgId, roleId: 'r', scope: 'organization',
     });
@@ -75,6 +95,17 @@ describe('revalidateScriptCommandAuthority', () => {
 
   it('fails closed when the device or requester row is gone', async () => {
     expect(await revalidateScriptCommandAuthority(readerFor(undefined, { partnerId }), row)).toBe('scope_changed');
+    m.requester = null;
     expect(await revalidateScriptCommandAuthority(readerFor({ orgId, siteId }, undefined), row)).toBe('scope_changed');
+  });
+
+  it('uses a system identity read when the claim reader cannot see a partner-only requester', async () => {
+    m.getUserPermissions.mockResolvedValue({
+      permissions: [{ resource: 'scripts', action: 'execute' }],
+      partnerId, orgId: null, roleId: 'partner-admin', scope: 'partner', orgAccess: 'all',
+    });
+    const hiddenClaimReader = readerFor({ orgId, siteId }, undefined);
+    await expect(revalidateScriptCommandAuthority(hiddenClaimReader, row)).resolves.toBeNull();
+    expect(m.getUserPermissions).toHaveBeenCalledWith(userId, { orgId, partnerId });
   });
 });

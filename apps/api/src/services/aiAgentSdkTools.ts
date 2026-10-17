@@ -184,6 +184,7 @@ export const TOOL_TIERS = {
   manage_delivery: 1,
   get_dns_security: 1,
   get_huntress_status: 1,
+  get_harmony_evidence: 1,
   get_huntress_incidents: 1,
   manage_dns_policy: 2,
   get_s1_status: 1,
@@ -1686,6 +1687,13 @@ export function buildBreezeSdkTools(
         topN: z.number().int().min(1).max(100).optional(),
       },
       makeHandler('get_dns_security', getAuth, onPreToolUse, onPostToolUse)
+    ),
+
+    tool(
+      'get_harmony_evidence',
+      registryDescription('get_harmony_evidence'),
+      { deviceId: uuid },
+      makeHandler('get_harmony_evidence', getAuth, onPreToolUse, onPostToolUse)
     ),
 
     tool(

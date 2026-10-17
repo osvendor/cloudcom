@@ -6,6 +6,11 @@ const ORG_ID_2 = '22222222-2222-2222-2222-222222222222';
 const DEVICE_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const AGENT_ID = 'agent-001';
 
+const { admitAgentUpdateMock } = vi.hoisted(() => ({
+  admitAgentUpdateMock: vi.fn(),
+}));
+vi.mock('../services/agentRolloutAdmission', () => ({ admitAgentUpdate: admitAgentUpdateMock }));
+
 // ---------------------------------------------------------------------------
 // Mocks
 // ---------------------------------------------------------------------------
@@ -158,6 +163,7 @@ describe('devPush routes', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    admitAgentUpdateMock.mockResolvedValue({ allowed: true, reason: 'admitted' });
     parkedDeviceIds.clear();
     process.env.NODE_ENV = 'development';
     process.env.PUBLIC_API_URL = 'https://api.breeze.local';
@@ -203,11 +209,49 @@ describe('devPush routes', () => {
       expect(mkdir).not.toHaveBeenCalled();
       expect(createWriteStream).not.toHaveBeenCalled();
       expect(mockSendCommandToAgent).not.toHaveBeenCalled();
+      expect(admitAgentUpdateMock).not.toHaveBeenCalled();
       expect(mapSet.mock.calls.filter(([, value]) => value && typeof value === 'object'
         && 'filePath' in value && 'agentId' in value)).toEqual([]);
     } finally {
       mapSet.mockRestore();
     }
+  });
+
+  it.each(['agent', 'desktop-helper', 'user-helper'])('defers %s before staging or sending under rollout pressure', async component => {
+    mockGetDeviceWithOrgCheck.mockResolvedValue({ id: DEVICE_ID, agentId: AGENT_ID, orgId: ORG_ID, siteId: 'site-1' });
+    admitAgentUpdateMock.mockResolvedValue({ allowed: false, reason: 'site-capacity' });
+    const form = new FormData();
+    form.append('agentId', AGENT_ID);
+    form.append('version', 'dev-test');
+    form.append('component', component);
+    form.append('binary', new File(['inert-test-content'], 'fixture.bin'));
+    const res = await app.request('/dev/push', { method: 'POST', body: form });
+    expect(res.status).toBe(429);
+    expect(res.headers.get('Retry-After')).toBe('60');
+    expect(await res.json()).toEqual({
+      error: 'Agent update temporarily deferred; retry later',
+      code: 'AGENT_UPDATE_DEFERRED', retryLater: true, reason: 'site-capacity',
+    });
+    expect(admitAgentUpdateMock).toHaveBeenCalledWith({
+      deviceId: DEVICE_ID, siteKey: `${ORG_ID}:site-1`,
+      targets: { [component === 'agent' ? 'agent' : 'helper']: 'dev-test' },
+    });
+    expect(mkdir).not.toHaveBeenCalled();
+    expect(createWriteStream).not.toHaveBeenCalled();
+    expect(mockSendCommandToAgent).not.toHaveBeenCalled();
+    expect(mockWriteAuditEvent).not.toHaveBeenCalled();
+  });
+
+  it('keeps invalid component validation ahead of rollout admission', async () => {
+    admitAgentUpdateMock.mockResolvedValue({ allowed: false, reason: 'host-pressure' });
+    const form = new FormData();
+    form.append('agentId', AGENT_ID);
+    form.append('component', 'not-a-component');
+    form.append('binary', new File(['inert-test-content'], 'fixture.bin'));
+    const res = await app.request('/dev/push', { method: 'POST', body: form });
+    expect(res.status).toBe(400);
+    expect(admitAgentUpdateMock).not.toHaveBeenCalled();
+    expect(mockSendCommandToAgent).not.toHaveBeenCalled();
   });
 
   it('fails closed when a session reaches device authorization without permissions', async () => {

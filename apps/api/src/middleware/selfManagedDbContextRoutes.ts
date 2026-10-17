@@ -28,6 +28,14 @@ interface SelfManagedRoute {
 }
 
 const SELF_MANAGED_DB_CONTEXT_ROUTES: readonly SelfManagedRoute[] = [
+  // Harmony releases each claim/read transaction before its bounded provider call.
+  { method: 'GET', pattern: /^\/api\/v1\/(?:ext\/cloudcommand|cloud-command)\/harmony\/(?:connection|inventory)\/?$/ },
+  { method: 'POST', pattern: /^\/api\/v1\/(?:ext\/cloudcommand|cloud-command)\/harmony\/(?:discover|sync)\/?$/ },
+  { method: 'PUT', pattern: /^\/api\/v1\/(?:ext\/cloudcommand|cloud-command)\/harmony\/(?:connection|mappings|link)\/?$/ },
+  // IDrive commits its one-use operation claim before calling the provider.
+  ...['GET', 'POST', 'PUT'].map(method => ({ method, pattern: /^\/api\/v1\/(?:ext\/cloudcommand|cloud-command)\/idrive\/(?:connection|discover|inventory|installer|preview|execute|history)\/?$/ })),
+  { method: 'GET', pattern: /^\/api\/v1\/companion-scripts\// },
+  { method: 'POST', pattern: /^\/api\/v1\/companion-scripts\// },
   // Commit portal session fences before issuing leases or publishing commands.
   { method: 'POST', pattern: /^\/api\/v1\/portal\/remote\/sessions(?:\/[^/]+\/(?:offer|end))?\/?$/ },
   { method: 'GET', pattern: /^\/api\/v1\/portal\/remote\/sessions\/[^/]+\/?$/ },

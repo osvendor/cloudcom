@@ -114,6 +114,8 @@ import {
   stopEventLoopMonitor,
 } from './services/eventLoopMonitor';
 import { createStarvationReporter } from './services/eventLoopStarvationReporter';
+import { startCapacityGuard, stopCapacityGuard } from './services/capacityGuard';
+import { agentRolloutLimits } from './services/agentRolloutAdmission';
 import {
   getConnectTimeoutStarvationThresholdMs,
   safeDiagnoseConnectTimeout,
@@ -423,6 +425,8 @@ export async function bootWorker(): Promise<void> {
   setConnectTimeoutClassifier(safeDiagnoseConnectTimeout);
 
   const config = validateConfig();
+  agentRolloutLimits();
+  startCapacityGuard({ checkDependencies: async () => (await readiness.get()).ready });
   console.log(`[worker] Validated config: NODE_ENV=${config.NODE_ENV}`);
 
   // Step 3 — slim health server FIRST, before any DB/Redis/extension work.
@@ -714,6 +718,7 @@ export async function bootWorker(): Promise<void> {
     // probe connection while the pool drains (which would report
     // `database-unreachable` about a process that is simply shutting down).
     stopEventLoopMonitor();
+    stopCapacityGuard();
     stopDbPoolHealthMonitor();
     stopWedgedBackendMonitor();
     stopRedisMemoryMonitor();

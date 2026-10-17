@@ -16,6 +16,7 @@
  * same scope as the existing `requester_inactive` check just above this one.
  */
 import { eq } from 'drizzle-orm';
+import { db, runOutsideDbContext, withSystemDbAccessContext } from '../db';
 import { devices, users } from '../db/schema';
 import {
   registerCommandRevalidation,
@@ -39,11 +40,16 @@ export async function revalidateScriptCommandAuthority(
     .limit(1);
   if (!device) return 'scope_changed';
 
-  const [requester] = await reader
+  // The claim reader runs inside the agent/device RLS context. A requester
+  // may be a partner-only operator with no organization_users row, so reading
+  // their identity through that reader can be filtered to zero rows. Resolve
+  // this one equality-keyed identity row in a fresh system context; all
+  // authorization checks below still use the live permission resolver.
+  const [requester] = await runOutsideDbContext(() => withSystemDbAccessContext(() => db
     .select({ partnerId: users.partnerId })
     .from(users)
-    .where(eq(users.id, row.createdBy))
-    .limit(1);
+    .where(eq(users.id, row.createdBy!))
+    .limit(1)));
   if (!requester) return 'scope_changed';
 
   const perms = await getUserPermissions(row.createdBy, { orgId: device.orgId, partnerId: requester.partnerId });

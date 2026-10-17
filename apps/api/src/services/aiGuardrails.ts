@@ -1508,6 +1508,7 @@ export const TOOL_PERMISSIONS: Record<string, { resource: string; action: string
   get_cis_device_report: { resource: 'devices', action: 'read' },
   apply_cis_remediation: { resource: 'devices', action: 'execute' },
   get_huntress_status: { resource: 'devices', action: 'read' },
+  get_harmony_evidence: { resource: 'devices', action: 'read' },
   get_huntress_incidents: { resource: 'devices', action: 'read' },
   sync_huntress_data: { resource: 'organizations', action: 'write' },
   // User risk scoring tools

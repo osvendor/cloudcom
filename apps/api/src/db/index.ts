@@ -7,7 +7,6 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { sql, type SQL } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
-import * as schema from './schema';
 import { captureMessage } from '../services/sentry';
 import {
   logRequestDatabaseConfigSource,
@@ -114,7 +113,11 @@ export async function assertRequestDatabaseRoleSafe(): Promise<RequestDatabaseRo
   return role;
 }
 
-const baseDb = drizzle(client, { schema });
+// SQL builders take their table metadata from the imported table objects. This
+// pool does not use Drizzle's opt-in relational `db.query` API: registering the
+// full schema eagerly allocates a query builder per table on every transaction
+// and savepoint. Keep the supported schema-free constructor on this hot path.
+const baseDb = drizzle(client);
 const dbContextStorage = new AsyncLocalStorage<typeof baseDb>();
 // Parallel store holding the DbAccessContext METADATA (scope + allowlists) for
 // the active request transaction. Kept separate from dbContextStorage (which
@@ -467,14 +470,14 @@ export function formatHeldContextWarning(input: {
  * Anything with drizzle's `.execute(sql`…`)` shape — the module-scope `db`, a
  * `db.transaction` handle, or the resolved `getCurrentDb()`. Lets the GUC
  * writer below be shared by every context opener instead of each one keeping
- * its own copy of the six `set_config` calls.
+ * its own copy of the seven `set_config` calls.
  */
 interface GucExecutor {
   execute: (query: SQL) => Promise<unknown>;
 }
 
 /**
- * Write the seven `breeze.*` RLS GUCs (six statements) for `context` onto the CURRENT transaction
+ * Write all seven `breeze.*` RLS GUCs in one statement onto the CURRENT transaction
  * (`set_config(..., true)` == SET LOCAL, so they unwind with it).
  *
  * Single source of truth for the GUC contract: `withDbAccessContext`,
@@ -499,27 +502,19 @@ async function applyAccessContextGucs(
       ? context.reportHistoryOrgIds.join(',')
       : '';
 
-  // `deadline.throwIfAborted()` at EVERY statement boundary, not just the first.
-  // `Promise.race` does not cancel its loser (#6048): once the budget has
-  // expired the caller has already been given a typed error and the connection
-  // is being reclaimed, so a statement that finally resolved late must not be
-  // allowed to queue the remaining five onto a connection that is being torn
-  // down — or worse, has already been recycled to a different tenant's request.
-  const statements: SQL[] = [
-    sql`select set_config('breeze.scope', ${context.scope}, true)`,
-    sql`select set_config('breeze.org_id', ${context.orgId ?? ''}, true)`,
-    sql`select set_config('breeze.accessible_org_ids', ${serializedOrgIds}, true)`,
-    sql`select set_config('breeze.accessible_partner_ids', ${serializedPartnerIds}, true)`,
-    sql`select set_config('breeze.user_id', ${serializedUserId}, true)`,
-    // Two GUCs in ONE statement: the report-history ids ride with the partner
-    // id so the prologue stays six round trips on every request.
-    sql`select set_config('breeze.current_partner_id', ${context.currentPartnerId ?? ''}, true), set_config('breeze.report_history_org_ids', ${serializedReportHistoryOrgIds}, true)`,
-  ];
-
-  for (const statement of statements) {
-    deadline?.throwIfAborted();
-    await executor.execute(statement);
-  }
+  // These settings are independent; batching replaces six database round trips
+  // with one without changing their transaction-local lifetime. Keep
+  // the leading text compatible with the wedged-backend reclaimer's predicate.
+  // Promise.race does not cancel its loser (#6048): check on BOTH sides so a
+  // late pool acquisition cannot issue work and a late response cannot run fn.
+  deadline?.throwIfAborted();
+  await executor.execute(sql`select set_config('breeze.scope', ${context.scope}, true),
+    set_config('breeze.org_id', ${context.orgId ?? ''}, true),
+    set_config('breeze.accessible_org_ids', ${serializedOrgIds}, true),
+    set_config('breeze.accessible_partner_ids', ${serializedPartnerIds}, true),
+    set_config('breeze.user_id', ${serializedUserId}, true),
+    set_config('breeze.current_partner_id', ${context.currentPartnerId ?? ''}, true),
+    set_config('breeze.report_history_org_ids', ${serializedReportHistoryOrgIds}, true)`);
   deadline?.throwIfAborted();
 }
 
@@ -1048,6 +1043,11 @@ export async function withDbTransaction<T>(fn: () => Promise<T>): Promise<T> {
  */
 export function getCurrentDbAccessContext(): DbAccessContext | undefined {
   return dbContextMetaStorage.getStore();
+}
+
+/** Opaque identity for transaction-local read snapshots; never exposes a pool fallback. */
+export function getCurrentDbTransactionIdentity(): object | undefined {
+  return dbContextStorage.getStore();
 }
 
 export type RunOutsideDbContextFn = <T>(fn: () => T) => T;

@@ -67,6 +67,7 @@ import { scripts } from '../db/schema/scripts';
 import { getBinaryEdition } from './binaryEdition';
 import { getGithubReleaseVersion } from './binarySource';
 import { compareAgentVersions } from './agentEditionCompat';
+import { admitAgentUpdate } from './agentRolloutAdmission';
 import { dispatchScriptToDevice, type DispatchScriptInput, type DispatchScriptResult } from './scriptDispatch';
 import { deliverDeferredDispatch } from './scriptDeferredDelivery';
 import { captureException, captureMessage } from './sentry';
@@ -327,6 +328,15 @@ async function prepareEditionMigration(args: EditionMigrationArgs): Promise<Prep
       );
       return null;
     }
+
+    // Capacity deferral must not burn this device's once-only migration claim
+    // or poison failedDevices: a later heartbeat may safely try again.
+    const admission = await admitAgentUpdate({
+      deviceId: device.id,
+      siteKey: `${device.orgId}:${device.siteId ?? 'unassigned'}`,
+      targets: { agent: target },
+    });
+    if (!admission.allowed) return null;
 
     // Atomic once-per-device claim: whichever concurrent heartbeat wins this
     // UPDATE dispatches; everyone else sees zero rows and stands down.

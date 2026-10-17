@@ -598,7 +598,7 @@ describe("server-only releases", () => {
 
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining(
-          "Stale binaries volume detected: volume has v0.65.8 but BREEZE_VERSION=0.65.9",
+          "Stale binaries volume detected: volume has v0.65.8 but expected binary version=0.65.9",
         ),
       );
       expect(fetchSpy).toHaveBeenCalledWith(`${API}/releases/tags/v0.65.9`, expect.anything());

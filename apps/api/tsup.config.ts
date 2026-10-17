@@ -12,6 +12,8 @@ export default defineConfig({
     // pattern as scripts/recover-stuck-agents below, so worker.cjs lands at
     // dist/worker.cjs (the compose `worker` service's `command`).
     worker: 'src/worker.ts',
+    'scripts/credentials-import': 'scripts/credentials-import.ts',
+    'scripts/documentation-import': 'scripts/documentation-import.ts',
     'scripts/recover-stuck-agents': 'scripts/recover-stuck-agents.ts',
     // #6605: `node dist/scripts/upgrade-preflight.cjs [--strict]` — run the new
     // image against the current database before upgrading.

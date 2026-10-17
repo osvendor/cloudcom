@@ -32,6 +32,20 @@ type DeviceSecurity = {
   gatekeeperEnabled?: boolean | null;
   status: "protected" | "at_risk" | "unprotected" | "offline";
   threatsDetected: number;
+  cloudAntivirus?: {
+    provider: "Check Point Harmony Endpoint";
+    source: "cloud";
+    checkedAt: string;
+    stale: boolean;
+    antiMalwareStatus: string | null;
+    engineStatus: string | null;
+    clientVersion: string | null;
+    realTimeProtection: boolean | null;
+    definitionsVersion: string | null;
+    definitionsUpdatedAt: string | null;
+    lastScanAt: string | null;
+    isolationStatus: string | null;
+  } | null;
 };
 type DeviceSecurityStatusProps = {
   deviceId?: string;
@@ -173,6 +187,16 @@ export default function DeviceSecurityStatus({
         },
       ]
     : baseProtectionItems;
+  const cloud = data.cloudAntivirus;
+  const cloudCard = cloud ? (
+    <div className="mt-4 rounded-md border bg-muted/20 p-4" data-testid="harmony-cloud-evidence">
+      <div className="flex items-start justify-between gap-3">
+        <div><p className="text-xs uppercase text-muted-foreground">Harmony Endpoint · cloud evidence</p><p className="mt-1 text-sm font-medium">{cloud.antiMalwareStatus ?? "Unknown"} · {cloud.engineStatus ?? "Unknown"}</p></div>
+        <span className="text-xs text-muted-foreground">{cloud.stale ? "Stale" : "Checked"} {formatDate(cloud.checkedAt)}</span>
+      </div>
+      <p className="mt-2 text-xs text-muted-foreground">Version {cloud.clientVersion ?? "Unknown"} · Real-time protection {cloud.realTimeProtection === null ? "Unknown" : cloud.realTimeProtection ? "Enabled" : "Disabled"}</p>
+    </div>
+  ) : null;
   if (!showAvActions) {
     return (
       <div className="rounded-lg border bg-card p-6 shadow-xs">
@@ -241,6 +265,7 @@ export default function DeviceSecurityStatus({
             </div>
           )}
         </div>
+        {cloudCard}
       </div>
     );
   }
@@ -303,6 +328,7 @@ export default function DeviceSecurityStatus({
           </p>
         </div>
       </div>
+      {cloudCard}
 
       <div className="mt-6 space-y-3">
         {protectionItems.map((item) => (

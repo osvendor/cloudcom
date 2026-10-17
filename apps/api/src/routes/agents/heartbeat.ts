@@ -1,6 +1,8 @@
+import { withDevicePolicyReadSnapshot } from '../../services/devicePolicyReadSnapshot';
 import { topologyHeartbeat } from '../../services/topology/heartbeat';
 import { loadTopologyFlags, withResolvedTopologyFlags, type TopologyFlags } from '../../services/topology/flags';
 import { Hono } from 'hono';
+import { guardHeartbeatUpdates } from '../../services/agentRolloutAdmission';
 import { timingSafeEqual } from 'node:crypto';
 import { bodyLimit } from 'hono/body-limit';
 import { zValidator } from '../../lib/validation';
@@ -549,17 +551,10 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     // request-long wrap). Those are not nested and cost no second connection,
     // so W03 had no reason to touch them.
     //
-    // Converting them to org-scoped contexts is a real follow-up — it would
-    // close the last RLS-bypass surface on the hottest path — but it is NOT a
-    // drop-in swap, which is why it is not in this wave:
-    // `buildPatchSourceConfigUpdate` reaches `resolveDeviceTimezone`, whose
-    // `partners` read is partner-AXIS and escapes through
-    // `readWithPartnerAxisVisibility` (#2822). Under a system wrapper that
-    // escape short-circuits; under an org wrapper it fires, uncached, once per
-    // heartbeat — turning one hoisted context into a genuinely NESTED
-    // double-hold on the fleet's hottest path, which is the #1105 shape this
-    // whole epic exists to remove. The timezone read has to be hoisted or
-    // batched first. Track it separately; do not do it by analogy with W03.
+    // Converting the hoisted contexts to org scope remains a separate access
+    // review. The patch-source flag now uses the policy-only resolver, avoiding
+    // the unused timezone/partner reads that previously prevented that change.
+    // This heartbeat read optimization preserves the existing context scopes.
     //
     // Read-only widening to the device's own MSP; see agentAuth.ts.
     currentPartnerId: agent.partnerId,
@@ -641,7 +636,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
 
   const scoped = await withDbAccessContext(
     dbContext,
-    async (): Promise<Response | { deviceOrgId: string; deviceId: string; mainResponse: Record<string, unknown> }> => {
+    async (): Promise<Response | { deviceOrgId: string; deviceId: string; siteKey: string; watchdogOnly?: boolean; mainResponse: Record<string, unknown> }> => {
 
   const [device] = await db
     .select()
@@ -923,7 +918,12 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     // than letting it re-read the column: the watchdog branch returns before
     // the device update at all, so the stored value here is always from an
     // earlier beat.
-    return c.json({
+    return {
+      deviceOrgId: device.orgId,
+      deviceId: device.id,
+      siteKey: `${device.orgId}:${device.siteId ?? 'unassigned'}`,
+      watchdogOnly: true,
+      mainResponse: {
       commands: await prepareClaimedCommandsForDelivery(watchdogCommands, {
         reportedScriptSecretEnvVersion: normalizeReportedScriptSecretEnvVersion(
           data.securityCapabilities?.scriptSecretEnvVersion,
@@ -931,7 +931,8 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       }),
       watchdogUpgradeTo,
       upgradeTo: agentUpgradeTo,
-    });
+      },
+    };
   }
 
   const deviceUpdates: Record<string, unknown> = {
@@ -2041,6 +2042,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   return {
     deviceOrgId: device.orgId,
     deviceId: device.id,
+    siteKey: `${device.orgId}:${device.siteId ?? 'unassigned'}`,
     mainResponse: {
       commands: deliverableCommands,
       configUpdate: mergedConfigUpdate,
@@ -2066,9 +2068,26 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     },
   );
 
-  // 404 / 401 / watchdog branches returned a Response directly from the scoped
+  // 404 / 401 branches returned a Response directly from the scoped
   // block — pass it through.
   if (scoped instanceof Response) return scoped;
+
+  // Shared fleet/site admission runs after the transaction commits. Withhold
+  // only new update offers; healthy check-ins, command delivery and credentials
+  // must continue while the host recovers. Watchdog recovery shares the same
+  // bounded lane, so a mass failover cannot restart the entire fleet together.
+  await guardHeartbeatUpdates({
+    deviceId: scoped.deviceId,
+    siteKey: scoped.siteKey,
+    versions: scoped.watchdogOnly ? { watchdog: data.agentVersion } : {
+      agent: data.agentVersion,
+      ...(data.helperVersion ? { helper: data.helperVersion } : {}),
+      ...(data.watchdogVersion ? { watchdog: data.watchdogVersion } : {}),
+      ...(data.backupVersion ? { backup: data.backupVersion } : {}),
+    },
+    response: scoped.mainResponse,
+  });
+  if (scoped.watchdogOnly) return c.json(scoped.mainResponse);
 
   // Self-health is independent from reachability and is persisted only after
   // the request's org-scoped transaction has released. A failed observation
@@ -2199,15 +2218,9 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // (org_id NULL) is RLS-invisible, so a partner-authored policy for any of the
   // four never reached an agent.
   //
-  // #4673 W03 kept this hoist deliberately. The resolvers themselves no longer
-  // escape internally — they read partner-wide rows through the
-  // `*_partner_wide_select` branch in whatever context they are given — so an
-  // org-scoped wrapper here WOULD work for event_log / monitoring / pam. It is
-  // not applied because `buildPatchSourceConfigUpdate` shares this wrapper and
-  // reaches the partner-AXIS `partners` read in `resolveDeviceTimezone`, which
-  // would then take a nested `readWithPartnerAxisVisibility` escape once per
-  // heartbeat (see the long note at the `currentPartnerId` assignment above).
-  // Same treatment as policyProbeConfig /
+  // #4673 W03 kept this hoist deliberately. The patch-source flag now avoids
+  // unused timezone reads; changing these existing access scopes remains a
+  // separate review. Same treatment as policyProbeConfig /
   // onedriveSettings / helperSettings above: resolved after the org tx is
   // released, under a system context anchored to `scoped.deviceId` — an id
   // derived from the device the agent already authenticated as, so this cannot
@@ -2219,6 +2232,8 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // system transaction would cost four connection acquisitions per heartbeat
   // against the 25-connection production ceiling for no isolation gain. The
   // per-resolver try/catch below keeps each feature's documented fallback.
+  // A read snapshot shares only the device/org/group hierarchy within this
+  // transaction. Each resolver retains its own policy query and fallback.
   //
   // The whole block is ALSO wrapped in an outer catch. The per-resolver catches
   // below cannot see a transaction setup or COMMIT failure, and a SQL error
@@ -2247,7 +2262,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     timeSyncSettings: null,
   };
   try {
-    policyConfigs = await withSystemDbAccessContext(async (): Promise<PolicyConfigUpdates> => {
+    policyConfigs = await withSystemDbAccessContext(() => withDevicePolicyReadSnapshot(scoped.deviceId, async (): Promise<PolicyConfigUpdates> => {
       let eventLogSettings: Record<string, unknown> | null = null;
       let monitoringSettings: Record<string, unknown> | null = null;
       let pamSettings: { uacInterceptionEnabled: boolean } | null = null;
@@ -2343,7 +2358,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
         hardwareMonitoringSettings,
         timeSyncSettings,
       };
-    });
+    }));
   } catch (err) {
     // Transaction setup/commit failure — see the note above. Every resolver's
     // documented "no policy this cycle" fallback already applies because

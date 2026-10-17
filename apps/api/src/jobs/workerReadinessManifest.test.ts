@@ -5,6 +5,7 @@ import { WORKER_READINESS_MANIFEST, declareExpectedConsumers } from './workerRea
 const NON_CONSUMERS = [
   'desktopSessionOrphanRecovery',
   'oauthRevocationRetryWorker',
+  'cloudCommandM365SnapshotWorker',
   'topologyOutboxWorker',
   'topologyReconcileWorker',
   'topologyCollectionRetentionWorker',

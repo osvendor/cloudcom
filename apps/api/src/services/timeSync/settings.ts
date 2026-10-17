@@ -1,3 +1,4 @@
+import { isPolicyFeatureAbsentInSnapshot, readPolicyDevice, readPolicyOrganization, readPolicyGroups } from '../devicePolicyReadSnapshot';
 import { and, eq, inArray, or } from 'drizzle-orm';
 import { z } from 'zod';
 import {
@@ -10,9 +11,6 @@ import {
   configPolicyEffectiveFeatureLinks,
   configPolicyTimeSyncSettings,
   configurationPolicies,
-  devices,
-  deviceGroupMemberships,
-  organizations,
 } from '../../db/schema';
 import {
   policyOwnershipCondition,
@@ -56,26 +54,10 @@ const cacheSchema = z
 export async function resolveDeviceTimeSyncSettings(
   deviceId: string,
 ): Promise<ResolvedTimeSyncSettings> {
-  const [device] = await db
-    .select({
-      orgId: devices.orgId,
-      siteId: devices.siteId,
-      deviceRole: devices.deviceRole,
-      osType: devices.osType,
-    })
-    .from(devices)
-    .where(eq(devices.id, deviceId))
-    .limit(1);
+  const device = await readPolicyDevice(deviceId);
   if (!device) throw new Error('Time sync device not visible');
-  const [org] = await db
-    .select({ partnerId: organizations.partnerId })
-    .from(organizations)
-    .where(eq(organizations.id, device.orgId))
-    .limit(1);
-  const groups = await db
-    .select({ groupId: deviceGroupMemberships.groupId })
-    .from(deviceGroupMemberships)
-    .where(eq(deviceGroupMemberships.deviceId, deviceId));
+  const org = await readPolicyOrganization(deviceId, device.orgId);
+  const groups = await readPolicyGroups(deviceId);
   const targets = [
     and(
       eq(configPolicyAssignments.level, 'device'),
@@ -114,6 +96,9 @@ export async function resolveDeviceTimeSyncSettings(
   // an org-scoped caller (device view, agent ingest) cannot see partner-wide policy rows
   // without widening to the device's own partner. partnerId comes from the org row read
   // above under the caller's RLS context, never from input.
+  if (await isPolicyFeatureAbsentInSnapshot(deviceId, 'time_sync')) {
+    return { orgId: device.orgId, settings: timeSyncInlineSettingsSchema.parse({}), policy: null };
+  }
   const rows = await withDevicePartnerPolicyVisibility(
     db,
     org?.partnerId ?? null,
@@ -211,11 +196,7 @@ export async function resolveDeviceTimeSyncSettings(
 export async function getDeviceTimeSyncSettings(
   deviceId: string,
 ): Promise<ResolvedTimeSyncSettings> {
-  const [device] = await db
-    .select({ orgId: devices.orgId })
-    .from(devices)
-    .where(eq(devices.id, deviceId))
-    .limit(1);
+  const device = await readPolicyDevice(deviceId);
   if (!device) throw new Error('Time sync device not visible');
   const redis = getRedis();
   const key = `timesync:settings:device:${deviceId}`;

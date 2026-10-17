@@ -750,6 +750,8 @@ export const toolInputSchemas: Record<string, z.ZodType> = {
     }
   }),
 
+  get_harmony_evidence: z.object({ deviceId: uuid }).strict(),
+
   get_huntress_status: z.object({
     orgId: uuid.optional(),
     integrationId: uuid.optional(),

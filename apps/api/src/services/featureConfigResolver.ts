@@ -1,3 +1,4 @@
+import { isPolicyFeatureAbsentInSnapshot, readPolicyDevice, readPolicyOrganization, readPolicyGroups } from './devicePolicyReadSnapshot';
 import { db } from '../db';
 import { readWithPartnerAxisVisibility } from '../db/partnerAxisRead';
 import { policyOwnershipCondition } from './configPolicyOwnership';
@@ -103,26 +104,15 @@ interface DeviceHierarchy {
 
 async function loadDeviceHierarchy(deviceId: string, executor: DbExecutor = db): Promise<DeviceHierarchy | null> {
   // 1. Load device
-  const [device] = await executor
-    .select({ id: devices.id, orgId: devices.orgId, siteId: devices.siteId, deviceRole: devices.deviceRole, osType: devices.osType })
-    .from(devices)
-    .where(eq(devices.id, deviceId))
-    .limit(1);
+  const device = await readPolicyDevice(deviceId, executor);
 
   if (!device) return null;
 
   // 2. Load org for partnerId
-  const [org] = await executor
-    .select({ partnerId: organizations.partnerId, type: organizations.type })
-    .from(organizations)
-    .where(eq(organizations.id, device.orgId))
-    .limit(1);
+  const org = await readPolicyOrganization(deviceId, device.orgId, executor);
 
   // 3. Load device group memberships
-  const groupRows = await executor
-    .select({ groupId: deviceGroupMemberships.groupId })
-    .from(deviceGroupMemberships)
-    .where(eq(deviceGroupMemberships.deviceId, deviceId));
+  const groupRows = await readPolicyGroups(deviceId, executor);
 
   return {
     deviceId: device.id,
@@ -544,6 +534,8 @@ export async function resolvePatchConfigPolicyForDevice(
 
   const targetConditions = buildTargetConditions(hierarchy);
   const roleOsConditions = buildRoleOsFilterConditions(hierarchy);
+
+  if (await isPolicyFeatureAbsentInSnapshot(deviceId, 'patch')) return null;
 
   // #2930 — the ownership predicate below already admits partner-owned rows,
   // and #4673 W01 makes RLS agree via the SELECT-only `*_partner_wide_select`

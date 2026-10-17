@@ -1,4 +1,4 @@
-import { eq, and, inArray } from 'drizzle-orm';
+import { eq, and, inArray, isNull, not, sql } from 'drizzle-orm';
 import {
   db,
   getCurrentDbAccessContext,
@@ -799,9 +799,33 @@ export async function queueCommand(
   return command as QueuedCommand;
 }
 
-/**
- * Wait for a command to complete with polling
- */
+// A capacity-deferred binary update has not started. Stop the synchronous wait
+// without terminalising the queued command. Keep the public result union intact
+// and explicitly report failure to start, so existing UI/AI callers cannot
+// mistake pending work for a completed upgrade. Delivery/reaper deadlines stay
+// authoritative; this does not extend offline or execution timeouts.
+function pendingAgentUpdateWaitResult(command: QueuedCommand | undefined): QueuedCommand | null {
+  if (!command) return null;
+  const result = command.result as unknown as Record<string, unknown> | null;
+  const reason = result?.deliveryDeferred;
+  if (
+    !AGENT_BINARY_UPDATE_COMMAND_TYPES.has(command.type)
+    || command.status !== 'pending'
+    || command.executedAt !== null
+    || typeof reason !== 'string'
+    || !reason.startsWith('Agent update deferred: ')
+  ) return null;
+  return {
+    ...command,
+    result: {
+      status: 'failed',
+      error: `Agent update not started; queued for retry. ${reason}`,
+      data: { deliveryDeferred: true, reason },
+    },
+  };
+}
+
+/** Wait for completion, or report a deliberately deferred binary update. */
 export async function waitForCommandResult(
   commandId: string,
   timeoutMs: number = 30000,
@@ -822,6 +846,9 @@ export async function waitForCommandResult(
     }
 
     lastObservedCommand = command as QueuedCommand;
+
+    const deferredUpdate = pendingAgentUpdateWaitResult(command as QueuedCommand);
+    if (deferredUpdate) return deferredUpdate;
 
     // Check if command is complete
     if (command.status === 'completed' || command.status === 'failed') {
@@ -857,6 +884,15 @@ export async function waitForCommandResult(
       .where(and(
         eq(deviceCommands.id, commandId),
         inArray(deviceCommands.status, ['pending', 'sent']),
+        // Fence the race where capacity deferral lands after the last poll.
+        // Only never-started binary updates with our exact deferral marker
+        // survive; ordinary pending and already-sent work still time out.
+        not(and(
+          inArray(deviceCommands.type, [...AGENT_BINARY_UPDATE_COMMAND_TYPES]),
+          eq(deviceCommands.status, 'pending'),
+          isNull(deviceCommands.executedAt),
+          sql`coalesce(${deviceCommands.result}->>'deliveryDeferred', '') like 'Agent update deferred: %'`,
+        )),
       ))
       .returning({
         id: deviceCommands.id,
@@ -886,7 +922,7 @@ export async function waitForCommandResult(
     .where(eq(deviceCommands.id, commandId))
     .limit(1);
 
-  return timedOutCommand as QueuedCommand;
+  return pendingAgentUpdateWaitResult(timedOutCommand as QueuedCommand) ?? (timedOutCommand as QueuedCommand);
 }
 
 /**

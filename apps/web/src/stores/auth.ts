@@ -1035,13 +1035,41 @@ export async function restoreAccessTokenFromCookie(): Promise<boolean> {
  *   2. Fetch the user record (`/users/me`) with that token
  *   3. Populate the store via `login(user, tokens)`
  *
- * Returns true if the store was populated; false if any step failed (the
- * caller should fall back to the regular login form).
+ * Boolean compatibility wrapper. UI recovery should use the detailed variant
+ * so a transient failure does not initiate a competing login.
  */
 export async function bootstrapFromCfAccessRedirect(): Promise<boolean> {
-  const outcome = await requestTokenRefreshShared();
-  if (outcome.kind !== 'restored' || !outcome.tokens.accessToken) return false;
-  return completeBootstrapLogin(outcome.tokens);
+  return (await bootstrapFromCfAccessRedirectDetailed()) === 'restored';
+}
+
+export type CfBootstrapOutcome = 'restored' | 'transient' | 'throttled' | 'auth-failed' | 'origin-rejected' | 'cancelled';
+
+/** Retry the existing cookie handoff, never create a second CF login issuance. */
+export async function bootstrapFromCfAccessRedirectDetailed(): Promise<CfBootstrapOutcome> {
+  const generation = useAuthStore.getState().sessionGeneration;
+  const isCurrent = () => useAuthStore.getState().sessionGeneration === generation;
+  let outcome: RefreshOutcome;
+  try { outcome = await requestTokenRefreshShared(); }
+  catch { return isCurrent() ? 'transient' : 'cancelled'; }
+  if (!isCurrent()) return 'cancelled';
+  if (outcome.kind === 'auth-failed') return outcome.originRejected ? 'origin-rejected' : 'auth-failed';
+  if (outcome.kind !== 'restored') return outcome.kind;
+  let response: Response;
+  try {
+    response = await fetch(buildApiUrl('/users/me'), {
+      method: 'GET', credentials: 'include',
+      headers: { Authorization: `Bearer ${outcome.tokens.accessToken}`, 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch { return isCurrent() ? 'transient' : 'cancelled'; }
+  if (!isCurrent()) return 'cancelled';
+  if (!response.ok) return response.status === 401 || response.status === 403 ? 'auth-failed' : 'transient';
+  const user = await response.json().catch(() => null) as User | null;
+  if (!isCurrent()) return 'cancelled';
+  if (!user?.id) return 'transient';
+  useAuthStore.getState().login(user, outcome.tokens);
+  void fetchAndApplyPreferences();
+  return 'restored';
 }
 
 /**

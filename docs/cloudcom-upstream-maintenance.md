@@ -2,6 +2,27 @@
 
 This guide records how the CloudCom fork differs from LanternOps/Breeze and how to integrate upstream changes. Maintain it with the code; it is not a guarantee that future merges will be conflict-free or regression-free.
 
+## Capacity and fleet-update safeguards (2026-10-16)
+
+Preserve `capacityGuard.ts` / `capacityGuardPolicy.ts`, atomic Redis admission in
+`agentRolloutAdmission.ts` / `agentRolloutAdmissionLua.ts`, and their startup and
+shutdown hooks in both API and worker entrypoints. Heartbeat offer admission
+runs after its organization transaction; watchdog main-agent recovery and
+watchdog self-update keep their distinct reported component identities.
+Command delivery, development push and automatic edition migration share the
+same admission lane. Deferred commands stay pending without a false execution
+timeout; their normal delivery expiry remains bounded.
+
+Routine script monitors and scheduled Harmony refresh defer at safe boundaries.
+Readiness retains raw dependency single-flight ownership after response deadlines
+so monitoring cannot accumulate work in an exhausted pool. Operations health
+reports protection state and limits. Feature flags default off outside configured
+CloudCom deployments; tenant authorization, emergency rollback and independent
+local recovery are unchanged. No schema, agent or store release is required.
+See [capacity safeguards](operations/cloudcom-capacity-safeguards.md) for scope,
+tuning, rollback and regression requirements. Keep these contracts when upstream
+changes update offers, command delivery, readiness or worker scheduling.
+
 ## Baseline and ownership
 
 - Fork: `osvendor/cloudcom`; upstream: `LanternOps/breeze`.
@@ -12,6 +33,356 @@ This guide records how the CloudCom fork differs from LanternOps/Breeze and how 
 - Never put server addresses, secrets, signing keys, or internal domain mappings in this public guide.
 
 ## Change register
+
+### Independent local native release version (2026-10-16)
+
+`apps/api/src/services/binarySync.ts` resolves the expected local binary volume
+version through `getBinariesVersion`, matching the download routes' explicit
+`BINARY_VERSION` override. A native-only release can therefore register its
+signed component manifests without changing the API/web version or falling
+back to GitHub because the server image is older. The registration safety net
+uses the same override precedence so it cannot re-promote an older API release.
+Preserve that precedence, the server-only paired-image guard, hosted-edition
+refusal and manifest signing.
+Focused tests cover four-component signed registration with an older server
+version and rejection of a stale hosted volume that matches only that server.
+No migration or agent protocol change is required. Recovery restores the prior
+binary volume and override together; it does not automatically downgrade agents.
+
+### Windows GDI bitmap readback recovery (2026-10-16)
+
+`agent/internal/remote/desktop/capture_gdi.go`, `capture_gdi_dib.go` and
+`capture_windows_nocgo.go` retain DXGI and the existing GDI readback path.
+Only a typed GetDIBits failure, after successful bitmap reselection, enables a
+persistent DIB-section fallback for that capturer. The existing bounded retry
+recreates the native bitmap; BitBlt and GdiFlush complete before its pixels are
+copied into owned Go memory. Resolution/thread changes and Close release the
+native allocation with its bitmap. Preserve the error gate, flush-before-copy,
+CAPTUREBLT retry and handle lifetime when integrating upstream capture changes.
+Desktop/session selection, permissions, consent and transport are unchanged.
+
+The recovery addresses a live Windows secure-desktop case where GetDIBits
+returned zero without an error code across fresh handles, both DPI modes,
+bottom-up headers and named display contexts, while a native DIB section read
+succeeded. Portable race tests cover the marker, failed reselection exclusion,
+sequencing, buffer bounds and failed-frame handling. Release-mode desktop tests
+pass with ten pre-existing adaptive-bitrate/audio failures excluded after
+reproducing them on the preceding source. Live browser capture and reconnection
+passed on the affected Windows Server 2019 secure desktop; Windows 11 canary
+capture also passed. Full Windows desktop CGO/race compilation remains unsupported.
+No migration is required. Retain the preceding verified binaries for recovery;
+the MSI downgrade guard must not be bypassed by blindly installing an older MSI.
+Private release evidence records the native canary scope and exact artifacts.
+
+### Periodic monitor backlog and lookup cost (2026-10-14)
+
+`monitorScriptWorker.ts` schedules recurring probes only for online devices,
+rejects an offline race at dispatch, and treats pending/queued/running/cancelling
+executions as blockers. Preserve these guards and their tests when merging;
+intentional manual offline script queues retain their existing behavior.
+The additive `2026-10-14-223000-cloudcom-monitor-lookup-indexes.sql` migration
+and Drizzle declarations index command execution IDs and monitor/device/status
+lookups. No agent or public API contract change is required.
+
+The dry-run-first `scripts/cancel-offline-monitor-backlog.ts` operator tool
+cancels only unstarted periodic-monitor executions with a unique undelivered
+pending command on an offline device. It rechecks under row locks, uses bounded
+transactions, records an audit event, and preserves execution history. It does
+not cancel manual scripts, ambiguous matches, or sent/running commands.
+Before applying, back up command/execution tables and deploy the scheduler guard.
+API rollback uses the prior application bundle; additive indexes can remain.
+Do not restore backed-up pending work wholesale into an active queue.
+Validation: 180 worker/dispatch/stale-reaper tests plus 31 recovery/terminalizer
+tests passed; API and standalone recovery bundles built successfully.
+
+The DB context prologue sets all seven transaction-local tenant settings in one
+parameterized query. Preserve every setting, the before/after deadline checks,
+and the recognizable query prefix used by the wedged-backend reclaimer.
+Worker initialization is bounded to four concurrent initializers by default
+(`WORKER_STARTUP_CONCURRENCY`, capped at eight), with failure isolation and the
+same required-consumer readiness gate. These changes reduce startup contention;
+they do not relax readiness or increase request deadlines.
+
+The request pool uses Drizzle's supported schema-free constructor. All production
+queries use table imports and SQL builders; there are no relational `db.query`
+consumers. Registering the full schema allocated 579 unused relational builders
+on every transaction/savepoint. Preserve schema-free construction unless a future
+upstream change deliberately adopts that API. Real-Drizzle/fake-transport checks
+cover SQL equivalence, GUCs, savepoints and context boundaries: 120 DB tests and
+26 RLS contract tests passed (five existing skips). These are not substitutes for
+real PostgreSQL RLS integration tests. The local constructor benchmark is not a
+claim of equivalent whole-application speedup.
+
+Heartbeat policy resolution shares only device, organization and group reads
+within its existing policy transaction. `devicePolicyReadSnapshot.ts` binds that
+short-lived cache to the device, transaction and access-context identities; it
+does not cache resolved policy decisions or reuse reads across heartbeats.
+Explicit executors, new/narrowed contexts and savepoints bypass an outer cache.
+The patch-source flag uses the policy-only resolver to avoid unused timezone
+queries. Regression checks cover identical resolver results, reduced query counts,
+context separation, callback lifetime and failed-read retry.
+
+Within that same system-scoped snapshot only, five resolvers can skip their
+effective-policy join when the base feature-link table contains no such type.
+The effective view contains only own/parent base links. One grouped inventory
+read is shared; every cached absence requires a same-transaction `SELECT 1` so
+an earlier caught SQL failure still prevents later default/off updates. Keep
+device/org visibility checks and existing Redis-cache ordering. Explicit
+executors, other scopes, devices, transactions and callbacks cannot use this
+shortcut. Monitoring uses `monitors` links and is deliberately unchanged.
+Validation: 506 tests across 13 focused suites and the six-entry API build passed.
+No cross-heartbeat decision cache or access-policy change is introduced.
+
+The additive `2026-10-14-233000-cloudcom-policy-planner-statistics.sql` migration
+initializes statistics on the small configuration tables and lowers their
+autoanalyze threshold. Previously these tables could remain below the default
+50-change threshold indefinitely, producing inflated estimates for RLS-heavy
+queries. Preserve automatic statistics maintenance after schema/data migrations;
+this migration changes no application rows or access policies.
+
+The monitor sweep owns its DB context and commits each device admission before
+delivery and before the next device's policy reads. This releases device foreign
+key locks promptly while keeping execution/command creation atomic. A failed
+admission rolls back only that device; a failed delivery leaves its committed
+command available to heartbeat delivery. Preserve the post-commit boundary and
+worker concurrency of one. The updated worker, dispatcher, maintenance, resolver
+and evaluator regression suites passed 155 tests; the full API bundle built.
+
+Before full policy resolution, the 60-second sweep reads a fresh complete monitor
+attachment inventory. A monitor with no attachments cannot win for any device.
+For attached monitors, the shortest valid authored/attachment interval bounds a
+bulk active/recent execution check. Unknown or invalid overrides disable that
+optimization; failed metadata reads are reported and fall back to full admission
+in fresh transactions. Recency is checked again per candidate as time advances.
+Every remaining candidate retains the exact resolver, effective due check and
+dispatcher guards. No decision survives the sweep. Added skipped-unattached and
+not-due counters make the saved work observable. Focused worker/dispatch/resolver
+checks and the six-entry API build passed; existing worker-readiness inventory
+drift remains outside this change. No schema or endpoint changes are needed.
+
+`cfAccessRedirectLogin.ts` logs only fixed binding-error classes/reasons, issuance
+phase, elapsed time and presence booleans. It never logs exception text, bindings,
+capabilities, identities or tokens, and does not weaken authentication or alter
+public error responses. The diagnostic distinguishes binding failures without
+assuming that every login failure is a timeout.
+
+Operations health samples Linux CPU steal-counter deltas in its existing
+single-flight collection. The first observation is unknown; later observations
+flag host scheduling pressure at 5% and 20%. This is hypervisor steal, not Docker
+quota use or proof of one hosting cause. Auth diagnostics and CPU/health checks
+passed 67 tests. Live deployment and sustained recovery must be recorded
+separately; passing local tests does not establish hosting capacity.
+
+The web auth overlay distinguishes retryable recovery failures from definitive
+authentication failures. Slow refresh and Cloudflare cookie handoffs retain
+navigation ownership past the overlay safety timer; an explicit retry reuses
+the existing cookie rather than starting another login issuance. The detailed
+Cloudflare bootstrap fences every asynchronous stage on session generation so
+logout or account changes cannot be undone by late responses. The login page
+shows bootstrap progress and a bounded preparation timeout. Preserve token,
+origin, revocation and throttling checks; this is recovery behavior, not relaxed
+authentication. Validation: 67 focused web tests plus three existing 409 race
+tests passed. Deployment and authenticated browser acceptance are recorded
+separately in the private incident evidence.
+
+Callback failures expose an explicit single-sign-on retry instead of an automatic
+loop. AuthOverlay claims one fixed login redirect target before rerendering, so a
+generic redirect cannot overwrite the CF error context. Cancelled handoffs defer
+to a newer live session or expiry owner; incomplete recovery remains actionable.
+A stalled/rejected navigation shows an ordinary full-page sign-in link. Preserve
+the existing transient/throttle ownership and all session-generation fences.
+Validation: 82 focused web tests and the dependency-locked production build passed.
+
+### Harmony Endpoint integration (2026-10-15)
+
+Cloud Command's `harmony-contract.ts` and `harmony-provider.ts` implement bounded,
+read-only group discovery and complete, exact-ID-scoped endpoint inventory.
+Fixed regional origins, guarded fetch, redirect refusal, deadlines, capped jobs
+and pagination, strict provider schemas and allowlisted DTOs are required.
+Unknown protection state remains unknown. Failed or incomplete snapshots are
+rejected rather than published as empty inventory. Client group scopes accept only
+custom `GROUP` entries, never virtual/offline categories. Shared-tenant publishing
+must partition the complete snapshot against all approved organization mappings:
+cross-client claims withhold the endpoint from every client, and missing scopes
+produce empty projections without an account-wide fallback. Explicit endpoint
+mappings support an initial single-device trial without treating generic groups
+as client boundaries. Client projections strip other groups and setup diagnostics.
+The host service `cloudCommandHarmony.ts` owns platform-admin setup with effective
+account MFA-policy enforcement (policy satisfaction is not proof of a second factor), the
+partner-owned encrypted connection and complete shared-tenant partitioning.
+Setup accepts a system principal or a platform administrator with full partner
+organization access; partial partner access is insufficient. Owner operations
+explicitly read all connection mappings, including inactive clients, after this
+gate. Normal readers retain their organization-scoped database context.
+Organization readers only receive their published cache. The core migration
+`2026-10-15-harmony-integrations.sql` must precede the extension migration
+`2026-10-15-harmony.sql`; all four tables use forced RLS and composite ownership
+constraints. Versioned three-minute leases fence stale publications. Provider I/O
+runs outside short database transactions. `harmonySyncWorker` executes through the
+host BullMQ worker registry; the extension contribution registry alone does not
+execute jobs. A five-minute repeat checks one connection at a time, refreshing no
+more frequently than every fifteen minutes. The host consumer participates in
+readiness, has concurrency one and bounded job retention, and stops provider work
+when Cloud Command is disabled. Configuration
+and mapping changes invalidate all affected client caches atomically.
+
+Cloud Command adds connection setup, exact group/endpoint mapping, inventory and
+explicit same-client device links. Native antivirus views add separately labelled
+cloud evidence without overwriting agent observations, inventing real-time
+protection, or treating cumulative infection counts as active threats. Threat
+Hunting transport remains pending: authentication and portal telemetry do not
+establish the external GraphQL URL, authentication or tenant-binding contract.
+
+Validation: 115 provider/route tests, 369 host/route-context tests (including manifest
+registration), fifteen extension UI tests, focused native security tests,
+TypeScript and production builds. Real PostgreSQL checks cover forced RLS,
+cross-client/partner forgeries, publication, link preservation, stale leases,
+provider failure, disabling and native antivirus attachment for single/multiple
+device results (36 passed; unrelated integration cases skipped). Native attachment
+must use parameterized UUID predicates: direct JavaScript-array interpolation into
+`ANY(...::uuid[])` is a SQL record, not a PostgreSQL array. UI mutations reload
+inventory so saved links and invalidated caches are immediately reflected.
+Both new migrations were reapplied successfully. Full registry tests remain
+blocked by the existing missing local `re2-wasm` package. Fresh-database bootstrap
+also exposed a pre-existing monitor-index migration ordering dependency; that was
+deferred in disposable QA, not edited or claimed fixed here.
+
+Deployment uses a signed artifact manifest, verified database backup and existing
+runtime images. Rollback keeps additive migrations and tenancy declarations while
+restoring the previous API/web/bundle and hiding Harmony navigation/jobs. Runtime
+deployment and trial acceptance evidence belong in the operator release record.
+
+AI continuation (2026-10-15): `aiToolsHarmony.ts` registers the read-only
+`get_harmony_evidence` tool across the registry, SDK, input schema, permission
+map and security-response capability catalog. It reads one explicitly linked
+Breeze device from the existing client cache; organization, site, exact-device
+and helper ceilings still apply. It never reads partner secrets or broadens the
+configuration API's human-owner gate. Collection time, freshness, source
+references and unknown values are preserved. Clean anti-malware inventory is not
+an absence-of-threats verdict. Hunting telemetry and provider response actions
+remain explicitly unavailable, rather than represented by successful empty data.
+Existing incident/ticket/evidence/action tools retain their permission and
+approval paths; this read tool executes no actions and grants no new AI policy.
+
+`harmony-hunting-contract.ts` is a prepared, OFFLINE-only schema adapter for the
+published GraphQL contract. No runtime route, credentialed transport, ingestion
+job or action executor calls it yet. It builds a single exact-EPGUID query with
+an endpoint-only data source, 24-hour window and at most 200 records, then rejects
+cross-endpoint/out-of-window rows, duplicates and partial GraphQL errors. It
+allowlists evidence fields, omits raw command arguments/file/script bodies and
+registry contents, and labels truncated coverage. An independently verified
+EPGUID mapping and supported URL/auth/tenant contract are prerequisites to wiring
+it live. Do not infer that inventory computerId and EPGUID are interchangeable.
+Focused checks: 120 AI/SDK/catalog/metadata tests, 15 offline hunting contract
+tests, extension TypeScript and API six-entry bundle passed. These are not live
+Threat Hunting or autonomous-response acceptance tests.
+
+### Managed RustDesk partner default (2026-10-13)
+
+Fleet enforcement uses native partner-owned scripts, script monitors and a
+Windows-filtered partner configuration-policy assignment. Preserve sourced
+script parameter `org.id` binding, partner monitor inheritance and Quick Support /
+holding-device exclusions when merging upstream. The pinned custom host installer,
+native admission, protected staging and unknown-payload refusal remain unchanged.
+The operator provisioning record is private under `internal/managed-host-default.ts`;
+this configuration requires no API patch, migration or additional scheduled job.
+
+Native target authentication must carry the active tenant's server-derived
+partner ID into `withDbAccessContext.currentPartnerId` while retaining organization
+scope. Without it, inherited remote-access settings are RLS-invisible during host
+admission/renewal even though policy resolution finds the partner policy; admission
+then fails closed with HTTP 503. Preserve this in `portalNativeTarget.ts` and
+`routes/nativeTarget.ts`, together with the target-context regression tests.
+
+### IDrive 360 integration (2026-10-13)
+
+Cloud Command owns the IDrive contract, fixed-origin public HTTPS provider,
+client routes, web page and two additive tables in
+`packages/ext-cloud-command/{src/server/idrive*,src/web/idrive*,migrations/2026-10-13-idrive360.sql}`.
+Preserve its manifest page, navigation, tenant erasure/merge/export declarations,
+and Connect/overview entries across upstream updates. Keys and operation payloads
+are encrypted with organization-bound AAD and excluded from organization exports.
+Mapping changes require platform-administrator setup authority.
+
+An IDrive MSP company can contain multiple customer groups: the company alone
+is not a client boundary. Group-bound connections return only their group's
+devices and exclusively owned plans. Shared plans and cross-client targets are
+excluded; conflict responses expose counts rather than other clients' identities.
+Company-wide connections require platform-admin authority on reads as well.
+
+Supported operations cover inventory, plan creation/editing, group management,
+subcompany creation, device tags/metadata, notifications and configured installer
+links. Provider-supported dry runs precede plan/group writes; other changes use
+local previews. Execution consumes an actor/org/version-bound, expiring preview
+before dispatch. No automatic write retries. An uncertain outcome must be checked
+in IDrive before a technician submits a new operation. Restore and backup-file
+browsing remain outside the published MSP API. Company installers are not
+group-specific; subsequent client-group assignment is required.
+
+The host changes are deliberately narrow: a lazy caller-scoped DB runner in
+`apps/api/src/extensions/builtinRegistry.ts` and exact IDrive route exemptions in
+`middleware/selfManagedDbContextRoutes.ts`. These keep operation claims durable
+before outbound calls and avoid holding request transactions across network work.
+Do not remove one without the other. The SDK and existing provider signatures
+remain compatible through an optional injected runner.
+
+Validation: focused provider/authorization/client-boundary and web tests,
+extension typecheck, web/API builds, existing host registration tests, the two
+org-table RLS catalog coverage assertions, and a rollback-only real-PostgreSQL
+cross-client read/write rehearsal. Live acceptance covers scoped inventory,
+client switching and a non-executed preview. Existing customer backup settings
+were not mutated for acceptance. Complex plan changes currently use an advanced
+JSON editor; tag and notification changes have ordinary forms. Backup timestamps
+without timezone remain provider-local; stale detection uses a conservative
+14-hour offset allowance and does not certify recovery health.
+
+The normal extension migration ledger applies the additive migration. If code is
+rolled back after it runs, retain the new tables' tenancy declarations until a
+separately reviewed schema rollback; an old manifest cannot classify them.
+Deployment hashes, mappings, and rollback artifacts belong in private records.
+
+### Operations health extension (2026-10-13)
+
+Cloud Command adds `/extensions/cloudcommand/health`, a read-only platform-operator
+view. The package owns its route, web component and manifest entry; the built-in
+registry supplies a narrow lazy host collector (`extensions/operationsHealth.ts`).
+Preserve that bridge across upstream merges. Interactive system-scope platform
+administrators (including platform admins retaining a partner login membership)
+require organization-read permission. Site-limited, organization, ordinary partner,
+API-key and customer sessions cannot consume global aggregates. Active account
+status and the live platform-admin flag are rechecked before cached observations.
+Use the existing `BREEZE_PLATFORM_ADMINS` bootstrap for deployment owners; this
+feature adds no separate privilege list and changes no login scope resolution.
+
+The collector coalesces requests for 30 seconds and executes bounded aggregate
+queries using explicit system DB contexts and transaction-local statement limits.
+No new tables, dependencies, credentials, device commands or migrations. Results
+contain counts/status only, never device/customer identifiers or command payloads.
+The UI pauses polling when hidden, handles timeout/stale/error states and labels
+unmeasured coverage explicitly. Enrollment toward 500 is rollout progress, not a
+claim of tested capacity. Host-visible load/RAM are distinguished from API process
+memory; the filesystem check covers the API mount only. Relay bandwidth, external
+SSO/integrations, backup recovery, release compliance and full queue depth remain
+unmeasured. Deployment and capacity evidence belong in the private operational
+record. Focused tests cover global authorization, revocation, partial failures,
+thresholds, cached collection and browser polling/error behavior.
+
+### OS Companion public privacy page (2026-10-08)
+
+The staff-only OS Companion Edge listing has a standalone privacy policy at
+`apps/web/public/edge-store/privacy.html`. Keep this path publicly reachable
+through the web edge so store reviewers can read it without an authenticated
+session. The page documents the extension's active-tab metadata checks,
+client-scoped credentials, device tools, notes, work tickets and session
+storage without making legal retention or security guarantees. This is a
+static documentation asset; it does not change authentication, API routes,
+authorization, or data handling.
+
+The public path must remain separate from authenticated application routes and
+must not expose private infrastructure details. Deployment and public-edge
+access verification belong in the operational record; this register records
+the source asset only. No new automated tests are required for this static
+HTML change.
 
 ### Quick Support desktop readiness (2026-10-06)
 
@@ -236,3 +607,175 @@ Affected paths: `apps/api/src/jobs/unifiWorker.ts`, `apps/api/src/services/unifi
 Implemented in [PR #28](https://github.com/osvendor/cloudcom/pull/28). The `unifi-sync-lock-order` entry in `.github/cloudcom-customizations.json` requires the lock helper, worker, unit and PostgreSQL regression tests, and their worker/classifier/CI attachments. The updater checks the pre-merge registry and aborts even a conflict-free import that removes these attachments. Intentional upstream replacements require manual integration and contract review; substring checks do not prove semantic compatibility, so the existing unit and PostgreSQL CI gates remain required.
 
 Verified on the Linux runner: 23 tests passed and the full customization contract passed. Commands: `node --test scripts/cloudcom/customization-contract.test.mjs scripts/cloudcom/update-upstream.test.mjs .github/scripts/cloudcom-delta.test.mjs` and `node scripts/cloudcom/customization-contract.mjs` on the Linux runner. The updater regression cases remove the real registered helper, worker call and classifier attachment independently and verify rollback to a clean original checkout. This protection changes the repository updater only; no application deployment, migration or configuration change is required. Upstream baseline remains v0.115.0.
+
+## Client credential extension (2026-10-07)
+
+Keep `packages/ext-credentials` separate during upstream intake. The additive
+`credentials_records` migration enables and forces org RLS immediately; the
+manifest owns erasure and metadata-only export and refuses automatic org merge.
+Preserve its built-in default-off flag, Docker assets, API package dependency,
+row-bound encryption registry entry, granular permission catalog/seed entries,
+and strict `createAuditLog` injection (SDK queued audit is not sufficient before
+secret disclosure). Keep the operational importer entry in the API bundle.
+
+The vault supports imported passwords and TOTP. Remote-toolbar integration uses
+the separate SessionCredentials adapter and checked viewer transforms; preserve
+the client binding derived from the owned remote session. Clipboard integration
+also uses checked transforms instead of manual edits to regenerated viewer code.
+Editing is not provided. Tests and security/import limits are documented in
+`packages/ext-credentials/README.md`.
+
+Version 0.2.0 adds the sibling Documentation extension page and the additive
+`credentials_documents` migration. Preserve the row-bound encryption registry,
+metadata-only export and erasure/merge contracts, plus the operator importer
+bundle entry. Workbook originals and previews share the credential permission
+boundary. Native organization Documents and core navigation remain unchanged.
+After migration, recovery must keep a schema-aware manifest even if the extension
+is disabled. API built-in lifecycle tests validate the manifest/table naming and
+tenancy declarations; run these alongside extension and importer tests at intake.
+
+## Staff Edge companion (2026-10-08)
+
+Extension version 0.3.0 adds the browser-companion page and fixed browser routes;
+`packages/browser-companion` is the standalone, dependency-free MV3 pilot. Keep
+these at the extension boundary during upstream intake. There are no schema,
+core authentication, Cloudflare, agent or remote transport changes.
+
+Preserve interactive partner-session checks, account verification policy, explicit
+client binding and RLS, granular credential disclosure permissions and durable
+fill audit. The dedicated Breeze bridge uses the existing session without giving
+bearer tokens to the addon. Website matching is exact HTTPS origin; fill requires
+a stable document, unique supported field and same-origin form action. The worker
+accepts requests only from its own popup, never stores secrets and never submits
+forms. Device icons open existing Remote Tools surfaces under existing policies.
+Run addon Node tests plus extension server/web tests, typecheck and builds.
+The pilot requires a manually enabled connection tab and is not a Store release.
+
+### Browser-session companion candidate (not deployed)
+
+The 0.2 development source adds optional side-panel/window workspaces and a
+PKCE handoff to an opaque, browser-session-only token. Core attachment points are
+`services/browserCompanionSession.ts`, `services/browserCompanionPolicy.ts`,
+`routes/browserCompanion.ts`, one early transport mount in `index.ts`, and an
+authorization callback injected through the credentials builtin registration.
+The transport is disabled unless `CLOUDCOM_BROWSER_COMPANION_IDS` registers the
+installation ID. Keep its narrow CORS separate from normal browser CORS. Each
+request revalidates the original staff identity, client/device binding, IP policy,
+and existing core authorization via bounded in-process dispatch. Never expose
+the internal dispatch JWT to the addon. No database migration is introduced.
+
+Addon session/workspace tests and API session/policy/transport tests are present.
+Development validation: 54 focused API tests and six addon tests passed. This is
+not browser acceptance: terminal integration, complete tool UI review, native
+auto-connect tests, Cloudflare transport configuration, and end-to-end OS-TEST
+acceptance remain release gates. Do not distribute the development package as a
+finished update. The previously deployed tab-dependent pilot remains unchanged.
+
+### Companion stable sections and client notes (2026-10-08)
+
+Browser companion 0.5.1 adds persistent Work, Logins, Devices and Notes sections.
+Device workspaces survive section switches but are discarded on client change or
+lock. The selected device remains visible when filtering the selector. Notes use
+the existing client-scoped document routes and canonical document section parser
+(the browser document-sections.js is generated from ext-credentials import code).
+All-client login metadata and explicit password/OTP copy reuse existing audited
+vault routes. Website fill remains exact-origin scoped, uses a focused eligible
+field when available, and never submits forms. Secrets are not persisted by the
+extension; explicit Copy puts the requested value on the user's clipboard.
+
+Affected boundaries: packages/browser-companion and the exact client route
+allowlist in apps/api/src/services/browserCompanionPolicy.ts. No schema, upstream
+viewer, Cloudflare rule, tenant permission or credential encryption changes.
+Validation: browser tests cover client switches, preserved tool iframe, stale notes,
+masked workbook secrets, focused field insertion and cross-origin form rejection;
+transport tests reject mismatched clients, workspace vault calls and imports.
+Recovery: restore the previous API bind and companion package. Do not remove vault
+data or rewrite imported documents as part of reverting the UI.
+
+### Compact one-click companion Scripts (2026-10-08)
+
+Companion 0.5.2 replaces the spooler script form with one compact row: name, last
+execution time, outcome, Run. Run performs the existing required preview internally
+and executes only after successful validation, linking to the automatically ensured
+Work ticket. Detailed deleted/failed counts and spooler state remain in existing
+server-side ticket comments. No new endpoint or server deployment is required.
+Ambiguous submissions retain their idempotency key and offer Check; reopening
+tracks an existing execution without auto-executing a previous preview. Disposing
+the panel prevents continuation from a preview. Last run means last execution,
+not passive folder inspection. Relevant tests cover one-click sequence, failed
+preflight, network ambiguity and reopen/disposal. Revert the companion package to
+restore the old form; no database change.
+
+### OS Companion selected-device IP scan (development, 2026-10-13)
+
+The companion adds IP Scan beside Processes and Services, using the selected
+endpoint's active IPv4 inventory and reported subnet mask. The API accepts an
+inventory network ID, rechecks device/org/site access and active membership,
+and never accepts a browser-supplied scan target. Missing masks and networks
+larger than /24 are shown as unsupported rather than guessed or truncated.
+Scans use existing network_discovery agent commands, reject offline dispatch,
+and poll command results scoped to actor, device, submitted organization and
+command type. No schema or agent changes are required.
+
+Files: packages/browser-companion/workspace-network.js and its workspace,
+policy and build wiring; apps/api/src/routes/systemTools/networkScan.ts,
+browserCompanionPolicy.ts and companionWorkModel.ts. The work timeline records
+scan start; command completion remains available through the command system.
+The table shows IP, MAC, manufacturer and TCP 443 reachability (not a verified
+HTTPS handshake). Discovery currently probes TCP 80/443/445 and available ARP;
+nonresponding hosts may not be discovered and MAC/vendor may be unavailable.
+
+Focused API tests cover masks, server-derived targets, access denial, inactive
+network IDs, dispatch scoping and polling. UI tests cover inventory loading,
+explicit scan start and stale results. This remains development-only: no store
+submission, production deployment, or live endpoint acceptance is recorded.
+
+### IP Scan default /24 override (2026-10-13)
+
+Owner requested every scan default to /24. Network choices and dispatch now
+calculate the /24 containing the selected device's active IPv4 address,
+regardless of missing or different reported masks. This explicitly supersedes
+the preceding mask-required/larger-network-disabled behavior. Private-address,
+selected-device, organization, site and command-result checks remain. Nine
+focused route tests pass, including missing, empty, /16 and /25 masks.
+
+### IP Scan MAC vendor enrichment (2026-10-13)
+
+The scan-results route now falls back to the existing local MAC vendor lookup
+when the agent supplies no manufacturer. Explicit device manufacturer wins;
+missing/unrecognized MACs remain unknown. manufacturerSource distinguishes
+device identity from mac_oui (network-adapter vendor). No outbound lookup,
+SNMP credentials, schema change or endpoint update is required. Focused scan
+and MAC-lookup suites pass 24 tests. Store publication remains unchanged.
+
+### IP Scan opportunistic public SNMP (2026-10-13)
+
+Owner requested default read-only public SNMP, with nonresponders ignored.
+Companion scan commands now include the snmp method and explicit public
+community, using the existing agent's SNMPv2c discovery path with one-second
+scan timeout. No device configuration or credentials are modified. Discovery
+merges successful SNMP identity responses and retains ordinary port/ARP results
+when SNMP is unavailable. MAC vendor fallback remains. The extension table
+uses returned manufacturer; additional SNMP detail views are not implemented.
+24 focused route/vendor tests passed. API-only deployment; no store release.
+
+### IP Scan table and hostname (2026-10-13)
+
+Companion network table now includes sortable/filterable hostname, read-only
+TCP443 checkbox, and five resizable columns with keyboard and pointer handles.
+A dedicated scroll wrapper and colgroup avoid generic service-table widths.
+API enables agent reverse DNS and returns hostname with SNMP sysName fallback.
+Existing org/site/actor scope is unchanged. 25 API/vendor tests and six UI tests
+pass. API deployed at companion-ipscan-hostname-20261013; unpacked development
+folder rebuilt with the registered public key. No store submission/version bump.
+
+### IP Scan three-column layout (2026-10-13)
+
+The table uses IP as a fixed first column and two configurable columns,
+defaulting to Hostname and Manufacturer. Choices include Hostname, Manufacturer,
+HTTPS and MAC address. Preferences contain only column field names in local
+extension storage; scan results and client data are not persisted. Resizing,
+filtering and sorting remain available. This is a development-extension UI
+change only and requires no API deployment or store version change.
+
+IP Scan compact header adjustment: 28px toolbar, 26px borderless field selectors, arrow-only sort buttons with accessible labels, tighter rows; existing eight UI tests pass. Development package rebuilt, store unchanged.

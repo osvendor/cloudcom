@@ -6,8 +6,8 @@
  * is not the same as proving `db/index.ts` uses it correctly: the bug this PR
  * fixes lives at the seam — is the deadline actually armed around
  * `applyAccessContextGucs`, is it DISARMED before the caller's `fn` runs, and
- * does the per-statement abort check really stop the remaining `set_config`
- * statements? None of that is observable from the helper's own tests, and every
+ * does an expired deadline prevent late responses from starting caller work?
+ * None of that is observable from the helper's own tests, and every
  * consumer test in this repo stubs `withDbAccessContext` out with a passthrough,
  * so without this file the wiring has no coverage at all.
  *
@@ -18,6 +18,8 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import type { SQL } from 'drizzle-orm';
 
 const { drizzleFactory, transactionImpl, requestWedgedBackendReclaim } = vi.hoisted(() => {
   const transactionImpl = vi.fn();
@@ -44,14 +46,14 @@ const originalEnv = { ...process.env };
 
 /**
  * A transaction handle whose Nth `execute` never settles — the wedge. Records
- * every statement it was asked to run, so "statements 4-6 were never issued"
+ * every statement it was asked to run, so "caller work was never issued"
  * is an assertion about behaviour rather than about a mock's internals.
  */
 function makeTx(hangOnStatement: number | null) {
-  const issued: string[] = [];
+  const issued: Array<{ sql: string; params: unknown[] }> = [];
   const tx = {
-    execute: vi.fn((query: unknown) => {
-      issued.push(JSON.stringify(query ?? null).slice(0, 80));
+    execute: vi.fn((query: SQL) => {
+      issued.push(new PgDialect().sqlToQuery(query));
       if (hangOnStatement !== null && issued.length === hangOnStatement) {
         return new Promise(() => {});
       }
@@ -103,32 +105,77 @@ describe('#6048 prologue deadline wiring', () => {
     expect(requestWedgedBackendReclaim).toHaveBeenCalledTimes(1);
   });
 
-  it('stops issuing the remaining set_config statements when the wedge is mid-prologue', async () => {
+  it('does not enter caller work when the batched prologue resolves after its deadline', async () => {
     // `Promise.race` does not cancel its loser. Without the per-statement abort
-    // check, a statement that resolved late would queue the rest onto a
+    // check, a statement that resolved late could run caller work on a
     // connection being torn down — or already recycled to another tenant.
-    const { tx, issued } = makeTx(3);
+    const { tx, issued } = makeTx(null);
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    tx.execute.mockImplementationOnce(async (query) => {
+      issued.push(new PgDialect().sqlToQuery(query));
+      await pending;
+      return [];
+    });
     transactionImpl.mockImplementation((fn: (t: unknown) => Promise<unknown>) => fn(tx));
 
     const { withSystemDbAccessContext, DbAccessContextPrologueTimeoutError } = await loadDb();
-    const result = withSystemDbAccessContext(async () => 'rows', 'wiringTest');
+    const fn = vi.fn(async () => 'rows');
+    const result = withSystemDbAccessContext(fn, 'wiringTest');
     const assertion = expect(result).rejects.toBeInstanceOf(DbAccessContextPrologueTimeoutError);
 
     await vi.advanceTimersByTimeAsync(15_000);
     await assertion;
 
-    expect(issued).toHaveLength(3);
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(issued).toHaveLength(1);
+    expect(fn).not.toHaveBeenCalled();
   });
 
-  it('runs the full six-statement prologue and the caller work when nothing wedges', async () => {
+  it('stamps all seven transaction-local settings in one round trip before caller work', async () => {
     const { tx, issued } = makeTx(null);
     transactionImpl.mockImplementation((fn: (t: unknown) => Promise<unknown>) => fn(tx));
 
     const { withSystemDbAccessContext } = await loadDb();
     await expect(withSystemDbAccessContext(async () => 'rows', 'wiringTest')).resolves.toBe('rows');
 
-    expect(issued).toHaveLength(6);
+    expect(issued).toHaveLength(1);
+    expect(issued[0]!.sql.startsWith("select set_config('breeze.scope'")).toBe(true);
+    expect(issued[0]!.sql.match(/set_config\(/g)).toHaveLength(7);
+    expect(issued[0]!.sql.match(/, true\)/g)).toHaveLength(7);
+    expect(issued[0]!.params).toEqual(['system', '', '*', '*', '', '', '']);
     expect(requestWedgedBackendReclaim).not.toHaveBeenCalled();
+  });
+
+  it('exposes distinct transaction identities for savepoints and fresh contexts, never the bare pool', async () => {
+    const savepoint = makeTx(null).tx;
+    const outer = Object.assign(makeTx(null).tx, {
+      transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(savepoint),
+    });
+    const fresh = makeTx(null).tx;
+    transactionImpl.mockImplementationOnce((fn: (tx: unknown) => Promise<unknown>) => fn(outer));
+    transactionImpl.mockImplementationOnce((fn: (tx: unknown) => Promise<unknown>) => fn(fresh));
+    const database = await loadDb();
+    expect(database.getCurrentDbTransactionIdentity()).toBeUndefined();
+    await database.withSystemDbAccessContext(async () => {
+      const context = database.getCurrentDbAccessContext();
+      expect(database.getCurrentDbTransactionIdentity()).toBe(outer);
+      await database.withDbTransaction(async () => {
+        expect(database.getCurrentDbTransactionIdentity()).toBe(savepoint);
+        expect(database.getCurrentDbAccessContext()).toBe(context);
+      });
+      await database.runOutsideDbContext(async () => {
+        expect(database.getCurrentDbTransactionIdentity()).toBeUndefined();
+        await database.withSystemDbAccessContext(async () => {
+          expect(database.getCurrentDbTransactionIdentity()).toBe(fresh);
+          // The unlabeled system context is intentionally a shared singleton.
+          expect(database.getCurrentDbAccessContext()).toBe(context);
+        });
+      });
+      expect(database.getCurrentDbTransactionIdentity()).toBe(outer);
+    });
+    expect(database.getCurrentDbTransactionIdentity()).toBeUndefined();
   });
 
   it('does NOT bound the caller work that follows a completed prologue', async () => {
@@ -149,6 +196,67 @@ describe('#6048 prologue deadline wiring', () => {
 
     release!('late but fine');
     await expect(result).resolves.toBe('late but fine');
+  });
+
+  it('does not issue the prologue when a transaction is acquired after the deadline', async () => {
+    const { tx } = makeTx(null);
+    let acquire!: () => void;
+    const pending = new Promise<void>((resolve) => { acquire = resolve; });
+    transactionImpl.mockImplementation(async (fn: (t: unknown) => Promise<unknown>) => {
+      await pending;
+      return fn(tx);
+    });
+    const { withSystemDbAccessContext, DbAccessContextPrologueTimeoutError } = await loadDb();
+    const fn = vi.fn(async () => 'rows');
+    const assertion = expect(withSystemDbAccessContext(fn)).rejects.toBeInstanceOf(DbAccessContextPrologueTimeoutError);
+    await vi.advanceTimersByTimeAsync(15_000);
+    await assertion;
+    acquire();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tx.execute).not.toHaveBeenCalled();
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it.each(['partner', 'organization'] as const)('narrows every access axis to %s before caller work', async (scope) => {
+    const { tx, issued } = makeTx(null);
+    transactionImpl.mockImplementation((fn: (t: unknown) => Promise<unknown>) => fn(tx));
+    const { withResolvedDbAccessContext, getCurrentDbAccessContext } = await loadDb();
+    const orgId = '11111111-1111-1111-1111-111111111111';
+    const partnerId = '22222222-2222-2222-2222-222222222222';
+    const userId = '33333333-3333-3333-3333-333333333333';
+    const historyOrgId = '44444444-4444-4444-4444-444444444444';
+    const context = {
+      scope,
+      orgId,
+      accessibleOrgIds: [orgId],
+      accessiblePartnerIds: scope === 'partner' ? [partnerId] : null,
+      currentPartnerId: partnerId,
+      userId,
+      reportHistoryOrgIds: [historyOrgId],
+    };
+    await withResolvedDbAccessContext(async () => ({ context, value: 1 }), async (value) => {
+      expect(value).toBe(1);
+      expect(getCurrentDbAccessContext()).toEqual(context);
+      expect(issued).toHaveLength(2);
+      expect(issued[0]!.params).toEqual(['system', '', '*', '*', '', '', '']);
+      expect(issued[1]!.params).toEqual([
+        scope, orgId, orgId, scope === 'partner' ? partnerId : '', userId,
+        partnerId, scope === 'partner' ? historyOrgId : '',
+      ]);
+    });
+    expect(transactionImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('establishes archive read-only mode before the batch and clears unrelated grants', async () => {
+    const { tx, issued } = makeTx(null);
+    transactionImpl.mockImplementation((fn: (t: unknown) => Promise<unknown>) => fn(tx));
+    const { withArchivedOrgReadContext } = await loadDb();
+    const orgId = '11111111-1111-1111-1111-111111111111';
+    await withArchivedOrgReadContext([orgId], async () => {
+      expect(issued).toHaveLength(2);
+      expect(issued[0]!.sql).toBe('SET TRANSACTION READ ONLY');
+      expect(issued[1]!.params).toEqual(['partner', '', orgId, '', '', '', '']);
+    });
   });
 
   it('bounds the archived-org opener, whose first statement is SET TRANSACTION READ ONLY', async () => {
@@ -179,9 +287,9 @@ describe('#6048 prologue deadline wiring', () => {
       execute: vi.fn(() => {
         call += 1;
         issued.push(call);
-        // Statements 1-6 are the outer system prologue; 7 is the first
-        // statement of the narrowing prologue, and that is where we wedge.
-        return call === 7 ? new Promise(() => {}) : Promise.resolve([]);
+        // The first statement establishes system scope; the second narrows
+        // it in the same transaction, and that is where we wedge.
+        return call === 2 ? new Promise(() => {}) : Promise.resolve([]);
       }),
     };
     transactionImpl.mockImplementation((fn: (t: unknown) => Promise<unknown>) => fn(tx));
@@ -204,7 +312,7 @@ describe('#6048 prologue deadline wiring', () => {
     await vi.advanceTimersByTimeAsync(15_000);
     await assertion;
 
-    expect(issued).toHaveLength(7);
+    expect(issued).toHaveLength(2);
     expect(fn).not.toHaveBeenCalled();
   });
 

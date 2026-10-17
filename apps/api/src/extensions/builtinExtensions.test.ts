@@ -1027,8 +1027,33 @@ describe('loadBuiltinExtensions â€” helperRoutes staging', () => {
 });
 
 describe('BUILTIN_EXTENSION_NAMES', () => {
+  it('keeps the credential vault opt-in and secrets out of tenant exports', () => {
+    const vault = BUILTINS.find(b => b.name === 'credentials')!;
+    expect(vault.enableEnvVar).toBe('CLOUDCOM_CREDENTIALS_ENABLED');
+    const previous = process.env.CLOUDCOM_CREDENTIALS_ENABLED;
+    try {
+      delete process.env.CLOUDCOM_CREDENTIALS_ENABLED;
+      expect(isBuiltinEnabled(vault)).toBe(false);
+      process.env.CLOUDCOM_CREDENTIALS_ENABLED = 'true';
+      expect(isBuiltinEnabled(vault)).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.CLOUDCOM_CREDENTIALS_ENABLED;
+      else process.env.CLOUDCOM_CREDENTIALS_ENABLED = previous;
+    }
+    expect(vault.helperRoutes).toBe(false);
+    expect(vault.manifest.publicRoutes).toEqual([]);
+    expect(vault.manifest.tenancy.orgCascadeDeleteTables).toEqual(['credentials_records', 'credentials_documents', 'credentials_companion_script_runs']);
+    expect(vault.manifest.tenancy.orgMergePolicies.credentials_records.kind).toBe('leave-for-erasure');
+    expect(vault.manifest.tenancy.orgExportColumns.credentials_records.exclude).toContain('secret_ciphertext');
+    expect(vault.manifest.tenancy.orgExportColumns.credentials_records.include).not.toContain('secret_ciphertext');
+    expect(vault.manifest.tenancy.orgMergePolicies.credentials_documents.kind).toBe('leave-for-erasure');
+    expect(vault.manifest.tenancy.orgExportColumns.credentials_documents.exclude).toContain('payload_ciphertext');
+    expect(vault.manifest.tenancy.orgExportColumns.credentials_documents.include).not.toContain('payload_ciphertext');
+    expect(vault.manifest.tenancy.orgExportColumns.credentials_documents.include).toContain('org_id');
+  });
+
   it('names the compiled-in extensions', () => {
-    expect([...BUILTIN_EXTENSION_NAMES]).toEqual(['cloudcommand', 'workspace', 'rustdeskaccess']);
+    expect([...BUILTIN_EXTENSION_NAMES]).toEqual(['cloudcommand', 'workspace', 'rustdeskaccess', 'credentials']);
   });
 
   /**

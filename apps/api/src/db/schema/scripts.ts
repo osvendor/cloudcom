@@ -323,6 +323,8 @@ export const scriptExecutions = pgTable('script_executions', {
   aiAgentRunId: uuid('ai_agent_run_id'),
   createdAt: timestamp('created_at').defaultNow().notNull()
 }, (table) => ({
+  monitorDeviceStatusIdx: index('cloudcom_script_executions_monitor_device_status_idx')
+    .on(table.monitorId, table.deviceId, table.status, table.createdAt.desc()),
   proposalIdx: index('script_executions_proposal_idx')
     .on(table.proposalId)
     .where(sql`proposal_id IS NOT NULL`),

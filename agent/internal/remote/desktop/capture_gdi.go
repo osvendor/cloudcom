@@ -156,6 +156,11 @@ func shouldRebuildGDIHandles(inited bool, haveWidth, haveHeight, wantWidth, want
 // the frame loudly and rebuilding is the only safe response.
 var errGDIHandlesUnusable = errors.New("GDI handles are no longer usable")
 
+// errGDIReadback marks a failed GetDIBits readback after the capture bitmap
+// was successfully restored. Only this failure can select the DIB-section
+// fallback; blit, buffer and bitmap-selection failures keep their own paths.
+var errGDIReadback = errors.New("GDI bitmap readback unavailable")
+
 // gdiFrameOps is the set of Win32 calls one GDI frame makes. The Windows build
 // supplies a syscall-backed implementation (capture_windows_nocgo.go); tests
 // supply a fake.
@@ -235,12 +240,12 @@ func captureGDIFrame(ops gdiFrameOps, h gdiFrameHandles, bi *bitmapInfo, dst []b
 	}
 
 	if copied == 0 {
-		return gdiCallError("GetDIBits", dibErrno)
+		return fmt.Errorf("%w: %w", errGDIReadback, gdiCallError("GetDIBits", dibErrno))
 	}
 	// GetDIBits returns the number of scan lines it copied. Anything short of
 	// the full height is a torn frame, not a frame.
 	if copied != h.height {
-		return fmt.Errorf("GetDIBits copied %d of %d scan lines", copied, h.height)
+		return fmt.Errorf("%w: GetDIBits copied %d of %d scan lines", errGDIReadback, copied, h.height)
 	}
 	return nil
 }

@@ -9,6 +9,7 @@ import { registryRoutes } from './registry';
 import { eventLogsRoutes } from './eventLogs';
 import { scheduledTasksRoutes } from './scheduledTasks';
 import { fileBrowserRoutes } from './fileBrowser';
+import { networkScanRoutes } from './networkScan';
 import { getDeviceWithOrgCheck } from './helpers';
 
 export const systemToolsRoutes = new Hono();
@@ -82,3 +83,4 @@ systemToolsRoutes.route('/', registryRoutes);
 systemToolsRoutes.route('/', eventLogsRoutes);
 systemToolsRoutes.route('/', scheduledTasksRoutes);
 systemToolsRoutes.route('/', fileBrowserRoutes);
+systemToolsRoutes.route('/', networkScanRoutes);

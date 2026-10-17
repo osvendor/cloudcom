@@ -4,7 +4,10 @@ import { hasDbAccessContext, withDbTransaction } from '../db';
 import { BROKERED_READ_COMMAND_TYPES, deliverBrokeredReadCommand } from './backupStorageSessions';
 import { RECOVERY_INTEGRITY_COMMAND_TYPES, deliverRecoveryCommandIntegrity } from './backupRecoveryCommandIntegrity';
 import { expireRefusedClaimedCommandDelivery, releaseClaimedCommandDelivery } from './commandDispatch';
+import { admitAgentUpdate } from './agentRolloutAdmission';
 import {
+  CommandDeliveryDeferredError,
+  CommandDeliveryRefusedError,
   isCommandDeliveryDeferral,
   isCommandDeliveryRefusal,
   type DeliveryRefreshContext,
@@ -115,6 +118,29 @@ for (const type of RECOVERY_INTEGRITY_COMMAND_TYPES) {
 // credential — is resolved as before (services/backupStorageWriteDelivery.ts).
 for (const type of BACKUP_WRITE_GATED_COMMAND_TYPES) {
   registerDeliveryRefresher(type, deliverBackupWriteCommand);
+}
+
+// Admit at delivery, so a queued update cannot bypass a later capacity pause.
+// Only these binary updates are gated: ordinary commands keep delivering, and
+// signed rollback remains an exempt, short-lived recovery authorization.
+for (const [type, component] of [['update_agent', 'agent'], ['update_watchdog', 'watchdog']] as const) {
+  registerDeliveryRefresher(type, async (payload, ctx) => {
+    // Reject malformed queued work before admission; an empty target must
+    // never bypass the capacity guard or fall through to a default release.
+    if (typeof payload.version !== 'string' || !payload.version.trim()) {
+      throw new CommandDeliveryRefusedError('Agent update version is required');
+    }
+    const admission = await admitAgentUpdate({
+      deviceId: ctx.deviceId,
+      targets: { [component]: payload.version },
+      // No site identity is present in the trusted delivery context. The
+      // admission service uses an exclusive fleet slot; never trust a payload site key.
+    });
+    if (!admission.allowed) {
+      throw new CommandDeliveryDeferredError(`Agent update deferred: ${admission.reason}`);
+    }
+    return payload;
+  });
 }
 
 /**

@@ -1,9 +1,9 @@
 import { dispatchExtensionHostEvent, parseExtensionPageContextV1, type ExtensionPageContextV1 } from '@breeze/extension-web-sdk';
 
-type Provider = 'threecx' | 'microsoft' | 'google';
+type Provider = 'threecx' | 'microsoft' | 'google' | 'idrive';
 type Status = { connected: boolean; enabled?: boolean; canManage?: boolean; available?: boolean };
 type HostApi = { request(path: string): Promise<Response> };
-const providers = [{ id: 'threecx', title: '3CX', description: 'PBX connection and extension directory.' }, { id: 'microsoft', title: 'Microsoft 365', description: 'Users, groups, licenses and SharePoint inventory.' }, { id: 'google', title: 'Google Workspace', description: 'Users and groups from the connected Workspace directory.' }] as const;
+const providers = [{ id: 'idrive', title: 'IDrive 360', description: 'Backup coverage, plans, devices and deployment.' }, { id: 'threecx', title: '3CX', description: 'PBX connection and extension directory.' }, { id: 'microsoft', title: 'Microsoft 365', description: 'Users, groups, licenses and SharePoint inventory.' }, { id: 'google', title: 'Google Workspace', description: 'Users and groups from the connected Workspace directory.' }] as const;
 
 export class CloudCommandOverviewPage extends HTMLElement {
   private root = this.attachShadow({ mode: 'open' });

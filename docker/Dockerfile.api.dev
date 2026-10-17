@@ -26,6 +26,7 @@ COPY packages/extension-testkit/package.json ./packages/extension-testkit/
 COPY ee/workspace/package.json ./ee/workspace/
 COPY packages/ext-cloud-command/package.json ./packages/ext-cloud-command/
 COPY packages/ext-rustdesk-access/package.json ./packages/ext-rustdesk-access/
+COPY packages/ext-credentials/package.json ./packages/ext-credentials/
 
 # Install all dependencies (including devDependencies for development)
 RUN pnpm install
@@ -42,6 +43,7 @@ COPY packages/extension-testkit ./packages/extension-testkit
 COPY ee/workspace ./ee/workspace
 COPY packages/ext-cloud-command ./packages/ext-cloud-command
 COPY packages/ext-rustdesk-access ./packages/ext-rustdesk-access
+COPY packages/ext-credentials ./packages/ext-credentials
 
 # Set working directory to api
 WORKDIR /app/apps/api

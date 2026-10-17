@@ -16,6 +16,10 @@ import SessionPickerModal from './SessionPickerModal';
 interface Props {
   /** Browser is the default; native remains available to explicit consumers. */
   viewerMode?: 'browser' | 'native';
+  /** Explicit browser entry must not redirect to a configured native provider. */
+  preferBuiltIn?: boolean;
+  /** Dedicated desktop page: consume its explicit navigation once. */
+  autoStart?: boolean;
   deviceId: string;
   className?: string;
   compact?: boolean;
@@ -116,7 +120,7 @@ function desktopAccessUnavailableReason(
   }
 }
 
-export default function ConnectDesktopButton({ viewerMode = 'browser', deviceId, className = '', compact = false, iconOnly = false, disabled = false, disabledTitle, isHeadless = false, desktopAccess = null, remoteAccessPolicy = null, helperLifecycleMode = null }: Props) {
+export default function ConnectDesktopButton({ viewerMode = 'browser', preferBuiltIn = false, autoStart = false, deviceId, className = '', compact = false, iconOnly = false, disabled = false, disabledTitle, isHeadless = false, desktopAccess = null, remoteAccessPolicy = null, helperLifecycleMode = null }: Props) {
   const { t } = useTranslation('remote');
   const [status, setStatus] = useState<'idle' | 'creating' | 'launching' | 'fallback' | 'denied' | 'ending' | 'revoked' | 'loginWindow' | 'unavailable' | 'startFailed'>('idle');
   // #7335: the agent's (server-redacted) reason for a failed start_desktop.
@@ -282,7 +286,7 @@ export default function ConnectDesktopButton({ viewerMode = 'browser', deviceId,
       // is intentionally NOT toasted — that's the expected-empty case.
       // `scheme_not_allowed` would be a 422 on the launch POST, so it's
       // surfaced loudly there rather than here.
-      if (!hasRemoteAccessLauncher && launcherSkipReason && launcherSkipReason !== 'no_provider_configured') {
+      if (!preferBuiltIn && !hasRemoteAccessLauncher && launcherSkipReason && launcherSkipReason !== 'no_provider_configured') {
         const friendly =
           launcherSkipReason === 'missing_device_identifier'
             ? t('connectDesktopButton.launcherSkip.missingIdentifier')
@@ -320,7 +324,7 @@ export default function ConnectDesktopButton({ viewerMode = 'browser', deviceId,
       // file:, etc. at write time AND re-checks the substituted URL before
       // returning 422. We still re-check on the client so a tampered
       // response can't execute a hostile scheme in the partner's origin.
-      if (hasRemoteAccessLauncher) {
+      if (hasRemoteAccessLauncher && !preferBuiltIn) {
         const launchRes = await fetchWithAuth(`/devices/${deviceId}/remote-access-launch`, {
           method: 'POST',
         });
@@ -585,7 +589,7 @@ export default function ConnectDesktopButton({ viewerMode = 'browser', deviceId,
       );
       setStatus('idle');
     }
-  }, [viewerMode, deviceId, desktopAccess, remoteAccessPolicy, endSession, connectViaVnc, t]);
+  }, [viewerMode, preferBuiltIn, deviceId, desktopAccess, remoteAccessPolicy, endSession, connectViaVnc, t]);
 
   // Entry point for a connect click. RDS hosts open the session picker first;
   // everything else connects immediately (unchanged behavior).
@@ -596,6 +600,15 @@ export default function ConnectDesktopButton({ viewerMode = 'browser', deviceId,
     }
     void startConnect();
   }, [helperLifecycleMode, startConnect]);
+
+  const autoStartConsumed = useRef(false);
+  useEffect(() => {
+    if (!autoStart || autoStartConsumed.current || disabled || isHeadless
+      || remoteAccessPolicy?.webrtcDesktop === false
+      || (desktopAccess?.mode === 'unavailable' && !canFallbackToVNC(desktopAccess, remoteAccessPolicy))) return;
+    autoStartConsumed.current = true;
+    handleClick();
+  }, [autoStart, disabled, isHeadless, remoteAccessPolicy, desktopAccess, handleClick]);
 
   const handleDismiss = useCallback(() => {
     setVncFallback(null);

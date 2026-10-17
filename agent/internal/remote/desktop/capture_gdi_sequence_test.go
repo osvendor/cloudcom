@@ -33,6 +33,7 @@ type fakeGDI struct {
 	bitBltFailAlways     bool
 	getDIBitsErrno       syscall.Errno
 	getDIBitsPartial     bool // copy fewer scan lines than asked
+	getDIBitsFailNoErrno bool // observed driver failure with no extended error
 	failSelectTo         uintptr
 	selectErrno          syscall.Errno
 
@@ -84,6 +85,9 @@ func (f *fakeGDI) GetDIBits(hdc, hbm uintptr, lines int, bits *byte, bi *bitmapI
 	}
 	if f.getDIBitsErrno != 0 {
 		return 0, f.getDIBitsErrno
+	}
+	if f.getDIBitsFailNoErrno {
+		return 0, syscall.Errno(0)
 	}
 	if f.getDIBitsPartial {
 		return lines - 1, syscall.Errno(0)

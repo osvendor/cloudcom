@@ -27,7 +27,10 @@ nativeTargetRoutes.use('*', async (c, next) => {
     const deviceLimit = await rateLimiter(redis, `native_target_device:${target.id}`, 240, 60);
     if (!deviceLimit.allowed) { c.header('Retry-After', '60'); return c.json({ error: 'Rate limit exceeded' }, 429); }
     c.set('nativeTarget', target);
-    await withDbAccessContext({ scope: 'organization', orgId: target.orgId, accessibleOrgIds: [target.orgId], userId: null }, next);
+    // Own-partner SELECT visibility is needed for inherited remote-access policy.
+    // This identity comes only from the authenticated target's active tenant;
+    // organization scope and partner-wide write access remain unchanged.
+    await withDbAccessContext({ scope: 'organization', orgId: target.orgId, accessibleOrgIds: [target.orgId], currentPartnerId: target.partnerId, userId: null }, next);
   } catch (error) {
     return c.json({ error: 'Native admission unavailable' }, error instanceof NativeAdmissionError ? error.status : 503);
   }

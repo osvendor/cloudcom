@@ -6,6 +6,20 @@
  * that stops appearing in apps/api/src fails the "stale" check.
  */
 export const INTERNAL_ENV_VARS: Readonly<Record<string, string>> = {
+  // CloudCom host admission controls; status is shown in Operations health.
+  CLOUDCOM_CAPACITY_GUARD_ENABLED: 'background capacity admission switch',
+  CLOUDCOM_CAPACITY_GUARD_CPU_PAUSE_PERCENT: 'background CPU pause threshold',
+  CLOUDCOM_CAPACITY_GUARD_CPU_RESUME_PERCENT: 'background CPU recovery threshold',
+  CLOUDCOM_CAPACITY_GUARD_EVENT_LOOP_PAUSE_MS: 'background event-loop pause threshold',
+  CLOUDCOM_CAPACITY_GUARD_EVENT_LOOP_RESUME_MS: 'background event-loop recovery threshold',
+  CLOUDCOM_CAPACITY_GUARD_MEMORY_PAUSE_PERCENT: 'background memory pause threshold',
+  CLOUDCOM_CAPACITY_GUARD_MEMORY_RESUME_PERCENT: 'background memory recovery threshold',
+  CLOUDCOM_CAPACITY_GUARD_STEAL_PAUSE_PERCENT: 'hypervisor pressure pause threshold',
+  CLOUDCOM_CAPACITY_GUARD_STEAL_RESUME_PERCENT: 'hypervisor pressure recovery threshold',
+  CLOUDCOM_UPDATE_GUARD_ENABLED: 'fleet update admission switch',
+  CLOUDCOM_UPDATE_MAX_CONCURRENT: 'fleet concurrent update limit',
+  CLOUDCOM_UPDATE_STARTS_PER_WINDOW: 'fleet update start rate',
+  CLOUDCOM_UPDATE_WINDOW_SECONDS: 'fleet update start window',
   // ABUSE_*
   ABUSE_HOSTNAME_INDICATORS: 'abuse heuristic tuning list',
   ABUSE_SCRIPT_INDICATORS: 'abuse heuristic tuning list',
@@ -492,6 +506,7 @@ export const INTERNAL_ENV_VARS: Readonly<Record<string, string>> = {
   USER_RISK_SCAN_CRON: 'job schedule override',
   USER_RISK_TRAINING_DEDUP_HOURS: 'timing knob',
   USER_RISK_WORKER_CONCURRENCY: 'worker throughput knob',
+  WORKER_STARTUP_CONCURRENCY: 'bounded background worker initialization throughput',
   // VIEWER_*
   VIEWER_BINARY_DIR: 'filesystem path',
   // VITEST

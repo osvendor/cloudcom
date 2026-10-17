@@ -38,6 +38,8 @@ const systemDbAccessContextPassthrough = async (fn: () => Promise<unknown>) => {
 const withSystemDbAccessContextMock = vi.fn(systemDbAccessContextPassthrough);
 
 vi.mock('../../db', () => ({
+  getCurrentDbTransactionIdentity: () => undefined,
+  getCurrentDbAccessContext: () => undefined,
   db: {
     select: (...args: unknown[]) => selectMock(...(args as [])),
     update: (...args: unknown[]) => updateMock(...(args as [])),
@@ -1350,6 +1352,84 @@ const watchdogDeviceRow = {
   watchdogStatus: 'connected',
   watchdogLastSeen: new Date(),
 };
+
+describe('POST /agents/:id/heartbeat — rollout admission wiring', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    selectMock.mockReset();
+    updateMock.mockReset();
+    insertMock.mockReset();
+    claimPendingCommandsForDeviceMock.mockReset();
+    withSystemDbAccessContextMock.mockImplementation(systemDbAccessContextPassthrough);
+    callOrder.length = 0;
+    getActiveTrustKeysetMock.mockResolvedValue([]);
+    getActiveManifestKeyDelegationsMock.mockResolvedValue([]);
+    updateMock.mockReturnValue({ set: vi.fn(() => ({ where: vi.fn(() => whereResultWithReturning()) })) });
+    insertMock.mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) });
+    const helpers = await import('./helpers');
+    vi.mocked(helpers.compareAgentVersions).mockReturnValue(1);
+    vi.mocked(helpers.agentAcceptsServedEdition).mockReturnValue(true);
+    vi.mocked(helpers.resolvePinnedUpgradeTarget).mockResolvedValue('0.66.0');
+    vi.mocked(helpers.getOrgAgentUpdateConfig).mockResolvedValue({
+      settings: { policy: 'auto', maintenanceWindow: null }, pins: { agent: null, watchdog: null },
+    });
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    claimPendingCommandsForDeviceMock.mockResolvedValue([]);
+    const helpers = await import('./helpers');
+    vi.mocked(helpers.compareAgentVersions).mockReturnValue(0);
+    vi.mocked(helpers.getOrgAgentUpdateConfig).mockResolvedValue({
+      settings: { policy: 'staged', maintenanceWindow: null }, pins: { agent: null, watchdog: null },
+    });
+  });
+
+  it.each(['agent', 'watchdog'] as const)('%s admission runs after the org transaction and leaves ordinary commands deliverable', async role => {
+    selectMock.mockReturnValueOnce(selectChainResolving([{
+      ...watchdogDeviceRow, status: 'online',
+      lastSeenAt: new Date(Date.now() - 20 * 60_000),
+    }]));
+    selectMock.mockReturnValue(selectChainResolving([]));
+    const commandType = role === 'watchdog' ? 'restart_agent' : 'list_services';
+    claimPendingCommandsForDeviceMock.mockResolvedValueOnce([{
+      id: 'ordinary-command', deviceId: 'device-1', type: commandType, payload: {}, executedAt: new Date(),
+    }]);
+    const admission = await import('../../services/agentRolloutAdmission');
+    const guard = vi.spyOn(admission, 'guardHeartbeatUpdates').mockImplementation(async input => {
+      callOrder.push('rollout:admit');
+      expect(callOrder.lastIndexOf('dbContext:released')).toBeGreaterThan(callOrder.lastIndexOf('dbContext:opened'));
+      expect(input.response.upgradeTo).toBe('0.66.0');
+      expect(input.response.watchdogUpgradeTo).toBe('0.66.0');
+      input.response.upgradeTo = null;
+      input.response.helperUpgradeTo = undefined;
+      input.response.watchdogUpgradeTo = undefined;
+    });
+    const response = await (role === 'watchdog' ? buildWatchdogApp() : buildApp()).request('/agents/device-1/heartbeat', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        ...minimalHeartbeatBody, role, helperVersion: '0.65.10', watchdogVersion: '0.65.10', backupVersion: '0.65.10',
+        ...(role === 'watchdog' ? { watchdogState: 'FAILOVER' } : {}),
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(guard).toHaveBeenCalledTimes(1);
+    expect(guard.mock.calls[0]?.[0]).toMatchObject({
+      deviceId: 'device-1', siteKey: 'org-1:site-1',
+      versions: role === 'watchdog'
+        ? { watchdog: '0.65.10' }
+        : { agent: '0.65.10', helper: '0.65.10', watchdog: '0.65.10', backup: '0.65.10' },
+    });
+    if (role === 'watchdog') expect(guard.mock.calls[0]?.[0].versions).not.toHaveProperty('agent');
+    expect(callOrder.indexOf('rollout:admit')).toBeGreaterThan(callOrder.indexOf('dbContext:released'));
+    const body = await response.json() as Record<string, unknown>;
+    expect(body.commands).toEqual([expect.objectContaining({ id: 'ordinary-command', type: commandType })]);
+    expect(body.upgradeTo).toBeNull();
+    expect(body.helperUpgradeTo).toBeUndefined();
+    expect(body.watchdogUpgradeTo).toBeUndefined();
+    if (role === 'agent') expect(body).toHaveProperty('configUpdate.backup_server_url');
+  });
+});
 
 // `agent_heartbeat_total` had a Grafana panel and a `NoAgentHeartbeats` alert rule
 // but no producer — the route never touched the counter, so both read a flat zero

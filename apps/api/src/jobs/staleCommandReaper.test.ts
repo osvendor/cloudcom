@@ -189,6 +189,92 @@ describe('resolveMaxReapPerRun', () => {
   });
 });
 
+describe('capacity-deferred agent update deadlines', () => {
+  const NOW = new Date('2026-10-16T16:00:00Z');
+  const MINUTE = 60_000;
+  const deferredReason = 'Agent update deferred: host-pressure';
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => { vi.useRealTimers(); });
+
+  function arrange(overrides: Record<string, unknown>) {
+    selectMock.mockReturnValueOnce(selectChain([{
+      id: 'capacity-update', type: 'update_agent', status: 'pending', payload: { version: '0.123.0' },
+      deviceId: 'device-1', createdAt: new Date(NOW.getTime() - 30 * MINUTE),
+      executedAt: null, deliverBy: null, result: { deliveryDeferred: deferredReason },
+      ...overrides,
+    }]));
+    const write = vi.fn(() => ({
+      where: vi.fn(() => ({ returning: vi.fn().mockResolvedValue([{ id: 'capacity-update' }]) })),
+    }));
+    updateMock.mockImplementation(table => {
+      if (table === deviceCommandsTable) return { set: write };
+      if (table === deploymentResultsTable || table === restoreJobsTable) {
+        return { set: vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) })) };
+      }
+      throw new Error('Unexpected propagation table');
+    });
+    return write;
+  }
+
+  it.each(['update_agent', 'update_watchdog'])('retains %s until 30 minutes from creation', async type => {
+    arrange({ type, createdAt: new Date(NOW.getTime() - 30 * MINUTE + 1) });
+    expect(await reapStaleDeviceCommands()).toBe(0);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['update_agent', 'update_watchdog'])('expires %s at the 30 minute boundary with the capacity reason', async type => {
+    const write = arrange({ type });
+    expect(await reapStaleDeviceCommands()).toBe(1);
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed',
+      result: expect.objectContaining({
+        status: 'timeout', reason: 'delivery_deferred', timedOutBy: 'server',
+        error: `Command was not delivered: ${deferredReason}`,
+      }),
+    }));
+  });
+
+  it('honors a shorter explicit delivery deadline without extending offline work', async () => {
+    const write = arrange({ createdAt: new Date(NOW.getTime() - 5 * MINUTE), deliverBy: new Date(NOW.getTime() - 1) });
+    expect(await reapStaleDeviceCommands()).toBe(1);
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ clock: 'delivery', reason: 'delivery_deferred' }),
+    }));
+  });
+
+  it('does not extend an ordinary short command carrying a deferral marker', async () => {
+    arrange({ type: 'list_processes', createdAt: new Date(NOW.getTime() - 5 * MINUTE) });
+    expect(await reapStaleDeviceCommands()).toBe(1);
+  });
+
+  it('starts an already-sent update timeout at execution rather than creation', async () => {
+    arrange({
+      status: 'sent', createdAt: new Date(NOW.getTime() - 60 * MINUTE),
+      executedAt: new Date(NOW.getTime() - 30 * MINUTE + 1),
+    });
+    expect(await reapStaleDeviceCommands()).toBe(0);
+  });
+
+  it('times out a sent update normally despite an old capacity marker', async () => {
+    const write = arrange({ status: 'sent', executedAt: new Date(NOW.getTime() - 30 * MINUTE) });
+    expect(await reapStaleDeviceCommands()).toBe(1);
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({
+      result: expect.objectContaining({ error: 'Server-side timeout: no response from agent after 30 minutes' }),
+    }));
+  });
+
+  it('does not shorten the existing signed rollback recovery timeout', async () => {
+    arrange({ type: 'agent_rollback_v1', createdAt: new Date(NOW.getTime() - 31 * MINUTE) });
+    expect(await reapStaleDeviceCommands()).toBe(0);
+  });
+});
+
 describe('stale command reaper', () => {
   beforeEach(() => {
     vi.resetAllMocks();
