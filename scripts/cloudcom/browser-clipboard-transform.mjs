@@ -14,10 +14,7 @@ export function applyBrowserClipboard(content) {
     content = content.replace("const { readText } = await import('@tauri-apps/plugin-clipboard-manager');\n      text = await readText();", "text = await navigator.clipboard.readText();");
   }
   if (modernClipboard) {
-    replace('  // One controller per WebRTC clipboard channel (lib/clipboardSync.ts).\n  const clipboardSyncRef = useRef<ClipboardSync | null>(null);\n  const [clipboardState, setClipboardState] = useState<ClipboardSyncState | null>(null);', `  const browserClipboardRef = useRef<BrowserClipboard | null>(null);
-  if (!browserClipboardRef.current) browserClipboardRef.current = new BrowserClipboard(setPasteNotice);
-  useEffect(() => () => browserClipboardRef.current?.clear(), []);
-  useEffect(() => { if (closing || status !== 'connected') browserClipboardRef.current?.clear(); }, [closing, status]);`);
+    replace('  // One controller per WebRTC clipboard channel (lib/clipboardSync.ts).\n  const clipboardSyncRef = useRef<ClipboardSync | null>(null);\n  const [clipboardState, setClipboardState] = useState<ClipboardSyncState | null>(null);', '');
     replace('  const [remapOverride, setRemapOverride] = useState<boolean | null>(null);\n  const remapCmdCtrl = remapOverride ?? defaultRemapCmdCtrl(VIEWER_OS, remoteOs);', `  const [remapCmdCtrl, setRemapCmdCtrl] = useState(false);
   const browserRemapOverrideRef = useRef(false);
   useEffect(() => {
@@ -41,11 +38,6 @@ export function applyBrowserClipboard(content) {
           browserRemapOverrideRef.current = true;
           setRemapCmdCtrl(value);
         }}`);
-  replace("  const [pasteNotice, setPasteNotice] = useState<string | null>(null);", `  const [pasteNotice, setPasteNotice] = useState<string | null>(null);
-  const browserClipboardRef = useRef<BrowserClipboard | null>(null);
-  if (!browserClipboardRef.current) browserClipboardRef.current = new BrowserClipboard(setPasteNotice);
-  useEffect(() => () => browserClipboardRef.current?.clear(), []);
-  useEffect(() => { if (closing || status !== 'connected') browserClipboardRef.current?.clear(); }, [closing, status]);`);
   const start = content.indexOf('      onClipboardChannel: (channel) => {');
   const end = content.indexOf('      onCursorChannelOpen:', start);
   if (start < 0 || end < 0) throw new Error('Browser clipboard channel attachment point changed');
@@ -55,6 +47,13 @@ export function applyBrowserClipboard(content) {
       },
 ` + content.slice(end);
   }
+  // The upstream native clipboard ref may precede status and pasteNotice.
+  // Browser construction reads both immediately, so attach after their state.
+  replace("  const [pasteNotice, setPasteNotice] = useState<string | null>(null);", `  const [pasteNotice, setPasteNotice] = useState<string | null>(null);
+  const browserClipboardRef = useRef<BrowserClipboard | null>(null);
+  if (!browserClipboardRef.current) browserClipboardRef.current = new BrowserClipboard(setPasteNotice);
+  useEffect(() => () => browserClipboardRef.current?.clear(), []);
+  useEffect(() => { if (closing || status !== 'connected') browserClipboardRef.current?.clear(); }, [closing, status]);`);
   const keyHook = modernClipboard
     ? '    if (!viewOnlyRef.current && composition.keyDown(ne) === \'capture\') return;\n    e.preventDefault();'
     : '  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {\n    e.preventDefault();';

@@ -59,6 +59,13 @@ extension and browser suites and all three application builds passed before imag
 acceptance. Native PAM race tests retain both CloudCom failure evidence and the
 upstream restart/token-verification marker; the current fleet binary is unchanged.
 
+Live browser acceptance caught a clipboard adapter initialization-order regression:
+the upstream clipboard ref precedes the browser status and paste-notice state.
+The browser transform now attaches its controller after that state is declared.
+A real, unmocked viewer render test reproduces the original temporal-dead-zone
+failure and passes after repair; all 42 browser desktop tests and the 47-module
+sync contract pass. Preserve this render test across future viewer refreshes.
+
 Local MSI serving now requires a signed artifact manifest. Stage a manifest for
 the verified current MSI using the established CloudCom release trust key and
 register that public key while retaining existing verifier keys. Keep the native

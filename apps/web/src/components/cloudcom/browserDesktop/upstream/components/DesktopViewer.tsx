@@ -299,10 +299,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
   const activeVncTunnelIdRef = useRef<string | null>(null);
   const switchingToRef = useRef<Transport | null>(null);
 
-  const browserClipboardRef = useRef<BrowserClipboard | null>(null);
-  if (!browserClipboardRef.current) browserClipboardRef.current = new BrowserClipboard(setPasteNotice);
-  useEffect(() => () => browserClipboardRef.current?.clear(), []);
-  useEffect(() => { if (closing || status !== 'connected') browserClipboardRef.current?.clear(); }, [closing, status]);
+
   const [vncClipboardState, setVncClipboardState] = useState<VncClipboardState | null>(null);
   const webrtcMouseMovePendingRef = useRef<{ x: number; y: number } | null>(null);
   const webrtcMouseMoveRafRef = useRef<number | null>(null);
@@ -334,6 +331,10 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
   // NOT errorMessage — that only renders behind the full-screen connection-error
   // overlay, and a failed paste must not tear down a working session.
   const [pasteNotice, setPasteNotice] = useState<string | null>(null);
+  const browserClipboardRef = useRef<BrowserClipboard | null>(null);
+  if (!browserClipboardRef.current) browserClipboardRef.current = new BrowserClipboard(setPasteNotice);
+  useEffect(() => () => browserClipboardRef.current?.clear(), []);
+  useEffect(() => { if (closing || status !== 'connected') browserClipboardRef.current?.clear(); }, [closing, status]);
   // null = follow the viewer/remote OS default. Only a Mac on exactly one side
   // needs the swap; on Windows → Windows it turned a held Ctrl into the Win key.
   const [remapCmdCtrl, setRemapCmdCtrl] = useState(false);
