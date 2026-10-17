@@ -10,7 +10,7 @@ export function applyBrowserClipboard(content) {
     content = content.replace("import { ClipboardSync, type ClipboardSyncState } from '../lib/clipboardSync';\n", '')
       .replace("import { createTauriClipboardIO } from '../lib/clipboardIO';\n", '')
       .replace("const clipboardIO = createTauriClipboardIO();\n", '');
-    content = content.replace("import { defaultModifierRemap } from '../../keyboard';\n", "import { defaultModifierRemap } from '../../keyboard';\nconst clipboardIO = {\n  readText: async () => { try { return await navigator.clipboard.readText(); } catch { return null; } },\n  writeText: (text) => navigator.clipboard.writeText(text),\n  writeImage: async (bytes, format) => {\n    if (typeof ClipboardItem === 'undefined' || !navigator.clipboard.write) throw new Error('Browser image clipboard is unavailable');\n    const blob = new Blob([bytes], { type: `image/${format}` });\n    await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);\n  },\n};\n");
+    content = content.replace("import { defaultModifierRemap } from '../../keyboard';\n", "import { defaultModifierRemap } from '../../keyboard';\nconst clipboardIO = {\n  readText: async () => { try { return await navigator.clipboard.readText(); } catch { return null; } },\n  writeText: (text: string) => navigator.clipboard.writeText(text),\n  writeImage: async (bytes: Uint8Array, format: 'png' | 'jpeg') => {\n    if (typeof ClipboardItem === 'undefined' || !navigator.clipboard.write) throw new Error('Browser image clipboard is unavailable');\n    const blob = new Blob([new Uint8Array(bytes).buffer], { type: `image/${format}` });\n    await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);\n  },\n};\n");
     content = content.replace("const { readText } = await import('@tauri-apps/plugin-clipboard-manager');\n      text = await readText();", "text = await navigator.clipboard.readText();");
   }
   if (modernClipboard) {
@@ -50,7 +50,6 @@ export function applyBrowserClipboard(content) {
     const end = content.indexOf('        onCursorChannelOpen:', start);
     if (start < 0 || end < 0) throw new Error('Browser clipboard channel attachment point changed');
     content = content.slice(0, start) + `        onClipboardChannel: (channel) => {
-          clipboardDCRef.current = channel;
           browserClipboardRef.current?.attach(channel);
         },
 ` + content.slice(end);
@@ -92,6 +91,7 @@ export function applyBrowserClipboard(content) {
         e.preventDefault();
         browserClipboardRef.current?.requestCopy(() => {
           sendInputFn({ type: 'key_press', key: 'c', modifiers: [remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl'] });
+          forgetModifiersReleasedByKeyPress([remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl']);
         });
         return;
       }
@@ -126,16 +126,22 @@ export function applyBrowserClipboard(content) {
           rememberDevicePrefs({ remapCmdCtrl: v });
         }}`,
       `        onRemapCmdCtrlChange={(value) => {
+          releaseAllKeys();
           browserRemapOverrideRef.current = true;
           setRemapCmdCtrl(value);
+          rememberDevicePrefs({ remapCmdCtrl: value });
         }}`);
+    replace('        setRemapOverride(prefs.remapCmdCtrl);', `        browserRemapOverrideRef.current = true;
+        setRemapCmdCtrl(prefs.remapCmdCtrl);`);
   }
-  replace('    onKeyDown: handleKeyDown,', `    onPaste: (event: React.ClipboardEvent) => {
+  replace('  const interactionProps = {', `  const browserClipboardEvents = {
+    onPaste: (event: React.ClipboardEvent) => {
       if (transport !== 'webrtc' || status !== 'connected' || closing${modernClipboard ? ' || viewOnlyRef.current' : ''}) return;
       event.preventDefault();
       const text = event.clipboardData.getData('text/plain');
       void browserClipboardRef.current?.paste(text, () => {
         sendInputFn({ type: 'key_press', key: 'v', modifiers: [remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl'] });
+        ${modernClipboard ? "forgetModifiersReleasedByKeyPress([remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl']);" : ''}
       });
     },
     // Browser shells may deliver native Copy without dispatching a KeyC event.
@@ -145,18 +151,29 @@ export function applyBrowserClipboard(content) {
       event.preventDefault();
       browserClipboardRef.current?.requestCopy(() => {
         sendInputFn({ type: 'key_press', key: 'c', modifiers: [remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl'] });
+        ${modernClipboard ? "forgetModifiersReleasedByKeyPress([remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl']);" : ''}
       });
     },
-    onKeyDown: handleKeyDown,`);
+  };
+  const interactionProps = {`);
+  if (modernClipboard) {
+    // Clipboard events bubble from both the video and the focused IME input.
+    // Keep this ancestor limited to remote input, outside local toolbar/forms.
+    replace('        <div className={`absolute inset-0 ${scrollerClassName(viewScaling)}',
+      '        <div {...browserClipboardEvents} className={`absolute inset-0 ${scrollerClassName(viewScaling)}');
+  }
   replace('      <div className="flex-1 overflow-hidden flex items-center justify-center bg-black relative">', `      {transport === 'webrtc' && status === 'connected' && !closing && (
         <div className="flex items-center gap-3 bg-gray-900 px-3 py-1 text-xs text-gray-300">
           <span>Ctrl+C / Ctrl+V: copy and paste text in the remote desktop</span>
           <button type="button" className="rounded border border-gray-600 px-2 py-1 hover:bg-gray-800" onClick={() => void browserClipboardRef.current?.copy()}>Copy remote text</button>
         </div>
       )}
-      <div className="flex-1 overflow-hidden flex items-center justify-center bg-black relative">`);
+      <div ${modernClipboard ? '' : '{...browserClipboardEvents} '}className="flex-1 overflow-hidden flex items-center justify-center bg-black relative">`);
   if (/\b(?:clipboardSyncRef|clipboardState|setClipboardState)\b/.test(content)) {
     throw new Error('Browser clipboard adaptation left a native controller reference');
+  }
+  if (modernClipboard && /\b(?:clipboardDCRef|setRemapOverride|remapOverride)\b/.test(content)) {
+    throw new Error('Browser clipboard adaptation left a replaced native binding');
   }
   return content;
 }

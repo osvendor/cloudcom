@@ -39,13 +39,15 @@ test('browser remap derives from local and remote platforms while preserving a m
 
 test('native Copy is scoped to the active remote surface and uses the same deduplicated request', () => {
   const result = applyBrowserClipboard(source);
-  const interaction = result.slice(result.indexOf('  const interactionProps = {'), result.indexOf('\n  return (', result.indexOf('  const interactionProps = {')));
+  const interaction = result.slice(result.indexOf('  const browserClipboardEvents = {'), result.indexOf('  const interactionProps = {'));
   assert.match(interaction, /onCopy: \(event: React.ClipboardEvent\)/);
   assert.match(interaction, /transport !== 'webrtc' \|\| status !== 'connected' \|\| closing/);
   assert.match(interaction, /browserClipboardRef.current\?\.requestCopy\(\(\) =>/);
   assert.match(interaction, /type: 'key_press', key: 'c'/);
   const keyboard = result.slice(result.indexOf('  const handleKeyDown'), result.indexOf('  const handleKeyUp'));
   assert.match(keyboard, /browserClipboardRef.current\?\.requestCopy\(\(\) =>/);
+  assert.match(result, /<div \{\.\.\.browserClipboardEvents\} className=\{`absolute inset-0/);
+  assert.match(interaction, /forgetModifiersReleasedByKeyPress/);
 });
 
 test('upstream clipboard sync is replaced by browser adapters without native clipboard imports', () => {
@@ -55,5 +57,5 @@ test('upstream clipboard sync is replaced by browser adapters without native cli
   assert.match(result, /text = await navigator\.clipboard\.readText\(\);/);
   assert.doesNotMatch(result, /@tauri-apps\/plugin-clipboard-manager/);
   assert.doesNotMatch(result, /ClipboardSync/);
-  assert.doesNotMatch(result, /\b(?:clipboardSyncRef|clipboardState|setClipboardState)\b/);
+  assert.doesNotMatch(result, /\b(?:clipboardSyncRef|clipboardState|setClipboardState|clipboardDCRef|setRemapOverride|remapOverride)\b/);
 });

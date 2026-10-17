@@ -3,10 +3,10 @@ import { BrowserClipboard } from '../../clipboard';
 import { defaultModifierRemap } from '../../keyboard';
 const clipboardIO = {
   readText: async () => { try { return await navigator.clipboard.readText(); } catch { return null; } },
-  writeText: (text) => navigator.clipboard.writeText(text),
-  writeImage: async (bytes, format) => {
+  writeText: (text: string) => navigator.clipboard.writeText(text),
+  writeImage: async (bytes: Uint8Array, format: 'png' | 'jpeg') => {
     if (typeof ClipboardItem === 'undefined' || !navigator.clipboard.write) throw new Error('Browser image clipboard is unavailable');
-    const blob = new Blob([bytes], { type: `image/${format}` });
+    const blob = new Blob([new Uint8Array(bytes).buffer], { type: `image/${format}` });
     await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
   },
 };
@@ -802,7 +802,6 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
           setHasAudioTrack(true);
         },
         onClipboardChannel: (channel) => {
-          clipboardDCRef.current = channel;
           browserClipboardRef.current?.attach(channel);
         },
         onCursorChannelOpen: () => setCursorStreamActive(true),
@@ -2249,6 +2248,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
         e.preventDefault();
         browserClipboardRef.current?.requestCopy(() => {
           sendInputFn({ type: 'key_press', key: 'c', modifiers: [remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl'] });
+          forgetModifiersReleasedByKeyPress([remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl']);
         });
         return;
       }
@@ -2716,7 +2716,8 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
       if (prefs.remapCmdCtrl !== undefined) {
         // Anything held went down under the old mapping.
         releaseAllKeysRef.current();
-        setRemapOverride(prefs.remapCmdCtrl);
+        browserRemapOverrideRef.current = true;
+        setRemapCmdCtrl(prefs.remapCmdCtrl);
       }
       if (prefs.viewScaling) applyViewScaling(prefs.viewScaling);
       if (prefs.audio) setPendingAudioRestore(true);
@@ -2808,18 +2809,14 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
 
   // ── Render ─────────────────────────────────────────────────────────
 
-  const interactionProps = {
-    onMouseMove: handleMouseMove,
-    onMouseDown: handleMouseDown,
-    onMouseUp: handleMouseUp,
-    onContextMenu: handleContextMenu,
-    onPointerDown: handlePointerDown,
+  const browserClipboardEvents = {
     onPaste: (event: React.ClipboardEvent) => {
       if (transport !== 'webrtc' || status !== 'connected' || closing || viewOnlyRef.current) return;
       event.preventDefault();
       const text = event.clipboardData.getData('text/plain');
       void browserClipboardRef.current?.paste(text, () => {
         sendInputFn({ type: 'key_press', key: 'v', modifiers: [remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl'] });
+        forgetModifiersReleasedByKeyPress([remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl']);
       });
     },
     // Browser shells may deliver native Copy without dispatching a KeyC event.
@@ -2829,8 +2826,16 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
       event.preventDefault();
       browserClipboardRef.current?.requestCopy(() => {
         sendInputFn({ type: 'key_press', key: 'c', modifiers: [remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl'] });
+        forgetModifiersReleasedByKeyPress([remoteOs === 'darwin' || remoteOs === 'macos' ? 'meta' : 'ctrl']);
       });
     },
+  };
+  const interactionProps = {
+    onMouseMove: handleMouseMove,
+    onMouseDown: handleMouseDown,
+    onMouseUp: handleMouseUp,
+    onContextMenu: handleContextMenu,
+    onPointerDown: handlePointerDown,
     onKeyDown: handleKeyDown,
     onKeyUp: handleKeyUp,
     onFocus: handleInputFocus,
@@ -2883,8 +2888,10 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
         showRemoteCursor={showRemoteCursor}
         remoteOs={remoteOs}
         onRemapCmdCtrlChange={(value) => {
+          releaseAllKeys();
           browserRemapOverrideRef.current = true;
           setRemapCmdCtrl(value);
+          rememberDevicePrefs({ remapCmdCtrl: value });
         }}
         onReleaseAllKeys={releaseAllKeys}
         onShowRemoteCursorChange={setShowRemoteCursor}
@@ -2927,7 +2934,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
       <div className="flex-1 overflow-hidden flex items-center justify-center bg-black relative">
         {/* Holds the video/canvas; scrolls them at 100% (view scaling, #8241).
             Hidden for VNC so it never sits over noVNC's own container. */}
-        <div className={`absolute inset-0 ${scrollerClassName(viewScaling)} ${transport === 'vnc' ? 'hidden' : ''}`}>
+        <div {...browserClipboardEvents} className={`absolute inset-0 ${scrollerClassName(viewScaling)} ${transport === 'vnc' ? 'hidden' : ''}`}>
           {/* WebRTC: <video> element (hardware H264 decode) */}
           <video
             ref={videoRef}

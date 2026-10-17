@@ -1,5 +1,5 @@
 /** Browser equivalents for the native viewer's window registration/clipboard. */
-export async function invoke<T = void>(command: string, _args?: Record<string, unknown>): Promise<T> {
+export async function invoke<T = void>(command: string, _args?: Record<string, unknown> | Uint8Array): Promise<T> {
   if (!['register_session', 'unregister_session', 'register_device', 'update_session_hostname'].includes(command)) {
     throw new Error('This operation requires the native viewer.');
   }

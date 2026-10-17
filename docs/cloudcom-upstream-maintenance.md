@@ -65,10 +65,15 @@ The browser transform now attaches its controller after that state is declared.
 A real viewer render test reproduces the original temporal-dead-zone failure.
 The adaptation also replaces every native clipboard-controller reference in
 transport startup, cleanup and keyboard handling; generation fails if any remain.
-A transport-start test exercises the real viewer with mocked network channels,
-including connected rendering and unmount cleanup. All 43 browser desktop tests
-and the 47-module sync contract pass. Preserve these tests across viewer refreshes
-and keep browser clipboard gestures gated by connected, writable session state.
+Transport tests exercise the real viewer with mocked network channels, including
+clipboard-channel arrival, connected rendering and unmount cleanup. Clipboard
+events bubble through the remote media scroller so both video and IME focus work;
+clipboard ACK precedes paste input, and synthesized chords clear released modifier
+bookkeeping. Restore remembered remapping and release held keys before changing it.
+All 47 browser desktop tests and the 47-module sync contract pass. The CI binding
+guard also checks TypeScript diagnostics in the imported browser viewer graph;
+Astro transpilation alone does not reject missing identifiers. Preserve these
+checks across viewer refreshes and gate gestures by connected, writable state.
 
 Local MSI serving now requires a signed artifact manifest. Stage a manifest for
 the verified current MSI using the established CloudCom release trust key and
