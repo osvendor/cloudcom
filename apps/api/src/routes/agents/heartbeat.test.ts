@@ -2137,6 +2137,38 @@ describe('POST /agents/:id/heartbeat — rollout admission wiring', () => {
     });
   });
 
+  it.each([
+    { name: 'disabled Assist', settings: { enabled: false }, hierarchyFails: false, offered: false },
+    { name: 'enabled Assist', settings: { enabled: true }, hierarchyFails: false, offered: true },
+    { name: 'unknown Assist policy', settings: null, hierarchyFails: false, offered: true },
+    { name: 'failed hierarchy with fallback disabled', settings: { enabled: false }, hierarchyFails: true, offered: true },
+  ])('$name is evaluated before reserving an update slot', async ({ settings, hierarchyFails, offered }) => {
+    selectMock.mockReturnValueOnce(selectChainResolving([{ ...watchdogDeviceRow, status: 'online' }]));
+    selectMock.mockReturnValue(selectChainResolving([]));
+    const helpers = await import('./helpers');
+    vi.mocked(helpers.buildHelperConfigUpdate).mockResolvedValueOnce(settings as never);
+    if (hierarchyFails) {
+      const { loadDeviceHierarchy } = await import('../../services/deviceHierarchy');
+      vi.mocked(loadDeviceHierarchy).mockRejectedValueOnce(new Error('policy unavailable'));
+    }
+    const admission = await import('../../services/agentRolloutAdmission');
+    const guard = vi.spyOn(admission, 'guardHeartbeatUpdates').mockImplementation(async input => {
+      expect(callOrder.lastIndexOf('dbContext:released')).toBeGreaterThan(callOrder.lastIndexOf('dbContext:opened'));
+      expect(input.response.helperUpgradeTo).toBe(offered ? '0.66.0' : undefined);
+      expect(input.response.upgradeTo).toBe('0.66.0');
+      expect(input.response.watchdogUpgradeTo).toBe('0.66.0');
+    });
+    const response = await buildApp().request('/agents/device-1/heartbeat', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...minimalHeartbeatBody, securityCapabilities: { retainStateProtocolVersion: 1 } }),
+    });
+    expect(response.status).toBe(200);
+    expect(guard).toHaveBeenCalledTimes(1);
+    const body = await response.json() as Record<string, unknown>;
+    expect(body.helperUpgradeTo).toBe(offered ? '0.66.0' : undefined);
+    if (hierarchyFails || settings === null) expect(body.retainState).toContain('helper');
+  });
+
   it.each(['agent', 'watchdog'] as const)('%s admission runs after the org transaction and leaves ordinary commands deliverable', async role => {
     selectMock.mockReturnValueOnce(selectChainResolving([{
       ...watchdogDeviceRow, status: 'online',

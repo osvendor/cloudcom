@@ -2351,7 +2351,7 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
   // Fleet/site admission happens after the organization transaction commits.
   // Withhold new update offers under pressure; check-ins and ordinary commands
   // continue. A watchdog reports its own version, not the main agent's version.
-  await guardHeartbeatUpdates({
+  const rolloutAdmission = {
     deviceId: scoped.deviceId,
     siteKey: scoped.siteKey,
     versions: scoped.watchdogOnly ? { watchdog: data.agentVersion } : {
@@ -2361,8 +2361,11 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
       ...(data.backupVersion ? { backup: data.backupVersion } : {}),
     },
     response: scoped.mainResponse,
-  });
-  if (scoped.watchdogOnly) return c.json(scoped.mainResponse);
+  };
+  if (scoped.watchdogOnly) {
+    await guardHeartbeatUpdates(rolloutAdmission);
+    return c.json(scoped.mainResponse);
+  }
 
 
   // Caller verification readiness (#6354 W02), keyed by the authenticated
@@ -2929,6 +2932,17 @@ heartbeatRoutes.post('/:id/heartbeat', bodyLimit({ maxSize: 5 * 1024 * 1024, onE
     helperSettings,
     remoteManagement: scoped.remoteManagement,
   });
+
+  // Breeze Assist only installs while enabled. A bootstrap offer for a
+  // policy-disabled app can never complete and must not reserve a fleet slot.
+  // Trust only a resolved policy; missing/error/retained state is not "off".
+  // This is the optional Tauri helper, not the native user-helper component.
+  if (hierarchyOutcome === 'loaded' && helperSettings?.enabled === false) {
+    scoped.mainResponse.helperUpgradeTo = undefined;
+  }
+  // Policy discovery has closed its DB context; Redis admission still runs
+  // outside tenant transactions and observes actual component versions.
+  await guardHeartbeatUpdates(rolloutAdmission);
 
   return c.json({
     ...scoped.mainResponse,

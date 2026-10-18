@@ -71,6 +71,13 @@ migration. Ordinary commands, authentication and check-ins remain ungated.
 Signed emergency rollback and independent local repair are exempt. Arbitrary
 manually written installer scripts are not parsed or intercepted.
 
+Main heartbeat offers are filtered after policy resolution: explicitly disabled
+Breeze Assist is omitted before admission because its agent manager will not
+install it. A failed/missing hierarchy or missing policy is not treated as off.
+Native user-helper repairs are a distinct component and are unaffected. Existing
+reservations are not edited or cleared when this filter is deployed; any prior
+unconfirmed Assist target expires under the original bounded lease.
+
 ## Routine jobs and health probes
 
 Script monitors check before DB discovery and between monitors/devices.

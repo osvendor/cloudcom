@@ -15,6 +15,12 @@ together without deleting Redis leases. Regression tests include recurring short
 spikes, sustained/severe pressure, clock/probe failures, and 500 concurrent Redis
 requests with limits reduced to one.
 
+Main heartbeat admission follows policy resolution so an explicitly disabled
+Breeze Assist app does not reserve an unfulfillable helper update slot. Only a
+loaded hierarchy plus a resolved `enabled:false` policy withdraws that offer;
+unknown/retained policy keeps its prior behavior. This is separate from native
+user-helper updates. Watchdog-only admission and Redis lease expiry are unchanged.
+
 Preserve `capacityGuard.ts` / `capacityGuardPolicy.ts`, atomic Redis admission in
 `agentRolloutAdmission.ts` / `agentRolloutAdmissionLua.ts`, and their startup and
 shutdown hooks in both API and worker entrypoints. Heartbeat offer admission
