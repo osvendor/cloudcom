@@ -1,6 +1,7 @@
 import { cpus, freemem, platform, totalmem } from 'node:os';
 import { readFile } from 'node:fs/promises';
 import { readEventLoopLag, type EventLoopLagReading } from './eventLoopMonitor';
+import { AgentUpdateCapacityWindow, type AgentUpdateCapacitySnapshot } from './agentUpdateCapacity';
 import {
   capacityPressureReasons, EMPTY_CAPACITY_METRICS, readCapacityGuardConfig,
   type CapacityGuardConfig, type CapacityGuardMetrics, type CapacityGuardReason,
@@ -17,6 +18,7 @@ export interface CapacityGuardSnapshot {
   reasons: CapacityGuardReason[];
   metrics: CapacityGuardMetrics;
   thresholds: CapacityGuardConfig;
+  agentUpdates: AgentUpdateCapacitySnapshot;
 }
 export type HostCapacitySample = Pick<CapacityGuardMetrics,
   'cpuBusyPercent' | 'cpuStealPercent' | 'cpuIowaitPercent' | 'memoryUsedPercent'>;
@@ -26,6 +28,7 @@ export interface CapacityGuardOptions {
   collect?: () => Promise<HostCapacitySample>;
   readEventLoop?: (windowMs: number) => EventLoopLagReading;
   now?: () => number;
+  monotonicNow?: () => number;
   /** Bounded state changes only; logging/reporting failures cannot affect admission. */
   onTransition?: (snapshot: CapacityGuardSnapshot) => void;
 }
@@ -99,6 +102,7 @@ export function createHostCapacityCollector(): () => Promise<HostCapacitySample>
 export class CapacityGuard {
   private readonly config: CapacityGuardConfig;
   private readonly now: () => number;
+  private readonly monotonicNow: () => number;
   private readonly collect: () => Promise<HostCapacitySample>;
   private readonly loop: (windowMs: number) => EventLoopLagReading;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -113,10 +117,14 @@ export class CapacityGuard {
   private reasons: CapacityGuardReason[] = ['not_started'];
   private lastReportedTransition: string | null = null;
   private lastReportedAt: number | null = null;
+  private readonly updateCapacity: AgentUpdateCapacityWindow;
+  private monotonicObservedAt: number | null = null;
 
   constructor(private readonly options: CapacityGuardOptions) {
     this.config = { ...(options.config ?? readCapacityGuardConfig()) };
+    this.updateCapacity = new AgentUpdateCapacityWindow(this.config);
     this.now = options.now ?? Date.now;
+    this.monotonicNow = options.monotonicNow ?? (() => performance.now());
     this.collect = options.collect ?? createHostCapacityCollector();
     this.loop = options.readEventLoop ?? readEventLoopLag;
     this.state = this.config.enabled ? 'warming' : 'disabled';
@@ -130,6 +138,8 @@ export class CapacityGuard {
     this.healthySince = null;
     this.observedAt = null;
     this.reasons = ['warming_up'];
+    this.updateCapacity.reset();
+    this.monotonicObservedAt = null;
     this.reportTransition();
     this.timer = setInterval(() => { void this.sampleNow(); }, this.config.sampleIntervalMs);
     this.timer.unref?.();
@@ -144,6 +154,8 @@ export class CapacityGuard {
     this.healthySince = null;
     this.state = this.config.enabled ? 'stopped' : 'disabled';
     this.reasons = ['stopped'];
+    this.updateCapacity.reset('stopped');
+    this.monotonicObservedAt = null;
     this.reportTransition();
   }
 
@@ -175,18 +187,31 @@ export class CapacityGuard {
 
   private async sample(generation: number): Promise<void> {
     const started = this.now();
+    const monotonicStarted = this.monotonicNow();
+    const monotonicGap = this.monotonicObservedAt === null ? 0 : monotonicStarted - this.monotonicObservedAt;
     const gap = this.observedAt === null ? 0 : started - this.observedAt;
-    if (gap > this.config.staleAfterMs || gap < 0) { this.state = 'paused'; this.healthySince = null; }
+    const clockChanged = this.monotonicObservedAt !== null && Math.abs(gap - monotonicGap) > 1000;
+    if (clockChanged) this.updateCapacity.reset('clock_discontinuity');
+    if (gap > this.config.staleAfterMs || gap < 0) {
+      this.state = 'paused'; this.healthySince = null; this.updateCapacity.reset('observation_gap');
+    }
     try {
       const [host, dependencies] = await Promise.all([this.collect(), this.dependencies()]);
       if (!this.active || generation !== this.generation) return;
-      const loop = this.loop(this.config.sampleIntervalMs);
+      // Cover the actual CPU observation interval when a timer tick is delayed.
+      const elapsed = Math.max(0, this.monotonicNow() - monotonicStarted);
+      const loop = this.loop(Math.max(this.config.sampleIntervalMs,
+        monotonicGap > 0 && monotonicGap <= this.config.staleAfterMs ? monotonicGap : 0) + elapsed);
       this.metrics = { ...host, dependenciesReady: dependencies.ready,
         eventLoopLagMs: loop.monitored && loop.coversWindow ? loop.worstLagMs : null };
       this.observedAt = started;
+      this.monotonicObservedAt = monotonicStarted;
       const reasons = capacityPressureReasons(this.metrics, this.config, this.state !== 'healthy');
       if (dependencies.reason) reasons.push(dependencies.reason);
       if (this.now() - started > this.config.staleAfterMs || this.now() < started) reasons.push('stale_sample');
+      if (dependencies.reason || reasons.includes('stale_sample') || clockChanged || elapsed > this.config.staleAfterMs) {
+        this.updateCapacity.reset('observations_unavailable');
+      } else this.updateCapacity.record(monotonicStarted, this.metrics);
       if (reasons.length) {
         this.state = 'paused'; this.healthySince = null; this.reasons = reasons;
       } else {
@@ -198,6 +223,7 @@ export class CapacityGuard {
       if (!this.active || generation !== this.generation) return;
       this.state = 'paused'; this.healthySince = null; this.observedAt = started;
       this.metrics = { ...EMPTY_CAPACITY_METRICS }; this.reasons = ['sample_failed'];
+      this.updateCapacity.reset('sample_failed');
     }
     this.reportTransition();
   }
@@ -205,7 +231,7 @@ export class CapacityGuard {
   private reportTransition(): void {
     if (!this.options.onTransition) return;
     const snapshot = this.read();
-    const key = `${snapshot.state}:${snapshot.reasons.join(',')}`;
+    const key = `${snapshot.state}:${snapshot.reasons.join(',')}:${snapshot.agentUpdates.allowed}:${snapshot.agentUpdates.reasons.join(',')}`;
     const now = this.now();
     if (key === this.lastReportedTransition) return;
     if (this.lastReportedAt !== null && now >= this.lastReportedAt && now - this.lastReportedAt < 30_000) return;
@@ -217,6 +243,10 @@ export class CapacityGuard {
     const now = this.now();
     const age = this.observedAt === null ? null : now - this.observedAt;
     const stale = age !== null && (age > this.config.staleAfterMs || age < 0);
+    const monotonicAge = this.monotonicObservedAt === null ? null : this.monotonicNow() - this.monotonicObservedAt;
+    if (stale || (age !== null && monotonicAge !== null && Math.abs(age - monotonicAge) > 1000)) {
+      this.updateCapacity.reset('clock_or_sample_invalid');
+    }
     const disabled = !this.config.enabled;
     const reasons = disabled ? [] : [...this.reasons];
     if (stale && !reasons.includes('stale_sample')) reasons.push('stale_sample');
@@ -226,6 +256,7 @@ export class CapacityGuard {
       observedAt: this.observedAt === null ? null : new Date(this.observedAt).toISOString(),
       sampleAgeMs: age, healthyForMs: this.healthySince === null || stale ? 0 : Math.max(0, now - this.healthySince),
       reasons, metrics: { ...this.metrics }, thresholds: { ...this.config },
+      agentUpdates: this.updateCapacity.read(this.monotonicNow()),
     };
   }
 }
@@ -238,6 +269,7 @@ export function startCapacityGuard(options: CapacityGuardOptions): CapacityGuard
       cpuBusyPercent: snapshot.metrics.cpuBusyPercent, cpuStealPercent: snapshot.metrics.cpuStealPercent,
       memoryUsedPercent: snapshot.metrics.memoryUsedPercent, eventLoopLagMs: snapshot.metrics.eventLoopLagMs,
       dependenciesReady: snapshot.metrics.dependenciesReady,
+      agentUpdates: snapshot.agentUpdates,
     });
   }) });
   guard.start();
@@ -248,3 +280,4 @@ export function readCapacityGuard(): CapacityGuardSnapshot {
   return (guard ?? new CapacityGuard({ checkDependencies: async () => false })).read();
 }
 export function canRunBackgroundWork(): boolean { return readCapacityGuard().canRunBackgroundWork; }
+export function canRunAgentUpdateWork(): boolean { return readCapacityGuard().agentUpdates.allowed; }

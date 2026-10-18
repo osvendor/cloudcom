@@ -15,11 +15,11 @@ vi.mock('node:fs/promises', async importOriginal => ({ ...await importOriginal<t
 vi.mock('node:os', async importOriginal => ({ ...await importOriginal<typeof import('node:os')>(), platform: hostIo.platform }));
 
 function harness(options: { collect?: () => Promise<HostCapacitySample>; checkDependencies?: () => Promise<boolean>;
-  onTransition?: (snapshot: CapacityGuardSnapshot) => void } = {}) {
+  onTransition?: (snapshot: CapacityGuardSnapshot) => void; env?: NodeJS.ProcessEnv } = {}) {
   const collect = vi.fn(options.collect ?? (async () => ({ ...host })));
   const checkDependencies = vi.fn(options.checkDependencies ?? (async () => true));
   const readEventLoop = vi.fn(() => ({ ...loop }));
-  const guard = new CapacityGuard({ config: readCapacityGuardConfig({ CLOUDCOM_CAPACITY_GUARD_ENABLED: 'true' }),
+  const guard = new CapacityGuard({ config: readCapacityGuardConfig({ CLOUDCOM_CAPACITY_GUARD_ENABLED: 'true', ...options.env }),
     collect, checkDependencies, readEventLoop, onTransition: options.onTransition });
   guards.push(guard);
   return { guard, collect, checkDependencies, readEventLoop };
@@ -29,6 +29,44 @@ async function start(guard: CapacityGuard) { guard.start(); await guard.sampleNo
 describe('capacity guard admission', () => {
   beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(1_000_000); });
   afterEach(() => { guards.splice(0).forEach(guard => guard.stop()); vi.useRealTimers(); vi.unstubAllEnvs(); });
+
+  it('admits bounded updates between recurring spikes while heavy jobs stay paused', async () => {
+    const { guard, readEventLoop } = harness({ env: { CLOUDCOM_CAPACITY_GUARD_CPU_PAUSE_PERCENT: '35',
+      CLOUDCOM_CAPACITY_GUARD_CPU_RESUME_PERCENT: '25' }, collect: async () => ({ ...host,
+        cpuBusyPercent: Date.now() % 30_000 < 5_000 ? 45 : 15 }) });
+    readEventLoop.mockImplementation(() => ({ ...loop, worstLagMs: Date.now() % 30_000 < 5_000 ? 140 : 25 }));
+    await start(guard);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(guard.read()).toMatchObject({ canRunBackgroundWork: false, agentUpdates: { allowed: true, observedMs: 60_000 } });
+    guard.stop(); expect(guard.read().agentUpdates.allowed).toBe(false);
+  });
+
+  it('covers the entire delayed observation interval in event-loop readings', async () => {
+    const { guard, readEventLoop } = harness(); await start(guard);
+    await vi.advanceTimersByTimeAsync(12_000);
+    await guard.sampleNow();
+    expect(readEventLoop.mock.calls.every(([duration]) => duration >= 5_000)).toBe(true);
+    readEventLoop.mockReturnValue({ ...loop, coversWindow: false });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(guard.read().agentUpdates).toMatchObject({ allowed: false, observedMs: 0 });
+  });
+
+  it('cannot manufacture update capacity coverage with a small forward wall-clock jump', async () => {
+    const { guard } = harness(); await start(guard); await vi.advanceTimersByTimeAsync(45_000);
+    vi.setSystemTime(Date.now() + 15_000); await guard.sampleNow();
+    expect(guard.read().agentUpdates).toMatchObject({ allowed: false, observedMs: 0 });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(guard.read().agentUpdates.allowed).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(guard.read().agentUpdates.allowed).toBe(true);
+  });
+
+  it('includes collection and dependency duration in required lag coverage', async () => {
+    const { guard, checkDependencies, readEventLoop } = harness(); await start(guard);
+    checkDependencies.mockImplementation(() => new Promise(resolve => setTimeout(() => resolve(true), 2_000)));
+    await vi.advanceTimersByTimeAsync(7_000);
+    expect(readEventLoop).toHaveBeenLastCalledWith(7_000);
+  });
 
   it('leaves the default disabled path open without collecting or checking dependencies', async () => {
     vi.stubEnv('CLOUDCOM_CAPACITY_GUARD_ENABLED', 'false');
@@ -171,7 +209,10 @@ describe('capacity guard admission', () => {
     expect(report.mock.calls[2]![0]).toMatchObject({ state: 'paused', reasons: ['cpu_busy'] });
     expect(guard.read().reasons).toEqual(['cpu_busy']);
     await vi.advanceTimersByTimeAsync(90_000);
-    expect(report).toHaveBeenCalledTimes(3);
+    // The sustained update window crosses its own pressure boundary once.
+    expect(report).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(report).toHaveBeenCalledTimes(4);
   });
 });
 

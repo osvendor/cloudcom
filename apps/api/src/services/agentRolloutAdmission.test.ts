@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({ eval: vi.fn(), healthy: vi.fn(), ready: true }));
 vi.mock('./redis', () => ({ getRedis: () => mocks.ready ? { status: 'ready', eval: mocks.eval } : null }));
-vi.mock('./capacityGuard', () => ({ canRunBackgroundWork: mocks.healthy }));
+vi.mock('./capacityGuard', () => ({ canRunAgentUpdateWork: mocks.healthy }));
 beforeEach(() => {
   vi.resetModules(); vi.clearAllMocks(); mocks.ready = true;
   vi.stubEnv('CLOUDCOM_UPDATE_GUARD_ENABLED', 'true');

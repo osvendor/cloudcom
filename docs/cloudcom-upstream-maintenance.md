@@ -4,6 +4,17 @@ This guide records how the CloudCom fork differs from LanternOps/Breeze and how 
 
 ## Capacity and fleet-update safeguards (2026-10-16)
 
+The October 18 correction gives rate-limited agent updates a separate sustained
+capacity window (`agentUpdateCapacity.ts`, integrated by `capacityGuard.ts`).
+The heavy-job recovery latch remains unchanged. Preserve monotonic elapsed-time
+coverage, complete current observations, time-weighted CPU/steal/lag averages,
+current-pressure stops, and full window resets after severe pressure or missing
+evidence. Operations health distinguishes waiting updates from paused heavy jobs.
+No schema or native-agent change is required; roll back the API image and tuning
+together without deleting Redis leases. Regression tests include recurring short
+spikes, sustained/severe pressure, clock/probe failures, and 500 concurrent Redis
+requests with limits reduced to one.
+
 Preserve `capacityGuard.ts` / `capacityGuardPolicy.ts`, atomic Redis admission in
 `agentRolloutAdmission.ts` / `agentRolloutAdmissionLua.ts`, and their startup and
 shutdown hooks in both API and worker entrypoints. Heartbeat offer admission

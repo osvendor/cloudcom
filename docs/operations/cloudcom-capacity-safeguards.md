@@ -29,6 +29,21 @@ must also pass. API and worker processes each measure their own host.
 
 ## Fleet admission
 
+Agent updates use `canRunAgentUpdateWork()`, independently of the heavy-job
+recovery latch. A complete 60-second window must have time-weighted CPU, steal
+and event-loop readings below the configured resume thresholds. Latest readings
+must also be below pause thresholds; window peak memory stays below its resume
+threshold. CPU/steal/memory/lag observations and dependency readiness are required.
+Intervals use monotonic time; lag coverage includes delayed ticks and probe time.
+Stale/missing observations, clock discontinuities and lifecycle changes discard
+history. Severe CPU (at least 85%), steal (20%), event-loop lag (1 second), or
+memory at its pause threshold requires a fresh window. The severe CPU/steal/lag
+boundaries are never lower than their configured pause thresholds. Admission
+uses cached samples and performs no extra host or dependency probes per request.
+Brief non-severe spikes remain in the average and block starts while current,
+without resetting a full minute of otherwise valid evidence. Existing Redis
+concurrency, per-site, settling and start-rate controls still apply.
+
 - Two devices at once, one per verified organization/site by default.
 - Two new device starts per rolling two-minute window, shared across replicas.
   Redis server time and one atomic script enforce the bounds.

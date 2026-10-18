@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { getRedis } from './redis';
-import { canRunBackgroundWork } from './capacityGuard';
+import { canRunAgentUpdateWork } from './capacityGuard';
 import { AGENT_ROLLOUT_LUA } from './agentRolloutAdmissionLua';
 
 export type UpdateTargets = Partial<Record<'agent' | 'helper' | 'watchdog' | 'backup', string>>;
@@ -57,7 +57,7 @@ async function invoke(input: { deviceId: string; siteKey?: string; targets: Upda
     const request = redis.eval(AGENT_ROLLOUT_LUA, 3,
       `${PREFIX}active`, `${PREFIX}starts`, `${PREFIX}device:${input.deviceId}`,
       PREFIX, input.deviceId, site, mode, JSON.stringify(input.targets),
-      canRunBackgroundWork() ? '1' : '0',
+      canRunAgentUpdateWork() ? '1' : '0',
       limits.concurrent, limits.perSite, limits.starts, limits.windowMs,
       limits.leaseMs, limits.retryMs, limits.settleMs,
     );

@@ -48,7 +48,6 @@ import {
   prepareClaimedCommandsForDelivery,
   refreshClaimedPayloadForPush,
   refreshPayloadForDelivery,
-  refreshClaimedPayloadForPush,
   registerDeliveryRefresher,
   __resetDeliveryRefreshersForTests,
 } from './commandDelivery';

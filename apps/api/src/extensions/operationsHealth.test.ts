@@ -19,7 +19,9 @@ function capacity(overrides: Partial<CapacityGuardSnapshot> = {}): CapacityGuard
     healthyForMs: 0, reasons: [], metrics: { cpuBusyPercent: null, cpuStealPercent: null,
       cpuIowaitPercent: null, memoryUsedPercent: null, eventLoopLagMs: null, dependenciesReady: null },
     thresholds: readCapacityGuardConfig({ CLOUDCOM_CAPACITY_GUARD_CPU_PAUSE_PERCENT: '35',
-      CLOUDCOM_CAPACITY_GUARD_CPU_RESUME_PERCENT: '25' }), ...overrides,
+      CLOUDCOM_CAPACITY_GUARD_CPU_RESUME_PERCENT: '25' }),
+    agentUpdates: { allowed: true, reasons: [], windowMs: 60_000, observedMs: 60_000,
+      averages: { cpuBusyPercent: 15, cpuStealPercent: 0, eventLoopLagMs: 25 } }, ...overrides,
   };
 }
 beforeEach(() => {
@@ -116,7 +118,7 @@ describe('operations health collector', () => {
         canRunBackgroundWork: false, reasons: [reason] }));
       const { readOperationsHealth } = await import('./operationsHealth');
       const card = (await readOperationsHealth(admin))!.cards.find(card => card.id === 'capacity-guard')!;
-      expect(card).toMatchObject({ status: 'attention', value: 'New work paused' });
+      expect(card).toMatchObject({ status: 'attention', value: 'Heavy background work paused' });
       expect(card.detail).toContain('CPU unknown');
       expect(card.detail).toContain(`Waiting: ${reason}.`);
       expect(card.detail).toContain('Routine script probes and Harmony refresh defer');
@@ -126,12 +128,13 @@ describe('operations health collector', () => {
 
   it('reports configured rollout concurrency, start window and the completion timeout honestly', async () => {
     state.rolloutEnabled.mockReturnValue(true);
+    state.capacity.mockReturnValue(capacity({ enabled: true, state: 'paused', canRunBackgroundWork: false }));
     state.rolloutLimits.mockReturnValue({ concurrent: 1, perSite: 1, starts: 3, windowMs: 180_000,
       leaseMs: 600_000, retryMs: 1_800_000, settleMs: 60_000 });
     const { readOperationsHealth } = await import('./operationsHealth');
     const card = (await readOperationsHealth(admin))!.cards.find(card => card.id === 'agent-rollout-guard')!;
-    expect(card).toMatchObject({ status: 'healthy', value: '1 at once · 1 per site' });
-    expect(card.detail).toContain('At most 3 new starts every 3 minutes');
+    expect(card).toMatchObject({ status: 'healthy', value: 'Ready · 1 at once' });
+    expect(card.detail).toContain('at most 3 new starts every 3 minutes');
     expect(card.detail).toContain('Missing completion holds its slot for 10 minutes');
     expect(card.detail).toContain('30-minute retry window');
     expect(card.detail).toContain('Signed emergency rollback and independent local repair are excluded');
