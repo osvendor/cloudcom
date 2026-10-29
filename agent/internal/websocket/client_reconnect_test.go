@@ -226,10 +226,11 @@ func TestReconnectLoop_BacksOffAfterShortLivedConnections(t *testing.T) {
 				if gap < 650*time.Millisecond {
 					t.Fatalf("reconnect gap = %v, want at least 650ms", gap)
 				}
-				if gap > 3*time.Second {
+				// Upstream fleet spreading permits up to 5s after a server close.
+				if gap > serverCloseSpreadMax+time.Second {
 					t.Fatalf("reconnect gap = %v, want bounded retry", gap)
 				}
-			case <-time.After(5 * time.Second):
+			case <-time.After(serverCloseSpreadMax + 2*time.Second):
 				t.Fatal("timed out waiting for reconnect")
 			}
 			select {
@@ -237,7 +238,7 @@ func TestReconnectLoop_BacksOffAfterShortLivedConnections(t *testing.T) {
 				if gap := third.Sub(second); gap < 1300*time.Millisecond {
 					t.Fatalf("second reconnect gap = %v, want at least 1.3s", gap)
 				}
-			case <-time.After(5 * time.Second):
+			case <-time.After(serverCloseSpreadMax + 2*time.Second):
 				t.Fatal("timed out waiting for second reconnect")
 			}
 

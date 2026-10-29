@@ -2195,8 +2195,8 @@ func bootstrapThenListenWithRetry(ctx context.Context, bootstrap func() error, l
 }
 
 func (h *Heartbeat) Start() {
-	go h.reconcileNativeRustDeskTarget()
 	h.startHardwareHealth()
+	go h.reconcileNativeRustDeskTarget()
 	h.startTimeSync()
 	h.startWorkloads()
 	h.startPamReconciliationRetryLoop()

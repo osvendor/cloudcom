@@ -18,6 +18,7 @@ import (
 // ungated call fails here, so a new periodic sender cannot silently ignore a
 // server's Retry-After, and a heartbeat can never be routed through the gate.
 var loopDeferralExempt = map[string]string{
+	"reportLocalPamDecision": "PAM local decision: interactive one-shot approval/deny report, bounded by a 15s context and httputil retries; deferring it would strand the server's local approval gate",
 	"doHeartbeatPost":        "heartbeat: the watchdog restarts an agent whose LastHeartbeat is 3 min stale; overload answers feed #9146 liveness (D6)",
 	"submitCommandResult":    "command result: never deferred (Global Constraints)",
 	"SendElevationRequest":   "elevation: interactive, a user is waiting; W08 protected",
