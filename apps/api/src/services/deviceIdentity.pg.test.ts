@@ -3,7 +3,6 @@ import postgres from 'postgres';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
 import { currentDeviceUser, previousDeviceUsers, deviceIdentitySearch } from './deviceIdentity';
-import { deviceDirectoryQuery } from '../../../../packages/ext-credentials/src/server/deviceDirectory';
 
 const url=process.env.DEVICE_IDENTITY_TEST_URL;
 const ORG='11111111-1111-4111-8111-111111111111',OTHER='22222222-2222-4222-8222-222222222222';
@@ -31,11 +30,15 @@ describe.skipIf(!url)('device identity SQL against PostgreSQL',()=>{
   const rows=await run(sql`SELECT ${currentDeviceUser} current,${previousDeviceUsers} previous FROM devices WHERE id=${STALE}::uuid`);
   expect(rows[0]?.current).toBeNull();expect(rows[0]?.previous).toEqual(['Carol']);
  });
- it('companion and core identity projections agree and directory remains org scoped',async()=>{
-  const rows=await run(deviceDirectoryQuery(sql`d.org_id=${ORG}::uuid`,'HOST-01',0));
+ it('composes identity projection and literal search with the caller organization scope',async()=>{
+  // The retired companion-only query was replaced by shared core identity SQL.
+  // staffRemoteDirectory.test.ts pins its use in the native/browser directory.
+  const directory=(org:string,query:string)=>run(sql`SELECT hostname,display_name AS "displayName",
+   org_id AS "orgId",${currentDeviceUser} AS "currentUser",${previousDeviceUsers} AS "previousUsers"
+   FROM devices WHERE org_id=${org}::uuid AND ${deviceIdentitySearch(query)}`);
+  const rows=await directory(ORG,'HOST-01');
   expect(rows).toHaveLength(1);expect(rows[0]).toMatchObject({hostname:'HOST-01',displayName:'Front desk',currentUser:'Alice',previousUsers:['bob','Old_User%'],orgId:ORG});
-  expect(await run(deviceDirectoryQuery(sql`d.org_id=${OTHER}::uuid`,'',0))).toHaveLength(0);
-  expect(await run(deviceDirectoryQuery(sql`d.org_id=${ORG}::uuid`,'Old_User%',0))).toHaveLength(1);
+  expect(await directory(OTHER,'')).toHaveLength(0);
+  expect(await directory(ORG,'Old_User%')).toHaveLength(1);
  });
 });
-

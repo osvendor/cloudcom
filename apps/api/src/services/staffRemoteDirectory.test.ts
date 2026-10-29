@@ -5,6 +5,7 @@ vi.mock('../db', () => ({ db: { select: m.select } }));
 vi.mock('./staffNativeAuthority', () => ({ revalidateStaffNativePrincipal: m.authority }));
 vi.mock('./staffNativeAvailability', () => ({ staffNativeAvailability: () => async () => ({ available: false }) }));
 vi.mock('./remoteAccessPolicy', () => ({ checkRemoteAccess: async () => ({ allowed: true }) }));
+import { currentDeviceUser, previousDeviceUsers } from './deviceIdentity';
 import { listStaffRemoteComputers } from './staffRemoteDirectory';
 import type { StaffNativePrincipal } from './staffNativeAuthority';
 const id = '11111111-1111-4111-8111-111111111111';
@@ -19,6 +20,15 @@ beforeEach(() => {
   m.authority.mockResolvedValue({ permissions: { scope: 'partner', orgAccess: 'all', permissions: [] } });
 });
 describe('shared staff remote directory authority', () => {
+  it('uses the shared identity projections and preserves alias, hostname and user history', async () => {
+    m.rows = [{ device: { id, orgId: org, hostname: 'HOST-01', displayName: 'Front desk', status: 'online' },
+      peerId: '123', organizationName: 'Client', currentUser: 'Alice', previousUsers: ['bob', 'Old_User%'] }];
+    const result = await listStaffRemoteComputers(principal);
+    expect(m.select.mock.calls[0]![0].currentUser).toBe(currentDeviceUser);
+    expect(m.select.mock.calls[0]![0].previousUsers).toBe(previousDeviceUsers);
+    expect(result.devices[0]).toMatchObject({ hostname: 'HOST-01', displayName: 'Front desk',
+      organizationId: org, currentUser: 'Alice', previousUsers: ['bob', 'Old_User%'] });
+  });
   it('binds partner ownership and cursor before pagination', async () => {
     await listStaffRemoteComputers(principal, org);
     expect(where().params).toEqual([id, org]);
