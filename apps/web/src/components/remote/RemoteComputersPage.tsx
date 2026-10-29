@@ -48,7 +48,8 @@ export default function RemoteComputersPage({ navigate = defaultNavigate }: { na
         let cursor: string | null = null;
         do {
           const response: Response = selected.kind === 'staff'
-            ? await fetchWithAuth(`/staff-native/browser/devices${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`)
+            // The server derives the cross-organization directory from staff permissions.
+            ? await fetchWithAuth(`/staff-native/browser/devices${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`, { skipOrgIdInjection: true })
             : await customerRequest('/portal/remote/browser/devices');
           if (!response.ok) throw new Error('Your account cannot load this remote directory. Sign in again or retry.');
           const body: { devices: RemoteComputer[]; nextCursor?: string | null } = await response.json();

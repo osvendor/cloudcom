@@ -34,9 +34,31 @@ describe('shared remote browser directory', () => {
     const download = screen.getByRole('link', { name: 'Download viewer for Windows' });
     expect(download).toHaveAttribute('href', '/downloads/managed-viewer/OS-Consultants-Remote-Access-1.0.7-x64.msi');
     expect(download).toHaveAttribute('download', 'OS-Consultants-Remote-Access-1.0.7-x64.msi');
-    expect(m.staffFetch).toHaveBeenNthCalledWith(2, `/staff-native/browser/devices?cursor=${secondId}`);
+    expect(m.staffFetch).toHaveBeenNthCalledWith(2, `/staff-native/browser/devices?cursor=${secondId}`, { skipOrgIdInjection: true });
     fireEvent.click(screen.getAllByRole('button', { name: 'Web Remote' })[1]!);
     expect(m.navigate).toHaveBeenCalledWith(`/remote/desktop/${id}`);
+    expect(m.fetch).not.toHaveBeenCalled();
+  });
+
+  it('keeps both directory pages free of ambient organization query parameters', async () => {
+    const { applyOrgId } = await vi.importActual<typeof import('../../stores/auth')>('../../stores/auth');
+    const ambient = '33333333-3333-4333-8333-333333333333';
+    const requests: string[] = [];
+    // Exercise the real URL transformation used by fetchWithAuth, including a
+    // selected organization restored before the header island has hydrated.
+    expect(applyOrgId('/staff-native/browser/devices', { ambient })).toContain('orgId=');
+    m.staffFetch.mockImplementation(async (url, options = {}) => {
+      const actual = applyOrgId(url, { ...options, ambient });
+      requests.push(actual);
+      const query = new URL(actual, 'https://breeze.example.test').searchParams;
+      if ([...query.keys()].some(key => key !== 'cursor')) return Response.json({ error: 'Invalid query' }, { status: 400 });
+      return Response.json({ devices: [{ ...device, id: query.has('cursor') ? secondId : id,
+        hostname: query.has('cursor') ? 'SECOND' : device.hostname }], nextCursor: query.has('cursor') ? null : secondId });
+    });
+    render(<RemoteComputersPage navigate={m.navigate} />);
+    await screen.findByText('SECOND');
+    expect(requests).toEqual(['/staff-native/browser/devices', `/staff-native/browser/devices?cursor=${secondId}`]);
+    expect(screen.queryByRole('alert')).toBeNull();
     expect(m.fetch).not.toHaveBeenCalled();
   });
 
