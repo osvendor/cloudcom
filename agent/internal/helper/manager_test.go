@@ -264,9 +264,15 @@ func TestApplyDisabledUninstalledIsStableNoOp(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(tmpDir, "sessions")); !os.IsNotExist(err) {
 		t.Fatalf("sessions dir should never be created when disabled+uninstalled; err=%v", err)
 	}
-	if removeCalls != 0 || uninstallCalls != 0 || stopLegacyCalls != 0 {
-		t.Fatalf("expected zero cleanup churn, got remove=%d uninstall=%d stopLegacy=%d",
-			removeCalls, uninstallCalls, stopLegacyCalls)
+	// Windows performs one intentional legacy HKLM Run sweep, even with
+	// no install. A second disabled tick must not repeat that cleanup.
+	wantRemoveCalls := 0
+	if sweepLegacyAutoStart {
+		wantRemoveCalls = 1
+	}
+	if removeCalls != wantRemoveCalls || uninstallCalls != 0 || stopLegacyCalls != 0 {
+		t.Fatalf("expected %d one-time removals and no uninstall/stop churn, got remove=%d uninstall=%d stopLegacy=%d",
+			wantRemoveCalls, removeCalls, uninstallCalls, stopLegacyCalls)
 	}
 	if mgr.pendingHelperVersion != "1.2.3" {
 		t.Fatalf("pendingHelperVersion should survive disabled ticks, got %q", mgr.pendingHelperVersion)

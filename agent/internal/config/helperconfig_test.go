@@ -20,7 +20,7 @@ func writeHelperAgentYAML(t *testing.T, body string) string {
 
 func TestLoadHelperConfig(t *testing.T) {
 	path := writeHelperAgentYAML(t, ""+
-		"agent_id: agent-123\n"+
+		"agent_id: 00000000-0000-4000-8000-000000000123\n"+
 		"server_url: https://primary.example.com\n"+
 		"helper_auth_token: helper-secret\n"+
 		"ipc_socket_path: /tmp/breeze-helper.sock\n"+
@@ -31,8 +31,8 @@ func TestLoadHelperConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadHelperConfig() error = %v", err)
 	}
-	if cfg.AgentID != "agent-123" {
-		t.Errorf("AgentID = %q, want agent-123", cfg.AgentID)
+	if cfg.AgentID != "00000000-0000-4000-8000-000000000123" {
+		t.Errorf("AgentID = %q, want 00000000-0000-4000-8000-000000000123", cfg.AgentID)
 	}
 	if cfg.ServerURL != "https://primary.example.com" {
 		t.Errorf("ServerURL = %q", cfg.ServerURL)
@@ -55,7 +55,7 @@ func TestLoadHelperConfig(t *testing.T) {
 // Default() value untouched (notably LogShippingLevel, which the shipper reads).
 func TestLoadHelperConfigKeepsDefaultsForAbsentKeys(t *testing.T) {
 	path := writeHelperAgentYAML(t, ""+
-		"agent_id: agent-123\n"+
+		"agent_id: 00000000-0000-4000-8000-000000000123\n"+
 		"server_url: https://primary.example.com\n"+
 		"helper_auth_token: helper-secret\n")
 
@@ -80,7 +80,7 @@ func TestLoadHelperConfigKeepsDefaultsForAbsentKeys(t *testing.T) {
 // carries a different value (Load() would have merged the secrets one).
 func TestLoadHelperConfigIgnoresSecretsFile(t *testing.T) {
 	path := writeHelperAgentYAML(t, ""+
-		"agent_id: agent-123\n"+
+		"agent_id: 00000000-0000-4000-8000-000000000123\n"+
 		"server_url: https://primary.example.com\n"+
 		"helper_auth_token: from-agent-yaml\n")
 
@@ -107,7 +107,7 @@ func TestLoadHelperConfigSucceedsWithUnreadableSecretsFile(t *testing.T) {
 		t.Skip("running as root bypasses file permissions; cannot simulate EACCES")
 	}
 	path := writeHelperAgentYAML(t, ""+
-		"agent_id: agent-123\n"+
+		"agent_id: 00000000-0000-4000-8000-000000000123\n"+
 		"server_url: https://primary.example.com\n"+
 		"helper_auth_token: helper-secret\n")
 
@@ -115,10 +115,7 @@ func TestLoadHelperConfigSucceedsWithUnreadableSecretsFile(t *testing.T) {
 	if err := os.WriteFile(secretsPath, []byte("auth_token: root-only\n"), 0600); err != nil {
 		t.Fatalf("write secrets.yaml: %v", err)
 	}
-	if err := os.Chmod(secretsPath, 0000); err != nil {
-		t.Fatalf("chmod secrets.yaml: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(secretsPath, 0600) })
+	makeHelperSecretUnreadable(t, secretsPath)
 
 	// Sanity check: the full Load() DOES fail on the unreadable secrets file.
 	if _, err := Load(path); err == nil {
@@ -129,8 +126,8 @@ func TestLoadHelperConfigSucceedsWithUnreadableSecretsFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadHelperConfig() error = %v (must ignore unreadable secrets.yaml)", err)
 	}
-	if cfg.AgentID != "agent-123" || cfg.HelperAuthToken != "helper-secret" {
-		t.Errorf("cfg = %+v, want agent-123 / helper-secret from agent.yaml", cfg)
+	if cfg.AgentID != "00000000-0000-4000-8000-000000000123" || cfg.HelperAuthToken != "helper-secret" {
+		t.Errorf("cfg = %+v, want 00000000-0000-4000-8000-000000000123 / helper-secret from agent.yaml", cfg)
 	}
 }
 

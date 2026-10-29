@@ -13,6 +13,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/spf13/viper"
 	"golang.org/x/sys/windows"
 )
 
@@ -855,6 +856,8 @@ func TestReclaimConfigDirSetsAsideOnlyAnotherAccountsOtherFile(t *testing.T) {
 // config folder and files the agent wrote.
 func TestMachineConfigTrustLoadReadsTheAgentsOwnConfig(t *testing.T) {
 	requireElevatedRunner(t)
+	viper.Reset()
+	t.Cleanup(viper.Reset)
 	root := agentConfigFolder(t)
 	t.Cleanup(SetConfigDirForTest(root))
 	cfg, err := Load("")

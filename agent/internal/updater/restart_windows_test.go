@@ -22,8 +22,8 @@ func TestBuildRestartScript_AgentOnly(t *testing.T) {
 	if !strings.Contains(got, `Copy-Item -Path 'C:\Windows\Temp\breeze-agent-1234.exe' -Destination 'C:\Program Files\Breeze\breeze-agent.exe' -Force`) {
 		t.Fatalf("expected agent Copy-Item line; script was:\n%s", got)
 	}
-	if strings.Contains(got, "breeze-user-helper") {
-		t.Fatalf("agent-only script should not mention user-helper; script was:\n%s", got)
+	if strings.Count(got, "Copy-Item -Path") != 1 || strings.Count(got, "Remove-Item -Path") != 2 {
+		t.Fatalf("agent-only script must only copy/remove the agent artifact and remove its script; script was:\n%s", got)
 	}
 	if !strings.Contains(got, "Start-Service -Name 'BreezeAgent'") {
 		t.Fatalf("expected Start-Service line; script was:\n%s", got)
@@ -46,8 +46,8 @@ func TestBuildRestartScript_NilUserHelperIsAbsent(t *testing.T) {
 		UserHelper: nil,
 	})
 
-	if strings.Contains(got, "breeze-user-helper") {
-		t.Fatalf("nil UserHelper script must not mention breeze-user-helper; script was:\n%s", got)
+	if strings.Count(got, "Copy-Item -Path") != 1 || strings.Count(got, "Remove-Item -Path") != 2 {
+		t.Fatalf("nil UserHelper script must not copy/remove a helper artifact; script was:\n%s", got)
 	}
 	// Defense in depth: also verify no second Copy-Item snuck in. The agent
 	// Copy-Item is the only Copy-Item line we expect.

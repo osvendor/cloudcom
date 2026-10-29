@@ -62,6 +62,12 @@ func swapCompanionBinary(pair *BinaryPair) error {
 		_ = staging.Close()
 		return fmt.Errorf("copy binary bytes: %w", err)
 	}
+	// Windows refuses to remove an open source file. Close it before the
+	// successful swap consumes the download; the defer still covers copy errors.
+	if err := src.Close(); err != nil {
+		_ = staging.Close()
+		return fmt.Errorf("close downloaded binary: %w", err)
+	}
 	if err := staging.Sync(); err != nil {
 		_ = staging.Close()
 		return fmt.Errorf("sync staging file: %w", err)

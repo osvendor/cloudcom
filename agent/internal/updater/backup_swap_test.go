@@ -3,6 +3,7 @@ package updater
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -34,7 +35,7 @@ func TestSwapCompanionBinary_SwapsContentModeAndCleansUpTemp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat dest: %v", err)
 	}
-	if fi.Mode().Perm() != 0o755 {
+	if runtime.GOOS != "windows" && fi.Mode().Perm() != 0o755 {
 		t.Fatalf("dest mode = %o, want 0755", fi.Mode().Perm())
 	}
 

@@ -287,9 +287,6 @@ func TestExitProbeReadErrorIsNotReportedAsAnExit(t *testing.T) {
 // The process still knows the install is its own, and writes the marker once
 // it can.
 func TestMarkerWriteFailureIsRetried(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root ignores directory permissions")
-	}
 	slowWatcher(t)
 	var calls ownershipCalls
 	f := newOwnershipFixture(t, false)
@@ -299,17 +296,19 @@ func TestMarkerWriteFailureIsRetried(t *testing.T) {
 	mgr := newOwnershipManager(t, f, &calls, WithMachineInstallOwner(true))
 	installingSeams(t, mgr, "1.2.3")
 
-	if err := os.Chmod(f.baseDir, 0o555); err != nil {
+	// A directory at the atomic-write temp path fails on Windows and Unix,
+	// including privileged runners; chmod does not deny Windows writes.
+	blockedTemp := filepath.Join(f.baseDir, ownershipFileName+".tmp")
+	if err := os.Mkdir(blockedTemp, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(f.baseDir, 0o755) })
 	mgr.CheckUpdate("1.2.3")
 	mgr.Apply(&Settings{Enabled: true})
 	if isMarked(t, f.baseDir) {
 		t.Fatal("test setup: the marker write should have failed")
 	}
 
-	if err := os.Chmod(f.baseDir, 0o755); err != nil {
+	if err := os.Remove(blockedTemp); err != nil {
 		t.Fatal(err)
 	}
 	mgr.WithdrawOffer() // no reinstall on this tick: only the retry can write the marker
@@ -323,9 +322,6 @@ func TestMarkerWriteFailureIsRetried(t *testing.T) {
 // Same failure, then deploy off before the write lands: the agent still
 // removes its own install.
 func TestFailedMarkerWriteStillUninstallsTheAgentsInstall(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root ignores directory permissions")
-	}
 	slowWatcher(t)
 	var calls ownershipCalls
 	f := newOwnershipFixture(t, false)
@@ -335,12 +331,17 @@ func TestFailedMarkerWriteStillUninstallsTheAgentsInstall(t *testing.T) {
 	mgr := newOwnershipManager(t, f, &calls, WithMachineInstallOwner(true))
 	installingSeams(t, mgr, "1.2.3")
 
-	if err := os.Chmod(f.baseDir, 0o555); err != nil {
+	// A directory at the atomic-write temp path fails on Windows and Unix,
+	// including privileged runners; chmod does not deny Windows writes.
+	blockedTemp := filepath.Join(f.baseDir, ownershipFileName+".tmp")
+	if err := os.Mkdir(blockedTemp, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(f.baseDir, 0o755) })
 	mgr.CheckUpdate("1.2.3")
 	mgr.Apply(&Settings{Enabled: true})
+	if isMarked(t, f.baseDir) || mgr.pendingOwnershipMark == nil {
+		t.Fatal("test setup: marker write must fail and retain pending ownership")
+	}
 	mgr.Apply(&Settings{Enabled: false})
 
 	if calls.uninstall != 1 {

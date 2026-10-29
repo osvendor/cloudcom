@@ -98,6 +98,13 @@ func TestVerifyProgramDataPathAcceptsHardenedChainAndRefusesUserWritableFile(t *
 }
 
 func TestResetProgramDataTreeRemovesNestedLinksAndResetsForeignEntries(t *testing.T) {
+	// The installed service performs this repair as SYSTEM. An elevated test
+	// runner must enable its restore privilege to assign that same owner.
+	restore, err := enableRestorePrivilege()
+	if err != nil {
+		t.Fatalf("enable restore privilege for service-context fixture: %v", err)
+	}
+	t.Cleanup(restore)
 	root := hardenedTestRoot(t)
 	data := filepath.Join(root, "data")
 	if err := createProgramDataDir(data); err != nil {

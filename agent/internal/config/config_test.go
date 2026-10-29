@@ -99,7 +99,7 @@ func TestMigrateInlineSecretsToSecretFileScrubsAgentYAML(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "agent.yaml")
 	if err := os.WriteFile(cfgPath, []byte(`
-agent_id: agent-1
+agent_id: 00000000-0000-4000-8000-000000000001
 server_url: https://api.example.test
 auth_token: brz_agent_inline
 watchdog_auth_token: brz_watchdog_inline
@@ -155,7 +155,7 @@ func TestFixAgentYAMLPermissionsLocksDownWhenMigrationLeavesInlineSecrets(t *tes
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "agent.yaml")
 	if err := os.WriteFile(cfgPath, []byte(
-		"agent_id: agent-1\nserver_url: https://api.example.test\nauth_token: brz_still_inline\n",
+		"agent_id: 00000000-0000-4000-8000-000000000001\nserver_url: https://api.example.test\nauth_token: brz_still_inline\n",
 	), 0o600); err != nil {
 		t.Fatalf("write agent.yaml: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestFixAgentYAMLPermissionsWidensWhenMigrationSucceeds(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "agent.yaml")
 	if err := os.WriteFile(cfgPath, []byte(
-		"agent_id: agent-1\nserver_url: https://api.example.test\n",
+		"agent_id: 00000000-0000-4000-8000-000000000001\nserver_url: https://api.example.test\n",
 	), 0o600); err != nil {
 		t.Fatalf("write agent.yaml: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestSeedHelperTokenFileFromSecretsIfMissing(t *testing.T) {
 	}
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "agent.yaml")
-	if err := os.WriteFile(cfgPath, []byte("agent_id: agent-1\nserver_url: https://api.example.test\n"), 0o644); err != nil {
+	if err := os.WriteFile(cfgPath, []byte("agent_id: 00000000-0000-4000-8000-000000000001\nserver_url: https://api.example.test\n"), 0o644); err != nil {
 		t.Fatalf("write agent.yaml: %v", err)
 	}
 	secretsPath := filepath.Join(dir, "secrets.yaml")
@@ -247,7 +247,7 @@ func TestSeedHelperTokenFileFromSecretsIfMissingSkipsWhenAlreadyPresent(t *testi
 	}
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "agent.yaml")
-	if err := os.WriteFile(cfgPath, []byte("agent_id: agent-1\n"), 0o644); err != nil {
+	if err := os.WriteFile(cfgPath, []byte("agent_id: 00000000-0000-4000-8000-000000000001\n"), 0o644); err != nil {
 		t.Fatalf("write agent.yaml: %v", err)
 	}
 	if err := writeHelperTokenFileFor(cfgPath, "brz_current"); err != nil {
@@ -275,7 +275,7 @@ func TestSetAndPersistScrubsLegacyInlineSecrets(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "agent.yaml")
 	if err := os.WriteFile(cfgPath, []byte(`
-agent_id: agent-1
+agent_id: 00000000-0000-4000-8000-000000000001
 server_url: https://api.example.test
 auth_token: brz_agent_inline
 watchdog_auth_token: brz_watchdog_inline
@@ -789,7 +789,7 @@ func TestSaveToStripsBackupS3SecretsFromAgentYAML(t *testing.T) {
 
 	// Write agent.yaml with inline backup_s3 secrets (old/misconfigured format).
 	if err := os.WriteFile(cfgPath, []byte(`
-agent_id: agent-backup-1
+agent_id: 00000000-0000-4000-8000-000000000002
 server_url: https://api.example.test
 helper_auth_token: brz_helper
 backup_s3_bucket: my-bucket
