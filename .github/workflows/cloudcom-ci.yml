@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+# One self-hosted service accepts one job at a time. PRs remain disposable.
+env:
+  GOMAXPROCS: 2
+  NODE_OPTIONS: --max-old-space-size=2048
+
 concurrency:
   group: cloudcom-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -17,7 +22,8 @@ concurrency:
 jobs:
   delta:
     name: Validate cumulative fork delta
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(github.repository == 'osvendor/cloudcom' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && '["self-hosted","Linux","X64","cloudcom-linux"]' || '["ubuntu-24.04"]') }}
+    timeout-minutes: 90
     outputs:
       docs_only: ${{ steps.delta.outputs.docsOnly }}
       api: ${{ steps.delta.outputs.api }}
@@ -53,7 +59,8 @@ jobs:
     name: Secret detection
     needs: delta
     if: always() && needs.delta.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(github.repository == 'osvendor/cloudcom' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && '["self-hosted","Linux","X64","cloudcom-linux"]' || '["ubuntu-24.04"]') }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -72,7 +79,9 @@ jobs:
           curl -sSfL -o "$workdir/$checksums" "$base_url/$checksums"
           (cd "$workdir" && grep "  ${asset}$" "$checksums" | sha256sum -c -)
           tar -xzf "$workdir/$asset" -C "$workdir" gitleaks
-          sudo install -m 0755 "$workdir/gitleaks" /usr/local/bin/gitleaks
+          mkdir -p "$RUNNER_TEMP/cloudcom-bin"
+          install -m 0755 "$workdir/gitleaks" "$RUNNER_TEMP/cloudcom-bin/gitleaks"
+          echo "$RUNNER_TEMP/cloudcom-bin" >> "$GITHUB_PATH"
       - name: Scan the cumulative fork delta
         run: gitleaks detect --source . --log-opts="${{ needs.delta.outputs.baseline_commit }}...HEAD" --redact --verbose
 
@@ -80,7 +89,8 @@ jobs:
     name: Workflow security and syntax
     needs: delta
     if: needs.delta.outputs.infra == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(github.repository == 'osvendor/cloudcom' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && '["self-hosted","Linux","X64","cloudcom-linux"]' || '["ubuntu-24.04"]') }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -99,7 +109,8 @@ jobs:
     name: API and web delta validation
     needs: delta
     if: needs.delta.outputs.docs_only != 'true' && (needs.delta.outputs.api == 'true' || needs.delta.outputs.web == 'true' || needs.delta.outputs.shared == 'true' || needs.delta.outputs.infra == 'true')
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(github.repository == 'osvendor/cloudcom' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && '["self-hosted","Linux","X64","cloudcom-linux"]' || '["ubuntu-24.04"]') }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -111,7 +122,7 @@ jobs:
         with:
           node-version-file: .node-version
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile --child-concurrency=1 --network-concurrency=4
       - name: Typecheck and test the Cloud Command extension package
         if: needs.delta.outputs.api == 'true' || needs.delta.outputs.web == 'true' || needs.delta.outputs.shared == 'true'
         run: |
@@ -195,7 +206,7 @@ jobs:
           (cd apps/web/public/scripts && sha256sum -c SHA256SUMS)
           python3 scripts/cloudcom/verify-exchange-worker-oci.test.py
           bash scripts/check-guided-setup-systemd-unit.sh
-          node --test scripts/cloudcom/update-upstream.test.mjs
+          node --test scripts/cloudcom/update-upstream.test.mjs scripts/cloudcom/runner-routing.test.mjs
           node --test scripts/cloudcom/customization-contract.test.mjs
           node scripts/cloudcom/customization-contract.mjs
       - name: Validate RustDesk deployment mutation boundaries
@@ -213,28 +224,30 @@ jobs:
     name: Native agent delta validation
     needs: delta
     if: needs.delta.outputs.native == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(github.repository == 'osvendor/cloudcom' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && '["self-hosted","Linux","X64","cloudcom-linux"]' || '["ubuntu-24.04"]') }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Install native packet capture build dependency
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libpcap-dev
+      - name: Install hosted packet capture dependency
+        if: runner.environment == 'github-hosted'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpcap-dev
+      - name: Verify preprovisioned self-hosted packet capture dependency
+        if: runner.environment == 'self-hosted'
+        run: pkg-config --exists libpcap
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: agent/go.mod
-      - name: Install native packet capture headers
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpcap-dev
       - working-directory: agent
-        run: go test -race ./...
+        run: go test -p 1 -race ./...
 
   complete:
     name: CloudCom checks
     if: always()
     needs: [delta, security, workflow-security, javascript, native]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ fromJSON(github.repository == 'osvendor/cloudcom' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && '["self-hosted","Linux","X64","cloudcom-linux"]' || '["ubuntu-24.04"]') }}
+    timeout-minutes: 90
     steps:
       - name: Require every applicable check to succeed
         env:

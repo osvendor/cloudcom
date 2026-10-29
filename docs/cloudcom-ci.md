@@ -1,10 +1,16 @@
 # CloudCom CI and upstream updates
 
-CloudCom owns three workflows: cloudcom-ci.yml, cloudcom-upstream.yml and cloudcom-candidate.yml. The 17 inherited Breeze workflows remain retired. Reusable source tests and scripts remain available, but their existence is not evidence that they run in CloudCom CI.
+CloudCom owns four workflows: cloudcom-ci.yml, cloudcom-upstream.yml, cloudcom-candidate.yml and cloudcom-runner-smoke.yml. The 17 inherited Breeze workflows remain retired. Reusable source tests and scripts remain available, but their existence is not evidence that they run in CloudCom CI.
 
 ## Validation
 
-CloudCom CI runs on pull requests to main, pushes to main, and manual dispatch. It uses disposable GitHub-hosted workers; the existing CloudCom-owned worker is retained but is not required by these workflows. Production is not a PR runner.
+CloudCom CI runs on pull requests to main, pushes to main, and manual dispatch. Pull requests use disposable GitHub-hosted workers. Pushes to main and maintainer-dispatched runs in this repository use the dedicated Linux worker labelled `cloudcom-linux`; this includes updater-dispatched integration branches. Production is not a runner.
+
+The worker runs one job at a time under a dedicated account, separate from the development checkout. Provision Node 22, pnpm 10.34.5, Go matching agent/go.mod, GitHub CLI, Python 3, Docker/Compose, PowerShell with Pester 5.7.1, build-essential, pkg-config and libpcap-dev before starting it. CI installs temporary tools without sudo. Native Go tests use one package worker and candidate builds serialize their matrix. The 4 GB worker starts with a 2 GB Node heap limit and two Go processors; this is a capacity bound, not evidence that every full build fits.
+
+Because this is a public repository, workflow routing alone is not a security boundary: a pull request can edit its own workflow. The service must enforce a root-owned job-start hook outside the checkout that rejects pull_request/pull_request_target and foreign repositories before any job step. Permit only main pushes, main scheduled runs, and maintainer-dispatched same-repository branches; missing/unknown event context fails closed. Do not run the service without that gate. Keep production SSH material and signing secrets off this worker. Native Windows/macOS and privileged signing jobs remain on their matching hosted workers until separately isolated runners exist.
+
+The weekly updater and manual candidate preparation also use `cloudcom-linux`. Their existing default-branch and verified-source checks remain mandatory. A worker outage queues those jobs; it does not trigger a production fallback. Runner provisioning, registration and live job evidence are recorded privately, not in this public repository. Run the manual CloudCom Runner Smoke workflow from the default branch after provisioning or moving the worker; it verifies the runner environment and installed tools without checkout, builds or deployment.
 
 The baseline in .github/cloudcom-baseline.json records the released upstream repository, tag and exact commit. CI verifies the published release, tag resolution and ancestry, then compares the cumulative fork tree against that baseline. This validates retained customizations after an upstream update without replaying the complete upstream development/release pipeline.
 
