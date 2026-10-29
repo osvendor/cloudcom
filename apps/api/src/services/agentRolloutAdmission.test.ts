@@ -27,7 +27,7 @@ describe('agent rollout admission transport', () => {
     expect(args.slice(2,5).every((s: string) => s.includes('{agent-rollout}'))).toBe(true);
     expect(args[7]).toMatch(/^[a-f0-9]{64}$/);
     expect(args[10]).toBe('0');
-    expect(args.slice(11)).toEqual([2,1,2,120000,600000,1800000,60000]);
+    expect(args.slice(11)).toEqual([4,1,4,120000,600000,1800000,60000]);
   });
   it('fails closed on Redis outage, malformed targets and command errors', async () => {
     const { admitAgentUpdate } = await import('./agentRolloutAdmission');
@@ -74,6 +74,6 @@ describe('agent rollout admission transport', () => {
     const { agentRolloutLimits } = await import('./agentRolloutAdmission');
     for (const value of ['0','-1','100','NaN','2.5']) expect(() => agentRolloutLimits({ CLOUDCOM_UPDATE_MAX_CONCURRENT: value })).toThrow();
     expect(() => agentRolloutLimits({ CLOUDCOM_UPDATE_GUARD_ENABLED: 'maybe' })).toThrow();
-    expect(agentRolloutLimits({})).toMatchObject({ concurrent: 2, perSite: 1, starts: 2 });
+    expect(agentRolloutLimits({})).toMatchObject({ concurrent: 4, perSite: 1, starts: 4 });
   });
 });

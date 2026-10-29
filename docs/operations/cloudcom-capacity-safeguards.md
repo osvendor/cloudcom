@@ -166,8 +166,8 @@ Brief non-severe spikes remain in the average and block starts while current,
 without resetting a full minute of otherwise valid evidence. Existing Redis
 concurrency, per-site, settling and start-rate controls still apply.
 
-- Two devices at once, one per verified organization/site by default.
-- Two new device starts per rolling two-minute window, shared across replicas.
+- Four devices at once, one per verified organization/site by default.
+- Four new device starts per rolling two-minute window, shared across replicas.
   Redis server time and one atomic script enforce the bounds.
 - Commands without trusted site context occupy an exclusive fleet slot; site
   identity is never inferred from a command payload.
@@ -182,7 +182,7 @@ concurrency, per-site, settling and start-rate controls still apply.
   retains single-flight ownership. Unused late reservations expire safely.
 
 `CLOUDCOM_UPDATE_MAX_CONCURRENT` and `CLOUDCOM_UPDATE_STARTS_PER_WINDOW` accept
-1–10 (default 2). `CLOUDCOM_UPDATE_WINDOW_SECONDS` accepts 60–3600 (default 120).
+1–10 (default 4). `CLOUDCOM_UPDATE_WINDOW_SECONDS` accepts 60–3600 (default 120).
 Other bounds are fixed. Keys use `cloudcom:{agent-rollout}:v1:`, expiry and
 hashed site identities. No schema migration is required. Do not flush the
 namespace during active updates or reset capacity by restarting the server.

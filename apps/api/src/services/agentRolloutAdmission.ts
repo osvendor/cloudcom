@@ -27,9 +27,9 @@ export function agentRolloutLimits(env: NodeJS.ProcessEnv = process.env) {
     throw new Error('Invalid CLOUDCOM_UPDATE_GUARD_ENABLED');
   }
   return {
-    concurrent: number(CONCURRENT_ENV, 2, 1, 10),
+    concurrent: number(CONCURRENT_ENV, 4, 1, 10),
     perSite: 1,
-    starts: number(STARTS_ENV, 2, 1, 10),
+    starts: number(STARTS_ENV, 4, 1, 10),
     windowMs: number(WINDOW_ENV, 120, 60, 3600) * 1000,
     leaseMs: 10 * 60_000,
     retryMs: 30 * 60_000,
