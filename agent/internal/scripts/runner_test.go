@@ -149,8 +149,9 @@ func TestRunBashEchoScript(t *testing.T) {
 	if result.Stdout != "hello world\n" {
 		t.Fatalf("stdout = %q, want %q", result.Stdout, "hello world\n")
 	}
-	if result.DurationMs <= 0 {
-		t.Fatal("durationMs should be > 0")
+	// Milliseconds truncates a successful sub-millisecond execution to zero.
+	if result.DurationMs < 0 {
+		t.Fatal("durationMs should be >= 0")
 	}
 }
 
