@@ -1832,6 +1832,33 @@ describe('public RustDesk host MSI download', () => {
     vi.restoreAllMocks();
   });
 
+  it('keeps pinned host downloads separate from the stable package', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'breeze-managed-host-versioned-'));
+    try {
+      process.env.CLOUDCOM_RUSTDESK_HOST_DIR = dir;
+      writeFileSync(join(dir, 'cloudcom-rustdesk-host.msi'), 'stable-68');
+      writeFileSync(join(dir, 'cloudcom-rustdesk-host-1.5.0.68.msi'), 'pinned-68');
+      writeFileSync(join(dir, 'cloudcom-rustdesk-host-1.5.0.69.msi'), 'canary-69');
+      const stable = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi');
+      const previous = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi/1.5.0.68');
+      const canary = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi/1.5.0.69');
+      expect(await stable.text()).toBe('stable-68');
+      expect(await previous.text()).toBe('pinned-68');
+      expect(canary.status).toBe(200);
+      expect(await canary.text()).toBe('canary-69');
+      expect(canary.headers.get('content-disposition')).toBe('attachment; filename="cloudcom-rustdesk-host-1.5.0.69.msi"');
+      expect((await downloadRoutes.request('/download/rustdesk/windows/amd64/msi/unknown')).status).toBe(404);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('applies the public download rate limit to pinned host packages', async () => {
+    rateLimiterMock.mockResolvedValueOnce({ allowed: false, remaining: 0, resetAt: new Date() });
+    const res = await downloadRoutes.request('/download/rustdesk/windows/amd64/msi/1.5.0.69');
+    expect(res.status).toBe(429);
+  });
+
   it('serves the staged host MSI bytes verbatim', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'breeze-rustdesk-host-msi-test-'));
     try {

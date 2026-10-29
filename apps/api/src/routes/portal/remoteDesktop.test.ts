@@ -99,15 +99,15 @@ describe('portal desktop routes', () => {
     expect(m.end).toHaveBeenCalled();
   });
 
-  it('passes the consent prompt contract to the agent start command', async () => {
+  it.each([1, 2])('passes supported consent protocol %s to the agent start command', async version => {
     const capable = row();
-    m.selectLimit.mockResolvedValue([{ ...capable, device: { ...capable.device, consentPromptProtocolVersion: 1 } }]);
+    m.selectLimit.mockResolvedValue([{ ...capable, device: { ...capable.device, consentPromptProtocolVersion: version } }]);
     m.prompt.mockResolvedValue({ mode: 'consent', consentUnavailableBehavior: 'deny', notifyOnEnd: true, showIndicator: true });
     await request(`/remote/sessions/${SESSION}/offer`, { method: 'POST', body: JSON.stringify({ offer: 'v=0' }) });
     expect(m.dispatch).toHaveBeenCalledWith('agent-1', expect.objectContaining({ payload: expect.objectContaining({ prompt: expect.objectContaining({ mode: 'consent', technicianName: 'Customer', consentTimeoutMs: 30000 }) }) }));
   });
 
-  it.each([undefined, null, 0, 2])('refuses consent before dispatch when the agent reports protocol %s', async version => {
+  it.each([undefined, null, 0, 3])('refuses consent before dispatch when the agent reports protocol %s', async version => {
     const unsupported = row();
     m.selectLimit.mockResolvedValue([{ ...unsupported, device: { ...unsupported.device, consentPromptProtocolVersion: version } }]);
     m.prompt.mockResolvedValue({ mode: 'consent' });

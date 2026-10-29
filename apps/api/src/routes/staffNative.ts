@@ -2,10 +2,9 @@ import { Hono } from 'hono';
 import { HTTPException } from 'hono/http-exception';
 import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
-import { and, eq, gt } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 import { zValidator } from '../lib/validation';
 import { db, withDbAccessContext } from '../db';
-import { devices, organizations } from '../db/schema';
 import { portalNativeTargets } from '../db/schema/portalNative';
 import { authMiddleware, requireInteractiveSession, requireMfa, requirePermission, computeAccessibleOrgIds } from '../middleware/auth';
 import { ipAllowlistGuard } from '../middleware/ipAllowlistGuard';
@@ -19,7 +18,8 @@ import { staffNativePrincipalFromAuth, authorizeStaffNativeDevice } from '../ser
 import { issueStaffNativeAdmission, touchStaffNativePresence, endStaffNativeAdmission, type StaffNativeOperator } from '../services/staffNativeAdmission';
 import { NativeAdmissionError, nativeUuid, nativeIssueSchema, nativePresenceSchema } from '../services/portalNativeAdmissionSchemas';
 import { writeAuditEventAsync } from '../services/auditEvents';
-import { staffNativeAvailability } from '../services/staffNativeAvailability';
+import { renameStaffNativeDevice } from '../services/staffNativeDirectory';
+import { listStaffRemoteComputers } from '../services/staffRemoteDirectory';
 declare module 'hono' { interface ContextVariableMap { staffNative: StaffNativeOperator } }
 
 export const staffNativeRoutes = new Hono();
@@ -35,9 +35,21 @@ staffNativeRoutes.use('*', async (c, next) => {
   await next();
 });
 const browser = new Hono();
-for (const path of ['/authorize', '/launch/*']) {
+for (const path of ['/authorize', '/launch/*', '/browser/*']) {
   browser.use(path, authMiddleware, requireInteractiveSession(), requireMfa(), requirePermission('remote', 'access'));
 }
+browser.get('/browser/devices', zValidator('query', z.object({ cursor: nativeUuid.optional() }).strict()), async c => {
+  return c.json(await listStaffRemoteComputers(staffNativePrincipalFromAuth(c.get('auth')), c.req.valid('query').cursor));
+});
+browser.post('/browser/devices/:id/name', zValidator('param', z.object({ id: nativeUuid })),
+  zValidator('json', z.object({ displayName: z.string().trim().max(255).nullable() }).strict()), async c => {
+    const principal = staffNativePrincipalFromAuth(c.get('auth'));
+    const result = await renameStaffNativeDevice(principal, c.req.valid('param').id, c.req.valid('json').displayName || null);
+    await writeAuditEventAsync(c, { orgId: result.orgId, actorType: 'user', actorId: principal.userId,
+      action: 'device.update', resourceType: 'device', resourceId: result.id, result: 'success',
+      details: { source: 'remote_browser', previousDisplayName: result.previousName, displayName: result.displayName } });
+    return c.json({ success: true, id: result.id, displayName: result.displayName });
+  });
 browser.post('/authorize', zValidator('json', z.object({ clientId: z.literal(NATIVE_CLIENT_ID),
   redirectUri: z.string().max(160), codeChallenge: z.string().length(43), codeChallengeMethod: z.literal('S256'),
   state: z.string().length(43) }).strict()), async c => {
@@ -45,7 +57,7 @@ browser.post('/authorize', zValidator('json', z.object({ clientId: z.literal(NAT
   const limit = await rateLimiter(getRedis()!, `staff_native_login:${principal.userId}`, 10, 3600);
   if (!limit.allowed) { c.header('Retry-After', '3600'); return c.json({ error: 'Too many sign-in attempts' }, 429); }
   const result = await issueStaffNativeLoginCode(principal, c.req.valid('json'));
-  await writeAuditEventAsync(c, { actorType: 'user', actorId: principal.userId, action: 'staff.native.authorize',
+  await writeAuditEventAsync(c, { orgId: null, actorType: 'user', actorId: principal.userId, action: 'staff.native.authorize',
     resourceType: 'user', resourceId: principal.userId, result: 'success', details: { principalType: 'staff_native' } });
   return c.json(result);
 });
@@ -78,23 +90,17 @@ native.use('*', async (c, next) => {
   }, { partnerId: principal.partnerId, isPlatformAdmin: false, actorId: principal.userId, actorEmail: null });
 });
 native.get('/devices', zValidator('query', z.object({ cursor: nativeUuid.optional() }).strict()), async c => {
-  const cursor = c.req.valid('query').cursor;
-  const rows = await db.select({ device: devices, peerId: portalNativeTargets.rustdeskId, organizationName: organizations.name })
-    .from(devices).innerJoin(portalNativeTargets, and(eq(portalNativeTargets.deviceId, devices.id),
-      eq(portalNativeTargets.orgId, devices.orgId), eq(portalNativeTargets.enabled, true)))
-    .innerJoin(organizations, eq(organizations.id, devices.orgId))
-    .where(and(eq(organizations.partnerId, c.get('staffNative').principal.partnerId), cursor ? gt(devices.id, cursor) : undefined))
-    .orderBy(devices.id).limit(51);
-  const page = rows.slice(0, 50);
-  const availability = staffNativeAvailability(c.get('staffNative').principal);
-  const directory = [];
-  for (const { device, peerId, organizationName } of page) {
-    directory.push({ id: device.id, hostname: device.hostname, displayName: device.displayName, organizationName,
-      transports: { rustdesk: { peerId, ...await availability(device) } } });
-  }
-  return c.json({ devices: directory,
-    nextCursor: rows.length > 50 ? page[page.length - 1]!.device.id : null });
+  return c.json(await listStaffRemoteComputers(c.get('staffNative').principal, c.req.valid('query').cursor));
 });
+native.post('/devices/:id/name', zValidator('param', z.object({ id: nativeUuid })),
+  zValidator('json', z.object({ displayName: z.string().trim().max(255).nullable() }).strict()), async c => {
+    const id = c.req.valid('param').id;
+    const result = await renameStaffNativeDevice(c.get('staffNative').principal, id, c.req.valid('json').displayName || null);
+    await writeAuditEventAsync(c, { orgId: result.orgId, actorType: 'user', actorId: c.get('staffNative').principal.userId,
+      action: 'device.update', resourceType: 'device', resourceId: id, result: 'success',
+      details: { source: 'staff_native', previousDisplayName: result.previousName, displayName: result.displayName } });
+    return c.json({ success: true, id: result.id, displayName: result.displayName });
+  });
 native.post('/logout', async c => { await endStaffNativeLogin(c.get('staffNative').sessionHash); return c.json({ success: true }); });
 native.post('/sessions', zValidator('json', nativeIssueSchema), async c => {
   const input = c.req.valid('json');

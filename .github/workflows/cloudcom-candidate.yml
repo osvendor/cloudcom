@@ -15,8 +15,8 @@ permissions:
 jobs:
   validate:
     name: Validate candidate source
-    if: github.repository == 'osvendor/cloudcom'
-    runs-on: ubuntu-24.04
+    if: github.repository == 'osvendor/cloudcom' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: [self-hosted, Linux, X64, cloudcom-linux]
     timeout-minutes: 15
     outputs:
       source_commit: ${{ steps.validate.outputs.source_commit }}
@@ -65,10 +65,11 @@ jobs:
   build:
     name: Build ${{ matrix.component }} candidate
     needs: validate
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, Linux, X64, cloudcom-linux]
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - component: api

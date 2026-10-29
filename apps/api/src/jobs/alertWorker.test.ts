@@ -48,7 +48,10 @@ const {
     organizationsSchema: { id: 'organizations.id', status: 'organizations.status', type: 'organizations.type' } as const,
     fleetState: { fleet: [] as { id: string; orgId: string }[], chunkCalls: 0 },
     ctx,
-    workerState: { processor: null as null | ((job: { data: unknown }) => Promise<unknown>) }
+    workerState: {
+      processor: null as null | ((job: { data: unknown }) => Promise<unknown>),
+      options: {} as Record<string, unknown>,
+    }
   };
 });
 
@@ -137,8 +140,9 @@ vi.mock('bullmq', () => ({
     getJob = getJobMock;
   },
   Worker: class {
-    constructor(_name: string, processor: (job: { data: unknown }) => Promise<unknown>) {
+    constructor(_name: string, processor: (job: { data: unknown }) => Promise<unknown>, options: Record<string, unknown>) {
       workerState.processor = processor;
+      workerState.options = options;
     }
     on = vi.fn();
     close = vi.fn();
@@ -153,6 +157,15 @@ vi.mock('../services/alertService', () => ({
   evaluateDeviceAlerts: vi.fn(),
   checkAllAutoResolve: vi.fn(),
 }));
+
+const { hierarchyMock } = vi.hoisted(() => ({ hierarchyMock: vi.fn() }));
+vi.mock('../services/deviceHierarchy', () => ({ loadDeviceHierarchy: hierarchyMock }));
+beforeEach(() => {
+  hierarchyMock.mockReset().mockImplementation(async (deviceId: string) => ({
+    deviceId, orgId: 'org-1', siteId: 'site-1', deviceRole: 'workstation', osType: 'windows',
+    org: { partnerId: 'partner-1', type: 'customer' }, site: null, groupIds: ['group-1'],
+  }));
+});
 
 vi.mock('../services/bullmqUtils', () => ({
   isReusableState: vi.fn(() => false)
@@ -179,7 +192,7 @@ vi.mock('../services/subjectAlertOutbox', () => ({
   drainSubjectAlertOutbox: vi.fn(async () => { subjectOutbox.depths.push(ctx.depth); }),
 }));
 
-import { createAlertWorker, processEvaluateAll, triggerFullEvaluation } from './alertWorker';
+import { createAlertWorker, processEvaluateAll, scheduledAlertEvaluationOptions, triggerFullEvaluation } from './alertWorker';
 
 const resetCtx = () => {
   ctx.depth = 0;
@@ -389,6 +402,43 @@ describe('alertWorker evaluate-all #1105 DB-context scoping', () => {
     expect(seenDepths).toEqual([1]);
   });
 
+  it('loads one fresh hierarchy inside the evaluation transaction and passes it to the evaluator', async () => {
+    const hierarchy = { deviceId: 'device-1', orgId: 'org-1', groupIds: ['group-1'] };
+    const depths: number[] = [];
+    hierarchyMock.mockImplementation(async () => { depths.push(ctx.depth); return hierarchy; });
+    const { evaluateDeviceAlerts } = await import('../services/alertService');
+    vi.mocked(evaluateDeviceAlerts).mockClear().mockResolvedValue([]);
+    createAlertWorker();
+    await workerState.processor!({ data: { type: 'evaluate-device', deviceId: 'device-1', orgId: 'org-1' } });
+    expect(hierarchyMock).toHaveBeenCalledExactlyOnceWith('device-1');
+    expect(depths).toEqual([1]);
+    expect(evaluateDeviceAlerts).toHaveBeenCalledExactlyOnceWith('device-1', { hierarchy });
+    expect(ctx.depth).toBe(0);
+  });
+
+  it('does not evaluate a missing device or reuse another evaluation hierarchy', async () => {
+    hierarchyMock.mockResolvedValueOnce(null);
+    const { evaluateDeviceAlerts } = await import('../services/alertService');
+    vi.mocked(evaluateDeviceAlerts).mockClear().mockResolvedValue([]);
+    createAlertWorker();
+    const result = await workerState.processor!({ data: { type: 'evaluate-device', deviceId: 'gone', orgId: 'org-1' } });
+    expect(result).toMatchObject({ alertsCreated: 0 });
+    expect(evaluateDeviceAlerts).not.toHaveBeenCalled();
+    await workerState.processor!({ data: { type: 'evaluate-device', deviceId: 'device-2', orgId: 'org-1' } });
+    expect(hierarchyMock).toHaveBeenCalledTimes(2);
+    expect(evaluateDeviceAlerts).toHaveBeenCalledWith('device-2', {
+      hierarchy: expect.objectContaining({ deviceId: 'device-2' }),
+    });
+  });
+
+  it('propagates hierarchy read failures instead of reporting a successful evaluation', async () => {
+    hierarchyMock.mockRejectedValueOnce(new Error('database unavailable'));
+    createAlertWorker();
+    await expect(workerState.processor!({ data: { type: 'evaluate-device', deviceId: 'device-1', orgId: 'org-1' } }))
+      .rejects.toThrow('database unavailable');
+    expect(ctx.depth).toBe(0);
+  });
+
   it('drains subject events after device commit and outside the fleet context', async () => {
     subjectOutbox.depths.length = 0;
     createAlertWorker();
@@ -399,6 +449,55 @@ describe('alertWorker evaluate-all #1105 DB-context scoping', () => {
     fleetState.fleet = [];
     await workerState.processor!({ data: { type: 'evaluate-all' } });
     expect(subjectOutbox.depths).toEqual([0, 0]);
+  });
+});
+
+describe('alertWorker scheduled pressure bounds', () => {
+  afterEach(() => {
+    delete process.env.ALERT_WORKER_CONCURRENCY;
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    [undefined, 2], ['', 2], ['not-a-number', 2], ['0', 1], ['-2', 1], ['100', 10], ['3', 3],
+  ])('bounds local concurrency for %s without changing the Redis global budget', (value, expected) => {
+    if (value === undefined) delete process.env.ALERT_WORKER_CONCURRENCY;
+    else process.env.ALERT_WORKER_CONCURRENCY = value;
+    createAlertWorker();
+    expect(workerState.options.concurrency).toBe(expected);
+    expect(workerState.options).not.toHaveProperty('globalConcurrency');
+  });
+
+  it('coalesces scheduled devices across sweeps with a retained successor and tenant-scoped identities', async () => {
+    fleetState.fleet = [{ id: 'device-1', orgId: 'org-1' }, { id: 'device-1', orgId: 'org-2' }];
+    fleetState.chunkCalls = 0;
+    addBulkMock.mockClear();
+    networkCheckOrgIdsMock.mockResolvedValue([]);
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    await processEvaluateAll({ type: 'evaluate-all' });
+    const [jobs] = addBulkMock.mock.calls[0] as unknown as [Array<{ opts: { deduplication: { id: string; keepLastIfActive: boolean }; removeOnComplete: unknown; removeOnFail: unknown } }>];
+    expect(jobs[0]!.opts.deduplication).toEqual({
+      id: scheduledAlertEvaluationOptions('device', 'org-1', 'device-1').deduplication!.id,
+      keepLastIfActive: true,
+    });
+    expect(jobs[0]!.opts.deduplication.id).not.toBe(jobs[1]!.opts.deduplication.id);
+    expect(jobs[0]!.opts.deduplication).not.toHaveProperty('ttl');
+    expect(jobs[0]!.opts.removeOnComplete).toEqual({ count: 100 });
+    expect(jobs[0]!.opts.removeOnFail).toEqual({ count: 100 });
+    fleetState.chunkCalls = 0;
+    await processEvaluateAll({ type: 'evaluate-all' });
+    const [next] = addBulkMock.mock.calls[1] as unknown as [typeof jobs];
+    expect(next.map(j => j.opts.deduplication.id)).toEqual(jobs.map(j => j.opts.deduplication.id));
+  });
+
+  it('separates network-check and device scopes, including identifiers with delimiters', () => {
+    const ids = [
+      scheduledAlertEvaluationOptions('device', 'a-b', 'c').deduplication!.id,
+      scheduledAlertEvaluationOptions('device', 'a', 'b-c').deduplication!.id,
+      scheduledAlertEvaluationOptions('network-checks', 'a-b').deduplication!.id,
+      scheduledAlertEvaluationOptions('network-checks', 'a').deduplication!.id,
+    ];
+    expect(new Set(ids).size).toBe(ids.length);
   });
 });
 
@@ -438,7 +537,7 @@ describe('alertWorker evaluate-all network_check fan-out (#6353)', () => {
     expect(ctx.addBulkDepths).toEqual([0, 0]);
     expect(ctx.tripwireViolations).toEqual([]);
     const [jobs] = addBulkMock.mock.calls[1] as unknown as [{ name: string; data: { type: string; orgId: string } }[]];
-    expect(jobs).toEqual([
+    expect(jobs).toMatchObject([
       { name: 'evaluate-network-checks', data: { type: 'evaluate-network-checks', orgId: 'org-1' } },
       { name: 'evaluate-network-checks', data: { type: 'evaluate-network-checks', orgId: 'org-2' } },
     ]);

@@ -17,24 +17,28 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  */
 
 const txState = vi.hoisted(() => ({ depth: 0, open: 0, failNextCommit: false }));
+const capacity = vi.hoisted(() => ({ available: true }));
+vi.mock('../services/capacityGuard', () => ({ canRunBackgroundWork: () => capacity.available }));
 
 const { selectMock, evaluatePolicyMock, scanConfigMock, afterCommitMock, captured, events } = vi.hoisted(() => ({
   selectMock: vi.fn(),
   evaluatePolicyMock: vi.fn(),
   scanConfigMock: vi.fn(),
   afterCommitMock: vi.fn(),
-  captured: { processor: null as null | ((job: unknown) => Promise<unknown>) },
+  captured: { options: {} as { concurrency?: number }, processor: null as null | ((job: unknown, token?: string) => Promise<unknown>) },
   events: [] as Array<{ event: string; depth: number; open: number }>,
 }));
 
 vi.mock('bullmq', () => ({
+  DelayedError: class DelayedError extends Error {},
   Queue: class {
-    addBulk = vi.fn();
+    addBulk = vi.fn(async () => { events.push({ event: 'bulk_enqueue', depth: txState.depth, open: txState.open }); });
     close = vi.fn();
   },
   Worker: class {
-    constructor(_name: string, processor: (job: unknown) => Promise<unknown>) {
+    constructor(_name: string, processor: (job: unknown) => Promise<unknown>, options: { concurrency?: number }) {
       captured.processor = processor;
+      captured.options = options;
     }
     on = vi.fn();
     close = vi.fn();
@@ -70,6 +74,7 @@ vi.mock('../services/policyEvaluationService', () => ({
   scanAndEvaluateConfigPolicyCompliance: scanConfigMock,
 }));
 
+import { DelayedError } from 'bullmq';
 import { createPolicyEvaluationWorker } from './policyEvaluationWorker';
 
 const POLICY = { id: 'policy-1', enabled: true };
@@ -84,6 +89,7 @@ function mockPolicyRow(rows: unknown[]) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  capacity.available = true;
   selectMock.mockReset();
   txState.depth = 0;
   txState.open = 0;
@@ -158,4 +164,101 @@ describe('policy evaluation enqueues remediation runs only after they commit (#7
     await expect(captured.processor!(CONFIG_SCAN_JOB)).resolves.toEqual({ rulesScanned: 0, devicesEvaluated: 0 });
     expect(afterCommitMock).not.toHaveBeenCalled();
   });
+});
+
+describe('policy evaluation capacity admission', () => {
+  it.each(['scan-due-policies', 'evaluate-policy', 'scan-config-policy-compliance', 'reconcile-compliance-alerts'])(
+    'retains explicit %s work with its lock token before database access', async (type) => {
+      capacity.available = false;
+      const moveToDelayed = vi.fn().mockResolvedValue(undefined);
+      const before = Date.now();
+      await expect(captured.processor!({ data: { type, policyId: POLICY.id }, moveToDelayed }, 'lock-token'))
+        .rejects.toBeInstanceOf(DelayedError);
+      expect(moveToDelayed).toHaveBeenCalledWith(expect.any(Number), 'lock-token');
+      expect(moveToDelayed.mock.calls[0]![0]).toBeGreaterThanOrEqual(before + 60_000);
+      expect(selectMock).not.toHaveBeenCalled();
+      expect(scanConfigMock).not.toHaveBeenCalled();
+      expect(evaluatePolicyMock).not.toHaveBeenCalled();
+      expect(txState.open).toBe(0);
+    },
+  );
+
+  it('skips only the missed recurring scan tick, without retaining a catch-up backlog', async () => {
+    capacity.available = false;
+    const moveToDelayed = vi.fn();
+    await expect(captured.processor!({ ...CONFIG_SCAN_JOB, opts: { repeat: { every: 60_000 } }, moveToDelayed }, 'lock'))
+      .resolves.toEqual({ deferredForCapacity: true });
+    expect(moveToDelayed).not.toHaveBeenCalled();
+    expect(scanConfigMock).not.toHaveBeenCalled();
+    capacity.available = true;
+    await expect(captured.processor!(CONFIG_SCAN_JOB)).resolves.toEqual({ rulesScanned: 1, devicesEvaluated: 1 });
+  });
+
+  it('propagates a failed delay instead of claiming the work was safely deferred', async () => {
+    capacity.available = false;
+    const error = Error('Redis unavailable');
+    await expect(captured.processor!({ ...EVALUATE_JOB, moveToDelayed: vi.fn().mockRejectedValue(error) }, 'lock'))
+      .rejects.toBe(error);
+    expect(evaluatePolicyMock).not.toHaveBeenCalled();
+  });
+
+  it('allows already-admitted work to commit and enqueue after capacity drops', async () => {
+    mockPolicyRow([POLICY]);
+    evaluatePolicyMock.mockImplementationOnce(async () => {
+      capacity.available = false;
+      return { devicesEvaluated: 1, summary: { compliant: 0, non_compliant: 1 }, afterCommit: afterCommitMock };
+    });
+    await expect(captured.processor!(EVALUATE_JOB)).resolves.toMatchObject({ devicesEvaluated: 1 });
+    expect(afterCommitMock).toHaveBeenCalledOnce();
+    expect(events.find(e => e.event === 'enqueue')).toMatchObject({ open: 0 });
+  });
+
+  it('releases the policy scan transaction before enqueuing to Redis', async () => {
+    selectMock.mockReturnValueOnce({ from: vi.fn().mockReturnValue({
+      where: vi.fn().mockImplementation(async () => {
+        expect(txState.open).toBe(1);
+        return [{ ...POLICY, lastEvaluatedAt: null }];
+      }),
+    }) });
+    await expect(captured.processor!({ data: { type: 'scan-due-policies' } })).resolves.toEqual({ queued: 1 });
+    expect(events.find(e => e.event === 'bulk_enqueue')).toMatchObject({ open: 0, depth: 0 });
+  });
+});
+it('limits simultaneous policy evaluations to one', () => {
+  expect(captured.options.concurrency).toBe(1);
+});
+
+it('aggregates workload counters without device identities or per-job logging', async () => {
+  const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+  const date = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 120_000);
+  try {
+    capacity.available = false;
+    await captured.processor!({ ...CONFIG_SCAN_JOB, opts: { repeat: { every: 60_000 } } });
+    const record = info.mock.calls.find(call => call[0] === '[PolicyEvaluationWorker] Workload');
+    expect(record).toBeDefined();
+    expect(record![1]).toMatchObject({ jobs: {
+      'scan-config-policy-compliance': { deferred: expect.any(Number), elapsedMs: expect.any(Number) },
+    } });
+    expect(JSON.stringify(record)).not.toContain(POLICY.id);
+    info.mockClear();
+    await captured.processor!({ ...CONFIG_SCAN_JOB, opts: { repeat: { every: 60_000 } } });
+    expect(info).not.toHaveBeenCalled();
+  } finally { info.mockRestore(); date.mockRestore(); }
+});
+it('retains a scoped reconcile even if repeat metadata is present', async () => {
+  capacity.available = false;
+  const moveToDelayed = vi.fn().mockResolvedValue(undefined);
+  await expect(captured.processor!({
+    data: { type: 'reconcile-compliance-alerts', orgId: 'org-1' },
+    opts: { repeat: { every: 60_000 } }, moveToDelayed,
+  }, 'lock')).rejects.toBeInstanceOf(DelayedError);
+  expect(moveToDelayed).toHaveBeenCalledOnce();
+});
+
+it('does not start explicit work or claim a safe deferral without a lock token', async () => {
+  capacity.available = false;
+  const moveToDelayed = vi.fn();
+  await expect(captured.processor!({ ...EVALUATE_JOB, moveToDelayed })).rejects.toThrow('worker lock token');
+  expect(moveToDelayed).not.toHaveBeenCalled();
+  expect(selectMock).not.toHaveBeenCalled();
 });

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { PgDialect } from 'drizzle-orm/pg-core';
 
 const mocks = vi.hoisted(() => ({
   claim: vi.fn(), publish: vi.fn(), release: vi.fn(), provision: vi.fn(),
@@ -26,7 +27,10 @@ vi.mock('../extensions/cloudCommandAdminRuntime', () => ({
 }));
 vi.mock('../services/urlSafety', () => ({ safeFetch: vi.fn() }));
 
-import { collectCloudCommandM365Snapshot, refreshCloudCommandM365Snapshot } from './cloudCommandM365SnapshotWorker';
+import { db } from '../db';
+import { cloudCommandAdminRuntime } from '../extensions/cloudCommandAdminRuntime';
+import { collectCloudCommandM365Snapshot, refreshCloudCommandM365Snapshot,
+  initializeCloudCommandM365SnapshotWorker, shutdownCloudCommandM365SnapshotWorker } from './cloudCommandM365SnapshotWorker';
 
 const binding = { orgId: '0b430874-6159-4ddf-b4ad-36ae5f62ba14',
   tenantId: '1b430874-6159-4ddf-b4ad-36ae5f62ba14',
@@ -53,6 +57,32 @@ beforeEach(() => {
 });
 
 describe('Cloud Command Microsoft snapshot collection', () => {
+  it('does not start Exchange collection for an idle tenant without a pending explicit refresh', async () => {
+    vi.mocked(cloudCommandAdminRuntime.configuration).mockResolvedValue(binding as never);
+    vi.mocked(db.execute).mockResolvedValue([] as never);
+    initializeCloudCommandM365SnapshotWorker();
+    try {
+      await vi.waitFor(() => expect(db.execute).toHaveBeenCalledOnce());
+      const query = new PgDialect().sqlToQuery(vi.mocked(db.execute).mock.calls[0]![0] as never).sql;
+      expect(query).toMatch(/WHERE c\.enabled = true AND s\.refresh_requested_at IS NOT NULL\s+AND \(s\.last_attempt_at IS NULL OR s\.refresh_requested_at > s\.last_attempt_at\)/);
+      expect(query).not.toContain("interval '5 minutes'");
+      expect(mocks.claim).not.toHaveBeenCalled();
+      expect(mocks.provision).not.toHaveBeenCalled();
+    } finally { shutdownCloudCommandM365SnapshotWorker(); }
+  });
+
+  it('collects and publishes a requested refresh through the existing claim and release flow', async () => {
+    vi.mocked(cloudCommandAdminRuntime.configuration).mockResolvedValue(binding as never);
+    vi.mocked(db.execute).mockResolvedValue([{ ...binding, id: 'connection-a' }] as never);
+    initializeCloudCommandM365SnapshotWorker();
+    try {
+      await vi.waitFor(() => expect(mocks.release).toHaveBeenCalledOnce());
+      expect(mocks.claim).toHaveBeenCalledWith(expect.anything(), expect.objectContaining(binding));
+      expect(mocks.publish).toHaveBeenCalledWith(expect.anything(), expect.objectContaining(binding), expect.any(String), 'directory', expect.objectContaining({ mailboxes: expect.any(Array) }));
+      expect(mocks.publish).toHaveBeenCalledWith(expect.anything(), expect.objectContaining(binding), expect.any(String), 'usage', expect.any(Object));
+    } finally { shutdownCloudCommandM365SnapshotWorker(); }
+  });
+
   it('uses the bound Exchange descriptor and fills missing licensed drive usage before publishing', async () => {
     const result = await collectCloudCommandM365Snapshot(binding);
     expect(mocks.provision).toHaveBeenCalledWith({ organizationId: binding.orgId,

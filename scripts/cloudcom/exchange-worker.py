@@ -5,7 +5,7 @@ Deployment owns the socket path, permitted API uid, config file and certificate 
 process deliberately never listens on TCP and never accepts PowerShell, certificate paths, or
 tenant configuration from a client. It is a service-side companion, not an API endpoint.
 """
-import argparse, datetime, json, os, re, select, socket, socketserver, stat, struct, subprocess, threading, time, uuid, tempfile
+import argparse, datetime, json, os, re, select, signal, socket, socketserver, stat, struct, subprocess, threading, time, uuid, tempfile
 from pathlib import Path
 try: import pwd
 except ModuleNotFoundError: pwd = None
@@ -14,6 +14,8 @@ MAX_REQUEST = 64 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
 MAX_PAGE_SIZE = 200
 COMMAND_TIMEOUT_SECONDS = 45
+IDLE_TIMEOUT_SECONDS = 60
+MAX_PERSISTENT_SESSIONS = 3
 ALLOWED_OPERATIONS = frozenset(('mailbox.inventory', 'mailbox.statistics.get', 'mailbox.preservation.get', 'mailbox.convert.shared', 'mailbox.forwarding.get', 'mailbox.forwarding.set',
     'mailbox.autoreply.get', 'mailbox.autoreply.set', 'mailbox.addresses.get', 'mailbox.primary.set',
     'mailbox.alias.add', 'mailbox.alias.remove', 'mailbox.delegation.get', 'mailbox.delegation.list', 'mailbox.delegation.set', 'distribution.create', 'shared.create', 'distribution.member.set', 'distribution.members.get', 'group.settings.get', 'group.external.set', 'distribution.name.set', 'group.primary.set', 'group.alias.add', 'group.alias.remove', 'trace.search', 'trace.detail', 'quarantine.lookup', 'quarantine.release.set'))
@@ -340,12 +342,16 @@ class PersistentPowerShell:
         env = {**os.environ, 'CLOUDCOM_EXCHANGE_CONFIG': json.dumps(descriptor, separators=(',', ':')),
                'TMPDIR': self.temp_directory.name, 'TMP': self.temp_directory.name, 'TEMP': self.temp_directory.name}
         self.buffer = b''
-        try: self.process = subprocess.Popen(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-File', script], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, env=env)
+        try: self.process = subprocess.Popen(['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-File', script], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0, env=env, start_new_session=True)
         except Exception:
             self.temp_directory.cleanup()
             raise
     def close(self):
-        if self.process.poll() is None: self.process.kill()
+        if self.process.poll() is None:
+            if os.name == 'posix':
+                try: os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+            self.process.kill()
         try: self.process.wait(timeout=3)
         except subprocess.TimeoutExpired: return
         self.temp_directory.cleanup()
@@ -353,10 +359,32 @@ class PersistentPowerShell:
         if request['tenantId'] != self.tenant_id: return fail(request['requestId'], 'connection_mismatch')
         with self.lock:
             try:
-                self.process.stdin.write((json.dumps(request, separators=(',', ':')) + '\n').encode('utf-8')); self.process.stdin.flush()
                 deadline = time.monotonic() + COMMAND_TIMEOUT_SECONDS
+                payload = (json.dumps(request, separators=(',', ':')) + '\n').encode('utf-8')
+                if os.name == 'posix':
+                    # Startup/import can stall before pwsh reads stdin. A 64 KiB
+                    # envelope exceeds Linux's minimum pipe capacity, so writing
+                    # must share the command deadline rather than block first.
+                    descriptor = self.process.stdin.fileno()
+                    os.set_blocking(descriptor, False)
+                    offset = 0
+                    while offset < len(payload):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0: raise TimeoutError()
+                        _, writable, _ = select.select([], [descriptor], [], remaining)
+                        if not writable: raise TimeoutError()
+                        try: written = os.write(descriptor, payload[offset:])
+                        except BlockingIOError: continue
+                        if written <= 0: raise BrokenPipeError()
+                        offset += written
+                else:
+                    # This service is Linux-only; support fake-process contract
+                    # tests on Windows without attempting select() on pipes.
+                    self.process.stdin.write(payload); self.process.stdin.flush()
                 while b'\n' not in self.buffer:
                     remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.close(); return fail(request['requestId'], 'unknown_write_outcome' if is_write(request['operation']) else 'provider_unreachable')
                     ready, _, _ = select.select([self.process.stdout.fileno()], [], [], max(remaining, 0))
                     if not ready: self.close(); return fail(request['requestId'], 'unknown_write_outcome' if is_write(request['operation']) else 'provider_unreachable')
                     chunk = os.read(self.process.stdout.fileno(), min(8192, MAX_RESPONSE + 1 - len(self.buffer)))
@@ -377,19 +405,60 @@ class PersistentPowerShell:
                 self.close(); return fail(request['requestId'], 'unknown_write_outcome' if is_write(request['operation']) else 'provider_unreachable')
 
 class Broker:
-    def __init__(self, config, script): self.config, self.script, self.pool, self.lock = config, script, {}, threading.Lock()
+    def __init__(self, config, script):
+        self.config, self.script, self.pool, self.lock = config, script, {}, threading.Lock()
+        # Reject excess work before starting processes or accumulating waiters.
+        self.admission = threading.BoundedSemaphore(1)
+        self.stopping = threading.Event()
+    def reap_idle(self):
+        with self.lock:
+            for tenant, worker in list(self.pool.items()):
+                if not worker.lock.acquire(blocking=False): continue
+                try:
+                    if worker.process.poll() is not None or time.monotonic() - worker.used >= IDLE_TIMEOUT_SECONDS:
+                        worker.close(); del self.pool[tenant]
+                finally: worker.lock.release()
+    def close(self):
+        self.stopping.set()
+        with self.lock:
+            for worker in self.pool.values():
+                with worker.lock: worker.close()
+            self.pool.clear()
     def execute(self, raw):
+        request_id = raw.get('requestId') if isinstance(raw, dict) else None
+        # The private health probe deliberately sends an invalid envelope. Its
+        # answer must not depend on capacity or shutdown admission state.
+        try:
+            if not isinstance(raw, dict) or not isinstance(request_id, str): raise ValueError()
+            normalized_uuid(request_id)
+        except (ValueError, TypeError, AttributeError):
+            return fail('00000000-0000-4000-8000-000000000000', 'invalid_request')
+        if self.stopping.is_set() or not self.admission.acquire(blocking=False): return fail(request_id, 'worker_busy')
+        try: return self._execute(raw)
+        finally: self.admission.release()
+    def _execute(self, raw):
         request_id = raw.get('requestId') if isinstance(raw, dict) else None
         try: tenants = read_config(self.config); request_id, descriptor = validate_request(raw, tenants)
         except Exception: return fail(request_id if isinstance(request_id, str) else '00000000-0000-4000-8000-000000000000', 'invalid_request')
         if descriptor is None: return fail(request_id, 'connection_mismatch')
         with self.lock:
+            if self.stopping.is_set(): return fail(request_id, 'worker_busy')
             worker = self.pool.get(raw['tenantId'])
-            if worker is None or worker.process.poll() is not None or worker.descriptor != descriptor or time.monotonic() - worker.used > 300:
+            if worker is None or worker.process.poll() is not None or worker.descriptor != descriptor or time.monotonic() - worker.used >= IDLE_TIMEOUT_SECONDS:
                 if worker:
                     # A replacement waits for an in-flight request. This stops a rotated
                     # descriptor from killing a read and returning a stale response.
                     with worker.lock: worker.close()
+                if worker: del self.pool[raw['tenantId']]
+                while len(self.pool) >= MAX_PERSISTENT_SESSIONS:
+                    # Recent sessions may own an inventory continuation. Never
+                    # invalidate another tenant's cursor merely to admit work.
+                    candidates = [(tenant, session) for tenant, session in self.pool.items()
+                                  if session.process.poll() is not None or time.monotonic() - session.used >= IDLE_TIMEOUT_SECONDS]
+                    if not candidates: return fail(request_id, 'worker_busy')
+                    tenant, retired = min(candidates, key=lambda entry: entry[1].used)
+                    with retired.lock: retired.close()
+                    del self.pool[tenant]
                 worker = self.pool[raw['tenantId']] = PersistentPowerShell(raw, descriptor, self.script)
             # Take the per-worker lock before releasing the pool lock so a concurrent
             # descriptor rotation cannot close this process before run() starts.
@@ -400,6 +469,7 @@ class Broker:
 class Handler(socketserver.StreamRequestHandler):
     def handle(self):
         try:
+            self.request.settimeout(5)
             if not peer_allowed(self.request, self.server.allowed_uid): return
             body = self.rfile.readline(MAX_REQUEST + 1)
             if not body or len(body) > MAX_REQUEST: result = fail('00000000-0000-4000-8000-000000000000', 'invalid_request')
@@ -409,7 +479,13 @@ class Handler(socketserver.StreamRequestHandler):
         except (BrokenPipeError, ConnectionResetError): pass
 # The fallback only allows contract tests to import this Linux-only service on Windows.
 UnixServerBase = getattr(socketserver, 'ThreadingUnixStreamServer', socketserver.TCPServer)
-class Server(UnixServerBase): allow_reuse_address = True; daemon_threads = True
+class Server(UnixServerBase):
+    allow_reuse_address = True
+    daemon_threads = True
+    def service_actions(self): self.broker.reap_idle()
+    def server_close(self):
+        super().server_close()
+        self.broker.close()
 
 def main():
     parser = argparse.ArgumentParser(); parser.add_argument('--socket', required=True); parser.add_argument('--config', required=True); parser.add_argument('--script', required=True); parser.add_argument('--api-user', required=True)
@@ -421,5 +497,12 @@ def main():
     broker = Broker(args.config, args.script)
     with Server(str(socket_path), Handler) as server:
         server.allowed_uid = pwd.getpwnam(args.api_user).pw_uid; server.broker = broker
+        def stop(_signum, _frame):
+            broker.stopping.set()
+            # shutdown must run outside serve_forever's thread. Context cleanup
+            # then waits for the bounded active command before closing sessions.
+            threading.Thread(target=server.shutdown, daemon=True).start()
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
         os.chmod(socket_path, 0o660); server.serve_forever()
 if __name__ == '__main__': main()

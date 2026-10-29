@@ -163,6 +163,7 @@ vi.mock('./deviceSiteResolver', () => ({ resolveDeviceSiteId: vi.fn(() => Promis
 vi.mock('../jobs/alertCorrelation', () => ({ enqueueAlertCorrelation: vi.fn(() => Promise.resolve('job-1')) }));
 
 import { resolveMaintenanceConfigForDevice, isInMaintenanceWindow } from './featureConfigResolver';
+import { getAlertWorkTelemetrySnapshot, getActiveAlertWorkSpan } from './alertWorkTelemetry';
 
 import { evaluateDeviceAlerts, evaluateNetworkCheckAlertsForDevice } from './alertService';
 
@@ -282,6 +283,7 @@ beforeEach(() => {
 
 describe('#6353 — network_check rules are evaluated once per check, not once per device', () => {
   it('the per-device sweep raises NO alert for a network_check rule on any of N online devices', async () => {
+    const before = getAlertWorkTelemetrySnapshot().groups.find(row => row.group === 'network')!.evaluations;
     const online = ['device-a', 'device-b', 'device-c'];
     for (const id of online) pushSweepQueue({ deviceId: id, createsAlert: false, detachScan: true });
 
@@ -290,6 +292,7 @@ describe('#6353 — network_check rules are evaluated once per check, not once p
     expect(insertedAlerts).toHaveLength(0);
     expect(evaluateConditionsMock).not.toHaveBeenCalled();
     expect(recordMonitorEvaluationMock).not.toHaveBeenCalled();
+    expect(getAlertWorkTelemetrySnapshot().groups.find(row => row.group === 'network')!.evaluations).toBe(before);
   });
 
   it('the per-device sweep still counts the network_check monitor as evaluated, so its open episode on the alert device is not detached', async () => {
@@ -301,6 +304,15 @@ describe('#6353 — network_check rules are evaluated once per check, not once p
   });
 
   it('the device-independent path raises exactly one alert on the resolved alert device even when it is OFFLINE', async () => {
+    const before = getAlertWorkTelemetrySnapshot().groups.find(row => row.group === 'network')!;
+    evaluateConditionsMock.mockImplementationOnce(async () => {
+      getActiveAlertWorkSpan()!.queryCount += 2;
+      return { triggered: true, conditionsMet: [], conditionsNotMet: [], dataState: 'ok', context: {} };
+    });
+    recordMonitorEvaluationMock.mockImplementationOnce(async () => {
+      getActiveAlertWorkSpan()!.queryCount += 3;
+      return { episodeId: null, episodeOpened: false, episodeClosed: false, episodesInWindow: 0, latched: false, needsEscalationAlert: false, responsesPaused: false };
+    });
     pushSweepQueue({ deviceId: 'device-offline', deviceStatus: 'offline', createsAlert: true, detachScan: false });
 
     const created = await evaluateNetworkCheckAlertsForDevice('device-offline', new Set([MONITOR_ID]));
@@ -317,6 +329,9 @@ describe('#6353 — network_check rules are evaluated once per check, not once p
     // close every OTHER monitor's episode on this device.
     expect(detachMonitorFromDeviceMock).not.toHaveBeenCalled();
     expect(resultsQueue).toHaveLength(0);
+    const after = getAlertWorkTelemetrySnapshot().groups.find(row => row.group === 'network')!;
+    expect(after.evaluations - before.evaluations).toBe(1);
+    expect(after.queryCount - before.queryCount).toBe(5); // condition AND bookkeeping share the span
   });
 
   it('the device-independent path skips a network_check rule whose monitor is not one this device is the alert device for', async () => {

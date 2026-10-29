@@ -441,6 +441,39 @@ describe('GET /cf-access-login', () => {
     expect(res.headers.get('Location')).toContain('/login?');
     expect(res.headers.get('Location')).toContain('reason=disabled');
   });
+  it('does not discover staff from a caller email or portal cookie without verified Access', async () => {
+    envState.enabled = true; dbState.userRow = activeUser;
+    const response = await callGet('/cf-access-login?remoteIdentity=1&email=admin@example.test', {
+      Cookie: 'breeze_portal_session=customer',
+    });
+    expect(await response.json()).toEqual({ kind: 'none' });
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    expect(servicesState.mintCalls).toHaveLength(0);
+  });
+  it.each(['active', 'disabled'])('discovers %s staff only after Access verification, without issuing a session', async status => {
+    envState.enabled = true;
+    verifyState.next = { kind: 'claims', claims: { email: 'user@example.com', sub: 'cf-user' } };
+    dbState.userRow = { ...activeUser, status };
+    const response = await callGet('/cf-access-login?remoteIdentity=1', { 'Cf-Access-Jwt-Assertion': 'tok' });
+    expect(await response.json()).toEqual({ kind: 'staff' });
+    expect(servicesState.mintCalls).toHaveLength(0);
+    expect(cookieState.set).toBeNull();
+    expect(dbState.lastLoginUpdated).toBe(false);
+  });
+  it('an unknown verified Access identity remains a customer and issues no staff session', async () => {
+    envState.enabled = true;
+    verifyState.next = { kind: 'claims', claims: { email: 'customer@example.com', sub: 'cf-customer' } };
+    const response = await callGet('/cf-access-login?remoteIdentity=1', { 'Cf-Access-Jwt-Assertion': 'tok' });
+    expect(await response.json()).toEqual({ kind: 'customer' });
+    expect(servicesState.mintCalls).toHaveLength(0);
+  });
+  it('rejects invalid Access assertions during remote identity discovery', async () => {
+    envState.enabled = true; verifyState.next = { kind: 'invalid', code: 'ERR_JWT_EXPIRED' };
+    const response = await callGet('/cf-access-login?remoteIdentity=1', { 'Cf-Access-Jwt-Assertion': 'tok' });
+    expect(response.status).toBe(302);
+    expect(response.headers.get('Location')).toContain('invalid-jwt');
+    expect(servicesState.mintCalls).toHaveLength(0);
+  });
 
   it('redirects to /login with error=no-jwt when header missing', async () => {
     envState.enabled = true;

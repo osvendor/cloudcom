@@ -528,6 +528,19 @@ registerDiskOnlyMsiDownloadRoute({
   directory: () => process.env.CLOUDCOM_RUSTDESK_HOST_DIR || binaryStoreDir('agent'),
 });
 
+// Keep queued, checksum-pinned installations independent of later promotions.
+// Explicit routes also prevent caller-controlled paths into the artifact store.
+for (const version of ['1.5.0.68', '1.5.0.69']) {
+  registerDiskOnlyMsiDownloadRoute({
+    path: `/download/rustdesk/windows/amd64/msi/${version}`,
+    logTag: 'rustdesk-host-msi-download',
+    filename: `cloudcom-rustdesk-host-${version}.msi`,
+    downloadFilename: `cloudcom-rustdesk-host-${version}.msi`,
+    entityLabel: 'RustDesk host',
+    directory: () => process.env.CLOUDCOM_RUSTDESK_HOST_DIR || binaryStoreDir('agent'),
+  });
+}
+
 // ============================================
 // Agent .pkg Installer Download (macOS, public, no auth)
 // ============================================

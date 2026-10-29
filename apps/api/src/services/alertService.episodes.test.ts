@@ -25,7 +25,9 @@ const {
   isCooldownActiveMock,
   isFlappingMock,
   callOrder,
+  episodeUpdates,
 } = vi.hoisted(() => {
+  const episodeUpdates: Array<{ table: unknown; set: unknown; where: unknown }> = [];
   const resultsQueue: unknown[][] = [];
   const callOrder: string[] = [];
   const insertedAlerts: Record<string, unknown>[] = [];
@@ -44,6 +46,7 @@ const {
   };
   return {
     resultsQueue,
+    episodeUpdates,
     callOrder,
     insertedAlerts,
     dbMock: {
@@ -67,7 +70,10 @@ const {
         });
         return [{ id: 'alert-1' }];
       }),
-      update: vi.fn(() => ({ set: () => ({ where: () => Promise.resolve(undefined) }) })),
+      update: vi.fn((table: unknown) => ({ set: (set: unknown) => ({ where: (where: unknown) => {
+        episodeUpdates.push({ table, set, where });
+        return Promise.resolve(undefined);
+      } }) })),
       delete: vi.fn(() => ({ where: () => Promise.resolve([]) })),
     },
     captureExceptionMock: vi.fn(),
@@ -122,6 +128,8 @@ vi.mock('../db/schema', () => ({
   organizations: { id: 'organizations.id', partnerId: 'organizations.partnerId' },
   sites: {},
   configPolicyAlertRules: {},
+  monitorEpisodes: { id: 'episodes.id', alertId: 'episodes.alertId', responseOutcome: 'episodes.responseOutcome',
+    responseRunId: 'episodes.responseRunId', responseDispatch: 'episodes.responseDispatch', responsesAdmittedAt: 'episodes.responsesAdmittedAt' },
   monitorDefinitions: { id: 'monitor_definitions.id' },
   monitorDeviceState: {
     monitorId: 'monitor_device_state.monitorId',
@@ -254,6 +262,7 @@ function pushSweepQueue(opts: {
 
 beforeEach(() => {
   resultsQueue.length = 0;
+  episodeUpdates.length = 0;
   callOrder.length = 0;
   insertedAlerts.length = 0;
   vi.clearAllMocks();
@@ -291,6 +300,20 @@ beforeEach(() => {
 });
 
 describe('evaluateDeviceAlerts — monitor episodes (#5290)', () => {
+  it('records a suppressed alert as no response only while its episode is wholly unclaimed', async () => {
+    pushSweepQueue({ triggered: true });
+    isCooldownActiveMock.mockResolvedValue(true);
+    await evaluateDeviceAlerts(DEVICE_ID);
+    const update = episodeUpdates.find(row => (row.set as any).responseOutcome === 'skipped_no_response');
+    expect(update).toBeDefined();
+    expect(update!.where).toEqual({ op: 'and', args: [
+      { op: 'eq', col: 'episodes.id', val: 'episode-1' },
+      ...['alertId', 'responseOutcome', 'responseRunId', 'responseDispatch', 'responsesAdmittedAt']
+        .map(field => ({ op: 'isNull', col: `episodes.${field}` })),
+    ] });
+    expect(insertedAlerts).toHaveLength(0);
+  });
+
   it('records a breach observation BEFORE the alert is inserted', async () => {
     pushSweepQueue({ triggered: true });
 

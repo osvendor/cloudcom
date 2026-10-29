@@ -51,6 +51,11 @@ describe('operations health collector', () => {
   it('rechecks active platform status even when results are cached', async () => {
     const { readOperationsHealth } = await import('./operationsHealth');
     const first = await readOperationsHealth(admin);
+    expect(first?.alertWorkload?.windowMs).toBe(300_000);
+    expect(first?.alertWorkload?.groups).toHaveLength(9);
+    expect(first?.alertWorkload?.scriptMonitors).toEqual([]);
+    expect(first?.alertWorkload?.scriptMonitorLimit).toBe(64);
+    expect(first?.alertWorkload?.groups.every(group => group.queryCount === 0 && group.evaluations === 0)).toBe(true);
     const calls = state.execute.mock.calls.length;
     expect(await readOperationsHealth(admin)).toBe(first);
     expect(state.execute).toHaveBeenCalledTimes(calls);
@@ -121,7 +126,7 @@ describe('operations health collector', () => {
       expect(card).toMatchObject({ status: 'attention', value: 'Heavy background work paused' });
       expect(card.detail).toContain('CPU unknown');
       expect(card.detail).toContain(`Waiting: ${reason}.`);
-      expect(card.detail).toContain('Routine script probes and Harmony refresh defer');
+      expect(card.detail).toContain('Small script-monitor checks continue only with fresh safe measurements and paced capacity');
       expect(card.detail).toContain('sign-in, check-ins and remote tools remain available');
     },
   );

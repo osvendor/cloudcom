@@ -31,6 +31,7 @@ import { monitorRequestUrl, readTlsObservation, tlsObservationUpdate } from '../
 import { selectMonitorExecutor } from '../services/networkExecutorSelection';
 import { resolveNetworkCheckAlertDevice } from '../services/monitors/networkCheckAlertDevice';
 import { notHoldingOrgCondition } from '../services/unassignedPool/selectorPredicate';
+import { readMonitorConcurrency, runMonitorWork } from './monitorWorkAdmission';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -115,36 +116,39 @@ const MONITOR_REPEATABLE_META: QueueActorMeta = {
 function createMonitorWorker(): Worker<MonitorJobData> {
   return new Worker<MonitorJobData>(
     MONITOR_QUEUE,
-    async (job: Job<MonitorJobData>) => {
+    async (job: Job<MonitorJobData>, token?: string) => {
       const data = parseQueueJobData(MONITOR_QUEUE, job, monitorQueueJobDataSchema);
-      switch (data.type) {
-        case 'monitor-scheduler':
-          assertQueueJobName(MONITOR_QUEUE, job, 'monitor-scheduler');
-          // Self-manages its DB context: reads due monitors in a SHORT context,
-          // then runs the Redis enqueue loop OUTSIDE any transaction. A blanket
-          // wrap here would pin a pooled connection idle-in-transaction for the
-          // whole enqueue loop (~20s on the EU fleet), starving the pool (#1105).
-          return await processScheduler();
-        case 'check-monitor':
-          // NOT wrapped in runWithSystemDbAccess here (final-review fix,
-          // #4084/#1105): processCheckMonitor calls the agentCommandRelay
-          // facade (isAgentConnectedAnywhere, dispatchCommandToAgent — Redis/WS
-          // I/O), and manages its own short-lived system DB context around
-          // just its reads, closing it before that I/O runs.
-          assertQueueJobName(MONITOR_QUEUE, job, 'check-monitor');
-          return await processCheckMonitor(data);
-        case 'process-check-result':
-          return await runWithSystemDbAccess(() => {
-            assertQueueJobName(MONITOR_QUEUE, job, 'process-check-result');
-            return processCheckResult(data);
-          });
-        default:
-          throw new Error(`Unknown job type: ${(data as { type: string }).type}`);
-      }
+      assertQueueJobName(MONITOR_QUEUE, job, data.type);
+      return runMonitorWork(job, token, data.type, async () => {
+        switch (data.type) {
+          case 'monitor-scheduler':
+            assertQueueJobName(MONITOR_QUEUE, job, 'monitor-scheduler');
+            // Self-manages its DB context: reads due monitors in a SHORT context,
+            // then runs the Redis enqueue loop OUTSIDE any transaction. A blanket
+            // wrap here would pin a pooled connection idle-in-transaction for the
+            // whole enqueue loop (~20s on the EU fleet), starving the pool (#1105).
+            return await processScheduler();
+          case 'check-monitor':
+            // NOT wrapped in runWithSystemDbAccess here (final-review fix,
+            // #4084/#1105): processCheckMonitor calls the agentCommandRelay
+            // facade (isAgentConnectedAnywhere, dispatchCommandToAgent — Redis/WS
+            // I/O), and manages its own short-lived system DB context around
+            // just its reads, closing it before that I/O runs.
+            assertQueueJobName(MONITOR_QUEUE, job, 'check-monitor');
+            return await processCheckMonitor(data);
+          case 'process-check-result':
+            return await runWithSystemDbAccess(() => {
+              assertQueueJobName(MONITOR_QUEUE, job, 'process-check-result');
+              return processCheckResult(data);
+            });
+          default:
+            throw new Error(`Unknown job type: ${(data as { type: string }).type}`);
+        }
+      });
     },
     {
       connection: getBullMQConnection(),
-      concurrency: 10,
+      concurrency: readMonitorConcurrency(),
       lockDuration: 300_000,
       stalledInterval: 60_000,
       maxStalledCount: 2,

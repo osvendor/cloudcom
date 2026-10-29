@@ -160,6 +160,29 @@ describe('metric rollups service', () => {
     expect(executedSql).toContain('jsonb_array_elements');
   });
 
+  it('avoids unchanged-row rewrites across every raw and derived source, including null and metadata changes', async () => {
+    await rollupDeviceMetricsRange({
+      orgId: '11111111-1111-1111-1111-111111111111',
+      from: new Date('2026-06-18T12:00:00.000Z'),
+      to: new Date('2026-06-18T13:00:00.000Z'),
+    });
+    expect(executeMock).toHaveBeenCalledTimes(9);
+    const fields = ['avg_value', 'min_value', 'max_value', 'p95_value', 'sum_value', 'sample_count', 'gap_seconds', 'metadata'];
+    for (const [statement] of executeMock.mock.calls) {
+      const query = new PgDialect().sqlToQuery(statement as SQL).sql;
+      const conflictUpdate = query.slice(query.indexOf('DO UPDATE SET'));
+      expect(conflictUpdate).toContain('updated_at = now()');
+      const condition = conflictUpdate.slice(conflictUpdate.indexOf('WHERE'));
+      expect(condition).toContain('IS DISTINCT FROM');
+      for (const field of fields) {
+        expect(condition).toContain(`metric_rollups.${field}`);
+        expect(condition).toContain(`EXCLUDED.${field}`);
+      }
+      // Comparing refresh timestamps would make every repeated run write again.
+      expect(condition).not.toContain('updated_at');
+    }
+  });
+
   it('materializes regular raw bucket grids so sparse heartbeats create gap buckets', async () => {
     await rollupDeviceMetricsRange({
       orgId: '11111111-1111-1111-1111-111111111111',

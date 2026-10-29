@@ -8,6 +8,7 @@ import { rollupDeviceMetricsRange, type MetricRollupResult } from '../services/m
 import { getBullMQConnection } from '../services/redis';
 import { attachWorkerObservability } from './workerObservability';
 import { notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
+import { readMetricRollupConcurrency, runMetricRollupWork } from './metricRollupWorkAdmission';
 
 const METRIC_ROLLUPS_QUEUE = 'metric-rollups';
 const DEFAULT_LOOKBACK_MINUTES = 15;
@@ -165,7 +166,7 @@ async function processRollupOrgRange(data: RollupOrgRangeJobData): Promise<Metri
 export function createMetricRollupsWorker(): Worker<MetricRollupJobData> {
   return new Worker<MetricRollupJobData>(
     METRIC_ROLLUPS_QUEUE,
-    async (job: Job<MetricRollupJobData>) => {
+    async (job: Job<MetricRollupJobData>, token?: string) => {
       if (job.data.type === 'scan-orgs') {
         return processScanOrgs(job.data);
       }
@@ -177,11 +178,11 @@ export function createMetricRollupsWorker(): Worker<MetricRollupJobData> {
       // connection for the whole pass (an unlabeled hold, plus a second pool
       // slot). This outer runOutsideDbContext is belt-and-braces against a
       // future ambient context on this path.
-      return runOutsideDbContext(() => processRollupOrgRange(data));
+      return runOutsideDbContext(() => runMetricRollupWork(job, token, () => processRollupOrgRange(data)));
     },
     {
       connection: getBullMQConnection(),
-      concurrency: 2,
+      concurrency: readMetricRollupConcurrency(),
       lockDuration: 300_000,
       stalledInterval: 60_000,
       maxStalledCount: 2,
@@ -214,6 +215,9 @@ async function scheduleMetricRollupsScan(): Promise<void> {
 }
 
 export async function initializeMetricRollupsWorker(): Promise<void> {
+  // A per-process limit is insufficient when multiple API/worker replicas run.
+  // Do this before starting the consumer, so there is no unconstrained boot gap.
+  await getMetricRollupsQueue().setGlobalConcurrency(readMetricRollupConcurrency());
   metricRollupsWorker = createMetricRollupsWorker();
   attachWorkerObservability(metricRollupsWorker, 'metricRollupsWorker');
   metricRollupsWorker.on('error', (error) => {

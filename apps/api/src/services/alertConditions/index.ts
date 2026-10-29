@@ -256,9 +256,6 @@ export async function evaluateConditions(
   // from whichever sibling's Promise happened to settle first.
   results.primaryActualValue = pickPrimaryActualValue(results.leafActualValues);
 
-  // Get latest metric for context
-  const latestMetric = await getLatestMetric(deviceId);
-
   const context: EvaluationResult['context'] = { deviceId, evaluatedAt };
 
   // Find the first condition carrying operator/value (threshold-shaped)
@@ -305,6 +302,12 @@ export async function evaluateConditions(
   const primaryThreshold = findFirstThreshold(rootCondition);
   if (primaryThreshold) {
     const normalizedMetric = primaryThreshold.metric ? normalizeMetricName(primaryThreshold.metric) : undefined;
+    // Most handlers already supplied the evaluated value. A latest-row read is
+    // only needed for the legacy raw-metric fallback (for example an empty
+    // threshold window), never for unrelated service/security/script rules.
+    const latestMetric = results.primaryActualValue === undefined && normalizedMetric
+      ? await getLatestMetric(deviceId)
+      : null;
     const latestValue = normalizedMetric ? latestMetric?.[normalizedMetric] ?? undefined : undefined;
     if (primaryThreshold.metric) {
       context.metric = primaryThreshold.metric;

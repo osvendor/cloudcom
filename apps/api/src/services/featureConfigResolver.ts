@@ -801,9 +801,11 @@ export async function resolveBackupConfigForDevice(
  * follow-up rather than guessed at here.
  */
 export async function resolveMaintenanceConfigForDevice(
-  deviceId: string
+  deviceId: string,
+  opts?: DeviceHierarchyOpts,
 ): Promise<typeof configPolicyMaintenanceSettings.$inferSelect | null> {
-  const hierarchy = await loadDeviceHierarchy(deviceId);
+  const passed = hierarchyFor(deviceId, opts);
+  const hierarchy = passed ? fromPassedHierarchy(passed) : await loadDeviceHierarchy(deviceId);
   if (!hierarchy) return null;
 
   const targetConditions = buildTargetConditions(hierarchy);

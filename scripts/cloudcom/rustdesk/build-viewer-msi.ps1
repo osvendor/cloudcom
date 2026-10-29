@@ -37,7 +37,7 @@ $icon = [Drawing.Icon]::ExtractAssociatedIcon((Join-Path $payload 'rustdesk.exe'
 $stream = [IO.File]::Create($iconPath)
 try { $icon.Save($stream) } finally { $stream.Dispose(); $icon.Dispose() }
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-& $compiler /nologo /target:winexe /platform:x64 /reference:System.Windows.Forms.dll "/win32icon:$iconPath" "/out:$payload\OSConsultantsRemote.exe" $csPath
+& $compiler /nologo /target:winexe /platform:x64 /reference:System.Windows.Forms.dll "/win32icon:$iconPath" "/out:$payload\OSConsultantsRemote.exe" $csPath (Join-Path $PSScriptRoot 'ManagedViewerDefaults.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Launcher compilation failed.' }
 $check = Start-Process -FilePath "$payload\OSConsultantsRemote.exe" -ArgumentList '--verify' -WindowStyle Hidden -Wait -PassThru
 if ($check.ExitCode -ne 0) { throw 'Compiled launcher payload verification failed.' }

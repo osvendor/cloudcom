@@ -144,6 +144,10 @@ function bucketStartSql(timestampSql: SQL, bucketSeconds: number): SQL<Date> {
 }
 
 function upsertAssignments(): SQL {
+  // Scheduled windows deliberately overlap to catch late samples. Rechecking
+  // them must not rewrite unchanged rows (WAL, dead tuples and vacuum work).
+  // NULL-safe comparison includes every mutable aggregate and metadata. Thus
+  // updated_at denotes an actual aggregate change, not a redundant refresh.
   return sql`
     avg_value = EXCLUDED.avg_value,
     min_value = EXCLUDED.min_value,
@@ -154,6 +158,15 @@ function upsertAssignments(): SQL {
     gap_seconds = EXCLUDED.gap_seconds,
     metadata = EXCLUDED.metadata,
     updated_at = now()
+    WHERE (
+      metric_rollups.avg_value, metric_rollups.min_value, metric_rollups.max_value,
+      metric_rollups.p95_value, metric_rollups.sum_value, metric_rollups.sample_count,
+      metric_rollups.gap_seconds, metric_rollups.metadata
+    ) IS DISTINCT FROM (
+      EXCLUDED.avg_value, EXCLUDED.min_value, EXCLUDED.max_value,
+      EXCLUDED.p95_value, EXCLUDED.sum_value, EXCLUDED.sample_count,
+      EXCLUDED.gap_seconds, EXCLUDED.metadata
+    )
   `;
 }
 

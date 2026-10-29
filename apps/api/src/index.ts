@@ -25,6 +25,7 @@ import { securityMiddleware } from './middleware/security';
 import { exceptPathPrefix } from './middleware/pathExemption';
 import { requestPathLogger } from './middleware/requestPathLogger';
 import { agentAdmission } from './middleware/agentAdmission';
+import { agentRequestConcurrency } from './middleware/agentRequestConcurrency';
 import { startAdmissionControl, stopAdmissionControl } from './services/admission/admissionRuntime';
 import { createGlobalBodyLimitMiddleware } from './middleware/bodyLimitGate';
 import { globalRateLimit, registerGlobalRateLimitSkipPrefix } from './middleware/globalRateLimit';
@@ -481,6 +482,7 @@ app.use('*', requestPathLogger());
 // and any body read. O(1), no I/O, never inside a DB context. A pass-through
 // until the admission controller starts, and in BREEZE_ADMISSION_MODE=off.
 app.use('*', agentAdmission());
+app.use('*', agentRequestConcurrency());
 // Network Proxy host mode (spec 2026-10-06 §3): classify by Host + the Caddy
 // tunnel-site assertion. Runs after metrics/logging (they cover tunnel traffic)
 // and before every app header/CORS middleware (those skip tunnel surfaces).

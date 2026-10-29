@@ -28,9 +28,8 @@ async function candidates(): Promise<BoundRow[]> {
       c.credential_version AS "credentialVersion", c.generation
     FROM cloudcommand_microsoft_admin_connections c
     LEFT JOIN cloudcommand_microsoft_directory_snapshots s ON s.org_id = c.org_id
-    WHERE c.enabled = true AND (s.last_attempt_at IS NULL
-      OR s.last_attempt_at < now() - interval '5 minutes'
-      OR s.refresh_requested_at > s.last_attempt_at)
+    WHERE c.enabled = true AND s.refresh_requested_at IS NOT NULL
+      AND (s.last_attempt_at IS NULL OR s.refresh_requested_at > s.last_attempt_at)
     ORDER BY s.last_attempt_at NULLS FIRST, c.org_id
     LIMIT 10
   `)));

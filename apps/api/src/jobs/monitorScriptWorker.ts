@@ -1,11 +1,11 @@
 /**
  * Script Monitor Worker (#5291 W04)
  *
- * DESIGN — this is the DISPATCH half of the `script` monitor kind; the
+ * DESIGN â€” this is the DISPATCH half of the `script` monitor kind; the
  * BREACH/VERDICT half is `alertConditions/handlers/scriptMonitor.ts`. Unlike
  * every other monitor kind (evaluated against data the agent already
  * reports, or an agent-delivered watch), a `script` monitor's evidence does
- * not exist until something runs the probe script — this worker is that
+ * not exist until something runs the probe script â€” this worker is that
  * "something". It never decides breach/no-breach itself; it only keeps
  * `script_executions` freshly populated for the handler to read. The two
  * halves are deliberately decoupled through that table, not a shared
@@ -29,11 +29,11 @@
  * resolver and exact effective due check; the prefilter never grants a run.
  *
  * OVERRIDES: a config-policy attachment can override `intervalMinutes` /
- * `timeoutSeconds` per device (scriptKind.overridableKeys) — see
+ * `timeoutSeconds` per device (scriptKind.overridableKeys) â€” see
  * `alertService.ts`'s own `applyOverrides(spec, base, effective.overrides)`
  * call on the EVALUATION side. This worker mirrors that on the DISPATCH
  * side: using the monitor's raw, un-overridden `intervalMinutes` here would
- * desync the two — a device overridden to a SHORTER interval would still
+ * desync the two â€” a device overridden to a SHORTER interval would still
  * only get re-probed on the monitor's baseline cadence, so the handler's
  * staleness window (3x the EFFECTIVE interval) would go stale well before
  * this worker ever dispatches again.
@@ -46,9 +46,9 @@
  * workerReadinessCoverage.test.ts / workerReadinessManifest.test.ts fail.
  */
 import { Queue, Worker } from 'bullmq';
-import { and, eq, gt, inArray, or } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, or, sql } from 'drizzle-orm';
 import * as dbModule from '../db';
-import { configPolicyMonitors, devices, monitorDefinitions, organizations, scriptExecutions, scripts } from '../db/schema';
+import { automationRuns, configPolicyMonitors, devices, monitorDefinitions, monitorDeviceState, monitorEpisodes, organizations, scriptExecutions, scripts } from '../db/schema';
 import { dispatchScriptToDevice } from '../services/scriptDispatch';
 import { resolveMonitorsForDevice } from '../services/monitors/monitorResolver';
 import { applyOverrides } from '../services/monitors/kinds';
@@ -60,7 +60,9 @@ import { excludeEphemeralDevices, excludeQuickSupportOrgs } from '../services/qu
 import { withQueueMeta, type QueueActorMeta } from './queueSchemas';
 import { attachWorkerObservability } from './workerObservability';
 import { captureException } from '../services/sentry';
-import { canRunBackgroundWork } from '../services/capacityGuard';
+import { readCapacityGuard, type CapacityGuardSnapshot } from '../services/capacityGuard';
+import { parseLastMonitorMarker } from '../services/alertConditions/handlers/scriptMonitor';
+import { capacityPressureReasons } from '../services/capacityGuardPolicy';
 import { notHoldingOrgCondition, notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
 
 const { db } = dbModule;
@@ -76,8 +78,92 @@ const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
 // thousands of per-device dispatch attempts.
 const PARTNER_FANOUT_ORG_LIMIT = 500;
 
+/** Small probes do not need the heavy-work recovery latch, but never use
+ * stale, stopped, incomplete or currently pressured observations. */
+export function canRunScriptMonitorProbe(snapshot: CapacityGuardSnapshot): boolean {
+  if (!snapshot.enabled) return true;
+  if (snapshot.state === 'stopped' || snapshot.observedAt === null || !Number.isFinite(Date.parse(snapshot.observedAt))
+    || snapshot.sampleAgeMs === null || snapshot.sampleAgeMs < 0
+    || snapshot.sampleAgeMs > snapshot.thresholds.staleAfterMs) return false;
+  for (const value of [snapshot.metrics.memoryUsedPercent, snapshot.metrics.cpuStealPercent]) {
+    if (value === null || !Number.isFinite(value) || value < 0 || value > 100) return false;
+  }
+  return capacityPressureReasons(snapshot.metrics, snapshot.thresholds, false).length === 0;
+}
+
+const isScriptUuid = (value: unknown): value is string => typeof value === 'string'
+  && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+
+type ResponseMonitor = { id: string; condition: Record<string, unknown>;
+  responses?: Array<Record<string, unknown>>; recurrenceActions?: Array<Record<string, unknown>> | null };
+type ResponseProbe = { monitorId: string | null; deviceId: string; status: string;
+  exitCode: number | null; stdout: string | null; createdAt: Date; completedAt?: Date | null };
+export type MonitorResponseDecision = { monitorId: string; deviceId: string;
+  lastEvaluatedAt: Date | null; responsesPaused: boolean;
+  episodeId: string | null; responseOutcome: string | null;
+  responseDispatch: unknown; responseRunStatus: string | null };
+type MonitorResponseHistory = { deviceId: string; scriptId: string | null; createdAt: Date };
+
+/** Derived durable reservations bridge probe completion and asynchronous remediation. */
+export function pendingMonitorResponseDevices(
+  monitors: ResponseMonitor[], latestProbes: ResponseProbe[], responses: MonitorResponseHistory[],
+  decisions: MonitorResponseDecision[] = [],
+): Set<string> {
+  const result = new Set<string>();
+  for (const probe of latestProbes) {
+    if (probe.status !== 'completed') continue;
+    const monitor = monitors.find((row) => row.id === probe.monitorId);
+    if (!monitor) continue;
+    const marker = parseLastMonitorMarker(probe.stdout);
+    const breach = marker ? marker.state === 'breach'
+      : monitor.condition.breachOnNonZeroExit === true && probe.exitCode !== 0;
+    if (!breach) continue;
+    const scriptIds = [...(monitor.responses ?? []), ...(monitor.recurrenceActions ?? [])]
+      .filter((response) => response.type === 'run_script')
+      .map((response) => response.scriptId).filter(isScriptUuid);
+    if (scriptIds.length === 0) continue;
+    const dispatched = responses.some((response) => response.deviceId === probe.deviceId
+      && response.scriptId !== null && scriptIds.includes(response.scriptId)
+      && new Date(response.createdAt).getTime() >= new Date(probe.createdAt).getTime());
+    if (dispatched) continue;
+    const decision = decisions.find((row) => row.monitorId === probe.monitorId && row.deviceId === probe.deviceId);
+    const evaluated = decision?.lastEvaluatedAt !== null && decision?.lastEvaluatedAt !== undefined
+      && new Date(decision.lastEvaluatedAt).getTime() >= new Date(probe.completedAt ?? probe.createdAt).getTime();
+    if (!decision || !evaluated) { result.add(probe.deviceId); continue; }
+    // An evaluated non-actionable breach (threshold/cooldown/no episode,
+    // paused or explicitly skipped/terminal response) must not block the fleet.
+    if (decision.responsesPaused || !decision.episodeId) continue;
+    const terminal = ['completed', 'failed', 'partial', 'cancelled'].includes(decision.responseRunStatus ?? '');
+    const queued = decision.responseOutcome === 'queued';
+    // Legacy evaluation persists the episode BEFORE creating/publishing its
+    // alert. A null outcome is provisional, even without an outbox payload.
+    const awaitingOutbox = decision.responseOutcome === null;
+    if (!terminal && (queued || awaitingOutbox)) result.add(probe.deviceId);
+  }
+  return result;
+}
+
+/** Detached or disabled monitors cannot enqueue a future response. Running
+ * executions still consume the separate active-work budget. Resolve only the
+ * small set of potential reservations, not every device in the inventory. */
+export async function applicablePendingMonitorResponseDevices(
+  monitors: ResponseMonitor[], latestProbes: ResponseProbe[], responses: MonitorResponseHistory[],
+  decisions: MonitorResponseDecision[] = [],
+): Promise<Set<string>> {
+  const result = new Set<string>();
+  for (const deviceId of pendingMonitorResponseDevices(monitors, latestProbes, responses, decisions)) {
+    const resolution = await runWithSystemDbAccess(() => resolveMonitorsForDevice(deviceId));
+    if (resolution.kind !== 'resolved') continue;
+    const enabled = new Set(resolution.monitors.filter(monitor => monitor.enabled).map(monitor => monitor.monitorId));
+    const applicable = latestProbes.filter(probe => probe.deviceId === deviceId && enabled.has(probe.monitorId ?? ''));
+    if (pendingMonitorResponseDevices(monitors, applicable, responses, decisions).has(deviceId)) result.add(deviceId);
+  }
+  return result;
+}
+
 export interface ScriptMonitorTickResult {
   deferredForCapacity?: true;
+  deferredForActiveWork?: true;
   monitorsConsidered: number;
   devicesConsidered: number;
   dispatched: number;
@@ -128,26 +214,22 @@ const ACTIVE_PROBE_STATUSES = ['pending', 'queued', 'running', 'cancelling'] as 
 async function readBlockingProbeHistory(
   monitorId: string,
   onlineDeviceIds: string[],
-  minimumInterval: number,
 ): Promise<ProbeHistory> {
   const rows = await db.select({
     deviceId: scriptExecutions.deviceId,
-    status: scriptExecutions.status,
-    createdAt: scriptExecutions.createdAt,
+    active: sql<boolean>`bool_or(${scriptExecutions.status} in ('pending', 'queued', 'running', 'cancelling'))`,
+    createdAt: sql<Date>`max(${scriptExecutions.createdAt})`,
   }).from(scriptExecutions).where(and(
     eq(scriptExecutions.monitorId, monitorId),
     inArray(scriptExecutions.deviceId, onlineDeviceIds),
-    or(
-      inArray(scriptExecutions.status, [...ACTIVE_PROBE_STATUSES]),
-      gt(scriptExecutions.createdAt, new Date(Date.now() - minimumInterval * 60_000)),
-    ),
-  ));
+
+  )).groupBy(scriptExecutions.deviceId);
   const history: ProbeHistory = new Map();
   for (const row of rows) {
     const previous = history.get(row.deviceId);
     history.set(row.deviceId, {
-      active: previous?.active === true || ACTIVE_PROBE_STATUSES.some((status) => status === row.status),
-      latestCreatedAt: Math.max(previous?.latestCreatedAt ?? -Infinity, row.createdAt.getTime()),
+      active: previous?.active === true || row.active === true,
+      latestCreatedAt: Math.max(previous?.latestCreatedAt ?? -Infinity, new Date(row.createdAt).getTime()),
     });
   }
   return history;
@@ -156,7 +238,7 @@ async function readBlockingProbeHistory(
 /**
  * The orgs a `script` monitor row must be evaluated against: itself, for an
  * org-owned row; every org under its partner, for a partner-wide row (Partner
- * Wide First — CLAUDE.md). Mirrors `monitorWorker.ts`'s identical fan-out for
+ * Wide First â€” CLAUDE.md). Mirrors `monitorWorker.ts`'s identical fan-out for
  * partner-wide network monitors, including the same safety cap.
  */
 async function resolveCandidateOrgIds(monitor: {
@@ -226,9 +308,9 @@ async function isDeviceDueForProbe(
 }
 
 /**
- * One tick: dispatch the `script` monitor's probe to every device it
+ * One tick: dispatch a bounded number of probes to devices the monitor
  * currently applies to and is due on. Exported bare (no BullMQ) so it is
- * fully testable — see the REGISTRATION NOTE above for why this file stops
+ * fully testable â€” see the REGISTRATION NOTE above for why this file stops
  * short of wiring a `Worker` around it.
  */
 export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResult> {
@@ -246,11 +328,78 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
     };
 
     // Nothing becomes complete/not-due when capacity defers this tick.
-    if (!canRunBackgroundWork()) return { ...result, deferredForCapacity: true };
+    const admitted = () => canRunScriptMonitorProbe(readCapacityGuard());
+    if (!admitted()) return { ...result, deferredForCapacity: true };
     const monitorRows = await runWithSystemDbAccess(() => db
       .select()
       .from(monitorDefinitions)
       .where(and(eq(monitorDefinitions.kind, 'script'), eq(monitorDefinitions.enabled, true))));
+
+    // Small probes use fresh current-pressure checks rather than requiring
+    // a sustained quiet window. Dispatch and active-work caps remain in force.
+    const bound = (value: string | undefined, fallback: number) => {
+      const parsed = Number(value);
+      return Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, 10) : fallback;
+    };
+    const dispatchLimit = bound(process.env.MONITOR_SCRIPT_MAX_DISPATCH_PER_TICK, 1);
+    const activeLimit = bound(process.env.MONITOR_SCRIPT_MAX_ACTIVE_WORK, 2);
+    const responseScriptIds = (monitor: typeof monitorRows[number]) =>
+      [...(monitor.responses ?? []), ...(monitor.recurrenceActions ?? [])]
+        .filter((response) => response.type === 'run_script')
+        .flatMap((response) => isScriptUuid(response.scriptId) ? [response.scriptId] : []);
+    const scriptIds = monitorRows.flatMap((monitor) => [
+      ...(isScriptUuid(monitor.condition?.scriptId) ? [monitor.condition.scriptId] : []),
+      ...responseScriptIds(monitor),
+    ]);
+    const responseMonitorIds = monitorRows.filter((monitor) => responseScriptIds(monitor).length > 0)
+      .map((monitor) => monitor.id);
+    // Repairs are automation executions and do not necessarily carry monitor_id.
+    const readActiveDevices = () => runWithSystemDbAccess(() => db.select({ deviceId: scriptExecutions.deviceId })
+      .from(scriptExecutions).where(and(
+        inArray(scriptExecutions.status, [...ACTIVE_PROBE_STATUSES]),
+        or(inArray(scriptExecutions.monitorId, monitorRows.map((monitor) => monitor.id)),
+          inArray(scriptExecutions.scriptId, scriptIds)),
+      )).groupBy(scriptExecutions.deviceId).limit(activeLimit));
+    const occupiedDevices = new Set((await readActiveDevices()).map((row) => row.deviceId));
+    if (occupiedDevices.size >= activeLimit) return { ...result, deferredForActiveWork: true };
+    if (responseMonitorIds.length > 0) {
+      // DISTINCT ON bounds history to one latest probe per monitor/device.
+      // A completed breach keeps its slot until a response has actually been
+      // dispatched. No TTL: a slow/stuck alert queue must not release capacity
+      // for more installations that it may dispatch together later.
+      const latestProbes = await runWithSystemDbAccess(() => db.selectDistinctOn(
+        [scriptExecutions.monitorId, scriptExecutions.deviceId], {
+          monitorId: scriptExecutions.monitorId, deviceId: scriptExecutions.deviceId,
+          status: scriptExecutions.status, exitCode: scriptExecutions.exitCode,
+          stdout: scriptExecutions.stdout, createdAt: scriptExecutions.createdAt, completedAt: scriptExecutions.completedAt,
+        }).from(scriptExecutions).where(inArray(scriptExecutions.monitorId, responseMonitorIds))
+        .orderBy(scriptExecutions.monitorId, scriptExecutions.deviceId, desc(scriptExecutions.createdAt)));
+      const latestResponses = await runWithSystemDbAccess(() => db.select({
+        deviceId: scriptExecutions.deviceId, scriptId: scriptExecutions.scriptId,
+        createdAt: sql<Date>`max(${scriptExecutions.createdAt})`,
+      }).from(scriptExecutions).where(inArray(scriptExecutions.scriptId,
+        monitorRows.flatMap(responseScriptIds)))
+        .groupBy(scriptExecutions.deviceId, scriptExecutions.scriptId));
+      const decisions = await runWithSystemDbAccess(() => db.select({
+        monitorId: monitorDeviceState.monitorId, deviceId: monitorDeviceState.deviceId,
+        lastEvaluatedAt: monitorDeviceState.lastEvaluatedAt, responsesPaused: monitorDeviceState.responsesPaused,
+        episodeId: monitorEpisodes.id, responseOutcome: monitorEpisodes.responseOutcome,
+        responseDispatch: monitorEpisodes.responseDispatch, responseRunStatus: automationRuns.status,
+      }).from(monitorDeviceState)
+        .leftJoin(monitorEpisodes, eq(monitorEpisodes.id, monitorDeviceState.currentEpisodeId))
+        .leftJoin(automationRuns, eq(automationRuns.id, monitorEpisodes.responseRunId))
+        .where(inArray(monitorDeviceState.monitorId, responseMonitorIds)));
+      for (const deviceId of await applicablePendingMonitorResponseDevices(monitorRows, latestProbes, latestResponses, decisions)) {
+        occupiedDevices.add(deviceId);
+      }
+    }
+    // Response execution may have appeared after the first active snapshot
+    // and before history released its reservation. Re-read before admitting.
+    for (const row of await readActiveDevices()) occupiedDevices.add(row.deviceId);
+    if (occupiedDevices.size >= activeLimit) return { ...result, deferredForActiveWork: true };
+    const availableDispatches = Math.min(dispatchLimit, activeLimit - occupiedDevices.size);
+    const candidates: Array<{ monitor: typeof monitorRows[number]; device: CandidateDevice;
+      authoredCondition: ScriptCondition; latestCreatedAt: number }> = [];
 
     // No assignment/status filtering: inherited or disabled attachments can
     // lower the bound too. This inventory is discarded at the end of the tick,
@@ -279,7 +428,7 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
     }
 
     for (const monitor of monitorRows) {
-      if (!canRunBackgroundWork()) return { ...result, deferredForCapacity: true };
+      if (!admitted()) return { ...result, deferredForCapacity: true };
       result.monitorsConsidered++;
 
       let authoredCondition: ScriptCondition;
@@ -296,7 +445,7 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
 
       const orgIds = await runWithSystemDbAccess(() => resolveCandidateOrgIds(monitor));
       if (orgIds.length === 0) {
-        // Either an ownerless row or a fan-out over the cap — both are logged
+        // Either an ownerless row or a fan-out over the cap â€” both are logged
         // above, and both are operational problems rather than "nothing to do",
         // so the tick result must not report them as a clean zero.
         result.errors++;
@@ -330,7 +479,7 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
       const onlineDeviceIds = deviceRows.filter((device) => device.status === 'online').map((device) => device.id);
       if (minimumInterval !== null && onlineDeviceIds.length > 0) {
         try {
-          history = await runWithSystemDbAccess(() => readBlockingProbeHistory(monitor.id, onlineDeviceIds, minimumInterval));
+          history = await runWithSystemDbAccess(() => readBlockingProbeHistory(monitor.id, onlineDeviceIds));
         } catch (err) {
           result.errors++;
           console.error('[monitorScriptWorker] execution prefilter failed; using full admission checks', err);
@@ -340,7 +489,7 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
 
       for (const device of deviceRows) {
         // Prior probes have committed/delivered. Never wait with a transaction held.
-        if (!canRunBackgroundWork()) return { ...result, deferredForCapacity: true };
+        if (!admitted()) return { ...result, deferredForCapacity: true };
         result.devicesConsidered++;
 
         // Periodic probes describe current health, so missed offline checks
@@ -368,6 +517,16 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
           continue;
         }
 
+        candidates.push({ monitor, device, authoredCondition,
+          latestCreatedAt: prior?.latestCreatedAt ?? -Infinity });
+      }
+    }
+    // Persisted oldest-first ordering prevents recently serviced devices from
+    // indefinitely starving new endpoints, even across process restarts.
+    candidates.sort((a, b) => a.latestCreatedAt === b.latestCreatedAt ? 0 : a.latestCreatedAt - b.latestCreatedAt);
+    for (const { monitor, device, authoredCondition } of candidates) {
+        if (result.dispatched >= availableDispatches) break;
+        if (!admitted()) return { ...result, deferredForCapacity: true };
         let dispatchResult: Awaited<ReturnType<typeof dispatchScriptToDevice>> | null;
         try {
           // One admission per transaction: policy reads, the due guard, and
@@ -380,7 +539,7 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
             // the hierarchy) contributes no dispatch, same as it contributes no
             // alert rule on the evaluation side. A device that vanished between
             // the query above and here (raced a delete) resolves as
-            // `device_missing`, not a fabricated "zero monitors" — same
+            // `device_missing`, not a fabricated "zero monitors" â€” same
             // no-dispatch outcome for this tick either way (#5677).
             const resolution = await resolveMonitorsForDevice(device.id);
             const match =
@@ -452,7 +611,6 @@ export async function processScriptMonitorTick(): Promise<ScriptMonitorTickResul
         } else {
           result.skipped++;
         }
-      }
     }
 
     return result;
@@ -468,10 +626,11 @@ const MONITOR_SCRIPT_QUEUE = 'monitor-scripts';
 /**
  * The tick cadence, NOT the probe cadence. A `script` monitor's own
  * `intervalMinutes` (5-1440) is enforced per device by `isDeviceDueForProbe`;
- * this only decides how often we look. One minute keeps the floor honest
- * without making the sweep hot.
+ * this only decides how often we look. Five seconds spreads admissions out
+ * rather than dispatching the fleet together. Each tick still admits one probe
+ * by default and waits while two probes or associated repairs are active.
  */
-const TICK_EVERY_MS = 60 * 1000;
+const TICK_EVERY_MS = 5 * 1000;
 
 const SCRIPT_MONITOR_TICK_META: QueueActorMeta = {
   actorType: 'system',
@@ -510,7 +669,7 @@ async function scheduleScriptMonitorTick(): Promise<void> {
     },
   );
 
-  console.log('[monitorScriptWorker] Scheduled repeatable script-monitor tick (every 60s)');
+  console.log('[monitorScriptWorker] Scheduled repeatable script-monitor tick (every 5s; bounded dispatch)');
 }
 
 let monitorScriptWorkerInstance: Worker | null = null;
@@ -534,6 +693,7 @@ export async function initializeMonitorScriptWorker(): Promise<void> {
       console.error(`[monitorScriptWorker] Job ${job?.id} failed:`, error);
     });
 
+    await getMonitorScriptQueue().setGlobalConcurrency(1);
     await scheduleScriptMonitorTick();
 
     console.log('[monitorScriptWorker] Script monitor worker initialized');

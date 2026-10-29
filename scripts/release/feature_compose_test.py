@@ -49,9 +49,13 @@ class FeatureComposeTest(unittest.TestCase):
             image = "cloudcom-candidate/api@sha256:" + "a" * 64
             worker_image = "cloudcom-candidate/exchange-worker@sha256:" + "b" * 64
             baseline = {"services": {"api": {"image": image}, "cloudcom-exchange-worker": {
-                "image": worker_image, "volumes": [{"type": "bind", "source": "/private", "target": "/run/private"}]}}}
+                "image": worker_image, "cpus": 0.25, "cpu_shares": 128, "stop_grace_period": "60s",
+                "volumes": [{"type": "bind", "source": "/private", "target": "/run/private"}]}}}
             result = prepare(copy.deepcopy(baseline), release, image, worker_image, allowed)
             mounts = result["services"]["cloudcom-exchange-worker"]["volumes"]
+            for resource in ('cpus', 'cpu_shares', 'stop_grace_period'):
+                self.assertEqual(result['services']['cloudcom-exchange-worker'][resource],
+                                 baseline['services']['cloudcom-exchange-worker'][resource])
             self.assertEqual(mounts[0], baseline["services"]["cloudcom-exchange-worker"]["volumes"][0])
             self.assertEqual({mount["target"] for mount in mounts[1:]}, set(WORKER_TARGETS))
             self.assertTrue(all(mount["read_only"] for mount in mounts[1:]))

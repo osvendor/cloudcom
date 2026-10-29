@@ -59,6 +59,14 @@ export const onRequest = defineMiddleware(async (context, next) => {
   // context.url.pathname includes the configured base (e.g. /portal/login); strip it
   // so the route checks below stay base-agnostic, and re-apply withBase on redirect.
   const pathname = stripBase(rawPathname);
+  // A single remote directory chooses the verified staff/customer identity,
+  // just like the native viewer. Existing customer session URLs and their
+  // assignment/CSRF/company checks remain on the portal's original routes.
+  if (pathname === '/remote' || pathname === '/remote/') {
+    const response = context.redirect('/remote/computers', 302);
+    response.headers.set('Cache-Control', 'no-store');
+    return response;
+  }
   const hasSession = hasPortalSessionCookie(context.request);
 
   // Per-request nonce for the single runtime-themed `<style>` element the

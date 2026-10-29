@@ -29,6 +29,7 @@ vi.mock('../../db/schema', () => ({
   portalRemoteSettings: { orgId: 'settings.orgId', enabled: 'settings.enabled' },
 }));
 vi.mock('../../services/portalRemoteFeature', () => ({ isPortalRemoteFeatureEnabled: vi.fn(async () => true) }));
+vi.mock('../../services/deviceIdentity', () => ({ currentDeviceUser: 'currentUser', previousDeviceUsers: 'previousUsers' }));
 vi.mock('../../services/portalRemoteAuthority', () => ({ authorizePortalRemote: mocks.authorize }));
 vi.mock('../../services/portalCompanyGateway', () => ({ checkPortalCompanyGateway: mocks.company }));
 vi.mock('../../services/portalNativeLogin', () => ({ NATIVE_SESSION_PREFIX: 'ccn1.' }));

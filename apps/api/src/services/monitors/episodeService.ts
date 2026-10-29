@@ -10,7 +10,8 @@
  * insert; allocation writes no observation. The sweep records one final
  * observation from admitted open alerts, then activates recurrence and pause.
  *
- * State changes serialize under SELECT FOR UPDATE on monitor_device_state.
+ * State changes serialize under a row lock on monitor_device_state: an atomic
+ * conditional UPDATE for an existing healthy pair, otherwise SELECT FOR UPDATE.
  * Episode insertion uses ON CONFLICT DO NOTHING against the one-open-episode
  * index; an existing allocation is read back without aborting the transaction.
  * Only the final breach observation activates an allocated subject episode.
@@ -139,6 +140,39 @@ export async function recordMonitorEvaluation(
   const now = input.now ?? new Date();
 
   return db.transaction(async (tx) => {
+    if (input.observation === 'ok') {
+      // Most observations are an already-healthy pair. A conditional UPDATE
+      // takes the same row lock as SELECT FOR UPDATE and PostgreSQL rechecks
+      // currentEpisodeId after waiting for a concurrent breach/reset. If a
+      // breach opened an episode, fall through to the locked recovery path.
+      // Keep this inside the savepoint: callers catch bookkeeping failures,
+      // which must not poison their outer alert-evaluation transaction.
+      const [healthy] = await tx
+        .update(monitorDeviceState)
+        .set({ lastEvaluatedAt: now, lastState: 'ok', updatedAt: now })
+        .where(and(
+          eq(monitorDeviceState.monitorId, input.monitor.id),
+          eq(monitorDeviceState.deviceId, input.deviceId),
+          eq(monitorDeviceState.orgId, input.orgId),
+          isNull(monitorDeviceState.currentEpisodeId),
+        ))
+        .returning({
+          episodesInWindow: monitorDeviceState.episodesInWindow,
+          responsesPaused: monitorDeviceState.responsesPaused,
+        });
+      if (healthy) {
+        return {
+          episodeId: null,
+          episodeOpened: false,
+          episodeClosed: false,
+          episodesInWindow: healthy.episodesInWindow ?? 0,
+          latched: false,
+          needsEscalationAlert: false,
+          responsesPaused: healthy.responsesPaused ?? false,
+        };
+      }
+    }
+
     // Upsert first so the lock below always has a row to take.
     await tx
       .insert(monitorDeviceState)

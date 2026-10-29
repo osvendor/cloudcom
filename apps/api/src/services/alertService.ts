@@ -21,7 +21,8 @@ import {
   organizations,
   sites,
   monitorDefinitions,
-  monitorDeviceState
+  monitorDeviceState,
+  monitorEpisodes
 } from '../db/schema';
 import { eq, and, inArray, isNull, isNotNull, or, sql, type SQL } from 'drizzle-orm';
 import { evaluateConditions, evaluateAutoResolveConditions, interpolateTemplate } from './alertConditions';
@@ -42,6 +43,8 @@ import { fireEscalationLatch } from './monitors/escalationLatch';
 import { isSubjectMonitorKind } from './monitors/subjectMonitorKinds';
 import { evaluateSubjectAlerts } from './alertSubjects';
 import { resolveMaintenanceConfigForDevice, isInMaintenanceWindow } from './featureConfigResolver';
+import { hierarchyFor, type DeviceHierarchyOpts } from './deviceHierarchy';
+import { classifyAlertWorkGroup, markAlertWorkSpanFailed, withAlertWorkSpan } from './alertWorkTelemetry';
 
 // Types for alert creation
 export interface CreateAlertParams {
@@ -957,9 +960,12 @@ export async function alertRuleOwnershipConditionForOrg(orgId: string): Promise<
   return sql`(${alertRules.orgId} = ${orgId} OR (${alertRules.orgId} IS NULL AND ${alertRules.partnerId} = ${partnerId}))`;
 }
 
-export async function getApplicableRules(deviceId: string): Promise<RuleWithTemplate[]> {
+export async function getApplicableRules(deviceId: string, opts?: DeviceHierarchyOpts): Promise<RuleWithTemplate[]> {
+  // Reuse only the current evaluation's hierarchy, never a cross-request cache.
+  // Validate the device before any lookup so a wiring mistake cannot cross tenants.
+  const passed = hierarchyFor(deviceId, opts);
   // Get device info
-  const [device] = await db
+  const [device] = passed ? [{ orgId: passed.orgId, siteId: passed.siteId }] : await db
     .select()
     .from(devices)
     .where(eq(devices.id, deviceId))
@@ -979,7 +985,7 @@ export async function getApplicableRules(deviceId: string): Promise<RuleWithTemp
   // can at most pick which alert rule evaluates it (self-evasion — quieter
   // alerting for itself), never a lateral effect on another device or a code
   // execution path. Accepted risk, tracked, not gated.
-  const groupMemberships = await db
+  const groupMemberships = passed ? passed.groupIds.map(groupId => ({ groupId })) : await db
     .select({ groupId: deviceGroupMemberships.groupId })
     .from(deviceGroupMemberships)
     .where(eq(deviceGroupMemberships.deviceId, deviceId));
@@ -1009,7 +1015,9 @@ export async function getApplicableRules(deviceId: string): Promise<RuleWithTemp
   // here) contributes no monitor-target rules either — same as a genuine zero,
   // since this function already returned [] earlier if the device never
   // existed for the `device` lookup above (#5677).
-  const monitorResolution = await resolveMonitorsForDevice(deviceId);
+  const monitorResolution = passed
+    ? await resolveMonitorsForDevice(deviceId, db, { hierarchy: passed })
+    : await resolveMonitorsForDevice(deviceId);
   const effectiveMonitors = monitorResolution.kind === 'resolved' ? monitorResolution.monitors : [];
   const enabledMonitorIds = effectiveMonitors.filter((m) => m.enabled).map((m) => m.monitorId);
   if (enabledMonitorIds.length > 0) {
@@ -1020,7 +1028,11 @@ export async function getApplicableRules(deviceId: string): Promise<RuleWithTemp
 
   // Get all active rules that apply to this device: the device org's own
   // rules plus its partner's partner-wide rules (#2128).
-  const ownershipCondition = await alertRuleOwnershipConditionForOrg(device.orgId);
+  const ownershipCondition = passed
+    ? (passed.org?.partnerId
+      ? sql`(${alertRules.orgId} = ${passed.orgId} OR (${alertRules.orgId} IS NULL AND ${alertRules.partnerId} = ${passed.org.partnerId}))`
+      : eq(alertRules.orgId, passed.orgId))
+    : await alertRuleOwnershipConditionForOrg(device.orgId);
   const rules = await db
     .select()
     .from(alertRules)
@@ -1144,8 +1156,8 @@ type DeviceEvaluationMode =
  * Evaluate all rules for a device and create alerts as needed
  * Returns list of created alert IDs
  */
-export async function evaluateDeviceAlerts(deviceId: string): Promise<string[]> {
-  return evaluateDeviceAlertsInMode(deviceId, { kind: 'device_sweep' });
+export async function evaluateDeviceAlerts(deviceId: string, opts?: DeviceHierarchyOpts): Promise<string[]> {
+  return evaluateDeviceAlertsInMode(deviceId, { kind: 'device_sweep' }, opts);
 }
 
 /**
@@ -1163,29 +1175,33 @@ export async function evaluateNetworkCheckAlertsForDevice(
   return evaluateDeviceAlertsInMode(deviceId, { kind: 'network_check', monitorIds });
 }
 
-async function evaluateDeviceAlertsInMode(deviceId: string, mode: DeviceEvaluationMode): Promise<string[]> {
+async function evaluateDeviceAlertsInMode(deviceId: string, mode: DeviceEvaluationMode, opts?: DeviceHierarchyOpts): Promise<string[]> {
+  hierarchyFor(deviceId, opts);
   // Match policy maintenance semantics before any monitor evaluation can
   // create an alert, subject alert, episode or escalation. Component recovery
   // shares this evaluator, so it must still run without admitting new breaches.
-  const maintenance = await resolveMaintenanceConfigForDevice(deviceId);
-  let suppressAlerts = false;
-  if (maintenance) {
-    const status = isInMaintenanceWindow(maintenance);
-    suppressAlerts = status.active && status.suppressAlerts;
-  }
+  const { suppressAlerts, applicableRules, device } = await withAlertWorkSpan('preparation', async () => {
+    const maintenance = opts?.hierarchy
+      ? await resolveMaintenanceConfigForDevice(deviceId, opts)
+      : await resolveMaintenanceConfigForDevice(deviceId);
+    let suppressAlerts = false;
+    if (maintenance) {
+      const status = isInMaintenanceWindow(maintenance);
+      suppressAlerts = status.active && status.suppressAlerts;
+    }
 
-  const applicableRules = await getApplicableRules(deviceId);
+    const applicableRules = await getApplicableRules(deviceId, opts);
 
-  if (applicableRules.length === 0) {
-    return [];
-  }
+    if (applicableRules.length === 0) return { suppressAlerts, applicableRules, device: null };
 
-  // Get device info for template interpolation
-  const [device] = await db
-    .select()
-    .from(devices)
-    .where(eq(devices.id, deviceId))
-    .limit(1);
+    // Get device info for template interpolation
+    const [device] = await db
+      .select()
+      .from(devices)
+      .where(eq(devices.id, deviceId))
+      .limit(1);
+    return { suppressAlerts, applicableRules, device: device ?? null };
+  });
 
   if (!device) {
     return [];
@@ -1217,182 +1233,198 @@ async function evaluateDeviceAlertsInMode(deviceId: string, mode: DeviceEvaluati
       continue;
     }
 
-    try {
-      // Evaluate conditions
-      const result = await evaluateConditions(effectiveConditions, deviceId);
+    await withAlertWorkSpan(classifyAlertWorkGroup(monitor?.kind, effectiveConditions, template.category), async () => {
+      try {
+        // Evaluate conditions
+        const result = await evaluateConditions(effectiveConditions, deviceId);
 
-      // W03 Task 10 — a hardware/RAID leaf reports per-COMPONENT evidence
-      // instead of one device-level verdict. Its whole reconciliation
-      // (create/recover, episode allocation/adoption, the final observation)
-      // runs inside one savepoint under an advisory lock so concurrent sweeps
-      // cannot close an episode between another sweep's creation and its
-      // ownership claim — and, critically, so nothing it does (publish,
-      // Redis write, correlation enqueue) can escape before the CALLER's
-      // outer transaction commits. Task 10's outbox drains the staged
-      // envelope only after that commit. This branch never falls through to
-      // the legacy NULL-subject block below.
-      if (result.subjects !== undefined) {
-        if (rule.managedByMonitorId) evaluatedMonitorIds.add(rule.managedByMonitorId);
-        const subjectAlertIds: string[] = [];
-        await withDbTransaction(async () => {
-          await db.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`hardware-subject:${rule.id}:${deviceId}`}, 0))`);
-          const evidence = await evaluateConditions(effectiveConditions, deviceId);
-          if (evidence.subjects === undefined) {
-            throw new Error('Subject evidence disappeared during evaluation');
-          }
-          const observation = await evaluateSubjectAlerts({
-            rule: {
-              ...rule,
-              overrideSettings: {
-                ...(rule.overrideSettings as Record<string, unknown> | null),
-                severity: effectiveSeverity,
-                cooldownMinutes: effectiveCooldownMinutes,
+        // W03 Task 10 — a hardware/RAID leaf reports per-COMPONENT evidence
+        // instead of one device-level verdict. Its whole reconciliation
+        // (create/recover, episode allocation/adoption, the final observation)
+        // runs inside one savepoint under an advisory lock so concurrent sweeps
+        // cannot close an episode between another sweep's creation and its
+        // ownership claim — and, critically, so nothing it does (publish,
+        // Redis write, correlation enqueue) can escape before the CALLER's
+        // outer transaction commits. Task 10's outbox drains the staged
+        // envelope only after that commit. This branch never falls through to
+        // the legacy NULL-subject block below.
+        if (result.subjects !== undefined) {
+          if (rule.managedByMonitorId) evaluatedMonitorIds.add(rule.managedByMonitorId);
+          const subjectAlertIds: string[] = [];
+          await withDbTransaction(async () => {
+            await db.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`hardware-subject:${rule.id}:${deviceId}`}, 0))`);
+            const evidence = await evaluateConditions(effectiveConditions, deviceId);
+            if (evidence.subjects === undefined) {
+              throw new Error('Subject evidence disappeared during evaluation');
+            }
+            const observation = await evaluateSubjectAlerts({
+              rule: {
+                ...rule,
+                overrideSettings: {
+                  ...(rule.overrideSettings as Record<string, unknown> | null),
+                  severity: effectiveSeverity,
+                  cooldownMinutes: effectiveCooldownMinutes,
+                },
               },
-            },
-            template, device, monitor, evidence: {
-              ...evidence,
-              subjects: suppressAlerts
-                ? evidence.subjects.filter(subject => subject.status !== 'breaching')
-                : evidence.subjects,
-              createdAlertIds: subjectAlertIds,
-            },
+              template, device, monitor, evidence: {
+                ...evidence,
+                subjects: suppressAlerts
+                  ? evidence.subjects.filter(subject => subject.status !== 'breaching')
+                  : evidence.subjects,
+                createdAlertIds: subjectAlertIds,
+              },
+            });
+            if (monitor && !suppressAlerts) {
+              await recordMonitorEvaluation({ monitor, deviceId, orgId: device.orgId, observation });
+            }
           });
-          if (monitor && !suppressAlerts) {
-            await recordMonitorEvaluation({ monitor, deviceId, orgId: device.orgId, observation });
-          }
-        });
-        createdAlerts.push(...subjectAlertIds);
-        continue;
-      }
+          createdAlerts.push(...subjectAlertIds);
+          return;
+        }
 
-      if (suppressAlerts) continue;
+        if (suppressAlerts) return;
 
-      // #5290 — the episode seam sits HERE, after the evaluation and BEFORE
-      // createAlert, on purpose:
-      //   * cooldown and flapping (both inside createAlert) gate the ALERT but
-      //     never the episode — noise controls cannot hide a loop;
-      //   * the escalation latch and its pause are durable before createAlert
-      //     publishes `alert.triggered`, so the compiled response automation
-      //     can never be queued between the latch and the pause;
-      //   * a non-triggering evaluation, which today does nothing at all, now
-      //     closes the open episode.
-      let episodeId: string | null = null;
-      if (rule.managedByMonitorId && monitor) {
-        evaluatedMonitorIds.add(rule.managedByMonitorId);
-        try {
-          const observation: MonitorObservation = result.triggered
-            ? 'breach'
-            : result.dataState === 'unknown'
-              ? 'unknown'
-              : 'ok';
-          const outcome = await recordMonitorEvaluation({
-            monitor,
-            deviceId,
-            // ALWAYS the DEVICE's org (#5290): a partner-wide monitor has no
-            // org of its own and its episodes are org-scoped.
-            orgId: device.orgId,
-            observation,
-          });
-          episodeId = outcome.episodeId;
-          // `needsEscalationAlert` retries an alert that the latch failed to
-          // raise earlier — the pause is already durable, so without the retry
-          // the device's responses stay held with nothing telling a human why.
-          if ((outcome.latched || outcome.needsEscalationAlert) && outcome.episodeId) {
-            await fireEscalationLatch({
+        // #5290 — the episode seam sits HERE, after the evaluation and BEFORE
+        // createAlert, on purpose:
+        //   * cooldown and flapping (both inside createAlert) gate the ALERT but
+        //     never the episode — noise controls cannot hide a loop;
+        //   * the escalation latch and its pause are durable before createAlert
+        //     publishes `alert.triggered`, so the compiled response automation
+        //     can never be queued between the latch and the pause;
+        //   * a non-triggering evaluation, which today does nothing at all, now
+        //     closes the open episode.
+        let episodeId: string | null = null;
+        if (rule.managedByMonitorId && monitor) {
+          evaluatedMonitorIds.add(rule.managedByMonitorId);
+          try {
+            const observation: MonitorObservation = result.triggered
+              ? 'breach'
+              : result.dataState === 'unknown'
+                ? 'unknown'
+                : 'ok';
+            const outcome = await recordMonitorEvaluation({
               monitor,
               deviceId,
+              // ALWAYS the DEVICE's org (#5290): a partner-wide monitor has no
+              // org of its own and its episodes are org-scoped.
               orgId: device.orgId,
-              episodeId: outcome.episodeId,
-              episodesInWindow: outcome.episodesInWindow,
+              observation,
+            });
+            episodeId = outcome.episodeId;
+            // `needsEscalationAlert` retries an alert that the latch failed to
+            // raise earlier — the pause is already durable, so without the retry
+            // the device's responses stay held with nothing telling a human why.
+            if ((outcome.latched || outcome.needsEscalationAlert) && outcome.episodeId) {
+              await fireEscalationLatch({
+                monitor,
+                deviceId,
+                orgId: device.orgId,
+                episodeId: outcome.episodeId,
+                episodesInWindow: outcome.episodesInWindow,
+              });
+            }
+          } catch (error) {
+            markAlertWorkSpanFailed();
+            // Episode bookkeeping must never cost the device its alert.
+            console.error(
+              `[AlertService] Episode bookkeeping failed for monitor=${rule.managedByMonitorId} device=${deviceId}:`,
+              error
+            );
+            captureException(error, undefined, {
+              area: 'monitors',
+              issue: 'episode_record_failed',
+              monitorId: rule.managedByMonitorId,
+              deviceId,
             });
           }
-        } catch (error) {
-          // Episode bookkeeping must never cost the device its alert.
-          console.error(
-            `[AlertService] Episode bookkeeping failed for monitor=${rule.managedByMonitorId} device=${deviceId}:`,
-            error
-          );
-          captureException(error, undefined, {
-            area: 'monitors',
-            issue: 'episode_record_failed',
-            monitorId: rule.managedByMonitorId,
-            deviceId,
-          });
         }
-      }
 
-      if (result.triggered) {
-        // Build template context
-        const templateContext: Record<string, unknown> = {
-          deviceName: device.displayName || device.hostname,
-          hostname: device.hostname,
-          osType: device.osType,
-          osVersion: device.osVersion,
-          ruleName: rule.name,
-          severity: effectiveSeverity,
-          ...result.context
-        };
+        if (result.triggered) {
+          // Build template context
+          const templateContext: Record<string, unknown> = {
+            deviceName: device.displayName || device.hostname,
+            hostname: device.hostname,
+            osType: device.osType,
+            osVersion: device.osVersion,
+            ruleName: rule.name,
+            severity: effectiveSeverity,
+            ...result.context
+          };
 
-        // Interpolate title and message
-        const title = interpolateTemplate(template.titleTemplate, templateContext);
-        const message = interpolateTemplate(template.messageTemplate, templateContext);
+          // Interpolate title and message
+          const title = interpolateTemplate(template.titleTemplate, templateContext);
+          const message = interpolateTemplate(template.messageTemplate, templateContext);
 
-        // Create alert — ALWAYS in the DEVICE's org (alerts.org_id NOT NULL):
-        // a partner-wide rule (#2128) has no org of its own, and for org-owned
-        // rules device.orgId is identical to rule.orgId by the ownership match
-        // above. Notifications then route via the firing org's own channels.
-        const alertId = await createAlert({
+          // Create alert — ALWAYS in the DEVICE's org (alerts.org_id NOT NULL):
+          // a partner-wide rule (#2128) has no org of its own, and for org-owned
+          // rules device.orgId is identical to rule.orgId by the ownership match
+          // above. Notifications then route via the firing org's own channels.
+          const alertId = await createAlert({
+            ruleId: rule.id,
+            deviceId,
+            orgId: device.orgId,
+            severity: effectiveSeverity,
+            title,
+            message,
+            // #5289 — provenance, so the alert links to the authored monitor
+            // rather than to the compiled rule the technician never sees.
+            monitorId: rule.managedByMonitorId ?? null,
+            kind: monitor?.kind ?? null,
+            episodeId,
+            context: {
+              ...result.context,
+              conditionsMet: result.conditionsMet,
+              conditionsNotMet: result.conditionsNotMet,
+              templateId: template.id,
+              cooldownMinutes: effectiveCooldownMinutes
+            }
+          });
+
+          if (!alertId && episodeId) {
+            // Cooldown/flapping/dedupe can suppress the alert after a new
+            // episode committed. Record that definitive no-response decision so
+            // bounded probe admission does not reserve its slot indefinitely.
+            // Never overwrite an episode claimed by an alert or response worker.
+            await db.update(monitorEpisodes)
+              .set({ responseOutcome: 'skipped_no_response', updatedAt: new Date() })
+              .where(and(eq(monitorEpisodes.id, episodeId), isNull(monitorEpisodes.alertId),
+                isNull(monitorEpisodes.responseOutcome), isNull(monitorEpisodes.responseRunId),
+                isNull(monitorEpisodes.responseDispatch), isNull(monitorEpisodes.responsesAdmittedAt)));
+          }
+          if (alertId) {
+            createdAlerts.push(alertId);
+            if (episodeId) {
+              await linkEpisodeAlert(episodeId, alertId).catch((error) => {
+                markAlertWorkSpanFailed();
+                console.error(
+                  `[AlertService] Failed to link alert ${alertId} to episode ${episodeId}:`,
+                  error
+                );
+                // Reported as well as logged: a run of these silently degrades the
+                // episode → alert traceability the Activity tab is built on, and
+                // nothing else would ever notice the pattern.
+                captureException(error, undefined, {
+                  area: 'monitors',
+                  issue: 'episode_alert_link_failed',
+                  episodeId,
+                  alertId,
+                });
+              });
+            }
+          }
+        }
+      } catch (error) {
+        markAlertWorkSpanFailed();
+        console.error(`[AlertService] Error evaluating rule ${rule.id} for device ${deviceId}:`, error);
+        // Also the only guard around the hardware subject transaction (W03):
+        // report it, or a recurring failure silently stops hardware alerts.
+        captureException(error, undefined, {
+          errorId: 'alert-rule-evaluation-failed',
           ruleId: rule.id,
           deviceId,
-          orgId: device.orgId,
-          severity: effectiveSeverity,
-          title,
-          message,
-          // #5289 — provenance, so the alert links to the authored monitor
-          // rather than to the compiled rule the technician never sees.
-          monitorId: rule.managedByMonitorId ?? null,
-          kind: monitor?.kind ?? null,
-          episodeId,
-          context: {
-            ...result.context,
-            conditionsMet: result.conditionsMet,
-            conditionsNotMet: result.conditionsNotMet,
-            templateId: template.id,
-            cooldownMinutes: effectiveCooldownMinutes
-          }
         });
-
-        if (alertId) {
-          createdAlerts.push(alertId);
-          if (episodeId) {
-            await linkEpisodeAlert(episodeId, alertId).catch((error) => {
-              console.error(
-                `[AlertService] Failed to link alert ${alertId} to episode ${episodeId}:`,
-                error
-              );
-              // Reported as well as logged: a run of these silently degrades the
-              // episode → alert traceability the Activity tab is built on, and
-              // nothing else would ever notice the pattern.
-              captureException(error, undefined, {
-                area: 'monitors',
-                issue: 'episode_alert_link_failed',
-                episodeId,
-                alertId,
-              });
-            });
-          }
-        }
       }
-    } catch (error) {
-      console.error(`[AlertService] Error evaluating rule ${rule.id} for device ${deviceId}:`, error);
-      // Also the only guard around the hardware subject transaction (W03):
-      // report it, or a recurring failure silently stops hardware alerts.
-      captureException(error, undefined, {
-        errorId: 'alert-rule-evaluation-failed',
-        ruleId: rule.id,
-        deviceId,
-      });
-    }
+    }, { id: monitor?.id ?? rule.id, label: monitor?.name ?? rule.name });
   }
 
   // Only the per-device sweep saw every monitor that resolves to this device;

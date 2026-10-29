@@ -1,8 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 
-const { mockDb, dispatchMock, resolveMonitorsMock, txState, neSpy, eqSpy } = vi.hoisted(() => ({
-  mockDb: { select: vi.fn() },
+const { mockDb, dispatchMock, resolveMonitorsMock, txState, neSpy, eqSpy, activeWorkMock, responseHistoryMock, latestProbeMock, decisionMock } = vi.hoisted(() => ({
+  mockDb: { select: vi.fn(), selectDistinctOn: vi.fn() },
+  decisionMock: vi.fn(() => [] as unknown[]),
+  latestProbeMock: vi.fn(() => [] as unknown[]),
+  responseHistoryMock: vi.fn(() => [] as unknown[]),
+  activeWorkMock: vi.fn((_predicate?: unknown) => [] as unknown[]),
   dispatchMock: vi.fn(),
   resolveMonitorsMock: vi.fn(),
   // Model context reuse and transaction commit/rollback, including probe writes
@@ -20,8 +24,8 @@ const { mockDb, dispatchMock, resolveMonitorsMock, txState, neSpy, eqSpy } = vi.
   eqSpy: vi.fn(),
 }));
 
-const { canRunBackgroundWorkMock } = vi.hoisted(() => ({ canRunBackgroundWorkMock: vi.fn(() => true) }));
-vi.mock('../services/capacityGuard', () => ({ canRunBackgroundWork: canRunBackgroundWorkMock }));
+const { canRunBackgroundWorkMock, snapshotMock } = vi.hoisted(() => ({ canRunBackgroundWorkMock: vi.fn(() => true), snapshotMock: vi.fn() }));
+vi.mock('../services/capacityGuard', () => ({ readCapacityGuard: () => snapshotMock.mock.calls.length || snapshotMock.getMockImplementation() ? snapshotMock() : ({ enabled: !canRunBackgroundWorkMock(), state: 'paused', observedAt: null }) }));
 
 // Plain-string mocked schema columns below cannot round-trip through a real
 // drizzle SQL compiler (no Column/Table shape for PgDialect to read), so the
@@ -90,6 +94,10 @@ vi.mock('../db', () => ({
 vi.mock('../db/schema', async () => {
   const { pgTable, uuid, timestamp, text } = await import('drizzle-orm/pg-core');
   return {
+  monitorDeviceState: { monitorId: 'state.monitorId', deviceId: 'state.deviceId',
+    lastEvaluatedAt: 'state.lastEvaluatedAt', responsesPaused: 'state.responsesPaused', currentEpisodeId: 'state.currentEpisodeId' },
+  monitorEpisodes: { id: 'episodes.id', responseOutcome: 'episodes.responseOutcome', responseDispatch: 'episodes.responseDispatch', responseRunId: 'episodes.responseRunId' },
+  automationRuns: { id: 'runs.id', status: 'runs.status' },
   monitorDefinitions: {
     id: 'monitorDefinitions.id',
     kind: 'monitorDefinitions.kind',
@@ -123,6 +131,10 @@ vi.mock('../db/schema', async () => {
     id: uuid('id'),
     monitorId: uuid('monitor_id'),
     deviceId: uuid('device_id'),
+    scriptId: uuid('script_id'),
+    exitCode: text('exit_code'),
+    stdout: text('stdout'),
+    completedAt: timestamp('completed_at'),
     status: text('status'),
     createdAt: timestamp('created_at'),
   }),
@@ -142,8 +154,10 @@ vi.mock('../services/monitors/monitorResolver', () => ({
   resolveMonitorsForDevice: resolveMonitorsMock,
 }));
 
-import { configPolicyMonitors, monitorDefinitions, organizations, devices, scriptExecutions, scripts } from '../db/schema';
-import { processScriptMonitorTick } from './monitorScriptWorker';
+import { configPolicyMonitors, monitorDefinitions, organizations, devices, scriptExecutions, scripts, monitorDeviceState } from '../db/schema';
+import { readCapacityGuardConfig } from '../services/capacityGuardPolicy';
+import type { CapacityGuardSnapshot } from '../services/capacityGuard';
+import { applicablePendingMonitorResponseDevices, canRunScriptMonitorProbe, pendingMonitorResponseDevices, processScriptMonitorTick } from './monitorScriptWorker';
 
 const MONITOR_ID = 'monitor-1';
 const DEVICE_ID = 'device-1';
@@ -163,13 +177,23 @@ type QueryResponse = unknown[] | (() => unknown[]);
  */
 function setupDb(responses: Map<TableRef, QueryResponse>) {
   const queries: Array<{ table: TableRef; where: unknown; transactionId: number | null }> = [];
-  mockDb.select.mockImplementation(() => {
+  mockDb.selectDistinctOn.mockImplementation(() => {
+    const builder = { from: () => builder, where: () => builder,
+      orderBy: () => Promise.resolve(latestProbeMock()) };
+    return builder;
+  });
+  mockDb.select.mockImplementation((fields) => {
     let response: QueryResponse = [];
     let tableRef: TableRef;
-    const readRows = () => typeof response === 'function' ? response() : response;
+    const readRows = () => {
+      const rows = typeof response === 'function' ? response() : response;
+      if (tableRef !== scriptExecutions || !fields?.active) return rows;
+      return rows.map((row: any) => ({ ...row, active: row.active ?? ['pending', 'queued', 'running', 'cancelling'].includes(row.status) }));
+    };
     const builder = {
       from(table: TableRef) {
         tableRef = table;
+        if (table === (monitorDeviceState as any)) { response = decisionMock; return builder; }
         // Existing admission fixtures represent attached monitors. Tests for
         // absence/overrides provide the complete inventory explicitly.
         response = responses.get(table) ?? (table === configPolicyMonitors
@@ -178,9 +202,17 @@ function setupDb(responses: Map<TableRef, QueryResponse>) {
         return builder;
       },
       where(predicate: unknown) {
+        if (tableRef === scriptExecutions && Object.keys(fields ?? {}).join() === 'deviceId') {
+          return { groupBy: () => ({ limit: () => Promise.resolve(activeWorkMock(predicate)) }) };
+        }
+        if (tableRef === scriptExecutions && Object.keys(fields ?? {}).join() === 'deviceId,scriptId,createdAt') {
+          return { groupBy: () => Promise.resolve(responseHistoryMock()) };
+        }
         queries.push({ table: tableRef, where: predicate, transactionId: txState.id });
         return builder;
       },
+      leftJoin() { return builder; },
+      groupBy() { return builder; },
       orderBy() {
         return builder;
       },
@@ -262,6 +294,13 @@ function deferredProbe(deviceId: string, deliver: () => Promise<void>) {
 describe('processScriptMonitorTick', () => {
   beforeEach(() => {
     canRunBackgroundWorkMock.mockReset().mockReturnValue(true);
+    snapshotMock.mockReset();
+    activeWorkMock.mockReset().mockReturnValue([]);
+    latestProbeMock.mockReset().mockReturnValue([]);
+    responseHistoryMock.mockReset().mockReturnValue([]);
+    decisionMock.mockReset().mockReturnValue([]);
+    vi.stubEnv('MONITOR_SCRIPT_MAX_DISPATCH_PER_TICK', '10');
+    vi.stubEnv('MONITOR_SCRIPT_MAX_ACTIVE_WORK', '10');
     mockDb.select.mockReset();
     dispatchMock.mockReset();
     resolveMonitorsMock.mockReset();
@@ -300,8 +339,66 @@ describe('processScriptMonitorTick', () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
     vi.useRealTimers();
+  });
+
+  it('makes one bounded admission during heavy-lane recovery, prioritizing never then oldest evidence', async () => {
+    vi.unstubAllEnvs(); // Production defaults are one dispatch and two active jobs.
+    snapshotMock.mockReturnValue(microSnapshot());
+    const responses = new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, ['recent', 'oldest', 'new'].map(id => makeDeviceRow({ id }))],
+      [scriptExecutions, [
+        { deviceId: 'recent', status: 'completed', createdAt: minutesAgo(90) },
+        { deviceId: 'oldest', status: 'completed', createdAt: minutesAgo(300) },
+      ]],
+      [scripts, [makeScriptRow()]],
+    ]);
+    let history = true;
+    responses.set(scriptExecutions, () => history ? (history = false, [
+      { deviceId: 'recent', status: 'completed', createdAt: minutesAgo(90) },
+      { deviceId: 'oldest', status: 'completed', createdAt: minutesAgo(300) },
+    ]) : []);
+    setupDb(responses);
+    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 1 });
+    expect(dispatchMock.mock.calls[0]![0].device.id).toBe('new');
+    dispatchMock.mockClear();
+    history = true;
+    responses.set(devices, ['recent', 'oldest'].map(id => makeDeviceRow({ id })));
+    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 1 });
+    expect(dispatchMock.mock.calls[0]![0].device.id).toBe('oldest');
+  });
+
+  it('rechecks active work when a response execution appears between admission snapshots', async () => {
+    vi.unstubAllEnvs();
+    setupDb(new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow()]],
+      [devices, [makeDeviceRow()]], [scripts, [makeScriptRow()]],
+    ]));
+    activeWorkMock.mockReturnValueOnce([]).mockReturnValueOnce([
+      { deviceId: 'just-started-one' }, { deviceId: 'just-started-two' },
+    ]);
+    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 0, deferredForActiveWork: true });
+    expect(dispatchMock).not.toHaveBeenCalled();
+  });
+  it('counts active automation response scripts even without monitor_id and refuses another probe', async () => {
+    vi.unstubAllEnvs();
+    const repairId = '22222222-2222-4222-8222-222222222222';
+    setupDb(new Map<TableRef, QueryResponse>([
+      [monitorDefinitions, [makeMonitorRow({ responses: [{ type: 'run_script', scriptId: repairId }] })]],
+    ]));
+    activeWorkMock.mockReturnValue([{ deviceId: 'device1' }, { deviceId: 'device2' }]);
+    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 0, deferredForActiveWork: true });
+    expect(resolveMonitorsMock).not.toHaveBeenCalled();
+    // Predicate includes response script IDs independently of monitor IDs.
+    expect(mockDb.select).toHaveBeenCalledTimes(2);
+    const query = new PgDialect().sqlToQuery(activeWorkMock.mock.calls[0]![0] as any);
+    expect(query.sql).toContain('"script_id" in');
+    expect(query.params).toContain(repairId);
+    expect(query.params).toContain(SCRIPT_ID);
+    expect(query.params).toContain('running');
   });
 
   it('defers a pressured tick before opening a database context or marking any probe due', async () => {
@@ -340,7 +437,7 @@ describe('processScriptMonitorTick', () => {
       });
     });
     expect(await processScriptMonitorTick()).toMatchObject({
-      devicesConsidered: 1, dispatched: 1, skipped: 0, skippedNotDue: 0, errors: 0, deferredForCapacity: true,
+      devicesConsidered: 2, dispatched: 1, skipped: 0, skippedNotDue: 0, errors: 0, deferredForCapacity: true,
     });
     expect(delivered).toEqual(['first']);
     expect(txState.committed).toEqual(['execution:first', 'command:first']);
@@ -468,7 +565,7 @@ describe('processScriptMonitorTick', () => {
       new Map<TableRef, unknown[]>([
         [monitorDefinitions, [makeMonitorRow()]],
         [devices, [makeDeviceRow()]],
-        // No execution history needed — disabled short-circuits before the throttle check.
+        // No execution history needed â€” disabled short-circuits before the throttle check.
         [scriptExecutions, []],
         [scripts, [makeScriptRow()]],
       ]),
@@ -480,7 +577,7 @@ describe('processScriptMonitorTick', () => {
     expect(result).toMatchObject({ monitorsConsidered: 1, devicesConsidered: 1, dispatched: 0, skipped: 1 });
   });
 
-  it('(c2) does not dispatch when the device raced a delete — resolver returns device_missing, not a fabricated "zero monitors" (#5677)', async () => {
+  it('(c2) does not dispatch when the device raced a delete â€” resolver returns device_missing, not a fabricated "zero monitors" (#5677)', async () => {
     resolveMonitorsMock.mockResolvedValue({ kind: 'device_missing' });
     setupDb(
       new Map<TableRef, unknown[]>([
@@ -725,7 +822,7 @@ describe('processScriptMonitorTick', () => {
     expect(dispatchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('a throwing deferred delivery does not fail the tick — the committed command waits for the heartbeat (#3445)', async () => {
+  it('a throwing deferred delivery does not fail the tick â€” the committed command waits for the heartbeat (#3445)', async () => {
     const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     setupDb(
       new Map<TableRef, unknown[]>([
@@ -869,7 +966,6 @@ describe('processScriptMonitorTick', () => {
     expect(compiled.sql).toContain('"device_id" in (');
     expect(compiled.params).toEqual([
       MONITOR_ID, ...fleet.map((device) => device.id),
-      'pending', 'queued', 'running', 'cancelling', minutesAgo(60).toISOString(),
     ]);
   });
 
@@ -913,7 +1009,7 @@ describe('processScriptMonitorTick', () => {
     const inventory = queries.find((query) => query.table === configPolicyMonitors)!;
     expect(new PgDialect().sqlToQuery(inventory.where as Parameters<PgDialect['sqlToQuery']>[0]).sql)
       .toBe('"config_policy_monitors"."monitor_id" in ($1)');
-    for (const query of queries.filter((query) => query.table === scriptExecutions)) {
+    for (const query of queries.filter((query) => query.table === scriptExecutions).slice(1)) {
       expect(new PgDialect().sqlToQuery(query.where as Parameters<PgDialect['sqlToQuery']>[0]).params)
         .toContain(minutesAgo(5).toISOString());
     }
@@ -938,7 +1034,7 @@ describe('processScriptMonitorTick', () => {
     expect(resolveMonitorsMock).toHaveBeenCalledTimes(1);
     const queriesWithCutoffs = queries.filter((query) => query.table === scriptExecutions)
       .map((query) => new PgDialect().sqlToQuery(query.where as Parameters<PgDialect['sqlToQuery']>[0]).params);
-    expect(queriesWithCutoffs[0]).toContain(minutesAgo(5).toISOString());
+    expect(queriesWithCutoffs[0]).not.toContain(minutesAgo(5).toISOString());
     expect(queriesWithCutoffs[1]).toContain(minutesAgo(60).toISOString());
   });
 
@@ -1011,7 +1107,7 @@ describe('processScriptMonitorTick', () => {
     expect(resolveMonitorsMock).toHaveBeenCalledTimes(1);
   });
 
-  it('rechecks recency after earlier admissions rather than freezing a long sweep cutoff', async () => {
+  it('reconsiders a not-yet-due candidate on the next bounded sweep', async () => {
     let historyReads = 0;
     setupDb(new Map<TableRef, QueryResponse>([
       [monitorDefinitions, [makeMonitorRow()]],
@@ -1026,9 +1122,9 @@ describe('processScriptMonitorTick', () => {
       return { ok: true };
     });
 
-    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 2, skippedNotDue: 0 });
-    expect(resolveMonitorsMock).toHaveBeenCalledTimes(2);
-    expect(historyReads).toBe(3); // One bulk read and both unchanged exact guards.
+    expect(await processScriptMonitorTick()).toMatchObject({ dispatched: 1, skippedNotDue: 1 });
+    expect(resolveMonitorsMock).toHaveBeenCalledTimes(1);
+    expect(historyReads).toBe(2); // One aggregate and one exact admission guard.
   });
 
   it('keeps monitor/device history separate across organizations in the same sweep', async () => {
@@ -1112,5 +1208,102 @@ describe('processScriptMonitorTick', () => {
       dispatched: 1, errors: 1, skippedNotDue: 0, skippedUnattached: 0,
     });
     expect(resolveMonitorsMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+function microSnapshot(overrides: Partial<CapacityGuardSnapshot> = {}): CapacityGuardSnapshot {
+  return {
+    enabled: true, state: 'paused', canRunBackgroundWork: false,
+    observedAt: NOW.toISOString(), sampleAgeMs: 1000, healthyForMs: 0,
+    reasons: ['recovering'], thresholds: readCapacityGuardConfig(),
+    metrics: { cpuBusyPercent: 30, cpuStealPercent: 3, cpuIowaitPercent: 0,
+      memoryUsedPercent: 50, eventLoopLagMs: 10, dependenciesReady: true },
+    agentUpdates: {} as CapacityGuardSnapshot['agentUpdates'], ...overrides,
+  };
+}
+
+describe('bounded script monitor admission', () => {
+  it('allows current healthy observations while the heavy-work recovery latch is paused', () => {
+    expect(canRunScriptMonitorProbe(microSnapshot())).toBe(true);
+  });
+  it.each([
+    { state: 'stopped' }, { observedAt: null }, { sampleAgeMs: 21000 }, { sampleAgeMs: -1 },
+    { metrics: { ...microSnapshot().metrics, cpuBusyPercent: 80 } },
+    { metrics: { ...microSnapshot().metrics, cpuStealPercent: 6 } },
+    { metrics: { ...microSnapshot().metrics, cpuStealPercent: null } },
+    { metrics: { ...microSnapshot().metrics, memoryUsedPercent: null } },
+    { metrics: { ...microSnapshot().metrics, eventLoopLagMs: 300 } },
+    { metrics: { ...microSnapshot().metrics, dependenciesReady: false } },
+  ] as Partial<CapacityGuardSnapshot>[])('rejects unhealthy or stale observations: %j', (overrides) => {
+    expect(canRunScriptMonitorProbe(microSnapshot(overrides))).toBe(false);
+  });
+});
+
+describe('durable pending response reservations', () => {
+  const repair = '22222222-2222-4222-8222-222222222222';
+  const monitor = makeMonitorRow({ responses: [{ type: 'run_script', scriptId: repair }] });
+  const probe = { monitorId: MONITOR_ID, deviceId: DEVICE_ID, status: 'completed',
+    exitCode: 0, stdout: '::breeze:monitor:: {"state":"breach"}', createdAt: minutesAgo(10) };
+  const decision = { monitorId: MONITOR_ID, deviceId: DEVICE_ID, lastEvaluatedAt: minutesAgo(5),
+    responsesPaused: false, episodeId: 'episode', responseOutcome: 'queued', responseDispatch: {}, responseRunStatus: 'running' };
+  it('does not let a detached historical breach reserve capacity forever', async () => {
+    resolveMonitorsMock.mockResolvedValue({ kind: 'resolved', monitors: [] });
+    expect((await applicablePendingMonitorResponseDevices([monitor], [probe], [])).size).toBe(0);
+    expect(resolveMonitorsMock).toHaveBeenCalledWith(DEVICE_ID);
+  });
+  it('releases a reservation when the current inherited winner is disabled', async () => {
+    resolveMonitorsMock.mockResolvedValue({ kind: 'resolved', monitors: [{ monitorId: MONITOR_ID, enabled: false }] });
+    expect((await applicablePendingMonitorResponseDevices([monitor], [probe], [], [decision])).size).toBe(0);
+  });
+  it('keeps an applicable queued response reserved across policy resolution', async () => {
+    resolveMonitorsMock.mockResolvedValue({ kind: 'resolved', monitors: [{ monitorId: MONITOR_ID, enabled: true }] });
+    expect([...(await applicablePendingMonitorResponseDevices([monitor], [probe], [], [decision]))]).toEqual([DEVICE_ID]);
+  });
+  it('fails closed when reservation applicability cannot be read', async () => {
+    resolveMonitorsMock.mockRejectedValue(new Error('policy read unavailable'));
+    await expect(applicablePendingMonitorResponseDevices([monitor], [probe], [], [decision])).rejects.toThrow('policy read unavailable');
+  });
+  it('retains a ten-minute breach when its response is durably queued, without an execution yet', () => {
+    expect(pendingMonitorResponseDevices([monitor], [probe], [], [decision]).size).toBe(1);
+  });
+  it.each([
+    { responsesPaused: true }, { episodeId: null }, { responseOutcome: 'skipped_paused' },
+    { responseOutcome: 'skipped_no_response' }, { responseOutcome: 'failed' },
+    { responseOutcome: 'completed' }, { responseRunStatus: 'completed' },
+  ])('releases an evaluated non-actionable response: %j', overrides => {
+    expect(pendingMonitorResponseDevices([monitor], [probe], [], [{ ...decision, ...overrides }]).size).toBe(0);
+  });
+  it('reserves an evaluated legacy episode before createAlert publishes its response', () => {
+    expect(pendingMonitorResponseDevices([monitor], [probe], [], [{ ...decision,
+      responseOutcome: null, responseDispatch: null, responseRunStatus: null }]).size).toBe(1);
+  });
+  it('retains a newly persisted outbox before it acquires a queued outcome', () => {
+    expect(pendingMonitorResponseDevices([monitor], [probe], [], [{ ...decision,
+      responseOutcome: null, responseRunStatus: null }]).size).toBe(1);
+  });
+  it('retains a breach older than ten minutes while no response has been dispatched', () => {
+    expect([...pendingMonitorResponseDevices([monitor], [probe], [])]).toEqual([DEVICE_ID]);
+  });
+  it('releases after a newer response execution exists; older repairs do not release', () => {
+    expect(pendingMonitorResponseDevices([monitor], [probe], [
+      { deviceId: DEVICE_ID, scriptId: repair, createdAt: minutesAgo(5) },
+    ]).size).toBe(0);
+    expect(pendingMonitorResponseDevices([monitor], [probe], [
+      { deviceId: DEVICE_ID, scriptId: repair, createdAt: minutesAgo(20) },
+    ]).size).toBe(1);
+  });
+  it('uses the final marker, respecting explicit OK even with a nonzero exit', () => {
+    expect(pendingMonitorResponseDevices([monitor], [{ ...probe, exitCode: 1,
+      stdout: probe.stdout + '\n::breeze:monitor:: {"state":"ok"}' }], []).size).toBe(0);
+  });
+  it('respects breachOnNonZeroExit and never reserves an unsuccessful probe without a verdict', () => {
+    expect(pendingMonitorResponseDevices([{ ...monitor,
+      condition: { ...monitor.condition, breachOnNonZeroExit: false } }],
+      [{ ...probe, stdout: '', exitCode: 1 }], []).size).toBe(0);
+    expect(pendingMonitorResponseDevices([monitor], [{ ...probe, status: 'failed' }], []).size).toBe(0);
+  });
+  it('only reserves the newest probe supplied by DISTINCT ON, not an older breach', () => {
+    expect(pendingMonitorResponseDevices([monitor], [{ ...probe,
+      stdout: '::breeze:monitor:: {"state":"ok"}', createdAt: minutesAgo(1) }], []).size).toBe(0);
   });
 });

@@ -82,7 +82,7 @@ interface ParsedMonitorMarker {
  * fallback in `evaluate`, never throws. A malformed marker is a bug in the
  * MONITORED script, not in this handler or in the execution pipeline.
  */
-function parseLastMonitorMarker(stdout: string | null): ParsedMonitorMarker | null {
+export function parseLastMonitorMarker(stdout: string | null): ParsedMonitorMarker | null {
   if (!stdout) return null;
 
   const lines = stdout.split(/\r?\n/);
@@ -143,7 +143,7 @@ export const scriptMonitorHandler: ConditionHandler = {
       .limit(1);
 
     if (!latest) {
-      return { passed: false, description: 'No recent probe result' };
+      return { passed: false, dataAvailable: false, description: 'No recent probe result' };
     }
 
     // completedAt is written for every terminal outcome (completed, failed,
@@ -155,20 +155,20 @@ export const scriptMonitorHandler: ConditionHandler = {
     if (ageMs > cond.intervalMinutes * MS_PER_MINUTE * STALE_PROBE_INTERVAL_MULTIPLIER) {
       // A stale probe must never latch a breach (nor a clear): an execution
       // pipeline outage must read as "no data", not as a silent all-clear.
-      return { passed: false, description: 'No recent probe result' };
+      return { passed: false, dataAvailable: false, description: 'No recent probe result' };
     }
 
     if (NON_COMPLETED_TERMINAL_STATUSES.has(latest.status)) {
       // Per spec, a timeout (and, by the same reasoning, a failed or
       // cancelled run) is NOT a breach: the probe itself never produced a
       // verdict, so there is nothing to breach on.
-      return { passed: false, description: `Script probe did not complete (status: ${latest.status})` };
+      return { passed: false, dataAvailable: false, description: `Script probe did not complete (status: ${latest.status})` };
     }
 
     if (latest.status !== 'completed') {
       // pending / queued / running / cancelling — the probe simply hasn't
       // finished yet. Not a breach.
-      return { passed: false, description: `Script probe still in progress (status: ${latest.status})` };
+      return { passed: false, dataAvailable: false, description: `Script probe still in progress (status: ${latest.status})` };
     }
 
     const marker = parseLastMonitorMarker(latest.stdout);

@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { devices } from '../../db/schema/devices';
+import { configPolicyMonitors } from '../../db/schema/monitorDefinitions';
+import { configPolicyFeatureLinks } from '../../db/schema/configurationPolicies';
+import type { DeviceHierarchy } from '../deviceHierarchy';
 import { pickWinner, resolveMonitorsForDevice, selectContributingAttachments, MONITOR_RESOLVER_CAPABILITIES, type MonitorCandidate } from './monitorResolver';
 
 function candidate(overrides: Partial<MonitorCandidate>): MonitorCandidate {
@@ -69,6 +72,70 @@ describe('monitor attachment ranking (#5289)', () => {
       candidate({ sourcePolicyId: 'site', sourceLevel: 'site', overrides: { value: 95 } }),
     ]);
     expect(winner.overrides).toEqual({ value: 95 });
+  });
+});
+
+describe('monitor link/attachment query parity', () => {
+  const hierarchy: DeviceHierarchy = {
+    deviceId: 'device', orgId: 'org', siteId: 'site', deviceRole: 'workstation', osType: 'windows',
+    org: { partnerId: 'partner', type: 'customer' }, site: { id: 'site', name: 'Site', timezone: 'UTC' }, groupIds: [],
+  };
+  const assignment = (policyId: string, level: string, parentPolicyId: string | null = null) => ({
+    policyId, parentPolicyId, level, priority: 0, createdAt: new Date('2026-01-01T00:00:00Z'),
+  });
+  const link = (configPolicyId: string, inheritance: unknown, monitorId: string | null, enabled: boolean | null = true) => ({
+    configPolicyId, inlineSettings: { inheritance }, monitorId, enabled: monitorId === null ? null : enabled, overrides: null,
+  });
+  async function resolve(assignments: ReturnType<typeof assignment>[], rows: ReturnType<typeof link>[]) {
+    const attachmentWhere = vi.fn(async (_where: Parameters<PgDialect['sqlToQuery']>[0]) => rows);
+    const leftJoin = vi.fn((_table: unknown, _on: unknown) => ({ where: attachmentWhere }));
+    const attachmentFrom = vi.fn(() => ({ leftJoin }));
+    const select = vi.fn()
+      .mockReturnValueOnce({ from: () => ({ innerJoin: () => ({ where: () => ({ orderBy: async () => assignments }) }) }) })
+      .mockReturnValueOnce({ from: attachmentFrom });
+    const executor = { select } as unknown as NonNullable<Parameters<typeof resolveMonitorsForDevice>[1]>;
+    const result = await resolveMonitorsForDevice('device', executor, { hierarchy });
+    expect(select).toHaveBeenCalledTimes(2); // assignments + links/attachments, no separate replace read
+    expect(attachmentFrom).toHaveBeenCalledWith(configPolicyFeatureLinks);
+    expect(leftJoin.mock.calls[0]?.[0]).toBe(configPolicyMonitors);
+    const query = new PgDialect().sqlToQuery(attachmentWhere.mock.calls[0]![0]);
+    expect(query.sql).not.toContain("'inheritance'");
+    expect(query.params).toContain('monitors');
+    return result;
+  }
+
+  it('retains an empty replace link while suppressing its parent and farther replace assignments', async () => {
+    expect(await resolve([
+      assignment('site-p', 'site', 'parent-p'), assignment('org-p', 'organization'), assignment('partner-p', 'partner'),
+    ], [
+      link('site-p', 'replace', null), link('parent-p', 'cumulative', 'parent-monitor'),
+      link('org-p', 'replace', 'org-monitor'), link('partner-p', 'cumulative', 'builtin'),
+    ])).toEqual({ kind: 'resolved', monitors: [expect.objectContaining({ monitorId: 'builtin' })] });
+  });
+
+  it('allows an empty cumulative link to inherit parent attachments', async () => {
+    expect(await resolve([assignment('child', 'site', 'parent')], [
+      link('child', 'cumulative', null), link('parent', 'cumulative', 'cpu'),
+    ])).toEqual({ kind: 'resolved', monitors: [expect.objectContaining({ monitorId: 'cpu', inheritedFromParent: true })] });
+  });
+
+  it('preserves disabled closest attachments and resolves multiple levels as before', async () => {
+    expect(await resolve([assignment('org-p', 'organization'), assignment('site-p', 'site')], [
+      link('org-p', 'cumulative', 'cpu'), link('site-p', 'cumulative', 'cpu', false),
+    ])).toEqual({ kind: 'resolved', monitors: [expect.objectContaining({ monitorId: 'cpu', enabled: false, sourcePolicyId: 'site-p' })] });
+  });
+
+  it('handles the null attachment projection produced when RLS hides attachments but exposes a replace link', async () => {
+    // Models the LEFT JOIN result, not a substitute for the real-RLS integration suite.
+    expect(await resolve([assignment('child', 'site', 'parent')], [
+      link('child', 'replace', null), link('parent', 'cumulative', 'cpu'),
+    ])).toEqual({ kind: 'resolved', monitors: [] });
+  });
+
+  it.each([null, undefined, 'invalid'])('keeps invalid inheritance %s cumulative', async inheritance => {
+    expect(await resolve([assignment('child', 'site', 'parent')], [
+      link('child', inheritance, null), link('parent', 'cumulative', 'cpu'),
+    ])).toEqual({ kind: 'resolved', monitors: [expect.objectContaining({ monitorId: 'cpu', inheritedFromParent: true })] });
   });
 });
 

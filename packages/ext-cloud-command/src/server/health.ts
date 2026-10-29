@@ -2,7 +2,17 @@ import { Hono } from 'hono';
 import type { ExtensionRequestAuthorization } from '@breeze/extension-sdk';
 
 export type HealthCard = { id: string; title: string; status: 'healthy' | 'attention' | 'critical' | 'unknown'; value: string; detail: string };
-export type OperationsHealth = { checkedAt: string; refreshSeconds: number; targetEndpoints: number; enrolled: number | null; cards: HealthCard[] };
+export type AlertWorkloadGroup = {
+  group: string; label: string; evaluations: number; perMinute: number;
+  totalMs: number; averageMs: number; maxMs: number; errors: number;
+  queryCount: number; dbElapsedMs: number;
+};
+export type AlertScriptMonitorWorkload = Omit<AlertWorkloadGroup, 'group'> & { id: string };
+export type AlertWorkload = {
+  windowMs: number; bucketMs: number; observedMs: number; groups: AlertWorkloadGroup[];
+  scriptMonitors?: AlertScriptMonitorWorkload[]; scriptMonitorLimit?: number;
+};
+export type OperationsHealth = { checkedAt: string; refreshSeconds: number; targetEndpoints: number; enrolled: number | null; cards: HealthCard[]; alertWorkload?: AlertWorkload };
 export type HealthAuth = { user?: { id?: string; isPlatformAdmin?: boolean }; scope?: string; principal?: { kind?: string }; allowedSiteIds?: unknown };
 export type HealthReader = (auth: HealthAuth) => Promise<OperationsHealth | null>;
 

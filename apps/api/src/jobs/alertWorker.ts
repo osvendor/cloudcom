@@ -5,7 +5,7 @@
  * Runs on a schedule and processes devices in batches.
  */
 
-import { Queue, Worker, Job } from 'bullmq';
+import { Queue, Worker, Job, type JobsOptions } from 'bullmq';
 import * as dbModule from '../db';
 import { devices, deviceMetrics, organizations } from '../db/schema';
 import { eq, ne, and, gte, gt, desc, asc, inArray } from 'drizzle-orm';
@@ -25,6 +25,8 @@ import {
 } from '../services/monitors/networkCheckAlertSweep';
 import { drainSubjectAlertOutbox } from '../services/subjectAlertOutbox';
 import { notHoldingOrgCondition, notParkedDeviceCondition } from '../services/unassignedPool/selectorPredicate';
+import { loadDeviceHierarchy } from '../services/deviceHierarchy';
+import { createAlertWorkReporter } from './alertWorkTelemetry';
 
 const { db } = dbModule;
 const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
@@ -35,6 +37,25 @@ const runWithSystemDbAccess = async <T>(fn: () => Promise<T>): Promise<T> => {
 // Queue name
 const ALERT_QUEUE = 'alert-evaluation';
 const ON_DEMAND_ALERT_DEDUPE_WINDOW_MS = 30 * 1000;
+
+/**
+ * One pending evaluation per tenant/device (or tenant/network-check sweep).
+ * BullMQ keeps one successor if a new sweep arrives while this scope is active,
+ * so a policy/metric change during evaluation is observed after it completes.
+ * No TTL: a slow evaluation must not let another copy start in parallel.
+ */
+export function scheduledAlertEvaluationOptions(
+  kind: 'device' | 'network-checks', orgId: string, deviceId?: string,
+): JobsOptions {
+  return {
+    deduplication: {
+      id: JSON.stringify(['scheduled-alert', kind, orgId, deviceId ?? null]),
+      keepLastIfActive: true,
+    },
+    removeOnComplete: { count: 100 },
+    removeOnFail: { count: 100 },
+  };
+}
 
 // Singleton queue instance
 let alertQueue: Queue | null = null;
@@ -131,7 +152,9 @@ export function createAlertWorker(): Worker<AlertJobData> {
     },
     {
       connection: getBullMQConnection(),
-      concurrency: 10,
+      // This is a per-process ceiling, not a replacement for a stricter
+      // Redis-persisted global concurrency budget (production may use one).
+      concurrency: Math.max(1, Math.min(10, envInt('ALERT_WORKER_CONCURRENCY', 2))),
       lockDuration: 300_000,
       stalledInterval: 60_000,
       maxStalledCount: 2,
@@ -255,7 +278,8 @@ export async function processEvaluateAll(data: EvaluateAllJobData): Promise<{
         type: 'evaluate-device' as const,
         deviceId: device.id,
         orgId: device.orgId
-      }
+      },
+      opts: scheduledAlertEvaluationOptions('device', device.orgId, device.id),
     }));
 
     await queue.addBulk(jobs);
@@ -289,6 +313,7 @@ export async function processEvaluateAll(data: EvaluateAllJobData): Promise<{
         networkCheckOrgIds.map((orgId) => ({
           name: 'evaluate-network-checks',
           data: { type: 'evaluate-network-checks' as const, orgId },
+          opts: scheduledAlertEvaluationOptions('network-checks', orgId),
         }))
       );
       console.log(`[AlertWorker] Queued ${networkCheckOrgIds.length} network-check org evaluations`);
@@ -366,7 +391,12 @@ async function processEvaluateDevice(data: EvaluateDeviceJobData): Promise<{
   const startTime = Date.now();
 
   try {
-    const alertIds = await evaluateDeviceAlerts(data.deviceId);
+    // One fresh, RLS-scoped hierarchy for this evaluation only. Passing it
+    // explicitly avoids repeated device/org/group reads in each resolver.
+    const hierarchy = await loadDeviceHierarchy(data.deviceId);
+    const alertIds = hierarchy
+      ? await evaluateDeviceAlerts(data.deviceId, { hierarchy })
+      : [];
 
     if (alertIds.length > 0) {
       console.log(`[AlertWorker] Created ${alertIds.length} alerts for device ${data.deviceId}`);
@@ -554,6 +584,7 @@ export async function initializeAlertWorkers(): Promise<void> {
     // Create worker
     alertWorker = createAlertWorker();
     attachWorkerObservability(alertWorker, 'alertWorker');
+    const recordWork = createAlertWorkReporter();
 
     // Set up error handler
     alertWorker.on('error', (error) => {
@@ -561,10 +592,12 @@ export async function initializeAlertWorkers(): Promise<void> {
     });
 
     alertWorker.on('failed', (job, error) => {
+      recordWork(job, true);
       console.error(`[AlertWorker] Job ${job?.id} failed:`, error);
     });
 
     alertWorker.on('completed', (job, result) => {
+      recordWork(job, false);
       // Only log significant completions
       if (job.data.type === 'evaluate-all' && result && typeof result === 'object' && 'queued' in result) {
         const r = result as { queued: number };

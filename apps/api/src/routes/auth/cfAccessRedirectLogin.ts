@@ -161,12 +161,19 @@ function cfAccessIssuanceError(
  */
 cfAccessRedirectLoginRoutes.get('/cf-access-login', async (c) => {
   const startedAt = performance.now();
+  // Account discovery for both remote viewers. Only a verified Access identity
+  // can select staff SSO; a portal email/cookie is never promoted to staff.
+  // This read-only probe neither issues cookies nor grants any permission.
+  const remoteIdentity = c.req.query('remoteIdentity') === '1';
+  if (remoteIdentity) c.header('Cache-Control', 'no-store');
   if (!cfAccessTrustEnabled()) {
+    if (remoteIdentity) return c.json({ kind: 'none' });
     return loginErrorRedirect('disabled');
   }
 
   const token = c.req.header(CF_ACCESS_JWT_HEADER);
   if (!token) {
+    if (remoteIdentity) return c.json({ kind: 'none' });
     return loginErrorRedirect('no-jwt');
   }
 
@@ -200,6 +207,10 @@ cfAccessRedirectLoginRoutes.get('/cf-access-login', async (c) => {
   const [user] = await withSystemDbAccessContext(async () =>
     db.select().from(users).where(eq(users.email, normalizedEmail)).limit(1)
   );
+
+  // Even disabled staff identities must go through staff authentication and
+  // its denial. Never reinterpret them as an identically named portal user.
+  if (remoteIdentity) return c.json({ kind: user ? 'staff' : 'customer' });
 
   if (!user) {
     return loginErrorRedirect('no-user');

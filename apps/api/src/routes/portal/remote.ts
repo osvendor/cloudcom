@@ -11,6 +11,7 @@ import { authorizePortalRemote } from '../../services/portalRemoteAuthority';
 import { checkPortalCompanyGateway } from '../../services/portalCompanyGateway';
 import { NATIVE_SESSION_PREFIX } from '../../services/portalNativeLogin';
 import { nativeAdmissionEnabled } from '../../services/portalNativeAdmissionSchemas';
+import { currentDeviceUser, previousDeviceUsers } from '../../services/deviceIdentity';
 
 
 export const portalRemoteRoutes = new Hono();
@@ -49,6 +50,7 @@ portalRemoteRoutes.on('GET', ['/remote/devices', '/remote/browser/devices'], asy
   // The organization-wide /devices route is deliberately never called here.
   const rows = await db.select({ id: devices.id, hostname: devices.hostname,
     displayName: devices.displayName, status: devices.status,
+    organizationId: devices.orgId, currentUser: currentDeviceUser, previousUsers: previousDeviceUsers,
   }).from(portalRemoteAssignments)
     .innerJoin(devices, and(eq(devices.id, portalRemoteAssignments.deviceId), eq(devices.orgId, portalRemoteAssignments.orgId)))
     .innerJoin(portalRemoteSettings, eq(portalRemoteSettings.orgId, portalRemoteAssignments.orgId))
@@ -85,7 +87,7 @@ portalRemoteRoutes.on('GET', ['/remote/devices', '/remote/browser/devices'], asy
         rustdesk = { available: false, reason: 'Managed RustDesk availability is temporarily unavailable' };
       }
     }
-    listed.push({ ...device, transports: {
+    listed.push({ ...device, canRename: false, transports: {
       rustdesk,
       webrtc: available ? { available: true } : { available: false, reason: 'Browser remote access is unavailable on this computer' },
     } });

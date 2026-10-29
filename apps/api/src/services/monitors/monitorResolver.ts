@@ -196,7 +196,7 @@ async function monitorsFromAssignments(assignments: AssignmentRow[], executor: D
       inlineSettings: configPolicyFeatureLinks.inlineSettings,
     })
     .from(configPolicyFeatureLinks)
-    .innerJoin(
+    .leftJoin(
       configPolicyMonitors,
       eq(configPolicyMonitors.featureLinkId, configPolicyFeatureLinks.id),
     )
@@ -210,24 +210,19 @@ async function monitorsFromAssignments(assignments: AssignmentRow[], executor: D
   const byPolicy = new Map<string, AttachmentRow[]>();
   const inheritanceByPolicy = new Map<string, MonitorsInheritance>();
   for (const row of attachmentRows) {
-    const list = byPolicy.get(row.configPolicyId) ?? [];
-    list.push({ configPolicyId: row.configPolicyId, monitorId: row.monitorId, enabled: row.enabled, overrides: row.overrides ?? null });
-    byPolicy.set(row.configPolicyId, list);
+    // A visible link with no visible attachments still controls inheritance.
+    // In particular, an empty replace link must continue to suppress its parent
+    // and farther replace links. The LEFT JOIN retains that row without a
+    // second query; RLS still applies independently to both joined tables.
     if (!inheritanceByPolicy.has(row.configPolicyId)) {
       const parsed = monitorsInheritanceSchema.safeParse((row.inlineSettings as { inheritance?: unknown } | null)?.inheritance);
       inheritanceByPolicy.set(row.configPolicyId, parsed.success ? parsed.data : 'cumulative');
     }
+    if (row.monitorId === null || row.enabled === null) continue;
+    const list = byPolicy.get(row.configPolicyId) ?? [];
+    list.push({ configPolicyId: row.configPolicyId, monitorId: row.monitorId, enabled: row.enabled, overrides: row.overrides ?? null });
+    byPolicy.set(row.configPolicyId, list);
   }
-
-  const replaceLinks = await executor
-    .select({ configPolicyId: configPolicyFeatureLinks.configPolicyId })
-    .from(configPolicyFeatureLinks)
-    .where(and(
-      inArray(configPolicyFeatureLinks.configPolicyId, [...policyIds]),
-      eq(configPolicyFeatureLinks.featureType, 'monitors'),
-      sql`${configPolicyFeatureLinks.inlineSettings} ->> 'inheritance' = 'replace'`,
-    ));
-  for (const r of replaceLinks) inheritanceByPolicy.set(r.configPolicyId, 'replace');
 
   const candidates = new Map<string, MonitorCandidate[]>();
   for (const candidate of selectContributingAttachments({ assignments, byPolicy, inheritanceByPolicy })) {

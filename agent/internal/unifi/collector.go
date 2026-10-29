@@ -375,9 +375,10 @@ func StartCollectorLoop(ctx context.Context, deps CollectorDeps) <-chan struct{}
 		defer timer.Stop()
 		lastRun := map[string]time.Time{}
 		// idle: the last successful fetch returned no collectors. A failed
-		// fetch keeps the current cadence, as the fixed ticker did.
+		// fetch preserves idle state but adds a bounded failure cooldown.
 		idle := false
-		var lastFetch time.Time
+		var lastFetch, retryUntil, lastErrorLog time.Time
+		failedFetches := 0
 		for {
 			select {
 			case <-ctx.Done():
@@ -385,7 +386,7 @@ func StartCollectorLoop(ctx context.Context, deps CollectorDeps) <-chan struct{}
 			case <-deps.Wake.C():
 				// Only an idle loop gains anything; an active one fetches
 				// within ActiveFetchInterval anyway.
-				if !idle || time.Since(lastFetch) < sched.wakeGap {
+				if !idle || time.Since(lastFetch) < sched.wakeGap || time.Now().Before(retryUntil) {
 					continue
 				}
 				timer.Stop()
@@ -394,8 +395,24 @@ func StartCollectorLoop(ctx context.Context, deps CollectorDeps) <-chan struct{}
 			configs, err := fetchConfigs(ctx, deps)
 			lastFetch = time.Now()
 			if err != nil {
-				deps.logf("[unifi] fetch configs: %v", err)
+				if ctx.Err() != nil {
+					return
+				}
+				failedFetches = min(failedFetches+1, 16)
+				var statusError *configFetchStatusError
+				var retryAfter time.Duration
+				if errors.As(err, &statusError) {
+					retryAfter = statusError.retryAfter
+				}
+				retryUntil = lastFetch.Add(defaultConfigFailureDelay(failedFetches, sched.active, retryAfter))
+				if lastErrorLog.IsZero() || lastFetch.Sub(lastErrorLog) >= fetchErrorLogInterval {
+					deps.logf("[unifi] fetch configs: %v (backing off)", err)
+					lastErrorLog = lastFetch
+				}
 			} else {
+				failedFetches = 0
+				retryUntil = time.Time{}
+				lastErrorLog = time.Time{}
 				idle = len(configs) == 0
 				now := time.Now()
 				for _, cfg := range configs {
@@ -412,6 +429,9 @@ func StartCollectorLoop(ctx context.Context, deps CollectorDeps) <-chan struct{}
 			next := sched.active
 			if idle {
 				next = sched.idle()
+			}
+			if remaining := time.Until(retryUntil); remaining > next {
+				next = remaining
 			}
 			timer.Reset(next)
 		}
@@ -434,7 +454,11 @@ func fetchConfigs(ctx context.Context, deps CollectorDeps) ([]CollectorConfig, e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch configs: status %d", resp.StatusCode)
+		retryAfter := time.Duration(0)
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable {
+			retryAfter = configRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+		}
+		return nil, &configFetchStatusError{status: resp.StatusCode, retryAfter: retryAfter}
 	}
 	var out struct {
 		Collectors []CollectorConfig `json:"collectors"`

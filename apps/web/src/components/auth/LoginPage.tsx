@@ -1,3 +1,4 @@
+import { bootstrapThenNavigate } from '../../lib/authNavigation';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import LoginForm from './LoginForm';
@@ -142,26 +143,6 @@ async function checkCfAccessLoginEnabled(): Promise<boolean> {
 function buildApiUrl(path: string): string {
   const apiHost = import.meta.env.PUBLIC_API_URL || '';
   return `${apiHost}/api/v1${path}`;
-}
-
-async function bootstrapThenNavigate(url: string): Promise<void> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
-  try {
-    const response = await fetch(buildApiUrl('/auth/browser-binding/bootstrap'), {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-    });
-    if (!response.ok) throw new Error('Authentication bootstrap failed');
-    window.location.assign(url);
-  } catch (error) {
-    if (controller.signal.aborted) throw new Error('Sign-in preparation timed out. Please wait a moment and retry.');
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 interface LoginPageProps {

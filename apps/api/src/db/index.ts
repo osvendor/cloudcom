@@ -7,6 +7,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { sql, type SQL } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
+import { enablePreparedPolicyReads } from './preparedPolicyReads';
+import { enableAlertQueryTiming } from './alertQueryTiming';
 import { captureMessage } from '../services/sentry';
 import {
   logRequestDatabaseConfigSource,
@@ -141,6 +143,10 @@ export async function assertRequestDatabaseRoleSafe(): Promise<RequestDatabaseRo
 // pool does not use Drizzle's opt-in relational `db.query` API: registering the
 // full schema eagerly allocates a query builder per table on every transaction
 // and savepoint. Keep the supported schema-free constructor on this hot path.
+// Opt-in rollout: reuse parameterized policy SELECT plans, never query results.
+// RLS remains evaluated by PostgreSQL in each transaction's access context.
+if (process.env.DB_PREPARED_POLICY_READS === 'true') enablePreparedPolicyReads(client);
+enableAlertQueryTiming(client);
 const baseDb = drizzle(client);
 const dbContextStorage = new AsyncLocalStorage<typeof baseDb>();
 // Parallel store holding the DbAccessContext METADATA (scope + allowlists) for

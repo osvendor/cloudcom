@@ -1,8 +1,125 @@
 # CloudCom upstream maintenance
 
+## Alert evaluation and metric aggregation cost (2026-10-27)
+
+Scheduled alert evaluation loads one fresh `DeviceHierarchy` inside its existing
+system database context and explicitly passes it through maintenance and rule/
+monitor resolution. Optional resolver arguments retain compatibility for other
+callers. Preserve the device mismatch guard, owner predicates, parked-organization
+semantics, and missing-org behavior. No hierarchy or query result is cached across
+evaluations. Existing episode/subject evidence and commit-before-outbox delivery
+boundaries remain unchanged.
+
+Scheduled device and network-check jobs use tenant-scoped BullMQ deduplication
+with `keepLastIfActive`: repeated pending work coalesces, but an active job retains
+one successor for new evidence. Do not replace this with a TTL or permanent job ID
+that can suppress fresh evaluations. Local alert concurrency defaults to two
+(1–10); an existing Redis global budget remains authoritative. Alert evaluation
+does not wait indefinitely for the optional-work capacity guard.
+
+Metric rollups default to one consumer across replicas. Capacity deferral retains
+the exact historical range/day plan without consuming attempts; scans continue
+recording ranges. Do not use per-org deduplication to discard historical windows.
+Unchanged aggregate upserts use null-safe comparison of all eight mutable fields,
+avoiding redundant writes, WAL and vacuum work. `updated_at` now denotes an actual
+aggregate change. Preserve overlap for late samples and daily catch-up semantics.
+
+Affected files: `alertWorker`, `alertWorkTelemetry`, `alertService`,
+`featureConfigResolver`, `metricRollups` worker/service and
+`metricRollupWorkAdmission`, their tests, and environment defaults. No schema,
+agent or browser-extension migration. Workload summaries are bounded and report
+wall-clock time/queue age, not CPU time. Persistent Redis metric global concurrency
+must be included in rollback; rolling back the artifact alone does not undo it.
+Source tests and isolated PostgreSQL/Redis fixtures are recorded in the task's
+evidence. Deployment activation and measured acceptance are recorded separately.
+
 This guide records how the CloudCom fork differs from LanternOps/Breeze and how to integrate upstream changes. Maintain it with the code; it is not a guarantee that future merges will be conflict-free or regression-free.
 
+## Database-pool pressure containment (2026-10-26)
+
+`DB_PREPARED_POLICY_READS=true` opts the request pool into bounded prepared
+statements for parameterized policy SELECTs. Drizzle's postgres-js adapter uses
+`unsafe()`, whose default disables preparation. The decorator covers transaction,
+savepoint and reserved clients; it does not cache result rows, alter RLS, force
+generic plans, or prepare writes/context setup. Preserve its SQL-shape/parameter
+bounds and explicit driver options. The isolated PostgreSQL integration test
+checks alternating tenant contexts, savepoints, plan reuse and fresh updates.
+
+The KEV/EPSS worker previously updated each CVE in one long transaction. Keep
+`exploitFeeds.ts`'s bounded writes (500 EPSS rows per transaction), unchanged-score
+predicate, and capacity checks between HTTP/write batches. All batches use the
+existing system DB context and release it before yielding. Capacity deferral must
+not record a false feed failure/success. `vulnerabilityWorkAdmission.ts` moves
+source/maintenance jobs to delayed without consuming an attempt when capacity is
+unavailable; preserve BullMQ lock-token handling and propagation of real errors.
+
+`agentRequestConcurrency.ts` bounds agent-ID HTTP handlers before auth/DB work.
+`CLOUDCOM_AGENT_REQUEST_CONCURRENCY` defaults to zero (disabled); deployment opts
+in to eight concurrent requests, with a bounded FIFO wait queue and abort cleanup.
+Human authentication, downloads and the separately budgeted WS setup route do not
+enter this queue. Existing authentication and RLS remain mandatory after admission.
+Do not increase the pool merely to work around overload. Preserve middleware order
+immediately after agent admission and before auth/body/database middleware.
+
+Validation in OS-TEST: 36 focused feed/admission/concurrency tests and 50 existing
+admission-core tests passed; candidate API syntax checked. Broader route tests
+could not load due to missing native argon2 in the isolated test environment.
+No migration or endpoint/extension release is required. Deployment receipts and
+post-deployment acceptance are recorded separately in the control-plane evidence.
+
+## Bounded script monitor progress (2026-10-23)
+
+Preserve `monitorScriptWorker`'s separate fresh-current-pressure admission for
+small probes: the heavy recovery latch previously starved first checks, so
+managed-host installation never began. The five-second tick has a default one
+probe admission, active/reserved device cap two (including response/recurrence
+scripts without monitor IDs), and distributed queue concurrency one. Keep
+never-probed/oldest-first persisted history ordering, exact inherited policy
+admission, offline rejection, maintenance gates, and capacity rechecks. See the
+capacity guide for durable response reservations, suppressed-alert compare-and-set,
+the final active-work recount, and rollout checks.
+
+## Script monitor evidence availability (2026-10-23)
+
+Script monitors return `dataAvailable: false` when no probe exists, evidence is
+stale, the probe is still running, or execution failed without a verdict. These
+states must remain unknown rather than silently clear an episode or report OK.
+Preserve the focused handler and episode-service tests during upstream intake.
+Routine probe sweeps still defer under the capacity guard; this correction does
+not bypass that guard or dispatch a fleet-wide installation.
+
 ## Capacity and fleet-update safeguards (2026-10-16)
+
+Microsoft directory snapshot candidates now require a pending explicit refresh;
+remove neither that predicate nor its idle/requested-sweep regression coverage
+in `cloudCommandM365SnapshotWorker.test.ts`. Enabled connections and stale cache
+age alone must not trigger Exchange mailbox/statistics collection. Cached reads
+and explicitly requested refreshes retain their existing tenant/lease checks.
+Production also retains a Redis-persisted global concurrency of one for the
+`alert-evaluation` queue; preserve/restore that operational budget when replacing
+Redis. See the capacity guide for monitoring and recovery boundaries.
+
+The October 23 Exchange correction bounds `scripts/cloudcom/exchange-worker.py`
+to one active command and three retained tenant sessions, autonomously reaps
+60-second idle sessions, enforces hard response deadlines, and terminates
+process groups on retirement. SIGTERM drains the bounded active command.
+Preserve the Exchange overlay's quarter-core CPU budget, reduced CPU share and
+60-second stop grace during upstream intakes. The feature Compose regression
+test checks these budgets survive artifact mount updates. No dependency, schema,
+API, browser-extension or endpoint release is required for this worker change.
+Rollback the worker file with its verified predecessor while retaining the CPU
+containment; do not restore unrelated older Compose/database limits. Focused
+broker tests cover busy rejection, cursor-safe pool saturation, idle cleanup,
+active-command protection, timeout behavior and shutdown. See the operational
+capacity guide for the inventory-continuation and unknown-write-outcome limits.
+
+The October 21 operational correction adjusts the private PostgreSQL container
+memory budget without changing the application, PostgreSQL tuning or pool size.
+Preserve the approved database memory/swap limits when generating deployment
+configuration or restoring historical Compose backups. Host memory and a zero
+container restart count do not rule out database cgroup OOM recovery. Verification
+must include cgroup counter deltas and PostgreSQL recovery history; see the
+database memory guidance in [capacity safeguards](operations/cloudcom-capacity-safeguards.md).
 
 The October 18 correction gives rate-limited agent updates a separate sustained
 capacity window (`agentUpdateCapacity.ts`, integrated by `capacityGuard.ts`).
@@ -30,7 +147,8 @@ Command delivery, development push and automatic edition migration share the
 same admission lane. Deferred commands stay pending without a false execution
 timeout; their normal delivery expiry remains bounded.
 
-Routine script monitors and scheduled Harmony refresh defer at safe boundaries.
+Heavy collectors such as scheduled Harmony refresh defer at safe boundaries.
+Small script monitor probes use the separate bounded current-pressure lane above.
 Readiness retains raw dependency single-flight ownership after response deadlines
 so monitoring cannot accumulate work in an exhausted pool. Operations health
 reports protection state and limits. Feature flags default off outside configured
@@ -50,6 +168,79 @@ changes update offers, command delivery, readiness or worker scheduling.
 - Never put server addresses, secrets, signing keys, or internal domain mappings in this public guide.
 
 ## Change register
+
+### Portal managed viewer download (2026-10-19)
+
+`RemoteComputersPage.tsx` offers authenticated staff and customer accounts the
+same managed Windows x64 viewer installer; `RemoteComputerDirectory.tsx` labels
+its browser action **Web Remote**. The versioned MSI link is independent of the
+selected computer and is the viewer installer, not the unattended host package.
+Normal managed sign-in and device authorization still apply after installation.
+
+Deployment must provide the verified release MSI through a persistent read-only
+mount at `apps/web/dist/client/downloads/managed-viewer`. Preserve this mount
+when rebuilding or replacing web artifacts; the binary stays outside Git. Bump
+the UI URL and download filename together with the published installer version.
+The directory's staff/customer tests cover the link and renamed action. Verify
+the served installer SHA-256 against the accepted viewer release before rollout.
+No API, database, native payload, or endpoint update is required. Revert the web
+artifact and its download mount together if rolling back this feature.
+
+### Shared browser/native remote directory (2026-10-19)
+
+The customer portal's `/portal/remote` landing redirects to the standalone web
+directory `/remote/computers`. Both browser and native sign-in use
+`remoteAccount.ts`: verified staff authority takes precedence; a verified
+Cloudflare staff assertion selects normal staff SSO with browser-binding
+bootstrap. A portal cookie or matching email never grants staff authority.
+Transient/denied staff checks must not downgrade to a cached customer account.
+The read-only `remoteIdentity` query on the existing CF login route discloses
+only the account kind after assertion verification, without issuing a session.
+
+`staffRemoteDirectory.ts` supplies both native and browser staff lists, applying
+fresh partner/org/site permissions before pagination and retaining the existing
+RLS context. Rename uses the same permission-checked service and audit trail.
+Customers use the existing shared native/browser assignment list; device/user
+metadata is additive and rename stays disabled. Each connection still performs
+the original live authorization. Transport readiness may differ. Existing
+customer session URLs, CSRF checks and company-gateway requirements remain.
+
+The browser directory mirrors search, organization collapse, aliases and user
+history. Staff desktop launch validates the managed app URL; customer desktop
+launch gives existing-app instructions (no new customer deep-link protocol).
+No schema, endpoint agent, native MSI, or store change is required. Roll back the
+API/web/portal artifacts together. Implemented and focused tests passing;
+deployment acceptance is recorded separately in private release evidence.
+
+Regression surface: staff/customer directory parity, revoked org/site access,
+account selection and binding preparation, pagination, safe launch URLs, CSRF,
+existing consent protocol 1/2, portal redirect and customer session guards.
+
+### Managed RustDesk viewer directory (2026-10-19)
+
+The separate Flutter viewer now searches hostnames, custom names, organizations,
+and current/previous users, with organization sections keyed by ID. It saves
+only the existing Breeze `displayName`; OS hostnames are unaffected. Preserve
+the `deviceIdentity.ts` projection's heartbeat freshness and device+org-scoped
+session history. The staff-native device directory includes identity metadata
+and a rename capability hint; actual rename authorization is freshly checked
+by `staffNativeDirectory.ts` for devices.write, partner ownership, active tenant
+and permitted organization, under the existing native-bearer/RLS/IP boundaries.
+The alias endpoint uses a strict schema and records an audit event. Native
+connection admission, credential scope and customer permissions are unchanged.
+
+No schema migration or endpoint-agent change is required. API fields are
+additive; old viewers continue to work. Updating technician viewer installations
+requires the native MSI. Tests cover permissions/revocation, tenant denial,
+payload validation, metadata, audit, search/collapse/rename and existing login,
+admission and presence paths. The mistaken earlier Breeze/Companion UI edits
+were removed; do not reintroduce them during upstream reconciliation.
+
+Regression surface: API `routes/staffNative.ts` extends only the managed staff
+directory and adds the alias route; the separate viewer's `account_page.dart`
+embeds the directory and coordinates rename, and `native_login.dart` adds its
+authorized request. Existing native connection engine/runner bytes are preserved
+in viewer 1.0.6. Keep all older uncommitted RustDesk fixes when integrating.
 
 ### LanternOps v0.123.0 intake (2026-10-17)
 
@@ -846,3 +1037,69 @@ filtering and sorting remain available. This is a development-extension UI
 change only and requires no API deployment or store version change.
 
 IP Scan compact header adjustment: 28px toolbar, 26px borderless field selectors, arrow-only sort buttons with accessible labels, tighter rows; existing eight UI tests pass. Development package rebuilt, store unchanged.
+
+### Managed native direct transport qualification (2026-10-23)
+
+Preserve the Oct13 server fleet UDP mode (`CLOUDCOM_UDP_TARGETS=*`) and absence
+of forced-relay override. A requested managed UDP probe must not be suppressed
+solely by the older TCP NAT classification. The native host69 mediator/helper
+change is based on approved68 source1cf9f803; do not replace it with a different
+working tree's unrelated native changes. Explicit relay/proxy policy, native
+admission, peer/key binding, bounded punch slots/deadlines and relay consent stay.
+
+Host69 is qualified by VM security/policy/wire tests, exact MSI extraction,
+68-to69 upgrade/68 rollback/69 reupgrade and real secure direct/frame acceptance
+inside OS-TEST. SERURE-DC and SERURE-APP have been upgraded with identities
+preserved; their WAN direct desktop acceptance is still unresolved. Both now
+perform UDP punching but receive no probe replies. The same OS-TEST runner
+connects directly to BBD-DC, so do not call host installation health proof of
+WAN traversal or repeatedly restart/reinstall endpoints to mask this symptom.
+A bounded viewer port-discovery candidate remains VM-only and is not a release.
+
+Keep immutable68/69 MSI download paths and old stable68 bytes while queued68
+scripts still require that checksum. Saved default Probe/Repair version2 accepts
+both reviewed payload pairs and requires effective TCP plus UDP firewall rules.
+A separate, reviewed69 default-installer promotion is prepared but not applied.
+The strict MSI upgrade tool preserves native identity, routing/enrollment and
+installer ownership; a busy or timed-out installer cannot trigger a concurrent
+rollback. Unknown or stock RustDesk payloads remain manual review.
+
+### Core workload admission (2026-10-27, candidate)
+
+Preserve policyEvaluationWorker capacity admission before transactions, single
+worker concurrency, due-policy read/Redis separation, and existing afterCommit
+ordering. Preserve monitorWorkAdmission: bounded concurrency, pressure admission
+for new checks, received-result bypass, retained explicit jobs and coalesced repeat
+ticks. Bounded aggregate workload logs must never change job outcomes. See
+operations/cloudcom-capacity-safeguards.md. Local validation was authorized: 134 focused tests plus exact-candidate smoke checks passed. Deployment activation is recorded separately.
+
+### UniFi disconnected-agent retry loop (2026-10-27)
+Preserve agentAdmission's bounded configuration GET lane and downstream auth/RLS;
+UniFi telemetry stays bulk. Preserve collector error backoff/Retry-After and
+warning suppression without suppressing genuine assignment responses. Tests:
+agentAdmission.test.ts, unifiTelemetry.test.ts, agent/internal/unifi package.
+Server middleware17tests and existingroute23tests passed. Existing unrelated
+routeclassification suite has5failures from3unclassifiednative/PAM routes; those
+routes remain unchanged. Agent binary promotion is separate from API activation.
+
+## Managed viewer UDP defaults — 2026-10-29
+Viewer 1.0.7 adds ManagedViewerDefaults.cs to the launcher build. After payload
+verification and before launch/URI handoff, the interactive user's missing
+options.enable-udp-punch defaults to Y. Explicit values (including N), relay
+preferences, other sections and session data remain unchanged. Writes use a
+same-directory atomic replacement with backup; --verify is side-effect free.
+Run ManagedViewerDefaults.test.cs with the helper using the .NET Framework C#
+compiler. Tests cover empty/existing/deleted profiles, idempotence, scoped keys,
+explicit opt-out, relay preservation, and backup. Do not move this to an elevated
+MSI action: SYSTEM's profile does not configure the interactive viewer.
+RemoteComputersPage and its expectations now reference viewer 1.0.7. No endpoint
+agent, native transport/auth engine or database migration. Existing viewer users
+must install the new MSI; this change is not a background fleet update.
+Release evidence and package validation are recorded in the control-plane
+viewer-1.0.7 directory. Portal component tests were attempted but blocked by this
+host's Vitest setup-module resolution; no claim that those tests passed.
+
+
+## Dedicated Linux Actions worker (2026-10-29)
+
+The CloudCom workflows route trusted Linux jobs to `cloudcom-linux`, retain disposable pull-request workers, remove self-hosted package-install sudo, and bound native/candidate parallelism. Preserve the source/publication gates and the runner-routing regression in `scripts/cloudcom/runner-routing.test.mjs` during upstream imports. The externally provisioned job-start event gate is required because PR-controlled YAML can select runner labels; workflow routing alone does not isolate a public repository. Native platform signing remains separate. See [CI operations](cloudcom-ci.md) for prerequisites and trust boundaries. Rollback is the prior workflow revision; no application, endpoint or database change is involved.

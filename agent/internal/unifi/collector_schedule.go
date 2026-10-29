@@ -17,6 +17,9 @@ import (
 //     server's configUpdate says this device has collectors
 //     (unifi_collectors_assigned), so an assignment is picked up within about
 //     one heartbeat instead of one idle interval.
+//   - Fetch failures retain the last successful idle/assigned state and apply
+//     exponential, jittered backoff (up to 15 minutes). A 429/503 Retry-After
+//     is a bounded floor; heartbeat wakes cannot bypass that failure cooldown.
 //
 // Pickup bound for a new assignment on an agent that is idle:
 //   - server that sends the hint: next heartbeat (60 s), plus up to the API's

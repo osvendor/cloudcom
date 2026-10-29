@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
-import { healthRoutes, type HealthAuth } from './health';
+import { healthRoutes, type HealthAuth, type AlertWorkload } from './health';
 import { createRoutes } from './index';
 
 const admin: HealthAuth = { user: { id: 'operator', isPlatformAdmin: true }, scope: 'system', principal: { kind: 'user_session' } };
@@ -34,5 +34,23 @@ describe('operations health authorization', () => {
   it('never returns raw collection failures', async () => {
     const h = harness(); h.read.mockRejectedValue(new Error('secret database host'));
     const response = await h.app.request('/health'); expect(response.status).toBe(503); expect(await response.text()).not.toContain('secret');
+  });
+  it('returns optional process-local workload measurements only through the existing administrator gate', async () => {
+    const h = harness();
+    const alertWorkload: AlertWorkload = {
+      windowMs: 300_000, bucketMs: 5000, observedMs: 30_000,
+      groups: [{ group: 'network', label: 'Network', evaluations: 0, perMinute: 0,
+        totalMs: 0, averageMs: 0, maxMs: 0, errors: 0, queryCount: 0, dbElapsedMs: 0 }],
+    };
+    const snapshot = { checkedAt: new Date().toISOString(), targetEndpoints: 500, refreshSeconds: 30, enrolled: 25, cards: [], alertWorkload };
+    h.read.mockResolvedValue(snapshot);
+    const response = await h.app.request('/health');
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect((await response.json()).alertWorkload).toEqual(alertWorkload);
+    const restricted = harness({ ...admin, scope: 'organization' });
+    restricted.read.mockResolvedValue(snapshot);
+    expect((await restricted.app.request('/health')).status).toBe(403);
+    expect(restricted.read).not.toHaveBeenCalled();
   });
 });

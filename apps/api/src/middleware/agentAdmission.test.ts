@@ -13,7 +13,7 @@ import { metricsMiddleware } from '../routes/metrics';
 import { metricsRegistry } from '../services/metricsRegistry';
 import type { AdmissionDecision, AdmissionGate } from '../services/admission/admissionRuntime';
 import type { ClassifiedRequest } from '../services/admission/agentRouteClasses';
-import { agentAdmission } from './agentAdmission';
+import { agentAdmission, createUnifiConfigBudget } from './agentAdmission';
 import { requestPathLogger } from './requestPathLogger';
 
 const AGENT = 'a'.repeat(64);
@@ -37,6 +37,100 @@ beforeEach(() => {
 });
 
 describe('agentAdmission', () => {
+  it('allows a bounded UniFi configuration read to reach authentication despite pressure', async () => {
+    const { gate, seen } = stubGate(shed);
+    const app = new Hono();
+    app.use('*', agentAdmission(() => gate, createUnifiConfigBudget(() => 0)));
+    app.route('/api/v1/agents', agentRoutes);
+    authSpy.mockImplementation(async (c: { json: (body: unknown, status: number) => Response }) => c.json({ error: 'Unauthorized' }, 401));
+    const res = await app.request(`/api/v1/agents/${AGENT}/unifi-collectors`);
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: 'Unauthorized' });
+    expect(authSpy).toHaveBeenCalledOnce();
+    expect(seen).toEqual([]); // no false bulk-shed counter for an admitted read
+  });
+
+  it('preserves assigned configurations and never invents an empty response', async () => {
+    const app = new Hono();
+    app.use('*', agentAdmission(() => stubGate(shed).gate, createUnifiConfigBudget(() => 0)));
+    app.get('/api/v1/agents/:id/unifi-collectors', c => c.json({ collectors: [{ id: 'existing-assignment' }] }));
+    const res = await app.request(`/api/v1/agents/${AGENT}/unifi-collectors`);
+    expect(await res.json()).toEqual({ collectors: [{ id: 'existing-assignment' }] });
+  });
+
+  it('bounds UniFi config starts across devices and releases the slot after a handler error', async () => {
+    let now = 0;
+    const app = new Hono();
+    const calls = vi.fn();
+    app.use('*', agentAdmission(() => stubGate(shed).gate, createUnifiConfigBudget(() => now)));
+    app.get('/api/v1/agents/:id/unifi-collectors', () => { calls(); throw new Error('lookup failed'); });
+    app.onError((_e, c) => c.text('failed', 500));
+    expect((await app.request(`/api/v1/agents/${AGENT}/unifi-collectors`)).status).toBe(500);
+    now = 999;
+    const refused = await app.request(`/api/v1/agents/${'b'.repeat(64)}/unifi-collectors`);
+    expect(refused.status).toBe(503);
+    expect(refused.headers.get('retry-after')).toBe('30');
+    expect(refused.headers.get('cache-control')).toBe('no-store');
+    expect(calls).toHaveBeenCalledOnce();
+    now = 1000;
+    expect((await app.request(`/api/v1/agents/${AGENT}/unifi-collectors`)).status).toBe(500);
+    expect(calls).toHaveBeenCalledTimes(2);
+  });
+
+  it('never permits more than one config request in flight, even after rate recovery', () => {
+    let now = 0;
+    const acquire = createUnifiConfigBudget(() => now);
+    const release = acquire()!;
+    now = 5000;
+    expect(acquire()).toBeNull();
+    release();
+    const second = acquire();
+    expect(second).toBeTypeOf('function');
+    release(); // old release cannot free the newer request
+    now = 10000;
+    expect(acquire()).toBeNull();
+    second!();
+    expect(acquire()).toBeTypeOf('function');
+  });
+
+  it('does not extend the config recovery lane to telemetry or other methods', async () => {
+    const acquire = vi.fn(() => null);
+    const { gate, seen } = stubGate(shed);
+    const app = new Hono();
+    app.use('*', agentAdmission(() => gate, acquire));
+    app.all('*', c => c.text('unclassified', 404));
+    expect((await app.request(`/api/v1/agents/${AGENT}/unifi-telemetry`, { method: 'POST' })).status).toBe(503);
+    expect((await app.request(`/api/v1/agents/${AGENT}/unifi-collectors`, { method: 'POST' })).status).toBe(404);
+    expect(acquire).not.toHaveBeenCalled();
+    expect(seen.map(x => x.req.key)).toEqual(['POST /:id/unifi-telemetry']);
+  });
+
+  it.each(['off', 'observe'] as const)('keeps %s mode semantics for config reads', async mode => {
+    const acquire = vi.fn(() => null);
+    const { gate, seen } = stubGate(() => ({ action: 'admit' }), mode);
+    const app = new Hono();
+    app.use('*', agentAdmission(() => gate, acquire));
+    app.get('/api/v1/agents/:id/unifi-collectors', c => c.json({ collectors: [] }));
+    expect((await app.request(`/api/v1/agents/${AGENT}/unifi-collectors`)).status).toBe(200);
+    expect(acquire).not.toHaveBeenCalled();
+    expect(seen).toHaveLength(mode === 'observe' ? 1 : 0);
+  });
+
+  it('labels budget refusals truthfully without using device IDs as metric labels', async () => {
+    const print = vi.fn();
+    const app = new Hono();
+    app.use('*', metricsMiddleware);
+    app.use('*', requestPathLogger(print));
+    app.use('*', agentAdmission(() => stubGate(shed).gate, () => null));
+    const res = await app.request(`/api/v1/agents/${AGENT}/unifi-collectors`);
+    expect(res.status).toBe(503);
+    const { values } = await metricsRegistry.getSingleMetric('http_requests_total')!.get();
+    expect(values).toContainEqual(expect.objectContaining({
+      labels: { method: 'GET', route: '/api/v1/agents/:id/unifi-collectors', status_class: '5xx' }, value: 1,
+    }));
+    expect(print.mock.calls.flat().join('\n')).toContain('route=/api/v1/agents/:id/unifi-collectors status=503 reason=admission_unifi_config_budget');
+  });
+
   it('refuses before agent auth runs — so before its DB transaction and any body read', async () => {
     const { gate, seen } = stubGate(shed);
     const app = new Hono();

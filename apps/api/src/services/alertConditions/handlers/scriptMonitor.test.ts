@@ -168,6 +168,7 @@ describe('scriptMonitorHandler', () => {
 
     expect(result.passed).toBe(false);
     expect(result.description).toMatch(/did not complete/i);
+    expect(result.dataAvailable).toBe(false);
   });
 
   it('status "failed" does not breach', async () => {
@@ -177,6 +178,7 @@ describe('scriptMonitorHandler', () => {
 
     expect(result.passed).toBe(false);
     expect(result.description).toMatch(/did not complete/i);
+    expect(result.dataAvailable).toBe(false);
   });
 
   it('no row at all: no recent probe result, not a breach', async () => {
@@ -186,6 +188,7 @@ describe('scriptMonitorHandler', () => {
 
     expect(result.passed).toBe(false);
     expect(result.description).toBe('No recent probe result');
+    expect(result.dataAvailable).toBe(false);
   });
 
   it('stale probe (older than 3x intervalMinutes) never latches a breach', async () => {
@@ -201,6 +204,7 @@ describe('scriptMonitorHandler', () => {
 
     expect(result.passed).toBe(false);
     expect(result.description).toBe('No recent probe result');
+    expect(result.dataAvailable).toBe(false);
   });
 
   it('a fresh probe within the staleness window still evaluates normally', async () => {
@@ -218,6 +222,19 @@ describe('scriptMonitorHandler', () => {
     expect(result.description).toBe('still fresh enough');
   });
 
+  it.each(['pending', 'queued', 'running', 'cancelling', 'cancelled'])('status %s reports unknown rather than healthy', async (status) => {
+    setRows([makeExecution({ status, exitCode: null, completedAt: null })]);
+    expect(await scriptMonitorHandler.evaluate(condition(), DEVICE_ID)).toMatchObject({
+      passed: false, dataAvailable: false,
+    });
+  });
+
+  it.each(['ok', 'breach'])('completed marker %s remains available evidence', async (state) => {
+    setRows([makeExecution({ stdout: `::breeze:monitor:: {"state":"${state}"}` })]);
+    const result = await scriptMonitorHandler.evaluate(condition(), DEVICE_ID);
+    expect(result.dataAvailable).not.toBe(false);
+    expect(result.passed).toBe(state === 'breach');
+  });
   describe('validate', () => {
     it('rejects a missing monitorId', () => {
       const errors = scriptMonitorHandler.validate({ intervalMinutes: 60 }, 'c');

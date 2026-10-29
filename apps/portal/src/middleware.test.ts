@@ -75,7 +75,6 @@ describe('portal middleware — disabled account guard', () => {
     '/profile',
     '/quotes',
     '/quotes/7',
-    '/remote',
     '/remote/123'
   ];
 
@@ -107,12 +106,18 @@ describe('portal middleware — disabled account guard', () => {
     expect(response.status).toBe(200);
   });
 
-  it.each(['/remote', '/remote/123', '/profile'])('keeps remote-only customers on %s', async path => {
+  it.each(['/remote/123', '/profile'])('keeps remote-only customers on %s', async path => {
     vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => Promise.resolve(
       new Response(JSON.stringify(String(url).includes('/profile')
         ? { user: { accessMode: 'remote_only' } } : { name: 'Acme' }), { status: 200 })
     )));
     expect((await run(contextFor(path, { signedIn: true }))).status).toBe(200);
+  });
+  it.each([true, false])('routes the directory to shared identity selection (portal cookie: %s)', async signedIn => {
+    const response = await run(contextFor('/remote', { signedIn }));
+    expect(response.status).toBe(302);
+    expect(response.headers.get('Location')).toBe('/remote/computers');
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
   });
 
   it('redirects remote-only customers away from the ordinary portal', async () => {

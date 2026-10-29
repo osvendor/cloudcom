@@ -34,6 +34,9 @@ internal static class ManagedViewerLauncher
                 }
             }
             if (verifyOnly) return 0;
+            ManagedViewerDefaults.EnsureUdpDefault(Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "RustDesk", "config", "RustDesk_local.toml"));
             string exe = Path.Combine(root, "rustdesk.exe");
             foreach (var process in Process.GetProcessesByName("rustdesk")) {
                 string path = null;

@@ -26,14 +26,18 @@ function Test-CloudComRustDeskFirewall {
     $rules = @(Get-NetFirewallApplicationFilter -PolicyStore ActiveStore -ErrorAction Stop |
         Where-Object { $_.Program -ieq $Executable } | Get-NetFirewallRule |
         Where-Object { $_.Enabled -eq 'True' -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow' -and $_.Profile -eq 'Any' })
+    $tcp = $false; $udp = $false
     foreach ($rule in $rules) {
         $address = $rule | Get-NetFirewallAddressFilter
         $port = $rule | Get-NetFirewallPortFilter
         if (@($address.RemoteAddress).Count -eq 1 -and @($address.RemoteAddress)[0] -in @('Any','LocalSubnet') -and
-            @($address.LocalAddress) -contains 'Any' -and $port.Protocol -in @('Any','TCP','6') -and
-            @($port.LocalPort) -contains 'Any' -and @($port.RemotePort) -contains 'Any') { return $true }
+            @($address.LocalAddress) -contains 'Any' -and $port.Protocol -in @('Any','TCP','6','UDP','17') -and
+            @($port.LocalPort) -contains 'Any' -and @($port.RemotePort) -contains 'Any') {
+            if ($port.Protocol -in @('Any','TCP','6')) { $tcp = $true }
+            if ($port.Protocol -in @('Any','UDP','17')) { $udp = $true }
+        }
     }
-    return $false
+    return ($tcp -and $udp)
 }
 
 function Test-CloudComPrivatePath {

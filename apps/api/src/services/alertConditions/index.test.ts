@@ -73,6 +73,42 @@ describe('evaluateConditions context.actualValue (issue #1980)', () => {
     expect(result.context.actualValue).toBeCloseTo(92.33, 1);
     // Must not be the latest sub-threshold sample.
     expect(result.context.actualValue).not.toBe(88);
+    expect(getLatestMetricMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the latest raw sample fallback when a recognized metric window is empty', async () => {
+    getRecentMetricsMock.mockResolvedValue([]);
+    getLatestMetricMock.mockResolvedValue({ cpuPercent: 42 });
+    const result = await evaluateConditions({ type: 'metric', metric: 'cpu', operator: 'gt', value: 90 }, 'device-1');
+    expect(result.triggered).toBe(false);
+    expect(result.dataState).toBe('unknown');
+    expect(result.context.actualValue).toBe(42);
+    expect(getLatestMetricMock).toHaveBeenCalledExactlyOnceWith('device-1');
+  });
+
+  it('preserves a missing fallback row as undefined rather than fabricating a value', async () => {
+    getRecentMetricsMock.mockResolvedValue([]);
+    getLatestMetricMock.mockResolvedValue(null);
+    const result = await evaluateConditions({ type: 'metric', metric: 'cpu', operator: 'gt', value: 90 }, 'device-1');
+    expect(result.context.actualValue).toBeUndefined();
+    expect(result.dataState).toBe('unknown');
+    expect(getLatestMetricMock).toHaveBeenCalledExactlyOnceWith('device-1');
+  });
+
+  it('does not read raw metrics for an unrecognized metric name', async () => {
+    const result = await evaluateConditions({ type: 'metric', metric: 'not-a-metric', operator: 'gt', value: 90 }, 'device-1');
+    expect(result.context.actualValue).toBeUndefined();
+    expect(result.dataState).toBe('unknown');
+    expect(getLatestMetricMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps an evaluated zero without falling back to a raw sample', async () => {
+    getRecentMetricsMock.mockResolvedValue([{ cpuPercent: 0 }]);
+    getLatestMetricMock.mockResolvedValue({ cpuPercent: 99 });
+    const result = await evaluateConditions({ type: 'metric', metric: 'cpu', operator: 'gt', value: 90 }, 'device-1');
+    expect(result.context.actualValue).toBe(0);
+    expect(result.triggered).toBe(false);
+    expect(getLatestMetricMock).not.toHaveBeenCalled();
   });
 });
 
@@ -278,6 +314,7 @@ describe('evaluateConditions context for non-threshold kinds (issue #6932)', () 
     expect(result.context.actualValue).toBe(50);
     expect(result.context.threshold).toBe(80);
     expect(result.context.operator).toBe('<');
+    expect(getLatestMetricMock).not.toHaveBeenCalled();
 
     const title = interpolateAlertTemplate(patchComplianceKind.titleTemplate, {
       ...result.context,

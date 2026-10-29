@@ -1,0 +1,19 @@
+---
+import '../../styles/globals.css';
+import RemoteComputersPage from '../../components/remote/RemoteComputersPage';
+Astro.response.headers.set('Cache-Control', 'no-store');
+Astro.response.headers.set('Referrer-Policy', 'no-referrer');
+Astro.response.headers.set('X-Robots-Tag', 'noindex, nofollow');
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Remote Access</title>
+    <script is:inline src="/theme-bootstrap.js"></script>
+  </head>
+  <body class="min-h-screen bg-background text-foreground antialiased">
+    <RemoteComputersPage client:only="react" />
+  </body>
+</html>

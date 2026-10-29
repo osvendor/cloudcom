@@ -29,6 +29,7 @@ import {
   resolveAllBackupAssignedDevices,
 } from './featureConfigResolver';
 import { db, getCurrentDbAccessContext, runOutsideDbContext, withSystemDbAccessContext } from '../db';
+import type { DeviceHierarchy } from './deviceHierarchy';
 import {
   configPolicyEffectiveFeatureLinks,
   configPolicyFeatureLinks,
@@ -89,6 +90,33 @@ const DEVICE = {
 function queueHierarchy(...rowSets: unknown[][]) {
   queue([DEVICE], [{ partnerId: 'ptr-1' }], [], ...rowSets);
 }
+
+describe('maintenance uses evaluation-scoped hierarchy', () => {
+  const hierarchy: DeviceHierarchy = {
+    deviceId: 'dev-1', orgId: 'org-1', siteId: 'site-1', deviceRole: 'workstation',
+    osType: 'windows', org: { partnerId: 'ptr-1', type: 'customer' }, site: null,
+    groupIds: ['group-1'],
+  };
+
+  it('preserves settings and effective-link lookup with one read instead of four', async () => {
+    const settings = { id: 'maint-1', timezone: 'UTC', suppressAlerts: true };
+    const rows = [{ maintenanceSettings: settings, assignmentLevel: 'organization', assignmentPriority: 0,
+      assignmentCreatedAt: new Date('2026-01-01'), assignmentId: 'assign-1' }];
+    queueHierarchy(rows);
+    const legacy = await resolveMaintenanceConfigForDevice('dev-1');
+    expect(db.select).toHaveBeenCalledTimes(4);
+    vi.mocked(db.select).mockClear();
+    queue(rows);
+    expect(await resolveMaintenanceConfigForDevice('dev-1', { hierarchy })).toEqual(legacy);
+    expect(db.select).toHaveBeenCalledTimes(1);
+    expect(rec.joined).toContain(configPolicyEffectiveFeatureLinks);
+  });
+
+  it('rejects a hierarchy for another device without querying', async () => {
+    await expect(resolveMaintenanceConfigForDevice('dev-2', { hierarchy })).rejects.toThrow('was passed to a resolver');
+    expect(db.select).not.toHaveBeenCalled();
+  });
+});
 
 // Some resolvers issue follow-up queries (timezone lookups, settings joins)
 // after the one under test. Queue spare empty chains so an extra call cannot

@@ -4,11 +4,12 @@
  * Schedules and runs policy evaluations based on checkIntervalMinutes.
  */
 
-import { Job, Queue, Worker } from 'bullmq';
+import { DelayedError, Job, Queue, Worker } from 'bullmq';
 import { and, eq } from 'drizzle-orm';
 import * as dbModule from '../db';
 import { automationPolicies } from '../db/schema';
 import { getBullMQConnection } from '../services/redis';
+import { canRunBackgroundWork } from '../services/capacityGuard';
 import { attachWorkerObservability } from './workerObservability';
 import { evaluatePolicy, scanAndEvaluateConfigPolicyCompliance } from '../services/policyEvaluationService';
 import type { ComplianceAlertReconcileResult } from '../services/complianceAlertReconcile';
@@ -93,10 +94,11 @@ export function getPolicyEvaluationQueue(): Queue<PolicyEvaluationJobData> {
 
 async function processScanDuePolicies(): Promise<{ queued: number }> {
   const nowMs = Date.now();
-  const policies = await db
+  // Release the database transaction before waiting on Redis below.
+  const policies = await runWithSystemDbAccess(() => db
     .select()
     .from(automationPolicies)
-    .where(eq(automationPolicies.enabled, true));
+    .where(eq(automationPolicies.enabled, true)));
 
   const duePolicies = policies.filter((policy) => isPolicyDue(policy, nowMs));
 
@@ -281,32 +283,82 @@ export const __processConfigPolicyComplianceScan = processConfigPolicyCompliance
 /** Test-only: the `evaluate-policy` job body, driven against real Postgres. */
 export const __processEvaluatePolicy = processEvaluatePolicy;
 
+// Fixed job-type keys only. Aggregate once a minute, rather than logging each
+// device or retry; elapsed time is wall time, not CPU or database execution time.
+const policyWorkload = new Map<PolicyEvaluationJobData['type'], {
+  completed: number; failed: number; deferred: number;
+  elapsedMs: number; maxElapsedMs: number; devicesEvaluated: number;
+}>();
+let policyWorkloadLastLogAt = Date.now();
+function recordPolicyWorkload(
+  type: PolicyEvaluationJobData['type'], outcome: 'completed' | 'failed' | 'deferred',
+  elapsedMs: number, devicesEvaluated = 0,
+): void {
+  const counters = policyWorkload.get(type) ?? {
+    completed: 0, failed: 0, deferred: 0, elapsedMs: 0, maxElapsedMs: 0, devicesEvaluated: 0,
+  };
+  counters[outcome] += 1;
+  counters.elapsedMs += elapsedMs;
+  counters.maxElapsedMs = Math.max(counters.maxElapsedMs, elapsedMs);
+  counters.devicesEvaluated += devicesEvaluated;
+  policyWorkload.set(type, counters);
+  const now = Date.now();
+  if (now - policyWorkloadLastLogAt < 60_000) return;
+  try {
+    console.info('[PolicyEvaluationWorker] Workload', {
+      windowMs: now - policyWorkloadLastLogAt, jobs: Object.fromEntries(policyWorkload),
+    });
+  } catch { /* Diagnostic logging must not change a committed job's outcome. */ }
+  policyWorkload.clear();
+  policyWorkloadLastLogAt = now;
+}
+
+async function processPolicyEvaluationJob(job: Job<PolicyEvaluationJobData>): Promise<object> {
+  const { data } = job;
+  if (data.type === 'scan-due-policies') return processScanDuePolicies();
+  // Both evaluations own their transaction and publish only after commit.
+  if (data.type === 'scan-config-policy-compliance') return processConfigPolicyComplianceScan();
+  if (data.type === 'reconcile-compliance-alerts') return processReconcileComplianceAlerts(data);
+  return processEvaluatePolicy(data.policyId);
+}
+
 export function createPolicyEvaluationWorker(): Worker<PolicyEvaluationJobData> {
   return new Worker<PolicyEvaluationJobData>(
     POLICY_EVALUATION_QUEUE,
-    async (job: Job<PolicyEvaluationJobData>) => {
-      const { data } = job;
-      if (data.type === 'scan-due-policies') {
-        return runWithSystemDbAccess(() => processScanDuePolicies());
+    async (job: Job<PolicyEvaluationJobData>, token?: string) => {
+      const startedAt = performance.now();
+      let outcome: 'completed' | 'failed' | 'deferred' = 'failed';
+      let devicesEvaluated = 0;
+      try {
+        // Admission happens before any DB context. An already-started evaluation
+        // commits and publishes afterCommit work even if pressure later changes.
+        if (!canRunBackgroundWork()) {
+          // A recurring scan has its next scheduled tick already. Retaining each
+          // missed tick would build a catch-up storm; explicit work is retained.
+          if (job.opts?.repeat && (job.data.type === 'scan-due-policies'
+            || job.data.type === 'scan-config-policy-compliance'
+            || (job.data.type === 'reconcile-compliance-alerts' && !reconcileScopeOf(job.data)))) {
+            outcome = 'deferred';
+            return { deferredForCapacity: true };
+          }
+          if (!token) throw new Error('Policy capacity deferral requires a worker lock token');
+          await job.moveToDelayed(Date.now() + 60_000, token);
+          outcome = 'deferred';
+          throw new DelayedError();
+        }
+        const result = await processPolicyEvaluationJob(job);
+        if ('devicesEvaluated' in result && typeof result.devicesEvaluated === 'number') {
+          devicesEvaluated = result.devicesEvaluated;
+        }
+        outcome = 'completed';
+        return result;
+      } finally {
+        recordPolicyWorkload(job.data.type, outcome, Math.round(performance.now() - startedAt), devicesEvaluated);
       }
-
-      // #7347 — both evaluations own their transaction (commitThenEnqueue) and
-      // enqueue remediation runs only after it commits, so they run with NO
-      // ambient context here: wrapped in a worker transaction, theirs would
-      // join it and the enqueue would again precede the commit.
-      if (data.type === 'scan-config-policy-compliance') {
-        return processConfigPolicyComplianceScan();
-      }
-
-      if (data.type === 'reconcile-compliance-alerts') {
-        return processReconcileComplianceAlerts(data);
-      }
-
-      return processEvaluatePolicy(data.policyId);
     },
     {
       connection: getBullMQConnection(),
-      concurrency: 3,
+      concurrency: 1,
       lockDuration: 300_000,
       stalledInterval: 60_000,
       maxStalledCount: 2,

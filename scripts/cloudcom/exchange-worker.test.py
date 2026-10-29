@@ -20,7 +20,7 @@ class FakeConnection:
     def getsockopt(self, *_args): return struct.pack('3i', 99, self.uid, 99)
 class FakeProcess:
     def __init__(self, line):
-        self.stdin = self; self.stdout = self; self.line = line; self.killed = False
+        self.stdin = self; self.stdout = self; self.line = line; self.killed = False; self.pid = 99999999
     def write(self, _value): pass
     def flush(self): pass
     def fileno(self): return 0
@@ -29,6 +29,16 @@ class FakeProcess:
     def wait(self, timeout=None): pass
 
 class ExchangeBrokerTests(unittest.TestCase):
+    def setUp(self):
+        # FakeProcess uses descriptor 0 only as an opaque identifier. Never
+        # change real stdin flags, write to it, or signal real process groups
+        # when these same contracts run under Linux.
+        for name, options in [('set_blocking', {}),
+                              ('write', {'side_effect': lambda _fd, data: len(data)}),
+                              ('killpg', {})]:
+            mocked = patch.object(worker.os, name, create=True, **options)
+            mocked.start(); self.addCleanup(mocked.stop)
+
     def test_quarantine_request_binding_and_write_classification(self):
         params = {'messageTraceId': REQUEST['organizationId'], 'recipient': 'qa@example.test', 'received': worker.datetime.datetime.now(worker.datetime.timezone.utc).isoformat()}
         identity = REQUEST['organizationId'] + '\\' + REQUEST['tenantId']
@@ -74,7 +84,7 @@ class ExchangeBrokerTests(unittest.TestCase):
     def test_failed_session_is_retired_without_replaying_request(self):
         result = {'requestId': REQUEST['requestId'], 'ok': False, 'code': 'provider_rejected'}
         process = FakeProcess(json.dumps(result).encode() + b'\n')
-        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([0], [], [])), patch.object(worker.os, 'read', return_value=process.line):
+        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([0], [0], [])), patch.object(worker.os, 'read', return_value=process.line):
             persistent = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1')
             directory = pathlib.Path(persistent.temp_directory.name)
             self.assertEqual(persistent.run(REQUEST)['code'], 'provider_rejected')
@@ -337,7 +347,7 @@ class ExchangeBrokerTests(unittest.TestCase):
     def test_mailbox_response_cannot_exceed_contract_bound(self):
         oversized = {'requestId': REQUEST['requestId'], 'ok': True, 'data': {'records': [{}] * 201, 'partial': True, 'collectedAt': '2026-09-22T00:00:00Z'}}
         process = FakeProcess(json.dumps(oversized).encode('utf-8') + b'\n')
-        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([0], [], [])), patch.object(worker.os, 'read', return_value=process.line):
+        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([0], [0], [])), patch.object(worker.os, 'read', return_value=process.line):
             result = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1').run(REQUEST)
         self.assertEqual(result['code'], 'response_too_large')
     def test_mailbox_continuation_is_bound_to_a_valid_snapshot_cursor(self):
@@ -356,11 +366,11 @@ class ExchangeBrokerTests(unittest.TestCase):
         second = {'requestId': second_request['requestId'], 'ok': True, 'data': {'records': [], 'partial': True, 'collectedAt': '2026-09-22T00:00:00Z'}}
         process = FakeProcess(b'')
         combined = (json.dumps(first) + '\n' + json.dumps(second) + '\n').encode('utf-8')
-        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([0], [], [])), patch.object(worker.os, 'read', return_value=combined):
+        with patch.object(worker.subprocess, 'Popen', return_value=process), patch.object(worker.select, 'select', return_value=([0], [0], [])), patch.object(worker.os, 'read', return_value=combined):
             persistent = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1')
             self.assertTrue(persistent.run(REQUEST)['ok'])
             self.assertTrue(persistent.run(second_request)['ok'])
-    def test_descriptor_rotation_waits_for_the_in_flight_worker(self):
+    def test_descriptor_rotation_rejects_excess_work_without_interrupting_active_request(self):
         entered, release, second_done = threading.Event(), threading.Event(), threading.Event()
         active = {REQUEST['tenantId']: DESCRIPTOR}
         class BlockingWorker:
@@ -377,9 +387,122 @@ class ExchangeBrokerTests(unittest.TestCase):
             first = threading.Thread(target=lambda: broker.execute(REQUEST)); first.start(); self.assertTrue(entered.wait(1))
             active[REQUEST['tenantId']] = rotated
             second = threading.Thread(target=lambda: (broker.execute(second_request), second_done.set())); second.start()
-            time.sleep(0.05); self.assertFalse(second_done.is_set())
+            self.assertTrue(second_done.wait(1))
+            self.assertFalse(broker.pool[REQUEST['tenantId']].closed)
             release.set(); first.join(1); second.join(1)
         self.assertTrue(second_done.is_set())
+    def test_global_admission_rejects_requests_before_launch(self):
+        broker = worker.Broker('/unused', '/unused.ps1')
+        broker.admission.acquire()
+        with patch.object(worker, 'PersistentPowerShell') as launch:
+            self.assertEqual(broker.execute(REQUEST)['code'], 'worker_busy')
+            launch.assert_not_called()
+        broker.admission.release()
+
+    def test_invalid_health_probe_stays_healthy_when_busy_or_stopping(self):
+        broker = worker.Broker('/unused', '/unused.ps1')
+        broker.admission.acquire()
+        with patch.object(worker, 'PersistentPowerShell') as launch, patch.object(worker, 'read_config') as config:
+            self.assertEqual(broker.execute({})['code'], 'invalid_request')
+            broker.stopping.set()
+            self.assertEqual(broker.execute({})['code'], 'invalid_request')
+            self.assertEqual(broker.execute({'requestId': 'invalid'})['code'], 'invalid_request')
+            launch.assert_not_called(); config.assert_not_called()
+        broker.admission.release()
+
+    def test_shutdown_refuses_new_requests_and_waits_for_active_session(self):
+        class Session:
+            def __init__(self): self.lock = threading.Lock(); self.closed = False
+            def close(self): self.closed = True
+        broker = worker.Broker('/unused', '/unused.ps1')
+        session = Session(); session.lock.acquire(); broker.pool['tenant'] = session
+        completed = threading.Event()
+        closer = threading.Thread(target=lambda: (broker.close(), completed.set()))
+        closer.start()
+        self.assertTrue(broker.stopping.wait(1))
+        self.assertEqual(broker.execute(REQUEST)['code'], 'worker_busy')
+        self.assertFalse(session.closed)
+        session.lock.release()
+        self.assertTrue(completed.wait(1)); closer.join(1)
+        self.assertTrue(session.closed)
+
+    def test_full_pool_preserves_recent_cursors_and_recycles_only_idle_sessions(self):
+        class Session:
+            def __init__(self, request, descriptor, script):
+                self.descriptor = descriptor; self.used = time.monotonic()
+                self.process = FakeProcess(b''); self.lock = threading.RLock(); self.closed = False
+            def close(self): self.closed = True
+            def run(self, request): return {'requestId': request['requestId'], 'ok': True}
+        broker = worker.Broker('/unused', '/unused.ps1')
+        other = {**REQUEST, 'tenantId': '55555555-5555-4555-8555-555555555555'}
+        other_descriptor = {**DESCRIPTOR, 'tenantId': other['tenantId']}
+        with patch.object(worker, 'read_config', return_value={REQUEST['tenantId']: DESCRIPTOR, other['tenantId']: other_descriptor}), patch.object(worker, 'PersistentPowerShell', Session):
+            self.assertTrue(broker.execute(REQUEST)['ok'])
+            previous = broker.pool[REQUEST['tenantId']]
+            broker.pool['second'] = Session(REQUEST, DESCRIPTOR, '')
+            broker.pool['third'] = Session(REQUEST, DESCRIPTOR, '')
+            self.assertEqual(broker.execute(other)['code'], 'worker_busy')
+            self.assertFalse(previous.closed)
+            self.assertEqual(len(broker.pool), worker.MAX_PERSISTENT_SESSIONS)
+            previous.used -= worker.IDLE_TIMEOUT_SECONDS + 1
+            self.assertTrue(broker.execute(other)['ok'])
+        self.assertTrue(previous.closed)
+        self.assertNotIn(REQUEST['tenantId'], broker.pool)
+        self.assertIn(other['tenantId'], broker.pool)
+        self.assertEqual(len(broker.pool), worker.MAX_PERSISTENT_SESSIONS)
+
+    def test_close_terminates_process_group_on_linux(self):
+        process = FakeProcess(b'')
+        with patch.object(worker.subprocess, 'Popen', return_value=process) as launch:
+            persistent = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1')
+        self.assertTrue(launch.call_args.kwargs['start_new_session'])
+        with patch.object(worker.os, 'name', 'posix'), patch.object(worker.signal, 'SIGKILL', 9, create=True), patch.object(worker.os, 'killpg', create=True) as kill_group:
+            persistent.close()
+        kill_group.assert_called_once_with(process.pid, 9)
+
+    def test_idle_sweep_closes_sessions_without_a_followup_request(self):
+        class IdleWorker:
+            used = 0
+            process = FakeProcess(b'')
+            def __init__(self): self.lock = threading.RLock(); self.closed = False
+            def close(self): self.closed = True
+        broker = worker.Broker('/unused', '/unused.ps1')
+        idle = IdleWorker(); broker.pool['tenant'] = idle
+        with patch.object(worker.time, 'monotonic', return_value=worker.IDLE_TIMEOUT_SECONDS + 1): broker.reap_idle()
+        self.assertTrue(idle.closed)
+        self.assertEqual(broker.pool, {})
+
+    def test_idle_sweep_does_not_interrupt_an_active_request(self):
+        class BusyWorker:
+            used = 0
+            process = FakeProcess(b'')
+            def __init__(self): self.lock = threading.Lock(); self.closed = False
+            def close(self): self.closed = True
+        broker = worker.Broker('/unused', '/unused.ps1')
+        busy = BusyWorker(); broker.pool['tenant'] = busy; busy.lock.acquire()
+        try: broker.reap_idle()
+        finally: busy.lock.release()
+        self.assertFalse(busy.closed)
+        broker.close()
+        self.assertTrue(busy.closed)
+
+    def test_continuous_stdout_cannot_extend_command_deadline(self):
+        process = FakeProcess(b'')
+        with patch.object(worker.subprocess, 'Popen', return_value=process):
+            persistent = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1')
+        with patch.object(worker.time, 'monotonic', side_effect=[0, worker.COMMAND_TIMEOUT_SECONDS + 1]):
+            self.assertEqual(persistent.run(REQUEST)['code'], 'provider_unreachable')
+        self.assertTrue(process.killed)
+
+    def test_pipe_backpressure_uses_command_deadline_and_preserves_unknown_write(self):
+        for operation, expected in [('mailbox.inventory', 'provider_unreachable'), ('mailbox.alias.add', 'unknown_write_outcome')]:
+            process = FakeProcess(b'')
+            with patch.object(worker.subprocess, 'Popen', return_value=process):
+                persistent = worker.PersistentPowerShell(REQUEST, DESCRIPTOR, '/unused.ps1')
+            with patch.object(worker.os, 'name', 'posix'), patch.object(worker.os, 'set_blocking', create=True), patch.object(worker.os, 'killpg', create=True), patch.object(worker.signal, 'SIGKILL', 9, create=True), patch.object(worker.select, 'select', return_value=([], [], [])), patch.object(worker.os, 'write') as write:
+                self.assertEqual(persistent.run({**REQUEST, 'operation': operation})['code'], expected)
+                write.assert_not_called()
+            self.assertTrue(process.killed)
     def test_trace_rejects_out_of_window_or_injected_continuation_before_powershell(self):
         now = worker.datetime.datetime.now(worker.datetime.timezone.utc)
         start = (now - worker.datetime.timedelta(days=2)).isoformat()

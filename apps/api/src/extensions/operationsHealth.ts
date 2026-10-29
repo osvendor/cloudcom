@@ -10,6 +10,7 @@ import { readCapacityGuard } from '../services/capacityGuard';
 import { agentRolloutLimits, isAgentUpdateGuardEnabled } from '../services/agentRolloutAdmission';
 import { summarizeConsumerReadiness, workerReadinessRegistry } from '../services/workerReadinessRegistry';
 import { cpuStealPercent, parseCpuCounters, type CpuCounters } from './hostCpuSteal';
+import { getAlertWorkTelemetrySnapshot } from '../services/alertWorkTelemetry';
 
 type State = HealthCard['status'];
 const card = (id: string, title: string, status: State, value: string, detail: string): HealthCard => ({ id, title, status, value, detail });
@@ -134,7 +135,7 @@ async function collect(): Promise<OperationsHealth> {
   const cards = groups.flat();
   cards.push(card('capacity-guard', 'Server load safeguards', !capacity.enabled ? 'attention' : capacity.canRunBackgroundWork ? 'healthy' : 'attention',
     !capacity.enabled ? 'Disabled' : capacity.canRunBackgroundWork ? 'Ready for background work' : 'Heavy background work paused',
-    `CPU ${capacity.metrics.cpuBusyPercent === null ? 'unknown' : capacity.metrics.cpuBusyPercent.toFixed(1) + '%'}; pause at ${capacity.thresholds.cpuPausePercent}%, resume below ${capacity.thresholds.cpuResumePercent}% after 60 healthy seconds. ${capacity.reasons.length ? 'Waiting: ' + capacity.reasons.join(', ') + '. ' : ''}Routine script probes and Harmony refresh defer; sign-in, check-ins and remote tools remain available. AWS burst credits are not measured.`),
+    `CPU ${capacity.metrics.cpuBusyPercent === null ? 'unknown' : capacity.metrics.cpuBusyPercent.toFixed(1) + '%'}; pause at ${capacity.thresholds.cpuPausePercent}%, resume below ${capacity.thresholds.cpuResumePercent}% after 60 healthy seconds. ${capacity.reasons.length ? 'Waiting: ' + capacity.reasons.join(', ') + '. ' : ''}Heavy collectors such as Harmony refresh defer. Small script-monitor checks continue only with fresh safe measurements and paced capacity; sign-in, check-ins and remote tools remain available. AWS burst credits are not measured.`),
     card('agent-rollout-guard', 'Agent update safeguards', isAgentUpdateGuardEnabled() && capacity.enabled && capacity.agentUpdates.allowed ? 'healthy' : 'attention',
       isAgentUpdateGuardEnabled() ? `${capacity.agentUpdates.allowed ? 'Ready' : 'Waiting for capacity'} · ${rollout.concurrent} at once` : 'Disabled',
       `1 per site; at most ${rollout.starts} new starts every ${rollout.windowMs / 60_000} minutes. ${capacity.enabled ? `Observed ${Math.round(capacity.agentUpdates.observedMs / 1000)}/60 seconds; average CPU ${capacity.agentUpdates.averages.cpuBusyPercent === null ? 'unknown' : capacity.agentUpdates.averages.cpuBusyPercent.toFixed(1) + '%'}. ${capacity.agentUpdates.reasons.length ? 'Waiting: ' + capacity.agentUpdates.reasons.join(', ') + '. ' : ''}Current pressure still blocks new starts. ` : 'Capacity measurements disabled. '}Confirmed components settle for at least 60 seconds. Missing completion holds its slot for 10 minutes, then defers that device for the rest of a 30-minute retry window. Signed emergency rollback and independent local repair are excluded.`));
@@ -143,5 +144,5 @@ async function collect(): Promise<OperationsHealth> {
     unknown('relay', 'Relay & bandwidth', 'Direct/relay split, relay bytes and Lightsail transfer allowance are not measured here.'),
     unknown('backups', 'Backup recovery', 'Backup freshness and restore verification are not measured here.'),
     unknown('external', 'Sign-in & integrations', 'Cloudflare, SSO, email, 3CX and Microsoft/Google upstream availability are not actively probed. A working API does not verify these services.'));
-  return { checkedAt, refreshSeconds: 30, targetEndpoints: 500, enrolled, cards };
+  return { checkedAt, refreshSeconds: 30, targetEndpoints: 500, enrolled, cards, alertWorkload: getAlertWorkTelemetrySnapshot() };
 }

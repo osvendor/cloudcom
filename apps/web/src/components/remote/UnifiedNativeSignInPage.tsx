@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import LoginPage from '../auth/LoginPage';
-import { apiLogin, bootstrapFromCfAccessRedirect, restoreAccessTokenFromCookieDetailed, useAuthStore } from '../../stores/auth';
+import { apiLogin } from '../../stores/auth';
+import { bootstrapThenNavigate } from '../../lib/authNavigation';
+import { resolveRemoteAccount, staffRemoteSignInUrl } from './remoteAccount';
 import { readStaffNativeAuthorizationRequest } from './staffNativeAuthorization';
 import { authenticateRemoteAccount } from './unifiedNativeSignIn';
 
@@ -21,36 +23,11 @@ export default function UnifiedNativeSignInPage({ navigate = navigateToSignIn }:
     let cancelled = false;
     void (async () => {
       try {
-        // Prefer a verified active staff session when the browser has both.
-        const restored = useAuthStore.getState().tokens?.accessToken
-          ? 'restored' : await restoreAccessTokenFromCookieDetailed();
+        const account = await resolveRemoteAccount();
         if (cancelled) return;
-        if (restored === 'restored') {
-          // A fresh browser can have the HttpOnly cookie without a hydrated
-          // user. Populate the verified identity before entering the dashboard
-          // layout, otherwise its auth overlay redirects away from this request.
-          if (!useAuthStore.getState().isAuthenticated && !await bootstrapFromCfAccessRedirect()) {
-            if (!cancelled) setError('Sign-in could not be checked. Please reload and try again.');
-            return;
-          }
-          if (!cancelled) navigate(staffPath);
-          return;
-        }
-        if (restored !== 'auth-failed') {
-          setError('Sign-in could not be checked. Please reload and try again.'); return;
-        }
-        const profile = await fetch('/api/v1/portal/profile', {
-          credentials: 'include', redirect: 'error', signal: AbortSignal.timeout(10000),
-        });
-        if (cancelled) return;
-        if (profile.ok) {
-          const body = await profile.json();
-          if (body.user?.accessMode === 'remote_only') {
-            navigate(customerPath); return;
-          }
-        } else if (profile.status !== 401 && profile.status !== 403) {
-          setError('Sign-in could not be checked. Please reload and try again.');
-        }
+        if (account.kind === 'staff') navigate(staffPath);
+        else if (account.kind === 'staff-sso') await bootstrapThenNavigate(staffRemoteSignInUrl(staffPath), navigate);
+        else if (account.kind === 'customer') navigate(customerPath);
       } catch { if (!cancelled) setError('Sign-in could not be checked. Please reload and try again.'); }
       finally { if (!cancelled) setChecking(false); }
     })();

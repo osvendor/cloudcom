@@ -21,15 +21,57 @@ declare module 'hono' {
   interface ContextVariableMap {
     /** W08: setup slot of an admitted agent WS upgrade; routes/agentWs.ts releases it when onOpen finishes. */
     admissionWsSetupSlot: WsSetupSlot;
+    /** Internal permit, set only while the bounded UniFi config lane is held. */
+    unifiConfigAdmissionReserved: boolean;
   }
 }
 
-export function agentAdmission(getGate: () => AdmissionGate | null = getAdmissionRuntime): MiddlewareHandler {
+/** A small recovery lane shared by all middleware mounts in this API process. */
+export function createUnifiConfigBudget(now: () => number = () => performance.now()): () => (() => void) | null {
+  let active = false;
+  let nextStart = -Infinity;
+  return () => {
+    const current = now();
+    if (active || current < nextStart) return null;
+    active = true;
+    nextStart = current + 1_000;
+    let released = false;
+    return () => { if (!released) { released = true; active = false; } };
+  };
+}
+const unifiConfigBudget = createUnifiConfigBudget();
+
+export function agentAdmission(
+  getGate: () => AdmissionGate | null = getAdmissionRuntime,
+  acquireUnifiConfig = unifiConfigBudget,
+): MiddlewareHandler {
   return async (c, next) => {
     const gate = getGate();
     if (!gate || gate.mode === 'off') return next();
     const req = classifyAgentRequest(c.req.method, c.req.path);
     if (!req || req.cls === 'protected') return next();
+    // Agents need a truthful empty assignment response to enter the 15-minute
+    // idle cadence. Treating this read like bulk telemetry traps unassigned
+    // agents in a 30-second 503/warning/upload loop. Admit only one config read
+    // per second and one in flight, even when healthy. This does not answer the
+    // request: global rate limiting, agent auth, DB-pool admission and tenant-bound
+    // assignment lookup still run downstream. Telemetry POST remains bulk.
+    if (gate.mode === 'enforce' && req.key === 'GET /:id/unifi-collectors') {
+      const release = acquireUnifiConfig();
+      if (!release) {
+        c.set('admissionRouteLabel', req.label);
+        c.set('rejectReason', 'admission_unifi_config_budget');
+        c.header('Retry-After', '30');
+        c.header('Cache-Control', 'no-store');
+        return c.json({ error: 'Server busy; retry later', code: 'ADMISSION_SHED', retryAfterSeconds: 30 }, 503);
+      }
+      c.set('unifiConfigAdmissionReserved', true);
+      try { await next(); } finally {
+        c.set('unifiConfigAdmissionReserved', false);
+        release();
+      }
+      return;
+    }
     // Junk GETs on the WS path (no Upgrade header) 401/404 without ever opening a
     // socket: they must not spend upgrade tokens or setup slots.
     if (req.cls === 'ws_upgrade' && c.req.header('upgrade')?.toLowerCase() !== 'websocket') return next();

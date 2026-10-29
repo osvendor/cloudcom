@@ -21,11 +21,20 @@ $dllHash='B5E885348145403A7A5C10D130DCD45916129D7D9037DE1FDFAF5F831E81B6E7'
 $enrollment=Join-Path $env:ProgramData 'Breeze\data\rustdesk\native-admission.dpapi'
 $configPath=Join-Path $env:WINDIR 'ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config\RustDesk2.toml'
 function Test-ApprovedPayload {
-    foreach ($entry in @(@{Path=$exe;Hash=$exeHash},@{Path=$dll;Hash=$dllHash})) {
-        if (!(Test-Path -LiteralPath $entry.Path -PathType Leaf) -or !(Test-CloudComNoReparsePath $entry.Path)) { return $false }
-        if ((Get-FileHash -LiteralPath $entry.Path -Algorithm SHA256).Hash -ne $entry.Hash) { return $false }
+    foreach ($path in @($exe,$dll)) {
+        if (!(Test-Path -LiteralPath $path -PathType Leaf) -or !(Test-CloudComNoReparsePath $path)) { return $false }
     }
-    return $true
+    $actualExe=(Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+    $actualDll=(Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash
+    # Accept reviewed release pairs independently of the current installer pin.
+    $approved=@(
+        @{Exe='ADF4C6313FB717FB62B6447A67CF5406207228945ABC2FB799E04E89210975BE';Dll='B5E885348145403A7A5C10D130DCD45916129D7D9037DE1FDFAF5F831E81B6E7'},
+        @{Exe='ADF4C6313FB717FB62B6447A67CF5406207228945ABC2FB799E04E89210975BE';Dll='C148DA5134774B9572E2251DB8A8FB189A91E5DF118E18CC7B63F6426D88E60E'}
+    )
+    foreach ($release in $approved) {
+        if ($actualExe -eq $release.Exe -and $actualDll -eq $release.Dll) { return $true }
+    }
+    return $false
 }
 function Test-PrivateRouting {
     if (!(Test-Path -LiteralPath $configPath -PathType Leaf)) { return $false }

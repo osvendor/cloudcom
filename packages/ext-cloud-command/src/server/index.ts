@@ -27,7 +27,7 @@ import { mountThreeCxDetails, ThreeCxDetailError } from './threecx-details';
 import { mountThreeCxDashboard } from './threecx-dashboard';
 import { mountThreeCxCallLog } from './threecx-call-log';
 import { healthRoutes, type HealthReader } from './health';
-export type { HealthReader, HealthAuth, HealthCard, OperationsHealth } from './health';
+export type { HealthReader, HealthAuth, HealthCard, OperationsHealth, AlertWorkload, AlertWorkloadGroup, AlertScriptMonitorWorkload } from './health';
 import type { AdministrationRuntime } from './admin-runtime';
 import { createAdministrationServices } from './admin-services';
 export type { AdministrationRuntime } from './admin-runtime';

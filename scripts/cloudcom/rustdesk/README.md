@@ -25,8 +25,9 @@ at organization level with a Windows filter to cover future enrollments. Keep
 organization and server values in private deployment records. For saved scripts,
 bundle the required common.ps1 functions after the parameter block.
 
-The API serves the exact pinned MSI at
-`/api/v1/agents/download/rustdesk/windows/amd64/msi`. Stage it in the persistent
+The API serves immutable versioned MSIs at
+`/api/v1/agents/download/rustdesk/windows/amd64/msi/1.5.0.68` (and the separately
+reviewed `/msi/1.5.0.69` canary). Stage the currently pinned MSI in the persistent
 `CLOUDCOM_RUSTDESK_HOST_DIR` as `cloudcom-rustdesk-host.msi`; it contains no device
 enrollment secrets. Preserve this directory across agent binary promotions.
 Changing the approved host requires a reviewed hash update and another pilot.
@@ -80,3 +81,58 @@ Rollout acceptance must cover server transport configuration plus actual desktop
 connectivity, separately from the endpoint installation/enrollment health probe.
 Keep the prior server binary and compose configuration for rollback. A running
 listener or healthy endpoint probe alone is not a successful remote session.
+
+### Diagnosing direct-to-relay reports
+
+Treat installation, authorization, and transport as separate checks. Confirm a
+native target is enrolled before changing transport settings. A missing host is
+handled by the existing organization-bound policy; never copy another host's ID
+or enrollment files.
+
+The managed firewall check requires effective, executable-bound inbound coverage
+for **both TCP and UDP**, either an Any-protocol rule or separate protocol rules.
+A TCP-only rule must not suppress UDP repair. Preserve firewall enforcement,
+private rendezvous routing, and native admission checks.
+
+On a failed direct attempt, capture the viewer's effective `udp_enabled` and
+`forced_relay` values and the selected target ID before restarting anything.
+Inspect the configuration in the real interactive user's context: packaged tools
+can see a virtualized profile that differs from a normal desktop/browser launch.
+Confirm server fleet eligibility separately. A remembered hostname, URL, or a
+healthy installation check is insufficient evidence that the same native peer ID
+and transport mode were used. Never log admission tokens or credentials.
+
+A relay success proves an authorized working fallback, not a direct path. Accept
+a direct repair only after a fresh direct session records successful transport
+and desktop frames. Some NAT/firewall combinations legitimately require relay;
+do not bypass authorization or indiscriminately open network ports to avoid it.
+A TCP-derived `SYMMETRIC` NAT classification can also explain an immediate relay
+choice even with UDP enabled. Capture the controlled host's classification and
+native NAT-test log as well as the viewer's. Do not overwrite the classification
+with a false value. A managed UDP implementation should test the requested UDP
+path within its existing concurrency/deadline bounds before deciding that a TCP
+mapping classification makes it unusable. Explicit relay/proxy policy and native
+session admission must retain priority. Validate a native change in the Windows
+endpoint VM and promote it as a new pinned host artifact; changing a policy hash
+alone is not a valid native release.
+
+### Reviewed host upgrades
+
+The desired-state probe accepts complete approved 68 and reviewed 69 EXE/DLL
+pairs. This allowance does not upgrade healthy 68 installations or permit stock
+RustDesk adoption. A separate promotion operator prepares 69 for new installs; live saved scripts remain
+at version 2 with installer 68 until the audited promotion is applied. Previously
+queued scripts must continue receiving their pinned bytes.
+Versioned download paths end in `/msi/1.5.0.68` and `/msi/1.5.0.69`, separate from
+the existing stable `/msi` route. Never overwrite a versioned artifact.
+
+`upgrade-managed-host.ps1` is the separate, explicit 68-to-69 MSI operation.
+It requires SYSTEM, an exact computer and organization, the approved installed
+68 hashes and MSI ownership, a pinned new MSI and an approved 68 rollback MSI.
+It preserves the native ID/key, protected enrollment and private routing. MSI
+timeouts or a busy Windows Installer stop further installation attempts and
+leave a protected review journal; they must not trigger a concurrent rollback.
+Completed but failed upgrades can restore only the verified 68 package and the
+existing identity. Validate upgrade, rollback and re-upgrade in OS-TEST before
+dispatching a release to endpoint canaries. The fourth MSI version component
+does not provide downgrade protection; the exact payload guards are essential.

@@ -16,6 +16,9 @@ const {
   runOutsideDbContextMock,
   withSystemDbAccessContextMock,
   rollupDeviceMetricsRangeMock,
+  setGlobalConcurrencyMock,
+  canRunBackgroundWorkMock,
+  workerOptionsMock,
 } = vi.hoisted(() => ({
   getJobMock: vi.fn(),
   addMock: vi.fn(),
@@ -32,6 +35,9 @@ const {
   runOutsideDbContextMock: vi.fn(<T>(fn: () => T) => fn()),
   withSystemDbAccessContextMock: vi.fn(async (fn: () => Promise<unknown>) => fn()),
   rollupDeviceMetricsRangeMock: vi.fn(),
+  setGlobalConcurrencyMock: vi.fn().mockResolvedValue(1),
+  canRunBackgroundWorkMock: vi.fn(() => true),
+  workerOptionsMock: vi.fn(),
 }));
 
 vi.mock('bullmq', () => ({
@@ -42,17 +48,22 @@ vi.mock('bullmq', () => ({
     getRepeatableJobs = getRepeatableJobsMock;
     removeRepeatableByKey = removeRepeatableByKeyMock;
     close = closeMock;
+    setGlobalConcurrency = setGlobalConcurrencyMock;
   },
   Worker: class {
-    constructor(_name: string, processor: (job: { data: unknown }) => unknown) {
+    constructor(_name: string, processor: (job: { data: unknown }) => unknown, options: unknown) {
       workerProcessorMock.mockImplementation(processor);
+      workerOptionsMock(options);
     }
 
     close = closeMock;
     on = vi.fn();
   },
   Job: class {},
+  DelayedError: class extends Error {},
 }));
+
+vi.mock('../services/capacityGuard', () => ({ canRunBackgroundWork: canRunBackgroundWorkMock }));
 
 vi.mock('../services/redis', () => ({
   getBullMQConnection: vi.fn(() => ({ host: 'localhost', port: 6379 })),
@@ -107,6 +118,9 @@ describe('metric rollups queue helpers', () => {
     whereMock.mockReset();
     groupByMock.mockReset();
     workerProcessorMock.mockReset();
+    workerOptionsMock.mockClear();
+    setGlobalConcurrencyMock.mockClear();
+    canRunBackgroundWorkMock.mockReturnValue(true);
     rollupDeviceMetricsRangeMock.mockReset();
     rollupDeviceMetricsRangeMock.mockResolvedValue({ statements: 9, skipped: false });
     runOutsideDbContextMock.mockClear();
@@ -175,6 +189,38 @@ describe('metric rollups queue helpers', () => {
     );
     const scanData = addMock.mock.calls.find(([name]) => name === 'scan-orgs')?.[1];
     expect(scanData).not.toHaveProperty('queuedAt');
+    expect(setGlobalConcurrencyMock).toHaveBeenCalledWith(1);
+    expect(workerOptionsMock).toHaveBeenCalledWith(expect.objectContaining({ concurrency: 1 }));
+  });
+
+  it('retains each fixed historical window when capacity is unavailable', async () => {
+    await initializeMetricRollupsWorker();
+    canRunBackgroundWorkMock.mockReturnValue(false);
+    const moveToDelayed = vi.fn().mockResolvedValue(undefined);
+    const data = {
+      type: 'rollup-org-range', orgId: 'org-1',
+      from: '2026-06-18T12:00:00.000Z', to: '2026-06-18T12:15:00.000Z',
+      queuedAt: '2026-06-18T12:15:00.000Z', dayRollups: { from: '2026-06-18T09:00:00.000Z' },
+    };
+    const prior = structuredClone(data);
+    await expect(workerProcessorMock({ data, moveToDelayed }, 'lock-token')).rejects.toBeInstanceOf(Error);
+    expect(moveToDelayed).toHaveBeenCalledWith(Date.now() + 60_000, 'lock-token');
+    expect(data).toEqual(prior);
+    expect(rollupDeviceMetricsRangeMock).not.toHaveBeenCalled();
+    canRunBackgroundWorkMock.mockReturnValue(true);
+    await workerProcessorMock({ data, moveToDelayed }, 'retry-token');
+    expect(rollupDeviceMetricsRangeMock).toHaveBeenCalledWith({
+      orgId: 'org-1', from: new Date(data.from), to: new Date(data.to),
+      dayRollups: { from: new Date(data.dayRollups.from) },
+    });
+  });
+
+  it('continues recording scan windows under pressure instead of silently losing history', async () => {
+    await initializeMetricRollupsWorker();
+    canRunBackgroundWorkMock.mockReturnValue(false);
+    await workerProcessorMock({ data: { type: 'scan-orgs', lookbackMinutes: 15 } });
+    expect(addBulkMock).toHaveBeenCalledTimes(1);
+    expect(rollupDeviceMetricsRangeMock).not.toHaveBeenCalled();
   });
 
   it('uses the worker execution time when fan-out repeat scans create rollup ranges', async () => {
@@ -294,6 +340,7 @@ describe('metric rollups queue helpers', () => {
 // a catch-up lookback so late data at a day boundary is still folded in.
 describe('metric rollups day-level schedule (#4276)', () => {
   beforeEach(async () => {
+    canRunBackgroundWorkMock.mockReturnValue(true);
     vi.useFakeTimers();
     getRepeatableJobsMock.mockReset();
     getRepeatableJobsMock.mockResolvedValue([]);

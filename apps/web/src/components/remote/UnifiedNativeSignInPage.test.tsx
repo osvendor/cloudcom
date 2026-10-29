@@ -20,7 +20,8 @@ describe('unified native browser entry', () => {
       clientId: 'cloudcom-rustdesk-v1', redirectUri: 'http://127.0.0.1:12345/cloudcom/callback',
       codeChallenge: 'A'.repeat(43), codeChallengeMethod: 'S256', state: 'A'.repeat(43),
     }));
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 401 }));
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url) => String(url).includes('remoteIdentity=1')
+      ? { ok: true, json: async () => ({ kind: 'none' }) } : { ok: false, status: 401 }));
   });
   afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
   it('routes a restored staff session without trusting persisted identity or querying customers', async () => {
@@ -39,7 +40,8 @@ describe('unified native browser entry', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
   it('routes only a verified remote customer profile to customer authorization', async () => {
-    vi.mocked(fetch).mockResolvedValue({ ok: true, json: async () => ({ user: { accessMode: 'remote_only' } }) } as Response);
+    vi.mocked(fetch).mockImplementation(async (url) => ({ ok: true, json: async () => String(url).includes('remoteIdentity=1')
+      ? { kind: 'customer' } : { user: { accessMode: 'remote_only' } } }) as Response);
     const navigate = vi.fn(); render(<UnifiedNativeSignInPage navigate={navigate} />);
     await waitFor(() => expect(navigate).toHaveBeenCalledWith(expect.stringMatching(/^\/portal\/remote\/native\?/)));
   });
@@ -60,6 +62,13 @@ describe('unified native browser entry', () => {
     render(<UnifiedNativeSignInPage />);
     expect(screen.getByRole('alert')).toHaveTextContent('invalid');
     expect(mocks.restore).not.toHaveBeenCalled();
+  });
+  it('prefers verified company staff identity over a cached customer login', async () => {
+    vi.mocked(fetch).mockResolvedValue({ ok: true, json: async () => ({ kind: 'staff' }) } as Response);
+    const navigate = vi.fn(); render(<UnifiedNativeSignInPage navigate={navigate} />);
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith(expect.stringMatching(/^\/api\/v1\/auth\/cf-access-login\?next=/)));
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenLastCalledWith('/api/v1/auth/browser-binding/bootstrap', expect.objectContaining({ method: 'POST', credentials: 'include' }));
   });
   it('requests the server identity guard for password fallback and keeps company context errors actionable', async () => {
     render(<UnifiedNativeSignInPage />);
