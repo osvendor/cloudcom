@@ -5,10 +5,9 @@ import {
   devices,
   organizations,
   partners,
-  partnerUsers,
-  roles,
   users,
 } from '../db/schema';
+import { listActivePartnerAdmins } from './partnerAdminRecipients';
 import { ANONYMOUS_ACTOR_ID, requestLikeFromSnapshot, writeAuditEvent } from './auditEvents';
 import { captureException } from './sentry';
 import {
@@ -34,6 +33,11 @@ import { enqueueTenantErasure } from '../jobs/tenantErasure';
 import { getOrgMergeQueue } from '../jobs/orgMerge';
 import { MERGE_PRIOR_STATUS_KEY } from './orgMerge';
 import {
+  ARCHIVE_PURGE_WARN_14_SENT_AT_KEY,
+  ARCHIVE_PURGE_WARN_1_SENT_AT_KEY,
+  ARCHIVE_PURGING_RECOVERY_ATTEMPTS_KEY,
+} from './orgSettingsInternalKeys';
+import {
   EVIDENCE_HOLD_RELEASED_ACTION,
   EVIDENCE_HOLD_SCOPED_ERASURE_KEY,
   findEvidenceHold,
@@ -43,7 +47,7 @@ import { getEmailService } from './email';
 import { releaseSendingDomainsForPartner } from './emailDomains/domainRelease';
 import { escapeHtml, renderLayout } from './emailLayout';
 
-import { terminalPayloadErasureSet } from './sensitiveCommandPayload';
+import { cancelDeviceCommands } from './commandCancelPropagation';
 /**
  * Offboarding drain state (#2774).
  *
@@ -151,8 +155,8 @@ function inCallerOrSystemDbContext<T>(
  */
 const DB_NOW = sql`now()`;
 
-export const ARCHIVE_PURGE_WARN_14_SENT_AT_KEY = 'archivePurgeWarn14SentAt';
-export const ARCHIVE_PURGE_WARN_1_SENT_AT_KEY = 'archivePurgeWarn1SentAt';
+// Declared in orgSettingsInternalKeys.ts (a leaf module); re-exported here.
+export { ARCHIVE_PURGE_WARN_14_SENT_AT_KEY, ARCHIVE_PURGE_WARN_1_SENT_AT_KEY };
 export type ArchivePurgeWarningMarker =
   | typeof ARCHIVE_PURGE_WARN_14_SENT_AT_KEY
   | typeof ARCHIVE_PURGE_WARN_1_SENT_AT_KEY;
@@ -174,7 +178,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * unit test injecting rows straight past the WHERE clause can't tell a
  * 15-minute floor apart from no floor at all.
  */
-export const ARCHIVE_PURGING_RECOVERY_ATTEMPTS_KEY = 'purgingRecoveryAttempts';
+export { ARCHIVE_PURGING_RECOVERY_ATTEMPTS_KEY }; // declared in orgSettingsInternalKeys.ts (a leaf module)
 
 /**
  * How many times the backstop will re-run the erasure handoff for one `purging`
@@ -378,22 +382,19 @@ async function queueDrainUninstalls(
       return { devicesTargeted: 0, uninstallsQueued: 0, otherCommandsCancelled: 0 };
     }
 
-    const cancelled = await tx
-      .update(deviceCommands)
-      .set({
-        status: 'cancelled',
-        completedAt: new Date(),
-        result: { reason: UNINSTALL_REASON_TENANT_OFFBOARDING },
-        ...terminalPayloadErasureSet(),
-      })
-      .where(
-        and(
-          inArray(deviceCommands.deviceId, deviceIds),
-          ne(deviceCommands.type, 'self_uninstall'),
-          inArray(deviceCommands.status, [...NON_TERMINAL_COMMAND_STATUSES])
-        )
-      )
-      .returning({ id: deviceCommands.id });
+    // Shared helper (#9719): UPDATE + per-type cancellation hooks, in this tx.
+    const cancelled = await cancelDeviceCommands({
+      executor: tx,
+      // A hook failure must not roll back the surrounding writes; it is
+      // isolated per command (savepoint), logged and sent to Sentry.
+      isolateFailures: true,
+            result: { reason: UNINSTALL_REASON_TENANT_OFFBOARDING },
+      where: and(
+        inArray(deviceCommands.deviceId, deviceIds),
+        ne(deviceCommands.type, 'self_uninstall'),
+        inArray(deviceCommands.status, [...NON_TERMINAL_COMMAND_STATUSES])
+      )!,
+    });
 
     const existing = await tx
       .select({
@@ -598,14 +599,9 @@ async function cancelDrainUninstallsForOrgIds(orgIds: string[], reason: string):
     .map((row) => row.id);
   if (toCancelIds.length === 0) return 0;
 
-  const cancelled = await db
-    .update(deviceCommands)
-    .set({
-      status: 'cancelled',
-      completedAt: new Date(),
-      result: { reason },
-      ...terminalPayloadErasureSet(),
-    })
+  // Shared helper (#9719): UPDATE + per-type cancellation hooks.
+  const cancelled = await cancelDeviceCommands({
+    result: { reason },
     // Re-check status IN (pending, sent), matching the strip step above and
     // collectAndCancelOutstanding's cancel step below — defense-in-depth
     // symmetry. Not currently exploitable (the strip and this cancel run
@@ -615,13 +611,11 @@ async function cancelDrainUninstallsForOrgIds(orgIds: string[], reason: string):
     // were exactly "a row's state moved between two writes that used to be
     // one." A future refactor that splits strip/cancel apart for batching
     // must not silently reopen that class of bug on this path only.
-    .where(
-      and(
-        inArray(deviceCommands.id, toCancelIds),
-        inArray(deviceCommands.status, [...NON_TERMINAL_COMMAND_STATUSES])
-      )
-    )
-    .returning({ id: deviceCommands.id });
+    where: and(
+      inArray(deviceCommands.id, toCancelIds),
+      inArray(deviceCommands.status, [...NON_TERMINAL_COMMAND_STATUSES])
+    )!,
+  });
   return cancelled.length;
 }
 
@@ -1066,24 +1060,17 @@ async function collectAndCancelOutstanding(
       .map((row) => row.id);
 
     if (toCancelIds.length > 0) {
-      await db
-        .update(deviceCommands)
-        .set({
+      await cancelDeviceCommands({
+        result: {
           status: 'cancelled',
-          completedAt: new Date(),
-          result: {
-            status: 'cancelled',
-            reason: 'offboarding_window_closed',
-            error: 'Offboarding drain window closed: agent never confirmed the uninstall',
-          },
-          ...terminalPayloadErasureSet(),
-        })
-        .where(
-          and(
-            inArray(deviceCommands.id, toCancelIds),
-            inArray(deviceCommands.status, [...NON_TERMINAL_COMMAND_STATUSES])
-          )
-        );
+          reason: 'offboarding_window_closed',
+          error: 'Offboarding drain window closed: agent never confirmed the uninstall',
+        },
+        where: and(
+          inArray(deviceCommands.id, toCancelIds),
+          inArray(deviceCommands.status, [...NON_TERMINAL_COMMAND_STATUSES])
+        )!,
+      });
     }
   }
 
@@ -2054,23 +2041,8 @@ export async function sweepOffboardingTenants(
           continue;
         }
 
-        const recipients = await runOutsideDbContext(() =>
-          withSystemDbAccessContext(() =>
-            db
-              .select({ email: users.email })
-              .from(partnerUsers)
-              .innerJoin(users, eq(partnerUsers.userId, users.id))
-              .innerJoin(roles, eq(partnerUsers.roleId, roles.id))
-              .where(
-                and(
-                  eq(partnerUsers.partnerId, org.partnerId),
-                  eq(roles.name, 'Partner Admin'),
-                  eq(users.status, 'active')
-                )
-              )
-          )
-        );
-        const emails = [...new Set(recipients.map((recipient) => recipient.email).filter(Boolean))];
+        const recipients = await listActivePartnerAdmins(org.partnerId);
+        const emails = recipients.map((recipient) => recipient.email);
         if (emails.length === 0) {
           console.warn(
             `[tenantOffboarding] no active Partner Admin recipients for org ${org.id}; `

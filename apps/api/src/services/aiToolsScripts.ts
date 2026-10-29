@@ -31,7 +31,8 @@ import {
   executionStatusEnum,
 } from '../db/schema';
 import { eq, and, desc, sql, ilike, inArray, isNull, or, SQL } from 'drizzle-orm';
-import { isAiAgentPrincipal, type AuthContext } from '../middleware/auth';
+import type { AuthContext } from '../middleware/auth';
+import { isAutomationPrincipal } from '../middleware/principalKind';
 import { escapeLike } from '../utils/sql';
 import type { AiTool } from './aiTools';
 // Type-only: the runtime import stays dynamic inside the handler.
@@ -52,6 +53,8 @@ import { isAgentConfigPath, isDeniedRegistryTarget } from '../routes/systemTools
 import { notParkedDeviceCondition } from './unassignedPool/selectorPredicate';
 import { inToolDbPhase } from './aiToolDbContext';
 import { aiPathRefusal, PATH_BLOCKED_MESSAGE } from './aiPathRestriction';
+import { findProfilePathInScript } from './aiScriptProfilePathScan';
+import { resolveDevicePolicyForGate } from './aiDevicePathPolicy';
 
 // Fix 4b: headroom under MAX_TOOL_RESULT_CHARS (8000) for the rest of the
 // get_script_execution envelope once stdout/stderr are counted at their
@@ -349,6 +352,37 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
       return JSON.stringify({ error: `proposal_not_runnable: ${runnable.reason}`, proposalId: input.proposalId });
     }
     const snapshot = proposalDispatchSnapshot(runnable.proposal, proposalDeviceIds);
+    // AI data policy (spec 2026-10-15 §2, best effort): an AI-authored
+    // proposal whose content names a user-profile path is refused unless the
+    // org of every target device that passes verifyDeviceAccess allows
+    // any_with_approval (a device that fails it is never dispatched below; none
+    // verified resolves as unresolved and refuses). Resolved with the
+    // executeTool gate's own resolver, so an unestablished partner refuses here
+    // too. Library scripts (scriptId) are human-authored
+    // and exempt; proposals take no parameters (runnable.ts), so the content
+    // is all there is to scan. Literal spellings only: a constructed path is
+    // not caught, and `off` does not make arbitrary scripts document-proof.
+    const profileHit = findProfilePathInScript(typeof runnable.proposal.content === 'string' ? runnable.proposal.content : '');
+    if (profileHit) {
+      const policy = await inToolDbPhase(auth, async () => {
+        const verified: Array<{ orgId: string }> = [];
+        for (const deviceId of proposalDeviceIds) {
+          const access = await verifyDeviceAccess(deviceId, auth);
+          if ('device' in access) verified.push(access.device);
+        }
+        return resolveDevicePolicyForGate(verified);
+      });
+      if (policy.deviceFileReadLevel !== 'any_with_approval') {
+        const level = policy.deviceFileReadLevel;
+        const source = policy.source.deviceFileReadLevel;
+        return JSON.stringify({
+          error: `This script proposal reads a user profile path (${profileHit}), which the AI data policy refuses (level: ${level}, set by: ${source}). Rewrite the script without it${level === 'no_user_profiles' ? ', or ask an administrator for a diagnostic access grant and read the file with diagnostic_read_file' : ''}.`,
+          condition: 'policy_denied',
+          policy: { level, source },
+          proposalId: input.proposalId,
+        });
+      }
+    }
     // #5645 — spec §4.1 `approval_method` is DERIVED from the releasing
     // intent's decision record (§4.6), which both release paths put on the
     // context next to `actionIntentId`. Resolved once per call, never per
@@ -447,7 +481,9 @@ const runScriptHandler: AiTool['handler'] = async (input, auth, context) => {
   // has no human review and no revalidation behind it at all. Ignore both
   // for this principal; dispatch falls back to the SAVED script's own
   // `runAs` (its `targetSessionId`, unset, already defaults to none).
-  const isUnattendedAgentDispatch = isAiAgentPrincipal(auth);
+  // A flow run (W04 #5219) is the same unattended case: the saved script's
+  // own run context wins over a caller-supplied runAs / targetSessionId.
+  const isUnattendedAgentDispatch = isAutomationPrincipal(auth);
 
   // #4888 — an assistant-chosen run context clears the SAME gate a human
   // one does. Not a copy of the rules, the actual object the HTTP route

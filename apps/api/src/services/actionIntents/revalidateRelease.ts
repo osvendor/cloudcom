@@ -8,7 +8,12 @@ import { getActiveOrgTenant } from '../tenantStatus';
 import { policyDecideEnabled } from '../../config/env';
 import { validateAuthorizationKeys } from './policyDecidable';
 import { buildAuthContextForIntent } from './actorContext';
+import { isMcpOriginIntent } from '../mcpIntentEligibility';
 import { checkAgentReleaseAuthority } from './agentReleaseAuthority';
+import { checkFlowReleaseAuthority } from '../flows/releaseAuthority';
+import { isFlowToolName } from '../flows/toolNames';
+import { isFlowBuiltinIntent } from '../flows/builtins/intentKind';
+import { flowBuiltinTierFor } from '@breeze/shared';
 import { isOrgWideGovernanceIntent } from './orgWideGovernanceTools';
 import { canMutateOrgWideGovernance, SITE_CEILING_WRITE_DENIED_MESSAGE } from '../siteCeilingAccess';
 import { IntentScopeLostError } from './intentTargetScope';
@@ -22,6 +27,14 @@ import {
   loadTaskAgentToolAllowlists,
 } from '../aiOperator/planApproval';
 import { planOrdinalFromOperationKey } from '../aiOperator/operationKey';
+import { runOutsideDbContext, withSystemDbAccessContext } from '../../db';
+import { callerAction, loadPinnedCallerBackend } from './callerTarget';
+import { requireCallerVerification } from '../callerVerification/gate';
+import { getEffectivePolicy } from '../callerVerification/policy';
+import {
+  CallerVerificationRequiredError, CallerVerificationValidationError, type CallerVerificationRefusal,
+} from '../callerVerification/errors';
+import { CALLER_VERIFICATION_REQUIRED_CODE } from '../callerVerification/refusal';
 
 /**
  * Shared release-time revalidation for an approved action intent (spec
@@ -228,6 +241,98 @@ export async function revalidateApprovedIntentForRelease(
   intent: ActionIntent,
   winningApproval: { boundArgumentDigest: string | null } | null,
 ): Promise<IntentReleaseRevalidation> {
+  let revalidation = await revalidateApprovedIntentCore(intent, winningApproval);
+  if (!revalidation.ok) return revalidation;
+  // Wisp W04a: a chat-originated intent (`ai_origin_session_id`) from a Wisp
+  // session is held to the session's delegation ceiling at release too — the
+  // approval wait can outlive the grant, and the durable worker has no live
+  // chat gate. Ordinary sessions pass unchanged after one by-id session read;
+  // intents with no chat origin never load the Wisp module. On success the
+  // release runs under the ceiling-narrowed auth. Before the caller-verification
+  // consume, so a refusal never spends that single-use grant.
+  if (intent.aiOriginSessionId) {
+    const { checkWispCeilingForRelease } = await import('../wisp/releaseCeiling');
+    const wisp = await checkWispCeilingForRelease(intent, revalidation.auth);
+    if (!wisp.ok) return wisp;
+    revalidation = { ...revalidation, auth: wisp.auth };
+  }
+  // Caller verification (#6354 W05) runs LAST: only an intent that passed
+  // every other release check may spend the caller's single-use grant.
+  return consumeCallerVerificationForRelease(intent, revalidation);
+}
+
+/**
+ * Caller verification W05 (#6354): the consume step for the two protected M365
+ * identity actions, after every RBAC / org / digest / authority check has
+ * passed and AFTER the caller already won the `approved -> executing` CAS.
+ *
+ *  - Agent-originated or requester-less protected intents refuse
+ *    (`technician_mismatch`): a verified caller authorizes a human technician.
+ *  - An intent without a pinned target (created before W05, or tampered)
+ *    refuses (`subject_unmatched`); nothing is resolved from its UPN.
+ *  - The gate consumes in its own committed transaction. A pre-consume
+ *    refusal leaves the grant untouched; a same-intent retry gets the grant it
+ *    already consumed back; a different intent can never spend it.
+ *
+ * Every refusal is the typed `caller_verification_required` failure carrying
+ * the gate's payload in `details.requiresCallerVerification` — never a retry.
+ * The pinned connection being gone is `connection_unavailable` (nothing sent).
+ */
+async function consumeCallerVerificationForRelease(
+  intent: ActionIntent,
+  revalidation: Extract<IntentReleaseRevalidation, { ok: true }>,
+): Promise<IntentReleaseRevalidation> {
+  const action = callerAction(intent.actionName);
+  if (!action) return revalidation;
+  let requiredTier = 2;
+  const refusal = (reason: CallerVerificationRefusal): IntentReleaseRevalidation => ({
+    ok: false,
+    errorCode: CALLER_VERIFICATION_REQUIRED_CODE,
+    details: {
+      requiresCallerVerification: {
+        orgId: intent.orgId, contactId: null, action, requiredTier, reason, latest: null,
+      },
+    },
+  });
+  try {
+    // Short org-filtered system reads, between DB contexts (the gate itself
+    // escapes into its own transactions and commits the consume).
+    const backend = await runOutsideDbContext(() => withSystemDbAccessContext(async () => {
+      const policy = await getEffectivePolicy(intent.orgId);
+      requiredTier = action === 'reset_password' ? policy.requiredTierResetPassword : policy.requiredTierDisableUser;
+      if (!intent.targetConnectionRef) return null;
+      return loadPinnedCallerBackend(intent.orgId, intent.targetConnectionRef);
+    }, 'callerVerification.release.prepare'));
+    if (!intent.requestedByUserId || intent.requestingAgentRunId) return refusal('technician_mismatch');
+    if (!intent.targetEntraTenantId || !intent.targetEntraOid || !backend) return refusal('subject_unmatched');
+    await requireCallerVerification({
+      orgId: intent.orgId, action,
+      target: { entraTenantId: intent.targetEntraTenantId, entraOid: intent.targetEntraOid },
+      backendTenantId: backend.tenantId,
+      technicianUserId: intent.requestedByUserId,
+      intentId: intent.id,
+      mode: 'consume',
+    });
+  } catch (error) {
+    if (error instanceof CallerVerificationRequiredError) {
+      return {
+        ok: false,
+        errorCode: CALLER_VERIFICATION_REQUIRED_CODE,
+        details: { requiresCallerVerification: error.payload },
+      };
+    }
+    if (error instanceof CallerVerificationValidationError && error.code === 'connection_not_ready') {
+      return { ok: false, errorCode: 'connection_unavailable', details: { reason: error.message } };
+    }
+    throw error;
+  }
+  return revalidation;
+}
+
+async function revalidateApprovedIntentCore(
+  intent: ActionIntent,
+  winningApproval: { boundArgumentDigest: string | null } | null,
+): Promise<IntentReleaseRevalidation> {
   // Wave 5 Part B (#3827): a policy-decided intent has NO approval_requests
   // row by construction — `runAuthorizeTransaction` (policyDecide.ts) CASes
   // straight to `approved` and NEVER inserts one, so `winningApproval` being
@@ -366,9 +471,27 @@ export async function revalidateApprovedIntentForRelease(
   // is fixed at 3 by construction (createActionIntent only accepts Tier-3
   // external bindings).
   const isExternalTool = !!intent.toolSourceToolId;
-  if (isExternalTool) {
+  // W5 PR C (#5220): an INVOKED-FLOW intent has no registry entry either. Its
+  // binding (flow + publication) is revalidated against the live flow by the
+  // worker's flow-tool branch (`flows/flowToolRelease.ts`), atomically with
+  // the run insert; here only its shape is asserted, so a flow tool name never
+  // reaches `getToolTier` (which would fail it as `tier_escalated`).
+  const isInvokedFlow = !!intent.invokedFlowId || isFlowToolName(intent.actionName);
+  if (isInvokedFlow) {
+    if (!intent.invokedFlowId || !isFlowToolName(intent.actionName) || !intent.toolRevision?.startsWith('flowpub:')) {
+      return { ok: false, errorCode: 'flow_tool_changed', details: { reason: 'malformed invoked-flow binding' } };
+    }
+  } else if (isExternalTool) {
     const binding = await revalidateExternalToolBinding(intent);
     if (!binding.ok) return binding;
+  } else if (isFlowBuiltinIntent(intent)) {
+    // Tool catalog W05 (#5220), Decision 12: a flow built-in step (an
+    // http_request write) is not a registered tool — its tier is its own
+    // `tierFor` on the stored arguments, and must not exceed the approved tier.
+    const currentTier = flowBuiltinTierFor(intent.actionName as Parameters<typeof flowBuiltinTierFor>[0], intent.arguments);
+    if (currentTier > intent.riskTier) {
+      return { ok: false, errorCode: 'tier_escalated', details: { currentTier, intentRiskTier: intent.riskTier } };
+    }
   } else {
     const currentTier = getToolTier(intent.actionName);
     if (currentTier === undefined || currentTier > intent.riskTier) {
@@ -394,13 +517,39 @@ export async function revalidateApprovedIntentForRelease(
   // where it gets there first (a policy-decided intent, or a future caller
   // that skips this step).
   let auth: AuthContext | null;
-  try {
-    auth = await buildAuthContextForIntent(intent);
-  } catch (error) {
-    if (error instanceof IntentScopeLostError) {
-      return { ok: false, errorCode: error.code, details: { reason: error.message } };
+  if (isMcpOriginIntent(intent)) {
+    // B-W04 (#6158, D-B26): rebuild from the live origin credential directly
+    // (not via buildAuthContextForIntent's null-collapsing branch) to keep the
+    // specific errorCode, then re-run the creation gates against live state.
+    // RBAC and the governance site ceiling below still run, unchanged.
+    const { rebuildMcpOriginAuthContext, checkMcpOriginReleaseAuthority } = await import('../mcpPrincipalAuth');
+    const rebuilt = await rebuildMcpOriginAuthContext(intent);
+    if ('error' in rebuilt) {
+      return { ok: false, errorCode: rebuilt.error };
     }
-    throw error;
+    const authority = checkMcpOriginReleaseAuthority(intent, rebuilt);
+    if (!authority.ok) {
+      return { ok: false, errorCode: authority.errorCode };
+    }
+    auth = rebuilt.auth;
+  } else if (intent.requestingFlowRunId) {
+    // Tool catalog W04 (#5219): rebuild the RUN's flow principal directly
+    // (not via buildAuthContextForIntent's null-collapsing branch) so the
+    // refusal reason survives into the audit trail.
+    const authority = await checkFlowReleaseAuthority(intent);
+    if (!authority.ok) {
+      return { ok: false, errorCode: 'actor_invalid', details: { reason: authority.code } };
+    }
+    auth = authority.auth;
+  } else {
+    try {
+      auth = await buildAuthContextForIntent(intent);
+    } catch (error) {
+      if (error instanceof IntentScopeLostError) {
+        return { ok: false, errorCode: error.code, details: { reason: error.message } };
+      }
+      throw error;
+    }
   }
   if (!auth) {
     return { ok: false, errorCode: 'actor_invalid' };
@@ -438,6 +587,25 @@ export async function revalidateApprovedIntentForRelease(
     return { ok: true, auth };
   }
 
+  // (e') Tool catalog W04 (#5219): a FLOW-originated intent is likewise never
+  // checked against user RBAC (checkToolPermission denies automation
+  // principals as its first statement). Its release authority is structural:
+  // the dispatch claim (services/flows/intentClaim.ts) re-proved, under lock,
+  // that the run is still parked on this intent, the flow is enabled on the
+  // run's publication, the delegator still holds what they delegated and the
+  // step still matches its pin; (c) rebuilt the run's flow principal and
+  // refused an org the flow does not own. Here only the structural
+  // consistency of that rebuild is asserted, and an external step reloads its
+  // descriptor under the flow principal (owner predicate + kill switch).
+  if (intent.requestingFlowRunId) {
+    const principal = auth.principal;
+    if (principal?.kind !== 'flow' || principal.runId !== intent.requestingFlowRunId || auth.orgId !== intent.orgId) {
+      return { ok: false, errorCode: 'actor_invalid', details: { reason: 'flow_principal_mismatch' } };
+    }
+    if (isExternalTool) return revalidateExternalToolForActor(intent, auth);
+    return { ok: true, auth };
+  }
+
   // (f) Site / exact-device ceiling on ORG-WIDE GOVERNANCE intents — the
   // release-time twin of the raise gate in `createActionIntent`.
   //
@@ -469,6 +637,16 @@ export async function revalidateApprovedIntentForRelease(
   // The actor must STILL hold the specific RBAC permission the tool
   // requires, checked against the rebuilt `auth` from (c) — not the caller's
   // original, now possibly stale, permission check.
+  if (isInvokedFlow) {
+    // W5 PR C: starting a Tier ≥ 2 flow is `automations.write` (the chat gate
+    // applied it at creation). The APPROVER, who becomes the run's triggerer,
+    // is re-authorized per step by the worker's flow-tool branch.
+    const permissionDenial = await checkPermissionRequirements(auth, [{ resource: 'automations', action: 'write' }]);
+    if (permissionDenial) {
+      return { ok: false, errorCode: 'rbac_denied', details: { reason: permissionDenial } };
+    }
+    return { ok: true, auth };
+  }
   if (isExternalTool) {
     // Tool catalog W01 PR B (#5216): `checkToolPermission` keys on the core
     // registry and would deny a qualified name outright. External tools

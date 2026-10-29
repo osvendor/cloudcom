@@ -2,12 +2,13 @@ package unifi
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/breeze-rmm/agent/internal/httputil"
 )
 
 func TestConfigRetryAfter(t *testing.T) {
@@ -59,17 +60,18 @@ func TestFetchConfigsPreservesOverloadRetryAfter(t *testing.T) {
 				w.WriteHeader(status)
 			}))
 			defer srv.Close()
-			_, err := fetchConfigs(context.Background(), CollectorDeps{APIBaseURL: func() string { return srv.URL }, AgentID: "a", HTTP: srv.Client()})
-			var got *configFetchStatusError
-			if !errors.As(err, &got) || got.status != status {
-				t.Fatalf("unexpected error %v", err)
+			now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+			_, err := fetchConfigs(context.Background(), CollectorDeps{APIBaseURL: func() string { return srv.URL }, AgentID: "a", HTTP: srv.Client(), now: func() time.Time { return now }, rnd: func() float64 { return 0 }})
+			if err == nil {
+				t.Fatal("expected status error")
 			}
-			want := time.Duration(0)
+			at, ok := httputil.RetryAtFrom(err)
 			if status == 429 || status == 503 {
-				want = 2 * time.Minute
-			}
-			if got.retryAfter != want {
-				t.Fatalf("retry delay %v want %v", got.retryAfter, want)
+				if !ok || !at.Equal(now.Add(2*time.Minute)) {
+					t.Fatalf("retry deadline %v (%v), want two minutes", at, ok)
+				}
+			} else if ok {
+				t.Fatalf("non-overload status acquired retry hint: %v", at)
 			}
 		})
 	}

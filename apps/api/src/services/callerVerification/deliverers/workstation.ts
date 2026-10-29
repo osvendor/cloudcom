@@ -23,7 +23,7 @@ import { and, eq, gt } from 'drizzle-orm';
 import { db, assertInTransaction, runOutsideDbContext, withSystemDbAccessContext } from '../../../db';
 import { deviceCommands, devices, organizations } from '../../../db/schema';
 import { callerVerifications as v } from '../../../db/schema/callerVerification';
-import { callerVerificationEnabled } from '../../../config/env';
+import { callerVerificationEnabled, callerVerificationWorkstationEnabled } from '../../../config/env';
 import { assertDeviceExecuteAllowed, TrustDeniedError } from '../../partnerTrust.commands';
 import { ParkedDeviceCommandRefusedError } from '../../unassignedPool/deliveryEligibility';
 import { insertQueuedCommandInTransaction } from '../../commandQueueInsert';
@@ -97,6 +97,8 @@ export async function prepareWorkstationVerification(row: VerificationRow): Prom
     reverseCode: row.reverseCode,
     choices,
     timeoutMs: Math.max(WORKSTATION_TIMEOUT_MIN_MS, Math.min(WORKSTATION_TIMEOUT_MAX_MS, lifetimeMs)),
+    // A late-claimed command must not restart a full countdown (#8668).
+    deadlineAt: row.expiresAt.toISOString(),
   });
   // A label the card cannot carry (empty technician name, over-long username)
   // is a request error, not a 500.
@@ -140,7 +142,9 @@ const system = <T>(fn: () => Promise<T>, label: string) =>
 export async function deliverWorkstation(verificationId: string): Promise<void> {
   // New prompts are not pushed while the feature is off; the pending row then
   // expires through the publisher. Results already issued are still applied.
-  if (!callerVerificationEnabled()) return;
+  // The workstation tier has its own dark flag: a row created before it went
+  // dark is left to expire (never pushed).
+  if (!callerVerificationEnabled() || !callerVerificationWorkstationEnabled()) return;
   const [row] = await system(() => db.select({
     id: v.id, commandId: deviceCommands.id, payload: deviceCommands.payload, agentId: devices.agentId,
   }).from(v)
@@ -167,7 +171,9 @@ export async function deliverWorkstation(verificationId: string): Promise<void> 
   const claim = await system(() => claimPendingCommandForDelivery(row.commandId), 'callerVerification.deliverWorkstation.claim');
   if (claim.status !== 'claimed') return;
 
-  const outcome = await dispatchCommandToAgent(row.agentId, { id: row.commandId, type: CALLER_VERIFY_COMMAND, payload });
+  // #8318 §6.4: to the agent_id read IN the claim, not `row.agentId` read
+  // before it (a reattach or re-enroll may have committed since).
+  const outcome = await dispatchCommandToAgent(claim.agentId, { id: row.commandId, type: CALLER_VERIFY_COMMAND, payload });
   if (outcome.status === 'sent' || outcome.status === 'indeterminate') {
     // Indeterminate: the frame may have reached the agent. Releasing it could
     // show a second prompt; the result or the expiry settles it instead.

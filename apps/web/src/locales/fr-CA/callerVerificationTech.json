@@ -170,6 +170,7 @@
       "partner": "Partenaire",
       "org": "Organisation"
     },
+    "tierCapHint": "Le niveau maximal est {{max}}. Le niveau 3 exige la vérification sur le poste de travail, qui n'est pas offerte dans cette version.",
     "ignored": "Certains paramètres sont moins stricts que la base de référence du partenaire et sont ignorés : {{fields}}",
     "readOnly": "Vous pouvez consulter cette politique, mais pas la modifier.",
     "save": "Enregistrer la politique",
@@ -206,7 +207,7 @@
     "title": "Vérification de l’appelant requise",
     "tier": "Cette action nécessite une vérification de niveau {{tier}}.",
     "verify": "Vérifier l’appelant",
-    "verifiedRetry": "Appelant vérifié. Demandez à l’assistant de réessayer.",
+    "verifiedRetry": "Appelant vérifié. Demandez à Breeze AI de réessayer.",
     "reasons": {
       "no_fresh_verification": "L’appelant n’a pas été vérifié récemment.",
       "grant_consumed": "La dernière vérification a déjà servi pour une autre action.",

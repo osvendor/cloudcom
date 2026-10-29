@@ -1,4 +1,5 @@
 import { hasSatisfiedMfa, type AuthContext } from '../middleware/auth';
+import { isAutomationPrincipal } from '../middleware/principalKind';
 
 /**
  * AI tool actions that require a session carrying the live MFA claim (#8340).
@@ -23,6 +24,16 @@ export const MFA_GATED_TOOL_ACTIONS: Readonly<Record<string, '*' | readonly stri
   remove_configuration_policy_assignment: '*',
   manage_configuration_policy: '*',
   manage_policy_feature_link: Object.freeze(['add', 'update', 'remove']),
+  // Full-control W11 (#6781, W11-D10): the writes whose REST twins carry requireMfa().
+  // routes/accessReviews.ts POST / and PATCH /:id/items/:itemId.
+  manage_access_reviews: Object.freeze(['create', 'decide_item']),
+  // routes/policyManagement/actions.ts POST /:id/deactivate.
+  manage_compliance_policies: '*',
+  // routes/pam.ts rule, org-config and signer-group writes.
+  manage_pam_rules: Object.freeze([
+    'create_rule', 'update_rule', 'delete_rule', 'set_config',
+    'create_signer_group', 'update_signer_group', 'delete_signer_group',
+  ]),
 });
 
 export const MFA_REQUIRED_CODE = 'MFA_REQUIRED';
@@ -56,7 +67,7 @@ export function isMfaGatedToolAction(toolName: string, action: string | undefine
  * behavior through `hasSatisfiedMfa`.
  */
 export function mfaGateRefusesCaller(auth: Pick<AuthContext, 'principal' | 'token'>): boolean {
-  if (auth.principal?.kind === 'ai_agent') return false;
+  if (isAutomationPrincipal(auth)) return false;
   return !hasSatisfiedMfa(auth);
 }
 

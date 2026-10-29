@@ -36,7 +36,8 @@ export type OrgMergePolicy =
   | { kind: 'derived'; note: string } // trigger-maintained; never written directly
   | { kind: 'follows-parent'; note: string } // no org_id column; rows travel with their parent
   | { kind: 'loser-shell' } // organizations itself
-  | { kind: 'blocks-merge'; note: string }; // rows FORBID the merge outright; engine refuses pre-walk — see specs/2026-08-31-s0-track-e-pam-org-merge-contract-design.md
+  | { kind: 'blocks-merge'; note: string } // rows FORBID the merge outright; engine refuses pre-walk — see specs/2026-08-31-s0-track-e-pam-org-merge-contract-design.md
+  | { kind: 'epoch-frozen'; note: string }; // PAM chain evidence: never written by a merge; stays at its loser epoch (evidence hold). Pre-walk refusal is transfer-mode dependent — see collectMergeBlockers
 
 // device_commands / user_sso_identities / sso_sessions / psa_ticket_mappings /
 // deployment_results have no org_id column of their own:
@@ -185,6 +186,18 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   // rewrites every child's qualified_name, which embeds it.
   tool_sources: { kind: 'custom', note: 'rename a loser source whose slug collides with a survivor source (suffix stays inside tool_sources_slug_chk), rewrite the affected tool_source_tools.qualified_name values, then repoint org_id — so no registration is silently dropped' },
   tool_source_tools: { kind: 'custom', note: 'repoint org_id alongside the parent source; the owner-guard constraint trigger is deferred for the merge transaction, so parent and child may move in separate statements' },
+
+  // Tool Catalog W03 (#5218). Two orgs may each own a flow with the same slug
+  // (`flows_org_slug_uq` is per-org), so a plain repoint aborts on 23505 and a
+  // dedupe-DELETE would silently destroy a draft.
+  flows: { kind: 'custom', note: 'repoint org_id; a loser flow whose slug collides with a survivor flow is renamed <slug>_m<n> first so no flow is silently dropped (flows_org_slug_uq); moved flows that name a renamed loser tool source have their step tool references rewritten (resolve phase, before mergeToolSources renames), and an ENABLED flow so rewritten is paused paused_reason=org_merged in the same statement (its live publication still names the old qualified tool; it keeps enabled_publication_seq and must be re-enabled). The resolve phase also sets cancel_requested_at on every active loser-org flow run (org and partner-wide flows alike), ends parked runs (queued/waiting/awaiting_approval with no live lease) cancelled error_code=org_merged, and leaves running runs to stop at their next checkpoint — never written cancelled under a live lease' },
+  // Tool Catalog W04 (#5219, 2027-01-06-130000-flow-runs.sql). Runs are
+  // history that stays with the source org (the ai_agent_runs decision, plan
+  // Open Decision 1); flow_versions is a plain repoint (REPOINT_TABLES).
+  flow_runs: { kind: 'leave-for-erasure', note: 'org_id is trigger-immutable (flow_runs_immutable_guard); run history stays with the source org like ai_agent_runs, and keeps the action_intents (requesting_flow_run_id, org_id) FK consistent; active loser runs are cancelled in the flows resolve phase' },
+  flow_webhook_deliveries: { kind: 'leave-for-erasure', note: 'delivery history of the source org; rows reference runs, which stay (flow_runs leave-for-erasure)' },
+  flow_usage_counters: { kind: 'leave-for-erasure', note: 'derived monthly counters; a moved org flow starts a fresh row in the survivor (one month of headroom at most)' },
+  flow_run_steps: { kind: 'leave-for-erasure', note: 'children of flow_runs (composite FK), erased with them' },
 
   // #5022 W01. Was a plain `repoint`. It still repoints org_id, but a merged
   // execution must not keep pointing at an `ai_agent_runs` row: runs are
@@ -341,6 +354,9 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   // already has (or none, falling back to the baseline). Partner baseline
   // rows have org_id NULL and are never touched by an org merge at all.
   ai_agent_schedules: { kind: 'leave-for-erasure', note: 'org override rows tighten a partner baseline for the LOSER org only; the survivor keeps its own overrides. Partner rows have org_id NULL and are not merge participants.' },
+  // Wisp W02 (#9908): an org-scoped delegation grant borrowed its grantor's
+  // authority for one org; org_id is trigger-immutable (wisp_grants_update_guard).
+  wisp_grants: { kind: 'leave-for-erasure', note: 'an org-scoped grant borrowed the grantor\'s authority for the LOSER org and its pinned revision names that org; it never follows a merge — the grantor turns Wisp on for the survivor again. Partner-wide grants have org_id NULL and are not merge participants.' },
   // ai_agent_fix_watches (Wave 6 PR 2, #3828): a fix-held watch is per-run
   // HISTORY tied to a specific ai_agent_runs row that itself never follows
   // an org merge (see ai_agent_runs above) — repointing the watch while its
@@ -363,6 +379,8 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   // org — same "history stays put" decision as ai_agent_fix_watches /
   // ai_agent_runs above, not a separate call.
   ai_agent_op_evidence: { kind: 'leave-for-erasure', note: 'evidence rows are historical copies of outcomes tied to runs/watches that stay with the source org (ai_agent_runs disposition); rows die with the loser shell' },
+  // ai_memory_blocks: deliberately absent — no `org_id` column (owner_org_id); owner rows cascade by FK; see migration 2027-01-04-110100-ai-memory-blocks.sql header (Wisp W03, w00 A9). A survivor repoint of
+  // org-owned blocks is a possible later enhancement; today the loser's blocks die with the loser shell.
   // AI Suggested Fixes W1. fix_outcomes: each row is one historical attempt in
   // the org it ran in; restamping would double-count or re-attribute proof.
   // fix_memory: derived; org rows are recomputed from fix_outcomes, partner
@@ -422,6 +440,10 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   // own grant wins and the loser's is dropped, exactly like ai_budgets. Partner
   // CEILING rows have org_id NULL and are not merge participants at all.
   ai_script_policies: { kind: 'keep-survivor' }, // verified: ai_script_policies_org_uq (org_id) WHERE org_id IS NOT NULL
+  // AI device file read policy (#8852): org override row is singleton org config
+  // (ai_data_policies_org_uq, total UNIQUE on org_id); survivor's wins. Partner
+  // default rows have org_id NULL and are not merge participants.
+  ai_data_policies: { kind: 'keep-survivor' }, // verified: ai_data_policies_org_uq (org_id)
   // llm_egress_events (#3922 phase 2, landed on main 2026-08-27): per-request
   // egress telemetry — which org attempted which outbound LLM dial, allowed or
   // blocked. Repointing would attribute the loser org's egress history to the
@@ -453,18 +475,27 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   ai_usage_charge_runs: { kind: 'leave-for-erasure', note: 'per-(org, month) close marker; unique (org_id, period_start)' },
 
   // Durable PAM actuation evidence (Track E org-merge contract,
-  // specs/2026-08-31-s0-track-e-pam-org-merge-contract-design.md): never
-  // re-tenanted, never destroyed, never bypassed — a loser org holding ANY
-  // row is refused outright. Repoint is physically unreachable
-  // (pam_actuation_results: UPDATE revoked from breeze_app + unconditional
-  // 42501 trigger; the composite (id, org_id) FK chain has no ON UPDATE
-  // CASCADE), and leave-for-erasure would break
-  // pam_actuations(device_id, org_id) -> devices(id, org_id) the moment the
-  // devices repoint runs — which devices_pam_history_move_guard RAISEs 23514
-  // on anyway. The engine refuses BEFORE the walk (collectMergeBlockers), so
-  // neither trigger can fire mid-merge.
-  pam_actuations: { kind: 'blocks-merge', note: 'durable PAM lifecycle evidence is source-frozen; any loser row refuses the merge — devices_pam_history_move_guard applied at org granularity' },
-  pam_actuation_results: { kind: 'blocks-merge', note: 'append-only PAM evidence (UPDATE revoked + unconditional RAISE); cannot exist without a pam_actuations parent — listed for registry completeness and preview counting' },
+  // specs/2026-08-31-s0-track-e-pam-org-merge-contract-design.md; PAM
+  // ownership epochs W6 #8208, spec §8): never re-tenanted, never destroyed,
+  // never bypassed. Repoint is physically unreachable (pam_actuation_results:
+  // UPDATE revoked from breeze_app + unconditional 42501 trigger; the chain is
+  // anchored to its ownership epoch by breeze_pam_chain_epoch_guard).
+  //
+  // `epoch-frozen` (non-mutating): the rows stay at the loser's org_id and
+  // epoch and keep the loser as an evidence-hold shell. Pre-walk refusal
+  // (collectMergeBlockers) depends on the transfer mode: OFF — any loser row
+  // refuses, exactly the former blocks-merge; ON (PAM_OWNERSHIP_EPOCH_TRANSFER
+  // + the database switch) — only an actuation that is not
+  // pam_actuation_is_closed() refuses. devices_pam_history_move_guard applies
+  // the same rule per device at the devices repoint (TOCTOU backstop).
+  pam_actuations: { kind: 'epoch-frozen', note: 'durable PAM lifecycle evidence stays at its loser epoch under an evidence hold; refused while any loser actuation is not closed (transfer on) or exists at all (transfer off)' },
+  pam_actuation_results: { kind: 'epoch-frozen', note: 'append-only PAM evidence (UPDATE revoked + unconditional RAISE) follows its actuation: stays with the held loser shell; refusal is decided on pam_actuations (transfer on) or on any row (transfer off)' },
+  // Un-actuated requests follow their device into the survivor (the devices
+  // restamp trigger, cause org_merge) after the resolve half expires the live
+  // ones (OD4); actuated ones are frozen evidence and stay with the held
+  // shell. See orgMergeCustomExecutors.ts resolveElevationRequests.
+  elevation_requests: { kind: 'custom', note: 'resolve: expire live un-actuated loser requests (OD4, ownership_changed); move: none — devices_restamp_unactuated_elevation_requests carries un-actuated rows with their device, actuated rows stay at their epoch under the evidence hold' },
+  elevation_audit: { kind: 'derived', note: 'follows its request: devices_restamp_unactuated_elevation_requests restamps the audit rows of every request it moves (composite (elevation_request_id, org_id) FK, deferred for the merge); rows of requests that stay remain with the held loser shell' },
 
   // partner_export_configuration_org_state is trigger-maintained (SECURITY
   // DEFINER triggers on the policy tables regenerate it — verified in
@@ -495,6 +526,12 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   // 42501 mid-merge, after the loser org was already fenced.
   agent_health_observations: { kind: 'derived', note: 'org_id moves via the (device_id, org_id) -> devices(id, org_id) ON UPDATE CASCADE FK; UPDATE is revoked from breeze_app (append-only evidence)' },
   software_inventory_observations: { kind: 'derived', note: 'org_id moves via the (device_id, org_id) -> devices(id, org_id) ON UPDATE CASCADE FK; UPDATE is revoked from breeze_app (append-only evidence)' },
+  // #6263 W03a (DECISION W03-c). A rule's org_id/partner_id are a trigger-kept
+  // copy of its parent set's: yara_rules_inherit_owner overwrites them on every
+  // write, and yara_rule_sets_propagate_owner rewrites them when the parent's
+  // owner changes. A direct repoint would be silently reverted to the parent's
+  // org, so the merge never writes this table — the yara_rule_sets repoint moves it.
+  yara_rules: { kind: 'derived', note: 'owner columns copied from yara_rule_sets by trigger; the parent repoint propagates (yara_rule_sets_propagate_owner)' },
 
   // No org_id column — tenancy via parent rows, which we re-point:
   ...buildFollowsParentEntries(),
@@ -569,6 +606,20 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   // are in one window, the loser's row collides with the survivor's and is
   // dropped; the survivor stays in the window either way.
   migration_window_orgs: { kind: 'repoint-dedupe', key: ['window_id'] },
+  // Wisp W04 (#9910): wisp_thread_sessions links a session to its thread; the
+  // row's org_id is the session's org (composite (session_id, org_id) FK to
+  // ai_sessions, which is itself repointed), so it follows the session. The
+  // key is the PK (thread_id, session_id); session_id is globally unique, so a
+  // collision cannot happen and the dedupe half always drops nothing.
+  wisp_thread_sessions: { kind: 'repoint-dedupe', key: ['thread_id', 'session_id'] },
+  // wisp_thread_attachments' org_id is its artifact's org (composite
+  // (artifact_id, org_id) FK to ai_run_artifacts). Attachment artifacts are
+  // session-anchored or unanchored (run_id NULL), which moveAiRunArtifacts
+  // re-points, so the pair stays consistent under SET CONSTRAINTS ALL
+  // DEFERRED; (thread_id, artifact_id) is unique and unaffected by org_id.
+  // wisp_threads (focus_org_id) has no org_id column and is not a merge
+  // participant: a loser focus is cleared by its FK when the shell is erased.
+  wisp_thread_attachments: { kind: 'repoint' },
   // #6592: Gmail mailbox connections carry org_id; repoint them to the survivor
   // instead of letting the FK cascade delete them with the loser org. Plain
   // repoint (no dedupe): the only unique is (partner_id, mailbox_address), which
@@ -589,6 +640,7 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   // deferrable (org_id, offering_partner_id) composite FK holds after the repoint.
   ai_model_assignments: { kind: 'repoint-dedupe', key: ['surface', 'role'], keyWhere: '{org_id} IS NOT NULL' },
   ai_budget_alert_events: { kind: 'repoint-dedupe', key: ['period', 'period_key', 'threshold_pct'] }, // verified: ai_budget_alert_events_org_period_rung_uidx (org_id, period, period_key, threshold_pct)
+  ai_credit_debits: { kind: 'repoint' }, // #9451: undelivered/failed credit debits are obligations, so they follow the survivor (leave-for-erasure would delete them unbilled with the loser shell). idempotency_key is GLOBALLY unique, so a repoint can never collide; no composite FKs. Merges are same-partner, so the billed partner is unchanged.
   ai_budget_reservations: { kind: 'repoint-dedupe', key: ['idempotency_key'] }, // verified: ai_budget_reservations_org_idempotency_uidx (org_id, idempotency_key). Its composite (session_id, org_id) FK to ai_sessions is DEFERRABLE INITIALLY IMMEDIATE so the merge can re-point ai_sessions and this table in separate statements.
   client_ai_usage: { kind: 'repoint-dedupe', key: ['client_user_id', 'period', 'period_key'] }, // verified: client_ai_usage_bucket_uniq (org_id, client_user_id, period, period_key)
   contact_external_links: { kind: 'repoint-dedupe', key: ['system', 'external_id'] }, // verified: contact_external_links_uniq (org_id, system, external_id)
@@ -626,6 +678,23 @@ const SPECIAL: Record<string, OrgMergePolicy> = {
   // child may repoint in separate statements under SET CONSTRAINTS ALL
   // DEFERRED.
   ticket_checklist_template_items: { kind: 'repoint' },
+  // Business-hours calendars (#8973 W4): org-owned calendars follow their org
+  // (spec §8.2). No org-axis unique exists (business_calendars_partner_name_uq
+  // is partner rows only), so a plain repoint cannot collide. The children copy
+  // the owner pair; their owner guards are DEFERRABLE INITIALLY IMMEDIATE, and
+  // the revision/interval immutability triggers allow an org_id-only restamp
+  // (Gate B15), so tickets that snapshotted a loser revision keep a valid one.
+  business_calendars: { kind: 'repoint' },
+  business_calendar_revisions: { kind: 'repoint' },
+  business_calendar_intervals: { kind: 'repoint' },
+  business_calendar_holidays: { kind: 'repoint' },
+  // Ticket routing rules (#8883 W5): org-owned rules follow their org. No
+  // org-axis unique exists on name or (org_id, position) — ordering is
+  // (position, id) — so a plain repoint cannot collide. The same-partner
+  // reference guard is a DEFERRABLE INITIALLY IMMEDIATE constraint trigger and
+  // a merge stays inside one partner, so it checks the final state and passes.
+  ticket_routing_rules: { kind: 'repoint' },
+  ticket_routing_rule_org_links: { kind: 'repoint-dedupe', key: ['rule_id'] }, // verified: ticket_routing_rule_org_links_rule_org_uq (rule_id, org_id)
   delegant_m365_connections: { kind: 'repoint-dedupe', key: ['customer_label'] }, // verified: delegant_m365_org_customer_uniq (org_id, customer_label)
   remediation_suggestions: { kind: 'repoint-dedupe', key: ['source_type', 'source_id'] }, // superset of its four partial uniques (org_id, source_type, source_id, {script_id|script_template_id|playbook_id|target_type}); derived rows, over-dropping is safe
   // service_deliverables_org_contract_name_uq (org_id, COALESCE(contract_id, nil), name)
@@ -778,6 +847,11 @@ const REPOINT_TABLES: readonly string[] = [
   "agent_rollback_directives",
   // agent_rollback_events removed (#4371 fixup): reclassified 'leave-for-erasure'
   // in SPECIAL above — breeze_app has no UPDATE on this append-only table.
+  // agreement_request_recipients / agreement_requests (#8865 W1b): composite
+  // (…, org_id) FKs are DEFERRABLE, so parent and child org_id move in separate
+  // statements; the only unique key, (request_id, email), cannot collide across orgs.
+  "agreement_request_recipients",
+  "agreement_requests",
   "ai_action_plans",
   // ai_invocations (#7600 W02) is append-only, but its trigger admits exactly
   // the org_id-only UPDATE this policy issues while the loser org is fenced
@@ -785,6 +859,9 @@ const REPOINT_TABLES: readonly string[] = [
   // (org_id) grant for it — so usage history follows the merged client
   // (spec §5.5; chargeback W10).
   "ai_invocations",
+  // AI model registry W08b (#7606): legacy AI model config archive (history,
+  // partner axis); org-level rows follow the merged client.
+  "ai_model_registry_legacy_archive",
   "ai_screenshots",
   "ai_sessions",
   // AI chargeback (#7608): billed history and unbilled charges follow the
@@ -866,6 +943,9 @@ const REPOINT_TABLES: readonly string[] = [
   "caller_verifications",
   "capacity_predictions",
   "capacity_thresholds",
+  "circuit_served_sites",
+  "circuit_terminations",
+  "circuits",
   "cis_baseline_results",
   "cis_baselines",
   "cis_remediation_actions",
@@ -884,6 +964,7 @@ const REPOINT_TABLES: readonly string[] = [
   "contract_hour_periods",
   "contract_lines",
   "contract_renewal_notices",
+  "contract_skipped_billing_periods",
   "contract_template_versions",
   "contract_templates",
   "contracts",
@@ -984,8 +1065,22 @@ const REPOINT_TABLES: readonly string[] = [
   "edr_detections",
   "edr_endpoints",
   "edr_tenants",
-  "elevation_audit",
-  "elevation_requests",
+  // elevation_requests / elevation_audit: see SPECIAL (PAM ownership epochs W6).
+  // Endpoint live chat (#8743 W03): plain repoints under SET CONSTRAINTS ALL
+  // DEFERRED; the (conversation_id, org_id) and (device_id, org_id) composite
+  // FKs re-resolve at commit. The only unique keys are (conversation_id,
+  // client_nonce) and the one-live-chat-per-device partial index, neither of
+  // which carries org_id, so a repoint cannot collide.
+  "endpoint_conversation_messages",
+  "endpoint_conversations",
+  // Endpoint messaging (#8742 W02): plain repoints under SET CONSTRAINTS ALL
+  // DEFERRED, so the (x, org_id) composite FKs between them re-resolve at
+  // commit. No org-scoped unique key: endpoint_messages is deliberately not
+  // unique on (org_id, batch_id), because a cross-org send's two rows would
+  // collide in the survivor.
+  "endpoint_message_deliveries",
+  "endpoint_message_receipts",
+  "endpoint_messages",
   "escalation_policies",
   // event_delivery_receipts (durable dispatch bookkeeping, #4117, landed on
   // main 2026-08-27 — the same PR dropped event_bus_events, which used to be
@@ -997,6 +1092,15 @@ const REPOINT_TABLES: readonly string[] = [
   "fleet_finding_devices",
   "fleet_remediation_run_targets",
   "fleet_remediation_runs",
+  // flow_versions (Tool Catalog W04, #5219, 2027-01-06-130000-flow-runs.sql):
+  // publications follow their flow; partner-wide rows (org_id NULL) untouched.
+  // The DEFERRED flow_versions_owner_guard_trg checks at commit that each
+  // row's owner equals its parent flow's (flows moves in its own custom move
+  // half), and flow_versions_immutable_guard lets the owner columns move. No
+  // unique key carries org_id (flow_versions_flow_seq_uq is per flow), so a
+  // plain repoint cannot collide. The resolveFlows org_merged pause keeps
+  // enabled_publication_seq, which still names a row that moved with it.
+  "flow_versions",
   "group_membership_log",
   "hardware_alert_retirement_outbox",
   "huntress_agents",
@@ -1135,9 +1239,14 @@ const REPOINT_TABLES: readonly string[] = [
   // see its note there.
   "script_tags",
   "scripts",
+  // #6960 W03: plain repoint. Uniques are (device_id, vendor) and
+  // (org_id, vendor, vendor_endpoint_id) for vendor_only rows; vendor_endpoint_id is
+  // a Breeze row id (huntress_agents.id), unique across orgs, so no collision.
+  "security_agent_device_status",
   "security_policies",
   "security_posture_org_snapshots",
   "security_posture_snapshots",
+  "security_scan_sweeps",
   "security_scans",
   "security_status",
   "security_threats",
@@ -1249,6 +1358,13 @@ const REPOINT_TABLES: readonly string[] = [
   // Children of trust_pages: ON DELETE CASCADE removes them with the loser's page in the custom executor; a plain repoint here only ever sees zero rows and keeps the registry total.
   "trust_page_documents",
   "trust_page_snapshots",
+  // Trust Center W2 (#8770 W02a): same reasoning — each cascades with the loser's page
+  // (access_tokens via access_requests).
+  "trust_page_access_requests",
+  "trust_page_access_tokens",
+  "trust_page_declarations",
+  "trust_page_faq_items",
+  "trust_page_subprocessors",
   "tunnel_sessions",
   "unifi_clients",
   "unifi_collectors",
@@ -1261,6 +1377,33 @@ const REPOINT_TABLES: readonly string[] = [
   "users",
   "vault_snapshot_inventory",
   "webhooks",
+  // Wisp W05a (#9911). Partner-level rows (org_id NULL) never match the
+  // `WHERE org_id = <loser>` repoint. No unique key is org-scoped in a way a
+  // merge can collide on: a live concern's (partner, org, subject_kind,
+  // subject_id) names a subject that lives in exactly one org, the signature
+  // index is (partner_id, signature), recipients are unique on
+  // (concern_id, grant_id), and watches have no unique beyond the PK. A watch
+  // or recipient of an org-scoped LOSER grant follows the org while the grant
+  // stays behind (leave-for-erasure): the survivor is outside that grant's
+  // ceiling, so the wake path skips it, and erasing the loser shell deletes
+  // the grant and, by ON DELETE CASCADE, those rows.
+  "wisp_concern_recipients",
+  "wisp_concerns",
+  // Wisp W08a (#9914). Partner-level links (org_id NULL) never match the
+  // repoint; the only unique key is (thread_id, entity_kind, entity_id), which
+  // has no org_id in it, so a repoint cannot collide. The thread is
+  // partner-axis and not a merge participant.
+  "wisp_thread_links",
+  // Wisp companion W02a (#10212). Same shape: partner-level posts (org_id
+  // NULL) never match the repoint, and the only unique key is
+  // (thread_id, dedupe_key), which has no org_id in it, so a repoint cannot
+  // collide.
+  "wisp_thread_posts",
+  "wisp_watches",
+  // #6263 W03a. Plain org XOR partner rule set; its AFTER UPDATE trigger
+  // yara_rule_sets_propagate_owner rewrites the child yara_rules owner columns
+  // (yara_rules is `derived` in SPECIAL). Built-in rows (org_id NULL) never match.
+  "yara_rule_sets",
 ];
 
 export function getOrgMergePolicies(): ReadonlyMap<string, OrgMergePolicy> {

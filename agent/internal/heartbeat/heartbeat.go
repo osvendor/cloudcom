@@ -40,6 +40,7 @@ import (
 	"github.com/breeze-rmm/agent/internal/helper"
 	"github.com/breeze-rmm/agent/internal/hostpolicy"
 	"github.com/breeze-rmm/agent/internal/httputil"
+	"github.com/breeze-rmm/agent/internal/inbox"
 	"github.com/breeze-rmm/agent/internal/ipc"
 	"github.com/breeze-rmm/agent/internal/logging"
 	"github.com/breeze-rmm/agent/internal/mgmtdetect"
@@ -52,6 +53,8 @@ import (
 	"github.com/breeze-rmm/agent/internal/patching"
 	"github.com/breeze-rmm/agent/internal/peripheral"
 	"github.com/breeze-rmm/agent/internal/privilege"
+	"github.com/breeze-rmm/agent/internal/prompthost"
+	"github.com/breeze-rmm/agent/internal/promptidentity"
 	"github.com/breeze-rmm/agent/internal/remote/desktop"
 	"github.com/breeze-rmm/agent/internal/remote/desktop/x11"
 	"github.com/breeze-rmm/agent/internal/remote/tools"
@@ -327,6 +330,11 @@ type SecurityCapabilities struct {
 	// (emission lands in a later wave): send retainState only to a beat
 	// declaring exactly 1; any other value gets the legacy response shape.
 	RetainStateProtocolVersion int `json:"retainStateProtocolVersion,omitempty"`
+	// PromptIdentityProtocolVersion (#10190 W03) declares that this build
+	// caches HeartbeatResponse.PromptIdentity and fetches its logo from
+	// /agents/:id/prompt-identity/logo. The API sends the block only to a
+	// beat declaring exactly 1.
+	PromptIdentityProtocolVersion int `json:"promptIdentityProtocolVersion,omitempty"`
 }
 
 type PamReconciliationStatus struct {
@@ -377,6 +385,12 @@ type HeartbeatResponse struct {
 	// RetainState (#8258) lists features the server made no decision about this
 	// beat (keep current state); see retain_state.go. Absent = today's semantics.
 	RetainState RetainState `json:"retainState"`
+	// PromptHost is the prompt-host kill switch (#10190); absent = nothing enabled.
+	PromptHost *PromptHostSettings `json:"promptHost,omitempty"`
+	// PromptIdentity is the MSP identity block (#10190 W03), kept raw so a
+	// malformed block never fails the rest of the response; absent = keep
+	// the last-known identity. See prompt_identity.go.
+	PromptIdentity json.RawMessage `json:"promptIdentity,omitempty"`
 }
 
 type HelperSettings struct {
@@ -406,6 +420,9 @@ type helperLifecycleController interface {
 	Done() <-chan struct{}
 	Mode() string
 	SetModeOverride(override string)
+	// SetPAMHelperHold keeps a SYSTEM helper in every signed-in session while
+	// UAC interception is enabled (#8996); a no-op in always-on mode.
+	SetPAMHelperHold(enabled bool)
 	AcquireLease(sessionID uint32, role ipc.HelperRole, opID string, ttl time.Duration) error
 	RenewLease(sessionID uint32, role ipc.HelperRole, opID string, ttl time.Duration) error
 	ReleaseLease(sessionID uint32, role ipc.HelperRole, opID string)
@@ -434,6 +451,11 @@ type Heartbeat struct {
 	endpointMessages     *messageStore
 	endpointMessagesOnce sync.Once
 	messageEventSink     func(messageEvent)
+	// Endpoint live chat (#8743): in-memory conversation store and the
+	// injectable reply-post seam (nil = post to the API; tests override it).
+	endpointChat     *chatStore
+	endpointChatOnce sync.Once
+	chatReplySink    func(chatReplyEvent) (int, error)
 	// unifiCollectorWake is signalled when configUpdate says this device has
 	// UniFi collectors (#7970); see unifi_collector_hint.go.
 	unifiCollectorWake        atomic.Pointer[func()]
@@ -448,13 +470,17 @@ type Heartbeat struct {
 	client                    *http.Client
 	clientMu                  sync.RWMutex
 	stopChan                  chan struct{}
-	metricsCol                *collectors.MetricsCollector
-	hardwareCol               *collectors.HardwareCollector
-	softwareCol               *collectors.SoftwareCollector
-	softwareObservationFn     func() (collectors.SoftwareInventoryObservationV2, error)
-	inventoryCol              *collectors.InventoryCollector
-	vpnCol                    *collectors.VPNCollector
-	changeTrackerCol          *collectors.ChangeTrackerCollector
+	// pamUnableStop closes as Stop begins, ahead of the bounded drain that
+	// precedes stopChan, so an in-flight PAM unable report is cancelled
+	// within the shutdown stage budget.
+	pamUnableStop         chan struct{}
+	metricsCol            *collectors.MetricsCollector
+	hardwareCol           *collectors.HardwareCollector
+	softwareCol           *collectors.SoftwareCollector
+	softwareObservationFn func() (collectors.SoftwareInventoryObservationV2, error)
+	inventoryCol          *collectors.InventoryCollector
+	vpnCol                *collectors.VPNCollector
+	changeTrackerCol      *collectors.ChangeTrackerCollector
 	// hardwareCollectFn / memoryCollectFn override the hardware-send path's
 	// collectors in tests; nil uses hardwareCol.CollectHardware and
 	// collectors.CollectMemoryModules. memoryCollectTimeout 0 = default.
@@ -475,6 +501,7 @@ type Heartbeat struct {
 	eventLogCol        *collectors.EventLogCollector
 	bootCol            *collectors.BootPerformanceCollector
 	reliabilityCol     *collectors.ReliabilityCollector
+	loopDefer          loopDeferral // per-route Retry-After deferral (W09, loop_deferral.go)
 	agentVersion       string
 	desktopMgr         *desktop.SessionManager
 	wsDesktopMgr       *desktop.WsSessionManager
@@ -498,18 +525,21 @@ type Heartbeat struct {
 	// commandJournal records, on disk, which server-tracked commands are
 	// executing, so a restart can report one that died with no result as
 	// failed instead of leaving its row in `sent` until the reaper (#8296).
-	commandJournal        *commandJournal
-	mu                    sync.Mutex
-	lastInventoryUpdate   time.Time
-	lastEventLogUpdate    time.Time
-	lastSecurityUpdate    time.Time
-	lastRecoveryKeysFP    string
-	pendingRecoveryKeys   []security.RecoveryKey
-	lastSessionUpdate     time.Time
-	lastPostureUpdate     time.Time
-	lastReliabilityUpdate time.Time
-	lastHardwareUpdate    time.Time // stamped at startup; gate then re-runs every 24 h
-	lastPatchUpdate       time.Time // stamped at startup; gate then re-runs every PatchScanIntervalHours
+	commandJournal      *commandJournal
+	mu                  sync.Mutex
+	lastInventoryUpdate time.Time
+	lastEventLogUpdate  time.Time
+	lastSecurityUpdate  time.Time
+	lastRecoveryKeysFP  string
+	// lastRecoveryKeysCollect is when the security tick last read the
+	// recovery protectors; see recoveryKeyCollectInterval.
+	lastRecoveryKeysCollect time.Time
+	pendingRecoveryKeys     []security.RecoveryKey
+	lastSessionUpdate       time.Time
+	lastPostureUpdate       time.Time
+	lastReliabilityUpdate   time.Time
+	lastHardwareUpdate      time.Time // stamped at startup; gate then re-runs every 24 h
+	lastPatchUpdate         time.Time // stamped at startup; gate then re-runs every PatchScanIntervalHours
 	// Hardware health (RAID/disk) collection state. hwContext/hwCancel bound
 	// in-flight collect/upload work so shutdown can cancel it; hwStarted /
 	// hwRunning / hwStopping / hwDisabled* gate dispatch (see hardware_health.go).
@@ -535,9 +565,15 @@ type Heartbeat struct {
 	patchSendFailures int
 
 	// User session helper (IPC)
-	helperToken     string // retained copy of the helper-scoped token for connect-time pushes
-	helperTokenMu   sync.RWMutex
-	sessionBroker   *sessionbroker.Broker
+	helperToken   string // retained copy of the helper-scoped token for connect-time pushes
+	helperTokenMu sync.RWMutex
+	sessionBroker *sessionbroker.Broker
+	promptHost    *prompthost.Host // on-device prompts (#10190); dormant in W02 (no kind registered or enabled)
+	// MSP identity cache and the prompt list it purges on a scope change
+	// (#10190 W03); see prompt_identity.go.
+	promptIdentity  *promptidentity.Store
+	promptListStore *inbox.Store
+	promptLogoState promptLogoFetchState
 	helperLifecycle helperLifecycleController
 	lifecycleCancel context.CancelFunc
 	shutdownTimeout time.Duration
@@ -583,9 +619,29 @@ type Heartbeat struct {
 	// PAM seams default to the real broker methods in RunPamFlow/denyConsent
 	// when nil; overridden in pam_flow_test.go.
 	pamFindSession         func(capability, targetWinSession string) *sessionbroker.Session
-	pamRequestDialog       func(session *sessionbroker.Session, id string, req ipc.PamRequestDialog, timeout time.Duration) (ipc.PamDialogResult, error)
-	pamDismissConsent      func(session *sessionbroker.Session, id string, timeout time.Duration) (ipc.PamDismissConsentResult, error)
 	pamReportLocalDecision func(requestID, decision string) error
+	pamRequestDialog       func(session *sessionbroker.Session, id string, req ipc.PamRequestDialog, timeout time.Duration) (ipc.PamDialogResult, error)
+	// pamConsoleSessionID resolves the console session for the on-demand
+	// helper spawn when the requester session is unknown. nil uses
+	// sessionbroker.GetConsoleSessionID — the same target FindCapableSession
+	// falls back to.
+	pamConsoleSessionID func() string
+	// pamReportUnable sends the "cannot act on this elevation" report (#9517);
+	// nil means reportPamUnable's real POST (sendPamElevationUnable), sent off
+	// the etwlua loop goroutine.
+	pamReportUnable   func(requestID string, unable pamUnable)
+	pamDismissConsent func(session *sessionbroker.Session, id string, timeout time.Duration) (ipc.PamDismissConsentResult, error)
+	// pamDismissConsentInstance dismisses one specific consent.exe (#8995);
+	// nil means sessionBroker.DismissPamConsentInstance.
+	pamDismissConsentInstance func(session *sessionbroker.Session, id string, instance ipc.PamConsentInstance, timeout time.Duration) (ipc.PamDismissConsentResult, error)
+	// pamPendingConsents remembers the consent.exe each request parked for
+	// technician approval was raised from, so a verified pam_apply_v2 launch
+	// can dismiss that prompt and no other (pam_approved_consent.go).
+	pamPendingConsents pendingPamConsents
+	// pamApprovedConsentQuiesceWait bounds how long an uncertain approved-
+	// prompt dismissal keeps pamActuateMu while waiting for the helper to
+	// prove it finished. Zero means pamDismissTimeout; tests shrink it.
+	pamApprovedConsentQuiesceWait time.Duration
 	// pamActuateMu serializes consent.exe actuation/dismissal so the local
 	// etwlua flow (RunPamFlow) and the remote actuate_elevation command never
 	// drive SendInput/SetThreadDesktop against the same live consent.exe prompt
@@ -620,6 +676,11 @@ type Heartbeat struct {
 	// method directly) so the helper-hosted bridge is observable in tests.
 	// Defaults to requestRevocationLeaseRenew; nil is a no-op.
 	leaseRenewRequester func(sessionID string)
+
+	// desktopICESender trickles a desktop session's late local ICE candidate
+	// (nil = end of gathering) to the API (#9182). The WebSocket client's
+	// SendDesktopICECandidate; tests substitute a recorder.
+	desktopICESender func(sessionID, startGeneration string, seq int, cand *websocket.DesktopICECandidate) error
 
 	// desktopStartFence linearizes desktop start decisions against terminal
 	// decisions: a per-session high-water generation plus an
@@ -673,6 +734,13 @@ type Heartbeat struct {
 	// executed twice when delivered via both WebSocket and heartbeat.
 	seenCommands   map[string]time.Time
 	seenCommandsMu sync.Mutex
+
+	// helperScriptsInFlight holds the command id of every script currently
+	// dispatched to a user helper (#9164) — the user-helper counterpart of the
+	// local executor's running map, which only ever sees service-path runs.
+	// A redelivery after the seenCommands window is refused against it BEFORE
+	// the restore-point checkpoint and the helper lease. Zero value is ready.
+	helperScriptsInFlight sync.Map
 
 	// commandInFlightWarnAfter overrides the wedged-worker watchdog interval
 	// in executeCommandViaPool for non-ephemeral commands; non-positive means
@@ -1106,15 +1174,16 @@ func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureStri
 
 	outboxRoot := backupResultOutboxDir()
 	h := &Heartbeat{
-		config:       cfg,
-		secureToken:  secToken,
-		client:       httpClient,
-		stopChan:     make(chan struct{}),
-		metricsCol:   collectors.NewMetricsCollector(),
-		hardwareCol:  collectors.NewHardwareCollector(),
-		softwareCol:  collectors.NewSoftwareCollectorWithVersion(version),
-		inventoryCol: collectors.NewInventoryCollector(),
-		vpnCol:       collectors.NewVPNCollector(),
+		config:        cfg,
+		secureToken:   secToken,
+		client:        httpClient,
+		stopChan:      make(chan struct{}),
+		pamUnableStop: make(chan struct{}),
+		metricsCol:    collectors.NewMetricsCollector(),
+		hardwareCol:   collectors.NewHardwareCollector(),
+		softwareCol:   collectors.NewSoftwareCollectorWithVersion(version),
+		inventoryCol:  collectors.NewInventoryCollector(),
+		vpnCol:        collectors.NewVPNCollector(),
 		changeTrackerCol: collectors.NewChangeTrackerCollector(
 			filepath.Join(config.GetDataDir(), "change_tracker_snapshot.json"),
 		),
@@ -1288,6 +1357,10 @@ func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureStri
 	// explicitly configured. macOS daemons handle desktop capture directly
 	// but still need the broker for user-context operations (run_as_user
 	// scripts and Breeze Helper launch).
+	// The MSP identity cache (#10190 W03) exists with or without the broker:
+	// it is what the device was last told, kept offline.
+	h.initPromptIdentity(config.GetDataDir())
+
 	needsBroker := cfg.UserHelperEnabled || cfg.IsService || cfg.IsHeadless
 	if needsBroker {
 		socketPath := cfg.IPCSocketPath
@@ -1297,6 +1370,20 @@ func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureStri
 		h.sessionBroker = sessionbroker.New(socketPath, h.handleUserHelperMessage)
 		h.sessionBroker.SetSessionClosedHandler(h.handleHelperSessionClosed)
 		h.sessionBroker.SetSessionAuthenticatedHandler(h.handleHelperSessionAuthenticated)
+		// The prompt list and its 24 h tombstones persist next to the endpoint
+		// messages (P5: one inbox, two files).
+		promptStore, err := inbox.Open(filepath.Join(config.GetDataDir(), promptInboxFile), inbox.PromptOptions())
+		if err != nil {
+			log.Warn("prompt inbox unreadable; starting empty", "error", err.Error())
+		}
+		h.promptListStore = promptStore
+		h.promptHost = prompthost.New(prompthost.Deps{
+			Broker:   prompthost.NewBrokerDirectory(h.sessionBroker),
+			Inbox:    &inbox.PromptInbox{Store: promptStore},
+			Identity: h.promptIdentity,
+			OSLocale: osUILocale,
+		})
+		h.sessionBroker.SetPromptSink(h.promptHost)
 		// Retain the helper-scoped token so connect-time pushes have it even after
 		// the config copy is cleared post-persist during rotation.
 		h.setHelperToken(h.config.HelperAuthToken)
@@ -1372,6 +1459,10 @@ func NewWithVersion(cfg *config.Config, version string, token *secmem.SecureStri
 	// unconditionally (not only in direct mode): the service process runs the
 	// renewals for helper-hosted sessions too.
 	h.desktopMgr.RequestRevocationLeaseRenew = h.requestRevocationLeaseRenew
+	// Trickle ICE (#9182): late local candidates of sessions hosted in this
+	// process go to the API. Unconditional for the same reason as the lease
+	// renewals: the callback only fires for sessions this process hosts.
+	h.desktopMgr.OnLocalICECandidate = h.forwardLocalICECandidate
 	// The WebSocket fallback stream renews the same lease over the same
 	// socket, and a lease-driven stop is reported like a WebRTC peer drop and
 	// ends the on-screen indicator and notice (handlers_desktop_stream.go).
@@ -1419,11 +1510,20 @@ func (h *Heartbeat) SetWebSocketClient(ws *websocket.Client) {
 		// Clear a command's in-flight journal entry only once its result is
 		// queued or already in the outbox (#8296).
 		ws.OnResultHandedOff = h.onWSResultHandedOff
+		// W09: results of journaled commands go to the outbox while the
+		// socket is down; ephemeral ones keep buffering in memory.
+		ws.PersistResultWhileDisconnected = func(c websocket.Command) bool {
+			return journalable(Command{ID: c.ID, Type: c.Type})
+		}
 		// Revocation-lease answers from the control plane. This process owns the
 		// command socket, so it performs every renewal — including for sessions
 		// whose capture actually runs in a user helper, which is told to stop
 		// over IPC (handleStopDesktop) rather than talking to the API itself.
 		ws.OnRevocationLease = h.applyRevocationLeaseAnswer
+		// Trickle ICE (#9182): late local candidates out, relayed viewer
+		// candidates in.
+		h.desktopICESender = ws.SendDesktopICECandidate
+		ws.OnDesktopICECandidate = h.onRemoteDesktopICECandidate
 	}
 }
 
@@ -1739,6 +1839,12 @@ func (h *Heartbeat) handleUserHelperMessage(session *sessionbroker.Session, env 
 		log.Debug("notify result from user helper", "uid", session.UID)
 	case ipc.TypeMessagePresented, ipc.TypeMessageAck, ipc.TypeMessageDismissed:
 		h.handleMessageEventFromHelper(session, env)
+	case ipc.TypeChatReply:
+		h.handleChatReplyFromHelper(session, env)
+	case ipc.TypeChatPresented:
+		// A chat_presented answering a live chat_open/chat_message is consumed
+		// by its waiter; one arriving here follows a replay and is ignored.
+		log.Debug("unsolicited chat_presented ignored", "sessionId", session.SessionID)
 	case ipc.TypeSASRequest:
 		go func() {
 			defer func() {
@@ -1774,6 +1880,8 @@ func (h *Heartbeat) handleUserHelperMessage(session *sessionbroker.Session, env 
 		if h.leaseRenewRequester != nil {
 			h.leaseRenewRequester(renew.SessionID)
 		}
+	case ipc.TypeDesktopLocalICECandidate:
+		h.handleHelperLocalICECandidate(session, env)
 	case ipc.TypeDesktopPeerDisconnected:
 		var notice ipc.DesktopPeerDisconnectedNotice
 		if err := json.Unmarshal(env.Payload, &notice); err != nil {
@@ -2124,10 +2232,7 @@ func (h *Heartbeat) Start() {
 	if h.scmSessionCh != nil && h.sessionBroker != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		lifecycle = sessionbroker.NewHelperLifecycleManager(h.sessionBroker, h.scmSessionCh, h.config.HelperLifecycleMode)
-		h.mu.Lock()
-		h.helperLifecycle = lifecycle
-		h.lifecycleCancel = cancel
-		h.mu.Unlock()
+		h.installHelperLifecycle(lifecycle, cancel)
 		go bootstrapThenListenWithRetry(ctx, lifecycle.Bootstrap, func() {
 			go h.sessionBroker.Listen(h.stopChan)
 		}, lifecycleBootstrapRetryInterval)
@@ -2137,6 +2242,11 @@ func (h *Heartbeat) Start() {
 	}
 	if h.sessionBroker != nil {
 		h.startDarwinDesktopWatcher()
+	}
+	if h.promptHost != nil {
+		promptCtx, promptCancel := context.WithCancel(context.Background())
+		go func() { <-h.stopChan; promptCancel() }()
+		go h.promptHost.Run(promptCtx)
 	}
 	if h.sessionCol != nil {
 		h.sessionCol.Start(h.stopChan)
@@ -2189,10 +2299,13 @@ func (h *Heartbeat) Start() {
 	// part of the sendInventory fan-out (they run on a daily cadence), so kick
 	// them off here too — a freshly started/enrolled agent should report hardware
 	// and pending patches promptly rather than waiting for the first daily tick.
-	go h.sendInventory()
-	go h.sendHardwareInventory()
-	go h.sendPatchInventory()
-	go h.runProcessSampler()
+	// W09: each bulk task waits its own U(0, 120 s) (startup_stagger.go).
+	h.staggerStartup([]startupTask{
+		{name: "inventory", run: h.sendInventory},
+		{name: "hardware inventory", run: h.sendHardwareInventory},
+		{name: "patch inventory", run: h.sendPatchInventory},
+	}, startupStaggerWindow, rand.Float64, time.After)
+	go h.runProcessSampler() // already waits one interval before its first sample
 
 	// Reliability cadence persists across restarts (#1906). Seed the in-memory
 	// timer from the last persisted post instead of "now", and only post on
@@ -2259,6 +2372,7 @@ func (h *Heartbeat) Start() {
 			}
 			h.sendHeartbeatWithWatchdog()
 			now := time.Now()
+			patchRouteReady := h.loopReady("PUT", h.agentRouteURL("patches/pending")) // W09: before the claim; outside h.mu
 			// Send inventory every 15 minutes
 			h.mu.Lock()
 			shouldSendInventory := now.Sub(h.lastInventoryUpdate) > 15*time.Minute
@@ -2296,7 +2410,7 @@ func (h *Heartbeat) Start() {
 			// Initial send is the explicit startup dispatch; this gate handles the rest.
 			patchIntervalHours := clampPatchScanIntervalHours(h.config.PatchScanIntervalHours)
 			patchInterval := time.Duration(patchIntervalHours) * time.Hour
-			shouldSendPatch := h.claimPatchScanLocked(now, patchInterval)
+			shouldSendPatch := patchRouteReady && h.claimPatchScanLocked(now, patchInterval)
 			hwTiers := h.hardwareTiersLocked(now, false)
 			h.timeSyncTickLocked(now)
 			h.mu.Unlock()
@@ -2307,7 +2421,9 @@ func (h *Heartbeat) Start() {
 				if bootTime, err := host.BootTime(); err == nil && bootTime > 0 {
 					uptimeSec := now.Unix() - int64(bootTime)
 					bt := time.Unix(int64(bootTime), 0)
-					if h.bootCol.ShouldCollect(uptimeSec, bt) {
+					// W09: check the route before MarkCollected, or a deferred
+					// send would lose this boot's report for good.
+					if h.bootCol.ShouldCollect(uptimeSec, bt) && h.loopReady("POST", h.agentRouteURL("boot-performance")) {
 						h.bootCol.MarkCollected(bt)
 						go func() {
 							defer observability.Recoverer("heartbeat.bootPerformance")
@@ -2362,7 +2478,7 @@ func (h *Heartbeat) Start() {
 			}
 			// Send security status every 5 minutes
 			if shouldSendSecurity {
-				go h.sendSecurityStatus()
+				go h.sendSecurityStatus(false)
 				go h.sendRecoveryKeys()
 			}
 			if shouldSendSessions {
@@ -2423,6 +2539,9 @@ func (h *Heartbeat) DrainAndWait(ctx context.Context) {
 
 func (h *Heartbeat) Stop() {
 	h.stopOnce.Do(func() {
+		if h.pamUnableStop != nil {
+			close(h.pamUnableStop)
+		}
 		h.stopHardwareHealth()
 		h.stopTimeSync()
 		h.stopWorkloads()
@@ -2515,6 +2634,11 @@ func (h *Heartbeat) sendMonitoringResults(results []monitoring.CheckResult) {
 	}
 
 	url := h.monitoringResultsURL()
+	if !h.loopReady("PUT", url) {
+		// Point-in-time results: a deferred cycle drops them, as a shed would.
+		log.Info("monitoring results dropped: route deferred by server Retry-After", "count", len(results))
+		return
+	}
 	headers := http.Header{
 		"Content-Type":  {"application/json"},
 		"Authorization": {h.authHeader()},
@@ -2525,6 +2649,7 @@ func (h *Heartbeat) sendMonitoringResults(results []monitoring.CheckResult) {
 
 	resp, err := httputil.Do(ctx, h.httpClient(), "PUT", url, body, headers, h.retryCfg)
 	if err != nil {
+		h.noteLoopAnswer("PUT", url, err)
 		log.Warn("failed to send monitoring results", "error", err.Error(), "count", len(results))
 		return
 	}
@@ -2579,13 +2704,16 @@ func (h *Heartbeat) authHeader() string {
 
 // sendInventoryData marshals the payload and sends it to the given endpoint via PUT.
 func (h *Heartbeat) sendInventoryData(endpoint string, payload any, label string) error {
+	url := fmt.Sprintf("%s/api/v1/agents/%s/%s", h.serverURL(), h.config.AgentID, endpoint)
+	if !h.loopReady("PUT", url) {
+		return ErrDeferred
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		log.Error("failed to marshal inventory", "label", label, "error", err.Error())
 		return err
 	}
 
-	url := fmt.Sprintf("%s/api/v1/agents/%s/%s", h.serverURL(), h.config.AgentID, endpoint)
 	headers := http.Header{
 		"Content-Type":  {"application/json"},
 		"Authorization": {h.authHeader()},
@@ -2610,6 +2738,7 @@ func (h *Heartbeat) sendInventoryData(endpoint string, payload any, label string
 
 	resp, err := httputil.Do(ctx, h.httpClient(), "PUT", url, body, headers, h.retryCfg)
 	if err != nil {
+		h.noteLoopAnswer("PUT", url, err)
 		log.Error("failed to send inventory", "label", label, "error", err.Error())
 		return err
 	}
@@ -2777,6 +2906,9 @@ func (h *Heartbeat) runProcessSampler() {
 // sendProcessSample builds a top-N process snapshot and POSTs it to the ingest
 // route, mirroring sendInventoryData's auth/retry/timeout handling.
 func (h *Heartbeat) sendProcessSample() {
+	if !h.loopReady("POST", h.agentRouteURL("process-sample")) {
+		return
+	}
 	entries, err := tools.TopProcessSample(processSampleTopN)
 	if err != nil {
 		log.Error("failed to collect process sample", "error", err.Error())
@@ -2804,6 +2936,7 @@ func (h *Heartbeat) sendProcessSample() {
 
 	resp, err := httputil.Do(ctx, h.httpClient(), "POST", url, body, headers, h.retryCfg)
 	if err != nil {
+		h.noteLoopAnswer("POST", url, err)
 		log.Error("failed to send process sample", "error", err.Error())
 		return
 	}
@@ -2824,6 +2957,9 @@ func (h *Heartbeat) submitPeripheralEvents(events []peripheral.PeripheralEvent) 
 	}
 
 	url := fmt.Sprintf("%s/api/v1/agents/%s/peripherals/events", h.serverURL(), h.config.AgentID)
+	if !h.loopReady("PUT", url) {
+		return ErrDeferred
+	}
 	headers := http.Header{
 		"Content-Type":  {"application/json"},
 		"Authorization": {h.authHeader()},
@@ -2834,6 +2970,7 @@ func (h *Heartbeat) submitPeripheralEvents(events []peripheral.PeripheralEvent) 
 
 	resp, err := httputil.Do(ctx, h.httpClient(), "PUT", url, body, headers, h.retryCfg)
 	if err != nil {
+		h.noteLoopAnswer("PUT", url, err)
 		return fmt.Errorf("PUT peripheral events: %w", err)
 	}
 	defer resp.Body.Close()
@@ -3482,6 +3619,17 @@ func (h *Heartbeat) applyConfigUpdate(update map[string]any) {
 		h.applyPatchSourceConfig(psRaw)
 	}
 
+	// Apply feature_update_settings if present: the update ring's decision on
+	// Windows feature releases (block / allow / pin). Filters the WUA scan on
+	// every platform; writes the WUfB target-release policy on Windows only.
+	fuRaw, hasFU := update["feature_update_settings"]
+	if !hasFU {
+		fuRaw, hasFU = update["featureUpdateSettings"]
+	}
+	if hasFU {
+		h.applyFeatureUpdateConfig(fuRaw)
+	}
+
 	// Backup control-plane URL (#2288). Key absent = no change; present
 	// empty string = clear. Snake_case and camelCase both accepted.
 	bsRaw, hasBS := update["backup_server_url"]
@@ -4091,6 +4239,12 @@ func (h *Heartbeat) availablePatchesToMaps(patches []patching.AvailablePatch) []
 		if p.Scope != "" {
 			item["scope"] = p.Scope
 		}
+		// Where the severity came from (vendor rating vs. derived from the
+		// update's classification, #9387). Omitted when the provider has no
+		// provenance, so the API stores NULL rather than a guess.
+		if p.SeveritySource != "" && severity != "unknown" {
+			item["severitySource"] = p.SeveritySource
+		}
 		items[i] = item
 	}
 	return items
@@ -4293,6 +4447,9 @@ func (h *Heartbeat) sendConnectionsInventory() {
 }
 
 func (h *Heartbeat) sendEventLogs() {
+	if !h.loopReady("PUT", h.agentRouteURL("eventlogs")) {
+		return // before Collect: the watermark advances at collect
+	}
 	events, err := collectors.Guard("eventLogs", h.eventLogCol.Collect)
 	if err != nil {
 		log.Error("failed to collect event logs", "error", err.Error())
@@ -4306,8 +4463,15 @@ func (h *Heartbeat) sendEventLogs() {
 	h.sendInventoryData("eventlogs", map[string]any{"events": events}, fmt.Sprintf("event logs (%d events)", len(events)))
 }
 
-func (h *Heartbeat) sendSecurityStatus() {
-	status, err := security.CollectStatus(h.config)
+// sendSecurityStatus uploads security posture. The 5-minute tick passes
+// fresh=false (slow Windows probes served from cache, #9267); an explicit
+// technician request (Refresh Inventory) passes fresh=true.
+func (h *Heartbeat) sendSecurityStatus(fresh bool) {
+	collect := security.CollectStatus
+	if fresh {
+		collect = security.CollectStatusFresh
+	}
+	status, err := collect(h.config)
 	if err != nil {
 		log.Warn("security status collection warning", "error", err.Error())
 	}
@@ -4317,9 +4481,13 @@ func (h *Heartbeat) sendSecurityStatus() {
 
 // sendRecoveryKeys escrows the device's BitLocker recovery keys. Runs on the
 // security tick but only transmits when the key set changed (fingerprint
-// gate) — recovery keys should not transit the wire every 5 minutes. Also
-// drains rotation results whose upload previously failed.
+// gate) — recovery keys should not transit the wire every 5 minutes — and only
+// re-reads the protectors every recoveryKeyCollectInterval (#9267). Drains
+// rotation results whose upload previously failed on every tick.
 func (h *Heartbeat) sendRecoveryKeys() {
+	if !h.loopReady("PUT", h.agentRouteURL("security/recovery-keys")) {
+		return // before the pop: parked keys stay parked, no false key-loss ERROR
+	}
 	h.mu.Lock()
 	pending := h.pendingRecoveryKeys
 	h.pendingRecoveryKeys = nil
@@ -4337,8 +4505,27 @@ func (h *Heartbeat) sendRecoveryKeys() {
 		}
 	}
 
-	keys, err := security.CollectRecoveryKeys()
+	now := time.Now()
+	h.mu.Lock()
+	due := h.lastRecoveryKeysCollect.IsZero() || now.Sub(h.lastRecoveryKeysCollect) >= recoveryKeyCollectInterval
+	if due {
+		// Stamped before the read so a failing read (no BitLocker module,
+		// PowerShell timeout) is retried after the interval, not every tick.
+		h.lastRecoveryKeysCollect = now
+	}
+	h.mu.Unlock()
+	if !due {
+		return
+	}
+
+	keys, err := collectRecoveryKeys()
 	if err != nil {
+		// Retry sooner than the full interval: the common transient cause is a
+		// PowerShell cold start after boot hitting its timeout, and a newly
+		// BitLocker-enabled volume should not wait half an hour for escrow.
+		h.mu.Lock()
+		h.lastRecoveryKeysCollect = now.Add(recoveryKeyErrorRetry - recoveryKeyCollectInterval)
+		h.mu.Unlock()
 		log.Warn("recovery key collection failed", "error", err.Error())
 		return
 	}
@@ -4350,6 +4537,13 @@ func (h *Heartbeat) sendRecoveryKeys() {
 		return
 	}
 	if err := h.pushRecoveryKeys("snapshot", keys); err != nil {
+		// Not escrowed: re-read and retry after recoveryKeyErrorRetry rather
+		// than the full interval. Not on the very next tick — a server outage
+		// or a persistent rejection would otherwise put the PowerShell read
+		// back on every 5-minute tick fleet-wide.
+		h.mu.Lock()
+		h.lastRecoveryKeysCollect = now.Add(recoveryKeyErrorRetry - recoveryKeyCollectInterval)
+		h.mu.Unlock()
 		return
 	}
 	h.mu.Lock()
@@ -4415,6 +4609,9 @@ func (h *Heartbeat) sendBootPerformance(metrics *collectors.BootPerformanceMetri
 		return
 	}
 	url := fmt.Sprintf("%s/api/v1/agents/%s/boot-performance", h.serverURL(), h.config.AgentID)
+	if !h.loopReady("POST", url) {
+		return
+	}
 	headers := http.Header{
 		"Content-Type":  {"application/json"},
 		"Authorization": {h.authHeader()},
@@ -4425,6 +4622,7 @@ func (h *Heartbeat) sendBootPerformance(metrics *collectors.BootPerformanceMetri
 
 	resp, err := httputil.Do(ctx, h.httpClient(), "POST", url, body, headers, h.retryCfg)
 	if err != nil {
+		h.noteLoopAnswer("POST", url, err)
 		log.Error("failed to send boot performance", "error", err.Error())
 		return
 	}
@@ -4450,6 +4648,9 @@ func (h *Heartbeat) sendReliabilityMetrics(sentAt time.Time) {
 	if h.reliabilityCol == nil {
 		return
 	}
+	if !h.loopReady("POST", h.agentRouteURL("reliability")) {
+		return // persisted 24 h gate stays stale, as on a failed send
+	}
 
 	metrics, err := collectors.Guard("reliability", h.reliabilityCol.Collect)
 	if err != nil {
@@ -4474,6 +4675,7 @@ func (h *Heartbeat) sendReliabilityMetrics(sentAt time.Time) {
 
 	resp, err := httputil.Do(ctx, h.httpClient(), "POST", url, body, headers, h.retryCfg)
 	if err != nil {
+		h.noteLoopAnswer("POST", url, err)
 		log.Error("failed to send reliability metrics", "error", err.Error())
 		return
 	}
@@ -5283,6 +5485,11 @@ func (h *Heartbeat) doHeartbeatPost(baseURL string, payload *HeartbeatPayload) (
 	if err != nil {
 		log.Error("failed to send heartbeat", "server", baseURL, "error", err.Error())
 		h.healthMon.Update("heartbeat", health.Unhealthy, err.Error())
+		// #8934: the server answered, it is just overloaded — the loop is
+		// alive, and the watchdog must not restart it for that.
+		if status, ok := serverOverloadAnswer(err); ok {
+			h.noteServerUnavailableLiveness(status)
+		}
 		return nil, false
 	}
 	defer resp.Body.Close()
@@ -5510,6 +5717,11 @@ func (h *Heartbeat) acknowledgeRollbackObservation(id string) {
 }
 
 func (h *Heartbeat) processHeartbeatResponse(response *HeartbeatResponse) {
+	// First: a scope change purges the old MSP's prompt list entries and
+	// replaces the identity before anything else in this response can create
+	// or replay a prompt (spec §3.6).
+	h.applyPromptIdentity(response)
+	h.applyPromptHostSettings(response)
 	h.ackNetworkContext(response.NetworkContextReceipt)
 	// Bare-metal recovery W04a: only clear the marker once the server has
 	// actually acked it — a failed/lost beat must resend it next time.
@@ -5828,6 +6040,9 @@ func (h *Heartbeat) reconcileAndReapplyPAMPolicyLocked(ctx context.Context) []pa
 }
 
 func (h *Heartbeat) handleUACInterceptionLocked(on bool) {
+	// Every exit path leaves the lifecycle's PAM hold matching the effective
+	// interception state (#8996), including a rejected enable (stays off).
+	defer h.syncPAMHelperHold()
 	if !on {
 		prev := h.uacInterceptionEnabled.Swap(false)
 		if h.pamLifetimeManager != nil {
@@ -6962,6 +7177,7 @@ func (h *Heartbeat) handleHelperSessionAuthenticated(session *sessionbroker.Sess
 	// Endpoint messaging (#8293): resend still-open cards to a (re)started
 	// Assist helper. Independent of the token push below.
 	h.replayEndpointMessages(session)
+	h.replayChat(session)
 	if session == nil || !shouldPushHelperToken(session.AllowedScopes) {
 		return
 	}
@@ -7094,6 +7310,9 @@ func toWSCommandResult(commandID string, result tools.CommandResult) websocket.C
 		// only proof that closes a `cancelling` execution as `cancelled`.
 		Cancelled:            result.Cancelled,
 		CancelledByCommandID: result.CancelledByCommandID,
+		// #4609: carried verbatim. Never folded into Result -- see the field
+		// comment on tools.CommandResult.RestorePoint.
+		RestorePoint: result.RestorePoint,
 	}
 
 	// An explicitly-set Result wins. The stdout reparse below stays for the
@@ -7507,9 +7726,24 @@ type patchCommandRef struct {
 	ExternalID string
 	PackageID  string
 	Title      string
+	// Category is the catalog category the server sends alongside a stamped
+	// restore-point block (#4609 W07); "" when absent. Only the
+	// definitions-update checkpoint skip reads it.
+	Category string
 }
 
+// patchBeforeInstallFunc runs immediately before one patch is installed — see
+// patching.BeforeInstallFunc — with the ref it is installing and the
+// provider's own category for it ("" when the provider reports none).
+type patchBeforeInstallFunc func(ref patchCommandRef, providerCategory string)
+
 func (h *Heartbeat) executePatchInstallCommand(payload map[string]any, rollback bool) tools.CommandResult {
+	return h.executePatchInstall(payload, rollback, nil)
+}
+
+// executePatchInstall is executePatchInstallCommand with an optional
+// before-install hook (install only; rollback never calls it).
+func (h *Heartbeat) executePatchInstall(payload map[string]any, rollback bool, before patchBeforeInstallFunc) tools.CommandResult {
 	start := time.Now()
 	if h.patchMgr == nil || len(h.patchMgr.ProviderIDs()) == 0 {
 		return tools.NewErrorResult(fmt.Errorf("no patch providers available"), time.Since(start).Milliseconds())
@@ -7553,7 +7787,12 @@ func (h *Heartbeat) executePatchInstallCommand(payload map[string]any, rollback 
 			continue
 		}
 
-		installResult, err := h.patchMgr.Install(installID)
+		var hook patching.BeforeInstallFunc
+		if before != nil {
+			ref := ref
+			hook = func(providerCategory string) { before(ref, providerCategory) }
+		}
+		installResult, err := h.patchMgr.InstallWithHook(installID, hook)
 		if err != nil {
 			failedCount++
 			result := patchCommandResultFields(ref, installID)
@@ -7669,6 +7908,7 @@ func (h *Heartbeat) patchRefsFromPayload(payload map[string]any) []patchCommandR
 				ExternalID: tools.GetPayloadString(obj, "externalId", ""),
 				PackageID:  tools.GetPayloadString(obj, "packageId", ""),
 				Title:      tools.GetPayloadString(obj, "title", ""),
+				Category:   tools.GetPayloadString(obj, "category", ""),
 			}
 			key := fmt.Sprintf("%s|%s|%s", ref.ID, ref.Source, ref.ExternalID)
 			if key == "||" {
@@ -8562,5 +8802,6 @@ func compiledSecurityCapabilities() SecurityCapabilities {
 		IdentitySyncProtocolVersion:           identitySyncProtocolVersion,
 		WorkloadInventoryProtocolVersion:      workloads.ProtocolVersion,
 		RetainStateProtocolVersion:            retainStateProtocolVersion,
+		PromptIdentityProtocolVersion:         promptidentity.ProtocolVersion,
 	}
 }

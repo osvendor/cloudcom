@@ -3,14 +3,14 @@ import { Hono } from 'hono';
 
 const {
   captureExceptionMock,
-  checkBudgetMock,
+  checkBudgetDetailedMock,
   checkSystemAiRateLimitMock,
   reserveAiBudgetMock,
   releaseUnusedAiBudgetMock,
   getEffectiveAiBudgetMock,
 } = vi.hoisted(() => ({
   captureExceptionMock: vi.fn(),
-  checkBudgetMock: vi.fn(),
+  checkBudgetDetailedMock: vi.fn(),
   checkSystemAiRateLimitMock: vi.fn(),
   reserveAiBudgetMock: vi.fn(),
   releaseUnusedAiBudgetMock: vi.fn(),
@@ -125,7 +125,8 @@ vi.mock('../../services/aiAgentSdkTools', () => ({
   createBreezeMcpServer: vi.fn(() => ({ type: 'sdk', name: 'breeze' })),
 }));
 
-vi.mock('../../services/aiInputSanitizer', () => ({
+vi.mock('../../services/aiInputSanitizer', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../services/aiInputSanitizer')>()),
   sanitizeUserMessage: vi.fn(() => ({ sanitized: 'hello', flags: [] })),
 }));
 
@@ -140,7 +141,7 @@ vi.mock('../../services/screenshotStorage', () => {
 });
 
 vi.mock('../../services/aiCostTracker', () => ({
-  checkBudget: (...args: unknown[]) => checkBudgetMock(...args),
+  checkBudgetDetailed: (...args: unknown[]) => checkBudgetDetailedMock(...args),
   checkSystemAiRateLimit: (...args: unknown[]) => checkSystemAiRateLimitMock(...args),
   getRemainingBudgetUsd: vi.fn(),
 }));
@@ -530,7 +531,7 @@ describe('helper routes permission derivation', () => {
     expect(allowedTools!.map((n) => n.replace('mcp__breeze__', '')).sort()).toEqual([...onlyTools].sort());
     expect(resolveSessionTurnMock).toHaveBeenCalledWith({ sessionId: 'session-1', surface: 'helper', userId: null });
     expect(chooseSessionModelMock).not.toHaveBeenCalled();
-    expect(checkBudgetMock).toHaveBeenCalledWith('org-1', 'partner_key');
+    expect(checkBudgetDetailedMock).toHaveBeenCalledWith('org-1', 'partner_key');
     // Org-axis AI rate limiter — the same ceiling technician chat enforces
     // via checkAiRateLimit. Helper sessions are device-scoped with no acting
     // user id, so this must be the org-only (no per-user bucket) form.
@@ -559,6 +560,49 @@ describe('helper routes permission derivation', () => {
       }),
     } as never);
   }
+
+  // #6354 W05: a typed caller-verification refusal rides the helper stream as
+  // the tool_result `output` string and must not be rewritten on the way out.
+  it('passes a typed caller-verification refusal tool_result through the SSE stream verbatim', async () => {
+    mockHelperAuthDevice();
+    vi.mocked(resolveHelperPermissionLevelForDevice).mockResolvedValue('standard');
+    mockHelperMessageSession();
+    vi.mocked(db.insert).mockReturnValueOnce({ values: vi.fn().mockResolvedValue(undefined) } as never);
+    const payload = {
+      orgId: 'org-1', contactId: null, action: 'disable_user',
+      requiredTier: 2, reason: 'contact_fenced', latest: null,
+    };
+    const refusal = JSON.stringify({ error: 'Caller verification required', requiresCallerVerification: payload });
+    const activeSession = {
+      inputController: { pushMessage: vi.fn() },
+      eventBus: {
+        subscribe: vi.fn(async function* () {
+          yield { type: 'tool_result', toolUseId: 'call-caller', output: refusal, isError: true };
+          yield { type: 'done' };
+        }),
+        unsubscribe: vi.fn(),
+        publish: vi.fn(),
+      },
+      state: 'idle',
+    };
+    vi.mocked(streamingSessionManager.getOrCreate).mockResolvedValue(activeSession as never);
+    vi.mocked(streamingSessionManager.tryTransitionToProcessing).mockReturnValue(true);
+
+    const res = await app.request('/helper/chat/sessions/session-1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'hello' }),
+    });
+    const stream = await res.text();
+
+    expect(res.status).toBe(200);
+    expect(stream).toContain(JSON.stringify(refusal));
+    const dataLine = stream.split('\n').find((l) => l.startsWith('data:') && l.includes('call-caller'))!;
+    expect(JSON.parse(JSON.parse(dataLine.slice(5)).output)).toEqual({
+      error: 'Caller verification required',
+      requiresCallerVerification: payload,
+    });
+  });
 
   it('dispatches and reserves exactly the model resolved for the helper surface (finding 13)', async () => {
     mockHelperAuthDevice();
@@ -600,6 +644,30 @@ describe('helper routes permission derivation', () => {
     );
   });
 
+  it.each([
+    ['credits_exhausted', { error: 'gate message', code: 'credits_exhausted' }],
+    ['plan_gate', { error: 'gate message', code: 'plan_not_eligible' }],
+    ['daily_budget', { error: 'gate message' }],
+  ] as const)('a %s denial is a 402 with its code (if any) and takes no reservation (#9450)', async (reason, expected) => {
+    mockHelperAuthDevice();
+    vi.mocked(resolveHelperPermissionLevelForDevice).mockResolvedValue('standard');
+    resolveSessionTurnMock.mockResolvedValue(makeResolvedModel('platform', { surface: 'helper' }));
+    checkBudgetDetailedMock.mockResolvedValueOnce({
+      message: 'gate message', reason, permanent: reason === 'plan_gate',
+    });
+    mockHelperMessageSession();
+
+    const res = await app.request('/helper/chat/sessions/session-1/messages', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer brz_agent_token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'hello' }),
+    });
+
+    expect(res.status).toBe(402);
+    expect(await res.json()).toEqual(expected);
+    expect(reserveAiBudgetMock).not.toHaveBeenCalled();
+  });
+
   it('an ineligible stored model is a recoverable 409 and takes no reservation', async () => {
     mockHelperAuthDevice();
     vi.mocked(resolveHelperPermissionLevelForDevice).mockResolvedValue('standard');
@@ -620,7 +688,7 @@ describe('helper routes permission derivation', () => {
       error: 'Model Opus 5.5 is no longer available — choose another.', code: 'model_unavailable', recoverable: true,
     });
     expect(reserveAiBudgetMock).not.toHaveBeenCalled();
-    expect(checkBudgetMock).not.toHaveBeenCalled();
+    expect(checkBudgetDetailedMock).not.toHaveBeenCalled();
     expect(streamingSessionManager.getOrCreate).not.toHaveBeenCalled();
   });
 
@@ -1255,6 +1323,33 @@ describe('helper session ownership scoping (cross-principal isolation)', () => {
     });
 
     expect(res.status).toBe(200);
+  });
+
+  it('returns a stored caller-verification refusal toolOutput verbatim in history', async () => {
+    const payload = {
+      orgId: 'org-1', contactId: null, action: 'disable_user',
+      requiredTier: 2, reason: 'contact_fenced', latest: null,
+    };
+    const refusal = JSON.stringify({ error: 'Caller verification required', requiresCallerVerification: payload });
+    mockHelperAuthDevice();
+    mockFilteredSessionSelect([HELPER_OWNED_SESSION, TECHNICIAN_SESSION_SAME_DEVICE]);
+    vi.mocked(db.select).mockReturnValueOnce({
+      from: vi.fn().mockReturnValue({
+        where: vi.fn().mockReturnValue({
+          orderBy: vi.fn().mockResolvedValue([
+            { id: 'm2', role: 'tool_result', content: null, toolName: 'm365_disable_user', toolOutput: refusal, createdAt: new Date() },
+          ]),
+        }),
+      }),
+    } as never);
+
+    const res = await app.request('/helper/chat/sessions/session-helper/messages', {
+      headers: { Authorization: 'Bearer brz_agent_token' },
+    });
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body[0].toolOutput).toBe(refusal);
   });
 
   it('denies reading a technician device-task session transcript for the same device', async () => {

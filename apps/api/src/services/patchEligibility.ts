@@ -35,14 +35,16 @@
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import type { PatchIneligibleReason } from '@breeze/shared';
+import { DEFAULT_RING_FEATURE_UPDATES, featureUpdateAllowed, isWindowsFeatureUpdateCandidate } from '@breeze/shared/validators';
 import { db } from '../db';
 import {
-  devicePatches, devices, organizations, patchApprovals, patches, patchPolicies,
+  devicePatches, devices, organizations, patches, patchPolicies,
   OUTSTANDING_DEVICE_PATCH_STATUSES,
 } from '../db/schema';
 import { loadPolicyLocalPatchConfig } from './configPolicyPatching';
 import { resolvePatchConfigPolicyForDevice } from './featureConfigResolver';
 import { captureException } from './sentry';
+import { resolveLatestManualDecisions, selectManualDecisionRows } from './patchManualDecisions';
 import { EFFECTIVE_PATCH_CATEGORY_SQL, EFFECTIVE_PATCH_SEVERITY_SQL } from './patchSeverityOverlay';
 import {
   buildAllowedPatchSources,
@@ -243,6 +245,27 @@ export async function evaluatePatchInstallEligibility(args: {
 
   if (categoryFiltered.length === 0) return { eligible, ineligible, ringId: ringConfig.ringId, resolvedAt };
 
+  // Windows feature releases ("Windows 11, version 25H2") follow the ring's
+  // feature-update policy: block (default, and what an absent value means),
+  // allow, or pin to one release. Like the source/category/app-rule gates it
+  // only narrows the candidate set and therefore overrides a manual approval —
+  // a blocked or off-pin release is never installed. Non-feature patches pass.
+  const featurePolicy = ringConfig.featureUpdates ?? DEFAULT_RING_FEATURE_UPDATES;
+  const featureFiltered = categoryFiltered.filter((p) => {
+    if (!isWindowsFeatureUpdateCandidate(p)) return true;
+    if (featureUpdateAllowed(featurePolicy, p.title)) return true;
+    const policyLabel = featurePolicy.mode === 'pin'
+      ? `pin ${featurePolicy.product} ${featurePolicy.targetVersion}`
+      : featurePolicy.mode;
+    console.warn(
+      `[PatchApproval] device ${deviceId}: feature update ${p.patchId} ("${p.title}") excluded by ring feature-update policy (${policyLabel})`
+    );
+    deny(p.patchId, 'blocked_by_feature_update_policy');
+    return false;
+  });
+
+  if (featureFiltered.length === 0) return { eligible, ineligible, ringId: ringConfig.ringId, resolvedAt };
+
   // App rules filter before manual approvals are loaded — a block/pin
   // overrides even an explicit manual approval in the job flow; manual
   // per-device installs bypass this evaluator entirely. The live path fills
@@ -251,7 +274,7 @@ export async function evaluatePatchInstallEligibility(args: {
   const appRuleMaps = [buildAppRuleMap(ringConfig.ringAppRules), buildAppRuleMap(ringConfig.apps)]
     .filter((m) => m.size > 0);
   const finalCandidates = appRuleMaps.length > 0
-    ? categoryFiltered.filter((p) => {
+    ? featureFiltered.filter((p) => {
       if (!p.packageId && isThirdPartyPatchSource(p.source)) {
         // Deliberate allow-with-warn: holding every unidentified third-party
         // patch because one unrelated app is pinned/blocked would be
@@ -271,36 +294,21 @@ export async function evaluatePatchInstallEligibility(args: {
       }
       return true;
     })
-    : categoryFiltered;
+    : featureFiltered;
 
   if (finalCandidates.length === 0) return { eligible, ineligible, ringId: ringConfig.ringId, resolvedAt };
 
   // 2. Load manual approvals for this partner (optionally scoped to ring).
   //    partner-wide (ring_id NULL) AND ring-specific rows are both returned.
   const patchIds = finalCandidates.map((p) => p.patchId);
-  const manualApprovals = await db
-    .select({
-      patchId: patchApprovals.patchId,
-      status: patchApprovals.status,
-      ringId: patchApprovals.ringId,
-    })
-    .from(patchApprovals)
-    .where(
-      and(
-        eq(patchApprovals.partnerId, partnerId),
-        inArray(patchApprovals.patchId, patchIds),
-        eq(patchApprovals.status, 'approved')
-      )
-    );
+  const manualApprovals = await selectManualDecisionRows(partnerId, patchIds);
 
-  // Index manual approvals by patchId for fast lookup
-  const manualApprovalSet = new Set<string>();
-  for (const approval of manualApprovals) {
-    // Ring-scoped approval: match if ringId matches, or approval is partner-wide (null ringId)
-    if (approval.ringId === ringConfig.ringId || approval.ringId === null) {
-      manualApprovalSet.add(approval.patchId);
-    }
-  }
+  // A decline ('rejected') is a TERMINAL deny (#9369) — it must beat ring
+  // auto-approve, which never sees it otherwise. Latest decision wins among
+  // this ring's rows and partner-wide (null ringId) rows; see
+  // patchManualDecisions.ts.
+  const { approved: manualApprovalSet, declined: declinedSet } =
+    resolveLatestManualDecisions(manualApprovals, { ringId: ringConfig.ringId });
 
   // 3. Build category rules index
   const categoryRules = Array.isArray(ringConfig.categoryRules) ? ringConfig.categoryRules : [];
@@ -320,7 +328,7 @@ export async function evaluatePatchInstallEligibility(args: {
 
   const now = new Date();
   for (const patch of finalCandidates) {
-    const decision = decidePatchApproval(patch, ringConfig, manualApprovalSet, categoryRuleMap, ringAutoApprove, now);
+    const decision = decidePatchApproval(patch, ringConfig, manualApprovalSet, categoryRuleMap, ringAutoApprove, now, declinedSet);
     if ('approved' in decision) {
       eligible.push({
         patchId: patch.patchId,
@@ -451,14 +459,11 @@ export async function resolveDevicePatchEvaluation(
     categories: ringId ? ring.categories : undefined,
     excludeCategories: ringId ? ring.excludeCategories : undefined,
     sources: settings.sources,
-    policyAutoApprove: {
-      enabled: settings.autoApprove ?? false,
-      severities: settings.autoApproveSeverities ?? [],
-      deferralDays: settings.autoApproveDeferralDays ?? 0,
-    },
     // The ring owns the app rules (#8186); the resolver already normalised
     // them (coerceRingAppRules). The policy's inline `apps` is not read.
     ringAppRules: ringId ? ring.appRules : [],
+    // The ring's Windows feature-release policy; no ring → block.
+    featureUpdates: ringId ? ring.featureUpdates : DEFAULT_RING_FEATURE_UPDATES,
   };
 
   if (ringId) {

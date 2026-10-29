@@ -170,6 +170,7 @@
       "partner": "Partner",
       "org": "Organization"
     },
+    "tierCapHint": "Maximum tier is {{max}}. Tier 3 needs workstation verification, which is not available in this release.",
     "ignored": "Some settings are looser than the partner baseline and are ignored: {{fields}}",
     "readOnly": "You can view this policy but not change it.",
     "save": "Save policy",
@@ -206,7 +207,7 @@
     "title": "Caller verification required",
     "tier": "This action needs a tier {{tier}} verification.",
     "verify": "Verify caller",
-    "verifiedRetry": "Caller verified. Ask the assistant to try again.",
+    "verifiedRetry": "Caller verified. Ask Breeze AI to try again.",
     "reasons": {
       "no_fresh_verification": "The caller has not been verified recently.",
       "grant_consumed": "The last verification was already used for another action.",

@@ -13,6 +13,7 @@ vi.mock('../sentry', () => ({
   captureException: captureExceptionMock,
 }));
 import {
+  PORTAL_PERMISSION_FLAG_KEYS,
   PORTAL_SENSITIVE_FLAG_KEYS,
   PORTAL_VISIBILITY_FLAG_KEYS,
   onPortalFlagsChanged
@@ -41,7 +42,7 @@ describe('PORTAL_VISIBILITY_FLAG_KEYS', () => {
 
 describe('PORTAL_SENSITIVE_FLAG_KEYS', () => {
   it('lists the flags that stay outside "Enable all"', () => {
-    expect(PORTAL_SENSITIVE_FLAG_KEYS).toEqual(['enableNetworkAlerts', 'enableHourBlock', 'enablePatchDetail', 'enableVulnerabilityDetail']);
+    expect(PORTAL_SENSITIVE_FLAG_KEYS).toEqual(['enableNetworkAlerts', 'enableHourBlock', 'enablePatchDetail', 'enableVulnerabilityDetail', 'enablePhysicalPlacement']);
   });
 
   it('keeps the billing-sensitive Support hours flag out of "Enable all"', () => {
@@ -65,9 +66,27 @@ describe('PORTAL_SENSITIVE_FLAG_KEYS', () => {
     expect(PORTAL_VISIBILITY_FLAG_KEYS).not.toContain('enableVulnerabilityDetail');
   });
 
+  it('keeps the sensitive physical placement flag out of "Enable all"', () => {
+    // enablePhysicalPlacement (environment visibility W1) shows rack and room.
+    expect(PORTAL_VISIBILITY_FLAG_KEYS).not.toContain('enablePhysicalPlacement');
+  });
+
   it('never overlaps the flags that "Enable all" turns on', () => {
     for (const key of PORTAL_SENSITIVE_FLAG_KEYS) {
       expect(PORTAL_VISIBILITY_FLAG_KEYS).not.toContain(key);
+    }
+  });
+});
+
+describe('PORTAL_PERMISSION_FLAG_KEYS (Trust Center W3d)', () => {
+  it('lists the flags that grant portal users a write permission', () => {
+    expect(PORTAL_PERMISSION_FLAG_KEYS).toEqual(['enableTrustPageEditing']);
+  });
+
+  it('keeps every permission flag out of "Enable all" and out of the sensitive list', () => {
+    for (const key of PORTAL_PERMISSION_FLAG_KEYS) {
+      expect(PORTAL_VISIBILITY_FLAG_KEYS as readonly string[]).not.toContain(key);
+      expect(PORTAL_SENSITIVE_FLAG_KEYS as readonly string[]).not.toContain(key);
     }
   });
 });

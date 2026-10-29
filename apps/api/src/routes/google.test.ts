@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 // --- mutable mock state, set per-test ---
 let selectRows: unknown[] = [];
 let insertRows: unknown[] = [];
+const insertCalls: Array<Record<string, unknown>> = [];
 let deleteRows: unknown[] = [];
 let oauthRows: unknown[] = [];
 let parseThrows = false;
@@ -50,7 +51,7 @@ vi.mock('../services/googleClient', () => ({
 vi.mock('../db', () => {
   const db = {
     select: vi.fn(() => ({ from: vi.fn(() => ({ where: vi.fn(() => ({ limit: vi.fn(async () => selectRows) })) })) })),
-    insert: vi.fn(() => ({ values: vi.fn(() => ({ onConflictDoUpdate: vi.fn(() => ({ returning: vi.fn(async () => insertRows) })) })) })),
+    insert: vi.fn(() => ({ values: vi.fn((v: unknown) => { insertCalls.push({ values: v }); return { onConflictDoUpdate: vi.fn((c: unknown) => { insertCalls.push({ conflict: c }); return { returning: vi.fn(async () => insertRows) }; }) }; }) })),
     delete: vi.fn(() => ({ where: vi.fn(() => ({ returning: vi.fn(async () => deleteRows) })) })),
     execute: vi.fn(async () => oauthRows),
     transaction: vi.fn(),
@@ -126,6 +127,21 @@ describe('google connection routes', () => {
     });
     expect(res.status).toBe(409);
     expect(db.insert).not.toHaveBeenCalled();
+  });
+
+  it('POST /connection resets the connection-health probe result: the save itself verified it (W4)', async () => {
+    insertCalls.length = 0;
+    insertRows = [storedRow];
+    const res = await app().request('/google/connection', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(validBody),
+    });
+    expect(res.status).toBe(201);
+    const values = insertCalls.find((c) => 'values' in c)!.values as Record<string, unknown>;
+    const conflict = insertCalls.find((c) => 'conflict' in c)!.conflict as { set: Record<string, unknown> };
+    for (const written of [values, conflict.set]) {
+      expect(written).toMatchObject({ lastProbeStatus: 'ok', lastProbeError: null });
+      expect(written.lastProbeAt).toBeInstanceOf(Date);
+    }
   });
 
   it('POST /connection returns 400 with a hint when the live Directory verify fails (bad DWD)', async () => {

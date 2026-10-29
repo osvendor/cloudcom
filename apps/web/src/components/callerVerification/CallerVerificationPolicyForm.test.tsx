@@ -4,6 +4,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { getPolicy, putPolicy, type PolicyResponse } from '@/lib/api/callerVerification';
 import { CallerVerificationPolicyForm, PartnerCallerVerificationPolicy, inheritedDraft } from './CallerVerificationPolicyForm';
 import { useAuthStore } from '@/stores/auth';
+import { usePartnerSettingsDraftStore } from '../settings/partnerSettings/partnerSettingsDraftStore';
 import { ORG, policy, policyValues } from './testFixtures';
 
 const enabled = vi.hoisted(() => ({ value: true }));
@@ -12,7 +13,7 @@ vi.mock('@/lib/useCallerVerificationEnabled', () => ({ useCallerVerificationEnab
 afterEach(() => { vi.clearAllMocks(); enabled.value = true; });
 
 const orgOwner = { ownerScope: 'organization' as const, orgId: ORG };
-const response = (over: Partial<PolicyResponse> = {}): PolicyResponse => ({ row: null, defaults: policyValues, baseline: policyValues, effective: policy, ...over });
+const response = (over: Partial<PolicyResponse> = {}): PolicyResponse => ({ maxAchievableTier: 3, row: null, defaults: policyValues, baseline: policyValues, effective: policy, ...over });
 
 it('makes no request while the feature is off', () => {
   enabled.value = false;
@@ -104,13 +105,17 @@ it('offers a retry when loading fails', async () => {
   expect(await screen.findByTestId('cv-policy-save')).toBeVisible();
 });
 
+// W2: the partner settings mount is a form card saved by the page's header Save.
 it.each([[false, true], [true, false], [undefined, false]])('partner mount with canManagePartnerWide=%s is read-only=%s', async (canManagePartnerWide, readOnly) => {
+  usePartnerSettingsDraftStore.getState().reset();
   useAuthStore.setState({ user: { id: 'u', email: 'e', name: 'n', canManagePartnerWide } as never });
   vi.mocked(getPolicy).mockResolvedValue(response());
   render(<PartnerCallerVerificationPolicy />);
-  await screen.findByTestId('cv-policy-form');
-  expect(screen.queryByTestId('cv-policy-save') === null).toBe(readOnly);
-  expect(getPolicy).toHaveBeenCalledWith({ ownerScope: 'partner' }, expect.any(AbortSignal));
+  const card = await screen.findByTestId('cv-policy-form');
+  expect(card.tagName).toBe('DIV');
+  expect(screen.queryByTestId('cv-policy-save')).toBeNull();
+  expect((screen.getByTestId('cv-policy-coolingOffHours') as HTMLInputElement).closest('fieldset')!.disabled).toBe(readOnly);
+  expect(getPolicy).toHaveBeenCalledWith({ ownerScope: 'partner' });
 });
 
 it('accepts a typed multi-digit value and commits it on blur', async () => {
@@ -142,4 +147,65 @@ it('partner mount makes no request while the feature is off', () => {
   enabled.value = false;
   render(<PartnerCallerVerificationPolicy />);
   expect(getPolicy).not.toHaveBeenCalled();
+});
+
+it('caps the tier selectors at maxAchievableTier and explains why while the workstation tier is dark', async () => {
+  vi.mocked(getPolicy).mockResolvedValue(response({ maxAchievableTier: 2 }));
+  render(<CallerVerificationPolicyForm owner={{ ownerScope: 'partner' }} />);
+  expect(await screen.findByTestId('cv-policy-requiredTierResetPassword')).toHaveAttribute('max', '2');
+  expect(screen.getByTestId('cv-policy-requiredTierDisableUser')).toHaveAttribute('max', '2');
+  expect(screen.getByTestId('cv-policy-requiredTierResetPassword-cap-hint')).toHaveTextContent(/Tier 3 needs workstation verification/);
+  // Other numeric fields keep their own bounds.
+  expect(screen.getByTestId('cv-policy-maxAttemptsPerHour')).toHaveAttribute('max', '100');
+});
+
+it('caps each tier input by its own per-action cap', async () => {
+  vi.mocked(getPolicy).mockResolvedValue(response({ maxAchievableTier: 2, maxAchievableTierResetPassword: 2, maxAchievableTierDisableUser: 3 }));
+  render(<CallerVerificationPolicyForm owner={{ ownerScope: 'partner' }} />);
+  expect(await screen.findByTestId('cv-policy-requiredTierResetPassword')).toHaveAttribute('max', '2');
+  expect(screen.getByTestId('cv-policy-requiredTierDisableUser')).toHaveAttribute('max', '3');
+  expect(screen.getByTestId('cv-policy-requiredTierResetPassword-cap-hint')).toBeInTheDocument();
+  expect(screen.queryByTestId('cv-policy-requiredTierDisableUser-cap-hint')).toBeNull();
+});
+
+it('keeps a stored disable_user tier 3 on save when its own cap allows it', async () => {
+  const row = { ...inheritedDraft(), requiredTierDisableUser: 3, requiredTierResetPassword: 3 } as unknown as PolicyResponse['row'];
+  const caps = { maxAchievableTier: 2 as const, maxAchievableTierResetPassword: 2 as const, maxAchievableTierDisableUser: 3 as const };
+  vi.mocked(getPolicy).mockResolvedValue(response({ ...caps, row }));
+  vi.mocked(putPolicy).mockResolvedValue(response({ ...caps, row }));
+  render(<CallerVerificationPolicyForm owner={{ ownerScope: 'partner' }} />);
+  expect(await screen.findByTestId('cv-policy-requiredTierDisableUser')).toHaveValue(3);
+  await act(async () => { fireEvent.click(screen.getByTestId('cv-policy-save')); });
+  expect(putPolicy).toHaveBeenCalledWith({ ownerScope: 'partner' }, { ...inheritedDraft(), requiredTierResetPassword: 2, requiredTierDisableUser: 3 });
+});
+
+it('allows tier 3 and shows no hint when the workstation tier is available', async () => {
+  vi.mocked(getPolicy).mockResolvedValue(response({ maxAchievableTier: 3 }));
+  render(<CallerVerificationPolicyForm owner={{ ownerScope: 'partner' }} />);
+  expect(await screen.findByTestId('cv-policy-requiredTierResetPassword')).toHaveAttribute('max', '3');
+  expect(screen.queryByTestId('cv-policy-requiredTierResetPassword-cap-hint')).toBeNull();
+});
+
+it('sends a stored tier 3 as the achievable tier on save instead of a refused value', async () => {
+  const row = { ...inheritedDraft(), requiredTierResetPassword: 3 } as unknown as PolicyResponse['row'];
+  vi.mocked(getPolicy).mockResolvedValue(response({ maxAchievableTier: 2, row }));
+  vi.mocked(putPolicy).mockResolvedValue(response({ maxAchievableTier: 2, row }));
+  render(<CallerVerificationPolicyForm owner={{ ownerScope: 'partner' }} />);
+  expect(await screen.findByTestId('cv-policy-requiredTierResetPassword')).toHaveValue(2);
+  await act(async () => { fireEvent.click(screen.getByTestId('cv-policy-save')); });
+  expect(putPolicy).toHaveBeenCalledWith({ ownerScope: 'partner' }, { ...inheritedDraft(), requiredTierResetPassword: 2 });
+});
+
+// #9168: the h-8 controls at the default font size clipped descenders in the
+// Yes/No selects and the numeric fields. They use the shared settings control
+// size (h-10 + text-sm) that every other partner-settings field uses.
+it('sizes its selects and number fields with the shared h-10 text-sm control style', async () => {
+  vi.mocked(getPolicy).mockResolvedValue(response());
+  render(<CallerVerificationPolicyForm owner={{ ownerScope: 'partner' }} />);
+  const select = await screen.findByTestId('cv-policy-requireTicket');
+  const number = screen.getByTestId('cv-policy-maxAttemptsPerHour');
+  for (const control of [select, number]) {
+    expect(control).toHaveClass('h-10', 'text-sm');
+    expect(control).not.toHaveClass('h-8');
+  }
 });

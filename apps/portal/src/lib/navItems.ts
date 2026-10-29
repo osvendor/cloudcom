@@ -13,6 +13,9 @@ export interface PortalNavItem {
  * approve a proposal or pay a bill, so those lead once Dashboard (opt-in) is
  * out of the way.
  *
+ * Proposals, Invoices and Agreements are always on (no flag): they are the
+ * documents a customer is asked to act on.
+ *
  * "Proposals", not "Quotes": every page this leads to is titled Proposal, and
  * a customer does not connect the two labels.
  *
@@ -46,6 +49,7 @@ export function buildPortalNavItems(
     | 'enableService'
     | 'enableDocuments'
     | 'enableNetworkVisibility'
+    | 'canEditTrustPage'
   >,
   paymentMethodsAvailable = false,
   approvalsPendingCount = 0
@@ -56,6 +60,7 @@ export function buildPortalNavItems(
       : null,
     { href: '/quotes', label: 'Proposals' },
     { href: '/invoices', label: 'Invoices' },
+    { href: '/agreements', label: 'Agreements' },
     paymentMethodsAvailable ? { href: '/payment-methods', label: 'Payment methods' } : null,
     branding.enableTickets !== false
       ? { href: '/tickets', label: 'Support' }
@@ -72,6 +77,12 @@ export function buildPortalNavItems(
       : null,
     branding.enableSecurity === true
       ? { href: '/security', label: 'Security' }
+      : null,
+    // Trust Center W3d: a per-user permission (org flag + org-scoped admin
+    // contact), not a visibility flag, so it does not follow enableSecurity.
+    // Fail closed: only an explicit true earns the slot.
+    branding.canEditTrustPage === true
+      ? { href: '/security/trust-page', label: 'Trust page' }
       : null,
     branding.enableBackups === true
       ? { href: '/backups', label: 'Backups' }

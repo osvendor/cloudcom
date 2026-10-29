@@ -20,7 +20,7 @@ import { snapshotCost } from './catalogPricing';
 // to keep allocation atomic with the number write inside its single transaction.
 import { formatInvoiceNumber } from './invoiceNumbers';
 import { emitInvoiceEvent } from './invoiceEvents';
-import { resolveDraftBillTo, invoiceTicketNumberSql, invoiceTicketCategorySql, invoiceLineTicketNumberSql, invoiceLineTicketSubjectSql, invoiceLineTicketCategorySql } from './invoicePdf';
+import { resolveDraftBillTo, invoiceTicketNumberSql, invoiceTicketCategorySql, invoiceLineTicketNumberSql, invoiceLineTicketSubjectSql, invoiceLineTicketCategorySql } from './invoiceRenderHelpers';
 import { freezeDocumentFooter } from './documentFooter';
 import { resolveOrgTaxRate, resolveOrgTaxRateOn, OrgNotVisibleForTaxError, PartnerNotVisibleForTaxError } from './taxRateResolver';
 import { stampedPresentation } from './invoicePresentation';
@@ -74,8 +74,10 @@ import { resolvePartnerDocumentLocale } from './documentLocale';
 import { retryOnTransientLockError } from '../utils/pgErrors';
 import { mergeBillingContact, type ContactBlob } from './contacts/compat';
 import type { InvoiceActor } from './invoiceTypes';
-import { isRepresentableInCurrency, minorUnitExponent, roundToCurrency, buildStripeCurrencyWarning, stampInvoiceLineDetail, resolveInvoiceLineDetail, invoiceLineText, isSupportedLocale, type InvoiceLineDetail, type InvoiceLineGrouping, type ManualLineInput, type RecordPaymentInput } from '@breeze/shared';
-import { tApi } from '../i18n';
+import { lockTicketsForWrite } from './ticketRowLock';
+import { isRepresentableInCurrency, minorUnitExponent, roundToCurrency, buildStripeCurrencyWarning, stampInvoiceLineDetail, resolveInvoiceLineDetail, invoiceLineText, type InvoiceLineDetail, type InvoiceLineGrouping, type ManualLineInput, type RecordPaymentInput } from '@breeze/shared';
+
+import { documentLabelsFor, type CustomerInvoiceHeaderDto, type CustomerInvoiceLineCore, type DocumentBillToAddress, type DocumentSellerSnapshot } from '@breeze/shared/documents';
 
 function requirePartner(actor: InvoiceActor): string {
   if (!actor.partnerId) throw new InvoiceServiceError('Partner could not be resolved', 400, 'PARTNER_UNRESOLVABLE');
@@ -120,6 +122,39 @@ export async function getOwnedInvoiceOr404(id: string, dbc: DbExecutor = db) {
 
 function assertDraft(inv: { status: string }): void {
   if (inv.status !== 'draft') throw new InvoiceServiceError('Invoice is not a draft', 409, 'NOT_A_DRAFT');
+}
+
+/**
+ * #8972 W0 (spec "Ticketing: merge, SLA calendars, routing" §3.5): issuing or
+ * voiding an invoice flips the billing status of time entries and parts,
+ * which are ticket child rows, so it locks their TICKETS before those rows:
+ * `FOR UPDATE` in ascending id order (lockTicketsForWrite), AFTER the
+ * contracts / contract_lines and BEFORE time_entries. That is the billing
+ * run's order: generateDueInvoice locks the contract first (#3778) and its
+ * hour-block close then locks the tickets of the entries it claims
+ * (lockHourBlockSourceTickets). Taking the tickets ahead of the invoice and
+ * contract rows deadlocked against that run. No ticket-side writer locks an
+ * invoice, line, contract or charge, so tickets after them cannot cycle.
+ * No org SHARE: it cannot be this transaction's first lock, and issue / void
+ * never took it before W0.
+ *
+ * `timeIds` / `partIds` come from the LOCKED invoice lines; their tickets are
+ * read unlocked. A source relinked to another ticket after that read is then
+ * flipped without its new ticket's lock: that is safe, because this
+ * transaction never requests a ticket lock after it has locked a source row
+ * (no late lock), so it can never hold a child row while waiting on a ticket.
+ */
+async function lockInvoiceSourceTickets(timeIds: readonly string[], partIds: readonly string[]): Promise<void> {
+  const ticketIds = [
+    ...(timeIds.length
+      ? (await db.select({ ticketId: timeEntries.ticketId }).from(timeEntries).where(inArray(timeEntries.id, timeIds))).map((r) => r.ticketId)
+      : []),
+    ...(partIds.length
+      ? (await db.select({ ticketId: ticketParts.ticketId }).from(ticketParts).where(inArray(ticketParts.id, partIds))).map((r) => r.ticketId)
+      : []),
+  ].filter((id): id is string => !!id);
+  if (ticketIds.length === 0) return; // no ticket child rows on this invoice: nothing to take
+  await lockTicketsForWrite(db, ticketIds);
 }
 
 /**
@@ -365,7 +400,7 @@ export async function addBundleLine(invoiceId: string, bundleId: string, quantit
     const parent = await insertLineAndRecompute(tx, invoiceId, inv.orgId, {
       sourceType: 'bundle', sourceId: null, catalogItemId: bundleId, parentLineId: null, ticketId: null,
       name: bundle?.name ?? 'Bundle', description: bundle?.description ?? null, quantity: qty, unitPrice: econ.headlinePrice,
-      costBasis: econ.totalCost, // null when any component's cost is in another currency (margin unavailable)
+      costBasis: econ.totalCost, // null when any component's cost is unknown (NULL, #9223) or in another currency (margin unavailable)
       taxable: true, customerVisible: true,
       lineTotal: computeLineTotal(qty, econ.headlinePrice, inv.currencyCode), isUnapprovedTime: false
     });
@@ -424,6 +459,54 @@ export async function addBundleLine(invoiceId: string, bundleId: string, quantit
  * the contract engine — no additional scoping is applied here).
  */
 export type ContractLinePricedFrom = 'org_override' | 'price_book' | 'contract_snapshot';
+
+/** invoice_lines.name is varchar(255). */
+const INVOICE_LINE_NAME_MAX = 255;
+
+/**
+ * #9664: the title + blurb of a contract-sourced invoice line. The staff
+ * views, the invoice PDF and the portal print `name` as the title and
+ * `description` as the blurb under it (falling back to `description` as the
+ * title only when `name` is NULL), so a contract line stored with name NULL
+ * showed an empty Name box in the editor. The accounting push sends only the
+ * title (`name ?? description`), never the blurb.
+ *
+ * The title is the catalog item's name when the line references one, else the
+ * first non-blank line of the contract line's text. `description` then keeps
+ * only what the title does not already say — a blurb that repeats the title
+ * would print twice on the PDF and portal. When the title had to be capped to
+ * the column, the full text stays as the blurb so nothing is lost.
+ *
+ * `titleSuffix` (a derived line's marker, e.g. the hour-block overage period)
+ * is appended to the TITLE and always survives the cap, so a multi-line base
+ * text can never push it down into the blurb.
+ */
+function contractInvoiceLineLabel(
+  text: string, catalogName: string | null, titleSuffix = '',
+): { name: string | null; description: string | null } {
+  const capped = (s: string) => {
+    const room = INVOICE_LINE_NAME_MAX - titleSuffix.length;
+    return s.length <= room
+      ? { value: `${s}${titleSuffix}`, truncated: false }
+      : { value: `${s.slice(0, room - 1)}…${titleSuffix}`, truncated: true };
+  };
+  const full = text.trim();
+  const catalogTitle = catalogName?.trim();
+  if (catalogTitle) {
+    const { value } = capped(catalogTitle);
+    return { name: value, description: full && full !== catalogTitle ? full : null };
+  }
+  const [first = '', ...rest] = full.split(/\r?\n/);
+  const firstLine = first.trim();
+  // Unreachable while contract_lines.description is validated non-blank; a
+  // blank text stays a legacy (name NULL) line rather than a '—' title.
+  if (!firstLine) return { name: titleSuffix.trim() || null, description: full || null };
+  const { value, truncated } = capped(firstLine);
+  if (truncated) return { name: value, description: full };
+  const blurb = rest.join('\n').trim();
+  return { name: value, description: blurb || null };
+}
+
 export async function addContractLine(
   invoiceId: string,
   input: {
@@ -444,6 +527,9 @@ export async function addContractLine(
      *  source_type='contract' line without it is a 500-worthy bug, never a
      *  silent insert, because the ACTIVE-contract restamp keys on this column. */
     contractId: string;
+    /** #9664: appended to the line's title (not its text), e.g. the hour-block
+     *  overage period, so it stays in the title for a multi-line base text. */
+    titleSuffix?: string;
   },
   actor: InvoiceActor
 ): Promise<{ line: typeof invoiceLines.$inferSelect; pricedFrom: ContractLinePricedFrom }> {
@@ -482,6 +568,7 @@ export async function addContractLine(
     let taxable: boolean;
     let costBasis: string | null = null;
     let pricedFrom: ContractLinePricedFrom;
+    let catalogName: string | null = null;
 
     if (input.catalogItemId) {
       // Catalog path: resolve price through the tenant-scoped catalog service in
@@ -511,6 +598,11 @@ export async function addContractLine(
         costBasis = null;
         pricedFrom = 'contract_snapshot';
       }
+      // #9664: the line's title. resolvePrice has already proven the item is
+      // the actor's (it throws before a price-book gap otherwise).
+      const [item] = await tx.select({ name: catalogItems.name }).from(catalogItems)
+        .where(eq(catalogItems.id, input.catalogItemId)).limit(1);
+      catalogName = item?.name ?? null;
     } else {
       // Non-catalog path: normalize like addManualLine/updateLine (Finding 2).
       unitPrice = Number(input.unitPrice).toFixed(2);
@@ -527,7 +619,7 @@ export async function addContractLine(
     const line = await insertLineAndRecompute(tx, invoiceId, inv.orgId, {
       sourceType: 'contract', sourceId: input.sourceId ?? null, sourceContractId: input.contractId,
       catalogItemId: input.catalogItemId ?? null,
-      parentLineId: null, ticketId: null, description: input.description, quantity,
+      parentLineId: null, ticketId: null, ...contractInvoiceLineLabel(input.description, catalogName, input.titleSuffix), quantity,
       unitPrice, costBasis, taxable, customerVisible: true,
       lineTotal: computeLineTotal(quantity, unitPrice, inv.currencyCode), isUnapprovedTime: false
     });
@@ -963,8 +1055,10 @@ export async function getInvoice(invoiceId: string, actor: InvoiceActor) {
 }
 
 /** #8604: resolved line itemization for the staff invoice view. Only a draft
- *  consults the partner row (resolveInvoiceLineDetail ignores it otherwise). */
-async function resolveDocumentLineDetail(inv: InvoiceRow): Promise<InvoiceLineDetail> {
+ *  consults the partner row (resolveInvoiceLineDetail ignores it otherwise).
+ *  Exported for the staff customer-view assembler (customerDocument.ts, #9402),
+ *  which resolves a draft's partner defaults BEFORE projecting its lines. */
+export async function resolveDocumentLineDetail(inv: InvoiceRow): Promise<InvoiceLineDetail> {
   if (inv.status !== 'draft') return resolveInvoiceLineDetail(inv, null);
   const [partner] = await db.select({
     invoiceLineGrouping: partners.invoiceLineGrouping, invoiceLineShowDate: partners.invoiceLineShowDate,
@@ -973,58 +1067,24 @@ async function resolveDocumentLineDetail(inv: InvoiceRow): Promise<InvoiceLineDe
   return resolveInvoiceLineDetail(inv, partner ?? null);
 }
 
-export type CustomerInvoiceLine = {
-  ticketNumber: string | null;
-  ticketCategory?: string | null;
-  /**
-   * Line title, mirroring invoice_lines.name (#3319). NULL for legacy lines
-   * created before the name/description split, where `description` holds the
-   * title — the portal renders `name ?? description` as the title and shows
-   * `description` as a sub-line only when `name` is set, exactly like
-   * invoicePdf's lineTitle/lineBlurb.
-   */
-  name: string | null;
-  description: string;
-  quantity: string;
-  unitPrice: string;
-  taxable: boolean;
-  lineTotal: string;
-  /** #6467: worked minutes for a time_entry line — the portal renders the
-   *  worked-vs-billed note from this, never from `description`. Null for
-   *  non-time-entry lines and legacy rows predating the column, and withheld
-   *  (null) when the invoice's #8604 worked-time toggle is off. */
-  workedMinutes: number | null;
-  /** #8604: the day the line was worked (YYYY-MM-DD, partner-local). Null
-   *  unless the invoice prints dates and the line has one. */
-  workDate: string | null;
-};
+/** The customer line projection (#9402: the DTO's core keyset; the OD-9 keys are
+ *  added only by customerDocument.ts's loader). Field notes:
+ *  - `name` mirrors invoice_lines.name (#3319). NULL for legacy lines, where
+ *    `description` holds the title — renderers show `name ?? description` as the
+ *    title and `description` as a sub-line only when `name` is set.
+ *  - `workedMinutes` (#6467) is withheld (null) when the #8604 worked-time
+ *    toggle is off; `workDate` (#8604) is null unless the invoice prints dates. */
+export type CustomerInvoiceLine = CustomerInvoiceLineCore;
 
-type InvoiceRow = typeof invoices.$inferSelect;
+export type InvoiceRow = typeof invoices.$inferSelect;
 
-export type CustomerInvoiceHeader = Pick<InvoiceRow,
-  | 'id'
-  | 'invoiceNumber'
-  | 'status'
-  | 'currencyCode'
-  | 'issueDate'
-  | 'dueDate'
-  | 'subtotal'
-  | 'taxRate'
-  | 'taxTotal'
-  | 'total'
-  | 'amountPaid'
-  | 'balance'
-  | 'depositDue'
-  | 'billToName'
-  | 'notes'
-  | 'sellerSnapshot'
-  | 'termsAndConditions'
-> & {
-  /** #8604: resolved per-day/per-entry presentation (frozen at issue). */
-  lineGrouping: InvoiceLineGrouping;
-};
+/** The customer invoice header minus `displayStatus`, which the assembler adds. */
+export type CustomerInvoiceHeader = Omit<CustomerInvoiceHeaderDto, 'displayStatus'>;
 
 type CustomerInvoiceLineSource = {
+  /** invoice_lines.id — the line's opaque row key in the customer DTO (#9402). */
+  id: string;
+  parentLineId?: string | null;
   ticketId?: string | null;
   ticketNumber?: string | null;
   ticketSubject?: string | null;
@@ -1061,14 +1121,17 @@ export function toCustomerInvoiceLine(
 ): CustomerInvoiceLine {
   const text = invoiceLineText(line, detail);
   const noteWithheld = !detail.showNote && line.sourceType === 'time_entry';
+  // Never emits ticketSubject / isChild even though the source selects
+  // ticketSubject: only customerDocument.ts's loader adds the OD-9 keys.
   return {
+    id: line.id,
     ticketNumber: line.ticketNumber ?? null,
     ticketCategory: line.ticketCategory ?? null,
     // Carry BOTH fields (#3319). This previously collapsed to
     // `description ?? name`, which is the INVERSE of the fallback every other
     // renderer uses, so a line with both set showed the customer only the
     // blurb and never the title.
-    name: noteWithheld ? (text.title ?? tApi(isSupportedLocale(locale) ? locale : 'en', 'pdf:invoice.laborLine')) : line.name ?? null,
+    name: noteWithheld ? (text.title ?? documentLabelsFor(locale).laborLine) : line.name ?? null,
     description: noteWithheld ? '' : line.description ?? '',
     quantity: line.quantity,
     unitPrice: line.unitPrice,
@@ -1076,25 +1139,6 @@ export function toCustomerInvoiceLine(
     lineTotal: line.lineTotal,
     workedMinutes: detail.showWorkedTime ? line.workedMinutes ?? null : null,
     workDate: detail.showDate ? line.workDate ?? null : null,
-  };
-}
-
-/** Second serialization boundary for a line ALREADY built by
- *  toCustomerInvoiceLine (the portal route re-projects the service result):
- *  picks the exact safe keyset and passes values through untouched, so the
- *  #8604 toggles applied upstream are never re-run with defaults. */
-export function projectCustomerInvoiceLine(line: CustomerInvoiceLine): CustomerInvoiceLine {
-  return {
-    ticketNumber: line.ticketNumber ?? null,
-    ticketCategory: line.ticketCategory ?? null,
-    name: line.name ?? null,
-    description: line.description ?? '',
-    quantity: line.quantity,
-    unitPrice: line.unitPrice,
-    taxable: line.taxable,
-    lineTotal: line.lineTotal,
-    workedMinutes: line.workedMinutes ?? null,
-    workDate: line.workDate ?? null,
   };
 }
 
@@ -1115,52 +1159,58 @@ export function toCustomerInvoiceHeader(invoice: InvoiceRow): CustomerInvoiceHea
     balance: invoice.balance,
     depositDue: invoice.depositDue,
     billToName: invoice.billToName,
+    billToAddress: asDocumentBillToAddress(invoice.billToAddress),
+    billToTaxId: invoice.billToTaxId ?? null,
+    terms: invoice.terms ?? null,
     notes: invoice.notes,
-    sellerSnapshot: invoice.sellerSnapshot,
+    sellerSnapshot: asDocumentSellerSnapshot(invoice.sellerSnapshot),
     termsAndConditions: invoice.termsAndConditions,
     lineGrouping: customerLineDetail(invoice).grouping,
   };
 }
 
-export async function getCustomerInvoice(
-  invoiceId: string,
-  orgId?: string
-): Promise<{ invoice: CustomerInvoiceHeader; lines: CustomerInvoiceLine[]; partnerId: string }> {
-  const inv = await getOwnedInvoiceOr404(invoiceId); // RLS scopes; portal context supplies org access
-  // App-layer org guard (defense-in-depth over RLS). 404, not 403 — don't leak existence to the portal.
-  if (orgId !== undefined && inv.orgId !== orgId) throw new InvoiceServiceError('Invoice not found', 404, 'INVOICE_NOT_FOUND');
-  const rows = await db.select({
-    ticketId: invoiceLines.ticketId,
-    ticketNumber: invoiceLineTicketNumberSql(inv.status),
-    ticketSubject: invoiceLineTicketSubjectSql(inv.status),
-    ticketCategory: invoiceLineTicketCategorySql(inv.status),
-    name: invoiceLines.name,
-    description: invoiceLines.description,
-    quantity: invoiceLines.quantity,
-    unitPrice: invoiceLines.unitPrice,
-    taxable: invoiceLines.taxable,
-    lineTotal: invoiceLines.lineTotal,
-    workedMinutes: invoiceLines.workedMinutes,
-    sourceType: invoiceLines.sourceType,
-    workDate: invoiceLines.workDate,
-  }).from(invoiceLines).leftJoin(tickets, and(
-    eq(tickets.id, invoiceLines.ticketId),
-    eq(tickets.orgId, inv.orgId),
-    isNull(tickets.deletedAt),
-  ))
-  .where(and(
-    eq(invoiceLines.invoiceId, invoiceId),
-    eq(invoiceLines.orgId, inv.orgId),
-    eq(invoiceLines.customerVisible, true),
-  )).orderBy(invoiceLines.sortOrder);
-  const detail = customerLineDetail(inv);
-  const lines = rows.map((r) => toCustomerInvoiceLine(r, detail, inv.documentLocale ?? 'en'));
-  // partnerId rides OUTSIDE the serialized header: the portal route needs it
-  // for the partner-name branding lookup, but CustomerInvoiceHeader is the
-  // customer payload and internal ids stay out of it. Reading it off the
-  // header (`result.invoice.partnerId`) compiled as `undefined` and made
-  // every portal invoice-detail request 500 in the partners query.
-  return { invoice: toCustomerInvoiceHeader(inv), lines, partnerId: inv.partnerId };
+const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+
+/** Narrow the untyped `bill_to_address` jsonb to the DTO address; same rebuild-from-known-keys rule as the seller. */
+export function asDocumentBillToAddress(value: unknown): DocumentBillToAddress | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const a = value as Record<string, unknown>;
+  return {
+    line1: str(a.line1), line2: str(a.line2), city: str(a.city),
+    region: str(a.region), postalCode: str(a.postalCode), country: str(a.country),
+  };
+}
+
+/** Narrow the untyped `seller_snapshot` jsonb to the customer DTO shape. Rebuilds
+ *  the object from the known keys, so an unexpected key frozen into a legacy
+ *  snapshot can never ride into a customer payload; a non-object reads as null. */
+export function asDocumentSellerSnapshot(value: unknown): DocumentSellerSnapshot | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  const a = v.address && typeof v.address === 'object' && !Array.isArray(v.address) ? v.address as Record<string, unknown> : null;
+  return {
+    name: str(v.name),
+    address: a ? {
+      line1: str(a.line1), line2: str(a.line2), city: str(a.city),
+      region: str(a.region), postalCode: str(a.postalCode), country: str(a.country),
+    } : null,
+    phone: str(v.phone),
+    email: str(v.email),
+    website: str(v.website),
+  };
+}
+
+/**
+ * The portal's invoice row read: RLS-scoped load plus an app-layer org guard
+ * (defense-in-depth over RLS). A mismatch is the same 404 as a missing row —
+ * never 403 — so the portal cannot probe for another tenant's invoice ids.
+ * Returns the raw row; the caller keeps its own draft refusal and hands the row
+ * to customerDocument.ts for the customer projection (#9402).
+ */
+export async function getPortalInvoiceRowOr404(invoiceId: string, orgId: string): Promise<InvoiceRow> {
+  const inv = await getOwnedInvoiceOr404(invoiceId);
+  if (inv.orgId !== orgId) throw new InvoiceServiceError('Invoice not found', 404, 'INVOICE_NOT_FOUND');
+  return inv;
 }
 
 export async function listInvoices(query: { orgId?: string; status?: string; limit: number; cursor?: string }, actor: InvoiceActor) {
@@ -1210,6 +1260,10 @@ export async function updatePartnerBillingSettings(
     billingAddressLine1?: string | null; billingAddressLine2?: string | null; billingAddressCity?: string | null;
     billingAddressRegion?: string | null; billingAddressPostalCode?: string | null; billingAddressCountry?: string | null;
     billingTermsAndConditions?: string | null;
+    // #9075 W4a: agreement-request defaults (read only via agreementRequestDefaults.ts).
+    agreementDefaultExpiryDays?: number;
+    agreementReminderIntervalDays?: number | null;
+    agreementMaxReminders?: number;
   },
   actor: InvoiceActor
 ) {
@@ -1242,6 +1296,8 @@ export async function updatePartnerBillingSettings(
     'billingCompanyName', 'billingPhone', 'billingWebsite', 'billingAddressLine1', 'billingAddressLine2',
     'billingAddressCity', 'billingAddressRegion', 'billingAddressPostalCode', 'billingAddressCountry',
     'billingTermsAndConditions',
+    // null interval = automatic reminders off.
+    'agreementDefaultExpiryDays', 'agreementReminderIntervalDays', 'agreementMaxReminders',
   ] as const) {
     if (patch[key] !== undefined) set[key] = patch[key];
   }
@@ -1256,6 +1312,9 @@ export async function updatePartnerBillingSettings(
     notifyCustomerOnBehalfAcceptance: partners.notifyCustomerOnBehalfAcceptance,
     catalogAiStyle: partners.catalogAiStyle, invoiceFooter: partners.invoiceFooter,
     documentTheme: partners.documentTheme, documentPageSize: partners.documentPageSize,
+    agreementDefaultExpiryDays: partners.agreementDefaultExpiryDays,
+    agreementReminderIntervalDays: partners.agreementReminderIntervalDays,
+    agreementMaxReminders: partners.agreementMaxReminders,
   });
   if (!row) throw new InvoiceServiceError('Partner could not be resolved', 400, 'PARTNER_UNRESOLVABLE');
   return row;
@@ -1413,14 +1472,20 @@ async function materializeLines(invoiceId: string, orgId: string, specs: DraftLi
   })));
 }
 
-/** #8603: the zone a draft's time-entry lines are dated in (`invoice_lines.work_date`).
- *  Runs in the caller's DB context — a partner request can read its own partners
- *  row. `partners.timezone` is NOT NULL DEFAULT 'UTC'; the fallback only covers a
- *  row the context cannot see, and an unknown zone string is handled downstream
- *  by `toPartnerLocalDate` (UTC). Never blocks assembly. */
-async function readPartnerTimeZone(partnerId: string): Promise<string> {
-  const [row] = await db.select({ timezone: partners.timezone }).from(partners).where(eq(partners.id, partnerId)).limit(1);
-  return row?.timezone || 'UTC';
+/** The partner settings assembly reads before creating a draft.
+ *  - timeZone (#8603): the zone a draft's time-entry lines are dated in
+ *    (`invoice_lines.work_date`). `partners.timezone` is NOT NULL DEFAULT 'UTC';
+ *    the fallback only covers a row the context cannot see, and an unknown zone
+ *    string is handled downstream by `toPartnerLocalDate` (UTC).
+ *  - documentLocale (#9669): groups the numbers in generated line text. An
+ *    invoice has no stamped document_locale until issue/send, so a draft uses
+ *    the partner's language (`resolvePartnerDocumentLocale`, 'en' fallback).
+ *  Runs in the caller's DB context — a partner request can read its own
+ *  partners row. Never blocks assembly. */
+async function readPartnerAssemblyDefaults(partnerId: string): Promise<{ timeZone: string; documentLocale: string }> {
+  const [row] = await db.select({ timezone: partners.timezone, settings: partners.settings })
+    .from(partners).where(eq(partners.id, partnerId)).limit(1);
+  return { timeZone: row?.timezone || 'UTC', documentLocale: resolvePartnerDocumentLocale(row) };
 }
 
 /** One blocked group on an assembly response: unbilled work snapshotted in a
@@ -1504,7 +1569,7 @@ export async function assembleDraftFromOrg(
   requireOrgAccess(actor, input.orgId);
   requireSiteAccess(actor, input.siteId ?? null);
   // Read BEFORE the draft insert so a failed read cannot orphan an empty draft.
-  const timeZone = await readPartnerTimeZone(partnerId);
+  const { timeZone, documentLocale } = await readPartnerAssemblyDefaults(partnerId);
   const from = new Date(input.from + 'T00:00:00Z');
   const to = new Date(input.to + 'T23:59:59Z');
   // Create the draft FIRST so the gathered line totals are rounded in the
@@ -1527,7 +1592,7 @@ export async function assembleDraftFromOrg(
   const gathered = mergeAssembly(
     await gatherOrgTimeEntries(input.orgId, from, to, inv!.currencyCode, new Date(), timeZone),
     await gatherOrgParts(input.orgId, from, to, inv!.currencyCode),
-    await gatherOrgAiUsageCharges(input.orgId, to, inv!.currencyCode)
+    await gatherOrgAiUsageCharges(input.orgId, to, inv!.currencyCode, documentLocale)
   );
   return finishAssembly(inv!, gathered, 'No unbilled billable work in range', actor);
 }
@@ -1541,7 +1606,7 @@ export async function assembleDraftFromTicket(ticketId: string, actor: InvoiceAc
   // can never see such a row, so deny it up front rather than orphan an invoice.
   requireSiteAccess(actor, null);
   // Read BEFORE the draft insert so a failed read cannot orphan an empty draft.
-  const timeZone = await readPartnerTimeZone(partnerId);
+  const { timeZone } = await readPartnerAssemblyDefaults(partnerId);
   // Draft first: gathered line totals must round in the invoice row's actual
   // currency (see assembleDraftFromOrg). Empty gathers delete the transient draft.
   // Ticket org's currency (spec §5) or the explicit old-currency override (spec §7),
@@ -1571,7 +1636,8 @@ export async function issueInvoice(invoiceId: string, actor: InvoiceActor) {
   // Everything below runs in ONE system transaction (withSystemDbAccessContext
   // wraps its callback in baseDb.transaction — db/index.ts). Lock order is the
   // repo-wide invoice contract (see lockDraftInvoice): invoices row → invoice
-  // lines → source rows (contracts before contract_lines, then time_entries,
+  // lines → source rows (contracts before contract_lines, then the source
+  // rows' tickets (#8972 W0, lockInvoiceSourceTickets), then time_entries,
   // then ticket_parts, then ai_usage_charges (#7608), each deduplicated +
   // ORDER BY id; a later source type appends after ai_usage_charges). The AI
   // monthly close never locks an existing charge (it only inserts new ones),
@@ -1665,6 +1731,9 @@ export async function issueInvoice(invoiceId: string, actor: InvoiceActor) {
         );
       }
     };
+    // #8972 W0: the source rows' tickets, after the contracts and before the
+    // ticket child rows (lockInvoiceSourceTickets has the order).
+    await lockInvoiceSourceTickets(timeIds, partIds);
     if (timeIds.length) {
       validateBillable('Time entries', timeIds, await db
         .select({ id: timeEntries.id, orgId: timeEntries.orgId, billingStatus: timeEntries.billingStatus, currencyCode: timeEntries.currencyCode })
@@ -1687,9 +1756,9 @@ export async function issueInvoice(invoiceId: string, actor: InvoiceActor) {
     //    before the guarded write.
     const [org] = await db.select().from(organizations).where(eq(organizations.id, inv.orgId)).limit(1);
     const [partner] = await db.select().from(partners).where(eq(partners.id, inv.partnerId)).limit(1);
-    // Portal-branding footer for the invoice's org — the last resort of the
-    // shared footer chain (resolveDocumentFooter, documentFooter.ts). Read here,
-    // after all locks, alongside the org/partner snapshot reads: a pure
+    // #7510: the portal-branding footer for the invoice's org is the org override
+    // in the shared footer chain (resolveDocumentFooter, documentFooter.ts),
+    // ahead of the partner default. Read here, after all locks, alongside the org/partner snapshot reads: a pure
     // additional SELECT on a read-only table, no new lock class.
     const [issueBranding] = await db.select({ footerText: portalBranding.footerText })
       .from(portalBranding).where(eq(portalBranding.orgId, inv.orgId)).limit(1);
@@ -1728,7 +1797,7 @@ export async function issueInvoice(invoiceId: string, actor: InvoiceActor) {
       taxRate, subtotal, taxTotal, total, balance: total,
       billToName: org?.name ?? null, billToAddress, billToTaxId: org?.taxId ?? null,
       billToTaxExempt: org?.taxExempt ?? false,
-      // `terms` is the small footer line (from partner.invoiceFooter); `termsAndConditions`
+      // `terms` is the small footer line (org footer, else partner.invoiceFooter); `termsAndConditions`
       // is the labeled Terms & Conditions block (from partner.billingTermsAndConditions).
       // Resolved through the SHARED chain (settings audit rule 5, finding 22)
       // so issue time sees the portal-branding fallback the render path always
@@ -2444,7 +2513,7 @@ export async function voidInvoice(invoiceId: string, reason: string, opts: { rei
   let voidedOrgId = '';
   let voidedPartnerId = '';
   await runOutsideDbContext(() => withSystemDbAccessContext(async () => {
-    // 1. Invoice row FIRST, FOR UPDATE — status is re-validated on the LOCKED row.
+    // 1. Invoice row first, FOR UPDATE — status is re-validated on the LOCKED row.
     const [inv] = await db.select().from(invoices).where(eq(invoices.id, invoiceId)).limit(1).for('update');
     if (!inv) throw new InvoiceServiceError('Invoice not found', 404, 'INVOICE_NOT_FOUND');
     requireInvoiceAccess(actor, inv);
@@ -2522,7 +2591,9 @@ export async function voidInvoice(invoiceId: string, reason: string, opts: { rei
         .where(inArray(contractLines.id, contractLineIds)).orderBy(contractLines.id).for('update');
     }
 
-    // 4. Source rows FOR UPDATE before they are released.
+    // 4. Source rows FOR UPDATE before they are released — their tickets
+    //    first (#8972 W0, lockInvoiceSourceTickets has the order).
+    await lockInvoiceSourceTickets(timeIds, partIds);
     if (timeIds.length) {
       await db.select({ id: timeEntries.id }).from(timeEntries)
         .where(inArray(timeEntries.id, timeIds)).orderBy(timeEntries.id).for('update');

@@ -23,7 +23,7 @@ var allCommandTypes = []string{
 	tools.CmdRegistryKeys, tools.CmdRegistryValues, tools.CmdRegistryGet,
 	tools.CmdRegistrySet, tools.CmdRegistryDelete,
 	tools.CmdRegistryKeyCreate, tools.CmdRegistryKeyDelete,
-	tools.CmdReboot, tools.CmdShutdown, tools.CmdLock, tools.CmdRebootSafeMode, tools.CmdWakeOnLan,
+	tools.CmdReboot, tools.CmdShutdown, tools.CmdLock, tools.CmdRebootSafeMode, tools.CmdForceReboot, tools.CmdWakeOnLan,
 	tools.CmdRefreshInventory,
 	tools.CmdCollectSoftware, tools.CmdSoftwareUninstall, tools.CmdSoftwareInstall, tools.CmdSoftwareUpdate,
 
@@ -96,7 +96,8 @@ var allCommandTypes = []string{
 	tools.CmdBMRRecover, tools.CmdBareMetalRebuild,
 
 	// handlers_user.go init()
-	CmdNotifyUser, CmdTrayUpdate,
+	CmdNotifyUser, CmdTrayUpdate, CmdRetractMessage,
+	CmdChatOpen, CmdChatMessage, CmdChatClose,
 	// caller_verify.go (#6354 W02)
 	cmdCallerVerify,
 

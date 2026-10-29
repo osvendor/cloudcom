@@ -58,12 +58,14 @@ import {
   EVIDENCE_HOLD_RELEASED_ACTION,
   EVIDENCE_HOLD_RETAINED_TABLES,
   EVIDENCE_HOLD_SCOPED_ERASURE_KEY,
+  EVIDENCE_HOLD_SCRUBBED_ORG_COLUMNS,
   deleteEvidenceHold,
   findEvidenceHold,
   listHeldLineage,
   listHoldsBySurvivor,
 } from './orgEvidenceHold';
 import { removeScreenshotFiles } from './screenshotFiles';
+import { ORG_LIFECYCLE_INTERNAL_SETTINGS_KEYS } from './orgSettingsInternalKeys';
 import { removePatchReportFiles } from './patchReportFiles';
 import { advanceUserEpochs, revokeAllRefreshFamilies, runPostCommitCleanup } from './authLifecycle';
 import {
@@ -258,6 +260,13 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'action_intents',
   'agent_health_observations',
   'agent_logs',
+  // agreement_request_recipients / agreement_requests (#8865 W1b): children
+  // before parent (recipients → requests is a composite ON DELETE CASCADE FK).
+  // contract_documents.agreement_request_id → agreement_requests is ON DELETE
+  // SET NULL, so a list position ahead of contract_documents is safe;
+  // topologicalCascadeOrder() deletes contract_documents first regardless.
+  'agreement_request_recipients',
+  'agreement_requests',
   'ai_action_plans',
   // ai_agent_circuit_state / ai_agent_fix_watches (Wave 6 PR 2, #3828): sort
   // here alphabetically (before ai_agent_runs) even though
@@ -314,6 +323,13 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'ai_budget_reservations',
   'ai_budgets',
   'ai_cost_usage',
+  // ai_credit_debits (#9451): keyed credit debit outbox, shape 1, NOT NULL
+  // org_id ON DELETE CASCADE. Leaf: no FKs in, and source_id deliberately has
+  // no FK (ai_agent_runs / ai_invocations), so its position is alphabetical.
+  'ai_credit_debits',
+  // AI device file read policy: only the org override row cascades; the
+  // partner default has org_id NULL and never participates.
+  'ai_data_policies',
   // ai_invocations (AI model registry W02, #7600): shape 1, APPEND-ONLY
   // (REVOKE UPDATE/DELETE from breeze_app + ai_invocations_append_only), so it
   // is ALSO in AUDIT_ADMIN_REQUIRED_TABLES. Leaf: FK out to organizations only,
@@ -325,6 +341,13 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   // (cascade + a deferrable composite), partner_ai_models (partner axis, not in
   // this list), partners. Nothing references it.
   'ai_model_assignments',
+  // AI model registry W08b (#7606): snapshot of the dropped legacy AI model
+  // config. Partner axis (shape 3) like legacy_labour_pricing_archive; org_id
+  // is metadata on org-level rows. Its composite (org_id, partner_id) FK to
+  // organizations is also ON DELETE CASCADE (W08 D12: the previous release's
+  // cascade list does not know the table, so a rollback must not abort an
+  // erasure on it). Nothing references it.
+  'ai_model_registry_legacy_archive',
   // AI Operator thin slice (#5205 W03, #5208). All three are Shape 1 with a
   // NOT NULL org_id, so all three are required here.
   //   - ai_operator_operations references action_intents and ai_agent_runs,
@@ -470,6 +493,18 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'browser_extensions',
   'browser_policies',
   'browser_policy_violations',
+  // Business-hours calendars (#8973 W4, 2027-01-03-160000): org_id XOR
+  // partner_id config tables; the three children copy the owner pair. Every
+  // child FK is ON DELETE CASCADE to its parent, and the children sort before
+  // the parent under localeCompare ('business_calendar_…' < 'business_calendars').
+  // tickets.sla_calendar_revision_id and org_ticket_settings.business_calendar_id
+  // are ON DELETE SET NULL back-edges that close no cycle, so the topological
+  // order already deletes those referencing rows first and no
+  // CASCADE_ORDER_SET_NULL_EDGE_BREAKS entry is needed.
+  'business_calendar_holidays',
+  'business_calendar_intervals',
+  'business_calendar_revisions',
+  'business_calendars',
   'c2c_backup_configs',
   'c2c_backup_items',
   'c2c_backup_jobs',
@@ -482,6 +517,9 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'capacity_predictions',
   'capacity_thresholds',
   'catalog_item_org_pricing',
+  'circuit_served_sites',
+  'circuit_terminations',
+  'circuits',
   'cis_baseline_results',
   'cis_baselines',
   'cis_remediation_actions',
@@ -513,6 +551,7 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'contract_hour_periods',
   'contract_lines',
   'contract_renewal_notices',
+  'contract_skipped_billing_periods',
   // contract_template_versions sorts before contract_templates: localeCompare
   // puts '_' (versions) before 's' (templates) at the diverging character —
   // same prefix-extension trap as custom_field_definitions/customer_email_domains
@@ -626,10 +665,21 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'edr_tenants',
   'elevation_audit',
   'elevation_requests',
+  // Endpoint live chat (#8743 W03). messages -> conversations (conversation_id,
+  // org_id) FK is ON DELETE CASCADE; both also cascade from devices.
+  'endpoint_conversation_messages',
+  'endpoint_conversations',
+  // Endpoint messaging (#8742 W02). receipts -> deliveries -> endpoint_messages
+  // FKs are all ON DELETE CASCADE; topologicalCascadeOrder() orders the live
+  // FK graph regardless of position.
+  'endpoint_message_deliveries',
+  'endpoint_message_receipts',
+  'endpoint_messages',
   'enrollment_keys',
   'escalation_policies',
   'event_delivery_receipts',
   'executive_summaries',
+  // ai_memory_blocks: deliberately absent — no `org_id` column (owner_org_id); owner rows cascade by FK; see migration 2027-01-04-110100-ai-memory-blocks.sql header (Wisp W03, w00 A9).
   // AI Suggested Fixes W1: fix_memory is dual-owner (org_id XOR partner_id).
   // Org rows cascade with the org; partner rows (org_id NULL) are untouched by
   // an org erasure and are rebuilt by jobs/tenantErasure.ts afterwards. FKs out
@@ -646,6 +696,26 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'fleet_findings',
   'fleet_remediation_run_targets',
   'fleet_remediation_runs',
+  // Tool Catalog W04 (#5219, 2027-01-06-130000-flow-runs.sql). flow_run_steps
+  // -> flow_runs (run_id, org_id) and flow_runs -> flow_versions are ON DELETE
+  // CASCADE; action_intents(requesting_flow_run_id, org_id) -> flow_runs is
+  // ON DELETE RESTRICT, so topologicalCascadeOrder() (live pg_constraint)
+  // deletes action_intents before flow_runs whatever the position here.
+  // flow_versions is org XOR partner like flows: partner-wide publications
+  // (org_id NULL) are untouched by an org erasure.
+  // Tool Catalog W5 (#5220, 2027-01-06-160000): flow_usage_counters and
+  // flow_webhook_deliveries both cascade from flows and carry org_id (nullable:
+  // partner-wide flows). flow_webhook_deliveries(run_id, org_id) -> flow_runs is
+  // a composite FK; the runtime order is computed topologically.
+  'flow_run_steps',
+  'flow_runs',
+  'flow_usage_counters',
+  'flow_versions',
+  'flow_webhook_deliveries',
+  // Tool Catalog W03 (#5218): org XOR partner flow documents. Its FKs to
+  // ai_sessions / ai_agents / users are ON DELETE SET NULL, so it imposes no
+  // child-before-parent constraint of its own.
+  'flows',
   'google_workspace_connections',
   'group_membership_log',
   // W03 Task 12 (#6859): org-scoped, no device_id — the retirement recovery
@@ -869,9 +939,14 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'script_proposals',
   'script_tags',
   'scripts',
+  // #6960 W03: per-(device, vendor) security-agent coverage. Composite
+  // (device_id, org_id) FK -> devices ON DELETE CASCADE; policy_id -> software_policies
+  // ON DELETE SET NULL. Topological order handles the FKs at runtime.
+  'security_agent_device_status',
   'security_policies',
   'security_posture_org_snapshots',
   'security_posture_snapshots',
+  'security_scan_sweeps',
   'security_scans',
   'security_status',
   'security_threats',
@@ -1017,6 +1092,15 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'ticket_outbox',
   'offline_transition_effects',
   'ticket_parts',
+  // Ticket routing rules (#8883 W5, 2027-01-04-120000). Dual-axis XOR config
+  // table plus its org-links FK child (whose org_id is the allowlisted org).
+  // localeCompare: 'ticket_parts' < 'ticket_routing_rule_org_links' <
+  // 'ticket_routing_rules' < 'tickets' ('p' < 'r'; 'rule_' < 'rules'), so the
+  // child precedes its parent. tickets.routing_rule_id -> rules is ON DELETE
+  // SET NULL and closes no FK cycle, so it needs no
+  // CASCADE_ORDER_SET_NULL_EDGE_BREAKS entry (the delete order is topological).
+  'ticket_routing_rule_org_links',
+  'ticket_routing_rules',
   'tickets',
   'time_entries',
   'time_series_metrics',
@@ -1058,10 +1142,16 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'topology_site_template_bindings',
   'topology_telemetry_arms',
   'topology_view_exclusions',
-  // trust_page_* : documents/snapshots -> trust_pages (children first);
-  // localeCompare puts '_' before 's', so alphabetical order IS FK order here.
+  // trust_page_* : children -> trust_pages (children first); access_tokens -> access_requests.
+  // localeCompare puts '_' before 's', so alphabetical order IS FK order here (and the
+  // runtime topological sort handles FK direction regardless).
+  'trust_page_access_requests',
+  'trust_page_access_tokens',
+  'trust_page_declarations',
   'trust_page_documents',
+  'trust_page_faq_items',
   'trust_page_snapshots',
+  'trust_page_subprocessors',
   'trust_pages',
   'tunnel_allowlists',
   'tunnel_sessions',
@@ -1078,6 +1168,47 @@ const CORE_ORG_CASCADE_DELETE_ORDER: ReadonlyArray<string> = Object.freeze([
   'users',
   'vault_snapshot_inventory',
   'webhooks',
+  // Wisp W02 (#9908): org-scoped grants only (partner-wide grants have org_id
+  // NULL and leave with the partner). ai_agent_runs / ai_operator_tasks pin a
+  // grant with ON DELETE RESTRICT FKs, so they must (and do) precede it; the
+  // revisions go with the grant via ON DELETE CASCADE.
+  'wisp_grants',
+  // Wisp W04 (#9910). wisp_thread_attachments is shape 1 (its artifact's org);
+  // wisp_thread_sessions is partner-axis but carries the attached session's
+  // org_id. Both reference ai_run_artifacts / ai_sessions / organizations with
+  // ON DELETE CASCADE and wisp_threads (a partner table, not in this list);
+  // topologicalCascadeOrder() puts them before their parents.
+  // wisp_threads.focus_org_id needs no step: its FK is ON DELETE SET NULL
+  // (focus_org_id).
+  // Wisp W05a (#9911). All three are partner-anchored / org-optional
+  // (DUAL_AXIS_TENANT_TABLES): this pass deletes their org rows only; a
+  // partner-level row (org_id NULL) leaves with the partner. Recipients
+  // reference wisp_concerns ON DELETE CASCADE, and recipients + watches
+  // reference wisp_grants ON DELETE CASCADE; topologicalCascadeOrder() puts
+  // them before their parents.
+  'wisp_concern_recipients',
+  'wisp_concerns',
+  'wisp_thread_attachments',
+  // Wisp W08a (#9914). Partner-anchored / org-optional like wisp_concerns
+  // (DUAL_AXIS_TENANT_TABLES): this pass deletes its org rows only; a
+  // partner-level link (org_id NULL) leaves with its thread / partner. It
+  // references wisp_threads, users and organizations ON DELETE CASCADE and
+  // wisp_grants ON DELETE SET NULL (added_by_grant_id).
+  'wisp_thread_links',
+  // Wisp companion W02a (#10212). Same partner-anchored / org-optional shape:
+  // this pass deletes its org posts only; a partner-level post (brief, digest,
+  // org-less concern) leaves with its thread / partner. It references
+  // wisp_threads and wisp_grants ON DELETE CASCADE, and wisp_concerns and
+  // user_notifications ON DELETE SET NULL; topologicalCascadeOrder() puts it
+  // before its parents.
+  'wisp_thread_posts',
+  'wisp_thread_sessions',
+  'wisp_watches',
+  // #6263 W03a. yara_rules.rule_set_id -> yara_rule_sets ON DELETE CASCADE,
+  // so deleting the parent first is FK-safe; built-in rows (org_id NULL) are
+  // never matched by an org erasure.
+  'yara_rule_sets',
+  'yara_rules',
   // organizations is id-keyed (no org_id column). Cleared last.
   'organizations',
 ]);
@@ -1355,6 +1486,11 @@ const AUDIT_ADMIN_REQUIRED_TABLES: ReadonlySet<string> = new Set<string>([
   // ai_invocations_append_only() (2026-11-14-100300, #7600 W02), so erasure has
   // to run as breeze_audit_admin with breeze.allow_audit_retention=1.
   'ai_invocations',
+  // Signed agreements (#9075 W4b): REVOKE UPDATE/DELETE from breeze_app (only
+  // column UPDATE on contract_id/org_id stays) plus
+  // contract_documents_append_only() (2027-01-06-150000), so erasure has to
+  // run as breeze_audit_admin with breeze.allow_audit_retention=1.
+  'contract_documents',
 ]);
 
 interface FkEdge {
@@ -1387,6 +1523,16 @@ interface FkEdge {
  */
 export const CASCADE_ORDER_SET_NULL_EDGE_BREAKS: ReadonlySet<string> = new Set([
   'report_runs_artifact_id_ai_run_artifacts_id_fk',
+  // Wisp W02: wisp_grants.current_revision_id -> wisp_grant_revisions is ON
+  // DELETE SET NULL (current_revision_id); the reverse edge (revisions ->
+  // grants, CASCADE) is the real ownership, so the partner-axis sweep deletes
+  // revisions first and the grant's pointer falls to NULL.
+  'wisp_grants_current_revision_fk',
+  // Wisp W07: ai_operator_tasks.requested_by_run_id -> ai_agent_runs is ON
+  // DELETE SET NULL (requested_by_run_id) — a lineage back-pointer. The
+  // reverse edge (ai_agent_runs.task_id -> ai_operator_tasks) is the real
+  // ordering, so runs go first and a specialist task's pointer falls to NULL.
+  'ai_operator_tasks_requested_by_run_fk',
 ]);
 
 /**
@@ -1532,6 +1678,20 @@ export interface CascadeStats {
    * deletes a parent the shell owns (users, approval requests, ...). A real
    * Phase B repoints those parents to the survivor, so a held shell normally
    * owns none; if one does, the pointer is nulled like any erased reference.
+   *
+   * One retained reference is NO ACTION instead: `elevation_requests.site_id`
+   * -> `sites` (event-time site, spec OD11). A held request whose site still
+   * belongs to the shell would make the `sites` delete raise 23503 and fail
+   * the scoped erasure (fail-fast, re-runnable, nothing retained is lost).
+   * Phase B repoints every loser site to the survivor (`sites` is a plain
+   * repoint), so in a real merge the held request's site is a survivor site
+   * and the walk never deletes it; a site a shell still owns means the merge
+   * walk did not complete.
+   *
+   * The kept `organizations` row is scrubbed in the same run: billing contact
+   * and address, tax id and SSO configuration are nulled
+   * (EVIDENCE_HOLD_SCRUBBED_ORG_COLUMNS) and `settings` is cut down to the
+   * engine-owned lifecycle keys; name and slug stay.
    */
   evidenceHoldScoped?: true;
 }
@@ -1878,6 +2038,12 @@ async function cascadeDeleteOrgInternal(
   const scopedDetails = scopedHold
     ? {
       evidenceHoldScoped: true,
+      // W6 (#8208): the run erased everything but the retained evidence and
+      // the identity columns of the organizations row; an auditor filtering
+      // tenant.erasure.completed must be able to tell it from a full erasure.
+      scoped_hold: true,
+      scrubbedOrganizationColumns: [...EVIDENCE_HOLD_SCRUBBED_ORG_COLUMNS],
+      settingsReducedToEngineKeys: true,
       retainedTables: [...retainedTables],
       survivorOrgId: scopedHold.survivorOrgId,
       mergeEventId: scopedHold.mergeEventId,
@@ -2349,12 +2515,30 @@ async function cascadeDeleteOrgInternal(
   // sweeper's merge-erasure retry stops handing the shell back to erasure.
   // Stamped only after the walk succeeded — a failed walk leaves no stamp and
   // the retry re-runs it (the walk is idempotent).
+  //
+  // The same statement erases what the kept `organizations` row still holds
+  // beyond what the lineage needs (PAM ownership epochs W6, #8208): billing
+  // contact, billing address, tax id, the SSO configuration (it can carry
+  // client secrets), and every tenant key of `settings` — that blob holds
+  // sealed credentials (log-forwarding / event-log API keys, launcher
+  // passwords, webhooks; settingsSecretMasking.ts). Only the engine-owned
+  // lifecycle keys (ORG_LIFECYCLE_INTERNAL_SETTINGS_KEYS) survive, plus this
+  // stamp. `name` and `slug` stay — survivors render held history under the
+  // shell's name. Re-running it is a no-op.
   if (scopedHold) {
     try {
+      const engineKeys = sql`ARRAY[${sql.join(ORG_LIFECYCLE_INTERNAL_SETTINGS_KEYS.map((k) => sql`${k}`), sql`, `)}]::text[]`;
       await dbModule.withSystemDbAccessContext(() => dbModule.db.execute(sql`
         UPDATE organizations
-           SET settings = COALESCE(settings, '{}'::jsonb)
-                 || jsonb_build_object(${EVIDENCE_HOLD_SCOPED_ERASURE_KEY}::text, now())
+           SET settings = COALESCE(
+                 CASE WHEN jsonb_typeof(settings) = 'object' THEN
+                   (SELECT jsonb_object_agg(e.key, e.value)
+                      FROM jsonb_each(settings) AS e
+                     WHERE e.key = ANY(${engineKeys}))
+                 END,
+                 '{}'::jsonb)
+                 || jsonb_build_object(${EVIDENCE_HOLD_SCOPED_ERASURE_KEY}::text, now()),
+               ${sql.join(EVIDENCE_HOLD_SCRUBBED_ORG_COLUMNS.map((c) => sql`${sql.identifier(c)} = NULL`), sql`, `)}
          WHERE id = ${orgId}::uuid`));
     } catch (err) {
       await writeErasureFailedAudit(orgId, performedBy, performedByEmail, 'organizations (evidence-hold stamp)', stats, err);

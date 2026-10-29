@@ -9,13 +9,15 @@ import { showToast } from '../shared/Toast';
 import { topologyGraphFixture, topologySettingsFixture, SITE, NODE } from '../topology/topologyFixtures';
 
 // Keep legacy discovery/action queues separate from the new parallel reads.
-const { fetchWithAuthMock, monitoringFetchMock } = vi.hoisted(() => ({
-  fetchWithAuthMock: vi.fn(), monitoringFetchMock: vi.fn(),
+const { fetchWithAuthMock, monitoringFetchMock, placementFetchMock } = vi.hoisted(() => ({
+  fetchWithAuthMock: vi.fn(), monitoringFetchMock: vi.fn(), placementFetchMock: vi.fn(),
 }));
 vi.mock('../../stores/auth', () => ({
   registerOrgIdProvider: vi.fn(),
+  // PhysicalPlacementCard's GET is routed away so it doesn't shift the Once queues or call counts.
   fetchWithAuth: (url: string, init?: RequestInit) =>
-    url.startsWith('/monitoring/assets/') || url.startsWith('/monitors?assetId=') || url === '/snmp/templates'
+    url.endsWith('/placement') ? placementFetchMock(url, init)
+    : url.startsWith('/monitoring/assets/') || url.startsWith('/monitors?assetId=') || url === '/snmp/templates'
       ? monitoringFetchMock(url, init) : init === undefined ? fetchWithAuthMock(url) : fetchWithAuthMock(url, init),
 }));
 
@@ -32,6 +34,16 @@ vi.mock('../shared/Toast', () => ({
 vi.mock('../topology/TopologyCanvas', () => ({ default: () => <div data-testid="topology-canvas" /> }));
 
 const showToastMock = vi.mocked(showToast);
+
+placementFetchMock.mockImplementation(async () => ({
+  ok: true,
+  status: 200,
+  json: async () => ({
+    subject: { kind: 'asset', id: '11111111-1111-1111-1111-111111111111' },
+    authority: { kind: 'asset', id: '11111111-1111-1111-1111-111111111111', linked: false },
+    placement: null,
+  }),
+}));
 
 const makeJsonResponse = (payload: unknown, ok = true, status = ok ? 200 : 500): Response =>
   ({
@@ -355,6 +367,41 @@ describe('NetworkDeviceDetailPage', () => {
 
     expect(screen.getByTestId('network-detail-snmp').textContent).toContain('No SNMP data was collected');
     expect(screen.getByTestId('network-detail-ports').textContent).toContain('No open ports were found on the most recent scan');
+  });
+
+  it('health card says "No SNMP health data" (not "Nothing is being monitored") when a network check is active (#9646)', async () => {
+    const observedAt = new Date(Date.now() - 60_000).toISOString();
+    fetchWithAuthMock.mockResolvedValueOnce(
+      makeJsonResponse({
+        data: {
+          ...baseAsset,
+          snmpMonitoringEnabled: false,
+          reachability: {
+            ...baseReachability,
+            source: 'network_check',
+            detail: { networkCheck: { state: 'online', observedAt, responseMs: 4, monitorId: 'm1' } },
+          },
+        },
+      }),
+    );
+
+    render(<NetworkDeviceDetailPage assetId={ASSET_ID} />);
+    await screen.findByTestId('network-device-detail');
+
+    const empty = screen.getByTestId('network-detail-health-empty');
+    expect(empty).toHaveTextContent('No SNMP health data');
+    expect(empty).not.toHaveTextContent('Nothing is being monitored yet');
+  });
+
+  it('health card keeps "Nothing is being monitored yet" when no check and no SNMP (#9646)', async () => {
+    fetchWithAuthMock.mockResolvedValueOnce(
+      makeJsonResponse({ data: { ...baseAsset, snmpMonitoringEnabled: false, reachability: { ...baseReachability, detail: {} } } }),
+    );
+
+    render(<NetworkDeviceDetailPage assetId={ASSET_ID} />);
+    await screen.findByTestId('network-device-detail');
+
+    expect(screen.getByTestId('network-detail-health-empty')).toHaveTextContent('Nothing is being monitored yet');
   });
 
   it('falls back to hostname for the display name when no label is set', async () => {

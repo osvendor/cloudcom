@@ -156,6 +156,9 @@ export const CommandTypes = {
 
   // Safe mode reboot (Windows only)
   REBOOT_SAFE_MODE: 'reboot_safe_mode',
+  // #8729: immediate reboot that force-closes running apps (/f on Windows).
+  // Queued only by POST /devices/:id/force-reboot (step-up, interactive session).
+  FORCE_REBOOT: 'force_reboot',
   // Wake-on-LAN — sent to a relay agent on the target's LAN, not the offline target itself
   WAKE_ON_LAN: 'wake_on_lan',
   // On-demand inventory refresh — agent re-runs every send*Inventory collector,
@@ -169,6 +172,18 @@ export const CommandTypes = {
   // while; registering it here is what makes it queueable. Partner-trust gated
   // (GATED_COMMAND_TYPES), never a lifecycle type: it carries operator content.
   NOTIFY_USER: 'notify_user',
+  // Endpoint messaging W02 (#8742): withdraw a message already on screen.
+  // Carries no operator content (only the message id), so it is a lifecycle
+  // type: a restricted partner can still take a message down.
+  RETRACT_MESSAGE: 'retract_message',
+  // Endpoint live chat W03 (#8743). Technician -> device-user chat over the
+  // Assist helper (Windows console session only). All three are `live`
+  // (commandOfflinePolicy: refused offline, never queued). open/message carry
+  // operator content and are partner-trust gated; close carries none and is a
+  // lifecycle type.
+  CHAT_OPEN: 'chat_open',
+  CHAT_MESSAGE: 'chat_message',
+  CHAT_CLOSE: 'chat_close',
   // Backup
   BACKUP_RUN: 'backup_run',
   BACKUP_STOP: 'backup_stop',

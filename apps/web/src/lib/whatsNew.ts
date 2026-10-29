@@ -18,6 +18,32 @@ export interface WhatsNewEntry {
  */
 export const WHATS_NEW_ENTRIES: WhatsNewEntry[] = [
   {
+    version: '0.125.0',
+    date: '2026-10-27',
+    title: 'Agreements clients sign without a quote, ticket merge and routing, and update rings that decide Windows feature updates',
+    highlights: [
+      'Send any agreement for signature from Agreements, an organization’s Billing tab or a contract. Clients sign on a public page or in the portal’s new Agreements page, everyone gets the signed copy with a signature certificate, and you can remind, void or let it expire automatically.',
+      'Merge duplicate tickets into one, give SLAs business hours and holidays (a partner default with an organization override), and add routing rules that set the category, priority, status or assignee on new tickets.',
+      'Update rings now decide Windows feature updates: block them (the default), allow the newest release, or pin devices to one such as Windows 11 25H2. Needs this release’s agent.',
+      'Software versions can run pre- and post-install scripts and ship as zip packages, and Control D and NextDNS can be added from Software → Catalog → Built-in packages. A new Detection Rules page under Security manages YARA rule sets, and Sweep now runs them across many devices at once.',
+      'AI conversations move between the side panel and the full-page Breeze AI chat with their history, and dashboard numbers now open the filtered lists they count. Breeze Assist no longer crash-loops on an old WebView2 runtime, and the remote-support consent prompt now defaults to Deny.',
+    ],
+    learnMoreUrl: 'https://breezermm.com/release-notes',
+  },
+  {
+    version: '0.124.0',
+    date: '2026-10-19',
+    title: 'A fuller Trust Center, connection health alerts, and Huntress and SentinelOne deployed from policy',
+    highlights: [
+      'Trust Center pages gain declared controls with yearly expiry, documents customers can request, framework views, subprocessors and an FAQ. A partner-wide template, a signed attestation, a website embed and questionnaire export round them out, and customers can edit the draft from the portal while you keep publishing.',
+      'A Connection Health panel on Integrations lists every broken integration with a fix link, including failing webhooks and stalled syncs. Admins who can fix an incident get one daily digest email. Notices to customer admins are opt-in.',
+      'Turn on Huntress or SentinelOne in a configuration policy’s Security Agents tab to deploy it with each organization’s own keys, then track per-device coverage and gaps. With this release’s agent, Windows devices also take a System Restore checkpoint before patches, scripts and software installs.',
+      'A new AI data & privacy setting controls whether AI can read device files (user profile folders are excluded by default) and how long AI tool outputs are kept. Microsoft 365 password resets and account disables now need a verified caller, and eight more M365 identity actions are available through AI with approval.',
+      'Getting around is faster: the header switcher goes Customer › Page with live counts, and organization, site, device and ticket names link everywhere. A Recent list sits in the sidebar and on the dashboard, and a new Attention column on the devices list shows open alerts and tickets.',
+    ],
+    learnMoreUrl: 'https://breezermm.com/release-notes',
+  },
+  {
     version: '0.123.0',
     date: '2026-10-17',
     title: 'Agents that get past ISP security filters, ticket types, and customer work approval',

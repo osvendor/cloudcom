@@ -45,6 +45,17 @@ describe('portal_branding.enable_vulnerability_detail export policy (portal visi
   });
 });
 
+describe('portal_branding.enable_physical_placement export policy (environment visibility W1)', () => {
+  it('is mapped and included (plain boolean, not jsonb/bytea)', () => {
+    expect(
+      getTenantExportPolicyRegistry()['portal_branding']?.columns['enable_physical_placement']?.decision,
+    ).toBe('include');
+    expect(
+      (getTableColumns(portalBranding) as Record<string, { name: string }>)['enablePhysicalPlacement']?.name,
+    ).toBe('enable_physical_placement');
+  });
+});
+
 describe('portal_branding.enable_edr_visibility export policy (EDR provider framework W02)', () => {
   it('is mapped and included (plain boolean, not jsonb/bytea)', () => {
     expect(
@@ -64,5 +75,16 @@ describe('portal_branding.enable_hour_block export policy (block hours W04)', ()
     expect(
       (getTableColumns(portalBranding) as Record<string, { name: string }>)['enableHourBlock']?.name,
     ).toBe('enable_hour_block');
+  });
+});
+
+describe('portal_branding.enable_trust_page_editing export policy (Trust Center W3d)', () => {
+  it('is mapped and included (plain boolean, not jsonb/bytea)', () => {
+    expect(
+      getTenantExportPolicyRegistry()['portal_branding']?.columns['enable_trust_page_editing']?.decision,
+    ).toBe('include');
+    expect(
+      (getTableColumns(portalBranding) as Record<string, { name: string }>)['enableTrustPageEditing']?.name,
+    ).toBe('enable_trust_page_editing');
   });
 });

@@ -29,7 +29,7 @@ import { fetchWithAuth } from "../../stores/auth";
 import { formatUptime } from "../../lib/utils";
 import { runAction, ActionError } from "../../lib/runAction";
 import { formatDateTime } from "@/lib/dateTimeFormat";
-import { isAgentUpdateStuck, isDeviceLogSilent } from "@breeze/shared";
+import { isAgentUpdateStuck } from "@breeze/shared";
 import {
   DEVICE_ROLES,
   getDeviceRoleLabel,
@@ -40,10 +40,13 @@ import {
 import DeviceFunctionField from "./DeviceFunctionField";
 import { asList } from '@/lib/asList';
 import { formatDeviceDetailOsVersion } from "./osDisplay";
+import { formatOsBuild } from "./formatOsLabel";
 import DeviceTimeSection from "./time/DeviceTimeSection";
+import { derivePromptRenderer, helperInstallIssueKey } from "./promptRenderer";
 import { formatNumber } from "@/lib/i18n/format";
 import { Trans, useTranslation } from "react-i18next";
 import "../../lib/i18n";
+import { dropdownChoiceLabel } from "../../lib/customFieldChoice";
 
 type DeviceInfoTabProps = {
   deviceId: string;
@@ -106,7 +109,6 @@ type DeviceInfo = {
   logsNotArriving?: { since: string } | null;
   status?: string | null;
   lastSeenAt?: string | null;
-  lastLogAt?: string | null;
   enrolledAt?: string | null;
   lastUser?: string | null;
   uptimeSeconds?: number | null;
@@ -239,6 +241,51 @@ function formatDesktopAccessReason(
     default:
       return "—";
   }
+}
+
+function AssistStatusRow({
+  helperVersion,
+  helperInstallIssue,
+}: {
+  helperVersion?: string | null;
+  helperInstallIssue?: string | null;
+}) {
+  const { t } = useTranslation("devices");
+  const renderer = derivePromptRenderer({ helperVersion, helperInstallIssue });
+  let value: string;
+  if (renderer.status === "installed") {
+    value = t("deviceInfoTab.assistStatus.installed");
+  } else if (renderer.status === "notDeployed") {
+    value = t("deviceInfoTab.assistStatus.notDeployed");
+  } else {
+    let reason: string;
+    switch (helperInstallIssueKey(renderer.issue ?? "")) {
+      case "webview2Outdated":
+        reason = t("deviceInfoTab.assistStatus.reason.webview2Outdated");
+        break;
+      case "crashLoop":
+        reason = t("deviceInfoTab.assistStatus.reason.crashLoop");
+        break;
+      case "unmanagedInstall":
+        reason = t("deviceInfoTab.assistStatus.reason.unmanagedInstall");
+        break;
+      case "awaitingServerOffer":
+        reason = t("deviceInfoTab.assistStatus.reason.awaitingServerOffer");
+        break;
+      case "installAbandoned":
+        reason = t("deviceInfoTab.assistStatus.reason.installAbandoned");
+        break;
+      default:
+        reason = t("deviceInfoTab.assistStatus.reason.unknown");
+    }
+    value = t("deviceInfoTab.assistStatus.unavailable", { reason });
+  }
+  return (
+    <div className="flex justify-between py-2" data-testid="assist-status">
+      <dt className="text-sm text-muted-foreground">{t("deviceInfoTab.assistStatus.label")}</dt>
+      <dd className="text-sm font-medium text-right">{value}</dd>
+    </div>
+  );
 }
 
 function InfoRow({ label, value }: { label: string; value: string }) {
@@ -520,7 +567,7 @@ function Section({
     <div className="rounded-lg border bg-card p-6 shadow-xs">
       <div className="flex items-center gap-2 mb-4">
         {icon}
-        <h3 className="text-sm font-semibold">{title}</h3>
+        <h2 className="text-sm font-semibold">{title}</h2>
       </div>
       <dl className="divide-y">{children}</dl>
     </div>
@@ -729,10 +776,7 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
     if (value === null || value === undefined || value === "") return "—";
     if (def.type === "boolean")
       return value ? t("deviceInfoTab.yes") : t("deviceInfoTab.no");
-    if (def.type === "dropdown" && def.options?.choices) {
-      const choice = def.options.choices.find((c) => c.value === value);
-      return choice?.label ?? String(value);
-    }
+    if (def.type === "dropdown") return dropdownChoiceLabel(def, value) ?? String(value);
     if (def.type === "date" && typeof value === "string")
       return formatDate(value);
     return String(value);
@@ -953,9 +997,9 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
             const RoleIcon = getDeviceRoleIcon(role);
             return <RoleIcon className="h-4 w-4 text-muted-foreground" />;
           })()}
-          <h3 className="text-sm font-semibold">
+          <h2 className="text-sm font-semibold">
             {t("deviceInfoTab.deviceRole")}
-          </h3>
+          </h2>
         </div>
         <dl className="divide-y">
           <div className="flex items-center justify-between py-2">
@@ -1000,6 +1044,15 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
                   {(() => {
                     const role = (info?.deviceRole ?? "unknown") as string;
                     const RoleIcon = getDeviceRoleIcon(role);
+                    // #9030: "Unknown" read as a fact about the device; it
+                    // only means nothing has classified it yet.
+                    if (role === "unknown") {
+                      return (
+                        <span className="text-sm font-normal text-muted-foreground">
+                          {t("deviceInfoTab.roleNotAssessed")}
+                        </span>
+                      );
+                    }
                     return (
                       <span className="inline-flex items-center gap-1.5 rounded-full border bg-muted/50 px-2.5 py-1 text-xs font-medium">
                         <RoleIcon className="h-3 w-3" />
@@ -1067,7 +1120,7 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
         />
         <InfoRow
           label={t("deviceInfoTab.osBuild")}
-          value={info?.osBuild ?? "—"}
+          value={formatOsBuild(info?.osType, info?.osVersion, info?.osBuild) ?? "—"}
         />
         <InfoRow
           label={t("deviceInfoTab.architecture")}
@@ -1281,22 +1334,6 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
             })}
           </div>
         ) : null}
-        {info &&
-        isDeviceLogSilent({
-          status: info.status,
-          lastLogAt: info.lastLogAt,
-          enrolledAt: info.enrolledAt,
-        }) ? (
-          <div
-            data-testid="logs-silent"
-            role="status"
-            className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-foreground"
-          >
-            {info.lastLogAt
-              ? t("deviceInfoTab.logsSilent", { since: formatDate(info.lastLogAt) })
-              : t("deviceInfoTab.logsSilentNeverShipped")}
-          </div>
-        ) : null}
         {info?.updateOfferWithheldReason ? (
           <div
             data-testid="update-offer-withheld"
@@ -1318,7 +1355,14 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
           label={t("deviceInfoTab.helperVersion")}
           value={info?.helperVersion?.trim() || "—"}
         />
-        {/* #6925: Assist enabled but not installed — the agent reports why. */}
+        {/* #10190 W01: whether Breeze Assist can draw prompts here, from the
+            last-reported helper state (not the live per-session renderer). */}
+        <AssistStatusRow
+          helperVersion={info?.helperVersion}
+          helperInstallIssue={info?.helperInstallIssue}
+        />
+        {/* #6925, #10183, #10185: the agent reports why Assist is not
+            installed or not running. */}
         {info?.helperInstallIssue ? (
           <div
             data-testid="helper-install-issue"
@@ -1329,11 +1373,17 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
               const since = info.helperInstallIssueSince
                 ? new Date(info.helperInstallIssueSince).toLocaleDateString()
                 : "—";
-              switch (info.helperInstallIssue) {
-                case "awaiting_server_offer":
+              switch (helperInstallIssueKey(info.helperInstallIssue)) {
+                case "awaitingServerOffer":
                   return t("deviceInfoTab.helperInstallIssue.awaitingServerOffer", { since });
-                case "install_abandoned":
+                case "installAbandoned":
                   return t("deviceInfoTab.helperInstallIssue.installAbandoned", { since });
+                case "webview2Outdated":
+                  return t("deviceInfoTab.helperInstallIssue.webview2Outdated", { since });
+                case "crashLoop":
+                  return t("deviceInfoTab.helperInstallIssue.crashLoop", { since });
+                case "unmanagedInstall":
+                  return t("deviceInfoTab.helperInstallIssue.unmanagedInstall", { since });
                 default:
                   return t("deviceInfoTab.helperInstallIssue.unknown", { since });
               }
@@ -1464,7 +1514,7 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
         <div className="rounded-lg border bg-card p-6 shadow-xs">
           <div className="flex items-center gap-2 mb-4">
             <Tag className="h-4 w-4 text-muted-foreground" />
-            <h3 className="text-sm font-semibold">{t("deviceInfoTab.tags")}</h3>
+            <h2 className="text-sm font-semibold">{t("deviceInfoTab.tags")}</h2>
           </div>
           <div className="flex flex-wrap gap-2">
             {tags.map((tag) => (
@@ -1483,9 +1533,9 @@ export default function DeviceInfoTab({ deviceId }: DeviceInfoTabProps) {
         <div className="rounded-lg border bg-card p-6 shadow-xs lg:col-span-2">
           <div className="flex items-center gap-2 mb-4">
             <ListChecks className="h-4 w-4 text-muted-foreground" />
-            <h3 className="text-sm font-semibold">
+            <h2 className="text-sm font-semibold">
               {t("deviceInfoTab.customFields")}
-            </h3>
+            </h2>
           </div>
           <dl className="divide-y">
             {applicableFields.map((def) => {

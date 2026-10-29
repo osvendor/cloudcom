@@ -11,6 +11,8 @@ import { oauthClients, oauthGrants } from '../../db/schema';
 import { createOrganization, createPartner, createUser } from './db-utils';
 import { oauthGrantSource, cleanDisplayName, brokenCandidatesQuery } from '../../services/connectionHealth/sources/oauthGrant';
 import { HEALTH_SOURCES } from '../../services/connectionHealth/sources';
+import { retryCounterKey } from '../../services/connectionHealth/oauthRetryCounter';
+import { getTestRedis } from './setup';
 
 const NOW = new Date();
 const daysAgo = (n: number) => new Date(NOW.getTime() - n * 86_400_000);
@@ -54,7 +56,7 @@ const observe = (tracked: string[] = []) => asSystem(() => oauthGrantSource.obse
 
 describe('oauthGrantSource', () => {
   it('is registered', () => {
-    expect(HEALTH_SOURCES).toEqual([oauthGrantSource]);
+    expect(HEALTH_SOURCES).toContain(oauthGrantSource);
     expect(oauthGrantSource).toMatchObject({ kind: 'oauth_grant', intervalMinutes: 15 });
   });
 
@@ -62,12 +64,30 @@ describe('oauthGrantSource', () => {
     const g = await seedGrant({ createdAt: daysAgo(12), revokedAt: daysAgo(10), revokedReason: 'refresh-token-reuse' });
     expect(await observe()).toEqual([expect.objectContaining({
       sourceKind: 'oauth_grant', sourceId: `${g.accountId}:${g.clientId}`, state: 'broken', severity: 'permanent',
-      condition: 'grant_revoked_reuse', ownerUserId: g.accountId, partnerId: g.partnerId, detail: null,
+      condition: 'grant_revoked_reuse', ownerUserId: g.accountId, partnerId: g.partnerId,
+      detail: expect.stringContaining('Breeze revoked this app'),
       fixHref: '/settings/connected-apps', ownerFixHref: '/account/connected-apps',
       viewPermission: { resource: 'connected_apps', action: 'read' },
       repairPermission: { resource: 'connected_apps', action: 'manage' },
-      displayName: 'Test MCP Client',
+      // #9594: reuse incidents are disambiguated with owner email + grant created date.
+      displayName: expect.stringMatching(/^Test MCP Client \(ch-oauth-[0-9a-f-]+@?[a-z.]*, \d{4}-\d{2}-\d{2}\)$/),
     })]);
+  });
+
+  it('W4: a broken grant whose app keeps retrying carries today\'s failed-refresh count from Redis', async () => {
+    const g = await seedGrant({ createdAt: daysAgo(12), revokedAt: daysAgo(10), revokedReason: 'refresh-token-reuse' });
+    const key = retryCounterKey(g.clientId, NOW);
+    await getTestRedis().set(key, '3', 'EX', 600);
+    try {
+      expect((await observe()).find((o) => o.sourceId === `${g.accountId}:${g.clientId}`)).toMatchObject({
+        state: 'broken',
+        detail: expect.stringMatching(/^Breeze revoked this app.* The app keeps retrying its revoked token \(3 failed refreshes today, UTC\)\.$/),
+      });
+    } finally {
+      await getTestRedis().del(key);
+    }
+    expect((await observe()).find((o) => o.sourceId === `${g.accountId}:${g.clientId}`)!.detail)
+      .not.toContain('keeps retrying');
   });
 
   it('a newer active grant for the same pair makes it healthy when tracked, absent when not', async () => {
@@ -166,7 +186,7 @@ describe('oauthGrantSource', () => {
     await seedGrant({ revokedAt: daysAgo(1), revokedReason: 'refresh-token-reuse', clientName: `\u0001\u001f\u0085\u202e<b>\u200b${'x'.repeat(500)}\n` });
     const [o] = await observe();
     expect(Array.from(o!.displayName).length).toBeLessThanOrEqual(80);
-    expect(o!.displayName).toMatch(/^<b>x+$/);
+    expect(o!.displayName).toMatch(/^<b>x+ \(ch-oauth-/);
   });
 
   it('cleanDisplayName strips C1, bidi, zero-width and line-separator characters', () => {

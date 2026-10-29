@@ -18,6 +18,7 @@
 import { and, eq, ne, sql } from 'drizzle-orm';
 import type { db } from '../../db';
 import { deviceCommands, devices, tickets } from '../../db/schema';
+import { carryMergedTombstonesInTx } from '../ticketMerge/movers';
 import type { AuthContext } from '../../middleware/auth';
 import {
   getDeviceOrgDenormalizedTables,
@@ -37,7 +38,12 @@ import {
 } from '../ticketMoveCurrencyGuard';
 import { assertNoHourBlockDrawnTime } from '../ticketMoveHourBlockGuard';
 import { assertNoPendingApprovalRequest } from '../ticketMoveApprovalGuard';
-import { assertPamDeviceOrgMoveAllowed } from '../pamDeviceMoveGuard';
+import {
+  armOwnershipChange,
+  assertPamDeviceOrgMoveAllowed,
+  expireUnactuatedElevationRequests,
+  resolvePamEpochTransfer,
+} from '../pamDeviceMoveGuard';
 import { revokeWorkstationGrantsForMove } from '../callerVerification/deviceMove';
 import { revokeDiagnosticGrantsForMove } from '../diagnosticAccess/deviceMove';
 import {
@@ -48,6 +54,7 @@ import {
 import { assertDeviceTicketsNotPinnedToDeliverable, revalidateTicketAssignee } from '../ticketService';
 import { removedTicketLinksFromRows, type RemovedTicketLink } from '../ticketLinkMoveNotes';
 import { lockOrgTicketLinks } from '../ticketLinkLock';
+import { reresolveMovedTicketCalendars } from '../businessCalendars/reresolve';
 
 export type DeviceOrgMoveTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -148,6 +155,12 @@ export interface MoveDeviceOrgResult {
    * commits its outer transaction would otherwise note a move that rolled back).
    */
   removedTicketLinks: RemovedTicketLink[];
+  /**
+   * PAM ownership epochs W6 (#8208, OD4): live elevation requests that never
+   * reached actuation, expired with reason `ownership_changed`. They stay in
+   * the source org as its history.
+   */
+  expiredElevationRequests: number;
 }
 
 export async function moveDeviceOrgInTransaction(
@@ -187,13 +200,17 @@ export async function moveDeviceOrgInTransaction(
   // devices UPDATE, long before the child tail deletes the links of the
   // moved tickets, so an IMMEDIATE check would 23503 first.
   //
+  // #8972 W1 adds tickets_merged_into_org_fk: the device's survivor tickets
+  // and their merged tombstones are re-stamped row by row, so the self-FK is
+  // checked at COMMIT, when all of them carry the target org.
+  //
   // The device-org cascade trigger restamps tickets.org_id before the
   // loop below can align partner_id; defer their composite FK too.
   //
   // Safe to precede the org lock below: SET CONSTRAINTS takes no table
   // locks, so it does not participate in this transaction's lock order.
   await tx.execute(
-    sql`SET CONSTRAINTS time_entries_ticket_org_fk, ticket_parts_ticket_org_fk, ticket_checklist_items_ticket_org_fk, ticket_external_refs_ticket_org_fk, partner_api_idempotency_keys_ticket_org_fk, ticket_approval_requests_ticket_org_fk, ticket_links_source_org_fk, ticket_links_target_org_fk, tickets_org_partner_fk DEFERRED`,
+    sql`SET CONSTRAINTS time_entries_ticket_org_fk, ticket_parts_ticket_org_fk, ticket_checklist_items_ticket_org_fk, ticket_external_refs_ticket_org_fk, partner_api_idempotency_keys_ticket_org_fk, ticket_approval_requests_ticket_org_fk, ticket_links_source_org_fk, ticket_links_target_org_fk, tickets_org_partner_fk, tickets_merged_into_org_fk DEFERRED`,
   );
   // #7900 W02: the source org's ticket_links lock, SHARED, before any row
   // lock (an advisory lock, so the step-up row lock below is still the first
@@ -239,7 +256,21 @@ export async function moveDeviceOrgInTransaction(
   const lockedTarget = lockedOrgs.get(targetOrgId);
   if (!lockedTarget) throw new OrgVanishedDuringMoveError('target');
   if (!lockedSource) throw new OrgVanishedDuringMoveError('source');
-  await assertPamDeviceOrgMoveAllowed(tx, { deviceId, sourceOrgId });
+  // PAM ownership epochs W6 (#8208). Transfer mode is env flag AND the
+  // database switch, read in-transaction; the GUCs armed here are what the
+  // devices triggers read at the org flip below (epoch cause, and the closed-
+  // actuation predicate of devices_pam_history_move_guard). The typed check
+  // runs first so a refusal is a 409, not the trigger's 23514.
+  const pamEpochTransfer = await resolvePamEpochTransfer(tx);
+  await armOwnershipChange(tx, 'device_move', pamEpochTransfer);
+  await assertPamDeviceOrgMoveAllowed(tx, { deviceId, sourceOrgId, transferEnabled: pamEpochTransfer });
+  // OD4: expire this device's live un-actuated elevation requests in the
+  // source org before anything else moves. Deliberately BEFORE the device
+  // FOR UPDATE below: an actuator holds its request row while it waits for the
+  // device FOR SHARE (breeze_pam_chain_epoch_guard), so taking the request
+  // rows after the device lock would invert that order and deadlock. A request
+  // that gains an actuation after this point is refused by the trigger.
+  const expiredElevationRequests = await expireUnactuatedElevationRequests(tx, { orgId: sourceOrgId, deviceId });
   // #5573 W02 — a ticket on this device that is a service deliverable's
   // work item pins it to the deliverable's org. `tickets` is in
   // getDeviceOrgDenormalizedTables(), so the loop below would re-stamp
@@ -465,6 +496,54 @@ export async function moveDeviceOrgInTransaction(
   if (poolRefusal) throw new DevicePoolMembershipRefusedError(poolRefusal);
   await revokeWorkstationGrantsForMove(tx, sourceOrgId, deviceId);
   await revokeDiagnosticGrantsForMove(tx, sourceOrgId, deviceId, input.actor.userId);
+
+  // Endpoint messaging (#8742 W02): delivery and receipt history follows the
+  // device, but the message (and its body) stays with the source org. The
+  // (endpoint_message_id, org_id) -> endpoint_messages(id, org_id) FK is
+  // DEFERRABLE INITIALLY IMMEDIATE, and breeze_cascade_device_org_id()
+  // restamps the delivery's org_id inside the devices UPDATE below, so the
+  // pointer must be severed BEFORE the flip or that UPDATE 23503s.
+  // LOAD-BEARING, like the invoice_line_devices detach.
+  await tx.execute(
+    sql`UPDATE endpoint_message_deliveries SET endpoint_message_id = NULL, updated_at = now()
+        WHERE device_id = ${deviceId}::uuid AND endpoint_message_id IS NOT NULL`,
+  );
+
+  // Endpoint live chat (#8743 W03): chat history follows the device (both
+  // tables are restamped by breeze_cascade_device_org_id()), but a LIVE chat
+  // must not: a destination-org technician would otherwise inherit, and could
+  // post into, a conversation the source org opened. End it here, in the
+  // source org, before the flip. The agent is not told (post-commit side
+  // effects are the caller's); its next reply gets 409 conversation_closed
+  // and the helper closes the window's input.
+  await tx.execute(
+    sql`UPDATE endpoint_conversations
+           SET status = 'closed', close_reason = 'device_moved', closed_at = now(), updated_at = now()
+         WHERE device_id = ${deviceId}::uuid AND status IN ('opening', 'open')`,
+  );
+
+  // #6263 W05 — IOC sweep scans detach from their sweep. The flip below
+  // fires breeze_cascade_device_org_id(), which restamps
+  // security_scans.org_id to the target org, while the
+  // security_scan_sweeps row stays in the SOURCE org (an execution record
+  // of the source org's request). sweep_id is a plain FK, not a composite
+  // (sweep_id, org_id), precisely so this restamp cannot 23503; the cost
+  // is that the pointer must be severed here or a target-org scan would
+  // name a source-org sweep. A still-queued scan was never dispatched and
+  // is cancelled (the target org never asked for it); a running one keeps
+  // its status so a delivered command's result still ingests in the new
+  // org. Every sweep reader (claim, pump, fetch, progress) also requires
+  // sweep.org_id = scan.org_id, the backstop for any writer that reaches
+  // devices.org_id without this statement. Placed before the flip, in the
+  // manual_assets position: after it, the restamped rows would already
+  // name the target org.
+  await tx.execute(
+    sql`UPDATE security_scans SET
+          status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
+          completed_at = CASE WHEN status = 'queued' THEN now() ELSE completed_at END,
+          sweep_id = NULL
+        WHERE device_id = ${deviceId}::uuid AND sweep_id IS NOT NULL`,
+  );
 
   // Flip the device row first so any concurrent agent heartbeat
   // after this point resolves the new org_id.
@@ -883,18 +962,14 @@ export async function moveDeviceOrgInTransaction(
     // the trusted org-only restamp inside this transaction.
     if (DEVICE_ORG_FK_CASCADE_TABLES.includes(table)) continue;
     if (table === 'elevation_requests') {
-      // PAM ownership epochs W6-pre (#8746): an ACTUATED request of ANY epoch
-      // is PAM-chain evidence frozen at its (org_id, device_epoch);
-      // breeze_pam_chain_epoch_guard() refuses (42501) a restamp of it. Only
-      // un-actuated requests follow the device (the guard re-anchors them into
-      // the new epoch). Same statement as the
-      // devices_restamp_unactuated_elevation_requests trigger, which has
-      // normally already run, so this copy matches nothing.
-      await tx.execute(
-        sql`UPDATE ${sql.identifier(table)} r SET org_id = ${targetOrgId}::uuid
-            WHERE r.device_id = ${deviceId}::uuid AND r.org_id IS DISTINCT FROM ${targetOrgId}::uuid
-              AND NOT EXISTS (SELECT 1 FROM pam_actuations a WHERE a.elevation_request_id = r.id)`,
-      );
+      // PAM ownership epochs W6 (#8208, spec §7.3/§8, OD4): on a device move
+      // EVERY elevation request stays at its (org_id, device_epoch) as source-
+      // org history — actuated ones are frozen evidence (the epoch guard
+      // refuses their restamp, 42501), and un-actuated ones were expired
+      // above and cannot follow anyway: each carries elevation_audit rows
+      // whose (elevation_request_id, org_id) FK is IMMEDIATE here, so a
+      // restamp raised 23503. The devices restamp trigger moves un-actuated
+      // requests only on an org merge (cause org_merge). Nothing to write.
       continue;
     }
     if (table === 'tickets') {
@@ -912,6 +987,11 @@ export async function moveDeviceOrgInTransaction(
       for (const ticket of movedTickets) {
         await revalidateTicketAssignee(ticket.id, { kind: 'user', userId: input.actor.userId }, tx);
       }
+      // #8973 W4 (spec §4.3 "Move-org"): after the restamp above, so each
+      // ticket re-resolves its business calendar for the org it now belongs
+      // to and recomputes its unfrozen deadlines; a source-org calendar is
+      // never left referenced. Same transaction, rows already locked.
+      await reresolveMovedTicketCalendars(tx, [...movedTickets].map((t) => t.id));
     } else {
       // The devices UPDATE above already fired breeze_cascade_device_org_id(),
       // which re-stamps every breeze_device_child_orgid_tables() row with the
@@ -1177,6 +1257,16 @@ export async function moveDeviceOrgInTransaction(
               (target_ticket_id IN (SELECT id FROM tickets WHERE device_id = ${deviceId}::uuid)) AS target_moved`);
   const removedTicketLinks = removedTicketLinksFromRows(removedLinkRows);
 
+  // #8972 W1 (spec §3.9): a merged tombstone's device_id is NULL, so the
+  // `device_id = D` joins above never reach it; it moves with its survivor
+  // here (the full per-ticket routine), or tickets_merged_into_org_fk
+  // (deferred at the top) fails at commit.
+  await carryMergedTombstonesInTx(
+    tx,
+    (await tx.select({ id: tickets.id }).from(tickets).where(eq(tickets.deviceId, deviceId))).map((r) => r.id),
+    targetOrgId,
+  );
+
   // #4867 — the ALERT-axis children (ALERT_CHILD_ORG_REWRITE_TABLES in
   // core.ts): alert_correlation_groups, alert_correlation_members and
   // ai_alert_verdicts all denormalize org_id but have NO device_id
@@ -1380,5 +1470,13 @@ export async function moveDeviceOrgInTransaction(
   // earlier epochs keep their event-time site (W2, #8204).
   await rewriteDeviceSiteDenormalizedTables(tx, deviceId, targetSiteId);
 
-  return { updated, linkGroupDissolved, currencyGuard, alertChildRewrite, customFieldRehome, removedTicketLinks };
+  return {
+    updated,
+    linkGroupDissolved,
+    currencyGuard,
+    alertChildRewrite,
+    customFieldRehome,
+    removedTicketLinks,
+    expiredElevationRequests,
+  };
 }

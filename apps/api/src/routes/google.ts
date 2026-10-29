@@ -152,6 +152,11 @@ googleRoutes.post(
         status: 'active',
         createdBy: auth.user?.id ?? null,
         lastVerifiedAt: now,
+        // The live Directory call above just verified it: clear any failed
+        // connection-health probe so the incident resolves (spec §3, W4).
+        lastProbeAt: now,
+        lastProbeStatus: 'ok',
+        lastProbeError: null,
         createdAt: now,
         updatedAt: now,
       }).onConflictDoUpdate({
@@ -163,6 +168,9 @@ googleRoutes.post(
           serviceAccountKey: encryptedKey,
           status: 'active',
           lastVerifiedAt: now,
+          lastProbeAt: now,
+          lastProbeStatus: 'ok',
+          lastProbeError: null,
           updatedAt: now,
         },
       }).returning();

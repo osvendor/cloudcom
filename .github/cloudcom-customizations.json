@@ -838,7 +838,27 @@
         },
         {
           "file": "agent/internal/unifi/collector.go",
-          "contains": "defaultConfigFailureDelay(failedFetches, sched.active, retryAfter)"
+          "contains": "retryUntil = lastFetch.Add(configFailureDelay(failedFetches, sched.active, 0, deps.random))"
+        },
+        {
+          "file": "agent/internal/unifi/collector.go",
+          "contains": "if at, ok := httputil.RetryAtFrom(err); ok {\n\t\t\t\t\tfetchRetryAt = at"
+        },
+        {
+          "file": "agent/internal/unifi/collector.go",
+          "contains": "if fetchRetryAt.After(retryUntil) {\n\t\t\t\t\tretryUntil = fetchRetryAt"
+        },
+        {
+          "file": "agent/internal/unifi/collector.go",
+          "contains": "if remaining := retryUntil.Sub(deps.clock()); remaining > next {\n\t\t\t\tnext = remaining"
+        },
+        {
+          "file": "agent/internal/unifi/collector.go",
+          "contains": "deps.clock().Before(retryUntil)"
+        },
+        {
+          "file": "agent/internal/unifi/collector.go",
+          "contains": "lastFetch.Sub(lastErrorLog) >= fetchErrorLogInterval"
         }
       ]
     },

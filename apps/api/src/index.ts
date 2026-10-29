@@ -11,6 +11,8 @@ loadDotenv({ quiet: true });
 // on `NODE_ENV === 'production'` at import time). Must stay directly after
 // dotenv so .env is loaded first. See #917 (L-6).
 import './config/normalizeNodeEnv';
+// An empty CLAUDE_CONFIG_DIR (compose `${VAR:-}`) must read as unset for the Agent SDK. #9133.
+import './config/normalizeClaudeConfigDir';
 import { serve } from '@hono/node-server';
 import { createNodeWebSocket } from '@hono/node-ws';
 import { installPerRouteMaxPayload } from './services/wsMaxPayload';
@@ -54,12 +56,16 @@ import { emailWebhookRoutes } from './routes/tickets/emailWebhook';
 import { invoiceRoutes } from './routes/invoices';
 import { quoteRoutes } from './routes/quotes';
 import { quotesPublicRoutes } from './routes/quotesPublic';
+import { agreementsPublicRoutes } from './routes/agreementsPublic';
+import { routeReferrerPolicyWins } from './middleware/routeReferrerPolicy';
 import { invoicesPublicRoutes } from './routes/invoicesPublic';
 import { stripeConnectRoutes } from './routes/stripeConnect';
 import { stripeWebhookRoutes } from './routes/webhooks/stripe';
 import { quickbooksWebhookRoutes } from './routes/webhooks/quickbooks';
 import { xeroWebhookRoutes } from './routes/webhooks/xero';
 import { resendWebhookRoutes } from './routes/webhooks/emailProvider';
+import { edrWebhookRoutes } from './routes/webhooks/edr';
+import { flowWebhookRoutes } from './routes/flowWebhooks';
 import { invoiceAssemblyRoutes } from './routes/invoices/assembly';
 import { invoiceSettingsRoutes } from './routes/invoices/settings';
 import { billingPaymentSettingsRoutes } from './routes/billingPaymentSettings';
@@ -74,6 +80,8 @@ import { timeEntriesRoutes } from './routes/timeEntries';
 import { billingProfilesRoutes } from './routes/billingProfiles';
 import { ticketCategoriesRoutes } from './routes/ticketCategories';
 import { ticketConfigRoutes } from './routes/ticketConfig';
+import { businessCalendarRoutes } from './routes/businessCalendars';
+import { ticketRoutingRuleRoutes } from './routes/tickets/routingRules';
 import { ticketResponseTemplateRoutes } from './routes/tickets/ticketResponseTemplates';
 import { ticketFormRoutes } from './routes/tickets/forms';
 import { tenantVariableRoutes } from './routes/tenantVariables';
@@ -88,6 +96,15 @@ import { ticketChecklistTemplateRoutes } from './routes/ticketChecklistTemplates
 import { orgDocumentRoutes } from './routes/orgDocuments';
 import { trustPageRoutes } from './routes/trustPage';
 import { trustPagePublicRoutes } from './routes/trustPagePublic';
+import { trustPageAttestationRoutes } from './routes/trustPageAttestation';
+import { byTrustCrossOriginPath } from './middleware/trustCrossOrigin';
+import { bySameOriginFramePath, isSameOriginFramePath } from './middleware/sameOriginFrame';
+// Trust Center W2 (#8770) — W02a stub routers, filled by W02b/d/f/g.
+import { trustPageDeclarationRoutes } from './routes/trustPageDeclarations';
+import { trustPageContentRoutes } from './routes/trustPageContent';
+import { trustPageAccessRoutes } from './routes/trustPageAccess';
+import { trustAccessPublicRoutes } from './routes/trustAccessPublic';
+import { trustPageTemplateRoutes } from './routes/trustPageTemplate';
 import { orgKeyDateRoutes } from './routes/orgKeyDates';
 import { oauthRoutes } from './routes/oauth';
 import { wellKnownRoutes } from './routes/oauthWellKnown';
@@ -100,6 +117,7 @@ import { auditLogRoutes } from './routes/auditLogs';
 import { backupRoutes } from './routes/backup';
 import { edrRoutes } from './routes/edr';
 import { connectionHealthRoutes } from './routes/connectionHealth';
+import { emailUnsubscribeRoutes } from './routes/emailUnsubscribe';
 import { reportRoutes } from './routes/reports';
 import { incidentRoutes } from './routes/incidents';
 import { searchRoutes } from './routes/search';
@@ -140,6 +158,7 @@ import { discoveryAssetProbeRoutes } from './routes/discoveryAssetProbe';
 import { discoveryAssetPlacementRoutes } from './routes/discoveryAssetPlacement';
 import { monitoringAssetMetricsRoutes } from './routes/monitoringAssetMetrics';
 import { topologyRoutes } from './routes/topology';
+import { circuitRoutes } from './routes/circuits';
 import { networkBaselineRoutes } from './routes/networkBaselines';
 import { networkChangeRoutes } from './routes/networkChanges';
 import { portalRoutes } from './routes/portal';
@@ -156,6 +175,7 @@ import { monitorRoutes } from './routes/monitors';
 import { monitoringRoutes } from './routes/monitoring';
 import { auditBaselineRoutes } from './routes/auditBaselines';
 import { softwareRoutes } from './routes/software';
+import { softwareBuiltinPackagesRoutes } from './routes/softwareBuiltinPackages';
 import { softwarePoliciesRoutes } from './routes/softwarePolicies';
 import { vulnerabilityRoutes, vulnerabilitySyncRoutes } from './routes/vulnerabilities';
 import { systemRoutes } from './routes/system';
@@ -186,6 +206,8 @@ import { aiRoutes } from './routes/ai';
 import { aiScriptProposalRoutes } from './routes/ai/scriptProposals';
 import { aiScriptPolicyRoutes } from './routes/ai/scriptPolicy';
 import { partnerAiScriptPolicyRoutes } from './routes/partnerAiScriptPolicy';
+import { aiDataPolicyRoutes } from './routes/ai/dataPolicy';
+import { partnerAiDataPolicyRoutes } from './routes/partnerAiDataPolicy';
 import { aiModelsRoutes } from './routes/aiModels';
 import { aiAgentsRoutes } from './routes/aiAgents';
 import { aiArtifactRoutes } from './routes/aiArtifacts';
@@ -193,6 +215,8 @@ import { aiAgentSchedulesRoutes } from './routes/aiAgentSchedules';
 import { fleetDesignRoutes } from './routes/fleetDesign';
 import { patchPlanRoutes } from './routes/patchPlan';
 import { aiOperatorTasksRoutes } from './routes/aiOperatorTasks';
+import { wispRoutes } from './routes/wisp';
+import { wispMemoryRoutes } from './routes/wisp/memory';
 import { scriptAiRoutes } from './routes/scriptAi';
 import { mcpServerRoutes, initMcpBootstrapForStartup } from './routes/mcpServer';
 import { mountInviteLandingRoutes } from './modules/mcpInvites';
@@ -205,6 +229,7 @@ import { seedBuiltInPlaybooks } from './services/builtInPlaybooks';
 import { ensureSystemLibraryScripts } from './services/systemScriptLibrary';
 import { runLegacyAlertingRetirement, LEGACY_ALERTING_RETRY_DELAYS_MS } from './services/monitors/conversion/retirementSweep';
 import { ensureBuiltInMonitorsForAllPartners } from './services/monitors/builtInMonitors';
+import { refreshPinnedBuiltinPackages } from './services/builtinDeploymentPackages';
 import { sealUnsealedSettingsSecrets } from './services/settingsSecretBackfill';
 import { reportableCutoverError } from './services/aiModels/registryCutover';
 import { runEnvOpenAiBootstrapAtBoot } from './services/aiModels/envOpenAiBootstrap';
@@ -240,6 +265,7 @@ import { extensionsAdminRoutes } from './routes/extensionsAdmin';
 import { extensionsWebRoutes } from './routes/extensionsWeb';
 import { internalSyntheticRoutes } from './routes/internal/synthetic';
 import { toolSourcesRoutes } from './routes/toolSources';
+import { flowsRoutes } from './routes/flows';
 import { bootstrapPlatformAdmins } from './services/platformAdminBootstrap';
 import { reportStalePamRuleTiers } from './services/pamRuleTierDriftCheck';
 import {
@@ -318,6 +344,8 @@ import {
   shutdownAgentCommandRelayWorker,
 } from './jobs/agentCommandRelayWorker';
 import { AI_AGENTS_ENABLED, abuseSignalsEnabled, breezeRole, eventDispatchMode } from './config/env';
+import { wispEnabled } from './config/env';
+import { installWispGrantHooks } from './services/wisp/grantLifecycle';
 import { logAiAgentsSubsystemState } from './services/aiAgents/subsystemState';
 import { startPlatformModelSnapshotRefresher, warnOnUnsupportedPlatformInferenceGeo } from './services/aiModels/platformModels';
 import { partnerTrustMode } from './config/partnerTrustMode';
@@ -329,8 +357,9 @@ import { drainAuditRetryQueue, runWithAuditRequestTracking } from './services/au
 import { runShutdownPhases } from './services/shutdownPhases';
 import { drainLlmEgressQueue } from './services/llm/llmEgressRecorder';
 import { closeModelGateway } from './services/aiModels/gateway/server';
-import { createCorsOriginResolver } from './services/corsOrigins';
+import { CORS_MIDDLEWARE_OPTIONS } from './services/corsPolicy';
 import { validateConfig } from './config/validate';
+import { startTurnPreflight } from './services/system/connections/turnPreflight';
 import { initializeDatabaseForStartup } from './db/databaseStartup';
 import { clearPermissionCache } from './services/permissions';
 import { loadBuiltinExtensions } from './extensions/builtinExtensions';
@@ -343,6 +372,7 @@ import {
   extensionRootsSnapshot,
 } from './extensions/faultAttribution';
 import { syncBinaries } from './services/binarySync';
+import { syncBuiltinYaraPack } from './services/yaraBuiltinPack';
 import { startRegularMsiCacheWarmer } from './services/installerBuilder';
 import * as dbModule from './db';
 import { webhookDeliveries } from './db/schema';
@@ -461,10 +491,6 @@ const { injectWebSocket, upgradeWebSocket, wss } = createNodeWebSocket({ app });
 // per-route hook for `maxPayload`, so the `ws` library default of 100 MiB
 // would otherwise apply everywhere. Size it per route instead.
 installPerRouteMaxPayload(wss);
-const resolveCorsOrigin = createCorsOriginResolver({
-  configuredOriginsRaw: process.env.CORS_ALLOWED_ORIGINS,
-  nodeEnv: process.env.NODE_ENV
-});
 
 // Global middleware
 // FIRST, deliberately: `http_requests_total` / `http_request_duration_seconds`
@@ -509,21 +535,38 @@ app.use('*', tunnelHostClassifier());
 const TUNNEL_HTTP_PATH_PREFIX = '/api/v1/tunnel-http/';
 const exceptTunnelHttp = (mw: MiddlewareHandler) => exceptPathPrefix(TUNNEL_HTTP_PATH_PREFIX, exceptTunnelSurface(mw));
 
+const SECURE_HEADERS_OPTIONS = {
+  // Override defaults to match Breeze security policy:
+  // - HSTS: 1 year (secureHeaders default is 180 days / 15552000s)
+  strictTransportSecurity: 'max-age=31536000; includeSubDomains; preload',
+  // - X-Frame-Options: DENY (default is SAMEORIGIN)
+  xFrameOptions: 'DENY',
+  // - Referrer-Policy: strict-origin-when-cross-origin (default is no-referrer)
+  referrerPolicy: 'strict-origin-when-cross-origin',
+} as const;
+
+// Trust Center W3b: the public badge and the attestation/JWKS paths get the same headers except
+// `Cross-Origin-Resource-Policy: cross-origin` (middleware/trustCrossOrigin.ts), so other origins can load them.
+// It must be chosen here, not in the handlers: secureHeaders writes its headers after next() and would
+// overwrite a handler's CORP.
+// #10192: the two token-gated public PDF routes the portal iframes (middleware/sameOriginFrame.ts) get
+// X-Frame-Options: SAMEORIGIN here and CSP `frame-ancestors 'self'` from securityMiddleware below — chosen by
+// path for the same reason. Every other route keeps DENY / 'none'.
 app.use(
   '*',
   exceptTunnelHttp(
-    secureHeaders({
-      // Override defaults to match Breeze security policy:
-      // - HSTS: 1 year (secureHeaders default is 180 days / 15552000s)
-      strictTransportSecurity: 'max-age=31536000; includeSubDomains; preload',
-      // - X-Frame-Options: DENY (default is SAMEORIGIN)
-      xFrameOptions: 'DENY',
-      // - Referrer-Policy: strict-origin-when-cross-origin (default is no-referrer)
-      referrerPolicy: 'strict-origin-when-cross-origin',
-    })
+    routeReferrerPolicyWins(
+      bySameOriginFramePath(
+        byTrustCrossOriginPath(
+          secureHeaders({ ...SECURE_HEADERS_OPTIONS }),
+          secureHeaders({ ...SECURE_HEADERS_OPTIONS, crossOriginResourcePolicy: 'cross-origin' }),
+        ),
+        secureHeaders({ ...SECURE_HEADERS_OPTIONS, xFrameOptions: 'SAMEORIGIN' }),
+      )
+    )
   )
 );
-app.use('*', securityMiddleware({ skipHeadersPathPrefix: TUNNEL_HTTP_PATH_PREFIX, skipHeadersWhen: isTunnelSurface }));
+app.use('*', securityMiddleware({ skipHeadersPathPrefix: TUNNEL_HTTP_PATH_PREFIX, skipHeadersWhen: isTunnelSurface, sameOriginFrameWhen: isSameOriginFramePath }));
 app.use(
   '*',
   createGlobalBodyLimitMiddleware({
@@ -542,14 +585,8 @@ app.route('/api/v1/browser-companion', createBrowserCompanionTransport(async (re
 app.use(
   '*',
   exceptTunnelHttp(
-    cors({
-      origin: (origin) => resolveCorsOrigin(origin),
-      credentials: true,
-      allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-API-Key', 'X-Breeze-CSRF'],
-      allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      exposeHeaders: ['Content-Length', 'X-Request-Id'],
-      maxAge: 86400
-    })
+    // Origin resolver + header lists live in services/corsPolicy.ts (B-W03 #6157).
+    cors(CORS_MIDDLEWARE_OPTIONS)
   )
 );
 
@@ -790,7 +827,18 @@ api.route('/config', configRoutes);
 // IP) and is DB-free on a serving-set miss; /trust/public/* has its own isolated
 // 'trustpublic' bucket. Unrelated to /partner/trust (partnerTrustRoutes).
 registerGlobalRateLimitSkipPrefix('/api/v1/trust/card/');
+// Signed attestation + JWKS (Trust Center W3b): public like the W1 block above and mounted ahead of it for the same
+// reason; its own 'trustattest' bucket; CORP cross-origin comes from byTrustCrossOriginPath above.
+api.route('/trust/attestation', trustPageAttestationRoutes);
+// Gated-document access flow (Trust Center W2, no auth): before /trust so its paths are never read as slugs.
+api.route('/trust/access', trustAccessPublicRoutes);
 api.route('/trust', trustPagePublicRoutes);
+// Public, token-gated agreement signing (#9075 W2b, no auth). Mounted with the
+// other public surfaces, before every root-mounted router and before the
+// auth-gated /contracts router, so no `.use('*')` auth middleware can run ahead
+// of it (mirrors /quotes/public). The signed request token is the only
+// authorisation; its own isolated 'agreementpublic' rate bucket.
+api.route('/agreements/public', agreementsPublicRoutes);
 api.route('/', externalServicesRoutes);
 api.route('/agents', agentRoutes);
 api.route('/native-target', nativeTargetRoutes);
@@ -862,6 +910,8 @@ api.route('/time-entries', timeEntriesRoutes);
 api.route('/ticket-categories', ticketCategoriesRoutes);
 api.route('/billing-profiles', billingProfilesRoutes);
 api.route('/ticket-config', ticketConfigRoutes);
+api.route('/business-calendars', businessCalendarRoutes);
+api.route('/ticket-routing-rules', ticketRoutingRuleRoutes);
 api.route('/', ticketResponseTemplateRoutes);
 api.route('/', ticketFormRoutes);
 api.route('/', tenantVariableRoutes);
@@ -879,6 +929,10 @@ api.route('/deliverable-templates', deliverableTemplateRoutes); // (#5573 W05)
 api.route('/ticket-checklist-templates', ticketChecklistTemplateRoutes); // (#5783 W02)
 api.route('/orgs', orgDocumentRoutes); // /orgs/:orgId/documents/* (#5573 W03)
 api.route('/orgs', trustPageRoutes); // /orgs/:orgId/trust-page/* (Trust Center W1)
+api.route('/orgs', trustPageDeclarationRoutes); // /orgs/:orgId/trust-page/declarations/* (Trust Center W2, W02b)
+api.route('/orgs', trustPageContentRoutes); // /orgs/:orgId/trust-page/{faq,subprocessors}/* (Trust Center W2, W02f)
+api.route('/orgs', trustPageAccessRoutes); // /orgs/:orgId/trust-page/access/* (Trust Center W2, W02d)
+api.route('/trust-page-template', trustPageTemplateRoutes); // partner-wide template (Trust Center W2, W02g)
 api.route('/orgs', orgKeyDateRoutes);         // /orgs/:orgId/key-dates/* (#5573 W01)
 api.route('/users', userRoutes);
 api.route('/roles', roleRoutes);
@@ -887,6 +941,8 @@ api.route('/audit-logs', auditLogRoutes);
 api.route('/backup', backupRoutes);
 api.route('/edr', edrRoutes); // EDR provider framework (#8164 W01b)
 api.route('/connection-health', connectionHealthRoutes);
+// Unauthenticated RFC 8058 one-click unsubscribe (signed token; per-IP rate limited in the router).
+api.route('/email', emailUnsubscribeRoutes);
 api.route('/reports', reportRoutes);
 api.route('/incidents', incidentRoutes);
 api.route('/search', searchRoutes);
@@ -957,6 +1013,21 @@ api.route('/webhooks', xeroWebhookRoutes);
 // sit in front of it. NOT in SELF_MANAGED_DB_CONTEXT_ROUTES: there is no ambient
 // auth transaction to opt out of on an unauthenticated route.
 api.route('/webhooks', resendWebhookRoutes);
+// EDR vendor push hints (W03 PR-B, #8167) — no session auth; the per-connection
+// secret the vendor echoes in Authorization is verified in the handler.
+// partnerGuard skips the exact /webhooks/edr/<uuid> path so that secret is never
+// parsed as a JWT; the global body gate caps it at 256 KB and it has its own
+// isolated per-IP bucket. NOT under /edr (whose authMiddleware covers `*`) and
+// NOT in SELF_MANAGED_DB_CONTEXT_ROUTES: no ambient auth transaction exists here.
+api.route('/webhooks', edrWebhookRoutes);
+// Flow webhook ingress (Tool Catalog W05, #5220) — public, no session auth: the
+// Breeze HMAC signature / X-Breeze-Webhook-Token is verified in
+// services/flows/webhook/ingest.ts (uniform 401). partnerGuard skips the exact
+// /webhooks/flows/<uuid> path; the global body gate caps it at 262,144 B and it
+// has its own isolated per-IP bucket. Mounted at its own prefix, not under the
+// authenticated /flows router. NOT in SELF_MANAGED_DB_CONTEXT_ROUTES: no ambient
+// auth transaction exists on an unauthenticated route.
+api.route('/webhooks/flows', flowWebhookRoutes);
 api.route('/policies', policyRoutes);
 api.route('/configuration-policies', configPolicyRoutes);
 api.route('/psa', psaRoutes);
@@ -1027,6 +1098,8 @@ api.route('/monitoring', monitoringRoutes);
 // lines). `/assets/:id` cannot shadow `/assets/:id/metrics`.
 api.route('/monitoring', monitoringAssetMetricsRoutes);
 api.route('/audit-baselines', auditBaselineRoutes);
+// #6958 D2: deeper mount first so `/software` never shadows it.
+api.route('/software/builtin-packages', softwareBuiltinPackagesRoutes);
 api.route('/software', softwareRoutes);
 api.route('/software-policies', softwarePoliciesRoutes);
 // Deeper mount first: isolates the platform-admin sync router from the main
@@ -1042,6 +1115,7 @@ api.route('/integrations', integrationRoutes);
 api.route('/partner/trust', partnerTrustRoutes);
 // W04 (#5612): the partner CEILING for the unattended script lane.
 api.route('/partner/ai/script-policy', partnerAiScriptPolicyRoutes);
+api.route('/partner/ai/data-policy', partnerAiDataPolicyRoutes);
 // W03 (partner sending domains). MUST stay above the catch-all `/partner`
 // mount below, the same ordering `/partner/trust` relies on — Hono matches in
 // registration order, so a later specific mount is never reached.
@@ -1079,6 +1153,15 @@ api.route('/ai/patch-plan', patchPlanRoutes);
 // Read-only Operator task surface (W07 of #5205, P3-1e) — a separate route
 // module from the already-large aiAgentsRoutes per spec §12.
 api.route('/ai/operator', aiOperatorTasksRoutes);
+// Wisp W03 (#9909): memory page routes. MUST stay above '/wisp': wispRoutes'
+// use('*') gates (partner scope only) match /wisp/memory/* too, and Hono runs
+// matching handlers in registration order. Registered first, a matched memory
+// handler answers before those gates are reached (pinned in
+// routes/wisp/memory.test.ts). Its own gates: auth → wispEnabled() → ai_sessions:use.
+api.route('/wisp/memory', wispMemoryRoutes);
+// Wisp W02 (#9908): delegation grants. Every route 404s while
+// BREEZE_WISP_ENABLED is off (checked per request inside wispRoutes).
+api.route('/wisp', wispRoutes);
 // W03 (#5612): more specific than '/ai', so it must be registered first — same
 // reason '/ai/agents/schedules' sits above '/ai/agents'. Hono matches in
 // registration order.
@@ -1087,6 +1170,7 @@ api.route('/ai/script-proposals', aiScriptProposalRoutes);
 // registered ahead of '/ai' so the literal paths never fall into a sibling
 // param route.
 api.route('/ai', aiScriptPolicyRoutes);
+api.route('/ai', aiDataPolicyRoutes);
 // BEFORE /ai: aiRoutes owns broad paths. There is no /ai/agents mount here —
 // the per-run artifact LIST lives inside aiAgentsRoutes itself (see
 // routes/aiAgents.ts, above its /runs/:runId), so no second router shares
@@ -1136,7 +1220,11 @@ api.route('/extensions', extensionsWebRoutes);
 // Tool Catalog W1 (#5215 / #5216) — BYO MCP tool sources. 404s whole-router
 // when TOOL_SOURCES_ENABLED is off (routes/toolSources.ts's first `use('*')`).
 api.route('/tool-sources', toolSourcesRoutes);
+// Tool Catalog W03 (#5218) — read-only flows. 404s whole-router when
+// FLOWS_ENABLED is off (routes/flows.ts's first `use('*')`).
+api.route('/flows', flowsRoutes);
 api.route('/topology', topologyRoutes);
+api.route('/circuits', circuitRoutes);
 
 // One system-scoped state store, shared by the per-request enabled gate and the
 // built-in extension loader. The gate checks installed_extensions.enabled on
@@ -1755,6 +1843,9 @@ async function bootstrap(): Promise<void> {
   // userId bumps the shared Redis version key, so every replica invalidates at
   // once rather than each aging out independently.
   await clearPermissionCache();
+  // Wisp W02: re-evaluate a user's delegation grants whenever their permission
+  // authority changes (pause on lost access, lift its own pauses on recovery).
+  if (wispEnabled()) installWispGrantHooks();
   console.log(`[config] Validated: NODE_ENV=${config.NODE_ENV}, port=${config.API_PORT}`);
   if ((process.env.AGENT_BACKUP_SERVER_URL ?? '').trim()) {
     console.log(`[config] AGENT_BACKUP_SERVER_URL active: ${process.env.AGENT_BACKUP_SERVER_URL!.trim()}`);
@@ -1899,6 +1990,18 @@ async function bootstrap(): Promise<void> {
     console.error('[startup] Binary sync failed (non-fatal in github mode):', err);
   }
 
+  // #6263 W03b: upsert the built-in YARA pack from this release's signed
+  // manifest. Deliberately NOT awaited: it fetches the release asset and runs
+  // the breeze-yarac pre-check (up to minutes), and a pack problem must never
+  // block or crash boot. It never rejects (every failure logs and returns
+  // 'skipped', leaving the published built-in set as it was) and opens its
+  // own system DB context outside any ambient one. Every replica runs it; an
+  // advisory lock plus the strictly-newer version check make that a no-op
+  // after the first.
+  void syncBuiltinYaraPack()
+    .then((outcome) => console.log(`[startup] Built-in YARA pack: ${outcome}`))
+    .catch((err) => console.error('[startup] Built-in YARA pack sync failed unexpectedly:', err));
+
   // Keeps the regular-MSI download cache (installerBuilder.ts) warm from a
   // background timer instead of the request path: the installer routes that
   // consume it all run inside an ambient DB transaction opened by auth
@@ -1971,6 +2074,11 @@ async function bootstrap(): Promise<void> {
     port
   });
 
+  // #9372: one non-blocking TURN preflight (never rejects, never delays boot).
+  startTurnPreflight(process.env).catch(() => {
+    console.warn('[turn-preflight] preflight failed unexpectedly');
+  });
+
   injectWebSocket(server);
 
   console.log(`Breeze API running at http://localhost:${port}`);
@@ -1995,6 +2103,26 @@ async function bootstrap(): Promise<void> {
     })
     .catch((err) => {
       console.error('[startup] Failed to provision built-in monitors:', err);
+    });
+
+  // #6958: move every partner's provisioned DNS built-in rows forward to the
+  // code-pinned version. Forward-only (an older replica booting never reverts
+  // a newer pin), one row-locked transaction per catalog row, per-row failures
+  // counted rather than thrown. Detached after serve() like the task above.
+  void runStartupTaskWithRetry('pinned built-in package refresh', () => refreshPinnedBuiltinPackages(), {
+    hasFailures: (r) => r.failed > 0,
+    onFailure: ({ attempt, error, result }) =>
+      console.error(`[startup] pinned built-in package refresh attempt ${attempt + 1} failed:`, error ?? `${result?.failed} row(s) failed`),
+  })
+    .then((result) => {
+      // Counts are from the last attempt. Rows still failing after the retries
+      // are already in Sentry per key; surface the exhaustion as an error too.
+      const line = `[startup] pinned built-in package refresh: refreshed ${result.refreshed}, failed ${result.failed}`;
+      if (result.failed > 0) console.error(`${line} (retries exhausted)`);
+      else console.log(line);
+    })
+    .catch((err) => {
+      console.error('[startup] pinned built-in package refresh failed:', err);
     });
 
   // Notification-channel secrets in partner/org/site settings are sealed on

@@ -17,8 +17,17 @@ export const PORTAL_CUSTOM_CSS_MAX_LENGTH = 65_536;
 // enableHourBlock (block hours W04) exposes a prepaid-hours balance.
 // enablePatchDetail (visibility W05) exposes per-host missing/pending patches.
 // enableVulnerabilityDetail (visibility W06) exposes per-host CVE findings.
-export const PORTAL_SENSITIVE_FLAG_KEYS = ['enableNetworkAlerts', 'enableHourBlock', 'enablePatchDetail', 'enableVulnerabilityDetail'] as const;
+// enablePhysicalPlacement (environment visibility W1) exposes rack and room.
+export const PORTAL_SENSITIVE_FLAG_KEYS = ['enableNetworkAlerts', 'enableHourBlock', 'enablePatchDetail', 'enableVulnerabilityDetail', 'enablePhysicalPlacement'] as const;
 export type PortalSensitiveFlag = typeof PORTAL_SENSITIVE_FLAG_KEYS[number];
+
+// Portal flags that grant portal users a WRITE permission rather than a view.
+// Never set by "Enable all", and not a visibility tier, so they are listed
+// apart from both lists above. enableTrustPageEditing (Trust Center W3d) lets
+// the org's admin contacts edit part of the trust page draft; the MSP still
+// publishes.
+export const PORTAL_PERMISSION_FLAG_KEYS = ['enableTrustPageEditing'] as const;
+export type PortalPermissionFlag = typeof PORTAL_PERMISSION_FLAG_KEYS[number];
 
 // This CSS is served verbatim to end users of the customer portal (no
 // authoring-time sandbox), so a handful of legacy attack vectors are rejected
@@ -141,6 +150,12 @@ export const updatePortalSettingsSchema = z.object({
   // Portal advanced visibility W06 (#7736): vulnerability detail, fail closed. Sensitive:
   // "Enable all" never sets it.
   enableVulnerabilityDetail: z.boolean().optional(),
+  // Environment visibility W1 (#8775): physical placement, fail closed. Sensitive:
+  // "Enable all" never sets it.
+  enablePhysicalPlacement: z.boolean().optional(),
+  // Trust Center W3d: a permission flag, fail closed. Org-scoped admin contacts
+  // with a portal login may edit part of the trust page draft. Never in "Enable all".
+  enableTrustPageEditing: z.boolean().optional(),
   supportEmail: z.string().email().max(255).nullable().optional(),
   supportPhone: z.string().max(50).nullable().optional(),
   welcomeMessage: z.string().max(2000).nullable().optional(),

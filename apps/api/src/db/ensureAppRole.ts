@@ -220,6 +220,14 @@ export async function ensureAppRole(): Promise<boolean> {
         IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='pam_ledger_retirements') THEN
           REVOKE INSERT, UPDATE, TRUNCATE ON TABLE pam_ledger_retirements FROM breeze_app;
         END IF;
+        -- PAM ownership-epoch transfer switch (#8208, migrations/2026-12-30-210000):
+        -- the authority the device-move guard trusts over the forgeable
+        -- breeze.* GUCs. The request role must hold NO privilege on it (it
+        -- can claim system scope, so RLS alone would not stop it); it is read
+        -- only through SECURITY DEFINER breeze_pam_epoch_transfer_enabled().
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='pam_epoch_transfer_config') THEN
+          REVOKE ALL ON TABLE pam_epoch_transfer_config FROM breeze_app;
+        END IF;
         -- Backup snapshot id tombstones: ids that may never be issued again.
         -- Only ever appended (by triggers on backup_snapshot_id_reservations
         -- and by storage reclaim); nothing may rewrite or remove one, or an
@@ -376,6 +384,18 @@ export async function ensureAppRole(): Promise<boolean> {
         IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='ai_operator_plan_approval_effects') THEN
           REVOKE UPDATE ON TABLE ai_operator_plan_approval_effects FROM breeze_app;
         END IF;
+        -- contract_documents (signed agreements, #9075 W4b, 2027-01-06-150000):
+        -- append-only evidence. Table-level UPDATE/DELETE/TRUNCATE revoked;
+        -- the column-level UPDATE (contract_id, org_id) that link-later,
+        -- contract adopt and the org-merge re-point write is re-granted right
+        -- after (a table-level REVOKE also drops column grants). The
+        -- contract_documents_append_only trigger limits org_id to the merge.
+        -- Org erasure deletes as breeze_audit_admin with
+        -- breeze.allow_audit_retention='1' (AUDIT_ADMIN_REQUIRED_TABLES).
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='contract_documents') THEN
+          REVOKE UPDATE, DELETE, TRUNCATE ON TABLE contract_documents FROM breeze_app;
+          GRANT UPDATE (contract_id, org_id) ON TABLE contract_documents TO breeze_app;
+        END IF;
         -- ai_invocations (AI model registry W02, #7600, 2026-11-14-100300):
         -- append-only invocation ledger. Org erasure and retention delete it as
         -- breeze_audit_admin with breeze.allow_audit_retention='1'. The
@@ -404,6 +424,20 @@ export async function ensureAppRole(): Promise<boolean> {
         IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='ai_budget_reservations') THEN
           REVOKE TRUNCATE ON TABLE ai_budget_reservations FROM breeze_app;
           REVOKE TRUNCATE ON TABLE ai_budget_reservations FROM PUBLIC;
+        END IF;
+        -- ai_credit_debits (#9451, 2027-01-03-100000): the durable debit
+        -- outbox. TRUNCATE would wipe owed debits with no per-row trace; the
+        -- blanket GRANT in step 4 does not grant it, but re-revoke it on every
+        -- boot like the other append-only tables (#4371).
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='ai_credit_debits') THEN
+          REVOKE TRUNCATE ON TABLE ai_credit_debits FROM breeze_app;
+          REVOKE TRUNCATE ON TABLE ai_credit_debits FROM PUBLIC;
+        END IF;
+        -- security_scan_sweeps (#6263 W05, 2027-01-04-140000): IOC sweep
+        -- execution records; the migration revokes TRUNCATE like the other
+        -- tenant tables of its shape, so re-revoke it on every boot (#4371).
+        IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='security_scan_sweeps') THEN
+          REVOKE TRUNCATE ON TABLE security_scan_sweeps FROM breeze_app;
         END IF;
       END $$;
     `);

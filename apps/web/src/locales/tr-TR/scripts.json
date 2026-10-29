@@ -423,12 +423,17 @@
     "empty": {
       "noPolicies": "Hiçbir politika yapılandırılmadı",
       "allCompliant": "Tüm cihazlar uyumludur!",
+      "notEvaluated": "Henüz hiçbir cihaz değerlendirilmedi.",
+      "noViolationsPending_one": "İhlal bulunamadı; {{count}} cihazın değerlendirmesi hâlâ bekliyor.",
+      "noViolationsPending_other": "İhlal bulunamadı; {{count}} cihazın değerlendirmesi hâlâ bekliyor.",
       "noMatchingDevices": "Eşleşen cihaz bulunamadı."
     },
     "policyComplianceRatio": "{{compliant}} / {{total}} uyumlu",
     "searchDevices": "Cihazları arayın...",
-    "violationCount": "{{count}} ihlali",
-    "moreViolations": "+{{count}} daha fazla ihlal",
+    "violationCount_one": "{{count}} ihlal",
+    "violationCount_other": "{{count}} ihlal",
+    "moreViolations_one": "+{{count}} ihlal daha",
+    "moreViolations_other": "+{{count}} ihlal daha",
     "lastChecked": "Son kontrol: {{date}}",
     "pagination": {
       "showing": "{{start}} ila {{end}} / {{total}} gösteriliyor",
@@ -715,6 +720,8 @@
       "timeout": "Komut dosyası yürütme zaman aşımına uğradı",
       "pending": "Komut dosyası çalıştırılmayı bekliyor",
       "queued": "Komut dosyası cihaza gönderilmek üzere sırada",
+      "queuedAwaitingPickup": "Henüz etkin bir ajan oturumu bunu almadı. Betik, cihazın ajanı bir sonraki bağlantısında teslim edilir.",
+      "deviceOffline": "Cihaz çevrimdışı. Betik, cihaz yeniden bağlandığında teslim edilir.",
       "cancelling": "Durdurma istendi — cihazdan onay bekleniyor.",
       "cancelled": "Komut dosyası cihazda durduruldu"
     },
@@ -738,7 +745,8 @@
       "failedCancelTooLate": "Başarısız — durdurma isteğiniz çok geç geldi",
       "timeoutCancelTooLate": "Zaman aşımına uğradı — durdurma isteğiniz çok geç geldi",
       "cancelFailed": "Durdurma başarısız — cihaz işlemi durduramadı",
-      "queuedOffline": "Sırada — cihaz çevrimdışı"
+      "queuedOffline": "Sırada — cihaz çevrimdışı",
+      "queuedAwaitingPickup": "Kuyrukta — cihazın almasını bekliyor"
     }
   },
   "executionHistory": {
@@ -769,7 +777,8 @@
       "failedCancelTooLate": "Başarısız — durdurma isteğiniz çok geç geldi",
       "timeoutCancelTooLate": "Zaman aşımına uğradı — durdurma isteğiniz çok geç geldi",
       "cancelFailed": "Durdurma başarısız — cihaz işlemi durduramadı",
-      "queuedOffline": "Sırada — cihaz çevrimdışı"
+      "queuedOffline": "Sırada — cihaz çevrimdışı",
+      "queuedAwaitingPickup": "Kuyrukta — alınmayı bekliyor"
     },
     "summary": "{{shown}} / {{total}}",
     "headers": {
@@ -798,7 +807,7 @@
   "scriptAiInput": {
     "placeholder": {
       "ready": "İhtiyacınız olan komut dosyasını açıklayın...",
-      "opening": "Yapay zeka asistanı açılıyor..."
+      "opening": "Breeze AI açılıyor..."
     },
     "actions": {
       "stopGenerating": "Oluşturmayı durdur",
@@ -817,12 +826,12 @@
       "reject": "Reddet"
     },
     "empty": {
-      "title": "Komut Dosyası Yapay Zekası Asistanı",
-      "description": "Neye ihtiyacınız olduğunu açıklayın, ben de sizin için senaryoyu yazayım."
+      "title": "Breeze AI",
+      "description": "Breeze AI'dan bu komut dosyasını yazmasını veya incelemesini isteyin."
     }
   },
   "scriptAiPanel": {
-    "title": "AI Komut Dosyası Yardımcısı",
+    "title": "Breeze AI",
     "actions": {
       "redoTitle": "AI değişikliğini yeniden uygulayın",
       "redo": "Yinele",
@@ -961,7 +970,15 @@
       "allAdmitted": "Seçilen tüm cihazlar kabul edildi ve kuyruğa alındı.",
       "partiallyAdmitted": "Bazı cihazlar kabul edildi ve kuyruğa alındı. Kalan hedefleri inceleyin.",
       "rejected": "Hiçbir cihaz kabul edilmedi. Aşağıdaki nedenleri inceleyin.",
-      "queued": "Kuyruğa alındı"
+      "queued": "Kuyruğa alındı",
+      "reasons": {
+        "not_found_or_inaccessible": "Cihaz bulunamadı veya erişilemiyor",
+        "site_access_denied": "Bu cihazın sitesine erişiminiz yok",
+        "script_org_mismatch": "Komut dosyası, cihazdan farklı bir kuruluşa ait",
+        "os_incompatible": "Komut dosyası bu cihazın işletim sistemiyle uyumlu değil",
+        "device_decommissioned": "Cihaz hizmet dışı bırakıldı",
+        "maintenance_suppressed": "Atlandı: cihaz bir bakım penceresinde"
+      }
     },
     "confirm": {
       "title": "Yürütmeyi Onayla",
@@ -1117,8 +1134,8 @@
       "exitCodeSeverity": "Çıkış Kodu Önem Derecesi"
     },
     "ai": {
-      "toggleTitle": "AI Komut Dosyası Yardımcısını Aç/Kapat (⌘⇧I)",
-      "button": "Yapay Zeka Asistanı"
+      "toggleTitle": "Breeze AI'ı Aç/Kapat (⌘⇧I)",
+      "button": "Breeze AI"
     },
     "parameters": {
       "emptyPrefix": "Henüz parametre yok. Parametreler, kullanıcıların çalışma zamanında değerler sağlamasına olanak tanır; komut dosyanızda bunlara şu şekilde başvurun:",

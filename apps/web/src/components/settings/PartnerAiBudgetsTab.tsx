@@ -9,14 +9,15 @@ type Props = {
   data: InheritableAiBudgetSettings;
   onChange: (data: InheritableAiBudgetSettings) => void;
   /**
-   * Raised when the alert-threshold box holds text that does not parse. The
-   * hub gates its Save button on it, so an unparseable ladder cannot be
-   * silently dropped while the save reports success (#4388 W03).
+   * The alert-threshold box as typed (`null` until edited). The page owns it so
+   * an unparseable ladder survives a tab switch and keeps Save blocked
+   * (#4388 W03); validity is derived from it by the partners/me unit.
    */
-  onValidityChange?: (valid: boolean) => void;
+  thresholdsText?: string | null;
+  onThresholdsTextChange?: (text: string) => void;
 };
 
-export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }: Props) {
+export default function PartnerAiBudgetsTab({ data, onChange, thresholdsText, onThresholdsTextChange }: Props) {
   const { t } = useTranslation('settings');
   const set = (patch: Partial<InheritableAiBudgetSettings>) =>
     onChange({ ...data, ...patch });
@@ -31,22 +32,23 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-3">
+      <label className="flex items-center gap-3">
         <input
           type="checkbox"
           checked={data.enabled ?? false}
           onChange={e => set({ enabled: e.target.checked })}
           className="h-4 w-4 rounded border"
         />
-        <label className="text-sm font-medium">{t('partnerAiBudgets.enable')}</label>
-      </div>
+        <span className="text-sm font-medium">{t('partnerAiBudgets.enable')}</span>
+      </label>
 
       {data.enabled && (
         <>
           <div className="grid gap-6 sm:grid-cols-2">
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.monthlyBudget')}</label>
+              <label htmlFor="partner-ai-budget-monthly-budget" className="text-sm font-medium">{t('partnerAiBudgets.monthlyBudget')}</label>
               <input
+                id="partner-ai-budget-monthly-budget"
                 type="number"
                 step="0.01"
                 min={0}
@@ -58,8 +60,9 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.dailyBudget')}</label>
+              <label htmlFor="partner-ai-budget-daily-budget" className="text-sm font-medium">{t('partnerAiBudgets.dailyBudget')}</label>
               <input
+                id="partner-ai-budget-daily-budget"
                 type="number"
                 step="0.01"
                 min={0}
@@ -71,8 +74,9 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.approvalMode')}</label>
+              <label htmlFor="partner-ai-budget-approval-mode" className="text-sm font-medium">{t('partnerAiBudgets.approvalMode')}</label>
               <select
+                id="partner-ai-budget-approval-mode"
                 value={data.approvalMode ?? ''}
                 onChange={e => set({ approvalMode: (e.target.value || undefined) as InheritableAiBudgetSettings['approvalMode'] })}
                 className="h-10 w-full rounded-md border bg-background px-3 text-sm"
@@ -86,8 +90,9 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.maxTurns')}</label>
+              <label htmlFor="partner-ai-budget-max-turns" className="text-sm font-medium">{t('partnerAiBudgets.maxTurns')}</label>
               <input
+                id="partner-ai-budget-max-turns"
                 type="number"
                 value={data.maxTurnsPerSession ?? ''}
                 onChange={e => set({ maxTurnsPerSession: e.target.value ? Number(e.target.value) : undefined })}
@@ -99,8 +104,9 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.messagesPerMinute')}</label>
+              <label htmlFor="partner-ai-budget-messages-per-minute" className="text-sm font-medium">{t('partnerAiBudgets.messagesPerMinute')}</label>
               <input
+                id="partner-ai-budget-messages-per-minute"
                 type="number"
                 value={data.messagesPerMinutePerUser ?? ''}
                 onChange={e => set({ messagesPerMinutePerUser: e.target.value ? Number(e.target.value) : undefined })}
@@ -112,8 +118,9 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.messagesPerHour')}</label>
+              <label htmlFor="partner-ai-budget-messages-per-hour" className="text-sm font-medium">{t('partnerAiBudgets.messagesPerHour')}</label>
               <input
+                id="partner-ai-budget-messages-per-hour"
                 type="number"
                 value={data.messagesPerHourPerOrg ?? ''}
                 onChange={e => set({ messagesPerHourPerOrg: e.target.value ? Number(e.target.value) : undefined })}
@@ -125,8 +132,9 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
             </div>
 
             <div className="space-y-2">
-              <label className="text-sm font-medium">{t('aiUsagePage.toolRateLimitMultiplier')}</label>
+              <label htmlFor="partner-ai-budget-tool-rate-limit-multiplier" className="text-sm font-medium">{t('aiUsagePage.toolRateLimitMultiplier')}</label>
               <input
+                id="partner-ai-budget-tool-rate-limit-multiplier"
                 type="number"
                 data-testid="partner-ai-budget-tool-rate-limit-multiplier"
                 value={data.toolRateLimitMultiplier ?? ''}
@@ -141,11 +149,13 @@ export default function PartnerAiBudgetsTab({ data, onChange, onValidityChange }
             </div>
 
             <div className="space-y-2 sm:col-span-2">
-              <label className="text-sm font-medium">{t('partnerAiBudgets.alertThresholds')}</label>
+              <label htmlFor="partner-ai-budget-thresholds" className="text-sm font-medium">{t('partnerAiBudgets.alertThresholds')}</label>
               <AiBudgetThresholdsInput
+                id="partner-ai-budget-thresholds"
                 value={data.alertThresholdPercents}
                 onChange={(v) => set({ alertThresholdPercents: v })}
-                onValidityChange={onValidityChange}
+                text={thresholdsText}
+                onTextChange={onThresholdsTextChange}
                 placeholder={t('partnerAiBudgets.notSet')}
                 testId="partner-ai-budget-thresholds"
               />

@@ -32,6 +32,8 @@ import (
 	"github.com/breeze-rmm/agent/internal/observability"
 	"github.com/breeze-rmm/agent/internal/pamactuator"
 	"github.com/breeze-rmm/agent/internal/pamlifetime"
+	"github.com/breeze-rmm/agent/internal/promptidentity"
+	"github.com/breeze-rmm/agent/internal/remote/desktop"
 	"github.com/breeze-rmm/agent/internal/safemode"
 	"github.com/breeze-rmm/agent/internal/secmem"
 	"github.com/breeze-rmm/agent/internal/securefs"
@@ -814,6 +816,10 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 	secureToken := secmem.NewSecureString(cfg.AuthToken)
 	cfg.AuthToken = "" // Clear plaintext from config struct
 
+	// W09 (#8148): loop-level Retry-After switch, before the log shipper and
+	// the heartbeat (the first users of httputil.Do / the shipper) start.
+	applyRetryAfterSettings(cfg)
+
 	// Shared auth-failure monitor — gates heartbeat and log shipper
 	// HTTP calls after 3 consecutive 401s so a deauthorized agent
 	// stops spamming the API (#401).
@@ -852,6 +858,9 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 			logging.SetShipperLevel("info")
 		}
 	}
+	// desktop_debug also lifts pion's own warnings (TURN Allocate failures and
+	// the like) to Warn in the agent log (#9182).
+	desktop.SetPionWarnLogging(cfg.DesktopDebug)
 
 	logProcessStartup(cachedMainProcessStartup())
 
@@ -1033,6 +1042,8 @@ func startAgent(cfg *config.Config) (*agentComponents, error) {
 		AgentID:   cfg.AgentID,
 		AuthToken: secureToken,
 		TLSConfig: tlsCfg,
+
+		FirstReconnectWindow: wsReconnectConfig(cfg),
 	}
 	wsClient := websocket.New(wsConfig, hb.HandleCommand)
 	hb.SetWebSocketClient(wsClient)
@@ -1684,6 +1695,21 @@ func (e *enrollFailure) Unwrap() error { return e.detail }
 // the save after the server has accepted the enrollment.
 var saveEnrollmentFn = config.SaveEnrollment
 
+// promptIdentityDataDir is where the MSP identity cache lives (a seam for
+// tests).
+var promptIdentityDataDir = config.GetDataDir
+
+// clearPromptIdentityAfterEnrol drops the cached MSP identity and logo
+// (#10190 W03, spec §3.6): a new enrolment may belong to another MSP. The
+// dropped scope is remembered, so the service's next heartbeat purges the
+// prompt list entries created under it. A failure is logged, not fatal: the
+// next heartbeat's identity block replaces the cache anyway.
+func clearPromptIdentityAfterEnrol() {
+	if err := promptidentity.Open(promptIdentityDataDir(), promptidentity.Options{}).Clear(); err != nil {
+		logging.L("enroll").Warn("could not clear the cached MSP identity after enrollment", "error", err.Error())
+	}
+}
+
 // enrollPreflightFailure reports a config directory the agent could not
 // create or secure BEFORE the enroll request, so nothing exists server-side.
 func enrollPreflightFailure(cfgFile string, err error) *enrollFailure {
@@ -1939,6 +1965,7 @@ func enrollWithConfig(cfg *config.Config, cfgFile, enrollmentKey, secret string)
 	if err := saveEnrollmentFn(cfg, cfgFile); err != nil {
 		return enrollSaveFailure(cfg, cfgFile, err)
 	}
+	clearPromptIdentityAfterEnrol()
 
 	enrollLog.Info("enrollment successful",
 		"agentId", cfg.AgentID,
@@ -2106,6 +2133,28 @@ func desktopHelperRole() ipc.HelperRole {
 	return ipc.HelperRoleSystem
 }
 
+// Helper log rotation. Smaller than the agent's defaults: on Windows the
+// user-role helper's log lives in the user's own profile.
+const (
+	helperLogMaxSizeMB  = 10
+	helperLogMaxBackups = 3
+)
+
+// helperPanicFileMaxBytes bounds the stderr file. Panics are rare, but
+// anything else a library writes to stderr lands there too, and nothing
+// rotates it.
+const helperPanicFileMaxBytes = 1 << 20
+
+// openHelperPanicFile opens the stderr/panic file for appending, starting it
+// afresh when it has grown past helperPanicFileMaxBytes.
+func openHelperPanicFile(path string) (*os.File, error) {
+	flags := os.O_CREATE | os.O_APPEND | os.O_WRONLY
+	if fi, err := os.Stat(path); err == nil && fi.Size() > helperPanicFileMaxBytes {
+		flags |= os.O_TRUNC
+	}
+	return os.OpenFile(path, flags, 0600)
+}
+
 func runHelperProcess(name string, role ipc.HelperRole, context, binaryKind string) {
 	// Detach any inherited console immediately. This runs at the top of
 	// every helper role — user-helper, desktop-helper, and any future
@@ -2121,31 +2170,42 @@ func runHelperProcess(name string, role ipc.HelperRole, context, binaryKind stri
 	detachHelperConsole()
 
 	// Log to file in the same logs folder as the main agent (e.g.
-	// C:\ProgramData\Breeze\logs) — except on macOS, where these helpers
-	// run as the logged-in user and the shared directory is root-owned
-	// 0700 and re-hardened on every agent log open/rotation. There they
-	// get ~/Library/Logs/Breeze instead (#5877).
-	logDir, homeErr := config.HelperLogDir()
+	// C:\ProgramData\Breeze\logs) — except where the helper runs as the
+	// logged-in user and cannot write there: macOS, where the shared
+	// directory is root-owned 0700 and re-hardened on every agent log
+	// open/rotation (~/Library/Logs/Breeze, #5877), and the Windows
+	// user-role helper (%LOCALAPPDATA%\Breeze\logs, #9266).
+	logDir, homeErr := config.HelperLogDir(role == ipc.HelperRoleUser)
 	mkdirErr := os.MkdirAll(logDir, 0700)
 	logFileName := "user-helper.log"
+	panicFileName := "user-helper-panic.log"
 	if binaryKind == ipc.HelperBinaryDesktopHelper {
 		logFileName = "desktop-helper.log"
+		panicFileName = "desktop-helper-panic.log"
 	}
 	logPath := filepath.Join(logDir, logFileName)
 	var output io.Writer = os.Stdout
-	f, openErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	var panicFileErr error
+	// Rotated like agent.log: the helper lives for the whole logon session
+	// and used to append to one file forever.
+	rw, openErr := logging.NewRotatingWriter(logPath, helperLogMaxSizeMB, helperLogMaxBackups)
 	if openErr == nil {
 		// When spawned with CREATE_NO_WINDOW (service helper), stdout is invalid.
-		// Use file-only to avoid io.MultiWriter aborting on stdout write errors.
+		// Use file-only to avoid a tee aborting on stdout write errors.
 		if hasConsole() {
-			output = io.MultiWriter(os.Stdout, f)
+			output = logging.TeeWriter(os.Stdout, rw)
 		} else {
-			output = f
+			output = rw
 		}
-		// Redirect stderr to the same log file so Go panic stack traces
-		// are captured instead of being lost to NUL when spawned with
-		// CREATE_NO_WINDOW from the service.
-		redirectStderr(f)
+		// Redirect stderr so Go panic stack traces are captured instead of
+		// being lost to NUL when spawned with CREATE_NO_WINDOW from the
+		// service. Its own plain file, not the rotating one: rotation
+		// renames the file out from under any handle handed to the OS
+		// (same choice as cmd/breeze-backup).
+		var pf *os.File
+		if pf, panicFileErr = openHelperPanicFile(filepath.Join(logDir, panicFileName)); panicFileErr == nil {
+			redirectStderr(pf)
+		}
 	}
 	logging.Init("text", "info", output)
 
@@ -2212,7 +2272,16 @@ func runHelperProcess(name string, role ipc.HelperRole, context, binaryKind stri
 			logging.SetShipperLevel("info")
 		}
 		defer logging.StopShipper()
+	} else {
+		// No shipper (always the case on Windows): relay warn+ lines to
+		// the agent over IPC instead, so they still reach Agent Logs
+		// (#9266). Records logged before the first connection queue
+		// (bounded) and go out once it authenticates.
+		userhelper.EnableLogForwarding()
 	}
+	// Same pion warning elevation as the agent: a helper hosts the peer
+	// connection on service installs (#9182).
+	desktop.SetPionWarnLogging(cfg.DesktopDebug)
 
 	// Always record where diagnostics are going; the pre-#5877 code fell
 	// back to stdout silently, so an unwritable directory looked like an
@@ -2220,6 +2289,12 @@ func runHelperProcess(name string, role ipc.HelperRole, context, binaryKind stri
 	// or a CREATE_NO_WINDOW spawn, stdout goes nowhere at all). Emitted
 	// after the shipper is up so the warn still reaches Agent Logs.
 	logging.EmitLogFileOutcome(slog.Default(), logPath, openErr, mkdirErr, homeErr)
+	if panicFileErr != nil {
+		// Otherwise a later panic under CREATE_NO_WINDOW goes to NUL with
+		// nothing anywhere saying why.
+		slog.Warn("helper panic log unavailable; a panic stack trace would be lost",
+			"path", filepath.Join(logDir, panicFileName), "error", panicFileErr)
+	}
 
 	// Top-level panic recovery for the main goroutine of runHelperProcess.
 	// NOTE: recover() only catches panics in THIS goroutine. Panics in
@@ -2274,6 +2349,9 @@ func runHelperProcess(name string, role ipc.HelperRole, context, binaryKind stri
 	// disconnects in production are caused by permanent identity/auth problems
 	// (binary path mismatch, SID lookup failure on headless Windows, etc.),
 	// not transient socket hiccups. See issue #387.
+	// The helper is the same build as the agent: its prompt renderer
+	// version is the agent version (#10190 AuthRequest.rendererVersion).
+	userhelper.SetRendererVersion(version)
 	sup := &userhelper.Supervisor{
 		Name: name,
 		Policy: userhelper.ReconnectPolicy{

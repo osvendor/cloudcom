@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/breeze-rmm/agent/internal/patching"
 	"github.com/breeze-rmm/agent/internal/remote/tools"
+	"github.com/breeze-rmm/agent/internal/systemrestore"
 )
 
 // Accepted bounds for the schedule_reboot deferral budget (#3207). They mirror
@@ -133,10 +136,10 @@ func filterPatchInventoryItemsBySource(items []map[string]any, source string) []
 	return filtered
 }
 
-func handleInstallPatches(h *Heartbeat, cmd Command) tools.CommandResult {
-	start := time.Now()
-
-	// Run pre-flight checks before install
+// patchInstallPreflight runs the install pre-flight checks and returns the
+// first failure, or nil. A var solely so tests can drive the "preflight
+// rejected the command" path without Windows Update.
+var patchInstallPreflight = func(h *Heartbeat) error {
 	opts := patching.PreflightOptionsFromConfig(h.config)
 	pfResult := patching.RunPreflight(opts)
 	for _, check := range pfResult.Checks {
@@ -146,11 +149,70 @@ func handleInstallPatches(h *Heartbeat, cmd Command) tools.CommandResult {
 			log.Warn("preflight failed", "check", check.Name, "message", check.Message)
 		}
 	}
-	if !pfResult.OK {
-		return tools.NewErrorResult(pfResult.FirstError(), time.Since(start).Milliseconds())
+	if pfResult.OK {
+		return nil
+	}
+	if err := pfResult.FirstError(); err != nil {
+		return err
+	}
+	return errors.New("patch install preflight failed")
+}
+
+func handleInstallPatches(h *Heartbeat, cmd Command) (result tools.CommandResult) {
+	start := time.Now()
+
+	// #4609 W07: ONE System Restore checkpoint per install_patches COMMAND,
+	// not per patch. The per-update call that used to live in
+	// patching/windows.go produced N "successes" for at most one real point
+	// under the Windows creation-frequency throttle. A missing block here
+	// means legacy best-effort enabled (Global Constraint 7).
+	refs := h.patchRefsFromPayload(cmd.Payload)
+	cp := newCommandCheckpoint(cmd.Payload, true, fmt.Sprintf("install %d update(s)", len(refs)))
+	// Every return path reports: a stamped request that never reached the
+	// checkpoint (preflight rejection, nothing installable, every update
+	// already installed) becomes skipped_no_mutation rather than vanishing.
+	defer func() { result.RestorePoint = cp.Report() }()
+
+	// Run pre-flight checks before install
+	if err := patchInstallPreflight(h); err != nil {
+		return tools.NewErrorResult(err, time.Since(start).Milliseconds())
 	}
 
-	return h.executePatchInstallCommand(cmd.Payload, false)
+	// Taken LAZILY, at the first update the provider is actually about to
+	// install: for Windows Update that is after its own "already installed /
+	// no longer offered" check and the download (the spot the old per-update
+	// call used); any other provider calls the hook just before Install.
+	// Definitions updates never trigger it, by the device-observed category
+	// when the provider reports one, else by the server's catalog category.
+	// The Checkpoint makes the per-update calls at-most-once.
+	var sawDefinitions atomic.Bool
+	before := func(ref patchCommandRef, providerCategory string) {
+		if isDefinitionsUpdate(ref, providerCategory) {
+			sawDefinitions.Store(true)
+			return
+		}
+		takeCheckpoint(cp)
+	}
+	result = h.executePatchInstall(cmd.Payload, false, before)
+	if sawDefinitions.Load() {
+		// No-op once a checkpoint was taken: only an all-definitions command
+		// that installed something is reported this way.
+		cp.Skip(systemrestore.StatusSkippedDefinitions, "only definitions updates were installed")
+	}
+	return result
+}
+
+// isDefinitionsUpdate decides whether one update is a definitions update for
+// the checkpoint skip. The provider's device-observed category wins when it
+// has one; otherwise the server's catalog category (sent only alongside a
+// stamped block). UNKNOWN OR EMPTY COUNTS AS RISKY: an unlabelled update might
+// be anything, so we fail toward taking the checkpoint.
+func isDefinitionsUpdate(ref patchCommandRef, providerCategory string) bool {
+	category := strings.TrimSpace(providerCategory)
+	if category == "" {
+		category = strings.TrimSpace(ref.Category)
+	}
+	return strings.EqualFold(category, "definitions")
 }
 
 func handleRollbackPatches(h *Heartbeat, cmd Command) tools.CommandResult {
@@ -356,11 +418,34 @@ func handleCancelReboot(h *Heartbeat, _ Command) tools.CommandResult {
 		return tools.NewErrorResult(fmt.Errorf("reboot manager not available"), time.Since(start).Milliseconds())
 	}
 
-	if err := h.rebootMgr.Cancel(); err != nil {
-		return tools.NewErrorResult(err, time.Since(start).Milliseconds())
-	}
+	err := h.rebootMgr.Cancel()
+	return cancelRebootResult(err, time.Since(start).Milliseconds())
+}
 
-	return tools.NewSuccessResult(map[string]any{"cancelled": true}, time.Since(start).Milliseconds())
+// cancelRebootReasonNothingScheduled is the reason a cancel_reboot that found
+// nothing to cancel completes with.
+const cancelRebootReasonNothingScheduled = "no_reboot_scheduled"
+
+// cancelRebootResult maps Cancel's outcome onto the command result (#10186).
+//
+// Nothing pending is a success, not a failure: the caller wanted the restart
+// off and it is off, and a red command in the device's activity made every
+// automation and the console special-case it. It completes with
+// cancelled:false so a caller can still tell "I stopped a restart" from
+// "there was none". Every other error stays a failure — those are the cases
+// where the machine may still go down (an OS countdown that could not be
+// aborted, a shutdown already being handed to the OS).
+func cancelRebootResult(err error, durationMs int64) tools.CommandResult {
+	if errors.Is(err, patching.ErrNoRebootScheduled) {
+		return tools.NewSuccessResult(map[string]any{
+			"cancelled": false,
+			"reason":    cancelRebootReasonNothingScheduled,
+		}, durationMs)
+	}
+	if err != nil {
+		return tools.NewErrorResult(err, durationMs)
+	}
+	return tools.NewSuccessResult(map[string]any{"cancelled": true}, durationMs)
 }
 
 func handleGetRebootStatus(h *Heartbeat, _ Command) tools.CommandResult {

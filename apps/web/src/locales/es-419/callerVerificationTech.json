@@ -170,6 +170,7 @@
       "partner": "Socio",
       "org": "Organización"
     },
+    "tierCapHint": "El nivel máximo es {{max}}. El nivel 3 requiere verificación en la estación de trabajo, que no está disponible en esta versión.",
     "ignored": "Algunos ajustes son más laxos que la base del socio y se ignoran: {{fields}}",
     "readOnly": "Puedes ver esta política, pero no modificarla.",
     "save": "Guardar política",
@@ -206,7 +207,7 @@
     "title": "Se requiere verificar a quien llama",
     "tier": "Esta acción necesita una verificación de nivel {{tier}}.",
     "verify": "Verificar a quien llama",
-    "verifiedRetry": "Se verificó a quien llama. Pide al asistente que lo intente de nuevo.",
+    "verifiedRetry": "Llamante verificado. Pide a Breeze AI que lo intente de nuevo.",
     "reasons": {
       "no_fresh_verification": "No se ha verificado a quien llama recientemente.",
       "grant_consumed": "La última verificación ya se usó para otra acción.",

@@ -1103,3 +1103,25 @@ host's Vitest setup-module resolution; no claim that those tests passed.
 ## Dedicated Linux Actions worker (2026-10-29)
 
 The CloudCom workflows route trusted Linux jobs to `cloudcom-linux`, retain disposable pull-request workers, remove self-hosted package-install sudo, and bound native/candidate parallelism. Preserve the source/publication gates and the runner-routing regression in `scripts/cloudcom/runner-routing.test.mjs` during upstream imports. The externally provisioned job-start event gate is required because PR-controlled YAML can select runner labels; workflow routing alone does not isolate a public repository. Native platform signing remains separate. See [CI operations](cloudcom-ci.md) for prerequisites and trust boundaries. Rollback is the prior workflow revision; no application, endpoint or database change is involved.
+
+## Breeze v0.125 intake (2026-10-29, validation in progress)
+
+This intake combines upstream v0.125.0 with the current CloudCom fork as server
+version 0.125.5. Native binary version remains 0.123.5 and automatic promotion
+remains disabled pending separate platform qualification. Existing technician
+viewer distribution and OS Companion publication are independent deliverables.
+
+Preservation review covers Cloud Command, credentials and inline notes, IDrive,
+Harmony, shared portal/native remote access, managed RustDesk authorization,
+organization isolation, and CPU/database/background-work safeguards. The UniFi
+collector combines upstream Retry-After and telemetry deferral with local failure
+backoff and throttled logs; its preservation contract checks both deadlines and
+wake enforcement. PAM cleanup guards move into the upstream extracted services.
+CloudCom workflow ownership is retained instead of restoring retired upstream
+release workflows.
+
+The upstream database changes include destructive legacy AI/schema cleanup.
+Rollback requires a verified database restore as well as prior images and runtime
+configuration. A source checkpoint and a restore rehearsal precede live changes.
+This entry does not certify deployment or completion; exact validation and
+promotion receipts are recorded by the control plane.

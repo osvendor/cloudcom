@@ -7,6 +7,7 @@
     "unavailable": "Los detalles de la conexión no están disponibles.",
     "onboardingUnavailable": "La incorporación de lectura de Microsoft Graph del cliente no está habilitada para esta organización.",
     "notAvailableOnInstance": "Aún no está disponible en esta instancia de Breeze.",
+    "notEnabledForOrg": "Aún no está habilitado para esta organización. Pide a tu administrador de Breeze que lo habilite.",
     "callback": {
       "active": "Se completó el consentimiento de Microsoft. El estado actualizado de la conexión se muestra a continuación.",
       "degraded": "Se completó el consentimiento de Microsoft, pero la conexión requiere atención. Los detalles actualizados se muestran a continuación."
@@ -82,7 +83,9 @@
         "intune_devices": "Dispositivos de Intune",
         "ca_policies": "Acceso condicional",
         "skus": "Licencias",
-        "secure_score": "Puntuación de seguridad"
+        "secure_score": "Puntuación de seguridad",
+        "signin_events": "Eventos de inicio de sesión",
+        "unknown": "Tipo de datos no reconocido"
       }
     },
     "errors": {
@@ -91,6 +94,7 @@
       "consent_cancelled": "Se canceló el consentimiento de Microsoft.",
       "conditional_access_blocked": "Microsoft bloqueó este inicio de sesión: la directiva de acceso condicional del inquilino lo interrumpió (por ejemplo, una comprobación del dispositivo). Vuelva a intentarlo desde un navegador en el que confíe el inquilino o consulte al administrador del inquilino.",
       "consent_provider_error": "Microsoft devolvió un error durante el inicio de sesión. Vuelva a intentarlo; si se repite, revise los registros de inicio de sesión del inquilino.",
+      "user_consent_blocked": "Su organización requiere que un administrador apruebe el inicio de sesión en esta aplicación. Inicie sesión con un administrador global o apruébela en Entra → Aplicaciones empresariales → Solicitudes de consentimiento del administrador.",
       "admin_role_required": "Un administrador global o administrador de roles con privilegios debe otorgar el consentimiento.",
       "tenant_mismatch": "El administrador con el que iniciaste sesión pertenece a un inquilino de Microsoft distinto al de esta conexión. Inicia sesión con un administrador del inquilino conectado.",
       "tenant_already_bound": "Este inquilino de Microsoft ya está conectado a otra organización.",
@@ -103,6 +107,7 @@
       "manifest_stale": "Los permisos otorgados usan un manifiesto anterior. Vuelve a otorgar el consentimiento.",
       "organization_probe_failed": "Falló la comprobación de la organización de Microsoft. Vuelve a probar la conexión.",
       "executor_unavailable": "El servicio de verificación no está disponible. Vuelve a intentarlo más tarde.",
+      "executor_unavailablePending": "No se pudo completar la conexión. Vuelve a intentar con Conectar; si sigue fallando, comunícate con soporte.",
       "unknown": "La verificación requiere atención. Vuelve a probar la conexión o inicia el consentimiento nuevamente."
     },
     "stepTitle": "Acceso de lectura",
@@ -124,6 +129,7 @@
     "unavailable": "Los detalles de la conexión no están disponibles.",
     "onboardingUnavailable": "La incorporación de acciones de Microsoft Graph del cliente no está habilitada para esta organización.",
     "notAvailableOnInstance": "Aún no está disponible en esta instancia de Breeze.",
+    "notEnabledForOrg": "Aún no está habilitado para esta organización. Pide a tu administrador de Breeze que lo habilite.",
     "callback": {
       "active": "Se completó el consentimiento de Microsoft. El estado actualizado de la conexión se muestra a continuación.",
       "degraded": "Se completó el consentimiento de Microsoft, pero la conexión requiere atención. Los detalles actualizados se muestran a continuación."
@@ -175,6 +181,7 @@
       "consent_cancelled": "Se canceló el consentimiento de Microsoft.",
       "conditional_access_blocked": "Microsoft bloqueó este inicio de sesión: la directiva de acceso condicional del inquilino lo interrumpió (por ejemplo, una comprobación del dispositivo). Vuelva a intentarlo desde un navegador en el que confíe el inquilino o consulte al administrador del inquilino.",
       "consent_provider_error": "Microsoft devolvió un error durante el inicio de sesión. Vuelva a intentarlo; si se repite, revise los registros de inicio de sesión del inquilino.",
+      "user_consent_blocked": "Su organización requiere que un administrador apruebe el inicio de sesión en esta aplicación. Inicie sesión con un administrador global o apruébela en Entra → Aplicaciones empresariales → Solicitudes de consentimiento del administrador.",
       "admin_role_required": "Un administrador global o administrador de roles con privilegios debe otorgar el consentimiento.",
       "tenant_mismatch": "El administrador con el que iniciaste sesión pertenece a un inquilino de Microsoft distinto al de esta conexión. Inicia sesión con un administrador del inquilino conectado.",
       "tenant_already_bound": "Este inquilino de Microsoft ya está conectado a otra organización.",
@@ -186,6 +193,7 @@
       "manifest_stale": "Los permisos otorgados usan un manifiesto anterior. Vuelve a otorgar el consentimiento.",
       "organization_probe_failed": "Falló la comprobación de la organización de Microsoft. Vuelve a probar la conexión.",
       "executor_unavailable": "El servicio de verificación no está disponible. Vuelve a intentarlo más tarde.",
+      "executor_unavailablePending": "No se pudo completar la conexión. Vuelve a intentar con Conectar; si sigue fallando, comunícate con soporte.",
       "unknown": "La verificación requiere atención. Vuelve a probar la conexión o inicia el consentimiento nuevamente."
     },
     "stepTitle": "Acciones de administrador",
@@ -201,6 +209,34 @@
       "revoke": "Para revocar el acceso más adelante, desconecta aquí o quita la aplicación empresarial de Breeze en Microsoft Entra.",
       "continue": "Continuar a Microsoft",
       "defaultTarget": "el inquilino de Microsoft 365 de esta organización"
+    },
+    "v2": {
+      "title": "Se necesita volver a dar consentimiento para las acciones de identidad",
+      "intro": "Este inquilino dio su consentimiento a un conjunto de permisos anterior. Volver a dar consentimiento conserva todo lo que funciona hoy y agrega los permisos siguientes. Nada cambia para el cliente hasta que un administrador apruebe el nuevo consentimiento.",
+      "keepsWorking": "Deshabilitar un usuario y restablecer una contraseña siguen funcionando con el consentimiento actual.",
+      "upgradeAction": "Revisar y aprobar los nuevos permisos",
+      "upgradeFailed": "No se pudo iniciar la aprobación de los nuevos permisos.",
+      "revokedGrant": "Microsoft 365 ya no muestra un permiso que esta conexión ya tenía: {{grants}}. Vuelve a probar y, si sigue faltando, da el consentimiento de nuevo.",
+      "purpose": {
+        "userReadWrite": "Leer y actualizar cuentas de usuario: se usa para bloquear el inicio de sesión, cambiar licencias y crear un usuario.",
+        "userPasswordProfile": "Establecer la contraseña de un usuario: se usa para emitir una contraseña temporal en un restablecimiento o una cuenta nueva.",
+        "userRevokeSessions": "Cerrar todas las sesiones de un usuario: se usa para revocar las sesiones de inicio de sesión cuando una cuenta está comprometida o el empleado deja la organización.",
+        "groupMember": "Leer grupos y cambiar quién pertenece a ellos: se usa para agregar y quitar membresías. No puede crear ni eliminar un grupo.",
+        "intunePrivileged": "Retirar un dispositivo administrado por Intune: elimina los datos de la empresa y cancela la inscripción. Breeze nunca realiza un borrado completo.",
+        "mailboxSettings": "Leer y establecer la configuración del buzón: se usa para activar o desactivar una respuesta automática y confirmar que se aplicó.",
+        "organizationRead": "Leer el inventario de suscripciones del inquilino: se usa para comprobar que hay un puesto de licencia libre antes de asignarlo.",
+        "unknown": "Lo usa una acción de Microsoft 365 en Breeze."
+      }
+    },
+    "staleManifest": {
+      "title": "Organizaciones que necesitan un nuevo consentimiento de Microsoft 365",
+      "description": "Estos clientes siguen con un conjunto de permisos anterior. Abre la organización para iniciar el nuevo consentimiento.",
+      "empty": "Ninguna organización necesita un nuevo consentimiento.",
+      "columnOrganization": "Organización",
+      "columnTenant": "Inquilino",
+      "columnVersion": "Conjunto de permisos",
+      "columnLastVerified": "Última verificación",
+      "loadFailed": "No se pudo cargar la lista de nuevos consentimientos."
     }
   },
   "m365ConfirmTenant": {
@@ -230,8 +266,10 @@
   "m365TenantPanel": {
     "loading": "Cargando las conexiones de Microsoft 365.",
     "consentUnavailable": "La conexión basada en consentimiento aún no está disponible en esta instancia de Breeze.",
+    "consentNotEnabledForOrg": "La conexión basada en consentimiento aún no está habilitada para esta organización. Pide a tu administrador de Breeze que la habilite.",
     "selectOrganization": "Selecciona una organización para conectar su inquilino de Microsoft 365.",
     "noTenantForOrg": "No hay ningún inquilino de Microsoft 365 conectado a {{orgName}}",
+    "tenantConnectedToOrg": "{{tenantName}} · conectado a {{orgName}}",
     "noTenant": "No hay ningún inquilino de Microsoft 365 conectado a esta organización",
     "tenantId": "ID del inquilino",
     "copyTenantId": "Copiar ID del inquilino",
@@ -264,6 +302,9 @@
     "workspace": "Espacio de trabajo",
     "workspaceID": "Espacio de trabajo ID: {{id}}",
     "connectWorkspace": "Conectar espacio de trabajo",
+    "notConnected": "No conectado",
+    "pendingConnection": "Conexión pendiente",
+    "turnOnSlackToConnectWorkspace": "Activa las notificaciones de Slack para conectar un espacio de trabajo.",
     "oauthRedirectStartsWhenYouConnectASlack": "La redirección OAuth comienza cuando conecta un espacio de trabajo Slack.",
     "defaultChannel": "Canal predeterminado",
     "microsoftTeams": "Microsoft Teams",
@@ -295,39 +336,76 @@
     "saving": "Guardando...",
     "saveSettings": "Guardar configuración"
   },
-  "connectorStatusPanel": {
-    "healthy": "Saludable",
-    "degraded": "Degradado",
-    "paused": "En pausa",
-    "connectorStatus": "Estado del conector",
-    "trackIntegrationHealthAndRecentActivityAtA": "Realice un seguimiento del estado de la integración y de la actividad reciente de un vistazo.",
-    "refreshAll": "Actualizar todo",
-    "integration": "Integración",
-    "health": "Salud",
-    "lastActivity": "Última actividad",
-    "errors": "Errores",
-    "syncNow": "Sincronizar ahora",
-    "category": {
-      "psa": "PSA",
-      "monitoring": "Monitoreo",
-      "webhooks": "Webhooks",
-      "backup": "Respaldo"
+  "connectionHealthPanel": {
+    "title": "Estado de las conexiones",
+    "allHealthy": "Todas las conexiones funcionan correctamente",
+    "allHealthyDetail": "Las integraciones conectadas se verifican automáticamente. Los problemas aparecen aquí y junto a la integración en la lista.",
+    "loadError": "No se pudo cargar el estado de las conexiones.",
+    "retry": "Reintentar",
+    "since": "desde {{time}}",
+    "fix": "Corregir",
+    "remedy": {
+      "reconnect": "Vuelva a conectarse desde la aplicación cliente (p. ej., agregue de nuevo el servidor MCP). No requiere acción en Breeze."
     },
-    "activity": {
-      "threeMinutesAgo": "hace 3m",
-      "elevenMinutesAgo": "hace 11m",
-      "fiveMinutesAgo": "hace 5m",
-      "oneDayAgo": "Hace 1d"
+    "truncated": "Se muestran los primeros {{count}}",
+    "recentlyResolved": "Resueltas recientemente ({{count}})",
+    "resolution": {
+      "recovered": "Recuperada",
+      "retired": "Retirada"
+    },
+    "condition": {
+      "sync_failed": "Falló la sincronización",
+      "reauth_required": "Se requiere reautorización",
+      "disconnected": "Desconectada",
+      "error": "Error",
+      "mailbox_error": "Error de buzón",
+      "poll_failing": "Falla la consulta periódica",
+      "needs_consent": "Se requiere consentimiento",
+      "degraded": "Degradada",
+      "suspended": "Suspendida",
+      "grant_missing": "Falta la concesión",
+      "grant_unexpected": "Concesión inesperada",
+      "manifest_stale": "Manifiesto desactualizado",
+      "application_token_invalid": "Token de aplicación no válido",
+      "tenant_mismatch": "El inquilino no coincide",
+      "grant_reconciliation_unavailable": "Verificación de concesión no disponible",
+      "grant_revoked_reuse": "Concesión revocada (reutilización de token)",
+      "grant_revoked": "Concesión revocada",
+      "delivery_failed": "Las entregas fallan",
+      "sync_stale": "Sincronización detenida",
+      "verification_failed": "Falló la verificación",
+      "unknown": "Requiere atención"
     }
+  },
+  "connectionHealthSettings": {
+    "title": "Notificaciones de estado",
+    "description": "El personal del MSP que puede reparar una conexión averiada siempre recibe su aviso en la aplicación y el resumen diario. Elige si los administradores de las organizaciones cliente también se enteran de las conexiones de su propia organización.",
+    "partnerLabel": "Notificar a los administradores del cliente de forma predeterminada",
+    "partnerDescription": "Se aplica a toda organización que no tenga una configuración propia. Las conexiones de todo el socio nunca llegan a los administradores del cliente.",
+    "partnerReadOnly": "Solo los administradores del socio con acceso a todas las organizaciones pueden cambiar el valor predeterminado.",
+    "orgLabel": "Esta organización",
+    "orgDescription": "Reemplaza el valor predeterminado para la organización seleccionada arriba.",
+    "selectOrg": "Selecciona una organización para reemplazar el valor predeterminado en ella.",
+    "inherit": "Heredar",
+    "inheritOn": "Heredar (activado, {{from}})",
+    "inheritOff": "Heredar (desactivado, {{from}})",
+    "fromPartner": "de la configuración del socio",
+    "fromDefault": "del valor predeterminado integrado",
+    "on": "Activado",
+    "off": "Desactivado",
+    "loadFailed": "No se pudo cargar la configuración de notificaciones de estado.",
+    "retry": "Reintentar",
+    "saved": "Configuración de notificaciones de estado guardada",
+    "saveFailed": "No se pudo guardar la configuración de notificaciones de estado"
   },
   "googleWorkspaceIntegration": {
     "connectionVerifiedAndSaved": "Conexión verificada y guardada.",
     "googleWorkspace": "Google Workspace",
-    "connectAWorkspaceDomainSoTheAIAssistant": "Conecte un dominio de Workspace para que el asistente AI pueda administrar usuarios y grupos para esta organización.",
+    "connectAWorkspaceDomainSoTheAIAssistant": "Conecta un dominio de Workspace para que Breeze AI pueda administrar usuarios y grupos de esta organización. ",
     "googleWorkspaceIntegrationIsNotEnabledOnThis": "La integración de Google Workspace no está habilitada en esta instancia.",
     "anAdministratorEnablesItBySetting": "Un administrador lo habilita configurando",
     "onTheAPIServerThenReloadingThisPage": "en el servidor API, luego recargando esta página.",
-    "connectAWorkspaceDomainSoTheAIAssistant2": "Conecte un dominio de Workspace para que el asistente AI pueda buscar usuarios, administrar grupos, restablecer contraseñas, ejecutar salidas guiadas y más para esta organización.",
+    "connectAWorkspaceDomainSoTheAIAssistant2": "Conecta un dominio de Workspace para que Breeze AI pueda buscar usuarios, administrar grupos, restablecer contraseñas, ejecutar bajas guiadas y más para esta organización. ",
     "connection": "Conexión",
     "pasteTheServiceAccountJSONKeyAndThe": "Pegue la clave JSON de la cuenta de servicio y el superadministrador que representa. Breeze realiza una llamada al Directorio en vivo API para verificar la delegación de todo el dominio antes de guardar.",
     "howToGetTheServiceAccountJSONAnd": "Cómo obtener la cuenta de servicio JSON y autorizar la delegación",
@@ -476,6 +554,19 @@
     "pageOf": "Página {{current}} de {{total}}"
   },
   "integrationsPage": {
+    "scope": {
+      "partnerWide": "En todo el socio",
+      "partnerWideDetail": "Se aplica a todas las organizaciones que administra."
+    },
+    "nav": {
+      "select": "Elija una integración",
+      "openProblems": "Problemas abiertos: {{count}}"
+    },
+    "scopeBar": {
+      "configuringFor": "Configurando integraciones para",
+      "thisOrganization": "esta organización",
+      "change": "Cambiar"
+    },
     "webhooks": "Webhooks",
     "notifications": "Notificaciones",
     "security": "Seguridad",
@@ -489,16 +580,16 @@
     "googleWorkspace": "Google Workspace",
     "microsoft365": "Microsoft 365",
     "pax8": "Pax8",
-    "tdSYNNEXPricing": "TD SYNNEX Precios",
+    "tdSYNNEXPricing": "TD SYNNEX EC Express",
     "payments": "Pagos",
     "integrations": "Integraciones",
-    "manageAllConnectionsAndKeepAutomationWorkflowsHealthy": "Administre todas las conexiones y mantenga saludables los flujos de trabajo de automatización.",
+    "manageAllConnectionsAndKeepAutomationWorkflowsHealthy": "Conecte Breeze con las herramientas con las que trabaja su MSP y vea qué conexiones requieren atención.",
     "distributorIntegrationsPax8AndTDSYNNEXAreAvailable": "Las integraciones de distribuidores (Pax8 y TD SYNNEX) están disponibles solo para cuentas de socios.",
     "accountingIntegrationsAreAvailableToPartnerAccountsOnly": "Las integraciones contables solo están disponibles para cuentas de socios.",
     "theUniFiNetworkIntegrationIsAvailableToPartner": "La integración de la red UniFi está disponible solo para cuentas de socios.",
     "psa": "PSA",
     "viewNameDocumentation": "Ver documentación de {{name}}",
-    "tdSYNNEXPriceFile": "Archivo de precios TD SYNNEX",
+    "tdSYNNEXPriceFile": "TD SYNNEX SFTP",
     "backup": "Copia de seguridad",
     "edrProviders": "Proveedores de EDR"
   },
@@ -518,7 +609,7 @@
     "hidePassword": "Ocultar contraseña",
     "portalLabelToggle": "Mostrar el nombre del proveedor en el portal del cliente",
     "portalLabelHelp": "Desactivado de forma predeterminada: los clientes ven \"Copia de seguridad gestionada en la nube\" en lugar del nombre del fabricante.",
-    "credentialsHelp": "Cree un usuario dedicado de la consola de Cove con rol de solo lectura, una contraseña única y sin autenticación de dos factores. Breeze solo lee el estado; nunca modifica nada en Cove.",
+    "credentialsHelp": "Cree un usuario de API de Cove (Management → Users → API Users) bajo su cliente de nivel superior. Ingrese el nombre de ese cliente como nombre de partner, el nombre de inicio de sesión del usuario de API como usuario y su token como contraseña. Breeze solo lee el estado; nunca modifica nada en Cove.",
     "test": "Probar conexión",
     "syncNow": "Sincronizar ahora",
     "reauthRequired": "Credenciales rechazadas",
@@ -582,11 +673,10 @@
   "m365Integration": {
     "connectionVerifiedAndSaved": "Conexión verificada y guardada.",
     "microsoft365": "Microsoft 365",
-    "connectAnEntraAzureADAppRegistrationSo": "Conecte un registro de aplicación Entra (Azure AD) para que el asistente AI pueda administrar usuarios y grupos para el inquilino de esta organización.",
+    "connectAnEntraAzureADAppRegistrationSo": "Conecta un registro de aplicación de Entra (Azure AD) para que Breeze AI pueda administrar usuarios y grupos del tenant de esta organización. ",
     "microsoft365IntegrationIsNotEnabledOnThis": "La conexión directa heredada no está habilitada en esta instancia.",
     "anAdministratorEnablesItBySetting": "Un administrador lo habilita configurando",
     "onTheAPIServerThenReloadingThisPage": "en el servidor API, luego recargando esta página.",
-    "connectAnEntraAzureADAppRegistrationSo2": "Conecte un registro de aplicación Entra (Azure AD) para que el asistente AI pueda buscar usuarios, administrar grupos, deshabilitar cuentas y restablecer contraseñas para el inquilino de esta organización.",
     "connection": "Conexión",
     "enterTheTenantIdAppClientIdAnd": "Ingrese la identificación del inquilino, la identificación de la aplicación (cliente) y un secreto de cliente del registro de su aplicación Entra. Breeze realiza una llamada Graph en vivo para verificar las credenciales antes de guardar.",
     "howToGetTheTenantIdAppId": "Cómo obtener la identificación del inquilino, la identificación de la aplicación y el secreto del cliente",
@@ -616,7 +706,6 @@
     "permissionsListedBelowThen": "permisos enumerados a continuación, entonces",
     "grantAdminConsent": "Conceder consentimiento de administrador",
     "tenantID": "ID del inquilino",
-    "contosoOnmicrosoftComOrTenantGUID": "contoso.onmicrosoft.com o inquilino GUID",
     "appClientID": "Aplicación (cliente) ID",
     "applicationClientId": "identificación de la aplicación (cliente)",
     "clientSecret": "secreto del cliente",
@@ -638,7 +727,25 @@
     "saveAndVerify": "Guardar y verificar",
     "legacyBadge": "Heredado",
     "precedenceNote": "Esta conexión directa heredada tiene prioridad sobre la conexión basada en consentimiento para este inquilino.",
-    "disconnectConfirm": "¿Desconectar la conexión directa heredada? Breeze elimina las credenciales guardadas del registro de aplicación. El registro de aplicación sigue existiendo en Microsoft Entra."
+    "disconnectConfirm": "¿Desconectar la conexión directa heredada? Breeze elimina las credenciales guardadas del registro de aplicación. El registro de aplicación sigue existiendo en Microsoft Entra.",
+    "legacyHeading": "Microsoft 365: registro de aplicación heredado (solo Breeze AI)",
+    "legacyHeadingForOrg": "Microsoft 365: registro de aplicación heredado (solo Breeze AI) para {{orgName}}",
+    "legacyScopeSummary": "Un registro de aplicación de Entra más un secreto de cliente para el tenant de esta organización. Habilita únicamente las acciones de Breeze AI que se enumeran a continuación.",
+    "powersHeading": "Habilita",
+    "powersList": "Seis acciones de Breeze AI: búsqueda de usuarios, actividad de inicio de sesión, listar grupos, miembros del grupo, deshabilitar usuario, restablecer contraseña.",
+    "doesNotPowerHeading": "No habilita",
+    "doesNotPowerSync": "La sincronización del tenant (usuarios, licencias, inicios de sesión, Acceso condicional, Secure Score)",
+    "doesNotPowerQueryTools": "Herramientas de IA y MCP",
+    "doesNotPowerReports": "Informes y evidencia de M365 basados en ellas",
+    "useConnectWithMicrosoft": "Use Conectar con Microsoft, arriba, en su lugar.",
+    "searchAllApplicationsFirst": ". Antes de crear una aplicación nueva, busque en ",
+    "allApplications": "Todas las aplicaciones",
+    "searchAllApplicationsFirst2": " (no en Aplicaciones propias) si ya existe una aplicación de Breeze en este tenant. ",
+    "tenantIdGuidPlaceholder": "ID de tenant (GUID), p. ej. 00000000-0000-0000-0000-000000000000",
+    "tenantIdGuidHint": "Use el ID de directorio (tenant), un GUID, de la página Información general del registro de aplicación de Entra, no el dominio contoso.onmicrosoft.com.",
+    "savingRequiresMfa": " Para guardar se requiere verificación MFA.",
+    "clientSecretPlaceholder": "secreto de cliente de la app",
+    "clientSecretStoredPlaceholder": "•••••••••• (almacenado, cifrado)"
   },
   "monitoringIntegration": {
     "deviceHealth": "Estado del dispositivo",
@@ -1400,6 +1507,34 @@
       "degraded": "Degradado",
       "unhealthy": "Con problemas",
       "unknown": "Desconocido"
-    }
+    },
+    "actionsLabel": "Permitir acciones de respuesta",
+    "actionsHelp": "Permite a los técnicos aislar dispositivos y ejecutar análisis a través de esta conexión.",
+    "actionsConfirmTitle": "¿Permitir acciones de respuesta?",
+    "actionsConfirmMessage": "Los técnicos con permiso de ejecución en dispositivos podrán aislar y liberar dispositivos y ejecutar análisis en los endpoints administrados mediante “{{name}}”.",
+    "actionsConfirmLabel": "Permitir",
+    "actionsOnToast": "Acciones de respuesta permitidas",
+    "actionsOffToast": "Acciones de respuesta desactivadas",
+    "actionsError": "No se pudieron actualizar las acciones de respuesta.",
+    "pushLabel": "Eventos push",
+    "pushHelp": "{{provider}} notifica a Breeze sobre eventos nuevos, lo que activa una sincronización antes que el calendario habitual. Las sincronizaciones programadas siguen ejecutándose.",
+    "pushOnToast": "Eventos push activados",
+    "pushOffToast": "Eventos push desactivados",
+    "pushReplaceTitle": "¿Reemplazar el destino de push existente?",
+    "pushReplaceMessage": "{{provider}} ya envía eventos push a otro destino (por ejemplo, un SIEM). Si Breeze lo reemplaza, ese flujo se detiene.",
+    "pushReplaceConfirm": "Reemplazar y activar",
+    "pushError": "No se pudieron cambiar los eventos push.",
+    "pushErrors": {
+      "public_url_unset": "Define la URL pública del servidor antes de activar los eventos push.",
+      "public_url_not_https": "Los eventos push requieren una URL pública HTTPS.",
+      "connection_inactive": "Activa la conexión antes de activar los eventos push.",
+      "push_state_changed": "La configuración de push cambió durante la activación. Actualice e intente de nuevo."
+    },
+    "pushTest": "Enviar evento de prueba",
+    "pushTestQueuedToast": "Evento de prueba solicitado",
+    "pushTestError": "No se pudo enviar el evento de prueba.",
+    "pushTestNote": "El evento de prueba puede tardar unos minutos en llegar.",
+    "pushLast": "Último evento push: {{relative}}",
+    "pushNone": "Aún no se han recibido eventos push"
   }
 }

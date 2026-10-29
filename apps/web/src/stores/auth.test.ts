@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Tokens, User } from './auth';
 import { applyResolvedLocalePreferences } from '@/lib/appearance';
+import { entitlementsCache } from '../lib/entitlementsCache';
 import {
   apiAcceptInvite,
   apiConfirmPhone,
@@ -2304,6 +2305,24 @@ describe('fetchAndApplyPreferences locale wiring', () => {
 });
 
 describe('apiRegisterPartner recovery action', () => {
+  it.each([
+    [{ catalogVersion: 'launch-2026-10', capacity: 250, billingPeriod: 'annual' }, true],
+    [{ catalogVersion: 'launch-2026-10', capacity: 150, billingPeriod: 'annual' }, false],
+    [{ catalogVersion: 'launch-2026-10', capacity: 250, billingPeriod: 'annual', redirect: '//evil.test' }, false],
+  ])('validates purchase preference from sign-in recovery responses', async (purchaseSelection, accepted) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(makeResponse({ verified: false, status: 'sign_in', purchaseSelection })));
+    const result = await apiVerifyEmail('token');
+    expect(result.status).toBe('sign_in');
+    if (accepted) expect(result.purchaseSelection).toEqual(purchaseSelection);
+    else expect(result).not.toHaveProperty('purchaseSelection');
+  });
+  it('sends optional approved purchase intent to the registration API', async () => {
+    const doFetch = vi.fn().mockResolvedValue(makeResponse({ success: true, message: 'Check email' }));
+    vi.stubGlobal('fetch', doFetch);
+    const purchaseSelection = { catalogVersion: 'launch-2026-10' as const, capacity: 250, billingPeriod: 'annual' as const };
+    await apiRegisterPartner('Acme', 'jane@acme.test', 'pw', 'Jane', purchaseSelection);
+    expect(JSON.parse(doFetch.mock.calls[0]![1].body)).toEqual({ companyName: 'Acme', email: 'jane@acme.test', password: 'pw', name: 'Jane', acceptTerms: true, purchaseSelection });
+  });
   beforeEach(() => {
     vi.clearAllMocks();
   });
@@ -2475,12 +2494,57 @@ describe('MFA enrollment API bindings', () => {
 });
 
 describe('MFA enrollment session adoption', () => {
+  it.each(['totp', 'sms', 'passkey'] as const)('records the enrolled %s method in shared user state', (method) => {
+    useAuthStore.getState().login(baseUser, baseTokens);
+    const generation = useAuthStore.getState().sessionGeneration;
+
+    expect(useAuthStore.getState().commitMfaEnrollmentIfCurrent(generation, method, {
+      accessToken: `replacement-${method}`,
+      expiresInSeconds: 900,
+    })).toBe(true);
+    expect(useAuthStore.getState().user).toMatchObject({ mfaEnabled: true, mfaMethod: method });
+    expect(useAuthStore.getState().tokens?.accessToken).toBe(`replacement-${method}`);
+  });
+
+  it('records disabled MFA in shared state while adopting the replacement session', () => {
+    useAuthStore.getState().login({ ...baseUser, mfaEnabled: true, mfaMethod: 'totp' }, baseTokens);
+    const generation = useAuthStore.getState().sessionGeneration;
+    const tokens = { accessToken: 'replacement-disabled', expiresInSeconds: 900 };
+
+    expect(useAuthStore.getState().commitMfaDisableIfCurrent(generation, tokens)).toBe(true);
+    expect(useAuthStore.getState().user).toMatchObject({ mfaEnabled: false, mfaMethod: null });
+    expect(useAuthStore.getState().tokens).toEqual(tokens);
+  });
+
+  it('records the factor change without replacement tokens when the issuing session cannot be installed', () => {
+    useAuthStore.getState().login({ ...baseUser, mfaEnabled: true, mfaMethod: 'totp' }, baseTokens);
+    const generation = useAuthStore.getState().sessionGeneration;
+
+    expect(useAuthStore.getState().commitMfaDisableIfCurrent(generation)).toBe(true);
+    expect(useAuthStore.getState().user).toMatchObject({ mfaEnabled: false, mfaMethod: null });
+    expect(useAuthStore.getState().tokens).toEqual(baseTokens);
+  });
+
+  it('does not apply a disable response to a newer login', () => {
+    useAuthStore.getState().login({ ...baseUser, mfaEnabled: true, mfaMethod: 'totp' }, baseTokens);
+    const generation = useAuthStore.getState().sessionGeneration;
+    const newerTokens = { accessToken: 'newer-session', expiresInSeconds: 900 };
+    useAuthStore.getState().login({ ...baseUser, mfaEnabled: true, mfaMethod: 'totp' }, newerTokens);
+
+    expect(useAuthStore.getState().commitMfaDisableIfCurrent(generation, {
+      accessToken: 'stale-disable',
+      expiresInSeconds: 900,
+    })).toBe(false);
+    expect(useAuthStore.getState().tokens).toEqual(newerTokens);
+    expect(useAuthStore.getState().user).toMatchObject({ mfaEnabled: true, mfaMethod: 'totp' });
+  });
+
   it('refuses a terminal response after logout', () => {
     useAuthStore.getState().login(baseUser, baseTokens);
     const generation = useAuthStore.getState().sessionGeneration;
     useAuthStore.getState().logout();
 
-    expect(useAuthStore.getState().commitMfaEnrollmentIfCurrent(generation, {
+    expect(useAuthStore.getState().commitMfaEnrollmentIfCurrent(generation, 'totp', {
       accessToken: 'stale',
       expiresInSeconds: 900,
     })).toBe(false);
@@ -2493,7 +2557,7 @@ describe('MFA enrollment session adoption', () => {
     const newerTokens = { accessToken: 'newer', expiresInSeconds: 900 };
     useAuthStore.getState().login(baseUser, newerTokens);
 
-    expect(useAuthStore.getState().commitMfaEnrollmentIfCurrent(generation, {
+    expect(useAuthStore.getState().commitMfaEnrollmentIfCurrent(generation, 'totp', {
       accessToken: 'stale',
       expiresInSeconds: 900,
     })).toBe(false);
@@ -2701,5 +2765,32 @@ describe('fetchWithAuth — a rejected body password never looks like session de
     expect(replace).toHaveBeenCalledWith(
       `/login?next=${encodeURIComponent('/settings/profile')}&reason=session-expired`,
     );
+  });
+});
+
+// #8862: the profile page mirrors its SSO re-auth grant into sessionStorage so
+// a remount can restore it. Signing out must not leave it for the next session
+// on the same tab (the server would reject it, but the page would arm the
+// passkey card with a proof it cannot use).
+describe('logout() and the stashed SSO re-auth grant (#8862)', () => {
+  it('clears the stashed grant', async () => {
+    const { SSO_REAUTH_GRANT_KEY, stashSsoReauthGrant } = await import('@/lib/ssoReauthGrant');
+    sessionStorage.clear();
+    stashSsoReauthGrant('3f2504e0-4f89-41d3-9a0c-0305e82c3301', 'passkey', 'user-1');
+    expect(sessionStorage.getItem(SSO_REAUTH_GRANT_KEY)).not.toBeNull();
+
+    useAuthStore.getState().logout();
+
+    expect(sessionStorage.getItem(SSO_REAUTH_GRANT_KEY)).toBeNull();
+  });
+});
+
+describe('logout resets the entitlements cache (#9907)', () => {
+  it('clears a cached snapshot and invalidates in-flight requests', () => {
+    entitlementsCache.value = { plan: 'pro', entitlements: [] };
+    const generation = entitlementsCache.generation;
+    useAuthStore.getState().logout();
+    expect(entitlementsCache.value).toBeNull();
+    expect(entitlementsCache.generation).toBe(generation + 1);
   });
 });

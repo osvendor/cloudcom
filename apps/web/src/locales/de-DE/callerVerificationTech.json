@@ -170,6 +170,7 @@
       "partner": "Partnerebene",
       "org": "Organisation"
     },
+    "tierCapHint": "Die höchste Stufe ist {{max}}. Stufe 3 erfordert die Arbeitsplatz-Verifizierung, die in dieser Version nicht verfügbar ist.",
     "ignored": "Einige Einstellungen sind lockerer als die Partner-Basis und werden ignoriert: {{fields}}",
     "readOnly": "Sie können diese Richtlinie einsehen, aber nicht ändern.",
     "save": "Richtlinie speichern",
@@ -206,7 +207,7 @@
     "title": "Anruferüberprüfung erforderlich",
     "tier": "Diese Aktion erfordert eine Überprüfung der Stufe {{tier}}.",
     "verify": "Anrufer überprüfen",
-    "verifiedRetry": "Anrufer überprüft. Bitten Sie den Assistenten, es erneut zu versuchen.",
+    "verifiedRetry": "Anrufer verifiziert. Bitten Sie Breeze AI, es erneut zu versuchen.",
     "reasons": {
       "no_fresh_verification": "Der Anrufer wurde in letzter Zeit nicht überprüft.",
       "grant_consumed": "Die letzte Überprüfung wurde bereits für eine andere Aktion verwendet.",

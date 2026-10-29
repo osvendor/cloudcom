@@ -9,6 +9,7 @@ describe('buildPortalNavItems — enable_tickets nav gating (#2345)', () => {
     expect(items.map((i) => i.href)).toEqual([
       '/quotes',
       '/invoices',
+      '/agreements',
       '/devices',
       '/assets',
       '/profile'
@@ -21,6 +22,11 @@ describe('buildPortalNavItems — enable_tickets nav gating (#2345)', () => {
     const items = buildPortalNavItems({});
     expect(items[0]).toEqual({ label: 'Proposals', href: '/quotes' });
     expect(items[1]).toEqual({ label: 'Invoices', href: '/invoices' });
+  });
+
+  it('always lists Agreements right after Invoices (no flag)', () => {
+    const hrefs = buildPortalNavItems({}).map((i) => i.href);
+    expect(hrefs.indexOf('/agreements')).toBe(hrefs.indexOf('/invoices') + 1);
   });
 
   it('labels /quotes "Proposals", matching every page it leads to', () => {
@@ -58,6 +64,7 @@ describe('buildPortalNavItems — full flag set (#4562)', () => {
       '/dashboard',
       '/quotes',
       '/invoices',
+      '/agreements',
       '/tickets',
       '/approvals',
       '/devices',
@@ -85,6 +92,7 @@ describe('buildPortalNavItems — full flag set (#4562)', () => {
     }).map((item) => item.href)).toEqual([
       '/quotes',
       '/invoices',
+      '/agreements',
       '/profile',
     ]);
   });
@@ -112,6 +120,7 @@ describe('buildPortalNavItems — Network (/network) gating (#6640)', () => {
     expect(items.map((i) => i.href)).toEqual([
       '/quotes',
       '/invoices',
+      '/agreements',
       '/tickets',
       '/approvals',
       '/devices',
@@ -200,5 +209,25 @@ describe('buildPortalNavItems — Approvals (/approvals) (#8200)', () => {
     expect(find(3)).toEqual({ href: '/approvals', label: 'Approvals', badge: 3 });
     expect(find(0)).not.toHaveProperty('badge');
     expect(find(undefined)).not.toHaveProperty('badge');
+  });
+});
+
+describe('buildPortalNavItems — Trust page (/security/trust-page) (Trust Center W3d)', () => {
+  const hrefs = (b: Parameters<typeof buildPortalNavItems>[0]) => buildPortalNavItems(b).map((i) => i.href);
+
+  it('appears only when canEditTrustPage is strictly true', () => {
+    expect(hrefs({ enableSecurity: true })).not.toContain('/security/trust-page');
+    expect(hrefs({ enableSecurity: true, canEditTrustPage: false })).not.toContain('/security/trust-page');
+    expect(buildPortalNavItems({ canEditTrustPage: true }).find((i) => i.href === '/security/trust-page'))
+      .toEqual({ href: '/security/trust-page', label: 'Trust page' });
+  });
+
+  it('sits directly under Security when Security is on', () => {
+    const list = hrefs({ enableSecurity: true, canEditTrustPage: true });
+    expect(list.indexOf('/security/trust-page')).toBe(list.indexOf('/security') + 1);
+  });
+
+  it('does not depend on the Security flag (its own permission)', () => {
+    expect(hrefs({ enableSecurity: false, canEditTrustPage: true })).toContain('/security/trust-page');
   });
 });

@@ -33,8 +33,8 @@ export interface ApprovalRequest {
   riskSummary: string;
   /**
    * Customer tenant (M365) this action targets, e.g. "Example Dental".
-   * Server-derived for M365 mutation approvals (m365_reset_password /
-   * m365_disable_user) by resolving the linked AI session's Delegant M365
+   * Server-derived for M365 mutation approvals (m365_reset_password,
+   * m365_disable_user and the other M365 identity write tools) by resolving the linked AI session's Delegant M365
    * connection. Null for all other approvals. Surfaced prominently on the
    * card so a technician sees the blast radius before deciding.
    *
@@ -44,6 +44,14 @@ export interface ApprovalRequest {
    * instead. Do not wire operator_plan into the M365 mutation tool set.
    */
   customerTenant: string | null;
+  /**
+   * The action intent this row decides (server `serialize`, `intentId`), or
+   * null for an intent-less row. Wisp W06: a concern names its approval card
+   * by INTENT id, and an intent fans out to one approval row per approver, so
+   * the thread screen maps intent → this user's row before focusing it.
+   * Optional: absent from older servers.
+   */
+  intentId?: string | null;
   status: ApprovalStatus;
   expiresAt: string;
   decidedAt: string | null;

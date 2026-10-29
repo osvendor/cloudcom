@@ -40,6 +40,14 @@ describe('normalizeProvider — provider mapping (#2018, #7551)', () => {
     expect(normalizeProvider(raw)).toBe(expected);
   });
 
+  // CylancePROTECT, rebranded Aurora Endpoint Defense (#9178).
+  it.each([
+    ['cylance', 'cylance'],
+    ['Cylance', 'cylance']
+  ])('maps %s to %s (#9178)', (raw, expected) => {
+    expect(normalizeProvider(raw)).toBe(expected);
+  });
+
   it('still normalizes known providers and unknowns', () => {
     expect(normalizeProvider('crowdstrike')).toBe('crowdstrike');
     expect(normalizeProvider('acme-shield')).toBe('other');
@@ -63,7 +71,13 @@ describe('normalizeProvider — provider mapping (#2018, #7551)', () => {
   });
 
   it('every ingest provider value is in the catalog, the DB enum and the report labels (#7551)', () => {
-    const dbEnum = securityProviderEnum.enumValues as readonly string[];
+    // 'breeze' (#6263 W02) is Breeze's own scanner, assigned at security_scan
+    // ingest. It is deliberately NOT an AV status-ingest value, so it is in the
+    // DB enum and catalog but not in securityProviderValues.
+    const dbEnum = (securityProviderEnum.enumValues as readonly string[]).filter((v) => v !== 'breeze');
+    expect((securityProviderEnum.enumValues as readonly string[])).toContain('breeze');
+    expect(providerCatalog.breeze).toEqual({ id: 'breeze', name: 'Breeze IOC scan', vendor: 'Breeze' });
+    expect(securityProviderValues).not.toContain('breeze');
     expect([...securityProviderValues]).toEqual([...dbEnum]);
     for (const value of securityProviderValues) {
       // Every value the agent ingest can store must render in the dashboard...
@@ -75,6 +89,15 @@ describe('normalizeProvider — provider mapping (#2018, #7551)', () => {
         expect(prettySecurityProvider(value)).not.toBe(value);
       }
     }
-    expect(securityProviderValues).toEqual(expect.arrayContaining(['emsisoft', 'webroot', 'withsecure']));
+    expect(securityProviderValues).toEqual(expect.arrayContaining(['emsisoft', 'webroot', 'withsecure', 'cylance']));
+  });
+
+  it('labels Cylance with its Aurora rebrand and the old name (#9178)', () => {
+    expect(providerCatalog.cylance).toEqual({
+      id: 'cylance',
+      name: 'Aurora Endpoint Defense (CylancePROTECT)',
+      vendor: 'Arctic Wolf'
+    });
+    expect(prettySecurityProvider('cylance')).toBe('Aurora Endpoint Defense (CylancePROTECT)');
   });
 });

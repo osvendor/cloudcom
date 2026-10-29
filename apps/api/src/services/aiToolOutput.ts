@@ -1,6 +1,6 @@
 import { redactLogFields, redactLogMessage, redactToolOutputFields } from './logRedaction';
 import { scrubErrorFieldsDeep } from './aiToolErrors';
-import { sanitizeUntrustedText } from './aiInputSanitizer';
+import { sanitizeUntrustedToolStdout, sanitizeUntrustedToolText, sanitizeUntrustedToolValue } from './aiInputSanitizer';
 import { BARE_SECRET_PATTERNS } from './redactionPatterns';
 
 // Re-exported for existing importers; the rule set lives in ./redactionPatterns.
@@ -969,7 +969,7 @@ function asCaptureEnvelope(value: unknown): { artifact: Record<string, unknown>;
  * `aiToolOutput.ts` is the one chokepoint every `aiTools*.ts` result passes
  * through on its way into chat/act-mode context (see the error-scrub comment
  * above), so registering a tool's raw-text field names here is enough — the
- * tool handler itself does not need its own `sanitizeUntrustedText` call.
+ * tool handler itself does not need its own `sanitizeUntrustedToolText` call.
  *
  * Field NAME match, not a full JSON path: these results are homogeneous
  * arrays of rows (log lines, incidents) where the same raw-text key recurs
@@ -997,6 +997,66 @@ export const RAW_TEXT_FIELDS_BY_TOOL: Readonly<Record<string, ReadonlySet<string
   // Ticket subject/description can originate from an external requester
   // (portal or inbound email), not only from a technician.
   manage_tickets: new Set(['subject', 'description']),
+  // Full-control W06 (#6776). The inbound-email review queue holds mail the router could not
+  // place: sender, recipient, subject and parse error are all attacker-authored. Attachment
+  // filenames come from the uploader (or a run artifact name) and `text` is decoded file
+  // content. Time suggestions echo a ticket subject (requester-authored) and a device hostname
+  // (self-reported at enrollment).
+  manage_ticket_inbox: new Set(['subject', 'fromAddress', 'toAddress', 'error']),
+  manage_ticket_attachments: new Set(['originalFilename', 'text']),
+  manage_time_suggestions: new Set(['subject', 'hostname']),
+  // Full-control W07 (#6777). Alert title/message come from a rule match against endpoint-reported
+  // data; the RCA evidence timeline carries event-log text (`title`, `summary`, `message`) and
+  // metadata authored on the endpoint; a group's `rootCause`/`alerts` echo alert titles.
+  get_alert_correlations: new Set(['title', 'message', 'summary', 'label']),
+  // Reliability offender labels are service, hardware-source and process names reported by the
+  // device (`get_fleet_health` also returns them under `offenders`).
+  get_fleet_health: new Set(['label', 'detail']),
+  // Anomaly rows carry metric names and free-form baseline/evidence JSON from the agent's collectors.
+  manage_device_anomalies: new Set(['metricName', 'evidence', 'baselineSummary']),
+  // Full-control W08 (#6778). Node labels, roles, vendor / model / OS strings and frontier labels are collected
+  // from the network (LLDP / CDP / SNMP / controller strings) or typed by an operator; manual notes and
+  // template / policy / target names are operator-authored. They pass sanitizeTopologyAiText where projected and
+  // are fenced here as data, never instructions.
+  get_topology_graph: new Set(['label', 'role', 'vendor', 'model', 'os', 'type']),
+  manage_topology_manual: new Set(['label', 'notes']),
+  manage_topology_monitoring: new Set(['label', 'hostname', 'host', 'provider', 'independenceLabel']),
+  manage_topology_templates: new Set(['name', 'description', 'label', 'hostname', 'host']),
+  // Full-control W09 (#6779). Template / OID names and descriptions, known-guest labels and notes are
+  // operator-authored; UniFi console / site / device / client names, SSIDs, hostnames and error strings come from
+  // the vendor or the network. All are fenced as data, never instructions.
+  manage_snmp_templates: new Set(['name', 'description', 'vendor', 'deviceClass', 'label', 'unit', 'templateName']),
+  get_snmp_metrics: new Set(['name', 'deviceName']),
+  manage_known_guests: new Set(['label', 'notes']),
+  get_unifi_status: new Set(['accountLabel', 'name', 'hostname', 'ssid', 'unifiHostName', 'unifiSiteName', 'lastPollError', 'lastSyncError', 'error', 'model']),
+  probe_network_asset: new Set(['error']),
+  // Full-control W10 (#6780). Operator-task objectives / hand-offs / step and event text are written by humans and other agent
+  // runs; plan renderings and labels name provider accounts; the Fleet Design markdown is model-generated from device-reported
+  // data; origin labels are session titles or agent names. All are fenced as data, never instructions (quorum QW4).
+  get_device_ai_activity: new Set(['label']),
+  list_operator_tasks: new Set(['objective', 'label', 'name', 'outcomeDetail', 'handoffSummary']),
+  get_operator_task: new Set([
+    'objective', 'label', 'name', 'outcomeDetail', 'handoffSummary', 'targetLabel', 'principalLabel',
+    'expectedCriterion', 'detail', 'rendering', 'resolvedModel',
+  ]),
+  get_fleet_design: new Set(['markdown', 'agentName', 'siteName', 'unavailable']),
+  // Full-control W11 (#6781, quorum QW10): every free-text field the security policy tools return, nested included.
+  // Device-reported (hostnames, local admin usernames, password-policy rule text, encryption volume labels, audit
+  // deviations), staff-authored (policy, review, rule and signer-group names, descriptions, notes, exclusions,
+  // match patterns) or identity data (member names and emails): data for the model, never instructions.
+  get_security_compliance: new Set([
+    'deviceName', 'username', 'rule', 'drive', 'method', 'status', 'providerVersion', 'definitionsVersion', 'name', 'title',
+  ]),
+  manage_security_recommendations: new Set(['title', 'description']),
+  manage_access_reviews: new Set(['name', 'description', 'notes', 'userName', 'userEmail', 'reviewerName', 'roleName']),
+  manage_audit_baselines: new Set(['name', 'baselineName', 'hostname', 'setting', 'actual', 'reason']),
+  manage_security_policies: new Set(['name', 'description', 'providerId', 'exclusions']),
+  manage_compliance_policies: new Set(['name']),
+  manage_recovery_keys: new Set(['hostname', 'volumeMount', 'protectorId', 'keyType']),
+  manage_pam_rules: new Set([
+    'name', 'description', 'matchSigner', 'matchPathGlob', 'matchParentImage', 'matchCommandLine', 'matchUser',
+    'matchAdGroup', 'matchToolName', 'subjectCn', 'signers',
+  ]),
   // Alert title/message originate from a rule match against endpoint-
   // reported data — the same field this tool's task-prompt sibling
   // (runnerPrompt.ts) already sanitizes when it inlines them directly.
@@ -1018,34 +1078,176 @@ export const RAW_TEXT_FIELDS_BY_TOOL: Readonly<Record<string, ReadonlySet<string
   // names come straight off the endpoint and are writable by local users.
   diagnostic_read_file: new Set(['content']),
   diagnostic_list_directory: new Set(['name', 'path']),
+  // ── Device command output (#8852 W04) ──────────────────────────────────
+  // These tools return the agent's CommandResult verbatim. `stdout` is either
+  // raw command output or the JSON-encoded payload of a structured command
+  // (file_read `content`, registry `data`, event-log `message`, process
+  // `commandLine`, service/task descriptions, directory entry names), all
+  // authored on the endpoint and read by a root/LocalSystem agent: every
+  // string in it is fenced (see fenceEncodedStdout). `stderr`/`error` carry
+  // OS and agent error text, which echoes device-chosen names.
+  file_operations: new Set(['stdout', 'stderr', 'error']),
+  execute_command: new Set(['stdout', 'stderr', 'error']),
+  registry_operations: new Set(['stdout', 'stderr', 'error']),
+  manage_processes: new Set(['stdout', 'stderr', 'error']),
+  manage_services: new Set(['stdout', 'stderr', 'error']),
+  manage_scheduled_tasks: new Set(['stdout', 'stderr', 'error']),
+  network_discovery: new Set(['stdout', 'stderr', 'error']),
+  // security_scan's live actions are command results; its `vulnerabilities`
+  // action reads stored detections whose names/paths the endpoint chose.
+  security_scan: new Set(['stdout', 'stderr', 'error', 'threatName', 'threatType', 'filePath', 'processName', 'details']),
+  // ── Script output (#8852 W04) ──────────────────────────────────────────
+  // Raw script stdout/stderr per device, live (run_script) or stored.
+  run_script: new Set(['stdout', 'stderr', 'error']),
+  get_script_execution: new Set(['stdout', 'stderr', 'errorMessage']),
+  get_script_execution_history: new Set(['stdout', 'stderr', 'errorMessage']),
+  // A captured large result is read back window by window: without this the
+  // artifact handle would be an unfenced route to the same device bytes.
+  read_artifact: new Set(['text']),
+  // ── Other device-reported text (#8852 W04) ─────────────────────────────
+  // Every remaining tool in a command-dispatching aiTools*.ts file that
+  // returns endpoint-authored strings (paths, names, OS error text, raw OS
+  // tool output). aiTools.deviceTextFence.contract.test.ts classifies every
+  // tool in those files as fenced here or exempt with a reason.
+  analyze_disk_usage: new Set(['scanPath', 'path', 'paths', 'owner', 'key', 'error']),
+  disk_cleanup: new Set(['scanPath', 'path', 'failedChildren', 'rejectedPaths', 'error']),
+  // outputTail is up to 64 KB of raw DISM/brew/journalctl output.
+  system_cleanup: new Set(['outputTail', 'error', 'mount', 'label', 'description', 'estimateDetail', 'unavailableReason']),
+  get_sensitive_data_overview: new Set(['filePath', 'path', 'error']),
+  remediate_sensitive_data: new Set(['filePath', 'error']),
+  get_security_posture: new Set(['evidence']),
+  analyze_boot_performance: new Set(['name', 'itemId', 'path']),
+  manage_startup_items: new Set(['name', 'itemId', 'path', 'error']),
+  get_active_users: new Set(['username']),
+  get_user_experience_metrics: new Set(['username']),
+  capture_agent_pprof: new Set(['error']),
+  set_agent_log_level: new Set(['error', 'warning']),
+  trigger_agent_upgrade: new Set(['errors']),
+  trigger_agent_restart: new Set(['errors']),
+  take_screenshot: new Set(['error']),
+  analyze_screen: new Set(['error']),
+  computer_control: new Set(['error', 'screenshotError']),
+  // Host- and network-reported names an attacker on the endpoint or the LAN
+  // chooses: Hyper-V VM names/notes, SQL instance/database names, SNMP
+  // sysName/model strings, interface names.
+  query_hyperv_vms: new Set(['vmName', 'name']),
+  get_hyperv_vm_details: new Set(['vmName', 'notes', 'path', 'name']),
+  manage_hyperv_vm: new Set(['vmName']),
+  manage_hyperv_checkpoints: new Set(['vmName']),
+  trigger_hyperv_backup: new Set(['vmName']),
+  query_mssql_instances: new Set(['instanceName', 'name', 'version', 'edition']),
+  get_mssql_backup_status: new Set(['database', 'label', 'metadata']),
+  browse_snapshots: new Set(['label', 'metadata']),
+  restore_snapshot: new Set(['selectedPaths']),
+  trigger_backup: new Set(['errorLog']),
+  list_network_assets: new Set(['hostname', 'label', 'manufacturer', 'model']),
+  get_network_asset: new Set(['hostname', 'label', 'manufacturer', 'model']),
+  get_ip_history: new Set(['hostname', 'interfaceName']),
+  get_network_changes: new Set(['hostname', 'notes']),
+  get_network_asset_reachability: new Set(['name']),
+  // Evidence collect_evidence/execute_containment brought back from the
+  // device: evidence descriptions and metadata, raw action results.
+  // timeline[].summary repeats the evidence/action description verbatim
+  // (routes/incidentActions.ts writes summary: description).
+  get_incident_timeline: new Set(['description', 'metadata', 'result', 'summary']),
+  generate_incident_report: new Set(['description', 'metadata', 'summary']),
+  // Extension names/versions are self-reported by the browser profile; a
+  // sideloaded extension's name is whatever its author chose.
+  get_browser_security: new Set(['name', 'version', 'extensionId', 'details']),
+  // Per-device install history: the installer's/OS's own error text.
+  manage_patches: new Set(['errorMessage']),
+  // #9532: the affected software's name/version/vendor come from the agent's
+  // software inventory (an installer's DisplayName, settable by a local
+  // user). Every string under `software` is fenced; CVE ids, scores and
+  // Breeze-authored skip reasons stay verbatim.
+  get_device_vulnerabilities: new Set(['software']),
+  remediate_vulnerability: new Set(['software']),
 } as const;
 
 /**
  * Recursively neutralizes injection-shaped text (control-char smuggling,
  * role-impersonation, override phrases, chatml/XML instruction-boundary
- * imitation) in every field named in `fieldNames`, wherever it appears in
- * `value`. Values are replaced in place with `sanitizeUntrustedText`'s
- * output; everything else — including sibling fields — is left untouched.
+ * imitation, forged `<untrusted_data>` markers) under every field named in
+ * `fieldNames`, wherever it appears in `value`. Every string beneath a matched
+ * key is fenced — a REG_MULTI_SZ array or a jsonb `details` object as much as
+ * a plain string. Everything else, including sibling fields, is untouched.
+ *
+ * `stdout` is an encoding layer, not just a field: an `aiExecuteCommand` tool
+ * returns the agent's CommandResult verbatim, and the Go agent JSON-marshals
+ * a structured command's payload (file_read, registry values, event logs,
+ * process lists) into that string, HTML-escaping `<`/`>`/`&` as it goes. A
+ * regex over the still-encoded string would miss `\u003csystem\u003e`, and a
+ * field-name match would never see the `content`/`data` inside it. So a JSON
+ * `stdout` is decoded, fenced, and re-encoded — only when something changed,
+ * so a clean result (and its `stdoutChars`) stays byte-identical — before
+ * `compactCommandStylePayload` decodes it again for the model.
  */
-function fenceRawTextFields(value: unknown, fieldNames: ReadonlySet<string>): unknown {
+function fenceRawTextFields(value: unknown, fieldNames: ReadonlySet<string>, flags: string[]): unknown {
   if (Array.isArray(value)) {
-    return value.map((entry) => fenceRawTextFields(entry, fieldNames));
+    return value.map((entry) => fenceRawTextFields(entry, fieldNames, flags));
   }
   if (isRecord(value)) {
     const out: Record<string, unknown> = {};
     for (const [key, v] of Object.entries(value)) {
-      out[key] = fieldNames.has(key) && typeof v === 'string' && v.length > 0
-        ? sanitizeUntrustedText(v)
-        : fenceRawTextFields(v, fieldNames);
+      if (key === 'stdout' && typeof v === 'string') {
+        out[key] = fenceEncodedStdout(v, fieldNames, flags);
+      } else if (fieldNames.has(key)) {
+        out[key] = sanitizeUntrustedToolValue(v, flags);
+      } else {
+        out[key] = fenceRawTextFields(v, fieldNames, flags);
+      }
     }
     return out;
   }
   return value;
 }
 
+function fenceEncodedStdout(stdout: string, fieldNames: ReadonlySet<string>, flags: string[]): string {
+  // The whole stdout is device output: decode, fence every string, re-encode.
+  if (fieldNames.has('stdout')) return sanitizeUntrustedToolStdout(stdout, flags);
+  // Otherwise only the registered field names inside a JSON stdout are device
+  // text; raw stdout of an unregistered-stdout tool is left alone.
+  const decoded = tryParseJson(stdout);
+  if (decoded === null || typeof decoded !== 'object') return stdout;
+  const fenced = fenceRawTextFields(decoded, fieldNames, flags);
+  const reencoded = JSON.stringify(fenced);
+  return reencoded === JSON.stringify(decoded) ? stdout : reencoded;
+}
+
+/**
+ * The capture envelope's `head`/`tail` previews are the first and last bytes
+ * of the raw (redacted) result — for a registered tool, device bytes the inner
+ * `compacted` fence never sees. Fenced as text; the handle, sizes and content
+ * type (Breeze-generated, the model's route back to the bytes) stay verbatim.
+ */
+function fenceArtifactPreviews(toolName: string, artifact: Record<string, unknown>): Record<string, unknown> {
+  if (!RAW_TEXT_FIELDS_BY_TOOL[toolName]) return artifact;
+  const flags: string[] = [];
+  const out: Record<string, unknown> = { ...artifact };
+  for (const key of ['head', 'tail'] as const) {
+    const preview = artifact[key];
+    if (typeof preview === 'string' && preview.length > 0) out[key] = sanitizeUntrustedToolText(preview, flags);
+  }
+  logFenceFlags(toolName, flags);
+  return out;
+}
+
+function logFenceFlags(toolName: string, flags: readonly string[]): void {
+  // NBSP and soft hyphens are common in benign files; a lone dangerous_unicode
+  // strip is not a signal worth a log line per call.
+  if (!flags.some((flag) => flag !== 'dangerous_unicode')) return;
+  // Flag names and the tool only — never the text: it is attacker-authored
+  // and may carry secrets the redactor has not reached yet.
+  console.warn('[AI] Untrusted tool-output fence flags:', flags.join(','), 'tool:', toolName);
+}
+
 function fenceRegisteredRawTextFields(toolName: string, value: unknown): unknown {
   const fieldNames = RAW_TEXT_FIELDS_BY_TOOL[toolName];
-  return fieldNames ? fenceRawTextFields(value, fieldNames) : value;
+  if (!fieldNames) return value;
+  const flags: string[] = [];
+  const fenced = fenceRawTextFields(value, fieldNames, flags);
+  logFenceFlags(toolName, flags);
+  return fenced;
 }
 
 export function compactToolResultForChat(
@@ -1066,7 +1268,7 @@ export function compactToolResultForChat(
     const artifactJson = JSON.stringify({ artifact: envelope.artifact, compacted: '' });
     const innerBudget = Math.max(512, maxChars - artifactJson.length - 8);
     const inner = compactToolResultForChat(toolName, envelope.compacted, innerBudget);
-    return safeStringify({ artifact: envelope.artifact, compacted: tryParseJson(inner) ?? inner });
+    return safeStringify({ artifact: fenceArtifactPreviews(toolName, envelope.artifact), compacted: tryParseJson(inner) ?? inner });
   }
 
   if (parsed === null) {
@@ -1107,7 +1309,7 @@ export function compactToolResultForChat(
   // vendor-sourced content before it is measured/compacted. Same chokepoint
   // rationale as the error scrub above: this runs once here instead of
   // requiring every tool handler that returns one of these fields to
-  // remember to call `sanitizeUntrustedText` itself.
+  // remember to call `sanitizeUntrustedToolText` itself.
   const untrustedFenced = fenceRegisteredRawTextFields(toolName, errorScrubbed);
 
   const minimized = sanitizeToolPayloadValue(toolName, untrustedFenced, stats);

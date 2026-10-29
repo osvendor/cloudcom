@@ -138,6 +138,7 @@ function buildApp(opts: { skipAuth?: boolean } = {}): Hono {
   if (!opts.skipAuth) {
     app.use('/agents/*', async (c, next) => {
       c.set('agent', {
+        installIncarnation: 1,
         deviceId: 'device-1',
         orgId: 'org-1',
         partnerId: 'partner-1',
@@ -433,7 +434,7 @@ describe('agent elevation-requests ingestion route', () => {
     expect(body).toEqual({ id: null, status: 'ignored' });
     expect(values).not.toHaveBeenCalled();
     expect(bridgeMocks.resolveElevationApprovers).not.toHaveBeenCalled();
-    expect(pamConfigMocks.buildPamConfigUpdate).toHaveBeenCalledWith('device-1');
+    expect(pamConfigMocks.buildPamConfigUpdate).toHaveBeenCalledWith('device-1', { orgId: 'org-1' });
   });
 
   it('proceeds with normal decisioning when PAM/UAC interception is enabled', async () => {
@@ -1223,6 +1224,7 @@ describe('elevation-requests ingest #1105 context discipline (#6130)', () => {
       // cast is the point of the test: prove the handler refuses rather than
       // building a vacuous RLS context that reads as a 404.
       (c as unknown as { set: (k: string, v: unknown) => void }).set('agent', {
+        installIncarnation: 1,
         deviceId: 'device-1',
         agentId: 'agent-123',
         role: 'agent',

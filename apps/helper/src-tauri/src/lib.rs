@@ -1,5 +1,6 @@
 mod app_shell;
 mod ipc;
+mod requirements;
 mod single_instance;
 mod workspace_open;
 
@@ -885,6 +886,175 @@ fn message_close(
     Ok(())
 }
 
+/// What the endpoint live chat window in this window should render. Only the
+/// window labelled `chat-<conversation_id>` may read it (#8743).
+#[tauri::command]
+fn get_chat_view(
+    window: tauri::WebviewWindow,
+    bridge: tauri::State<'_, std::sync::Arc<crate::ipc::chat::ChatBridge>>,
+    conversation_id: String,
+) -> Result<crate::ipc::chat::ChatView, String> {
+    if !crate::ipc::chat::label_matches(window.label(), &conversation_id) {
+        return Err("wrong window".into());
+    }
+    bridge.view(&conversation_id).ok_or_else(|| "chat unavailable".into())
+}
+
+/// The `chat_send_reply` result: the nonce the reply travels under.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatReplyAck {
+    client_nonce: String,
+}
+
+/// The user sent a reply. Rust validates (conversation open, replies allowed,
+/// trimmed 1..=2000 chars), generates a fresh nonce, records the reply as
+/// pending and sends `chat_reply`; the status settles on `chat_reply_result`.
+/// `client_nonce` re-sends a failed reply under its ORIGINAL nonce.
+#[tauri::command]
+fn chat_send_reply(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    bridge: tauri::State<'_, std::sync::Arc<crate::ipc::chat::ChatBridge>>,
+    conversation_id: String,
+    body: String,
+    client_nonce: Option<String>,
+) -> Result<ChatReplyAck, String> {
+    if !crate::ipc::chat::label_matches(window.label(), &conversation_id) {
+        return Err("wrong window".into());
+    }
+    let nonce = bridge
+        .send_reply(&conversation_id, &body, client_nonce.as_deref())
+        .inspect_err(|e| eprintln!("[helper] chat_send_reply refused: {e}"))?;
+    if let Some(view) = bridge.view(&conversation_id) {
+        crate::ipc::desktop::emit_chat_update(&app, &view);
+    }
+    Ok(ChatReplyAck { client_nonce: nonce })
+}
+
+/// The chat window was looked at (focused / became visible): clear its unread
+/// badge. Local only; nothing is sent to the agent.
+#[tauri::command]
+fn chat_mark_read(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    bridge: tauri::State<'_, std::sync::Arc<crate::ipc::chat::ChatBridge>>,
+    conversation_id: String,
+) -> Result<(), String> {
+    if !crate::ipc::chat::label_matches(window.label(), &conversation_id) {
+        return Err("wrong window".into());
+    }
+    if bridge.tracker().mark_read(&conversation_id) {
+        refresh_chat_tray(&app);
+    }
+    Ok(())
+}
+
+/// What the prompt card in this window should render (#10190). Only the window
+/// labelled `prompt-<hash of prompt_id>` may read it.
+#[tauri::command]
+fn get_prompt_view(
+    window: tauri::WebviewWindow,
+    bridge: tauri::State<'_, std::sync::Arc<crate::ipc::prompt::PromptBridge>>,
+    prompt_id: String,
+) -> Result<crate::ipc::prompt::PromptView, String> {
+    if !crate::ipc::prompt::label_matches(window.label(), &prompt_id) {
+        return Err("wrong window".into());
+    }
+    let now = crate::ipc::client::now_unix_ms();
+    let view = bridge.tracker().view(&prompt_id, now);
+    view.ok_or_else(|| "prompt unavailable".into())
+}
+
+/// The person chose an action on the card (click or keyboard). At most one
+/// action is in flight per prompt; an Err (no live session, already sending)
+/// is shown on the card, which stays up so the person can retry.
+#[tauri::command]
+fn prompt_card_action(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    bridge: tauri::State<'_, std::sync::Arc<crate::ipc::prompt::PromptBridge>>,
+    prompt_id: String,
+    action_id: String,
+    via: String,
+) -> Result<(), String> {
+    if !crate::ipc::prompt::label_matches(window.label(), &prompt_id) {
+        return Err("wrong window".into());
+    }
+    // A card can only be clicked or keyed; "list" belongs to the main window.
+    let via = match via.as_str() {
+        "click" => crate::ipc::prompt::ActionVia::Click,
+        "keyboard" => crate::ipc::prompt::ActionVia::Keyboard,
+        _ => return Err("invalid via".into()),
+    };
+    let sent = bridge.act(crate::ipc::client::now_unix_ms(), &prompt_id, &action_id, via);
+    crate::ipc::desktop::publish_prompt_state(&app, Some(&prompt_id));
+    sent
+}
+
+/// Esc / the card's hide control: the safe action on a pending decision (the
+/// card stays up), otherwise hide the card (`prompt_closed{hidden}`); the list
+/// entry stays either way. Hiding is never a domain action. `via` is how the
+/// person did it (`keyboard` for Esc, `click` otherwise).
+#[tauri::command]
+fn prompt_card_hide(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    bridge: tauri::State<'_, std::sync::Arc<crate::ipc::prompt::PromptBridge>>,
+    prompt_id: String,
+    via: String,
+) -> Result<(), String> {
+    if !crate::ipc::prompt::label_matches(window.label(), &prompt_id) {
+        return Err("wrong window".into());
+    }
+    let via = match via.as_str() {
+        "click" => crate::ipc::prompt::ActionVia::Click,
+        "keyboard" => crate::ipc::prompt::ActionVia::Keyboard,
+        _ => return Err("invalid via".into()),
+    };
+    let effect = bridge.dismiss(crate::ipc::client::now_unix_ms(), &prompt_id, via);
+    if let Ok(crate::ipc::prompt::DismissEffect::Hidden | crate::ipc::prompt::DismissEffect::Nothing) = effect {
+        if let Err(e) = window.destroy() {
+            eprintln!("[helper] prompt card could not be closed (promptId={prompt_id}): {e}");
+            return Err("This notification could not be closed. Try again.".into());
+        }
+    }
+    crate::ipc::desktop::publish_prompt_state(&app, Some(&prompt_id));
+    effect.map(|_| ())
+}
+
+/// The notification list for the main window's Notifications tab (#10190).
+#[tauri::command]
+fn get_prompt_list(
+    window: tauri::WebviewWindow,
+    bridge: tauri::State<'_, std::sync::Arc<crate::ipc::prompt::PromptBridge>>,
+) -> Result<crate::ipc::prompt::PromptListView, String> {
+    crate::ipc::message::deny_message_window(window.label())?;
+    let now = crate::ipc::client::now_unix_ms();
+    let list = bridge.tracker().list_view(now);
+    Ok(list)
+}
+
+/// An action chosen from the Notifications tab (`via: list`).
+#[tauri::command]
+fn prompt_list_action(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    bridge: tauri::State<'_, std::sync::Arc<crate::ipc::prompt::PromptBridge>>,
+    prompt_id: String,
+    action_id: String,
+) -> Result<(), String> {
+    crate::ipc::message::deny_message_window(window.label())?;
+    let sent = bridge.act(
+        crate::ipc::client::now_unix_ms(),
+        &prompt_id,
+        &action_id,
+        crate::ipc::prompt::ActionVia::List,
+    );
+    crate::ipc::desktop::publish_prompt_state(&app, Some(&prompt_id));
+    sent
+}
+
 /// Submit the local user's choice (`<one of the 3 numbers>` | `not_me` |
 /// `timeout`). Single-use; the Rust side enforces the deadline. Closes the
 /// window on success.
@@ -935,13 +1105,18 @@ async fn read_agent_config(window: tauri::WebviewWindow) -> Result<AgentConfig, 
         api_url: state.config.api_url.clone(),
         agent_id: state.config.agent_id.clone(),
         has_mtls: state.config.mtls_cert_pem.is_some() && state.config.mtls_key_pem.is_some(),
-        os_username: get_os_username(),
+        os_username: os_username(),
         helper_version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
 
 #[tauri::command]
-fn get_os_username() -> String {
+fn get_os_username(window: tauri::WebviewWindow) -> Result<String, String> {
+    crate::ipc::message::deny_message_window(window.label())?;
+    Ok(os_username())
+}
+
+fn os_username() -> String {
     // When running as SYSTEM (spawned by agent service), whoami returns "SYSTEM".
     // Fall back to the USERNAME environment variable which is set to the
     // logged-in user's name even for SYSTEM processes in user sessions.
@@ -961,8 +1136,9 @@ fn get_os_username() -> String {
 }
 
 #[tauri::command]
-fn get_helper_config() -> HelperConfig {
-    load_helper_config()
+fn get_helper_config(window: tauri::WebviewWindow) -> Result<HelperConfig, String> {
+    crate::ipc::message::deny_message_window(window.label())?;
+    Ok(load_helper_config())
 }
 
 /// Restart the IPC client if it stopped (it gives up after a permanent broker
@@ -1447,11 +1623,96 @@ fn tray_menu_label(id: &str) -> &'static str {
     }
 }
 
+/// The tray's endpoint-chat entry (#8743): present while a conversation is
+/// open or unread; "(N)" is the unread count. This and the tooltip are the
+/// badge -- an incoming technician message after the first never raises a window.
+fn chat_menu_label(summary: &crate::ipc::chat::TraySummary) -> Option<String> {
+    summary.target.as_ref()?;
+    Some(if summary.total_unread > 0 {
+        format!("Open chat ({})", summary.total_unread)
+    } else {
+        "Open chat".to_string()
+    })
+}
+
+fn chat_tooltip(summary: &crate::ipc::chat::TraySummary) -> String {
+    let base = format!("Breeze Helper v{}", env!("CARGO_PKG_VERSION"));
+    match summary.total_unread {
+        0 => base,
+        1 => format!("{base} - 1 unread chat message"),
+        n => format!("{base} - {n} unread chat messages"),
+    }
+}
+
+fn chat_summary(app: &AppHandle) -> crate::ipc::chat::TraySummary {
+    app.try_state::<std::sync::Arc<crate::ipc::chat::ChatBridge>>()
+        .map(|b| b.tracker().summary())
+        .unwrap_or_default()
+}
+
+/// Re-render the tray tooltip and menu from the chat state. Called whenever
+/// unread changes; never shows a window.
+pub(crate) fn refresh_chat_tray(app: &AppHandle) {
+    let summary = chat_summary(app);
+    let Some(tray) = app.tray_by_id("main") else { return };
+    let _ = tray.set_tooltip(Some(&chat_tooltip(&summary)));
+    refresh_tray_menu(app);
+}
+
+/// The tray's Notifications entry (#10190): hidden while the list is empty;
+/// "(N)" is the number of entries. Windows 11 hides most tray icons in the
+/// overflow, so the on-screen card, not this entry, is what people rely on.
+fn notifications_menu_label(count: usize) -> Option<String> {
+    (count > 0).then(|| format!("Notifications ({count})"))
+}
+
+fn prompt_list_len(app: &AppHandle) -> usize {
+    let now = crate::ipc::client::now_unix_ms();
+    app.try_state::<std::sync::Arc<crate::ipc::prompt::PromptBridge>>()
+        .map(|b| b.tracker().list_len(now))
+        .unwrap_or(0)
+}
+
+/// Re-render the tray menu (the Notifications entry follows the prompt list).
+/// Never shows a window.
+pub(crate) fn refresh_tray_menu(app: &AppHandle) {
+    let Some(tray) = app.tray_by_id("main") else { return };
+    match build_tray_menu(app, &load_helper_config()) {
+        Ok(menu) => {
+            if let Err(e) = tray.set_menu(Some(menu)) {
+                eprintln!("[helper] Failed to update tray menu: {}", e);
+            }
+        }
+        Err(e) => eprintln!("[helper] Failed to rebuild tray menu: {}", e),
+    }
+}
+
+/// Tray "Open chat": the user's own action, so it may raise the window.
+fn open_chat_from_tray(app: &AppHandle) {
+    let Some(bridge) = app.try_state::<std::sync::Arc<crate::ipc::chat::ChatBridge>>() else {
+        return;
+    };
+    let target = bridge.tracker().summary().target;
+    if let Some(id) = target {
+        if let Err(e) = crate::ipc::desktop::show_chat_window(app, &id, true) {
+            eprintln!("[helper] chat window could not be opened: {}", e);
+        }
+    }
+}
+
 fn build_tray_menu(
     app: &AppHandle,
     config: &HelperConfig,
 ) -> Result<tauri::menu::Menu<tauri::Wry>, tauri::Error> {
     let mut builder = MenuBuilder::new(app);
+    if let Some(label) = chat_menu_label(&chat_summary(app)) {
+        let item = MenuItemBuilder::with_id("open_chat", label).build(app)?;
+        builder = builder.item(&item);
+    }
+    if let Some(label) = notifications_menu_label(prompt_list_len(app)) {
+        let item = MenuItemBuilder::with_id("notifications", label).build(app)?;
+        builder = builder.item(&item);
+    }
     for id in tray_menu_item_ids(config) {
         let item = MenuItemBuilder::with_id(id, tray_menu_label(id)).build(app)?;
         builder = builder.item(&item);
@@ -1515,6 +1776,14 @@ pub fn run() {
             get_message_view,
             message_ack,
             message_close,
+            get_chat_view,
+            chat_send_reply,
+            chat_mark_read,
+            get_prompt_view,
+            prompt_card_action,
+            prompt_card_hide,
+            get_prompt_list,
+            prompt_list_action,
             workspace_open::open_workspace_path,
         ])
         .setup(move |app| {
@@ -1653,6 +1922,15 @@ pub fn run() {
                 "open_assist" | "request_support" => {
                     show_window(&menu_handle);
                 }
+                // Endpoint live chat (#8743): the user asked for the chat window.
+                "open_chat" => open_chat_from_tray(&menu_handle),
+                // Prompt host (#10190): the user asked for the notification list.
+                "notifications" => {
+                    if let Err(e) = menu_handle.emit("show-notifications", ()) {
+                        eprintln!("[helper] Failed to emit show-notifications: {}", e);
+                    }
+                    show_window(&menu_handle);
+                }
                 // macOS app menu Cmd+Q (#8399): hide, never quit.
                 #[cfg(target_os = "macos")]
                 app_shell::HIDE_WINDOW_MENU_ID => {
@@ -1741,11 +2019,21 @@ pub fn run() {
             let messages =
                 std::sync::Arc::new(crate::ipc::message::MessageBridge::default());
             app.manage(messages.clone());
+            // Endpoint live chat (#8743): conversations in process memory; each
+            // lives in its own `chat-<id>` window, never the main one.
+            let chat = std::sync::Arc::new(crate::ipc::chat::ChatBridge::default());
+            app.manage(chat.clone());
+            // Prompt host (#10190): prompts in process memory only; each card
+            // is its own `prompt-<hash>` window, never the main one.
+            let prompts = std::sync::Arc::new(crate::ipc::prompt::PromptBridge::default());
+            app.manage(prompts.clone());
             let desktop_ctx = crate::ipc::client::DesktopCtx {
                 app: app.handle().clone(),
                 bridge,
                 caller_verify,
                 messages,
+                chat,
+                prompts,
             };
             let _ = IPC_DRIVER_CTX.set(IpcDriverCtx {
                 stop: stop_rx,
@@ -2033,36 +2321,243 @@ mod tests {
         assert!(!card.contains("\"main\""));
     }
 
+    // #8138 + prompt host (#10190): a prompt renders in its own `prompt-<hash>`
+    // card window or only in the notification list. Nothing in prompt.rs can
+    // reach the main window; the card is built from exactly one call site (the
+    // `prompt_show` handler); the prompt arms, their handlers, the window
+    // helpers and the card/list commands never show, focus or name `main`.
+    // The only main-window path is the user's own tray click.
+    #[test]
+    fn prompt_rs_never_shows_main_window() {
+        let prod_of = |s: &'static str| s.split("\nmod tests {").next().unwrap();
+        let body_of = |src: &'static str, sig: &str| -> &'static str {
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
+            let end = src[start..].find("\n}\n").map(|i| i + start).unwrap();
+            &src[start..end]
+        };
+        const NO_SURFACING: &[&str] =
+            &["\"main\"", "show_window(", ".show()", "set_focus", "unminimize", "show_chat_window", "show_message_window"];
+
+        let prompt = prod_of(include_str!("ipc/prompt.rs"));
+        for forbidden in NO_SURFACING.iter().chain(&["WebviewWindowBuilder", "get_webview_window", "AppHandle"]) {
+            assert!(!prompt.contains(forbidden), "prompt.rs contains {forbidden}");
+        }
+
+        let client = prod_of(include_str!("ipc/client.rs"));
+        assert_eq!(client.matches("desktop::show_prompt_window").count(), 1);
+        let show = body_of(client, "fn handle_prompt_show(");
+        assert!(show.contains("desktop::show_prompt_window"), "the card is built only by the prompt_show handler");
+        let arms_start = client.find("\"prompt_show\" =>").expect("prompt_show arm");
+        let arms_end = client[arms_start..].find("\"ping\" =>").map(|i| i + arms_start).expect("ping arm");
+        let arms = &client[arms_start..arms_end];
+        for sig in [
+            "fn handle_prompt_show(",
+            "fn handle_prompt_update(",
+            "fn handle_prompt_close(",
+            "fn handle_prompt_action_result(",
+            "fn handle_prompt_branding_sync(",
+            "fn handle_prompt_unknown(",
+            "fn drop_prompt(",
+        ] {
+            let body = body_of(client, sig);
+            for forbidden in NO_SURFACING {
+                assert!(!body.contains(forbidden), "{sig} contains {forbidden}");
+                assert!(!arms.contains(forbidden), "the prompt arms contain {forbidden}");
+            }
+        }
+
+        let desktop = prod_of(include_str!("ipc/desktop.rs"));
+        for sig in [
+            "pub fn show_prompt_window(",
+            "pub fn close_prompt_window(",
+            "pub fn emit_prompt_view(",
+            "pub fn publish_prompt_state(",
+            "pub fn emit_prompt_list(",
+        ] {
+            let body = body_of(desktop, sig);
+            for forbidden in NO_SURFACING {
+                if sig == "pub fn emit_prompt_list(" && *forbidden == "\"main\"" {
+                    // An event to the Notifications tab, never a show.
+                    assert!(body.contains("emit_to(\"main\""));
+                    continue;
+                }
+                assert!(!body.contains(forbidden), "{sig} contains {forbidden}");
+            }
+        }
+        assert!(body_of(desktop, "pub fn show_prompt_window(").contains("WebviewWindowBuilder::new"));
+
+        let lib = prod_of(include_str!("lib.rs"));
+        for sig in [
+            "fn get_prompt_view(",
+            "fn prompt_card_action(",
+            "fn prompt_card_hide(",
+            "fn get_prompt_list(",
+            "fn prompt_list_action(",
+            "pub(crate) fn refresh_tray_menu(",
+        ] {
+            // `tray_by_id("main")` is the tray icon's id, not the window.
+            let body = body_of(lib, sig).replace("tray_by_id(\"main\")", "");
+            for forbidden in NO_SURFACING {
+                assert!(!body.contains(forbidden), "{sig} contains {forbidden}");
+            }
+        }
+        // The tray's Notifications item is the user's own click, and the only
+        // prompt path that opens the main window.
+        assert_eq!(lib.matches("\"notifications\" =>").count(), 1);
+        // Main window still built hidden, and lib.rs builds no card.
+        assert!(lib.contains(".visible(false);"));
+        assert!(!lib.contains("show_prompt_window"));
+    }
+
+    // #10190 review: the hide command reports how the person dismissed the
+    // card and never swallows a failed close; the close box is a click.
+    #[test]
+    fn prompt_hide_paths_report_via_and_failures() {
+        let prod_of = |s: &'static str| s.split("\nmod tests {").next().unwrap();
+        let lib = prod_of(include_str!("lib.rs"));
+        let start = lib.find("fn prompt_card_hide(").expect("prompt_card_hide");
+        let end = lib[start..].find("\n}\n").map(|i| i + start).unwrap();
+        let hide = &lib[start..end];
+        assert!(hide.contains("via: String"), "hide takes the caller's via");
+        assert!(hide.contains("&prompt_id, via)"), "dismiss gets the caller's via, not a hard-coded one");
+        assert!(hide.contains("window.destroy()") && !hide.contains("let _ = window.destroy()"));
+        let desktop = prod_of(include_str!("ipc/desktop.rs"));
+        let start = desktop.find("pub fn show_prompt_window(").unwrap();
+        let end = desktop[start..].find("\n}\n").map(|i| i + start).unwrap();
+        let card = &desktop[start..end];
+        assert!(card.contains("ActionVia::Click") && !card.contains("ActionVia::Keyboard"));
+        assert!(card.contains("eprintln!"), "a refused close box is logged");
+    }
+
+    // #10190: the card capability grants only listening for its own
+    // `prompt-updated` event; the card calls only its label-checked commands.
+    #[test]
+    fn prompt_card_capability_is_minimal() {
+        let cap: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/prompt-card.json")).unwrap();
+        assert_eq!(cap["identifier"], "prompt-card");
+        assert_eq!(cap["windows"], serde_json::json!(["prompt-*"]));
+        let perms: Vec<&str> = cap["permissions"].as_array().unwrap().iter().map(|p| p.as_str().unwrap()).collect();
+        assert_eq!(perms, vec!["core:event:allow-listen", "core:event:allow-unlisten"]);
+        assert!(cap["description"].as_str().unwrap().len() > 40, "justify the permissions");
+        let default: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        for w in default["windows"].as_array().unwrap() {
+            assert!(!w.as_str().unwrap().starts_with("prompt"), "default capability covers {w}");
+        }
+        let gen: serde_json::Value =
+            serde_json::from_str(include_str!("../gen/schemas/capabilities.json")).unwrap();
+        assert_eq!(gen["prompt-card"]["windows"], cap["windows"]);
+        assert_eq!(gen["prompt-card"]["permissions"], cap["permissions"]);
+        // The window label the capability covers is the one the tracker builds.
+        assert!(crate::ipc::prompt::window_label("restart:42").starts_with("prompt-"));
+    }
+
+    #[test]
+    fn tray_notifications_entry_hidden_while_the_list_is_empty() {
+        assert_eq!(notifications_menu_label(0), None);
+        assert_eq!(notifications_menu_label(1).as_deref(), Some("Notifications (1)"));
+        assert_eq!(notifications_menu_label(12).as_deref(), Some("Notifications (12)"));
+        // The static ids are untouched: the entry is added dynamically.
+        assert!(!tray_menu_item_ids(&HelperConfig::default()).contains(&"notifications"));
+        let lib = include_str!("lib.rs").split("\nmod tests {").next().unwrap();
+        let start = lib.find("fn build_tray_menu(").unwrap();
+        let end = lib[start..].find("\n}\n").map(|i| i + start).unwrap();
+        assert!(lib[start..end].contains("notifications_menu_label(prompt_list_len(app))"));
+    }
+
     // #8741: build.rs declares no app-command ACL, so Tauri does not gate app
     // commands per window -- a `message-*` card window (technician-authored
-    // content) could otherwise invoke every command below. Each one refuses a
-    // card caller through the shared `deny_message_window` guard.
+    // content) could otherwise invoke every registered command. The test reads
+    // the `generate_handler![ ... ]` list from source, so a command added there
+    // without the shared `deny_message_window` guard fails here by name unless
+    // it is in the explicit allowlist below.
     #[test]
     fn privileged_commands_refuse_message_card_windows() {
         let prod_of = |s: &'static str| s.split("\nmod tests {").next().unwrap();
         let lib = prod_of(include_str!("lib.rs"));
-        let workspace = prod_of(include_str!("workspace_open.rs"));
-        let guarded: &[(&str, &str)] = &[
-            (lib, "fn helper_fetch("),
-            (lib, "fn read_agent_config("),
-            (lib, "fn submit_consent("),
-            (lib, "fn consent_presented("),
-            (lib, "fn get_consent_request("),
-            (lib, "fn hide_window("),
-            (lib, "fn minimize_window("),
-            (lib, "fn update_chat_active("),
-            (lib, "fn restart_ipc_if_stopped("),
-            (lib, "fn helper_token_ready("),
-            (workspace, "fn open_workspace_path("),
+
+        // Commands a card window (or the other self-labelled windows) must be
+        // able to call. Each does its own exact-label check instead of the
+        // blanket guard; the loop below enforces that.
+        //  - get_message_view / message_ack / message_close: the card itself
+        //    (src/components/MessageCard.tsx), valid only for `message-<id>`.
+        //  - get_caller_verify_request / submit_caller_verify: the caller-verify
+        //    window, valid only for `caller-verify-<id>`, so a card (label
+        //    `message-*`) can never match.
+        let label_checked: &[(&str, &str)] = &[
+            ("get_message_view", "crate::ipc::message::label_matches(window.label()"),
+            ("message_ack", "crate::ipc::message::label_matches(window.label()"),
+            ("message_close", "crate::ipc::message::label_matches(window.label()"),
+            //  - get_chat_view / chat_send_reply / chat_mark_read: the endpoint
+            //    live chat window (src/components/EndpointChat.tsx), valid only
+            //    for `chat-<conversationId>`; a card or any other window never matches.
+            ("get_chat_view", "crate::ipc::chat::label_matches(window.label()"),
+            ("chat_send_reply", "crate::ipc::chat::label_matches(window.label()"),
+            ("chat_mark_read", "crate::ipc::chat::label_matches(window.label()"),
+            //  - get_prompt_view / prompt_card_action / prompt_card_hide: the
+            //    prompt card (src/prompt/PromptCardWindow.tsx), valid only for
+            //    `prompt-<hash of promptId>` (#10190).
+            ("get_prompt_view", "crate::ipc::prompt::label_matches(window.label()"),
+            ("prompt_card_action", "crate::ipc::prompt::label_matches(window.label()"),
+            ("prompt_card_hide", "crate::ipc::prompt::label_matches(window.label()"),
+            (
+                "get_caller_verify_request",
+                "crate::ipc::caller_verify::label_matches(window.label()",
+            ),
+            (
+                "submit_caller_verify",
+                "crate::ipc::caller_verify::label_matches(window.label()",
+            ),
         ];
-        for (src, cmd) in guarded {
-            let start = src.find(cmd).unwrap_or_else(|| panic!("{cmd} not found"));
-            let end = src[start..].find("\n}\n").map(|i| i + start).unwrap();
-            let body = &src[start..end];
-            assert!(
-                body.contains("deny_message_window(window.label())"),
-                "{cmd} does not refuse message-* windows"
-            );
+
+        // Parse the registered command list out of the macro invocation.
+        let marker = "tauri::generate_handler![";
+        let start = lib.find(marker).expect("generate_handler! not found") + marker.len();
+        let end = start + lib[start..].find(']').expect("generate_handler! not closed");
+        let registered: Vec<&str> = lib[start..end]
+            .lines()
+            .map(|l| l.split("//").next().unwrap().trim())
+            .flat_map(|l| l.split(','))
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .collect();
+        assert!(
+            registered.len() >= 10,
+            "parsed too few commands from generate_handler!: {registered:?}"
+        );
+        // Every allowlisted command must really be registered (guards a stale allowlist).
+        for (name, _) in label_checked {
+            assert!(registered.contains(name), "allowlisted {name} is not registered");
+        }
+
+        for cmd in &registered {
+            // `module::command` lives in that module's file; bare names in lib.rs.
+            let (src, name) = match cmd.split_once("::") {
+                None => (lib, *cmd),
+                Some(("workspace_open", name)) => {
+                    (prod_of(include_str!("workspace_open.rs")), name)
+                }
+                Some((module, _)) => panic!(
+                    "{cmd}: command module `{module}` is unknown to this test; add its source here"
+                ),
+            };
+            let sig = format!("fn {name}(");
+            let fn_start = src
+                .find(&sig)
+                .unwrap_or_else(|| panic!("{cmd}: {sig} not found"));
+            let fn_end = src[fn_start..].find("\n}\n").map(|i| i + fn_start).unwrap();
+            let body = &src[fn_start..fn_end];
+            match label_checked.iter().find(|(n, _)| *n == name) {
+                Some((_, check)) => assert!(
+                    body.contains(check),
+                    "{cmd} is allowlisted for card/self-labelled windows but lacks its label check `{check}`"
+                ),
+                None => assert!(
+                    body.contains("deny_message_window(window.label())"),
+                    "{cmd} does not refuse message-* windows (call deny_message_window or allowlist it with its own label check)"
+                ),
+            }
         }
     }
 
@@ -2090,6 +2585,104 @@ mod tests {
             );
         }
         assert_eq!(cap["windows"], serde_json::json!(["message-*"]));
+    }
+
+    // #8743: the shared guard must itself refuse chat-* callers, so every
+    // command that calls it (all but the label-checked allowlist above, which
+    // `privileged_commands_refuse_message_card_windows` enforces) is closed to
+    // chat windows too -- including commands added later.
+    #[test]
+    fn shared_privileged_guard_also_refuses_chat_windows() {
+        let msg = include_str!("ipc/message.rs").split("\nmod tests {").next().unwrap();
+        let start = msg.find("pub fn deny_message_window").expect("guard");
+        let end = msg[start..].find("\n}\n").map(|i| i + start).unwrap();
+        assert!(msg[start..end].contains("deny_chat_window"));
+        // Prompt cards (#10190) render agent and operator text too.
+        assert!(msg[start..end].contains("deny_prompt_window"));
+        assert!(crate::ipc::message::deny_message_window("prompt-0123abcd").is_err());
+        assert!(crate::ipc::message::deny_message_window("chat-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").is_err());
+        assert!(crate::ipc::message::deny_message_window("message-x").is_err());
+        assert!(crate::ipc::message::deny_message_window("main").is_ok());
+    }
+
+    // #8743: each chat command checks the caller's label before it touches
+    // any state, and only for its own conversation's window.
+    #[test]
+    fn chat_commands_check_the_label_before_touching_state() {
+        let lib = include_str!("lib.rs").split("\nmod tests {").next().unwrap();
+        for cmd in ["fn get_chat_view(", "fn chat_send_reply(", "fn chat_mark_read("] {
+            let start = lib.find(cmd).expect(cmd);
+            let end = lib[start..].find("\n}\n").map(|i| i + start).unwrap();
+            let body = &lib[start..end];
+            let check = body.find("crate::ipc::chat::label_matches(window.label(), &conversation_id)").expect(cmd);
+            let first_use = body.find("bridge.").expect(cmd);
+            assert!(check < first_use, "{cmd} uses the bridge before checking the label");
+            assert!(!body.contains("show_window"), "{cmd} shows a window");
+            assert!(!body.contains("\"main\""), "{cmd} touches main");
+        }
+    }
+
+    // #8743: the chat window gets the least it truly needs: listening for
+    // its own `chat-updated` event. No window, webview, tray, menu, shell or
+    // emit permission, and not core:default (which would add all of those).
+    #[test]
+    fn endpoint_chat_capability_is_minimal() {
+        let cap: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/endpoint-chat.json")).unwrap();
+        assert_eq!(cap["identifier"], "endpoint-chat");
+        assert_eq!(cap["windows"], serde_json::json!(["chat-*"]));
+        let perms: Vec<&str> = cap["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert_eq!(perms, vec!["core:event:allow-listen", "core:event:allow-unlisten"]);
+        // And the default (main/consent/banner) capability never covers chat windows.
+        let default: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        for w in default["windows"].as_array().unwrap() {
+            assert!(!w.as_str().unwrap().starts_with("chat"), "default capability covers {w}");
+        }
+        assert!(cap["description"].as_str().unwrap().len() > 40, "justify the permissions");
+        // The regenerated schema agrees with the source capability.
+        let gen: serde_json::Value =
+            serde_json::from_str(include_str!("../gen/schemas/capabilities.json")).unwrap();
+        assert_eq!(gen["endpoint-chat"]["windows"], cap["windows"]);
+        assert_eq!(gen["endpoint-chat"]["permissions"], cap["permissions"]);
+    }
+
+    #[test]
+    fn tray_chat_entry_shows_only_with_a_conversation_and_carries_the_unread_count() {
+        use crate::ipc::chat::TraySummary;
+        assert_eq!(chat_menu_label(&TraySummary::default()), None);
+        let one = TraySummary { total_unread: 0, target: Some("a".into()), has_open: true };
+        assert_eq!(chat_menu_label(&one).as_deref(), Some("Open chat"));
+        let three = TraySummary { total_unread: 3, target: Some("a".into()), has_open: true };
+        assert_eq!(chat_menu_label(&three).as_deref(), Some("Open chat (3)"));
+        assert!(chat_tooltip(&three).contains("3 unread chat messages"));
+        assert!(chat_tooltip(&TraySummary { total_unread: 1, ..TraySummary::default() }).contains("1 unread chat message"));
+        assert!(!chat_tooltip(&TraySummary::default()).contains("unread"));
+        // The static menu ids are untouched: the chat entry is added dynamically.
+        assert!(!tray_menu_item_ids(&HelperConfig::default()).contains(&"open_chat"));
+    }
+
+    // #8743: a chat never raises the main Assist window, and the only chat
+    // window builder call in lib.rs is the user-initiated tray item.
+    #[test]
+    fn chat_paths_in_lib_never_touch_main_or_auto_show() {
+        let lib = include_str!("lib.rs").split("\nmod tests {").next().unwrap();
+        let start = lib.find("fn open_chat_from_tray").expect("open_chat_from_tray");
+        let end = lib[start..].find("\n}\n").map(|i| i + start).unwrap();
+        let body = &lib[start..end];
+        assert!(!body.contains("show_window("));
+        assert!(!body.contains("\"main\""));
+        let start = lib.find("pub(crate) fn refresh_chat_tray").expect("refresh_chat_tray");
+        let end = lib[start..].find("\n}\n").map(|i| i + start).unwrap();
+        let body = &lib[start..end];
+        assert!(!body.contains("show_window(") && !body.contains("set_focus") && !body.contains("show_chat_window"));
+        // Only the user's own menu click opens a chat window.
+        assert_eq!(lib.matches("\"open_chat\" =>").count(), 1);
     }
 
     // #8138: a plain agent-driven start (`--config`, nothing pending) builds

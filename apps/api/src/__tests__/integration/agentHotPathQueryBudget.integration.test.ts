@@ -180,7 +180,10 @@ const ROUTE_ONLY_STEADY_HEARTBEAT_TX = 2;
 // #7970: cold 48 -> 50 — the UniFi collector presence probe (SAVEPOINT +
 // one LIMIT 1 select) on a negative-cache miss; warm and steady unchanged.
 const COLD_TX = 7;
-const COLD_STATEMENTS = 50;
+// #8997: cold 50 -> 51 — the remote-access policy read now takes a SAVEPOINT on
+// a cache miss only (so a failed read cannot abort the org transaction); warm
+// and steady-state beats hit the cache and are unchanged.
+const COLD_STATEMENTS = 51;
 const CACHES_MISS_STATEMENTS = 21;
 const CONFIGURED_STEADY_STATEMENTS = 22;
 
@@ -1201,6 +1204,9 @@ describe('agent hot-path DB budget (#8053) — real PostgreSQL', () => {
     // with credentialTokenHash set, every frame after the re-check lease
     // re-authorizes the credential, exactly as on a production socket.
     const handlers = createAgentWsHandlers(device.agentId, {
+      agentId: device.agentId,
+      siteId: device.siteId,
+      installIncarnation: 1,
       deviceId: device.deviceId,
       orgId: device.orgId,
       partnerId: device.partnerId,

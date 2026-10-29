@@ -33,6 +33,7 @@ import {
 } from '../db/schema';
 import { eq, and, asc, desc, sql, inArray, SQL } from 'drizzle-orm';
 import { escapeLike } from '../utils/sql';
+import { sqlTextArray } from '../db/sqlValues';
 import type { AuthContext } from '../middleware/auth';
 import type { AiTool } from './aiTools';
 import { verifyDeviceAccess } from './aiTools';
@@ -204,6 +205,12 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
         conditions.push(
           sql`(${devices.hostname} ILIKE ${searchPattern} OR ${devices.displayName} ILIKE ${searchPattern})`
         );
+      }
+      // `tags` is documented as "devices must have ALL specified tags" → array
+      // containment (@>), not overlap (&&). (#9122)
+      if (Array.isArray(input.tags)) {
+        const tagFilter = input.tags.filter((t): t is string => typeof t === 'string' && t.length > 0);
+        if (tagFilter.length > 0) conditions.push(sql`${devices.tags} @> ${sqlTextArray(tagFilter)}`);
       }
 
       // Site axis (app-layer only; RLS does NOT enforce it): a site-restricted
@@ -808,11 +815,13 @@ export function registerDeviceTools(aiTools: Map<string, AiTool>): void {
           // `${tagsInput}::text[]` is spread by Drizzle into `($1, $2)::text[]`,
           // which Postgres rejects for every list length (#8297).
           const tagsArray = sql`ARRAY[${sql.join(tagsInput.map((tag) => sql`${tag}`), sql`, `)}]::text[]`;
+          // own-device-row-allowlisted: ai-tool-device-tags
           await db.execute(
             sql`UPDATE devices SET tags = (SELECT array_agg(DISTINCT t) FROM unnest(array_cat(tags, ${tagsArray})) t), updated_at = now() WHERE id = ${deviceId}`
           );
         } else {
           for (const tag of tagsInput) {
+            // own-device-row-allowlisted: ai-tool-device-tags
             await db.execute(
               sql`UPDATE devices SET tags = array_remove(tags, ${tag}), updated_at = now() WHERE id = ${deviceId}`
             );

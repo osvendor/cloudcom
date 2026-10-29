@@ -99,6 +99,12 @@ export const JOB_SCHEDULES = {
   'partner-api-idempotency-retention': '18 4 * * *',
   'audit-chain-verify': '13 4 * * *',
   'pax8-sync': '28 4 * * *',
+  // AI device file read policy W03 (#8855): nightly scrub of AI tool outputs
+  // past each org's retention window. Daily tier, minute ≡ 3 (mod 5).
+  'ai-tool-output-retention': '33 4 * * *',
+  // #9050: per-process SDK transcript sweep, five minutes after the retention
+  // scrub so it sees the cleared sdk_session_id pointers. Daily tier.
+  'ai-transcript-sweeper': '38 4 * * *',
   'audit-chain-anchor': '48 4 * * *',
   'contract-billing-sweep': '8 5 * * *',
   // Service deliverables W02 (#5573 spec §5.1). Daily tier, minute ≡ 3 (mod 5).
@@ -131,6 +137,9 @@ export const JOB_SCHEDULES = {
   'ml-output-retention': '23 8 * * *',
   'user-risk-retention': '43 8 * * *',
   'vulnerability-msrc-sync': '3 9 * * *',
+  // PAM ownership epochs W5 (#8207): held-shell PAM evidence retention. Daily
+  // tier, minute = 3 (mod 5); hour 9 held only :03 and the weekly :18.
+  'pam-evidence-retention': '33 9 * * *',
   'abuse-signals-digest': '18 9 * * 1',
   'vulnerability-nvd-sync': '3 10 * * *',
   // Patch compliance report files past PATCH_REPORT_RETENTION_DAYS (default
@@ -199,11 +208,39 @@ export const JOB_SCHEDULES = {
   // this file's header). Hour 21 was entirely free; :03 keeps the daily = 3
   // (mod 5) lane.
   'sending-domains-daily': '3 21 * * *',
+  // Wisp W05 (#9917) — closed-concern retention (90 d), subject_gone
+  // reconciliation and concern_outcome memory retention (180 d). Hour 21 held
+  // only `sending-domains-daily` at :03 (and `warranty-batch-sync` at :42);
+  // :23 keeps the daily = 3 (mod 5) lane.
+  'wisp-concern-retention': '23 21 * * *',
+  // Wisp W06a (#9912) — 15-minute nudge digest + morning-brief sweep (w00 A28).
+  // Sub-hourly, so outside the coarse collision grid; :13/:28/:43/:58 avoid
+  // the unmanaged 0 (mod 5) ticks.
+  'wisp-nudge-digest': '13,28,43,58 * * * *',
   // Disk Cleanup v2 W03 (spec §5.2) — daily sweep of device_filesystem_cleanup_runs:
   // abandoned previews at 7 days, the pinned candidate blob at 90 days, and
   // file runs stuck in `running` at 24 hours. Hour 22 held only the sub-daily
   // `user-risk-scan` at :57; :03 keeps the daily = 3 (mod 5) lane.
   'filesystem-cleanup-run-retention': '3 22 * * *',
+  // #8581 — daily prune of device_restore_point_attempts: terminal rows past
+  // RESTORE_POINT_ATTEMPT_RETENTION_DAYS (default 90) and orphaned `requested`
+  // rows past both that window and their command's deadline. Hour 22 held
+  // :03 (above) and the sub-daily `user-risk-scan` at :57; :08 keeps the
+  // daily = 3 (mod 5) lane.
+  'restore-point-attempt-retention': '8 22 * * *',
+  // #9128 — daily prune of terminal webhook_deliveries rows past
+  // WEBHOOK_DELIVERY_RETENTION_DAYS (default 90). :13 keeps the daily = 3
+  // (mod 5) lane in hour 22.
+  'webhook-delivery-retention': '13 22 * * *',
+  // #10020 — daily prune of dns_security_events + dns_event_aggregations past
+  // each integration's retentionDays (default DNS_SECURITY_RETENTION_DAYS_DEFAULT,
+  // 90). :18 keeps the daily = 3 (mod 5) lane in hour 22.
+  'dns-security-retention': '18 22 * * *',
+  // Tool catalog W04 (#5219, plan Task A8) — daily flow run body pruning
+  // (trigger payload, inputs, step inputs/outputs) past FLOW_RUN_RETENTION_DAYS;
+  // rows are never deleted. Hour 23 was free in the daily tier; :03 keeps the
+  // daily = 3 (mod 5) lane.
+  'flow-run-retention': '3 23 * * *',
 
   // ------------------------------------------------------------ sub-daily tier
   // Minutes ≡ 2 (mod 5), plus three legacy slots on :00 / :15 / :35. Minute 0
@@ -242,11 +279,24 @@ export const JOB_SCHEDULES = {
   'parked-device-expiry': '21 * * * *',
   // Autopay collection: :26 is free in every hour; the mod-5 sub-daily lane is full.
   'autopay-collection-run': '26 * * * *',
+  // Connection health W3 (#8847) — hourly daily-digest pass; each partner is due
+  // while its local hour is 08–11. The spec asked for the ≡2 (mod 5) lane, which
+  // is full; :09 is free in every hour and outside the ≡0 (mod 5) ticks.
+  'connection-health-digest': '9 * * * *',
   // Helper screenshot cleanup — sweeps ai_screenshots rows (and their files)
   // past their 24h retention. 4x/day is plenty against a 24h TTL; minute 27
   // on hours 1,7,13,19 is unused by any existing hour/minute combination in
   // this lane.
   'helper-screenshot-retention': '27 1,7,13,19 * * *',
+  // Endpoint messaging W02 (#8742) — body purge (90 d), past-expiry delivery
+  // close-out and 13-month history delete. 4x/day keeps the expiry view within
+  // ~6 h; minute 29 on hours 2,8,14,20 is unused in this lane.
+  'endpoint-message-retention': '29 2,8,14,20 * * *',
+  // Agreement auto-reminders (#9084) — hourly tick. The effective tick is hourly;
+  // the per-request cadence (partner "remind every N days") is enforced in the
+  // job's due-set SQL, so the tick only bounds how late a due reminder can go
+  // out (<= 1 h). :44 is free in every hour and outside the ≡0 (mod 5) ticks.
+  'agreement-request-auto-reminder': '44 * * * *',
 } as const;
 
 export type JobScheduleKey = keyof typeof JOB_SCHEDULES;

@@ -25,6 +25,8 @@ import PolishButton from '../catalog/PolishButton';
 import { listCatalog, type CatalogItem } from '../../lib/api/catalog';
 import { formatPercent } from '@/lib/i18n/format';
 import { useStableT } from '@/lib/i18n/useStableT';
+import { useRegisterDirtyForm } from '@/lib/keyboard/useRegisterDirtyForm';
+import { EntityLink } from '@/components/shared/EntityLink';
 
 const UNAUTHORIZED = () => void navigateTo('/login', { replace: true });
 
@@ -297,6 +299,8 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
     for (const key of failedKeys) if (dirtyLineKeys.has(key)) return t('invoiceEditor.unsavedField.lines');
     return null;
   }, [pending.size, failedKeys, notesDirty, termsDirty, dirtyLineKeys, t]);
+  // Unsaved input blocks the g/c chords and queue keys (see useRegisterDirtyForm).
+  useRegisterDirtyForm(hasPendingEdits || notesDirty || termsDirty || dirtyLineKeys.size > 0);
   useEffect(() => { onPendingEditsChange?.(hasPendingEdits); }, [hasPendingEdits, onPendingEditsChange]);
   useEffect(() => { onUnsavedEditsChange?.(unsavedFieldLabel); }, [unsavedFieldLabel, onUnsavedEditsChange]);
   // Clear BOTH on unmount so a stale signal can't lock Issue after the editor is
@@ -929,9 +933,7 @@ export default function InvoiceEditor({ detail, onChanged, onPendingEditsChange,
             {invoice.billToName ? (
               <>
                 <p className="text-sm">
-                  <a href={`/organizations/${encodeURIComponent(invoice.orgId)}`} data-testid="org-record-link" className="hover:underline">
-                    {invoice.billToName}
-                  </a>
+                  <EntityLink kind="org" id={invoice.orgId} name={invoice.billToName} />
                 </p>
                 {/* Draft-only fallback (sweep paper cut #16): set by the API
                     ONLY alongside a fallen-back billToName — see invoiceTypes.

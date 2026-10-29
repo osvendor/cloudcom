@@ -1,7 +1,9 @@
 import { z } from 'zod';
 import { isIP } from 'node:net';
 import { softwareInventoryReportSchema, type RestorePointOutcome } from '@breeze/shared';
+import { promptHostTelemetrySchema } from '@breeze/shared/promptHost';
 import { redactSecretsFromOutput } from '../../services/secretRedaction';
+import { MAX_AGENT_WARRANTY_ENTITLEMENTS } from '../../services/warrantyDataSources';
 
 // ============================================
 // Enrollment
@@ -64,7 +66,15 @@ export const enrollSchema = z.object({
     mac: z.string().optional(),
     ip: z.string().optional(),
     isPrimary: z.boolean().optional()
-  })).max(100).optional()
+  })).max(100).optional(),
+  // #8318 wave 1b — the capabilities a new install declares at enrollment.
+  // Only the rebind protocol so far: enroll records it, because a freshly
+  // enrolled install is exactly the device a reattach makes the SOURCE (§6.2).
+  // Same tolerant contract as the heartbeat's securityCapabilities: a
+  // malformed value drops this field alone and never fails the enrollment.
+  securityCapabilities: z.object({
+    rebindProtocolVersion: z.number().int().optional().catch(undefined),
+  }).optional().catch(undefined),
 });
 
 // ============================================
@@ -227,6 +237,12 @@ export const heartbeatSchema = z.object({
   helperCapabilities: z.object({
     callerVerify: z.boolean(),
     usernames: z.array(z.string().min(1).max(255)).max(32),
+    // #10190 W02 — what the console session's renderer advertised at its live
+    // IPC auth (`kinds` may be [], a W02 renderer advertises none). The
+    // shared contract schema (non-strict, so a newer agent's additive key is
+    // stripped, not fatal). Telemetry only: a malformed block drops to
+    // absent on its own, never the readiness beside it or the beat.
+    promptHost: promptHostTelemetrySchema.optional().catch(undefined),
   }).optional().catch(undefined),
   // #8869 — Encrypted Client Hello telemetry. Both are informational counters
   // only (no DB column): a malformed value drops to absent, never a 400.
@@ -430,6 +446,11 @@ export const heartbeatSchema = z.object({
     // (never persisted): the beat being answered is the only source of truth.
     // Same tolerant contract; anything but exactly 1 gets the legacy payload.
     retainStateProtocolVersion: z.number().int().optional().catch(undefined),
+    // #8318 wave 1b — the bounded rebind (reinstall reattach, §6.2). Recorded
+    // non-sticky on every main and parked beat; 1 makes the device eligible to
+    // be the source of a reattach and to receive the signed `rebind`
+    // directive. Same tolerant contract as its siblings.
+    rebindProtocolVersion: z.number().int().optional().catch(undefined),
     pamReconciliation: z.object({
       unresolvedCount: z.number().int().nonnegative(),
       quarantinedCount: z.number().int().nonnegative(),
@@ -624,7 +645,7 @@ export function isAgentCommandErrorCode(value: unknown): value is AgentCommandEr
 }
 
 /**
- * The nine statuses an agent can report for a System Restore checkpoint
+ * The ten statuses an agent can report for a System Restore checkpoint
  * attempt (#4609, W06 #4757). Mirrors `Status` in
  * agent/internal/systemrestore/types.go. 'requested' is deliberately absent:
  * it is server-only, written at command-creation time, and an agent claiming
@@ -636,6 +657,7 @@ export const RESTORE_POINT_OUTCOME_STATUSES = [
   'existing_accepted',
   'skipped_disabled',
   'skipped_definition_only',
+  'skipped_no_mutation',
   'unsupported',
   'busy',
   'insufficient_privileges',
@@ -692,7 +714,7 @@ export type RestorePointOutcomeClassification =
 /**
  * Validate a raw agent-supplied `restorePoint` value. Never throws.
  * `unknown_status` is an otherwise-recognisable outcome whose status is not one
- * of the nine (a future agent value, or the server-only 'requested');
+ * of the ten (a future agent value, or the server-only 'requested');
  * everything else that fails is `malformed`.
  */
 export function classifyRestorePointOutcome(raw: unknown): RestorePointOutcomeClassification {
@@ -780,6 +802,7 @@ export const securityProviderValues = [
   'emsisoft',
   'webroot',
   'withsecure',
+  'cylance',
   'other',
   'unknown'
 ] as const;
@@ -921,12 +944,33 @@ const warrantyDateSchema = z.string().max(50).optional()
     return d.toISOString().slice(0, 10);
   });
 
+/**
+ * One entitlement from an agent collector (#5511 W01, D10). HP CMSL reports N
+ * of these per device out of `HP_Entitlements`; the macOS plist collector
+ * reports none and keeps using the flat `coverageType` fields below.
+ *
+ * `provider` is deliberately NOT part of the wire shape. The server derives it
+ * from `source` (`warrantyEntitlementProviderForSource`): an agent that could
+ * name the vendor could label HP coverage as Apple. `z.object` strips it
+ * silently, and the schema test pins that.
+ *
+ * Dates run through the same `warrantyDateSchema` as the flat fields, so HP's
+ * own per-entitlement dates are preserved as reported, as ISO `YYYY-MM-DD`.
+ */
+const agentWarrantyEntitlementSchema = z.object({
+  serviceLevelDescription: z.string().max(200).optional(),
+  entitlementType: z.string().max(200).optional(),
+  startDate: warrantyDateSchema,
+  endDate: warrantyDateSchema,
+});
+
 export const agentWarrantyInfoSchema = z.object({
   source: z.string().min(1).max(50),
   manufacturer: z.string().min(1).max(100),
   coverageEndDate: warrantyDateSchema,
   coverageStartDate: warrantyDateSchema,
   coverageType: z.string().max(200).optional(),
+  entitlements: z.array(agentWarrantyEntitlementSchema).max(MAX_AGENT_WARRANTY_ENTITLEMENTS).optional(),
   // Coverage kind derived from the macOS NDO label verb: 'subscription'
   // ("Renews ...") vs 'fixed' ("Expires ..."). Empty/absent when unknown.
   // Accept '' for back-compat: older agents (and timestamp-only/labelless/
@@ -1123,6 +1167,12 @@ const pendingPatchSchema = z.object({
   externalId: z.string().optional(),
   category: z.string().optional(),
   severity: z.enum(['critical', 'important', 'moderate', 'low', 'unknown']).optional(),
+  // Provenance of `severity` (#9387): 'vendor' or 'derived'. Deliberately a
+  // free string, narrowed at ingest: an unrecognised value from a newer agent
+  // is dropped (stored as NULL) rather than rejecting the whole scan — and so
+  // is a malformed one (`.catch`), since a bad provenance label must never
+  // cost the device its whole patch inventory.
+  severitySource: z.string().max(32).optional().catch(undefined),
   size: z.number().int().optional(),
   requiresRestart: z.boolean().optional(),
   releaseDate: z.string().optional(),
