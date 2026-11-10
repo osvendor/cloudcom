@@ -77,7 +77,7 @@ export interface ProviderLegRow {
   name: string;
   computerName: string | null;
   osType: 'workstation' | 'server' | 'unknown';
-  accountType: 'backup_manager' | 'm365' | 'unknown';
+  accountType: 'backup_manager' | 'm365' | 'gws' | 'unknown';
   dataSources: string[];
   status: ExternalBackupStatus;
   lastSessionAt: Date | string | null;
@@ -95,6 +95,9 @@ export interface ProviderLegRow {
   connectionIsActive: boolean | null;
   connectionLastSyncAt: Date | string | null;
   connectionSyncIntervalMinutes: number | null;
+  verifiedBootableAt: Date | string | null;
+  verifiedBootable: boolean | null;
+  verifiedBootableFailedChecks: string[] | null;
 }
 
 export interface ConnectionFreshness {
@@ -255,6 +258,9 @@ export function toBreezeHealthRow(row: BreezeLegRow, opts: { now: Date }): Backu
     dataSources: [],
     history28d: [],
     agentOnline: row.deviceStatus === 'online',
+    verifiedBootableAt: null,
+    verifiedBootable: null,
+    verifiedBootableFailedChecks: null,
   };
 }
 
@@ -293,7 +299,7 @@ export function toProviderHealthRow(
     name: row.name,
     computerName: row.computerName,
     osType: row.osType,
-    accountType: row.accountType === 'm365' ? 'm365' : 'endpoint',
+    accountType: row.accountType === 'm365' || row.accountType === 'gws' ? row.accountType : 'endpoint',
     status: row.status,
     // Stale evidence is not a verdict. The status and timestamps stay as last
     // observed so the UI can still say WHAT it last saw and WHEN, but the
@@ -310,6 +316,9 @@ export function toProviderHealthRow(
     dataSources: row.dataSources ?? [],
     history28d: [],
     agentOnline: row.breezeDeviceId ? row.deviceStatus === 'online' : null,
+    verifiedBootableAt: toIso(row.verifiedBootableAt),
+    verifiedBootable: row.verifiedBootable,
+    verifiedBootableFailedChecks: row.verifiedBootableFailedChecks,
   };
 }
 
@@ -412,7 +421,7 @@ export function foldBackupHealthSummary(rows: readonly BackupHealthRow[]): Backu
     summary.byHealth[row.health] += 1;
     summary.byRecency[row.recency] += 1;
 
-    if (row.accountType === 'm365') {
+    if (row.accountType === 'm365' || row.accountType === 'gws') {
       summary.m365Accounts += 1;
       continue;
     }

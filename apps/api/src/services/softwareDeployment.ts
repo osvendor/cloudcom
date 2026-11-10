@@ -1,7 +1,7 @@
 import { cancelledCommandError } from './commandCancelMessage';
 import { and, eq, inArray, isNull } from 'drizzle-orm';
 import { findVariableTokens, isSoftwareFileType, variableToken } from '@breeze/shared';
-import { db } from '../db';
+import { db, withDbTransactionIfHeld } from '../db';
 import {
   deploymentResults,
   devices,
@@ -12,7 +12,9 @@ import {
   softwareInstallMethods,
   softwareVersions,
 } from '../db/schema';
-import { resolveEdrInstaller, type ResolvedInstaller } from './edrInstallerResolver';
+import { resolveEdrInstaller, type EdrResolveError, type ResolvedInstaller } from './edrInstallerResolver';
+import { isBuiltinProvider } from './builtinDeploymentPackages';
+import { isEdrInstallerProviderKey } from './edrProviders/providerKeys';
 import { resolveInstallerVariables, type InstallerVariableContext } from './installerVariables';
 import { buildInstallScriptPayload, type InstallScriptPayload } from './installScriptPayload';
 import {
@@ -38,7 +40,7 @@ import {
 } from './managedSoftwareDispatchPolicy';
 import { getEffectiveSoftwareDownloadPolicy } from './softwareDownloadPolicy';
 import { captureException } from './sentry';
-import { sendCommandToAgent, type AgentCommand } from '../routes/agentWs';
+import type { AgentCommand } from '../routes/agentWs';
 import {
   fingerprintSoftwareInstallMethodDependency,
   fingerprintSoftwareVersionDependency,
@@ -723,16 +725,18 @@ export async function buildAndDispatchSoftwareInstalls(
   // gate. On resolution failure, mark every result failed and return — never
   // dispatch and never silently no-op.
   let resolvedInstaller: ResolvedInstaller | null = null;
-  if (
-    catalogItem.integrationProvider === 'huntress' ||
-    catalogItem.integrationProvider === 'sentinelone'
-  ) {
-    const resolved = await resolveEdrInstaller({
-      provider: catalogItem.integrationProvider,
-      orgId,
-      downloadUrlTemplate: versionRecord.downloadUrl,
-      silentInstallArgsTemplate: versionRecord.silentInstallArgs,
-    });
+  const integrationProvider = catalogItem.integrationProvider;
+  if (integrationProvider != null) {
+    // Any provider without an installer path fails closed: the version row of a
+    // built-in package holds a template, never something to hand an agent.
+    const resolved: ResolvedInstaller | EdrResolveError = isBuiltinProvider(integrationProvider)
+      ? await resolveEdrInstaller({
+          provider: integrationProvider,
+          orgId,
+          downloadUrlTemplate: versionRecord.downloadUrl,
+          silentInstallArgsTemplate: versionRecord.silentInstallArgs,
+        })
+      : { error: `Unsupported integration provider: ${integrationProvider}` };
     if ('error' in resolved) {
       await db
         .update(deploymentResults)
@@ -955,6 +959,16 @@ export async function buildAndDispatchSoftwareInstalls(
     }
   }
   let variableFailureCount = 0;
+  // Distinct per-device variable-failure messages (token names only, never
+  // values). When there is exactly one, the batch message repeats it (#10307).
+  const variableFailureReasons = new Set<string>();
+  // Devices whose dispatch threw: they keep the batch message from naming a
+  // variable reason as if it were every device's (#10307).
+  let dispatchFailureCount = 0;
+  const countVariableFailure = (reason: string) => {
+    variableFailureCount++;
+    variableFailureReasons.add(reason);
+  };
   // #6958 gates, counted apart so the batch message names the real cause.
   let agentVersionFailureCount = 0;
   let scriptOsFailureCount = 0;
@@ -969,7 +983,7 @@ export async function buildAndDispatchSoftwareInstalls(
   // device either way.
   const failDevice = async (deviceId: string, errorMessage: string) => {
     try {
-      await db
+      await withDbTransactionIfHeld(() => db
         .update(deploymentResults)
         .set({ status: 'failed', errorMessage, completedAt: new Date() })
         .where(
@@ -977,7 +991,7 @@ export async function buildAndDispatchSoftwareInstalls(
             eq(deploymentResults.deploymentId, deploymentId),
             eq(deploymentResults.deviceId, deviceId),
           ),
-        );
+        ));
     } catch (err) {
       console.error(
         `[software-deploy] could not record a gate failure for device ${deviceId} in deployment ${deploymentId}:`,
@@ -1023,13 +1037,14 @@ export async function buildAndDispatchSoftwareInstalls(
       // deployment_results write + counter as an unresolvable token, so the
       // batch-level outcome below is unchanged. Keys only in the message.
       if (secretTemplateKeys.length > 0) {
+        const secretMessage =
+          'Software deployment templates cannot use secret variable(s) ' +
+          secretTemplateKeys.map(variableToken).join(', ');
         await db
           .update(deploymentResults)
           .set({
             status: 'failed',
-            errorMessage:
-              'Software deployment templates cannot use secret variable(s) ' +
-              secretTemplateKeys.map(variableToken).join(', '),
+            errorMessage: secretMessage,
             completedAt: new Date(),
           })
           .where(
@@ -1038,14 +1053,8 @@ export async function buildAndDispatchSoftwareInstalls(
               eq(deploymentResults.deviceId, device.id),
             ),
           );
-        variableFailureCount++;
-        const result = fanoutDeviceResult(
-          input,
-          device.id,
-          'failed',
-          null,
-          `Software deployment templates cannot use secret variable(s) ${secretTemplateKeys.map(variableToken).join(', ')}`,
-        );
+        countVariableFailure(secretMessage);
+        const result = fanoutDeviceResult(input, device.id, 'failed', null, secretMessage);
         if (result) deviceResults.push(result);
         continue;
       }
@@ -1060,11 +1069,12 @@ export async function buildAndDispatchSoftwareInstalls(
       };
       const resolved = resolveInstallerVariables(finalDownloadUrl, finalSilentInstallArgs, ctx);
       if (resolved.unresolved.length > 0) {
+        const unresolvedMessage = `Could not resolve installer variable(s): ${resolved.unresolved.join(', ')}`;
         await db
           .update(deploymentResults)
           .set({
             status: 'failed',
-            errorMessage: `Could not resolve installer variable(s): ${resolved.unresolved.join(', ')}`,
+            errorMessage: unresolvedMessage,
             completedAt: new Date(),
           })
           .where(
@@ -1073,14 +1083,8 @@ export async function buildAndDispatchSoftwareInstalls(
               eq(deploymentResults.deviceId, device.id),
             ),
           );
-        variableFailureCount++;
-        const result = fanoutDeviceResult(
-          input,
-          device.id,
-          'failed',
-          null,
-          `Could not resolve installer variable(s): ${resolved.unresolved.join(', ')}`,
-        );
+        countVariableFailure(unresolvedMessage);
+        const result = fanoutDeviceResult(input, device.id, 'failed', null, unresolvedMessage);
         if (result) deviceResults.push(result);
         continue;
       }
@@ -1121,8 +1125,9 @@ export async function buildAndDispatchSoftwareInstalls(
         ...(post && !post.ok ? post.unresolved : []),
       ];
       if (unresolved.length > 0) {
-        await failDevice(device.id, `Could not resolve installer variable(s): ${[...new Set(unresolved)].join(', ')}`);
-        variableFailureCount++;
+        const unresolvedMessage = `Could not resolve installer variable(s): ${[...new Set(unresolved)].join(', ')}`;
+        await failDevice(device.id, unresolvedMessage);
+        countVariableFailure(unresolvedMessage);
         continue;
       }
       preScriptPayload = pre && pre.ok ? pre.payload : null;
@@ -1179,9 +1184,8 @@ export async function buildAndDispatchSoftwareInstalls(
     // dispatch for legacy URL-only rows created before #3571 stamped file_type,
     // but it reverses an explicit decision in that PR, so it is left as a
     // separate call rather than smuggled in by a rebase.
-    const effectiveFileType = isSoftwareFileType(versionRecord.fileType)
-      ? versionRecord.fileType
-      : 'exe';
+    const effectiveFileType = resolvedInstaller?.fileType
+      ?? (isSoftwareFileType(versionRecord.fileType) ? versionRecord.fileType : 'exe');
     const detectionRules = stripUnsupportedDetectionClauses(versionRecord.detectionRules, device.agentVersion);
     const payload: AgentCommand['payload'] = {
       deploymentId,
@@ -1199,13 +1203,14 @@ export async function buildAndDispatchSoftwareInstalls(
         version: 1,
         approvedPrivateOrigins,
       },
-      checksum: versionRecord.checksum,
+      // Absent on the resolver = keep the version's; null = the vendor publishes none.
+      checksum: resolvedInstaller?.checksum !== undefined ? resolvedInstaller.checksum : versionRecord.checksum,
       // fileName and fileType are a COUPLED pair, not two independent fields:
       // the agent's validateInstallFileName rejects the command outright when
       // the filename's extension doesn't equal '.' + fileType. Building the
       // fallback name from the same resolved type is what keeps them in step.
       fileName:
-        versionRecord.originalFileName ?? `package.${effectiveFileType}`,
+        resolvedInstaller?.fileName ?? versionRecord.originalFileName ?? `package.${effectiveFileType}`,
       fileType: effectiveFileType,
       silentInstallArgs: deviceSilentInstallArgs,
       softwareName: catalogItem.name,
@@ -1213,6 +1218,9 @@ export async function buildAndDispatchSoftwareInstalls(
       ...(detectionRules ? { detectionRules } : {}),
       ...(successExitCodes ? { successExitCodes } : {}),
       forceReinstall,
+      // Marks a framework provider's install so its result is scrubbed of the link
+      // and file name when stored. Absent on every other payload (byte-identical).
+      ...(integrationProvider != null && isEdrInstallerProviderKey(integrationProvider) ? { integrationProvider } : {}),
       // #6958: present only for a script-enabled version, so every other
       // payload is byte-identical to before.
       ...(preScriptPayload ? { preInstallScript: preScriptPayload } : {}),
@@ -1243,6 +1251,7 @@ export async function buildAndDispatchSoftwareInstalls(
         );
       const failedResult = fanoutDeviceResult(input, device.id, 'failed', null, errorMessage);
       if (failedResult) deviceResults.push(failedResult);
+      dispatchFailureCount++;
       continue;
     }
     dispatchedDeviceIds.push(device.id);
@@ -1269,7 +1278,12 @@ export async function buildAndDispatchSoftwareInstalls(
       status: 'failed',
       message:
         variableFailureCount > 0
-          ? 'All target devices failed installer variable resolution'
+          ? 'All target devices failed installer variable resolution' +
+            (variableFailureReasons.size === 1 &&
+            agentVersionFailureCount + scriptOsFailureCount + policyDenialCount + missingDeviceCount +
+              dispatchFailureCount === 0
+              ? `: ${[...variableFailureReasons][0]}`
+              : '')
           : agentVersionFailureCount > 0 && scriptOsFailureCount === 0
             ? `No target device runs a new enough agent: ${agentUpdateRequiredInstallMessage()}`
           : scriptOsFailureCount > 0 && agentVersionFailureCount === 0

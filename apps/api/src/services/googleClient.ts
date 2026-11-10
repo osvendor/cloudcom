@@ -24,6 +24,7 @@ import { calendar, auth as calendarAuth, type calendar_v3 } from '@googleapis/ca
 import { licensing, auth as licensingAuth, type licensing_v1 } from '@googleapis/licensing';
 import {
   DIRECTORY_SCOPES,
+  DIRECTORY_DOMAIN_SCOPES,
   GMAIL_USER_SCOPES,
   GMAIL_INBOUND_SCOPES,
   GMAIL_INBOUND_MODIFY_SCOPES,
@@ -36,7 +37,7 @@ import {
 
 // Least-privilege DWD scope sets live in @breeze/shared (one list shared with the
 // web integration page). Re-exported here for existing API callers.
-export { DIRECTORY_SCOPES, GMAIL_USER_SCOPES, GMAIL_INBOUND_SCOPES, GMAIL_INBOUND_MODIFY_SCOPES, CALENDAR_SCOPES, LICENSING_SCOPES, REPORTS_SCOPES, AUDIT_REPORTS_SCOPES };
+export { DIRECTORY_SCOPES, DIRECTORY_DOMAIN_SCOPES, GMAIL_USER_SCOPES, GMAIL_INBOUND_SCOPES, GMAIL_INBOUND_MODIFY_SCOPES, CALENDAR_SCOPES, LICENSING_SCOPES, REPORTS_SCOPES, AUDIT_REPORTS_SCOPES };
 export const ALL_DWD_SCOPES_CSV = GOOGLE_DWD_SCOPES_CSV;
 
 // Explicit per-request deadline for every Gmail/UserInfo call. gaxios has no
@@ -107,6 +108,25 @@ export function getDirectoryClient(
     email: key.client_email,
     key: key.private_key,
     scopes: [...DIRECTORY_SCOPES],
+    subject: adminEmail, // DWD: impersonate the super-admin
+  });
+  return admin({ version: 'directory_v1', auth });
+}
+
+/**
+ * Admin SDK Directory client for the domains list ONLY (portal domain
+ * verification). Requests just admin.directory.domain.readonly, so the broad
+ * getDirectoryClient scope set is unchanged. Impersonates the super-admin.
+ */
+export function getDirectoryDomainsClient(
+  decryptedKeyJson: string,
+  adminEmail: string,
+): admin_directory_v1.Admin {
+  const key = parseServiceAccountKey(decryptedKeyJson);
+  const auth = new adminAuth.JWT({
+    email: key.client_email,
+    key: key.private_key,
+    scopes: [...DIRECTORY_DOMAIN_SCOPES],
     subject: adminEmail, // DWD: impersonate the super-admin
   });
   return admin({ version: 'directory_v1', auth });

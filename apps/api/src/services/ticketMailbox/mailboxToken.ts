@@ -9,6 +9,8 @@ interface CachedToken {
 const cache = new Map<string, CachedToken>();
 const FRESH_BUFFER_MS = 5 * 60 * 1000;
 
+import { MailboxPlatformNotConfiguredError } from './mailboxErrors';
+
 export function _clearMailboxTokenCache(): void {
   cache.clear();
 }
@@ -41,7 +43,7 @@ export function getMailboxCallbackUri(): string {
 export async function getMailboxToken(tenantId: string): Promise<string> {
   if (!isM365TenantId(tenantId)) throw new Error('Invalid M365 tenant id');
   const cfg = await getMailboxPlatformConfig();
-  if (!cfg) throw new Error('Microsoft ticket mailbox application not configured');
+  if (!cfg) throw new MailboxPlatformNotConfiguredError();
   if (cfg.credentialVersion !== undefined) {
     const { cloudCommandAdminRuntime } = await import('../../extensions/cloudCommandAdminRuntime');
     return cloudCommandAdminRuntime.acquireToken({ tenantId, clientId: cfg.clientId, credentialVersion: cfg.credentialVersion });

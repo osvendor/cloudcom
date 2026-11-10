@@ -141,10 +141,12 @@ export interface DnsRow {
 }
 
 /**
- * dnsSyncJob writes 'success' / 'error', or 'partial' when a run stopped at the
- * provider's request budget with the rest left for the next run (#10018) — that
- * run reached the vendor, so it is linked like 'success'. NULL means the
- * integration never ran.
+ * dnsSyncJob writes 'success' / 'error', 'partial' when a run stopped at the
+ * provider's request budget with the rest left for the next run (#10018), or
+ * 'truncated' when some records lay past the provider's paging limit and were
+ * not fetched (#10047). Both of those runs reached the vendor, so they are
+ * linked like 'success'; the loss is shown on the integration itself. NULL
+ * means the integration never ran.
  */
 export function dnsState(row: DnsRow): MappingState {
   if (row.lastSyncStatus === null) return { state: 'pending', reason: 'never_synced' };
@@ -272,10 +274,11 @@ export function accountingHealth(row: { status: string }): HealthVerdict {
 }
 
 /** DNS filter, via the board's dnsState. No UI path deactivates a row today; the schema allows it. */
-export function dnsFilterHealth(row: { isActive: boolean; lastSyncStatus: string | null }): HealthVerdict {
+export function dnsFilterHealth(row: { isActive: boolean; lastSyncStatus: string | null; stale?: boolean }): HealthVerdict {
   if (!row.isActive) return RETIRED;
   const s = dnsState(row);
   if (s.state === 'error') return transient('sync_failed');
+  if (row.stale) return transient('sync_stale');
   return s.state === 'linked' ? HEALTHY : UNKNOWN;
 }
 
@@ -316,11 +319,20 @@ export function m365ConnectionHealth(row: { status: string; lastErrorCode: strin
  * sync reports unknown instead of opening a second incident. No rows = the
  * connection was disconnected (lifecycle deletes them).
  */
-export function m365SyncHealth(connectionStatus: string | null, domainStatuses: readonly (string | null)[]): HealthVerdict {
+export function m365SyncHealth(
+  connectionStatus: string | null,
+  domainStatuses: readonly (string | null)[],
+  opts: { anyStale?: boolean; syncEnabled?: boolean } = {},
+): HealthVerdict {
+  const { anyStale = false, syncEnabled = true } = opts;
+  // Tenant sync is dark by default: with the flag off no domain syncs, so
+  // nothing is judged here (a tracked incident closes silently, #10021 D7b).
+  if (!syncEnabled) return RETIRED;
   if (domainStatuses.length === 0) return RETIRED;
   if (connectionStatus !== 'active') return UNKNOWN;
   if (domainStatuses.includes('needs_consent')) return permanent('needs_consent');
   if (domainStatuses.includes('error')) return transient('sync_failed');
+  if (anyStale) return transient('sync_stale');
   return domainStatuses.some((s) => s !== null && SYNC_OK.has(s)) ? HEALTHY : UNKNOWN;
 }
 

@@ -148,6 +148,8 @@ const REVIEWED_PUBLIC_VARS: readonly string[] = [
   'GITHUB_REPO',
   'GOOGLE_WORKSPACE_ENABLED',
   'HP_WARRANTY_ENABLED',
+  'INTERNAL_API_HOSTS',
+  'INTERNAL_SERVICE_CIDRS',
   'IP_CLASSIFY_PROVIDER',
   'LENOVO_WARRANTY_ENABLED',
   'LLM_PROVIDER_CATALOG_ENABLED',
@@ -189,10 +191,12 @@ const REVIEWED_PUBLIC_VARS: readonly string[] = [
   'OAUTH_DCR_ENABLED',
   'OAUTH_DCR_REQUIRE_IAT',
   'OAUTH_ISSUER',
+  'OAUTH_REFRESH_ROTATION_GRACE_MS',
   'OAUTH_RESOURCE_URL',
   'OPS_ALERT_EMAIL',
   'OPS_ALERT_LABEL',
   'PORTAL_BASE_PATH',
+  'PORTAL_ENTRA_CLIENT_ID',
   'PUBLIC_ACTIVATION_BASE_URL',
   'PUBLIC_API_URL',
   'PUBLIC_APP_URL',
@@ -249,5 +253,18 @@ describe('reviewed secret:false vars', () => {
   it('the set of secret:false vars matches the reviewed list exactly', () => {
     const actual = allVars.filter((v) => v.secret === false).map((v) => v.name).sort();
     expect(actual).toEqual([...REVIEWED_PUBLIC_VARS].sort());
+  });
+});
+
+describe('flows entry follows the FLOWS_ENABLED default (on since #5221 R1)', () => {
+  const flows = CONNECTION_REGISTRY.find((entry) => entry.id === 'flows')!;
+  it.each([
+    [{}, 'enabled'],
+    [{ FLOWS_ENABLED: '' }, 'enabled'],
+    [{ FLOWS_ENABLED: 'true' }, 'enabled'],
+    [{ FLOWS_ENABLED: 'false' }, 'disabled'],
+    [{ FLOWS_ENABLED: '0' }, 'disabled'],
+  ] as const)('%j is %s', (env, expected) => {
+    expect(flows.status(env as Record<string, string>).status).toBe(expected);
   });
 });

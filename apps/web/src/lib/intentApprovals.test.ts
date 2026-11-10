@@ -368,6 +368,17 @@ describe('decideIntentApproval server rejections', () => {
     expect(toasted.message).not.toMatch(/failed to submit the decision/i);
     expect(toasted.message).toMatch(/organization-wide/i);
   });
+
+  it('maps a 403 approver_scope_required to translated copy, not the raw token or decideFailed', async () => {
+    fetchWithAuth.mockResolvedValue(
+      new Response(JSON.stringify({ error: 'approver_scope_required' }), { status: 403 }),
+    );
+    const rejection = await decideIntentApproval('ap-1', 'approve').catch((e: unknown) => e);
+    expect(rejection).toBeInstanceOf(ActionError);
+    const toasted = showToast.mock.calls[0][0] as { message: string };
+    expect(toasted.message).not.toMatch(/failed to submit the decision/i);
+    expect(toasted.message).toMatch(/partner-level approver/i);
+  });
 });
 
 /**
@@ -401,7 +412,7 @@ describe('decideIntentApproval — an approve the server refused', () => {
     expect(showToast).toHaveBeenCalledTimes(1);
     const toasted = showToast.mock.calls[0][0] as { type: string; message: string; detail?: string };
     expect(toasted.type).toBe('error');
-    expect(toasted.message).toMatch(/refused/i);
+    expect(toasted.message).toMatch(/your approval was blocked/i);
     expect(toasted.message).not.toMatch(/^action approved$/i);
     expect(toasted.detail).toBe(REFUSAL);
   });
@@ -420,7 +431,7 @@ describe('decideIntentApproval — an approve the server refused', () => {
     expect(showToast).toHaveBeenCalledTimes(1);
     const toasted = showToast.mock.calls[0][0] as { type: string; message: string; detail?: string };
     expect(toasted.type).toBe('error');
-    expect(toasted.message).toMatch(/refused/i);
+    expect(toasted.message).toMatch(/your approval was blocked/i);
     expect(toasted.detail).toBeUndefined();
   });
 

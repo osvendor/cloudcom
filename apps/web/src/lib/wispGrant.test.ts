@@ -11,6 +11,20 @@ const body = (grant: Record<string, unknown> = {}) => ({
   },
 });
 
+describe('wispStateFromThread firstLookState (#11145)', () => {
+  const withState = (firstLookState: unknown) => ({
+    data: { thread: { id: 't1' }, grant: { id: 'g1', status: 'active', expiresAt: '2027-01-01T00:00:00.000Z' }, firstLookState },
+  });
+
+  it.each(['looking', 'done', 'couldnt_look'])('keeps %s', (state) => {
+    expect(wispStateFromThread(withState(state))?.firstLookState).toBe(state);
+  });
+
+  it.each([[undefined], ['maybe'], [7]])('anything else (%s) is unknown, never a default', (value) => {
+    expect(wispStateFromThread(withState(value))?.firstLookState).toBeUndefined();
+  });
+});
+
 describe('wispStateFromThread W06 fields (A32 spend, A29 pause reason)', () => {
   it('carries the spend meter only when both halves are present', () => {
     expect(wispStateFromThread(body({ spentTodayCents: 42, budgetResetsAt: '2026-10-25T00:00:00.000Z' })))
@@ -18,6 +32,33 @@ describe('wispStateFromThread W06 fields (A32 spend, A29 pause reason)', () => {
     const half = wispStateFromThread(body({ spentTodayCents: 42 }))!;
     expect('spentTodayCents' in half).toBe(false);
   });
+  it('#10414: carries the background/chat breakdown when both are numbers; an older server parses as before', () => {
+    const base = { spentTodayCents: 200, budgetResetsAt: '2026-10-25T00:00:00.000Z' };
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(wispStateFromThread(body({ ...base, backgroundCents: 30, chatCents: 170 })))
+      .toMatchObject({ spentTodayCents: 200, backgroundCents: 30, chatCents: 170 });
+    const old = wispStateFromThread(body(base))!;
+    expect(old.spentTodayCents).toBe(200);
+    expect('backgroundCents' in old).toBe(false);
+    const bad = wispStateFromThread(body({ ...base, backgroundCents: 30, chatCents: 'x' }))!;
+    expect(bad.spentTodayCents).toBe(200);
+    expect('backgroundCents' in bad).toBe(false);
+    expect('chatCents' in bad).toBe(false);
+    expect(err).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
+  it('#10973: reads the effective unattended-reads switch, false unless literally true', () => {
+    expect(wispStateFromThread(body({ unattendedReads: true }))!.unattendedReads).toBe(true);
+    expect(wispStateFromThread(body({ unattendedReads: 'true' }))!.unattendedReads).toBe(false);
+    expect(wispStateFromThread(body({}))!.unattendedReads).toBe(false);
+  });
+
+  it('#10390: reads the session-notes switch, false unless literally true', () => {
+    expect(wispStateFromThread(body({ summaryRefine: true }))!.summaryRefine).toBe(true);
+    expect(wispStateFromThread(body({ summaryRefine: 'true' }))!.summaryRefine).toBe(false);
+    expect(wispStateFromThread(body({}))!.summaryRefine).toBe(false);
+  });
+
   it('leaves pausedReason unknown when the payload omits it, and reads it when present', () => {
     expect('pausedReason' in wispStateFromThread(body({ status: 'paused' }))!).toBe(false);
     expect(wispStateFromThread(body({ status: 'paused', pausedReason: 'user_paused' }))!.pausedReason).toBe('user_paused');
@@ -42,6 +83,23 @@ describe('wispGrant owns its org scoping (no ambient orgId injection)', () => {
     expect(fetchWithAuth).toHaveBeenLastCalledWith('/wisp/thread', { skipOrgIdInjection: true });
     await fetchWispThread('org-1');
     expect(fetchWithAuth).toHaveBeenLastCalledWith('/wisp/thread?orgId=org-1', { skipOrgIdInjection: true });
+  });
+
+  it('fetchWispThread: no grant for the scope (200 { data: null }, or a pre-#10200 404 no_active_grant) rejects as isNoActiveGrant (#10200)', async () => {
+    const { fetchWithAuth } = await import('@/stores/auth');
+    const { fetchWispThread, isNoActiveGrant } = await import('./wispGrant');
+    const outcome = (p: Promise<unknown>) => p.then(() => 'resolved', (err: unknown) => (isNoActiveGrant(err) ? 'noGrant' : 'failed'));
+    vi.mocked(fetchWithAuth).mockResolvedValueOnce(res({ data: null }));
+    expect(await outcome(fetchWispThread('org-1'))).toBe('noGrant');
+    vi.mocked(fetchWithAuth).mockResolvedValueOnce(res({ code: 'no_active_grant', error: 'none' }, 404));
+    expect(await outcome(fetchWispThread('org-1'))).toBe('noGrant');
+    // A bare 404 (Wisp switched off at the hub), an unreadable 200 and a 500 are failures.
+    vi.mocked(fetchWithAuth).mockResolvedValueOnce(res({ error: 'Not found' }, 404));
+    expect(await outcome(fetchWispThread('org-1'))).toBe('failed');
+    vi.mocked(fetchWithAuth).mockResolvedValueOnce(res({ data: { thread: {} } }));
+    expect(await outcome(fetchWispThread('org-1'))).toBe('failed');
+    vi.mocked(fetchWithAuth).mockResolvedValueOnce(res({ code: 'no_active_grant' }, 500));
+    expect(await outcome(fetchWispThread('org-1'))).toBe('failed');
   });
 
   it('mintWispGrantStepUp({ orgId: null }) previews the partner-wide ceiling without the ambient org', async () => {

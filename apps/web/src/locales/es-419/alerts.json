@@ -31,6 +31,8 @@
     "confidenceValue": "{{confidence}}% confianza"
   },
   "alertDetailPage": {
+    "externalTickets": "Tickets externos",
+    "externalTicketsFailedToLoad": "No se pudieron cargar los tickets externos.",
     "loadingAlert": "Cargando alerta...",
     "backToAlerts": "Volver a alertas",
     "goBack": "Volver",
@@ -82,6 +84,21 @@
       "resolved": "Resuelto",
       "suppressed": "suprimido",
       "dismissed": "Descartado"
+    },
+    "createPsaTicket": "Crear ticket PSA",
+    "psaTicketRequested": "Ticket PSA solicitado",
+    "failedToCreatePsaTicket": "No se pudo solicitar el ticket PSA",
+    "lifecycleLine": {
+      "text": "{{rearm}} · enfriamiento {{minutes}} min ({{source}})",
+      "rearmNewEvidence": "Se rearma con evidencia nueva",
+      "rearmAfterDelay": "Se rearma después de {{minutes}} min",
+      "sources": {
+        "monitor": "este monitor",
+        "org": "valor predeterminado de la organización",
+        "partner": "valor predeterminado del partner",
+        "builtin": "valor predeterminado integrado",
+        "legacy": "regla de alerta"
+      }
     }
   },
   "alertDetails": {
@@ -652,6 +669,7 @@
       "info": "Información"
     },
     "status": {
+      "open": "Abierto",
       "active": "Activo",
       "acknowledged": "Reconocido",
       "resolved": "Resuelto",
@@ -965,5 +983,10 @@
       "body": "Las plantillas existentes siguen siendo editables aquí y se convertirán en la próxima versión.",
       "link": "Abrir Monitores"
     }
+  },
+  "subject": {
+    "label": "Elemento afectado",
+    "backupWorkload": "Carga de respaldo",
+    "topologySite": "Sitio de topología"
   }
 }

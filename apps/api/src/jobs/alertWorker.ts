@@ -57,6 +57,47 @@ export function scheduledAlertEvaluationOptions(
   };
 }
 
+/**
+ * Keep the fork's bounded per-process budget. Upstream contexts now release
+ * the connection between rules; Redis global concurrency remains authoritative.
+ */
+export function resolveAlertWorkerConcurrency(): number {
+  return Math.max(1, Math.min(10, envInt('ALERT_WORKER_CONCURRENCY', 2)));
+}
+
+const EVALUATE_ALL_INTERVAL_MS = 60 * 1000;
+const DEFAULT_STAGGER_WINDOW_MS = 50 * 1000;
+// Keep every staggered job due before the next evaluate-all tick.
+const MAX_STAGGER_WINDOW_MS = EVALUATE_ALL_INTERVAL_MS - 1000;
+
+/**
+ * #10859 — how far across the 60 s tick evaluate-all spreads the fleet's
+ * evaluate-device jobs. `ALERT_WORKER_STAGGER_WINDOW_MS` overrides the 50 s
+ * default; it is clamped to [0, 59 s], and 0 restores the old enqueue-all-now
+ * behaviour.
+ */
+export function resolveAlertStaggerWindowMs(): number {
+  const configured = envInt('ALERT_WORKER_STAGGER_WINDOW_MS', DEFAULT_STAGGER_WINDOW_MS);
+  return Math.min(Math.max(0, configured), MAX_STAGGER_WINDOW_MS);
+}
+
+/**
+ * The device's fixed offset within the window: a 32-bit FNV-1a hash of its id,
+ * modulo the window. A hash rather than the device's position in the sweep
+ * means a device keeps the same slot on every tick, so it is evaluated about
+ * every 60 s, and a device joining or leaving the fleet does not move anyone
+ * else's slot.
+ */
+export function evaluateDeviceStaggerDelayMs(deviceId: string, windowMs: number): number {
+  if (windowMs <= 0) return 0;
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < deviceId.length; i++) {
+    hash ^= deviceId.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0) % windowMs;
+}
+
 // Singleton queue instance
 let alertQueue: Queue | null = null;
 
@@ -129,11 +170,17 @@ export function createAlertWorker(): Worker<AlertJobData> {
           return await processEvaluateAll(data);
 
         case 'evaluate-device': {
-          const result = await runWithSystemDbAccess(() => processEvaluateDevice(data));
+          // #10859 — deliberately NOT wrapped. `evaluateDeviceAlerts` opens one
+          // short system context per unit of work (the rule lookup, each rule,
+          // the detach scan). A wrapper here would make each of those JOIN one
+          // transaction held across all of the device's rules: 2–6 s per
+          // device on a partner-wide monitor set, ~850 times an hour, which
+          // pinned the request pool and queued agent heartbeats behind it.
+          const result = await processEvaluateDevice(data);
           // W03 Task 10 — drain the committed subject-alert outbox only after
-          // this device's own evaluation transaction has committed. Retries
-          // even when a device is offline/unreachable on later ticks, so a
-          // crash between commit and dispatch does not strand an alert.
+          // every one of this device's evaluation transactions has committed.
+          // Retries even when a device is offline/unreachable on later ticks,
+          // so a crash between commit and dispatch does not strand an alert.
           await drainSubjectAlertOutbox(data.deviceId);
           return result;
         }
@@ -152,9 +199,7 @@ export function createAlertWorker(): Worker<AlertJobData> {
     },
     {
       connection: getBullMQConnection(),
-      // This is a per-process ceiling, not a replacement for a stricter
-      // Redis-persisted global concurrency budget (production may use one).
-      concurrency: Math.max(1, Math.min(10, envInt('ALERT_WORKER_CONCURRENCY', 2))),
+      concurrency: resolveAlertWorkerConcurrency(),
       lockDuration: 300_000,
       stalledInterval: 60_000,
       maxStalledCount: 2,
@@ -186,6 +231,8 @@ export async function processEvaluateAll(data: EvaluateAllJobData): Promise<{
   skipped: number;
   /** #6353 — orgs handed to the device-independent network_check sweep. */
   networkCheckOrgsQueued: number;
+  /** #10859 — due alert jobs with no free worker when this tick started (0 = keeping up). */
+  pendingFromPreviousTick?: number;
   durationMs: number;
 }> {
   const startTime = Date.now();
@@ -204,6 +251,7 @@ export async function processEvaluateAll(data: EvaluateAllJobData): Promise<{
   // env override; default 5000. Setting the env to 0 means "unlimited per run".
   const cap = data.batchSize ?? envInt('ALERT_WORKER_MAX_DEVICES_PER_RUN', 5000);
   const chunkSize = Math.max(1, envInt('ALERT_WORKER_CHUNK_SIZE', 500));
+  const staggerWindowMs = resolveAlertStaggerWindowMs();
 
   // Get all active organizations.
   //
@@ -241,6 +289,19 @@ export async function processEvaluateAll(data: EvaluateAllJobData): Promise<{
   let totalQueued = 0;
   let cursor: string | null = null;
 
+  // #10859 — sweep jobs are keyed by device, so a device whose previous
+  // evaluation is still waiting, delayed or running is silently skipped by
+  // BullMQ this tick. Make that visible: a job still waiting for a worker when
+  // a new tick starts means the worker is not keeping up with the fleet.
+  const pendingFromPreviousTick = await countPendingAlertJobs(queue);
+  if (pendingFromPreviousTick > 0) {
+    console.warn(
+      `[AlertWorker] ${pendingFromPreviousTick} alert jobs still pending from the previous tick; `
+      + 'devices with a pending evaluation are skipped this tick. '
+      + `Raise ALERT_WORKER_CONCURRENCY (now ${resolveAlertWorkerConcurrency()}) if this persists.`
+    );
+  }
+
   while (true) {
     const remaining = cap > 0 ? Math.max(0, cap - totalQueued) : chunkSize;
     if (cap > 0 && remaining === 0) {
@@ -272,6 +333,8 @@ export async function processEvaluateAll(data: EvaluateAllJobData): Promise<{
 
     if (chunk.length === 0) break;
 
+    // Spread the fleet across the tick, retaining tenant-scoped keep-last
+    // deduplication so an active evaluation receives one fresh successor.
     const jobs = chunk.map(device => ({
       name: 'evaluate-device',
       data: {
@@ -279,7 +342,10 @@ export async function processEvaluateAll(data: EvaluateAllJobData): Promise<{
         deviceId: device.id,
         orgId: device.orgId
       },
-      opts: scheduledAlertEvaluationOptions('device', device.orgId, device.id),
+      opts: {
+        ...scheduledAlertEvaluationOptions('device', device.orgId, device.id),
+        delay: evaluateDeviceStaggerDelayMs(device.id, staggerWindowMs),
+      }
     }));
 
     await queue.addBulk(jobs);
@@ -328,8 +394,29 @@ export async function processEvaluateAll(data: EvaluateAllJobData): Promise<{
     queued: totalQueued,
     skipped: 0,
     networkCheckOrgsQueued,
+    pendingFromPreviousTick,
     durationMs: Date.now() - startTime
   };
+}
+
+/**
+ * Jobs that are due but have no free worker: the only state more concurrency
+ * would drain. Not `delayed`: that always holds the next `repeat:` placeholder
+ * per scheduler, plus staggered jobs whose slot has not come up. A worker's
+ * fetch promotes every due delayed job to `waiting` (up to 1000 a call), and
+ * this code runs just after such a fetch, so overdue jobs are already counted
+ * here. Not `active`: those already have a worker, and include this
+ * evaluate-all plus auto-resolve, which fires on the same minute every other
+ * tick. Best-effort: a Redis error reads as 0 and never fails the sweep.
+ */
+async function countPendingAlertJobs(queue: Queue): Promise<number> {
+  try {
+    const counts = await queue.getJobCounts('waiting');
+    return counts.waiting ?? 0;
+  } catch (error) {
+    console.warn('[AlertWorker] Could not read alert queue backlog:', error);
+    return 0;
+  }
 }
 
 /**
@@ -393,7 +480,7 @@ async function processEvaluateDevice(data: EvaluateDeviceJobData): Promise<{
   try {
     // One fresh, RLS-scoped hierarchy for this evaluation only. Passing it
     // explicitly avoids repeated device/org/group reads in each resolver.
-    const hierarchy = await loadDeviceHierarchy(data.deviceId);
+    const hierarchy = await runWithSystemDbAccess(() => loadDeviceHierarchy(data.deviceId));
     const alertIds = hierarchy
       ? await evaluateDeviceAlerts(data.deviceId, { hierarchy })
       : [];

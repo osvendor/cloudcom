@@ -7,6 +7,7 @@ import { fetchWithAuth } from '../../stores/auth';
 import { useOrgStore } from '../../stores/orgStore';
 import { showToast } from '../shared/Toast';
 import { ALL_TABS } from './partnerSettings/tabRegistry';
+import { makePolicyView } from './portalAccess/viewFixture';
 import { PARTNERS_ME_FIXTURE } from './partnerSettings/partnersMeFixture';
 import { usePartnerSettingsDraftStore } from './partnerSettings/partnerSettingsDraftStore';
 import { getPolicy, putPolicy, type PolicyResponse } from '@/lib/api/callerVerification';
@@ -43,6 +44,7 @@ function routeFetch(routes: Record<string, Handler>) {
   fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
     const method = (init?.method ?? 'GET').toUpperCase();
     const handler = routes[`${method} ${url}`];
+    if (!handler && url === '/orgs/partners/me/portal-access-policy') return json({ data: makePolicyView({ kind: 'partner' }) });
     return handler ? handler(init) : json({ data: [] });
   });
 }
@@ -114,7 +116,7 @@ describe('PartnerSettingsPage header status and validity (W2 Task 18)', () => {
     await openTab(user, /^company$/i);
     expect(saveButton().disabled).toBe(true);
     expect(status().getAttribute('data-state')).toBe('invalid');
-    expect(status().textContent).toBe('Fix 1 field in AI Budgets to save.');
+    expect(status().textContent).toBe('Fix 1 field in AI Budgets & Limits to save.');
     await openTab(user, /^ai budgets/i);
     expect((screen.getByTestId('partner-ai-budget-thresholds-input') as HTMLInputElement).value).toBe('50,abc');
     expect(screen.getByTestId('partner-ai-budget-thresholds-error')).toBeTruthy();
@@ -133,11 +135,103 @@ describe('PartnerSettingsPage header status and validity (W2 Task 18)', () => {
 
   it('invalid maintenance window blocks Save', async () => {
     const user = await renderPage('#defaults');
-    const mw = screen.getByLabelText(/maintenance window/i) as HTMLInputElement;
+    const mw = screen.getByLabelText(/maintenance window/i, { selector: 'input' }) as HTMLInputElement;
     await user.clear(mw);
     await user.type(mw, 'whenever');
     expect(saveButton().disabled).toBe(true);
     expect(status().getAttribute('data-state')).toBe('invalid');
+  });
+
+  it('a minimum password length below the server floor is flagged inline and blocks Save (#10081)', async () => {
+    const user = await renderPage('#security');
+    const input = screen.getByLabelText('Minimum Password Length') as HTMLInputElement;
+    await user.clear(input);
+    await user.type(input, '2');
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+    expect(input.getAttribute('aria-describedby')).toBe('partner-security-min-length-error');
+    expect(screen.getByTestId('partner-security-min-length-error').textContent).toBe('Enter a whole number from 6 to 128.');
+    expect(saveButton().disabled).toBe(true);
+    expect(status().getAttribute('data-state')).toBe('invalid');
+    expect(status().textContent).toBe('Fix 1 field in Security to save.');
+    await user.clear(input);
+    await user.type(input, '8');
+    expect(input.getAttribute('aria-invalid')).toBeNull();
+    expect(saveButton().disabled).toBe(false);
+  });
+
+  it('a server 400 on a security limit is shown on that field, not as a raw toast blaming other tabs (#10081)', async () => {
+    const message = 'Too big: expected number to be <=5';
+    routeFetch({
+      'GET /orgs/partners/me': () => json(partnerWith()),
+      'PATCH /orgs/partners/me': () => json({
+        error: `settings.security.maxSessions: ${message}`,
+        details: { formErrors: [], fieldErrors: { 'settings.security.maxSessions': [message] } },
+      }, 400),
+    });
+    const user = await renderPage();
+    await user.type(screen.getByLabelText('City'), 'ville');
+    await openTab(user, /^security$/i);
+    const input = screen.getByLabelText('Max Concurrent Sessions');
+    await user.type(input, '8');
+    await user.click(saveButton());
+    await waitFor(() => expect(status().getAttribute('data-state')).toBe('invalid'));
+    expect(status().textContent).toBe('Fix 1 field in Security to save.');
+    expect(screen.getByTestId('partner-security-max-sessions-error').textContent).toBe(message);
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+    const errorToasts = showToastMock.mock.calls.map(([arg]) => arg as { type: string; message: string }).filter(a => a.type === 'error');
+    expect(errorToasts.map(a => a.message)).toEqual(['Settings not saved. Fix the highlighted field and save again.']);
+    // Changing the value clears the server's verdict on it; the unit is back to
+    // "last save failed", so Save is offered again.
+    await user.clear(input);
+    await user.type(input, '4');
+    expect(screen.queryByTestId('partner-security-max-sessions-error')).toBeNull();
+    expect(input.getAttribute('aria-invalid')).toBeNull();
+    expect(status().getAttribute('data-state')).toBe('failed');
+    expect(saveButton().disabled).toBe(false);
+  });
+
+  it('a successful save drops the server verdict, so re-entering the rejected value is not flagged (#10081)', async () => {
+    let reject = true;
+    routeFetch({
+      'GET /orgs/partners/me': () => json(partnerWith()),
+      'PATCH /orgs/partners/me': () => (reject
+        ? json({ error: 'settings.security.maxSessions: Too big', details: { formErrors: [], fieldErrors: { 'settings.security.maxSessions': ['Too big'] } } }, 400)
+        : json(partnerWith())),
+    });
+    const user = await renderPage('#security');
+    const input = screen.getByLabelText('Max Concurrent Sessions');
+    await user.type(input, '8');
+    await user.click(saveButton());
+    await waitFor(() => expect(screen.getByTestId('partner-security-max-sessions-error')).toBeTruthy());
+    reject = false;
+    await user.clear(input);
+    await user.type(input, '4');
+    await user.click(saveButton());
+    await waitFor(() => expect(status().getAttribute('data-state')).toBe('clean'));
+    await user.clear(input);
+    await user.type(input, '8');
+    expect(screen.queryByTestId('partner-security-max-sessions-error')).toBeNull();
+    expect(saveButton().disabled).toBe(false);
+  });
+
+  it('a field edited while its rejected save was in flight gets the full toast, not "fix the highlighted field" (#10081)', async () => {
+    let release!: (r: Response) => void;
+    routeFetch({
+      'GET /orgs/partners/me': () => json(partnerWith()),
+      'PATCH /orgs/partners/me': () => new Promise<Response>(r => { release = r; }),
+    });
+    const user = await renderPage('#security');
+    const input = screen.getByLabelText('Max Concurrent Sessions');
+    await user.type(input, '8');
+    await user.click(saveButton());
+    await user.type(input, '1');
+    await act(async () => {
+      release(json({ error: 'settings.security.maxSessions: Too big', details: { formErrors: [], fieldErrors: { 'settings.security.maxSessions': ['Too big'] } } }, 400));
+    });
+    await waitFor(() => expect(showToastMock.mock.calls.some(([a]) => (a as { type: string }).type === 'error')).toBe(true));
+    const errorToasts = showToastMock.mock.calls.map(([a]) => a as { type: string; message: string }).filter(a => a.type === 'error');
+    expect(errorToasts.map(a => a.message)).toEqual(['Max sessions: Too big']);
+    expect(screen.queryByTestId('partner-security-max-sessions-error')).toBeNull();
   });
 
   it('invalid link focuses the first invalid field', async () => {
@@ -338,6 +432,27 @@ describe('AI data policy saves through the header (W2 Task 22)', () => {
     await user.click(saveButton());
     await waitFor(() => expect(status().getAttribute('data-state')).toBe('clean'));
     expect((puts()[0][1] as RequestInit).body).toBe(JSON.stringify({ deviceFileReadLevel: 'off' }));
+  });
+});
+
+describe('Customer portal sign-in policy saves through the header (portal W3)', () => {
+  it('a registration-mode click marks Customer portal dirty and the header Save sends one PATCH with only the changed field', async () => {
+    const saved = makePolicyView({ kind: 'partner', capabilities: { selfRegistration: true } });
+    routeFetch({
+      'GET /orgs/partners/me': () => json(partnerWith()),
+      'GET /orgs/partners/me/portal-access-policy': () => json({ data: makePolicyView({ kind: 'partner', capabilities: { selfRegistration: true } }) }),
+      'PATCH /orgs/partners/me/portal-access-policy': () => json({ data: saved }),
+      'GET /orgs/partners/me/portal-access-requests/summary': () => json({ data: { pendingTotal: 0, orgs: [] } }),
+    });
+    const user = await renderPage('#customer-portal');
+    const patches = () => fetchMock.mock.calls.filter(([url, init]) => url === '/orgs/partners/me/portal-access-policy' && (init as RequestInit | undefined)?.method === 'PATCH');
+    await user.click(await screen.findByTestId('portal-access-policy-self-registration-approval'));
+    expect(patches()).toHaveLength(0);
+    expect(status().textContent).toBe('Unsaved changes in Customer portal.');
+    await user.click(saveButton());
+    await waitFor(() => expect(status().getAttribute('data-state')).toBe('clean'));
+    expect(patches()).toHaveLength(1);
+    expect(JSON.parse((patches()[0][1] as RequestInit).body as string)).toEqual({ selfRegistrationMode: 'approval' });
   });
 });
 

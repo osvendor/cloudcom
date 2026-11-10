@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { useWispInstructionCaptureStore } from './wispInstructionCaptureStore';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AiStreamEvent } from '@breeze/shared';
@@ -81,6 +82,54 @@ function makeActivePlan(): ActivePlan {
  * warning from the approver with every other test still green — the same
  * value-silently-discarded shape this whole change exists to remove.
  */
+describe('approval_resolved (#9431)', () => {
+  function harness() {
+    const h = { state: { ...makeState() } as StreamableState };
+    return {
+      get state() { return h.state; },
+      set: (fn: (s: StreamableState) => Partial<StreamableState>) => { h.state = { ...h.state, ...fn(h.state) }; },
+      get: () => h.state,
+    };
+  }
+  const card: AiStreamEvent = {
+    type: 'approval_required', executionId: 'e1', toolName: 'file_operations',
+    input: { action: 'delete' }, description: 'Delete a file',
+  };
+
+  it.each(['approved', 'not_approved', 'ended'] as const)(
+    'marks the matching card %s, decided wherever it was decided',
+    (outcome) => {
+      const h = harness();
+      processStreamEvent(card, h.set, h.get, null);
+      processStreamEvent({ type: 'approval_resolved', executionId: 'e1', outcome }, h.set, h.get, null);
+      expect(h.state.pendingApproval).toMatchObject({ executionId: 'e1', resolution: outcome });
+    },
+  );
+
+  it('leaves a different card alone', () => {
+    const h = harness();
+    processStreamEvent(card, h.set, h.get, null);
+    processStreamEvent({ type: 'approval_resolved', executionId: 'other', outcome: 'approved' }, h.set, h.get, null);
+    expect(h.state.pendingApproval?.resolution).toBeUndefined();
+  });
+
+  it('done removes a resolved card but leaves an undecided one', () => {
+    const h = harness();
+    processStreamEvent(card, h.set, h.get, null);
+    processStreamEvent({ type: 'done' }, h.set, h.get, null);
+    expect(h.state.pendingApproval?.executionId).toBe('e1');
+    processStreamEvent({ type: 'approval_resolved', executionId: 'e1', outcome: 'not_approved' }, h.set, h.get, null);
+    processStreamEvent({ type: 'done' }, h.set, h.get, null);
+    expect(h.state.pendingApproval).toBeNull();
+  });
+
+  it('does not resurrect a card that is already gone', () => {
+    const h = harness();
+    processStreamEvent({ type: 'approval_resolved', executionId: 'e1', outcome: 'approved' }, h.set, h.get, null);
+    expect(h.state.pendingApproval).toBeNull();
+  });
+});
+
 describe('approval_required — scriptRunContext passthrough (#4888)', () => {
   const runContext = {
     effectiveRunAs: 'system' as const,
@@ -170,6 +219,42 @@ describe('approval_required — selfApprovalRequestId passthrough', () => {
  * ceremony at all. Dropping it here silently forces every supervised approve
  * through a passkey prompt the server stopped requiring.
  */
+describe('approval_required — pushedToPhone / waitingOn passthrough (#10416)', () => {
+  it('carries pushedToPhone and waitingOn into pendingApproval', () => {
+    const state = makeState();
+    let patch: Partial<StreamableState> = {};
+    processStreamEvent(
+      {
+        type: 'approval_required', executionId: 'e1', toolName: 'file_operations',
+        input: { action: 'read' }, description: 'Read a file',
+        pushedToPhone: true, waitingOn: 'other_approvers',
+      },
+      (fn) => { patch = { ...patch, ...fn({ ...state, ...patch }) }; },
+      () => ({ ...state, ...patch }),
+      null,
+    );
+    expect(patch.pendingApproval).toMatchObject({ pushedToPhone: true, waitingOn: 'other_approvers' });
+  });
+});
+
+describe('approval_required — standingInstructionConflict passthrough (W06)', () => {
+  it('carries standingInstructionConflict into pendingApproval', () => {
+    const state = makeState();
+    let patch: Partial<StreamableState> = {};
+    processStreamEvent(
+      {
+        type: 'approval_required', executionId: 'e1', toolName: 'execute_command',
+        input: {}, description: 'Reboot PC-01',
+        standingInstructionConflict: { text: "don't reboot PC-01" },
+      },
+      (fn) => { patch = { ...patch, ...fn({ ...state, ...patch }) }; },
+      () => ({ ...state, ...patch }),
+      null,
+    );
+    expect(patch.pendingApproval).toMatchObject({ standingInstructionConflict: { text: "don't reboot PC-01" } });
+  });
+});
+
 describe('approval_required — approvalScope passthrough (#5600)', () => {
   it('carries approvalScope into pendingApproval', () => {
     const state = makeState();
@@ -556,6 +641,34 @@ describe('execution-plane run events (spec §5.5)', () => {
     expect(patch.chatRuns!.r1!.artifacts[0]!.name).toBe('failed-logons.csv');
   });
 
+  it('carries an awaiting_approval result and its pending count onto the run', () => {
+    const state = makeState();
+    let patch: Partial<StreamableState> = {};
+    processStreamEvent(
+      { type: 'run_result', runId: 'r1', status: 'awaiting_approval', summary: 'needs approval', artifacts: [], pendingIntentCount: 2 },
+      (fn) => { patch = fn(state); },
+      () => state,
+      null,
+    );
+    expect(patch.chatRuns!.r1).toMatchObject({ status: 'awaiting_approval', pendingIntentCount: 2 });
+  });
+
+  it('a run_progress after an awaiting_approval result keeps the status and pending count', () => {
+    const state = makeState();
+    state.chatRuns = {
+      r1: { runId: 'r1', status: 'awaiting_approval', progress: [], summary: null, artifacts: [], pendingIntentCount: 2 },
+    };
+    let patch: Partial<StreamableState> = {};
+    processStreamEvent(
+      { type: 'run_progress', runId: 'r1', step: 'late', label: 'Late', ordinal: 3 },
+      (fn) => { patch = fn(state); },
+      () => state,
+      null,
+    );
+    expect(patch.chatRuns!.r1).toMatchObject({ status: 'awaiting_approval', pendingIntentCount: 2 });
+    expect(patch.chatRuns!.r1!.progress).toHaveLength(1);
+  });
+
   it('keeps the progress already collected when the result arrives', () => {
     const state = makeState();
     state.chatRuns = {
@@ -739,5 +852,30 @@ describe('turn_model staleness', () => {
     const set = (fn: (s: StreamableState) => Partial<StreamableState>) => { h.state = { ...h.state, ...fn(h.state) }; };
     processStreamEvent({ type: 'message_start', messageId: 'm2' } as AiStreamEvent, set, () => h.state, null);
     expect(h.state.turnModel).toBeNull();
+  });
+});
+
+describe('wisp instruction capture (done)', () => {
+  function harness() {
+    const h = { state: { ...makeState() } as StreamableState };
+    return {
+      set: (fn: (s: StreamableState) => Partial<StreamableState>) => { h.state = { ...h.state, ...fn(h.state) }; },
+      get: () => h.state,
+    };
+  }
+  it('tracks the capture on done when the event carries one', async () => {
+    const spy = vi.spyOn(useWispInstructionCaptureStore.getState(), 'trackCapture').mockImplementation(() => {});
+    const h = harness();
+    processStreamEvent({ type: 'done', wispInstructionCapture: { captureId: 'c-9' } }, h.set, h.get, null);
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledWith('s1', 'c-9'));
+    spy.mockRestore();
+  });
+  it('does not track on a plain done', async () => {
+    const spy = vi.spyOn(useWispInstructionCaptureStore.getState(), 'trackCapture').mockImplementation(() => {});
+    const h = harness();
+    processStreamEvent({ type: 'done' }, h.set, h.get, null);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
   });
 });

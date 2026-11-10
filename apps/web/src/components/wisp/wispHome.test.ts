@@ -1,10 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Concern, WispHomePayload } from '@breeze/shared';
 
-const h = vi.hoisted(() => ({ fetchWithAuth: vi.fn() }));
+const h = vi.hoisted(() => ({ fetchWithAuth: vi.fn(), showToast: vi.fn() }));
 vi.mock('@/stores/auth', () => ({ fetchWithAuth: h.fetchWithAuth }));
+vi.mock('@/components/shared/Toast', () => ({ showToast: h.showToast }));
 
-import { briefAge, emptyStateFor, fetchWispHome, fetchWispPartnerEnabled, homeSectionFromHash, needsYouOrder } from './wispHome';
+import { briefAge, emptyStateFor, fetchWispHome, fetchWispPartnerEnabled, homeSectionFromHash, needsYouOrder, saveBrowserTimezone } from './wispHome';
 
 const res = (status: number, body: unknown) => ({ ok: status >= 200 && status < 300, status, json: async () => body }) as Response;
 
@@ -14,7 +15,7 @@ const concern = (id: string, severity: Concern['severity'], approvalIntentId: st
 const homePayload = (over: Partial<WispHomePayload> = {}): WispHomePayload => ({
   thread: { id: 'th-1', grantId: 'g-1', summary: 'Watching Acme', summaryUpdatedAt: null, lastSessionId: null, focusOrgId: null, createdAt: '2026-10-24T08:00:00Z', updatedAt: '2026-10-24T08:00:00Z' },
   focusOrgName: null,
-  grant: { id: 'g-1', status: 'active', orgId: null, expiresAt: '2026-11-24T08:00:00Z', currentRevisionId: 'r-1', budgetCentsPerDay: 200, floorTickMinutes: 30, spentTodayCents: 12, budgetResetsAt: '2026-10-25T00:00:00Z', pausedReason: null },
+  grant: { id: 'g-1', status: 'active', orgId: null, expiresAt: '2026-11-24T08:00:00Z', currentRevisionId: 'r-1', budgetCentsPerDay: 200, floorTickMinutes: 30, spentTodayCents: 12, backgroundCents: 12, chatCents: 0, budgetResetsAt: '2026-10-25T00:00:00Z', pausedReason: null, unattendedReads: false, unattendedReadsPinned: false, summaryRefine: false },
   wideningAvailable: false,
   brief: null,
   needsYou: [],
@@ -22,7 +23,35 @@ const homePayload = (over: Partial<WispHomePayload> = {}): WispHomePayload => ({
   current: null,
   links: [],
   partner: { enabled: true },
+  briefSchedule: { timeLocal: '08:00', timezone: 'UTC', browserTimezone: null },
+  firstLookAt: null,
+  firstLookState: 'looking',
+  firstLookProgress: null,
   ...over,
+});
+
+describe('saveBrowserTimezone (#10402)', () => {
+  beforeEach(() => {
+    h.fetchWithAuth.mockReset();
+    h.showToast.mockReset();
+  });
+
+  it('PUTs the zone to the grantor-scoped route, with no ambient org and no toast', async () => {
+    h.fetchWithAuth.mockResolvedValue(res(200, { data: { timezone: 'America/Denver' } }));
+    await saveBrowserTimezone('America/Denver');
+    const [url, init] = h.fetchWithAuth.mock.calls[0] as [string, RequestInit & { skipOrgIdInjection?: boolean }];
+    expect(url).toBe('/wisp/nudge-preferences/browser-timezone');
+    expect(init.method).toBe('PUT');
+    expect(JSON.parse(String(init.body))).toEqual({ timezone: 'America/Denver' });
+    expect(init.skipOrgIdInjection).toBe(true);
+    expect(h.showToast).not.toHaveBeenCalled();
+  });
+
+  it('a failure rejects for the caller to log, and never toasts: the user did not ask for this', async () => {
+    h.fetchWithAuth.mockResolvedValue(res(400, { error: 'Unknown time zone' }));
+    await expect(saveBrowserTimezone('Mars/Olympus')).rejects.toThrow();
+    expect(h.showToast).not.toHaveBeenCalled();
+  });
 });
 
 describe('wispHome helpers (W08 Task 9)', () => {
@@ -80,9 +109,16 @@ describe('wispHome helpers (W08 Task 9)', () => {
     expect(out.payload.partner.enabled).toBe(true);
   });
 
-  it('fetchWispHome: 404 no_grant → noGrant; 403 entitlement_required → locked; other failures throw', async () => {
+  it('fetchWispHome: 200 { data: null } → noGrant; 403 entitlement_required → locked; other failures throw', async () => {
+    // #10200: no grant is a 200 with null data, not a 404 (a red console line on every visit).
+    h.fetchWithAuth.mockResolvedValueOnce(res(200, { data: null }));
+    expect(await fetchWispHome()).toEqual({ kind: 'noGrant' });
+    // A pre-#10200 API still answers 404 no_grant during a rolling deploy.
     h.fetchWithAuth.mockResolvedValueOnce(res(404, { code: 'no_grant' }));
     expect(await fetchWispHome()).toEqual({ kind: 'noGrant' });
+    // A bare 404 (the hub's answer while Wisp is off) is not "no grant".
+    h.fetchWithAuth.mockResolvedValueOnce(res(404, { error: 'Not found' }));
+    await expect(fetchWispHome()).rejects.toThrow();
     h.fetchWithAuth.mockResolvedValueOnce(res(403, { code: 'entitlement_required' }));
     expect(await fetchWispHome()).toEqual({ kind: 'locked' });
     // Any other 403 (e.g. a Partner Viewer without ai_sessions:use) is a permission refusal, not a load error (#10145).

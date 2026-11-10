@@ -204,6 +204,8 @@ async function admitEvaluatePolicy(policyId: string): Promise<{
 async function processConfigPolicyComplianceScan(): Promise<{
   rulesScanned: number;
   devicesEvaluated: number;
+  devicesFailed: number;
+  ruleSetsFailed: number;
 }> {
   try {
     return await commitThenEnqueue(async () => {
@@ -211,6 +213,8 @@ async function processConfigPolicyComplianceScan(): Promise<{
       return {
         rulesScanned: result.rulesScanned,
         devicesEvaluated: result.devicesEvaluated,
+        devicesFailed: result.devicesFailed,
+        ruleSetsFailed: result.ruleSetsFailed,
         ...(result.afterCommit ? { afterCommit: result.afterCommit } : {}),
       };
     });
@@ -220,7 +224,7 @@ async function processConfigPolicyComplianceScan(): Promise<{
         _configPolicyTableWarningLogged = true;
         console.warn('[PolicyEvaluationWorker] Config policy tables not found — run "pnpm db:migrate" to create them. Skipping compliance scan.');
       }
-      return { rulesScanned: 0, devicesEvaluated: 0 };
+      return { rulesScanned: 0, devicesEvaluated: 0, devicesFailed: 0, ruleSetsFailed: 0 };
     }
     throw error;
   }

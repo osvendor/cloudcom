@@ -34,6 +34,8 @@ import {
   statIconMap,
   statusConfig
 } from './backupDashboardHelpers';
+import { splitReparseSkipNotice, stripInlineIndexDropNote } from '@breeze/shared';
+import BackupFailureCategoryBadge from './BackupFailureCategoryBadge';
 import { useTranslation } from 'react-i18next';
 import '../../lib/i18n';
 
@@ -284,6 +286,7 @@ export default function BackupOverviewContent(props: BackupOverviewContentProps)
                 }
                 const status = mapped ?? statusConfig.warning;
                 const StatusIcon = status.icon;
+                const jobDiagnostic = splitReparseSkipNotice(stripInlineIndexDropNote(job.errorLog).warning).diagnostic;
                 return (
                   <div
                     key={job.id}
@@ -310,10 +313,13 @@ export default function BackupOverviewContent(props: BackupOverviewContentProps)
                         <span className="text-foreground">{status.label}</span>
                       </div>
                     </div>
-                    {job.errorLog ? (
+                    {/* #9543: skipped reparse points are informational and
+                        stay on the job's details, not in this red error line. */}
+                    {jobDiagnostic ? (
                       <div className="mt-3 flex items-start gap-2 rounded-md border border-destructive/20 bg-destructive/5 px-3 py-2 text-xs text-destructive">
                         <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                        <span className="line-clamp-2">{job.errorLog}</span>
+                        <BackupFailureCategoryBadge category={job.failureCategory} />
+                        <span className="line-clamp-2">{jobDiagnostic}</span>
                       </div>
                     ) : null}
                   </div>

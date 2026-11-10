@@ -32,29 +32,46 @@ export const DOMAIN_VOCABULARY: Readonly<Record<AiToolDomain, string>> = {
   monitoring: 'alerts and alert rules, monitors, incidents, logs, fixes and remediation, alert delivery and escalation, SLA and capacity',
   network: 'network assets and discovery, topology, connectivity diagnostics, links, IP and interface history, DNS filtering',
   security: 'security posture, configuration policies, CIS, compliance, audit and change logs, IOC hunts, scans, user risk, peripherals, elevation',
-  backup: 'backups and jobs, snapshots, restores, vaults, Hyper-V, SQL Server, disaster recovery plans, backup SLA',
+  backup: 'backups and jobs, snapshots, restores, vaults, Hyper-V, SQL Server, disaster recovery plans, backup SLA, VSS, verification',
   tickets: 'tickets, checklists, routing rules, time entries and timers, timesheets, business calendars, end-user messages',
-  billing: 'invoices, quotes, contracts, catalog items, distributor products',
-  accounts: 'organizations and sites, contacts, documents, deliverables, key dates',
+  billing: 'invoices, quotes, contracts, catalog items, distributor products, Pax8 orders',
+  accounts: 'organizations and sites, contacts, documents, deliverables, key dates, portal',
   integrations: 'EDR (SentinelOne, Huntress), Microsoft 365, Google Workspace, cloud-to-cloud backup, PSA, webhooks, notification channels',
-  admin: 'reports, data export, agent versions and logs, saved filters, invites, tenant deletion',
+  admin: 'reports, data export, agent versions and logs, saved filters, invites, tenant deletion, users and roles',
   ai: 'AI agents and their runs, stored result artifacts, workspace runs',
 };
 
 /**
  * W19-D3: the domains whose tool list a page pre-expands into the prompt.
- * Closed and keyed by page TYPE only: page context is client-supplied, so a
+ * Closed and keyed by page type/kind enums only: page context is client-supplied, so a
  * client string (`custom.label`/`data`) never picks a domain. ≤ 2 per page
  * (bound B3). Topology sessions are pinned to the topology read tools and run
  * their own restricted server, so they expand nothing.
  */
-export const PAGE_CONTEXT_TOOL_DOMAINS: Readonly<Record<AiPageContext['type'], readonly AiToolDomain[]>> = Object.freeze({
-  device: ['devices', 'scripts'],
-  alert: ['monitoring', 'devices'],
-  dashboard: [],
-  custom: [],
-  topology: [],
-});
+export function pageContextToolDomains(ctx: AiPageContext): readonly AiToolDomain[] {
+  switch (ctx.type) {
+    case 'device': return ['devices', 'scripts'];
+    case 'alert': return ['monitoring', 'devices'];
+    case 'dashboard':
+    case 'custom':
+    case 'topology': return [];
+    case 'record':
+      switch (ctx.kind) {
+        case 'ticket': return ['tickets'];
+        case 'quote':
+        case 'invoice':
+        case 'contract': return ['billing'];
+        case 'organization':
+        case 'site': return ['accounts'];
+        default:
+          ctx.kind satisfies never;
+          return [];
+      }
+    default:
+      ctx satisfies never;
+      return [];
+  }
+}
 
 export const MAX_INLINE_ACTIONS = 7;
 
@@ -155,9 +172,8 @@ export function renderAlwaysOnIndex(names: Iterable<string>): string {
  * section. '' when the page maps to no domain or none of its domains has a
  * tool in `names`.
  */
-export function renderPageContextToolBlocks(pageType: AiPageContext['type'], names: readonly string[]): string {
-  // Own keys only: a prototype name ('constructor') is never a page type.
-  const domains = Object.hasOwn(PAGE_CONTEXT_TOOL_DOMAINS, pageType) ? PAGE_CONTEXT_TOOL_DOMAINS[pageType] : [];
+export function renderPageContextToolBlocks(ctx: AiPageContext, names: readonly string[]): string {
+  const domains = pageContextToolDomains(ctx);
   const blocks = domains
     .map((domain) => renderDomainBlock(domain, names))
     .filter((block) => block.length > 0);

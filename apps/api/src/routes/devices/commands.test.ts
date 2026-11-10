@@ -1,4 +1,7 @@
+const isolationOwner = vi.hoisted(() => vi.fn(async () => null as unknown));
+vi.mock('../../services/networkIsolation/episodeStore', () => ({ findEpisodeByCommand: isolationOwner }));
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { Hono } from 'hono';
 
 vi.mock('../../services/stepUpActorAssurance', () => ({ lockActorAssurance: vi.fn(async () => true) }));
@@ -121,6 +124,11 @@ vi.mock('../../middleware/auth', async (importOriginal) => {
   };
 });
 
+vi.mock('./commandOrgScope', async () => {
+  const { sql } = await import('drizzle-orm');
+  return { deviceCommandsInCurrentOrg: vi.fn(async () => sql`command_org_scope`) };
+});
+
 vi.mock('./helpers', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./helpers')>()),
   getPagination: vi.fn(() => ({ page: 1, limit: 50, offset: 0 })),
@@ -191,10 +199,11 @@ vi.mock('../../services/authEpochs', () => ({
 }));
 
 import { commandsRoutes } from './commands';
-import { db, runAfterDbContextCommit } from '../../db';
+import { deviceCommandsInCurrentOrg } from './commandOrgScope';
+import { db, runAfterDbContextCommit, withDbAccessContext } from '../../db';
 import { getDeviceWithOrgCheck } from './helpers';
 import { writeRouteAudit } from '../../services/auditEvents';
-import { dispatchWake } from '../../services/wakeOnLan';
+import { dispatchWake, type WakePrepared, type WakeSuccess } from '../../services/wakeOnLan';
 import { TrustDeniedError } from '../../services/partnerTrust.commands';
 import { consumeStepUpGrant, maintenanceResourceDigest, validateStepUpGrant } from '../../services/mfaStepUpGrant';
 import { propagateCancelledDeviceCommand, cancelDeviceCommands } from '../../services/commandCancelPropagation';
@@ -243,6 +252,31 @@ describe('device commands routes', () => {
     );
     app = new Hono();
     app.route('/devices', commandsRoutes);
+  });
+
+  describe('network isolation route ownership', () => {
+    const deviceId = '11111111-1111-4111-8111-111111111111';
+    it.each([
+      ['single', 'execute_containment'], ['bulk', 'execute_containment'],
+      ['single', 'release_containment'], ['bulk', 'release_containment'],
+    ])('rejects %s %s before dispatch', async (kind, type) => {
+      const response = await app.request(kind === 'bulk' ? '/devices/bulk/commands' : `/devices/${deviceId}/commands`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type, payload: { actionType: 'network_isolation' }, ...(kind === 'bulk' ? { deviceIds: [deviceId] } : {}) }),
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: 'use_network_isolation_routes' });
+      expect(dispatchDeviceCommandMock).not.toHaveBeenCalled();
+    });
+    it('preserves process_kill admission', async () => {
+      vi.mocked(getDeviceWithOrgCheck).mockResolvedValueOnce({ id: deviceId, orgId: 'org-123', status: 'online' } as never);
+      const payload = { actionType: 'process_kill', parameters: { pid: 1234 } };
+      const response = await app.request(`/devices/${deviceId}/commands`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'execute_containment', payload }),
+      });
+      expect(response.status).toBe(201);
+      expect(dispatchDeviceCommandMock).toHaveBeenCalledWith(expect.objectContaining({ type: 'execute_containment', payload }));
+    });
   });
 
   describe('time management command admission', () => {
@@ -726,9 +760,92 @@ describe('device commands routes', () => {
       expect(body.queuedOffline).toEqual([]);
     });
 
+    describe('single wake (type=wake)', () => {
+      const id = '11111111-1111-1111-1111-111111111111';
+      const prepared = { ok: true as const, commandId: 'cmd', wakeAttemptId: 'attempt', targetDeviceId: id,
+        targetHostname: 'target', relayDeviceId: 'relay', relayHostname: 'relay', network: '192.0.2.0',
+        broadcast: '192.0.2.255', maskSource: 'agent' as const, macs: ['02:00:00:00:00:01'] };
+      const send = () => app.request(`/devices/${id}/commands`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'wake' }),
+      });
+
+      beforeEach(() => {
+        vi.mocked(getDeviceWithOrgCheck).mockResolvedValue({ id, orgId: 'org-123', status: 'offline', hostname: 'target' } as never);
+      });
+
+      it('commits the attempt and command before delivering to the relay', async () => {
+        const events: string[] = [];
+        vi.mocked(withDbAccessContext).mockImplementation(async (_ctx, fn) => {
+          events.push('begin');
+          const value = await fn();
+          events.push('commit');
+          return value;
+        });
+        vi.mocked(dispatchWake).mockImplementationOnce(async () => {
+          events.push('prepare');
+          return { ...prepared, deliver: async () => { events.push('send'); return prepared; } };
+        });
+        try {
+          const res = await send();
+          expect(res.status).toBe(202);
+          expect(await res.json()).toMatchObject({ id: 'cmd', status: 'sent', wakeAttemptId: 'attempt' });
+          expect(events).toEqual(['begin', 'prepare', 'commit', 'send']);
+        } finally {
+          vi.mocked(withDbAccessContext).mockImplementation(async (_ctx, fn) => fn());
+        }
+      });
+
+      it('returns 412 when delivery fails after the commit', async () => {
+        vi.mocked(dispatchWake).mockResolvedValueOnce({ ...prepared, deliver: async () => (
+          { ok: false as const, code: 'WS_SEND_FAILED' as const, message: 'Relay agent went offline' }
+        ) });
+        const res = await send();
+        expect(res.status).toBe(412);
+        expect(await res.json()).toEqual({ error: 'Relay agent went offline', code: 'WS_SEND_FAILED' });
+      });
+
+      it('returns 412 without delivering when preparation refuses', async () => {
+        vi.mocked(dispatchWake).mockResolvedValueOnce({ ok: false, code: 'TARGET_ONLINE', message: 'Device is online' });
+        const res = await send();
+        expect(res.status).toBe(412);
+        expect(await res.json()).toEqual({ error: 'Device is online', code: 'TARGET_ONLINE' });
+      });
+    });
+
     describe('bulk-wake (type=wake)', () => {
+      const prepared = (result: WakeSuccess): WakePrepared => ({ ...result, deliver: async () => result });
       const onlineDevice = (id: string) =>
         ({ id, orgId: 'org-123', status: 'online', hostname: `host-${id.slice(0, 4)}` } as never);
+
+      it('commits each wake before delivery and before preparing the next device', async () => {
+        const ids = ['11111111-1111-1111-1111-111111111111', '22222222-2222-2222-2222-222222222222'];
+        const events: string[] = [];
+        vi.mocked(withDbAccessContext).mockImplementation(async (_ctx, fn) => {
+          events.push('begin');
+          const value = await fn();
+          events.push('commit');
+          return value;
+        });
+        vi.mocked(getDeviceWithOrgCheck).mockImplementation(async id => onlineDevice(id));
+        vi.mocked(dispatchWake).mockImplementation(async (id) => {
+          events.push(`prepare:${id}`);
+          const result = { ok: true as const, commandId: id, wakeAttemptId: id, targetDeviceId: id,
+            targetHostname: 'target', relayDeviceId: 'relay', relayHostname: 'relay', network: '192.0.2.0',
+            broadcast: '192.0.2.255', maskSource: 'agent' as const, macs: ['02:00:00:00:00:01'] };
+          return { ...result, deliver: async () => { events.push(`send:${id}`); return result; } };
+        });
+        try {
+          const response = await app.request('/devices/bulk/commands', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceIds: ids, type: 'wake' }),
+          });
+          expect(response.status).toBe(202);
+          expect((await response.json()).succeeded).toHaveLength(2);
+          expect(events).toEqual(ids.flatMap(id => ['begin', `prepare:${id}`, 'commit', `send:${id}`]));
+        } finally {
+          vi.mocked(withDbAccessContext).mockImplementation(async (_ctx, fn) => fn());
+        }
+      });
 
       it('iterates dispatchWake per device and returns per-device outcomes with a shared bulkId', async () => {
         // 3 devices: 2 wake-able, 1 with no relay
@@ -738,7 +855,7 @@ describe('device commands routes', () => {
           .mockResolvedValueOnce(onlineDevice('33333333-3333-3333-3333-333333333333'));
 
         vi.mocked(dispatchWake)
-          .mockResolvedValueOnce({
+          .mockResolvedValueOnce(prepared({
             ok: true,
             commandId: 'cmd-1',
             wakeAttemptId: 'wake-1',
@@ -750,13 +867,13 @@ describe('device commands routes', () => {
             broadcast: '10.10.10.255',
             maskSource: 'agent',
             macs: ['aa:bb:cc:dd:ee:01'],
-          })
+          }))
           .mockResolvedValueOnce({
             ok: false,
             code: 'NO_RELAY',
             message: 'No online peer agent is available at the target\'s site and subnet to relay the Wake-on-LAN packet.',
           })
-          .mockResolvedValueOnce({
+          .mockResolvedValueOnce(prepared({
             ok: true,
             commandId: 'cmd-3',
             wakeAttemptId: 'wake-3',
@@ -768,7 +885,7 @@ describe('device commands routes', () => {
             broadcast: '10.10.20.255',
             maskSource: 'agent',
             macs: ['aa:bb:cc:dd:ee:03'],
-          });
+          }));
 
         const res = await app.request('/devices/bulk/commands', {
           method: 'POST',
@@ -1174,6 +1291,10 @@ describe('device commands routes', () => {
   function mockMaintenanceTx(row: Record<string, unknown> | null) {
     const calls: string[] = [];
     const captured: Array<Record<string, unknown>> = [];
+    // The predicate handed to the lease UPDATE, kept so a test can COMPILE it.
+    // It is the only place the route's choice of device id is observable here:
+    // the digest folds case internally, and the audit reads the returned row.
+    const updateWheres: unknown[] = [];
     const txSelect = vi.fn(() => ({
       from: vi.fn(() => ({
         where: vi.fn(() => ({
@@ -1185,11 +1306,11 @@ describe('device commands routes', () => {
       set: vi.fn((values: Record<string, unknown>) => {
         captured.push(values);
         calls.push('update');
-        return { where: vi.fn(() => ({ returning: vi.fn(async () => [{ ...row, ...values }]) })) };
+        return { where: vi.fn((cond: unknown) => { updateWheres.push(cond); return { returning: vi.fn(async () => [{ ...row, ...values }]) }; }) };
       }),
     }));
     vi.mocked(db.transaction).mockImplementation(async (fn: any) => fn({ select: txSelect, update: txUpdate }));
-    return { calls, captured, txSelect, txUpdate };
+    return { calls, captured, txSelect, txUpdate, updateWheres };
   }
 
   describe('POST /devices/bulk/maintenance', () => {
@@ -1401,6 +1522,32 @@ describe('device commands routes', () => {
       expect(db.transaction).not.toHaveBeenCalled();
     });
 
+    // ---- #10119: the route dedups through the same helper the digest uses, so
+    // two spellings of one device are one device — one lease, one audit row,
+    // and a digest equal to the single-spelling set.
+    it('#10119 treats two spellings of one device as one device', async () => {
+      const HEX = 'abcdef12-3456-4789-8abc-def012345678';
+      vi.mocked(getDeviceWithOrgCheck).mockImplementation(async (id: string) => row(id) as never);
+      mockBulkTx([row(HEX)]);
+
+      const res = await bulkPost({
+        deviceIds: [HEX, HEX.toUpperCase()],
+        reason: 'scheduled patching', durationHours: 2, stepUpGrant: GRANT,
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.succeeded).toHaveLength(1);
+      expect(body.failed).toEqual([]);
+      expect(validateStepUpGrant).toHaveBeenCalledWith(GRANT, expect.objectContaining({
+        resourceDigest: maintenanceResourceDigest({ deviceIds: [HEX], reason: 'scheduled patching', durationHours: 2 }),
+      }));
+      const deviceAudits = vi.mocked(writeRouteAudit).mock.calls
+        .map((call) => call[1] as any)
+        .filter((r) => r.resourceId === HEX);
+      expect(deviceAudits).toHaveLength(1);
+    });
+
     it('is registered BEFORE /:id/maintenance so "bulk" is not read as a device id', async () => {
       stubLookups();
       mockMaintenanceTx(row(ids.ok));
@@ -1507,6 +1654,41 @@ describe('device commands routes', () => {
         action: 'device.maintenance.enable',
         details: expect.objectContaining({ reason: 'scheduled patching', durationHours: 2, stepUp: 'grant' }),
       }));
+    });
+
+    // ---- #10119: an uppercase uuid in the path must bind, lease and audit the
+    // CANONICAL id. Hex LETTERS are required: this file's other ids are
+    // digit-only, and `toUpperCase()` on those is a no-op, so a case test built
+    // on them would pass against unfixed code (*Quality review* rule 7).
+    it('#10119 binds, leases and audits the canonical device id on an uppercase path', async () => {
+      const HEX = 'abcdef12-3456-4789-8abc-def012345678';
+      vi.mocked(getDeviceWithOrgCheck).mockResolvedValueOnce(deviceRow({ id: HEX }) as never);
+      const { captured, updateWheres } = mockMaintenanceTx(deviceRow({ id: HEX }));
+
+      const res = await app.request(`/devices/${HEX.toUpperCase()}/maintenance`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer token' },
+        body: enterBody(),
+      });
+
+      expect(res.status).toBe(200);
+      // The lookup still receives the RAW spelling — that is what resolves it.
+      expect(getDeviceWithOrgCheck).toHaveBeenCalledWith(HEX.toUpperCase(), expect.anything());
+      // Everything after the lookup uses device.id.
+      const binding = {
+        userId: 'user-123', operation: 'device_maintenance', authEpoch: 1, mfaEpoch: 1, sid: 'sid-1',
+        resourceDigest: maintenanceResourceDigest({ deviceIds: [HEX], reason: 'scheduled patching', durationHours: 2 }),
+      };
+      expect(validateStepUpGrant).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111111', binding);
+      expect(consumeStepUpGrant).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111111', binding);
+      expect(writeRouteAudit).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ resourceId: HEX }));
+      expect(captured[0]).toMatchObject({ status: 'maintenance' });
+      // The discriminating assertion. The digest folds case internally and the
+      // audit reads the id off the returned row, so neither notices which
+      // spelling the route used; the lease predicate does. Compile it.
+      const { params } = new PgDialect().sqlToQuery(updateWheres[0] as never);
+      expect(params).toContain(HEX);
+      expect(params).not.toContain(HEX.toUpperCase());
     });
 
     // ---- T5: extension semantics.
@@ -1983,6 +2165,15 @@ describe('device commands routes', () => {
       );
     });
 
+    it('cancel: refuses episode-owned isolation and directs the operator to Release', async () => {
+      rigCancelTransaction({ existing: { id: COMMAND_ID, type: 'execute_containment', payload: { actionType: 'network_isolation' }, status: 'pending' }, updated: { id: COMMAND_ID } });
+      isolationOwner.mockResolvedValueOnce({ id: 'episode' });
+      const res = await app.request(`/devices/${DEVICE_ID}/commands/${COMMAND_ID}/cancel`, { method: 'POST', headers: { Authorization: 'Bearer token' } });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: 'Use Release to release this network isolation' });
+      expect(cancelDeviceCommands).not.toHaveBeenCalled();
+    });
+
     it('cancel: 409s when the command is not pending', async () => {
       rigCancelTransaction({ existing: { id: COMMAND_ID, type: 'reboot', payload: {}, status: 'sent' } });
 
@@ -2031,6 +2222,7 @@ describe('device commands routes', () => {
       expect(res.status).toBe(404);
       expect(txUpdate).not.toHaveBeenCalled();
       expect(cancelDeviceCommands).not.toHaveBeenCalled();
+      expect(deviceCommandsInCurrentOrg).toHaveBeenCalledWith(expect.objectContaining({ id: DEVICE_ID }));
     });
   });
 

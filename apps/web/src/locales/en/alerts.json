@@ -31,6 +31,8 @@
     "confidenceValue": "{{confidence}}% confidence"
   },
   "alertDetailPage": {
+    "externalTickets": "External tickets",
+    "externalTicketsFailedToLoad": "External tickets could not be loaded.",
     "loadingAlert": "Loading alert...",
     "backToAlerts": "Back to alerts",
     "goBack": "Go back",
@@ -82,6 +84,21 @@
       "resolved": "Resolved",
       "suppressed": "Suppressed",
       "dismissed": "Dismissed"
+    },
+    "createPsaTicket": "Create PSA ticket",
+    "psaTicketRequested": "PSA ticket requested",
+    "failedToCreatePsaTicket": "Failed to request PSA ticket",
+    "lifecycleLine": {
+      "text": "{{rearm}} · cooldown {{minutes}} min ({{source}})",
+      "rearmNewEvidence": "Re-arms on new evidence",
+      "rearmAfterDelay": "Re-arms after {{minutes}} min",
+      "sources": {
+        "monitor": "this monitor",
+        "org": "org default",
+        "partner": "partner default",
+        "builtin": "built-in default",
+        "legacy": "alert rule"
+      }
     }
   },
   "alertDetails": {
@@ -652,6 +669,7 @@
       "info": "Info"
     },
     "status": {
+      "open": "Open",
       "active": "Active",
       "acknowledged": "Acknowledged",
       "resolved": "Resolved",
@@ -965,5 +983,10 @@
       "body": "Existing templates stay editable here and convert in the next release.",
       "link": "Open Monitors"
     }
+  },
+  "subject": {
+    "label": "Subject",
+    "backupWorkload": "Backup workload",
+    "topologySite": "Topology site"
   }
 }

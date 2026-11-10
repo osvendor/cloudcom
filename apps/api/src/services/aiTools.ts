@@ -118,6 +118,36 @@ import { registerAuditBaselineTools } from './aiToolsAuditBaselines';
 import { registerSecurityPolicyTools } from './aiToolsSecurityPolicies';
 import { registerRecoveryKeyTools } from './aiToolsRecoveryKeys';
 import { registerPamRuleTools } from './aiToolsPamRules';
+import { registerSoftwareCatalogTools } from './aiToolsSoftwareCatalog';
+import { registerPackageSearchTools } from './aiToolsPackageSearch';
+import { registerSoftwareDeploymentTools } from './aiToolsSoftwareDeployments';
+import { registerDeviceSoftwareTools } from './aiToolsDeviceSoftware';
+import { registerSoftwareInventoryTools } from './aiToolsSoftwareInventory';
+import { registerFleetFindingTools } from './aiToolsFleetFindings';
+import { registerCustomFieldTools } from './aiToolsCustomFields';
+import { registerDeviceInventoryTools } from './aiToolsDeviceInventory';
+import { registerDeviceLinkTools } from './aiToolsDeviceLinks';
+import { registerManualAssetTools } from './aiToolsManualAssets';
+import { registerDeviceEventLogTools } from './aiToolsDeviceEventLog';
+import { registerTenantVariableTools } from './aiToolsTenantVariables';
+import { registerSupportSessionTools } from './aiToolsSupportSessions';
+import { registerPax8Tools } from './aiToolsPax8';
+import { registerPax8OrderTools } from './aiToolsPax8Orders';
+import { registerBackupVerificationTools } from './aiToolsBackupVerification';
+import { registerBackupRecoveryReadTools } from './aiToolsBackupRecoveryReads';
+import { registerC2CConfigTools } from './aiToolsC2CConfigs';
+import { registerOrgAdminReadTools } from './aiToolsOrgAdminReads';
+import { registerIdentityReadTools } from './aiToolsIdentityReads';
+import { registerOrgPortalSettingsTool } from './aiToolsOrgPortalSettings';
+import { registerReportRecipientsTool } from './aiToolsReportRecipients';
+import { registerAiAgentLaunchTools } from './aiToolsAiAgentLaunch';
+import { registerAiAgentScheduleTool } from './aiToolsAiAgentSchedules';
+import { registerFleetDesignTool } from './aiToolsFleetDesigns';
+import { registerBillingProfileTools } from './aiToolsBillingProfiles';
+import { registerBillingSettingsTools } from './aiToolsBillingSettings';
+import { registerContractTemplateTools } from './aiToolsContractTemplates';
+import { registerDeviceBillingTools } from './aiToolsDeviceBilling';
+import { registerAccountingSyncTools } from './aiToolsAccountingSync';
 import { registerTicketConfigTools } from './aiToolsTicketConfig';
 import { registerTicketChecklistTemplateTools } from './aiToolsTicketChecklistTemplates';
 import { registerTicketInboxTools } from './aiToolsTicketInbox';
@@ -137,12 +167,14 @@ import { registerDiagnosticAccessTools } from './aiToolsDiagnosticAccess';
 import { registerExportTools } from './aiToolsExport';
 import { registerArtifactTools } from './aiToolsArtifacts';
 import { registerTrustPageTools } from './aiToolsTrustPage';
+import { registerPartnerSettingsInheritanceTools } from './aiToolsPartnerSettingsInheritance';
 import { registerFlowTools } from './aiToolsFlows';
 import { registerBusinessCalendarTools } from './aiToolsBusinessCalendars';
 import { registerTicketRoutingTools } from './aiToolsTicketRouting';
 import { registerWispMemoryTools } from './wisp/memoryTools';
 import { registerWispConcernTools } from './wisp/concernTools';
 import { registerWispLinkTools } from './wisp/linkTools';
+import { registerWispCheckInTools } from './wisp/checkInTools';
 import { registerWispTools } from './aiToolsWisp';
 // M365 helpdesk tools are session-aware (handler signature includes a sessionId)
 // so they are NOT registered in the `aiTools` execution registry — they run via
@@ -157,6 +189,9 @@ import { applyHelperDeviceScope } from './helperToolFilter';
 // ============================================
 
 export type AiToolTier = 1 | 2 | 3 | 4;
+
+/** What `AiTool.validateBeforeFiling` returns: the call may be filed, or the handler's own refusal. */
+export type PreFilingVerdict = { ok: true } | { ok: false; error: string };
 
 export interface AiTool {
   definition: Anthropic.Tool;
@@ -193,6 +228,22 @@ export interface AiTool {
     auth: AuthContext,
     context?: ToolExecutionContext,
   ) => Promise<string>;
+  /**
+   * #11432: the refusal this tool's handler would return for `input` under
+   * `auth`, judged BEFORE an approval card or action intent is filed, so a
+   * person is never asked to approve a call that can only fail (an approved
+   * create that then ended "orgId is required"). The chat pre-tool gate
+   * (`createGatedSessionPreToolUse`, after RBAC and the rate limit) calls it
+   * under the auth the handler will run with: the session's tool auth, cut to
+   * the Wisp ceiling under a grant.
+   *
+   * Pure and synchronous: input and auth only, no I/O. Return `{ ok: true }`
+   * for anything it cannot judge from those alone (a row named by id, an input
+   * the schema refuses) and leave that to the handler. The handler keeps its
+   * own check as the backstop, so share one helper between them rather than
+   * restating the rule.
+   */
+  validateBeforeFiling?: (input: Record<string, unknown>, auth: AuthContext) => PreFilingVerdict;
   /**
    * Names of the tool's input properties that carry a device id (each a string
    * or string[]). When set, the central dispatch gates every supplied id
@@ -435,6 +486,49 @@ registerAuditBaselineTools(aiTools);
 registerSecurityPolicyTools(aiTools);
 registerRecoveryKeyTools(aiTools);
 registerPamRuleTools(aiTools);
+// Full-control W12 (#6782): software, fleet-finding and custom-field tools.
+registerSoftwareCatalogTools(aiTools);
+registerPackageSearchTools(aiTools);
+registerSoftwareDeploymentTools(aiTools);
+registerDeviceSoftwareTools(aiTools);
+registerSoftwareInventoryTools(aiTools);
+registerFleetFindingTools(aiTools);
+registerCustomFieldTools(aiTools);
+// Full-control W13 (#6783, PR A): device inventory reads and per-device records.
+registerDeviceInventoryTools(aiTools);
+registerDeviceLinkTools(aiTools);
+registerManualAssetTools(aiTools);
+// Full-control W13 (#6783, PR B): live event-log browse, tenant variables, Quick Support sessions.
+registerDeviceEventLogTools(aiTools);
+registerTenantVariableTools(aiTools);
+registerSupportSessionTools(aiTools);
+// Full-control W14 (#6784, PR A): billing lifecycle — rate cards, billing settings, agreement templates, signed
+// agreements, device billing (the contract / invoice read selectors live in aiToolsContracts / aiToolsBilling).
+registerBillingProfileTools(aiTools);
+registerPax8Tools(aiTools);
+registerPax8OrderTools(aiTools);
+// Full-control W17 (#6788): backup verification, VSS, recovery reads and C2C configs.
+registerBackupVerificationTools(aiTools);
+registerBackupRecoveryReadTools(aiTools);
+registerC2CConfigTools(aiTools);
+// Full-control W18 PR A (#6789): org admin reads (summary, readiness, audit retention, portal users) and the
+// read-only identity directory (Breeze logins, roles). No identity write is a tool (W18-1).
+registerOrgAdminReadTools(aiTools);
+registerIdentityReadTools(aiTools);
+// Full-control W18 PR B (#6789): the two supervised org-admin writers (portal settings with a four-eyes sensitive
+// action, report recipients).
+registerOrgPortalSettingsTool(aiTools);
+registerReportRecipientsTool(aiTools);
+// Full-control W16 PR A (#6786): the two supervised launch tools (patch-plan run, service-recovery operator task).
+registerAiAgentLaunchTools(aiTools);
+// Full-control W16 PR B (#6786): the schedule and Fleet Design multiplexers, each with four-eyes actions.
+registerAiAgentScheduleTool(aiTools);
+registerFleetDesignTool(aiTools);
+registerBillingSettingsTools(aiTools);
+registerContractTemplateTools(aiTools);
+registerDeviceBillingTools(aiTools);
+// Full-control W14 PR B (#6784): QuickBooks / Xero sync (generate_invoice lives on manage_contracts).
+registerAccountingSyncTools(aiTools);
 registerMessagingTools(aiTools);
 registerCatalogTools(aiTools);
 registerBillingTools(aiTools);
@@ -466,6 +560,8 @@ registerM365Tools(aiTools);
 registerExportTools(aiTools);
 registerArtifactTools(aiTools);
 registerTrustPageTools(aiTools);
+// #9763: partner settings inheritance read (twin of the two inheritance routes).
+registerPartnerSettingsInheritanceTools(aiTools);
 // Tool Catalog W03 (#5218): flow authoring tools, behind FLOWS_ENABLED.
 registerFlowTools(aiTools);
 registerBusinessCalendarTools(aiTools);
@@ -476,6 +572,8 @@ registerWispMemoryTools(aiTools);
 registerWispConcernTools(aiTools);
 // Wisp W08 thread links: same posture — inert without auth.wispGrant.
 registerWispLinkTools(aiTools);
+// Wisp check-in timers (#10991 W03): same posture — inert without auth.wispGrant.
+registerWispCheckInTools(aiTools);
 // Wisp W07 specialists: launch_specialist (inert without auth.wispGrant) and
 // the human-only approval carrier wisp_specialist_request.
 registerWispTools(aiTools);

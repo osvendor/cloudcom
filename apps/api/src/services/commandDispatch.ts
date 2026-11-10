@@ -4,8 +4,10 @@ import { deviceCommands, devices, organizations, peripheralPolicyDeviceStates } 
 import {
   partitionClaimable,
   POWER_STATE_BARRIER_TYPES,
+  prepareCommandRevalidations,
   type ClaimCancelReason,
   type ClaimHoldReason,
+  type CommandRevalidationPreparation,
 } from './commandClaimEligibility';
 import { isTransientLockError, pgErrorCode } from '../utils/pgErrors';
 import { terminalPayloadErasureSet } from './sensitiveCommandPayload';
@@ -28,6 +30,8 @@ import './topology/telemetryPollDelivery';
 // the requester's live RBAC — role/org-access/site — at claim time, same
 // rationale as the diagnostic import above).
 import './scriptCommandRevalidation';
+// Side-effect import: registers the vendor update revalidation (#11065).
+import './oemUpdates/revalidation';
 
 type DeviceCommandRow = typeof deviceCommands.$inferSelect;
 
@@ -79,8 +83,11 @@ export async function claimPendingCommandForDelivery(
   // `held` so the next heartbeat re-evaluates it, instead of failing the
   // caller's request.
   return withSystemDbAccessContext(async () => {
+    // #7268: revalidation inputs that live outside Postgres (Redis) are read
+    // here, on this connection, BEFORE the savepoint locks the command row.
+    const prepared = await prepareCommandRevalidations(db, { commandId });
     try {
-      return await claimInSavepoint(commandId, executedAt);
+      return await claimInSavepoint(commandId, executedAt, prepared);
     } catch (err) {
       if (!isTransientLockError(err)) throw err;
       console.warn('[commandDispatch] push claim lost a lock race; leaving the command pending', {
@@ -92,7 +99,11 @@ export async function claimPendingCommandForDelivery(
   });
 }
 
-async function claimInSavepoint(commandId: string, executedAt: Date): Promise<PushClaimOutcome> {
+async function claimInSavepoint(
+  commandId: string,
+  executedAt: Date,
+  prepared: CommandRevalidationPreparation,
+): Promise<PushClaimOutcome> {
   return db.transaction(async (tx): Promise<PushClaimOutcome> => {
     // The WebSocket push applies EXACTLY the claim-time eligibility the
     // heartbeat claim applies (`partitionClaimable`): parked-org, org drift
@@ -181,7 +192,7 @@ async function claimInSavepoint(commandId: string, executedAt: Date): Promise<Pu
           payload: candidate.payload,
         },
       ],
-      { inFlight },
+      { inFlight, prepared },
     );
     const cancel = cancelled.find((c) => c.id === candidate.id);
     if (cancel) return { status: 'cancelled', id: commandId, reason: cancel.reason };
@@ -340,6 +351,34 @@ export interface CommandClaimCaller extends CommandCallerIncarnation {
   agentId: string;
 }
 
+/**
+ * #10190 W07: the PAM apply worker adds `decidedBy` to a pam_apply_v2 only
+ * for a device reporting pamUserNotifyProtocolVersion >= 2, because older
+ * agents decode the payload with DisallowUnknownFields and refuse the whole
+ * apply. A row built for a v2 agent can still be claimed after the device
+ * rolled back to an older one, so a heartbeat claim hands a caller below 2
+ * the payload without the key. Only the delivered copy changes; the stored
+ * row keeps what was built. Every other command passes through untouched.
+ *
+ * The WebSocket push (pamActuationWorker -> claimPendingCommandForDelivery)
+ * sends the payload the worker built moments earlier from the capability it
+ * read in the same transaction; a downgrade inside that window is accepted:
+ * the older agent refuses the apply, which fails closed.
+ */
+export function stripPamApplyDecidedByForClaim<T extends { type: string; payload: unknown }>(
+  commands: T[],
+  capabilities: { pamUserNotifyProtocolVersion?: number } | undefined,
+): T[] {
+  if ((capabilities?.pamUserNotifyProtocolVersion ?? 0) >= 2) return commands;
+  return commands.map((command) => {
+    if (command.type !== 'pam_apply_v2') return command;
+    const payload = command.payload;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload) || !('decidedBy' in payload)) return command;
+    const { decidedBy: _omitted, ...rest } = payload as Record<string, unknown>;
+    return { ...command, payload: rest };
+  });
+}
+
 export async function claimPendingCommandsForDevice(
   caller: CommandClaimCaller,
   limit: number = 10,
@@ -353,6 +392,7 @@ export async function claimPendingCommandsForDevice(
     rollbackProtocolVersion?: number;
     pamLifetimeProtocolVersion?: number;
     pamReconciliationResetProtocolVersion?: number;
+    pamUserNotifyProtocolVersion?: number;
   },
 ): Promise<DeviceCommandRow[]> {
   // Only HTTP delivery paths (heartbeat responses) claim batches; the agent
@@ -360,6 +400,11 @@ export async function claimPendingCommandsForDevice(
   // connect-time/heartbeat_ack claims — no agent version ever consumed them),
   // so the per-frame payload budget that #2399 added here is gone with it.
   const deviceId = caller.deviceId;
+  // #7268: revalidation inputs that live outside Postgres (Redis) are read
+  // here, on the caller's connection, BEFORE the claim transaction takes its
+  // first `device_commands` row lock (the peripheral cancel or the parked-org
+  // refused-row cancel when they apply, otherwise the scan).
+  const prepared = await prepareCommandRevalidations(db, { deviceId, targetRole, typeAllowlist });
   return db.transaction(async (tx) => {
     const peripheralV2IsClaimable =
       typeAllowlist === undefined || typeAllowlist.includes('peripheral_policy_sync_v2');
@@ -411,6 +456,13 @@ export async function claimPendingCommandsForDevice(
     // but only builds implementing the evidence-preserving reset may claim it.
     if (targetRole === 'agent' && capabilities?.pamReconciliationResetProtocolVersion !== 1) {
       unsupportedProtocolTypes.push('pam_reconcile_v2');
+    }
+    // #8928: outcome notices need an agent that tracks the request and can
+    // render them (protocol 1, or 2 since #10190 W07). Unsupported rows stay
+    // pending and expire at their deliverBy.
+    const notifyVersion = capabilities?.pamUserNotifyProtocolVersion;
+    if (targetRole === 'agent' && notifyVersion !== 1 && notifyVersion !== 2) {
+      unsupportedProtocolTypes.push('pam_request_notify');
     }
 
     // A device parked in a holding org is claimed under the removal allowlist
@@ -516,6 +568,7 @@ export async function claimPendingCommandsForDevice(
       // whichever install's beat finds it — a device fact, not a caller fact.
       const { claimable } = await partitionClaimable(tx, dev, pendingCommands, {
         inFlight: inFlightRow?.inFlight ?? 0,
+        prepared,
       });
       const claimableIds = new Set(claimable.map((c) => c.id));
       // #8318 §6.4: delivery is a CALLER fact. A row stamped for an
@@ -563,6 +616,6 @@ export async function claimPendingCommandsForDevice(
       }
     }
 
-    return claimed;
+    return stripPamApplyDecidedByForClaim(claimed, capabilities);
   });
 }

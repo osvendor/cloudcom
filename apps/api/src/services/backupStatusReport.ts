@@ -20,6 +20,8 @@ import { backupStatusReportConfigSchema } from './reportConfigSchemas';
 import {
   BACKUP_STATUS_BUCKET_IDS,
   bucketForBackupStatus,
+  saasWorkloadLabel,
+  verifiedBootableState,
   EXTERNAL_BACKUP_STATUS_SEVERITY,
   type BackupHealth,
   type BackupHealthRow,
@@ -135,7 +137,8 @@ function toCsvRow(row: BackupHealthRow): Record<string, string | number | boolea
     organization: row.orgName,
     source: row.source,
     provider: row.providerLabel,
-    deviceType: row.osType,
+    deviceType: row.accountType === 'm365' || row.accountType === 'gws' ? 'saas' : row.osType,
+    workload: row.accountType === 'm365' || row.accountType === 'gws' ? row.dataSources.map(saasWorkloadLabel).join('; ') : null,
     accountType: row.accountType,
     status: row.status,
     health: row.health,
@@ -147,6 +150,9 @@ function toCsvRow(row: BackupHealthRow): Record<string, string | number | boolea
     errorsCount: row.errorsCount,
     dataSources: row.dataSources.join('; '),
     agentOnline: row.agentOnline,
+    verifiedBootable: verifiedBootableState(row),
+    verifiedBootableAt: row.verifiedBootableAt,
+    verifiedBootableFailedChecks: (row.verifiedBootableFailedChecks ?? []).join('; '),
   };
 }
 

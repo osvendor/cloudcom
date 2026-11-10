@@ -13,21 +13,24 @@ const h = vi.hoisted(() => ({
   calls: [] as string[],
   selectRows: [] as unknown[][],
   insertReturning: [] as Array<unknown[] | Error>,
-  updateReturning: [] as unknown[][],
+  updateReturning: [] as Array<unknown[] | Error>,
   executeRows: [] as unknown[][],
   inserts: [] as Array<{ values: Record<string, unknown>; conflict: 'nothing' | 'update'; opts: Record<string, unknown> }>,
   updates: [] as Array<{ set: Record<string, unknown>; where: unknown }>,
   executes: [] as unknown[],
+  selectWheres: [] as unknown[],
   rememberForGrant: vi.fn(),
   resolveGrantCeiling: vi.fn(),
   captureException: vi.fn(),
+  notifyNudgeResolved: vi.fn(),
 }));
 
 vi.mock('../../db', () => {
   const select = vi.fn(() => {
     h.calls.push('select');
     const chain: Record<string, unknown> = {};
-    for (const m of ['from', 'leftJoin', 'innerJoin', 'where', 'orderBy', 'limit']) chain[m] = () => chain;
+    for (const m of ['from', 'leftJoin', 'innerJoin', 'orderBy', 'limit']) chain[m] = () => chain;
+    chain.where = (w: unknown) => { h.selectWheres.push(w); return chain; };
     chain.then = (res: (v: unknown) => unknown, rej?: (e: unknown) => unknown) =>
       Promise.resolve(h.selectRows.shift() ?? []).then(res, rej);
     return chain;
@@ -58,7 +61,13 @@ vi.mock('../../db', () => {
       where: (where: unknown) => {
         h.calls.push('update');
         h.updates.push({ set, where });
-        return Object.assign(Promise.resolve(undefined), { returning: async () => h.updateReturning.shift() ?? [] });
+        return Object.assign(Promise.resolve(undefined), {
+          returning: async () => {
+            const r = h.updateReturning.shift() ?? [];
+            if (r instanceof Error) throw r;
+            return r;
+          },
+        });
       },
     }),
   }));
@@ -82,16 +91,21 @@ vi.mock('./grantAuthority', async (importOriginal) => {
 });
 vi.mock('./memoryBroker', () => ({ rememberForGrant: h.rememberForGrant }));
 vi.mock('../sentry', () => ({ captureException: h.captureException }));
+vi.mock('./nudgeResolved', () => ({ notifyNudgeResolved: h.notifyNudgeResolved }));
 
+import { getCurrentDbAccessContext, runOutsideDbContext } from '../../db';
 import { CeilingViolationError, GrantInactiveError, type GrantCeiling } from './grantAuthority';
 import {
   ConcernNotFoundError,
+  ConcernSubjectHeldError,
   isDigestOnly,
+  isLiveConcernRaisedByGrant,
   listConcernsForCeiling,
   nextBackoff,
   recordNudge,
   resolveConcern,
   resolveConcernBySignature,
+  resolveConcernsForAlert,
   upsertConcern,
 } from './concerns';
 
@@ -125,9 +139,11 @@ beforeEach(() => {
   h.inserts.length = 0;
   h.updates.length = 0;
   h.executes.length = 0;
+  h.selectWheres.length = 0;
   h.rememberForGrant.mockReset().mockResolvedValue({ id: 'block' });
   h.resolveGrantCeiling.mockReset().mockResolvedValue(ceiling());
   h.captureException.mockReset();
+  h.notifyNudgeResolved.mockReset().mockResolvedValue(undefined);
 });
 
 describe('nextBackoff', () => {
@@ -169,13 +185,33 @@ describe('upsertConcern', () => {
     expect(h.updates).toEqual([]);
   });
 
-  it('a unique violation on the other live index returns created:false instead of throwing', async () => {
+  // #10386: a signature-keyed insert that collides on the SUBJECT index with a
+  // different concern is not "the same concern" — returning that row's id let
+  // the readiness note overwrite a model-raised HIGH concern.
+  it('a signature insert blocked by a different live concern on the subject throws ConcernSubjectHeldError', async () => {
     const err = Object.assign(new Error('duplicate key'), { code: '23505', constraint_name: 'wisp_concerns_live_subject_uq' });
     h.insertReturning.push(err);
     h.selectRows.push([]); // no live row by signature
     h.selectRows.push([{ id: 'by-subject' }]);
-    await expect(upsertConcern({ ...baseInput, signature: 'readiness:x' })).resolves.toEqual({ id: 'by-subject', created: false });
+    const thrown = await upsertConcern({ ...baseInput, signature: 'readiness:x' }).catch((e: unknown) => e);
+    expect(thrown).toBeInstanceOf(ConcernSubjectHeldError);
+    expect(thrown).toMatchObject({ code: 'concern_subject_held', heldByConcernId: 'by-subject', signature: 'readiness:x' });
     expect(h.updates).toEqual([]);
+  });
+
+  it('a subject-index violation whose signature row turned up meanwhile is that row (created:false)', async () => {
+    const err = Object.assign(new Error('duplicate key'), { code: '23505', constraint_name: 'wisp_concerns_live_subject_uq' });
+    h.insertReturning.push(err);
+    h.selectRows.push([{ id: 'by-signature' }]);
+    await expect(upsertConcern({ ...baseInput, signature: 'readiness:x' })).resolves.toEqual({ id: 'by-signature', created: false });
+  });
+
+  it('a subject-index violation whose holder vanished before the read retries the insert', async () => {
+    const err = Object.assign(new Error('duplicate key'), { code: '23505', constraint_name: 'wisp_concerns_live_subject_uq' });
+    h.insertReturning.push(err, [{ id: C1 }]);
+    h.selectRows.push([], []); // neither by signature nor by subject
+    await expect(upsertConcern({ ...baseInput, signature: 'readiness:x' })).resolves.toEqual({ id: C1, created: true });
+    expect(h.inserts).toHaveLength(2);
   });
 
   it('a non-unique error escapes', async () => {
@@ -243,6 +279,117 @@ describe('resolveConcern', () => {
     h.rememberForGrant.mockRejectedValueOnce(new Error('db down'));
     await expect(resolveConcern(C1, { grantId: G1 }, 'fixed')).resolves.toEqual({ resolved: true, remembered: false });
     expect(h.captureException).toHaveBeenCalledTimes(1);
+  });
+});
+
+// #11427: a concern Wisp nudged about that closes by any path (assessment,
+// alert, person, reaper) tells the person, once, that no action is needed —
+// when the resolution is committed.
+describe('resolveConcern → resolved-nudge follow-up (#11427)', () => {
+  it('a real transition hands the concern to the follow-up once, outside any DB context', async () => {
+    h.updateReturning.push([resolvedRow]);
+    await expect(resolveConcern(C1, { userId: 'u1' }, 'fixed')).resolves.toEqual({ resolved: true, remembered: false });
+    expect(h.notifyNudgeResolved).toHaveBeenCalledTimes(1);
+    expect(h.notifyNudgeResolved).toHaveBeenCalledWith(C1);
+    expect(vi.mocked(runOutsideDbContext)).toHaveBeenCalled();
+  });
+
+  it("inside a caller's system transaction (resolution not committed) it is skipped with a trace; the resolve stands", async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.mocked(getCurrentDbAccessContext).mockReturnValue({ scope: 'system' } as never);
+    try {
+      h.updateReturning.push([resolvedRow]);
+      await expect(resolveConcern(C1, {}, 'superseded_no_effective_agent')).resolves.toEqual({ resolved: true, remembered: false });
+      expect(h.notifyNudgeResolved).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('no resolved-nudge follow-up'), { concernId: C1 });
+    } finally {
+      vi.mocked(getCurrentDbAccessContext).mockReturnValue(undefined);
+      warn.mockRestore();
+    }
+  });
+
+  it('runs on the grant path too (after the memory write)', async () => {
+    h.updateReturning.push([resolvedRow]);
+    h.selectRows.push([{ currentRevisionId: R1 }]);
+    await expect(resolveConcern(C1, { grantId: G1 }, 'customer replied')).resolves.toEqual({ resolved: true, remembered: true });
+    expect(h.notifyNudgeResolved).toHaveBeenCalledWith(C1);
+  });
+
+  it('a second resolve of the same concern (already closed) sends no follow-up', async () => {
+    h.updateReturning.push([resolvedRow]);
+    await resolveConcern(C1, {}, 'fixed');
+    h.updateReturning.push([]);
+    await expect(resolveConcern(C1, {}, 'fixed')).resolves.toEqual({ resolved: false, remembered: false });
+    expect(h.notifyNudgeResolved).toHaveBeenCalledTimes(1);
+  });
+
+  it('a failing follow-up never fails the resolve: it is captured and the result stands', async () => {
+    h.updateReturning.push([resolvedRow]);
+    h.notifyNudgeResolved.mockRejectedValueOnce(new Error('notify down'));
+    await expect(resolveConcern(C1, {}, 'fixed')).resolves.toEqual({ resolved: true, remembered: false });
+    expect(h.captureException).toHaveBeenCalledTimes(1);
+    expect(h.captureException.mock.calls[0]![2]).toMatchObject({ concernId: C1, op: 'wisp.concerns.resolve.nudgeResolved' });
+  });
+});
+
+describe('resolveConcernsForAlert (#11427)', () => {
+  const ALERT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const C2 = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+  const render = (w: unknown) => new PgDialect().sqlToQuery(w as SQL);
+
+  it("resolves every live concern of the alert's org whose evidence names the alert (alertId or rebootAlertId), outcome alert_resolved", async () => {
+    h.selectRows.push([{ id: C1 }, { id: C2 }]);
+    h.updateReturning.push([resolvedRow], [{ ...resolvedRow, id: C2 }]);
+    await expect(resolveConcernsForAlert(ALERT, O1)).resolves.toEqual({ resolved: 2 });
+    expect(h.updates.map((u) => u.set)).toEqual([
+      expect.objectContaining({ status: 'resolved', outcome: 'alert_resolved', resolvedByUserId: null }),
+      expect.objectContaining({ status: 'resolved', outcome: 'alert_resolved', resolvedByUserId: null }),
+    ]);
+    // No grant: nothing is remembered as Wisp-authored memory.
+    expect(h.rememberForGrant).not.toHaveBeenCalled();
+    expect(h.notifyNudgeResolved).toHaveBeenCalledTimes(2);
+  });
+
+  it("is scoped to the alert's org and live statuses, and matches both evidence keys", async () => {
+    h.selectRows.push([]);
+    await resolveConcernsForAlert(ALERT, O1);
+    expect(h.calls).toEqual(['system', 'select']);
+    const { sql: text, params } = render(h.selectWheres[0]);
+    expect(text).toContain('"wisp_concerns"."org_id" = $');
+    expect(text).toContain('"wisp_concerns"."status" in');
+    expect(text).toContain(`->>'alertId'`);
+    expect(text).toContain(`->>'rebootAlertId'`);
+    expect(params).toEqual(expect.arrayContaining([O1, 'open', 'snoozed', ALERT]));
+    // Another org's id is never part of the query.
+    expect(params).not.toContain(O2);
+  });
+
+  it('nothing matching → no write; a concern closed meanwhile is not counted (idempotent)', async () => {
+    h.selectRows.push([]);
+    await expect(resolveConcernsForAlert(ALERT, O1)).resolves.toEqual({ resolved: 0 });
+    expect(h.updates).toHaveLength(0);
+
+    h.selectRows.push([{ id: C1 }]);
+    h.updateReturning.push([]);
+    await expect(resolveConcernsForAlert(ALERT, O1)).resolves.toEqual({ resolved: 0 });
+    expect(h.notifyNudgeResolved).not.toHaveBeenCalled();
+  });
+
+  it('one concern that fails to resolve is reported and never stops the rest', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    h.selectRows.push([{ id: C1 }, { id: C2 }]);
+    h.updateReturning.push(new Error('deadlock'), [{ ...resolvedRow, id: C2 }]);
+    await expect(resolveConcernsForAlert(ALERT, O1)).resolves.toEqual({ resolved: 1 });
+    expect(h.captureException).toHaveBeenCalledTimes(1);
+    expect(h.captureException.mock.calls[0]![2]).toMatchObject({ concernId: C1, alertId: ALERT, op: 'wisp.concerns.resolveForAlert' });
+    expect(h.notifyNudgeResolved).toHaveBeenCalledWith(C2);
+    err.mockRestore();
+  });
+
+  it('a non-uuid alert or org id queries nothing', async () => {
+    await expect(resolveConcernsForAlert('not-a-uuid', O1)).resolves.toEqual({ resolved: 0 });
+    await expect(resolveConcernsForAlert(ALERT, 'nope')).resolves.toEqual({ resolved: 0 });
+    expect(h.calls).toEqual([]);
   });
 });
 
@@ -358,5 +505,35 @@ describe('concern transition metrics', () => {
     h.updateReturning.push([resolvedRow]);
     await resolveConcern(C1, {}, 'done');
     expect(wm.incWispConcern).toHaveBeenCalledExactlyOnceWith('resolved');
+  });
+});
+
+// #10392: the gate's own-concern check behind card-less snooze/resolve in chat.
+describe('isLiveConcernRaisedByGrant', () => {
+  const render = (w: unknown) => new PgDialect().sqlToQuery(w as SQL);
+
+  it('is true only for a row matching visibility AND id AND raised_by_grant_id = this grant AND a live status', async () => {
+    h.selectRows.push([{ id: C1 }]);
+
+    expect(await isLiveConcernRaisedByGrant(ceiling(), C1)).toBe(true);
+
+    expect(h.calls).toEqual(['system', 'select']);
+    const { sql: text, params } = render(h.selectWheres[0]);
+    expect(text).toContain('"wisp_concerns"."partner_id" = $');
+    expect(text).toContain('"wisp_concerns"."org_id" in');
+    expect(text).toContain('"wisp_concerns"."id" = $');
+    expect(text).toContain('"wisp_concerns"."raised_by_grant_id" = $');
+    expect(text).toContain('"wisp_concerns"."status" in');
+    expect(params).toEqual(expect.arrayContaining([P1, O1, C1, G1, 'open', 'snoozed']));
+  });
+
+  it('is false when no row matches (raised by another grant, a person, closed, or not visible)', async () => {
+    h.selectRows.push([]);
+    expect(await isLiveConcernRaisedByGrant(ceiling(), C1)).toBe(false);
+  });
+
+  it('is false WITHOUT a query when the ceiling can see no concerns', async () => {
+    expect(await isLiveConcernRaisedByGrant(ceiling({ orgIds: new Set() }), C1)).toBe(false);
+    expect(h.calls).toEqual([]);
   });
 });

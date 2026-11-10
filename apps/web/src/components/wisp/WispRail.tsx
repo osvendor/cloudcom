@@ -1,6 +1,7 @@
+import type { Dispatch, SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Brain, MessagesSquare } from 'lucide-react';
-import type { Concern, CurrentActivity, WispThreadLink } from '@breeze/shared';
+import type { Concern, CurrentActivity, WispBriefSchedule, WispThreadLink } from '@breeze/shared';
 import type { WispState } from '@/stores/aiStore';
 import WispThreadHeader from '../ai/WispThreadHeader';
 import WispActivityPanel from './WispActivityPanel';
@@ -19,11 +20,13 @@ export type WispRailProps = {
   needsYou: Concern[] | null;
   /** Null hides the section. */
   links: WispThreadLink[] | null;
-  onLinksChange: (links: WispThreadLink[]) => void;
+  onLinksChange: Dispatch<SetStateAction<WispThreadLink[]>>;
   onWispChange: (patch: Partial<Wisp>) => void;
   onRevoked: () => void | Promise<void>;
   /** Bumped when a check starts or finishes: workers and activity reload. */
   activityKey: number;
+  /** The brief time and resolved zone (#10402). The thread page has no home payload, so it passes none. */
+  briefSchedule?: WispBriefSchedule | null;
 };
 
 const CHATS_HREF = '/ai/chat';
@@ -63,8 +66,13 @@ export default function WispRail({
   onWispChange,
   onRevoked,
   activityKey,
+  briefSchedule = null,
 }: WispRailProps) {
   const { t } = useTranslation(['ai', 'pages']);
+  // #10104: an ended delegation (revoked or expired) authorizes no reads; the
+  // concerns, activity and links routes answer 409 grant_inactive. Say so once
+  // instead of mounting panes that can only fail.
+  const ended = wisp.status === 'revoked' || wisp.status === 'expired';
 
   return (
     <div className="space-y-4" data-testid="wisp-rail">
@@ -82,28 +90,41 @@ export default function WispRail({
               onRevoked={onRevoked}
             />
           </div>
+          {!ended && briefSchedule?.timeLocal && (
+            <p data-testid="wisp-rail-brief-at" className="text-xs text-muted-foreground">
+              {t('ai:wisp.welcome.briefAt', { time: briefSchedule.timeLocal, timezone: briefSchedule.timezone })}
+            </p>
+          )}
         </WispIdentityCard>
       </div>
 
-      {needsYou !== null && (
-        <div className={NEEDS_YOU_BODY}>
-          <WispNeedsYou key={wisp.grantId} grantId={wisp.grantId} threadId={wisp.threadId} initial={needsYou} />
-        </div>
+      {ended ? (
+        <p className={`${BOX} px-4 py-3 text-sm text-muted-foreground`} data-testid="wisp-rail-ended" role="status">
+          {t('ai:wisp.rail.ended')}
+        </p>
+      ) : (
+        <>
+          {needsYou !== null && (
+            <div className={NEEDS_YOU_BODY}>
+              <WispNeedsYou key={wisp.grantId} grantId={wisp.grantId} threadId={wisp.threadId} initial={needsYou} refreshKey={activityKey} />
+            </div>
+          )}
+
+          <div className={BOX}>
+            <WispWorkersPanel threadId={wisp.threadId} refreshKey={activityKey} />
+          </div>
+
+          {links !== null && (
+            <div className={BOX}>
+              <WispLinksPanel threadId={wisp.threadId} links={links} onLinksChange={onLinksChange} canAdd={wisp.status === 'active'} />
+            </div>
+          )}
+
+          <section id="activity" className={BOX}>
+            <WispActivityPanel threadId={wisp.threadId} refreshKey={activityKey} collapsible />
+          </section>
+        </>
       )}
-
-      <div className={BOX}>
-        <WispWorkersPanel threadId={wisp.threadId} refreshKey={activityKey} />
-      </div>
-
-      {links !== null && (
-        <div className={BOX}>
-          <WispLinksPanel threadId={wisp.threadId} links={links} onLinksChange={onLinksChange} canAdd={wisp.status === 'active'} />
-        </div>
-      )}
-
-      <section id="activity" className={BOX}>
-        <WispActivityPanel threadId={wisp.threadId} refreshKey={activityKey} collapsible />
-      </section>
 
       <nav className="flex flex-wrap items-center gap-1 text-sm" aria-label={t('pages:titles.wisp')} data-testid="wisp-rail-nav">
         <a href={CHATS_HREF} data-testid="wisp-home-chats" className="flex items-center gap-1.5 rounded px-2 py-1 text-muted-foreground hover:bg-muted hover:text-foreground">

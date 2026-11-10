@@ -137,9 +137,14 @@
       "remove": "Retirer le fichier",
       "tooMany": "Vous pouvez joindre au plus {{max}} fichiers à un commentaire.",
       "tooLarge": "{{name}} dépasse 10 Mo.",
-      "sentWithoutAttachment_one": "Note publiée, mais la pièce jointe n'a pas pu être ajoutée. Réessayez ou retirez-la.",
-      "sentWithoutAttachment_other": "Note publiée, mais {{count}} pièces jointes n'ont pas pu être ajoutées. Réessayez ou retirez-les."
-    }
+      "rejectedType": "{{name}} n'a pas été joint : seuls les images JPEG, PNG et WebP et les PDF sont pris en charge.",
+      "rejectedEmpty": "{{name}} n'a pas été joint : le fichier est vide.",
+      "sentWithoutAttachmentReply_one": "Réponse publiée, mais la pièce jointe n'a pas pu être ajoutée. Réessayez ou retirez-la.",
+      "sentWithoutAttachmentNote_one": "Note publiée, mais la pièce jointe n'a pas pu être ajoutée. Réessayez ou retirez-la.",
+      "sentWithoutAttachmentReply_other": "Réponse publiée, mais {{count}} pièces jointes n'ont pas pu être ajoutées. Réessayez ou retirez-les.",
+      "sentWithoutAttachmentNote_other": "Note publiée, mais {{count}} pièces jointes n'ont pas pu être ajoutées. Réessayez ou retirez-les."
+    },
+    "modeLabel": "Visibilité du commentaire"
   },
   "ticketFeed": {
     "empty": "Pas encore d’activité.",
@@ -416,7 +421,18 @@
     },
     "filterByType": "Filtrer par type",
     "allTypes": "Tous les types",
-    "showMerged": "Afficher les fusionnés"
+    "showMerged": "Afficher les fusionnés",
+    "shortcutsButton": "Raccourcis",
+    "announce": {
+      "ticket": "{{number}} {{subject}}, priorité {{priority}}",
+      "ticketWithSla": "{{number}} {{subject}}, priorité {{priority}}, {{sla}}",
+      "sla": {
+        "ok": "SLA : temps restant {{relative}}",
+        "atRisk": "SLA à risque, temps restant {{relative}}",
+        "paused": "SLA en pause, temps restant {{relative}}",
+        "breached": "SLA en violation"
+      }
+    }
   },
   "ticketWorkbench": {
     "notFound": "Billet non trouvé. Il se peut qu’il ait été supprimé, ou que vous n’y ayez peut-être pas accès.",
@@ -566,7 +582,8 @@
       "pending": "Ce billet a été fusionné avec un autre billet le {{date}}.",
       "deleted": "Ce billet a été fusionné le {{date}} avec un billet qui a été supprimé ou que vous ne pouvez pas voir.",
       "open": "Ouvrir {{number}}",
-      "readOnly": "Les billets fusionnés sont en lecture seule. Répondez sur le billet avec lequel il a été fusionné."
+      "readOnly": "Les billets fusionnés sont en lecture seule. Répondez sur le billet avec lequel il a été fusionné.",
+      "railReadOnly": "Le temps, la facturation et les pièces sont en lecture seule sur un billet fusionné. Saisissez le temps et les pièces sur le billet avec lequel il a été fusionné."
     },
     "triage": {
       "title": "Triage suggéré",

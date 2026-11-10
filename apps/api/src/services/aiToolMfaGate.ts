@@ -30,6 +30,57 @@ export const MFA_GATED_TOOL_ACTIONS: Readonly<Record<string, '*' | readonly stri
   // routes/policyManagement/actions.ts POST /:id/deactivate.
   manage_compliance_policies: '*',
   // routes/pam.ts rule, org-config and signer-group writes.
+  // Full-control W12 (#6782, W12-D5): every W12 write's REST twin carries requireMfa().
+  manage_software_catalog: Object.freeze([
+    'create', 'update', 'archive', 'add_version', 'update_version', 'promote_version',
+    'add_install_method', 'update_install_method', 'delete_install_method', 'import_package',
+  ]),
+  manage_software_deployments: Object.freeze(['create', 'cancel', 'retry']),
+  manage_device_software: '*',
+  bootstrap_homebrew: '*',
+  manage_software_inventory: Object.freeze(['approve', 'deny', 'clear']),
+  manage_fleet_findings: '*',
+  manage_custom_fields: '*',
+  // Full-control W13 (#6783, W13-D6): every PR A write's REST twin carries requireMfa().
+  manage_device_function: Object.freeze(['set']),
+  manage_device_links: Object.freeze(['create', 'update', 'dissolve']),
+  manage_manual_assets: Object.freeze(['create', 'update', 'delete', 'link', 'unlink']),
+  manage_device_warranty: Object.freeze(['refresh']),
+  // Full-control W13 PR B (#6783): the system-tools router carries requireMfa() on every event-log route; tenant-variable
+  // writes and support-session end carry it too (reads stay ungated, as every wave's reads).
+  browse_device_event_log: '*',
+  manage_tenant_variables: Object.freeze(['create', 'update', 'delete']),
+  manage_support_sessions: Object.freeze(['end']),
+  // Full-control W14 (#6784, W14-D3): every billing-profile / work-type / assignment write and both settings writes
+  // carry requireMfa() at REST. Template and signed-agreement routes carry none, so those tools are not listed.
+  manage_billing_profiles: Object.freeze([
+    'create', 'update', 'archive', 'set_rows', 'clone', 'create_work_type', 'update_work_type',
+    'set_org_profile', 'clear_org_profile',
+  ]),
+  manage_billing_settings: Object.freeze(['update_partner', 'update_org']),
+  // Full-control W14 PR B (#6784): every interactive accounting write carries requireMfa() at REST. (POST
+  // /contracts/:id/generate carries none, so generate_invoice is not listed; it is four-eyes.)
+  manage_accounting_sync: Object.freeze(['link_mapping', 'unlink_mapping', 'sync_mapping', 'push', 'push_bulk']),
+  // W15 PR A (#6785): every Pax8 write mirrors requireMfa() at REST, including isMock preflight.
+  manage_pax8_subscriptions: Object.freeze(['sync', 'link', 'unlink']),
+  manage_pax8_orders: Object.freeze(['create_draft', 'add_line', 'update_line', 'remove_line', 'preflight', 'submit', 'reconcile']),
+  // Full-control W17 (#6788): POST /backup/verify and GET /backup/vss/status/:deviceId carry requireMfa(), the VSS read
+  // included (it runs a command on the machine); C2C config writes carry it too. Their reads carry none.
+  manage_backup_verification: Object.freeze(['run']),
+  get_vss_status: '*',
+  manage_c2c_configs: Object.freeze(['create', 'update', 'delete']),
+  // Full-control W18 PR B (#6789): PATCH /organizations/:id/portal-settings and POST /reports/:id/recipients/convert
+  // carry requireMfa(). Recipient add is gated too (Decision 5: it always needs reports:export + MFA on the tool); a
+  // remove that restores a series delivery is gated inside the shared operation (callerMaySetEmailRecipients).
+  manage_org_portal_settings: Object.freeze(['update', 'set_sensitive_access']),
+  manage_report_recipients: Object.freeze(['add', 'convert']),
+  // Full-control W16 PR A (#6786): POST /ai/patch-plan/runs and POST /ai/operator/tasks carry requireMfa().
+  run_patch_plan: '*',
+  create_operator_task: '*',
+  // Full-control W16 PR B (#6786): every schedule write carries requireMfa(), as do the Fleet Design run, preview, apply
+  // and rollback routes. GET applied and POST document do not.
+  manage_ai_agent_schedules: '*',
+  manage_fleet_designs: Object.freeze(['run', 'preview', 'apply', 'rollback']),
   manage_pam_rules: Object.freeze([
     'create_rule', 'update_rule', 'delete_rule', 'set_config',
     'create_signer_group', 'update_signer_group', 'delete_signer_group',

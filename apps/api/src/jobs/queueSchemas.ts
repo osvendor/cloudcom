@@ -130,6 +130,13 @@ export const backupQueueJobDataSchema = z.discriminatedUnion('type', [
     // that re-queue and when the wait began (ISO 8601), which bounds it.
     capabilityWaitAttempt: z.number().int().positive().optional(),
     capabilityWaitSince: z.string().datetime().optional(),
+    // #11013, set by the scheduler alone (never on a manual job, nor when the
+    // policy turned runMissedBackupsOnConnect off): how long this job may wait
+    // for an offline device. Absent means an offline device fails the job.
+    catchUpUntil: z.string().datetime().optional(),
+    // #11013: this dispatch was queued because the agent connected, for a job
+    // that is already waiting (backupEnqueue.enqueueBackupCatchUpDispatch).
+    catchUpDispatch: z.literal(true).optional(),
     meta: queueActorMetaSchema.optional(),
   }).strict(),
   z.object({
@@ -303,14 +310,23 @@ export const automationQueueJobDataSchema = z.discriminatedUnion('type', [
     automationId: z.string().min(1),
     slotKey: z.string().min(1),
     scanAt: z.string().min(1),
+    // #5221 B2 (Decision 6): `false` only when the scan read the row as
+    // SWITCHED. Absent ⇒ true: the scan read it unswitched, or the job predates
+    // the field (no row could be switched before this field existed). Legacy
+    // attempts such a job; the occurrence claim dedupes it against the flow.
+    enqueuedWhileUnswitched: z.boolean().optional(),
   }).strict(),
   z.object({
     type: z.literal('trigger-event'),
     automationId: z.string().min(1),
     eventType: z.string().min(1),
     eventId: z.string().min(1).optional(),
+    // Preserve the event tenant for partner-wide automation skip diagnostics.
+    eventOrgId: z.string().min(1).optional(),
     eventPayload: z.record(z.string(), z.unknown()).optional(),
     eventTimestamp: z.string().min(1),
+    // #5221 B2 — as trigger-schedule's: false only from the switched-row fan-out.
+    enqueuedWhileUnswitched: z.boolean().optional(),
   }).strict(),
   z.object({
     type: z.literal('execute-run'),
@@ -594,6 +610,14 @@ export const scriptVerifyQueueJobDataSchema = z.object({
   attempt: z.number().int().min(1),
 });
 export type ScriptVerifyQueueJobData = z.infer<typeof scriptVerifyQueueJobDataSchema>;
+// #8313 W4: `ticket-import` queue, one job per slice of a run (spec
+// 2026-10-19 §5.8). Only the slice whose seq equals the run's slice_seq runs.
+export const ticketImportSliceJobDataSchema = z.object({
+  runId: z.string().uuid(),
+  partnerId: z.string().uuid(),
+  seq: z.number().int().min(0),
+}).strict();
+export type TicketImportSliceJobData = z.infer<typeof ticketImportSliceJobDataSchema>;
 export type QueueActorMeta = z.infer<typeof queueActorMetaSchema>;
 // Note: NOT named RouteEventJobData/DeliverEventJobData — those canonical
 // interfaces are hand-written in services/eventDispatchQueue.ts (the
@@ -621,3 +645,14 @@ export const flowRunJobDataSchema = z.object({
   runId: z.string().uuid(),
 }).strict();
 export type FlowRunJobData = z.infer<typeof flowRunJobDataSchema>;
+
+// The delivery row owns the payload and retry state; Redis carries references only.
+export const webhookAttemptJobDataSchema = z.object({
+  deliveryId: z.string().uuid(),
+  webhookId: z.string().uuid(),
+  generation: z.number().int().min(0),
+  attemptsMade: z.number().int().min(0),
+}).strict();
+export type WebhookAttemptJobData = z.infer<typeof webhookAttemptJobDataSchema>;
+
+export const psaTicketingJobDataSchema = z.object({ mappingId: z.string().uuid(), op: z.enum(['create', 'close', 'note']) }).strict();

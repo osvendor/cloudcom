@@ -5,7 +5,7 @@ import { optionalJsonValidator, zValidator } from '../../lib/validation';
 import { and, asc, eq, gte, ne, sql, desc, inArray, type SQL } from 'drizzle-orm';
 import { deviceSearchCondition } from './searchFilter';
 import { db, runOutsideDbContext, withDbTransaction, withSystemDbAccessContext } from '../../db';
-import { createHash, randomBytes } from 'crypto';
+import { createHash, randomBytes, randomUUID } from 'crypto';
 import { getRedis } from '../../services/redis';
 import { invalidateOrgDeviceCount } from '../../services/agentOrgRateLimit';
 import { CLEARED_AGENT_CREDENTIALS } from '../../services/agentCredentialHashes';
@@ -15,6 +15,7 @@ import {
   deviceHardware,
   deviceHardwareHealth,
   deviceReliability,
+  deviceWarranty,
   deviceNetwork,
   deviceMetrics,
   deviceGroupMemberships,
@@ -26,20 +27,27 @@ import {
 } from '../../db/schema';
 import {
   authMiddleware,
+  hasSatisfiedMfa,
   isInteractiveUserSession,
   requireMfa,
   requireScope,
   requirePermission,
   type AuthContext,
 } from '../../middleware/auth';
-import { PERMISSIONS, type UserPermissions } from '../../services/permissions';
+import { PERMISSIONS, hasPermission, type UserPermissions } from '../../services/permissions';
 import {
   getPagination,
   getDeviceWithOrgAndSiteCheck,
   SITE_ACCESS_DENIED,
   projectPublicDevice,
 } from './helpers';
-import { listDevicesSchema, updateDeviceSchema, decommissionDeviceSchema } from './schemas';
+import {
+  listDevicesSchema,
+  updateDeviceSchema,
+  decommissionDeviceSchema,
+  permanentDeleteDeviceSchema,
+  remoteAccessLaunchSchema,
+} from './schemas';
 import {
   DEVICES_LIST_DEFAULT_LIMIT,
   DEVICES_LIST_HARD_MAX,
@@ -58,6 +66,7 @@ import {
   purgeRemovedDevice,
   restoreRemovedDevice,
   DeviceLifecycleError,
+  type PurgeResult,
 } from '../../services/deviceLifecycle';
 import { listDeviceScreenshotStorageKeys } from '../../services/screenshotStorage';
 import { removeScreenshotFiles } from '../../services/screenshotFiles';
@@ -65,6 +74,8 @@ import { resolveRemoteAccessForDevice } from '../../services/remoteAccessPolicy'
 import {
   resolveRemoteAccessLaunch,
   checkRemoteAccessLaunchAvailability,
+  listRemoteAccessProviderOptions,
+  type RemoteAccessProviderOption,
   type RemoteAccessLaunchResult,
   type RemoteAccessLaunchAvailability,
   type RemoteAccessLaunchSkipReason,
@@ -81,6 +92,7 @@ import {
 } from '../agentWs';
 import { terminateDeviceRemoteSessions, TEARDOWN_FAILED } from '../../services/remoteSessionTeardown';
 import { decommissionDeviceInTransaction } from '../../services/deviceDecommission';
+import { NetworkIsolationUnresolvedError } from '../../services/networkIsolation/lifecycle';
 import { getDeviceUninstallStatus } from '../../services/deviceUninstallState';
 import { getGlobalEnrollmentSecret } from '../agents/enrollment';
 import { assertTtlWithinCap } from '../../services/enrollmentDefaults';
@@ -329,6 +341,10 @@ const CORE_DEVICE_ORG_DENORMALIZED_TABLES = [
   'topology_device_presence',
   // W3 (#7887): same shape for the daily summaries — the same BEFORE trigger deletes them on an org change.
   'topology_device_presence_days',
+  // Network-isolation episodes (#10089): listed for the coverage contract, but never restamped — it is in
+  // CORE_DEVICE_ORG_MOVE_DELETE_TABLES (its (incident_id, org_id) names a source-org incident), and
+  // breeze_network_isolation_device_moved (BEFORE UPDATE OF org_id on devices) deletes resolved history first.
+  'device_network_isolations',
   'agent_health_observations', 'agent_logs', 'ai_screenshots', 'ai_sessions', 'alerts', 'asset_checkouts', 'asset_physical_placements',
   'audit_baseline_results', 'audit_policy_states',
   'automation_action_results', 'automation_run_device_results',
@@ -350,6 +366,12 @@ const CORE_DEVICE_ORG_DENORMALIZED_TABLES = [
   'device_ip_history', 'device_memory_modules',
   'device_metrics', 'device_mtls_certificates', 'device_network', 'device_patches',
   'device_process_samples', 'device_recovery_keys', 'device_registry_state',
+  // #11242 — derived per-device vendor update policy side; restamped by its composite FK's ON UPDATE CASCADE
+  // (also in DEVICE_ORG_FK_CASCADE_TABLES below).
+  'device_oem_policy_side',
+  // #11068 — vendor update status; restamped by its composite FK's ON UPDATE
+  // CASCADE (also in DEVICE_ORG_FK_CASCADE_TABLES below).
+  'device_oem_update_status',
   // #4755 — restore-checkpoint attempt ledger; restamped by its composite FK's
   // ON UPDATE CASCADE (also in DEVICE_ORG_FK_CASCADE_TABLES below).
   'device_restore_point_attempts',
@@ -357,6 +379,8 @@ const CORE_DEVICE_ORG_DENORMALIZED_TABLES = [
   'device_reliability', 'device_reliability_baselines', 'device_reliability_history', 'device_sessions', 'device_software_inventory_state',
   'device_time_daily',
   'device_time_status',
+  'device_wake_attempts',
+  'device_wake_status',
   'device_vulnerabilities', 'device_warranty',
   'device_workload_runtimes', 'device_workloads',
   'dns_event_aggregations', 'dns_security_events',
@@ -456,6 +480,12 @@ export const DEVICE_ORG_FK_CASCADE_TABLES: readonly string[] = [
   'device_restore_point_attempts',
   // #6960 W03 — composite (device_id, org_id) FK ON UPDATE CASCADE.
   'security_agent_device_status',
+  // #11068 — composite (device_id, org_id) FK ON UPDATE CASCADE.
+  'device_oem_update_status',
+  // #11242 — composite (device_id, org_id) FK ON UPDATE CASCADE.
+  'device_oem_policy_side',
+  'device_wake_attempts',
+  'device_wake_status',
 ];
 
 export function getDeviceOrgDenormalizedTables(): readonly string[] {
@@ -472,6 +502,12 @@ export const CORE_DEVICE_ORG_MOVE_DELETE_TABLES: readonly string[] = [
   'topology_device_presence',
   // W3 (#7887): day rows name source-org sites the same way; history does not cross orgs (prospective again).
   'topology_device_presence_days',
+  // Network isolation (#10089): (incident_id, org_id) and (incident_action_id, org_id) name SOURCE-org rows,
+  // so a restamp would 23503. Only resolved, confirmed history can reach this point: the BEFORE UPDATE OF
+  // org_id trigger breeze_network_isolation_device_moved deletes it before the flip and refuses a move while
+  // an episode is unresolved or a release tombstone is unconfirmed (the app-level refusal is W1c); audit_logs
+  // keep the record. This loop is the fallback.
+  'device_network_isolations',
 ];
 
 export function getDeviceOrgMoveDeleteTables(): readonly string[] {
@@ -701,12 +737,23 @@ const CORE_DEVICE_CASCADE_DELETE_TABLES = [
   'device_hardware_health',
   'device_time_daily',
   'device_time_status',
+  'device_wake_attempts',
+  'device_wake_status',
   'device_network', 'device_ip_history', 'device_disks', 'device_memory_modules',
   'device_metrics', 'device_software', 'device_registry_state', 'device_config_state',
   // Restore-checkpoint attempt ledger (#4755) — FK (device_id, org_id) ->
   // devices(id, org_id) ON DELETE CASCADE; leaf table, no children. Default
   // device_id predicate (no DEVICE_CASCADE_DELETE_PREDICATES entry).
   'device_restore_point_attempts',
+  // Vendor update policy side (#11242) — FK (device_id, org_id) -> devices(id, org_id)
+  // ON DELETE CASCADE; leaf table, no children.
+  'device_oem_policy_side',
+  // Vendor update status (#11068) — FK (device_id, org_id) -> devices(id, org_id)
+  // ON DELETE CASCADE; leaf table, no children.
+  'device_oem_update_status',
+  // Network-isolation episodes (#10089) — FK (device_id, org_id) -> devices(id, org_id) ON DELETE CASCADE;
+  // leaf table, no children. Device delete with an unresolved episode is refused upstream (W1c).
+  'device_network_isolations',
   'device_commands', 'device_connections', 'device_boot_metrics',
   'device_sessions', 'device_change_log', 'device_warranty', 'device_vulnerabilities',
   // #3834 — workload inventory: leaf tables, FK (device_id, org_id) ->
@@ -739,7 +786,8 @@ const CORE_DEVICE_CASCADE_DELETE_TABLES = [
   'software_compliance_status', 'software_policy_audit', 'software_remediation_requests',
   // Remote access
   'remote_sessions', 'tunnel_sessions',
-  // Monitoring & logs
+  // Monitoring & logs. Site-owned topology alerts detach before this sweep;
+  // only device-owned alerts still reference the device and are deleted.
   'service_process_check_results', 'alerts', 'agent_logs', 'script_executions',
   // #5291 W04 - probe results now name the device they ran FROM.
   'network_monitor_results',
@@ -1062,8 +1110,12 @@ coreRoutes.post(
     const key = `enroll_${randomBytes(24).toString('hex')}`;
     const keyHash = hashEnrollmentKey(key);
     const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
+    // #11116: chosen here, not by the column default, so the response can name
+    // the stored row without a RETURNING round trip.
+    const childKeyId = randomUUID();
 
     await db.insert(enrollmentKeys).values({
+      id: childKeyId,
       orgId,
       siteId,
       name: `Onboarding token (${new Date().toISOString().slice(0, 10)})`,
@@ -1079,6 +1131,9 @@ coreRoutes.post(
 
     return c.json({
       token: key,
+      // #11116: the minted key's row id (never the secret), so a client that
+      // remembers the token can check GET /enrollment-keys/:id before reusing it.
+      childKeyId,
       maxUsage,
       // #7035: echo the bound site so the UI can say where devices will land.
       siteId,
@@ -1226,6 +1281,13 @@ coreRoutes.get(
       )`);
     }
 
+    if (query.isolated !== undefined) {
+      // Keep the literal state predicate identical to the unresolved-episode partial index.
+      // The existing request RLS context scopes this correlated subquery too.
+      const isolated = sql`EXISTS (SELECT 1 FROM device_network_isolations WHERE device_id = ${devices.id} AND state NOT IN ('released', 'expired', 'failed', 'uninstalled'))`;
+      conditions.push(query.isolated === 'true' ? isolated : sql`NOT (${isolated})`);
+    }
+
     if (query.status) {
       conditions.push(eq(devices.status, query.status));
     }
@@ -1276,7 +1338,8 @@ coreRoutes.get(
     const fetchLimit = isCursorMode ? limit + 1 : limit;
     const offset = isCursorMode ? 0 : Math.max(0, ((Number.parseInt(query.page ?? '1', 10) || 1) - 1) * limit);
 
-    const rows = await db
+    const includeWarranty = query.includeWarranty === 'true';
+    const listQuery = db
       .select({
         id: devices.id,
         orgId: devices.orgId,
@@ -1347,6 +1410,8 @@ coreRoutes.get(
         cpuCores: deviceHardware.cpuCores,
         ramTotalMb: deviceHardware.ramTotalMb,
         diskTotalGb: deviceHardware.diskTotalGb,
+        serialNumber: deviceHardware.serialNumber,
+        productSku: deviceHardware.productSku,
         // Reliability headline score (#1720) — surfaced as a sortable list
         // column. device_reliability is org-scoped (RLS shape #1), so the
         // leftJoin stays tenant-safe; null when no score computed yet.
@@ -1357,6 +1422,12 @@ coreRoutes.get(
         // Hardware & RAID rollup (#6854 W04) — null when no report yet.
         hardwareHealth: deviceHardwareHealth.health,
         hardwareHealthSummary: deviceHardwareHealth.summary,
+        // #9863 — Warranty column. Stored status, the same value the device's
+        // Warranty card shows; null when no warranty row exists yet.
+        ...(includeWarranty ? {
+          warrantyEndDate: deviceWarranty.warrantyEndDate,
+          warrantyStatus: deviceWarranty.status,
+        } : {}),
         // RDS per-session helpers (plan 2 heartbeat ingest) — UI hint only,
         // see the truthy-guard comment in heartbeat.ts. Tasks 13/14 gate the
         // session picker on this being 'on-demand' at the list-row level.
@@ -1384,7 +1455,13 @@ coreRoutes.get(
       .from(devices)
       .leftJoin(deviceHardware, eq(devices.id, deviceHardware.deviceId))
       .leftJoin(deviceReliability, eq(devices.id, deviceReliability.deviceId))
-      .leftJoin(deviceHardwareHealth, eq(devices.id, deviceHardwareHealth.deviceId))
+      .leftJoin(deviceHardwareHealth, eq(devices.id, deviceHardwareHealth.deviceId));
+    // The default list keeps its existing joins and query budget. Warranty
+    // is opt-in, backed by a unique device_id index (manual assets cannot
+    // match); the org-scoped table's RLS also applies to this join.
+    const rows = await (includeWarranty
+      ? listQuery.leftJoin(deviceWarranty, eq(devices.id, deviceWarranty.deviceId))
+      : listQuery)
       .where(whereCondition)
       .orderBy(...orderBy)
       .limit(fetchLimit)
@@ -1572,7 +1649,9 @@ coreRoutes.get(
           cpuModel: d.cpuModel,
           cpuCores: d.cpuCores,
           ramTotalMb: d.ramTotalMb,
-          diskTotalGb: d.diskTotalGb
+          diskTotalGb: d.diskTotalGb,
+          serialNumber: d.serialNumber,
+          productSku: d.productSku
         },
         // Reliability column (#1720): null when the device has no computed
         // score yet (no device_reliability row) — the list renders a dash.
@@ -1581,6 +1660,8 @@ coreRoutes.get(
         reliabilityProvisional: d.reliabilityProvisional === true,
         hardwareHealth: d.hardwareHealth ?? null,
         hardwareHealthSummary: d.hardwareHealthSummary ?? null,
+        warrantyEndDate: d.warrantyEndDate ?? null,
+        warrantyStatus: d.warrantyStatus ?? null,
         helperLifecycleMode: d.helperLifecycleMode ?? null,
         // Selected above but historically the mapper is where list fields
         // get silently dropped (#800/#1273/#2138/#5701) — the #7068 stuck-
@@ -1781,8 +1862,15 @@ coreRoutes.get(
 
     let hasRemoteAccessLauncher = false;
     let remoteAccessLaunchSkipReason: RemoteAccessLaunchSkipReason | 'config_error' | null = null;
+    // #10922: the tools the Connect menu may offer for this device, and the one
+    // its primary click would launch. This route only needs devices:read, so the
+    // list follows the stricter gate GET /remote/providers already has
+    // (remote:access + MFA): reading a device must not widen who can see which
+    // remote tools the tenant uses. Without it the button simply has no menu.
+    let remoteAccessProviders: RemoteAccessProviderOption[] = [];
+    let remoteAccessDefaultProviderId: string | null = null;
     try {
-      const availability = await checkRemoteAccessLauncherAvailabilityForDevice(
+      const { availability, providerOptions } = await loadRemoteAccessLauncherViewForDevice(
         device.orgId,
         device.customFields as Record<string, unknown> | null,
         auth,
@@ -1792,6 +1880,16 @@ coreRoutes.get(
         hasRemoteAccessLauncher = true;
       } else {
         remoteAccessLaunchSkipReason = availability.skipReason;
+      }
+      // Inside the try so a failure here degrades to "no menu", never a 500
+      // for the whole device page.
+      const callerPermissions = c.get('permissions') as UserPermissions | undefined;
+      const mayChooseRemoteTool = !!callerPermissions
+        && hasPermission(callerPermissions, PERMISSIONS.REMOTE_ACCESS.resource, PERMISSIONS.REMOTE_ACCESS.action)
+        && hasSatisfiedMfa(auth);
+      if (mayChooseRemoteTool) {
+        remoteAccessProviders = providerOptions;
+        remoteAccessDefaultProviderId = availability.available ? availability.providerId : null;
       }
     } catch (err) {
       captureException(err, c);
@@ -1825,6 +1923,8 @@ coreRoutes.get(
       remoteAccessPolicy,
       hasRemoteAccessLauncher,
       remoteAccessLaunchSkipReason,
+      remoteAccessProviders,
+      remoteAccessDefaultProviderId,
       uninstall,
     });
   }
@@ -1910,9 +2010,26 @@ export async function checkRemoteAccessLauncherAvailabilityForDevice(
   auth?: AuthContext,
   deviceId?: string,
 ): Promise<RemoteAccessLaunchAvailability> {
+  return (await loadRemoteAccessLauncherViewForDevice(orgId, customFields, auth, deviceId)).availability;
+}
+
+/**
+ * Everything GET /devices/:id shows about launchers, from ONE partner read:
+ * the primary click's availability and the Connect menu's options (#10922).
+ * Same no-decrypt guarantee as the availability check above.
+ */
+async function loadRemoteAccessLauncherViewForDevice(
+  orgId: string,
+  customFields: Record<string, unknown> | null,
+  auth?: AuthContext,
+  deviceId?: string,
+): Promise<{ availability: RemoteAccessLaunchAvailability; providerOptions: RemoteAccessProviderOption[] }> {
   const { providers, preferredProviderId } = await loadRemoteAccessLauncherContext(orgId, auth);
   const enrolledRustDeskId = await readEnrolledRustDeskId(deviceId, orgId, providers);
-  return checkRemoteAccessLaunchAvailability({ customFields, enrolledRustDeskId }, providers, preferredProviderId);
+  return {
+    availability: checkRemoteAccessLaunchAvailability({ customFields, enrolledRustDeskId }, providers, preferredProviderId),
+    providerOptions: listRemoteAccessProviderOptions({ customFields, enrolledRustDeskId }, providers),
+  };
 }
 
 /** Thrown by the launcher issuance for a device parked in a holding org. */
@@ -1937,13 +2054,41 @@ export async function resolveRemoteAccessLauncherForDevice(
   orgId: string,
   customFields: Record<string, unknown> | null,
   auth?: AuthContext,
+  explicitProviderId?: string | null,
 ): Promise<RemoteAccessLaunchResult> {
   if (await isParkedDevice(db, deviceId)) {
     throw new RemoteAccessLaunchParkedDeviceError(deviceId);
   }
   const { providers, preferredProviderId } = await loadRemoteAccessLauncherContext(orgId, auth);
   const enrolledRustDeskId = await readEnrolledRustDeskId(deviceId, orgId, providers);
-  return resolveRemoteAccessLaunch({ customFields, enrolledRustDeskId }, providers, preferredProviderId);
+  return resolveRemoteAccessLaunch({ customFields, enrolledRustDeskId }, providers, preferredProviderId, explicitProviderId);
+}
+
+/**
+ * Reads the launch POST's optional `{ providerId }` (#10922).
+ *
+ * Parsed by hand rather than with zValidator('json') for two reasons. The
+ * existing callers send no body, and fetchWithAuth forces a JSON content-type
+ * on every request, so the JSON validator would answer 400 to every one of
+ * them. And the validator skips a body whose content-type is not JSON, which
+ * here would quietly launch the DEFAULT tool for a request that named another
+ * one. So: a blank body is "no choice"; anything else must parse and validate
+ * whatever its content-type, or the request is refused. Never "fall back".
+ */
+async function readRemoteAccessLaunchChoice(
+  c: Context,
+): Promise<{ ok: true; providerId: string | null } | { ok: false }> {
+  const raw = await c.req.text();
+  if (raw.trim().length === 0) return { ok: true, providerId: null };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { ok: false };
+  }
+  const result = remoteAccessLaunchSchema.safeParse(parsed);
+  if (!result.success) return { ok: false };
+  return { ok: true, providerId: result.data.providerId ?? null };
 }
 
 // POST /devices/:id/remote-access-launch - Issue a one-shot remote-access
@@ -1975,6 +2120,17 @@ coreRoutes.post(
       return c.json({ error: 'Device not found' }, 404);
     }
 
+    // After the device lookup on purpose: a device the caller cannot see is a
+    // 404 whatever the body says.
+    const choice = await readRemoteAccessLaunchChoice(c);
+    if (!choice.ok) {
+      return c.json(
+        { error: 'Invalid request body: expected an empty body or { "providerId": "<id>" }', code: 'invalid_request' },
+        400,
+      );
+    }
+    const explicitProvider = choice.providerId !== null;
+
     let launcher: RemoteAccessLaunchResult;
     try {
       launcher = await resolveRemoteAccessLauncherForDevice(
@@ -1982,6 +2138,7 @@ coreRoutes.post(
         device.orgId,
         device.customFields as Record<string, unknown> | null,
         auth,
+        choice.providerId,
       );
     } catch (err) {
       if (err instanceof RemoteAccessLaunchParkedDeviceError) {
@@ -2006,6 +2163,7 @@ coreRoutes.post(
         details: {
           deviceId,
           providerId: launcher.providerId,
+          explicitProvider,
         },
         result: 'denied',
       });
@@ -2023,7 +2181,9 @@ coreRoutes.post(
       // Match GET /devices/:id 404 convention used elsewhere for missing
       // sub-resources; the UI uses `hasRemoteAccessLauncher` on the detail
       // response to know whether to surface the button at all, so this
-      // path is only reachable from race conditions or out-of-date UI.
+      // path is only reachable from race conditions or out-of-date UI. An
+      // explicit choice that is not an enabled tool of this tenant lands here
+      // too, as code `provider_not_available` (#10922).
       return c.json(
         { error: 'No remote-access launcher available for this device', code: launcher.skipReason ?? 'unavailable' },
         404,
@@ -2031,7 +2191,8 @@ coreRoutes.post(
     }
 
     // Success: record the issuance. NEVER write the launch URL or password
-    // into the audit row. Only deviceId, providerId, and the scheme.
+    // into the audit row. Only deviceId, providerId, the scheme, and whether
+    // the technician picked the tool (#10922) or got the default.
     writeRouteAudit(c, {
       orgId: device.orgId,
       action: 'device.remote_access_launch_url.issued',
@@ -2042,6 +2203,7 @@ coreRoutes.post(
         deviceId,
         providerId: launcher.providerId,
         scheme: launcher.scheme,
+        explicitProvider,
       },
     });
 
@@ -2380,15 +2542,22 @@ coreRoutes.delete(
     // let the command commit independently of the decommission write).
     let updated: typeof devices.$inferSelect | undefined;
     let uninstallQueued = false;
-    await db.transaction(async (tx) => {
-      const outcome = await decommissionDeviceInTransaction(tx, {
-        deviceId,
-        queueUninstall: uninstallAgent,
-        actorUserId: auth.user.id,
+    try {
+      await db.transaction(async (tx) => {
+        const outcome = await decommissionDeviceInTransaction(tx, {
+          deviceId,
+          queueUninstall: uninstallAgent,
+          actorUserId: auth.user.id,
+        });
+        updated = outcome.updated;
+        uninstallQueued = outcome.uninstallQueued;
       });
-      updated = outcome.updated;
-      uninstallQueued = outcome.uninstallQueued;
-    });
+    } catch (err) {
+      if (err instanceof NetworkIsolationUnresolvedError) {
+        return c.json({ error: err.code, message: err.message }, 409);
+      }
+      throw err;
+    }
 
     // Resolve any "possible replacement of THIS device" linkage now that the
     // old device is decommissioned (#2764). The banner/badge on the newer
@@ -2554,9 +2723,15 @@ coreRoutes.delete(
   requireScope('organization', 'partner', 'system'),
   requirePermission(PERMISSIONS.DEVICES_DELETE.resource, PERMISSIONS.DEVICES_DELETE.action),
   requireMfa(),
+  // #11153 — optional body: `{ force: true }` is the operator's explicit
+  // "delete anyway" after a 409 UNINSTALL_NOT_CONFIRMED. A bodyless call (every
+  // existing client) is `force: false`, so it is refused rather than silently
+  // orphaning an agent that never confirmed it came off.
+  optionalJsonValidator(permanentDeleteDeviceSchema),
   async (c) => {
     const auth = c.get('auth');
     const deviceId = c.req.param('id')!;
+    const { force } = c.req.valid('json');
 
     const device = await getDeviceWithOrgAndSiteCheck(c, deviceId, auth);
     if (device === SITE_ACCESS_DENIED) {
@@ -2581,8 +2756,10 @@ coreRoutes.delete(
     // #2787 review — omits the whole spread while the dissolve ran anyway.
     let linkGroupId: string | null = null;
     let linkGroupDissolved = false;
-    let removedTopologyAlerts = 0;
+    let detachedTopologyAlerts = 0;
     let screenshotStorageKeys: string[] = [];
+    let uninstallState: PurgeResult['uninstallState'] = 'none';
+    let forced = false;
 
     // Delegated to `purgeRemovedDevice` (services/deviceLifecycle.ts) since
     // #2787 — one implementation shared with POST /devices/bulk/permanent-delete
@@ -2641,7 +2818,7 @@ coreRoutes.delete(
           () => db.transaction(async (tx) => ({
             // #8117 — read in the purge transaction; files go after it commits.
             screenshotStorageKeys: await listDeviceScreenshotStorageKeys(tx, deviceId),
-            ...(await purgeRemovedDevice(tx, deviceId, auth.allowedSiteIds)),
+            ...(await purgeRemovedDevice(tx, deviceId, auth.allowedSiteIds, { force })),
           })),
           'devices.permanentDelete',
         ),
@@ -2649,10 +2826,17 @@ coreRoutes.delete(
       screenshotStorageKeys = purge.screenshotStorageKeys;
       linkGroupId = purge.linkGroupId;
       linkGroupDissolved = purge.linkGroupDissolved;
-      removedTopologyAlerts = purge.removedTopologyAlerts;
+      detachedTopologyAlerts = purge.detachedTopologyAlerts;
+      uninstallState = purge.uninstallState;
+      forced = purge.forced;
     } catch (err: unknown) {
+      if (err instanceof NetworkIsolationUnresolvedError) {
+        return c.json({ error: err.code, message: err.message }, 409);
+      }
       if (err instanceof DeviceLifecycleError) {
-        return c.json({ error: err.message, code: err.code }, err.status);
+        // UNINSTALL_NOT_CONFIRMED carries `uninstallState`, which the web's
+        // "delete anyway?" dialog explains to the operator.
+        return c.json({ error: err.message, code: err.code, ...err.details }, err.status);
       }
       // MUST unwrap. Drizzle wraps the postgres-js PostgresError in a
       // DrizzleQueryError whose own `.code` is undefined — the SQLSTATE lives on
@@ -2727,8 +2911,15 @@ coreRoutes.delete(
         // silently lost their grouping.
         ...(linkGroupId ? { linkGroupId, linkGroupDissolved } : {}),
         // Site-owned topology alerts this device originated (M3-D6) — after a
-        // move-org they belong to ANOTHER org, so record that they went.
-        ...(removedTopologyAlerts > 0 ? { removedTopologyAlerts } : {}),
+        // move-org they belong to ANOTHER org; record the detached provenance.
+        ...(detachedTopologyAlerts > 0 ? { detachedTopologyAlerts } : {}),
+        // #11153 — always present: whether the operator sent force, whether
+        // force is what let the device through (`forced`), and what the
+        // agent's uninstall looked like under the lock. `forced: true` is the
+        // record of a deliberate "delete anyway".
+        force,
+        forced,
+        uninstallState,
       }
     });
 

@@ -56,6 +56,15 @@ func TestRunPamFlow(t *testing.T) {
 		dismissResult *ipc.PamDismissConsentResult
 		// dismissErr simulates an IPC round-trip error from DismissPamConsent.
 		dismissErr error
+		// wantTracked asserts the request was recorded as handed to IT
+		// (#8928): only a `pending` request the user approved is tracked.
+		wantTracked bool
+		// selectedWinSession is the Windows session of the helper that the
+		// flow selected (and so showed the dialog in).
+		selectedWinSession string
+		// wantTrackedSession is the session the outcome notices will target;
+		// empty means wantTargetWinSession.
+		wantTrackedSession string
 	}{
 		{
 			name:                 "policy hard-deny targets requester session and dismisses without dialog",
@@ -86,28 +95,28 @@ func TestRunPamFlow(t *testing.T) {
 			status:                "auto_approved",
 			dialog:                approved,
 			localDecisionRequired: true, wantReported: "approved",
-			wantFind:              true,
-			wantDialog:            true,
-			wantDismissed:         true,
+			wantFind:      true,
+			wantDialog:    true,
+			wantDismissed: true,
 		},
 		{
 			name:                  "protocol one reports local denial",
 			status:                "auto_approved",
 			dialog:                dismissed,
 			localDecisionRequired: true, wantReported: "denied",
-			wantFind:              true,
-			wantDialog:            true,
-			wantDismissed:         true,
+			wantFind:      true,
+			wantDialog:    true,
+			wantDismissed: true,
 		},
 		{
 			name:                  "protocol one refuses launch if original consent cannot be dismissed",
 			status:                "auto_approved",
 			dialog:                approved,
 			localDecisionRequired: true, wantReported: "denied",
-			dismissResult:         &ipc.PamDismissConsentResult{Success: false, Reason: "send_input_failed"},
-			wantFind:              true,
-			wantDialog:            true,
-			wantDismissed:         true,
+			dismissResult: &ipc.PamDismissConsentResult{Success: false, Reason: "send_input_failed"},
+			wantFind:      true,
+			wantDialog:    true,
+			wantDismissed: true,
 		},
 		{
 			// 0xFFFFFFFF is Windows' invalid/unresolved session sentinel. Treat it
@@ -145,6 +154,48 @@ func TestRunPamFlow(t *testing.T) {
 			wantTriggered:        false,
 			wantDismissed:        true,
 			wantActuated:         false,
+			wantTracked:          true,
+		},
+		{
+			// Unresolved requester session: the dialog was shown by the
+			// console-fallback helper, so the notices must go to THAT helper's
+			// session, never to a machine-global "preferred" helper that could
+			// belong to another user on a multi-session host.
+			name:               "pending + Approve on the console fallback is tracked in the dialog helper's session",
+			status:             "pending",
+			dialog:             approved,
+			selectedWinSession: "1",
+			wantFind:           true,
+			wantDialog:         true,
+			wantTriggered:      false,
+			wantDismissed:      true,
+			wantActuated:       false,
+			wantTracked:        true,
+			wantTrackedSession: "1",
+		},
+		{
+			name:          "pending + Approve with no resolvable session anywhere is not tracked",
+			status:        "pending",
+			dialog:        approved,
+			wantFind:      true,
+			wantDialog:    true,
+			wantTriggered: false,
+			wantDismissed: true,
+			wantActuated:  false,
+			wantTracked:   false,
+		},
+		{
+			name:                 "pending + Deny is not tracked",
+			status:               "pending",
+			subjectSessionID:     42,
+			wantTargetWinSession: "42",
+			dialog:               ipc.PamDialogResult{Approved: false},
+			wantFind:             true,
+			wantDialog:           true,
+			wantTriggered:        false,
+			wantDismissed:        true,
+			wantActuated:         false,
+			wantTracked:          false,
 		},
 		{
 			name:          "pending + user-dismissed denies",
@@ -317,7 +368,7 @@ func TestRunPamFlow(t *testing.T) {
 			var gotDialogSession, gotDismissSession *sessionbroker.Session
 			var gotDismissID string
 			var gotDismissTimeout time.Duration
-			selectedSession := &sessionbroker.Session{SessionID: "selected-pam-helper"}
+			selectedSession := &sessionbroker.Session{SessionID: "selected-pam-helper", WinSessionID: tc.selectedWinSession}
 			// noBroker reproduces production wiring: all swappable seams nil
 			// AND a nil sessionBroker. The defensive guard in RunPamFlow must
 			// keep this from dereferencing the nil broker.
@@ -368,11 +419,34 @@ func TestRunPamFlow(t *testing.T) {
 				CommandLine:            `target.exe --do-thing`,
 			}
 			outcome := etwlua.ElevationOutcome{RequestID: "req-1", Status: tc.status,
-				LocalDecisionRequired: tc.localDecisionRequired}
+				LocalDecisionRequired: tc.localDecisionRequired, SupportName: "Contoso IT"}
+			notices := recordPamNotices(h)
 
 			h.RunPamFlow(context.Background(), ev, outcome)
 			if reportedDecision != tc.wantReported {
 				t.Errorf("reportedDecision = %q, want %q", reportedDecision, tc.wantReported)
+			}
+
+			// #8928 PR 1: Approve on a `pending` request tracks it for the
+			// outcome notices; nothing else does, and no flow shows a notice
+			// itself (the waiting toast is PR 2).
+			entry, tracked := h.pamTracker().Get(outcome.RequestID)
+			if tracked != tc.wantTracked {
+				t.Errorf("tracked = %v, want %v", tracked, tc.wantTracked)
+			}
+			if tracked {
+				wantSession := tc.wantTrackedSession
+				if wantSession == "" {
+					wantSession = tc.wantTargetWinSession
+				}
+				want := pamTrackedRequest{WinSession: wantSession, Program: "target.exe", SupportName: "Contoso IT"}
+				if entry.WinSession != want.WinSession || entry.Program != want.Program ||
+					entry.SupportName != want.SupportName || entry.Notified {
+					t.Errorf("tracked entry = %+v, want %+v", entry, want)
+				}
+			}
+			if calls := notices.Calls(); len(calls) != 0 {
+				t.Errorf("RunPamFlow showed notices in PR 1: %+v", calls)
 			}
 
 			if triggered != tc.wantTriggered {
@@ -405,8 +479,9 @@ func TestRunPamFlow(t *testing.T) {
 				if gotDismissSession != selectedSession {
 					t.Errorf("dismiss session = %p, want exact selected session %p", gotDismissSession, selectedSession)
 				}
-				if gotDismissID != outcome.RequestID {
-					t.Errorf("dismiss request ID = %q, want %q", gotDismissID, outcome.RequestID)
+				// #10370: its own IPC id, never the dialog's.
+				if want := outcome.RequestID + pamDenyDismissIDSuffix; gotDismissID != want {
+					t.Errorf("dismiss request ID = %q, want %q", gotDismissID, want)
 				}
 				if gotDismissTimeout != pamDismissTimeout {
 					t.Errorf("dismiss timeout = %v, want %v", gotDismissTimeout, pamDismissTimeout)
@@ -524,8 +599,8 @@ func TestActuateAndDenyMutuallyExclusive(t *testing.T) {
 			if session != selectedSession {
 				t.Errorf("dismiss session = %p, want selected session %p", session, selectedSession)
 			}
-			if id != "req-deny" {
-				t.Errorf("dismiss request ID = %q, want req-deny", id)
+			if want := "req-deny" + pamDenyDismissIDSuffix; id != want {
+				t.Errorf("dismiss request ID = %q, want %q", id, want)
 			}
 			if timeout != pamDismissTimeout {
 				t.Errorf("dismiss timeout = %v, want %v", timeout, pamDismissTimeout)
@@ -545,7 +620,7 @@ func TestActuateAndDenyMutuallyExclusive(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			h.denyConsent(selectedSession, "req-deny", "policy_denied", "")
+			h.denyConsent(selectedSession, "req-deny", "policy_denied", "", etwlua.ConsentInstance{})
 		}()
 	}
 	wg.Wait()
@@ -574,7 +649,7 @@ func TestDenyConsentTimeoutKeepsGateUntilHelperQuiescent(t *testing.T) {
 		},
 	}
 
-	h.denyConsent(selectedSession, "req-timeout", "policy_denied", "")
+	h.denyConsent(selectedSession, "req-timeout", "policy_denied", "", etwlua.ConsentInstance{})
 
 	resultCh := make(chan pamactuator.Result, 1)
 	go func() {
@@ -592,7 +667,7 @@ func TestDenyConsentTimeoutKeepsGateUntilHelperQuiescent(t *testing.T) {
 	if manager.promoteSeen != 0 {
 		t.Fatalf("Promote calls while dismissal uncertain = %d, want 0", manager.promoteSeen)
 	}
-	h.denyConsent(selectedSession, "req-second-deny", "policy_denied", "")
+	h.denyConsent(selectedSession, "req-second-deny", "policy_denied", "", etwlua.ConsentInstance{})
 	if got := dismissCalls.Load(); got != 1 {
 		t.Fatalf("dismiss calls while previous completion uncertain = %d, want 1", got)
 	}
@@ -754,7 +829,7 @@ func TestDenyConsentProvenFailedDismissalKeepsGateClosed(t *testing.T) {
 				},
 			}
 
-			h.denyConsent(&sessionbroker.Session{SessionID: "helper"}, "req-denied", "policy_denied", "")
+			h.denyConsent(&sessionbroker.Session{SessionID: "helper"}, "req-denied", "policy_denied", "", etwlua.ConsentInstance{})
 
 			// Give the quiescence goroutine time to (wrongly) release the gate.
 			time.Sleep(50 * time.Millisecond)
@@ -829,7 +904,7 @@ func TestDenyConsentHelperDeathRecoversViaProof(t *testing.T) {
 		},
 	}
 
-	h.denyConsent(&sessionbroker.Session{SessionID: "dying-helper"}, "req-death", "policy_denied", "2")
+	h.denyConsent(&sessionbroker.Session{SessionID: "dying-helper"}, "req-death", "policy_denied", "2", etwlua.ConsentInstance{})
 
 	// Safe to assert unconditionally: recovery cannot prove anything until the
 	// barrier opens, so the gate is deterministically still closed here.
@@ -887,7 +962,7 @@ func TestPamGateRecoveryExhaustionStaysFailClosed(t *testing.T) {
 		},
 	}
 
-	h.denyConsent(stillLive, "req-stuck", "policy_denied", "")
+	h.denyConsent(stillLive, "req-stuck", "policy_denied", "", etwlua.ConsentInstance{})
 
 	// Let recovery run to exhaustion.
 	deadline := time.Now().Add(2 * time.Second)
@@ -980,7 +1055,7 @@ func TestDenyConsentSilentHelperReachesRecovery(t *testing.T) {
 		},
 	}
 
-	h.denyConsent(recovered, "req-silent", "policy_denied", "")
+	h.denyConsent(recovered, "req-silent", "policy_denied", "", etwlua.ConsentInstance{})
 
 	if !gateClosed(h) {
 		t.Fatal("gate must engage when the dismissal cannot be proven")
@@ -1021,7 +1096,7 @@ func TestDenyConsentNilQuiescenceReachesRecovery(t *testing.T) {
 		},
 	}
 
-	h.denyConsent(helper, "req-nil-chan", "policy_denied", "")
+	h.denyConsent(helper, "req-nil-chan", "policy_denied", "", etwlua.ConsentInstance{})
 
 	if !gateClosed(h) {
 		t.Fatal("a nil quiescence channel must still engage the fail-closed gate")
@@ -1054,7 +1129,7 @@ func TestPamGateRecoveryStopsOnShutdown(t *testing.T) {
 		},
 	}
 
-	h.denyConsent(&sessionbroker.Session{SessionID: "helper"}, "req-shutdown", "policy_denied", "")
+	h.denyConsent(&sessionbroker.Session{SessionID: "helper"}, "req-shutdown", "policy_denied", "", etwlua.ConsentInstance{})
 	if !gateClosed(h) {
 		t.Fatal("gate must engage before shutdown")
 	}
@@ -1213,7 +1288,7 @@ func TestRecoveryDrainsLateProof(t *testing.T) {
 		},
 	}
 
-	h.denyConsent(&sessionbroker.Session{SessionID: "slow-helper"}, "req-late", "policy_denied", "")
+	h.denyConsent(&sessionbroker.Session{SessionID: "slow-helper"}, "req-late", "policy_denied", "", etwlua.ConsentInstance{})
 	if !gateClosed(h) {
 		t.Fatal("gate must engage while the dismissal is unproven")
 	}
@@ -1226,4 +1301,39 @@ func TestRecoveryDrainsLateProof(t *testing.T) {
 	close(quiesced)
 
 	waitForGate(t, h, false, "recovery ignored a late but valid dismissal proof")
+}
+
+// Protocol one and the upstream durable decline store must agree before the
+// server can issue a managed launch. Failed dismissal must never release it.
+func TestRunPamFlowProtocolOneDecisionOrdering(t *testing.T) {
+	for _, success := range []bool{true, false} {
+		t.Run(map[bool]string{true: "dismissed", false: "dismiss_failed"}[success], func(t *testing.T) {
+			r := newDeclineFlowRig(t, nil, ipc.PamDialogResult{Approved: true}, nil)
+			r.h.pamDismissConsent = func(*sessionbroker.Session, string, time.Duration) (ipc.PamDismissConsentResult, error) {
+				if got := entryState(r.store, declineFlowReq); got != "awaiting" {
+					t.Errorf("state before proof = %q", got)
+				}
+				return ipc.PamDismissConsentResult{Success: success, Reason: "test_dismissal"}, nil
+			}
+			reports := 0
+			r.h.pamReportLocalDecision = func(id, decision string) error {
+				reports++
+				wantDecision, wantState := "denied", "declined/dialog_error"
+				if success {
+					wantDecision, wantState = "approved", "absent"
+				}
+				if id != declineFlowReq || decision != wantDecision {
+					t.Errorf("report = %q/%q, want %q/%q", id, decision, declineFlowReq, wantDecision)
+				}
+				if got := entryState(r.store, declineFlowReq); got != wantState {
+					t.Errorf("state at report = %q, want %q", got, wantState)
+				}
+				return nil
+			}
+			r.h.RunPamFlow(context.Background(), etwlua.Event{}, etwlua.ElevationOutcome{RequestID: declineFlowReq, Status: etwlua.ElevationAutoApproved, LocalDecisionRequired: true})
+			if reports != 1 {
+				t.Errorf("reports = %d, want 1", reports)
+			}
+		})
+	}
 }

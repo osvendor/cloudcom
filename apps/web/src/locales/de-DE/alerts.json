@@ -31,6 +31,8 @@
     "confidenceValue": "{{confidence}} % Konfidenz"
   },
   "alertDetailPage": {
+    "externalTickets": "Externe Tickets",
+    "externalTicketsFailedToLoad": "Externe Tickets konnten nicht geladen werden.",
     "loadingAlert": "Benachrichtigung wird geladen...",
     "backToAlerts": "Zurück zu den Benachrichtigungen",
     "goBack": "Zurück",
@@ -82,6 +84,21 @@
       "resolved": "Gelöst",
       "suppressed": "Unterdrückt",
       "dismissed": "Verworfen"
+    },
+    "createPsaTicket": "PSA-Ticket erstellen",
+    "psaTicketRequested": "PSA-Ticket angefordert",
+    "failedToCreatePsaTicket": "PSA-Ticket konnte nicht angefordert werden",
+    "lifecycleLine": {
+      "text": "{{rearm}} · Abklingzeit {{minutes}} Min. ({{source}})",
+      "rearmNewEvidence": "Wird bei neuen Nachweisen wieder scharf",
+      "rearmAfterDelay": "Wird nach {{minutes}} Min. wieder scharf",
+      "sources": {
+        "monitor": "dieser Monitor",
+        "org": "Org-Standard",
+        "partner": "Partner-Standard",
+        "builtin": "integrierter Standard",
+        "legacy": "Alarmregel"
+      }
     }
   },
   "alertDetails": {
@@ -652,6 +669,7 @@
       "info": "Infos"
     },
     "status": {
+      "open": "Offen",
       "active": "Aktiv",
       "acknowledged": "Anerkannt",
       "resolved": "Gelöst",
@@ -965,5 +983,10 @@
       "body": "Bestehende Vorlagen bleiben hier bearbeitbar und werden im nächsten Release umgewandelt.",
       "link": "Monitore öffnen"
     }
+  },
+  "subject": {
+    "label": "Betroffenes Objekt",
+    "backupWorkload": "Backup-Workload",
+    "topologySite": "Topologiestandort"
   }
 }

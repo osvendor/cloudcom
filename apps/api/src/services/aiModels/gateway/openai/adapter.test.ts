@@ -2,10 +2,12 @@ import Anthropic from '@anthropic-ai/sdk';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../../../llm/llmEgressRecorder', () => ({ recordLlmEgressEvent: () => {} }));
 
+import { __resetGatewayFailureNotesForTests, takeGatewayFailure, takeGatewayFailureNote } from '../failureNotes';
 import { __setUpstreamFetchForTests } from '../forward';
 import { startModelGateway, type ModelGateway } from '../server';
 import './adapter';
 import { GATEWAY_PLACEHOLDER_KEY, openAiCompatibleAdapter } from './adapter';
+import { __resetContextWindowsForTests, contextSafetyMargin } from './contextWindow';
 
 let gw: ModelGateway;
 let lastUpstream: { url: string; body: Record<string, unknown>; headers: Record<string, string> } | null = null;
@@ -20,10 +22,10 @@ beforeEach(async () => {
 });
 afterEach(async () => { __setUpstreamFetchForTests(null); await gw.close(); });
 
-function clientFor(models = ['qwen']) {
+function clientFor(models = ['qwen'], aiSessionId: string | null = null) {
   const g = gw.grant({
     config: { source: 'gateway', kind: 'openai_compatible', partnerId: 'p', connectionId: 'c', configVersion: 1, baseUrl: 'https://llm.example.com/v1' },
-    credential: { secret: 'sk-upstream-secret-1' }, wireModels: models, orgId: 'o', aiSessionId: null, purpose: 'dispatch',
+    credential: { secret: 'sk-upstream-secret-1' }, wireModels: models, orgId: 'o', aiSessionId, purpose: 'dispatch',
   });
   return new Anthropic({ baseURL: g.baseUrl, apiKey: GATEWAY_PLACEHOLDER_KEY, maxRetries: 0 });
 }
@@ -156,5 +158,269 @@ describe('openai_compatible adapter (real Anthropic client through the gateway)'
       ANTHROPIC_SMALL_FAST_MODEL: 'qwen', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     });
     expect(JSON.stringify(env)).not.toContain('llm.example.com');
+  });
+  describe('upstream failure trace (#10591)', () => {
+    const captureWarns = () => {
+      const warns: string[] = [];
+      const spy = vi.spyOn(console, 'warn').mockImplementation((...a: unknown[]) => { warns.push(a.map(String).join(' ')); });
+      return { warns, restore: () => spy.mockRestore() };
+    };
+    const PROMPT = 'PROMPT-CANARY-do-not-log-me';
+    const call = async (aiSessionId: string | null = null, stream = false): Promise<void> => {
+      const client = clientFor(['qwen'], aiSessionId);
+      const params = { model: 'qwen', max_tokens: 10, messages: [{ role: 'user' as const, content: PROMPT }] };
+      try {
+        if (stream) await client.messages.stream(params).finalMessage();
+        else await client.messages.create(params);
+      } catch { /* expected */ }
+    };
+    const secretBody = JSON.stringify({ error: {
+      message: 'backend overloaded; request had authorization: Bearer sk-upstream-secret-1 and x-api-key sk-other-provider-key-99',
+      echoed_key: 'sk-upstream-secret-1', padding: 'y'.repeat(5_000),
+    } });
+
+    it('a non-2xx is logged once with connection, model, status, latency, request id and a bounded, redacted body', async () => {
+      reply = () => new Response(secretBody, { status: 500, headers: { 'x-request-id': 'req_abc123' } });
+      const { warns, restore } = captureWarns();
+      await call();
+      restore();
+      const lines = warns.filter((w) => w.includes('upstream returned HTTP'));
+      expect(lines).toHaveLength(1);
+      const line = lines[0]!;
+      expect(line).toContain('[modelGateway] upstream returned HTTP 500');
+      expect(line).toMatch(/grant [0-9a-f-]{36}, connection c/);
+      expect(line).toContain('model "qwen"');
+      expect(line).toContain('stream false');
+      expect(line).toMatch(/latency_ms \d+/);
+      expect(line).toMatch(/prompt_tokens_est \d+/);
+      expect(line).toContain('upstream_request_id "req_abc123"');
+      expect(line).toContain('backend overloaded');
+      // Redaction: the connection key, other key shapes and auth headers never reach the log.
+      expect(line).not.toContain('sk-upstream-secret-1');
+      expect(line).not.toContain('sk-other-provider-key-99');
+      expect(line).toContain('[redacted]');
+      // Never the prompt, and the body is bounded.
+      expect(line).not.toContain(PROMPT);
+      expect(line.length).toBeLessThan(1_000);
+    });
+
+    it('a 401 logs the provider detail server-side (the client still gets the fixed text), key redacted', async () => {
+      reply = () => new Response('{"error":"invalid api key sk-upstream-secret-1 for project acme"}', { status: 401 });
+      const { warns, restore } = captureWarns();
+      await call();
+      restore();
+      const line = warns.find((w) => w.includes('upstream returned HTTP 401'));
+      expect(line).toBeDefined();
+      expect(line).toContain('for project acme');
+      expect(line).not.toContain('sk-upstream-secret-1');
+    });
+
+    it('an unsafe upstream request id is not logged verbatim', async () => {
+      reply = () => new Response('nope', { status: 503, headers: { 'x-request-id': 'id with spaces and\\u001b[31m' } });
+      const { warns, restore } = captureWarns();
+      await call();
+      restore();
+      const line = warns.find((w) => w.includes('upstream returned HTTP 503'))!;
+      expect(line).toContain('upstream_request_id none');
+    });
+
+    it('a streamed request\'s non-2xx is logged the same way', async () => {
+      reply = () => new Response('{"error":"model not loaded"}', { status: 404 });
+      const { warns, restore } = captureWarns();
+      await call(null, true);
+      restore();
+      const line = warns.find((w) => w.includes('upstream returned HTTP 404'));
+      expect(line).toContain('stream true');
+      expect(line).toContain('model not loaded');
+    });
+
+    it('the failure reaches the chat turn as a redacted gateway note', async () => {
+      __resetGatewayFailureNotesForTests();
+      reply = () => new Response(secretBody, { status: 500 });
+      const { restore } = captureWarns();
+      await call('sess-10591');
+      restore();
+      const note = takeGatewayFailureNote('sess-10591');
+      expect(note).toContain('The endpoint returned HTTP 500');
+      expect(note).toContain('backend overloaded');
+      expect(note).not.toContain('sk-upstream-secret-1');
+      expect(note).not.toContain('sk-other-provider-key-99');
+    });
+
+    it('a streamed request answered without SSE is logged with its content type and a redacted snippet', async () => {
+      reply = () => new Response('{"error":"use stream=false sk-upstream-secret-1"}', { headers: { 'content-type': 'application/json' } });
+      const { warns, restore } = captureWarns();
+      await call(null, true);
+      restore();
+      const line = warns.find((w) => w.includes('did not stream'));
+      expect(line).toContain('content_type "application/json"');
+      expect(line).toContain('use stream=false');
+      expect(line).not.toContain('sk-upstream-secret-1');
+    });
+    it('a 2xx with a malformed body is logged and noted (upstream_malformed)', async () => {
+      __resetGatewayFailureNotesForTests();
+      reply = () => new Response('<html>oops</html>', { status: 200, headers: { 'content-type': 'text/html' } });
+      const { warns, restore } = captureWarns();
+      await call('sess-malformed');
+      restore();
+      const line = warns.find((w) => w.includes('upstream_malformed'));
+      expect(line).toMatch(/grant [0-9a-f-]{36}, connection c/);
+      expect(line).toContain('model "qwen"');
+      expect(takeGatewayFailureNote('sess-malformed')).toBe('The endpoint returned malformed JSON.');
+    });
+
+    it('a streamed in-band error reaches the turn as a gateway note', async () => {
+      __resetGatewayFailureNotesForTests();
+      reply = () => new Response('data: {"error":{"message":"out of memory loading model"}}\n\ndata: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } });
+      const { restore } = captureWarns();
+      await call('sess-inband', true);
+      restore();
+      expect(takeGatewayFailureNote('sess-inband')).toContain('out of memory loading model');
+    });
+  });
+
+  describe('max_tokens against the endpoint\'s context window (#10577)', () => {
+    const WINDOW = 131_072;
+    const PROMPT = 108_301;
+    const CAPPED = WINDOW - PROMPT - contextSafetyMargin(WINDOW);
+    // About 102k tokens by the gateway's byte estimate; the endpoint counts 108,301.
+    const bigPrompt = 'x'.repeat(306_000);
+    const rejection = (promptTokens: number, maxTokens: number) => new Response(JSON.stringify({ error: {
+      message: `This server's maximum context length is ${WINDOW} tokens: this request needs a ${promptTokens + maxTokens}-token context (${promptTokens} prompt tokens plus max_tokens ${maxTokens})`,
+      type: 'invalid_request_error', param: 'messages', code: 'context_length_exceeded',
+    } }), { status: 400, headers: { 'content-type': 'application/json' } });
+    const ok = () => Response.json({ choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'OK' } }], usage: { prompt_tokens: PROMPT, completion_tokens: 3 } });
+    const sse = () => new Response(
+      'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"OK"}}]}\n\n'
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":108301,"completion_tokens":3}}\n\ndata: [DONE]\n\n',
+      { headers: { 'content-type': 'text/event-stream' } },
+    );
+
+    let sent: number[];
+    /** The endpoint enforces its window for real: prompt + max_tokens over it is a 400. */
+    const enforcing = (promptTokens: number, success: () => Response) => (body: Record<string, unknown>) => {
+      const maxTokens = body.max_tokens as number;
+      sent.push(maxTokens);
+      return promptTokens + maxTokens > WINDOW ? rejection(promptTokens, maxTokens) : success();
+    };
+    const ask = (aiSessionId: string | null, content = bigPrompt, max_tokens = 32_000) =>
+      // An explicit timeout: the client refuses a non-streaming 32k request without one.
+      clientFor(['qwen'], aiSessionId).messages.create({ model: 'qwen', max_tokens, messages: [{ role: 'user', content }] }, { timeout: 30_000 });
+
+    let warn: ReturnType<typeof vi.spyOn>;
+    beforeEach(() => {
+      sent = [];
+      __resetContextWindowsForTests();
+      __resetGatewayFailureNotesForTests();
+      warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+    afterEach(() => { warn.mockRestore(); });
+
+    it('a rejected 108k prompt + 32k request is retried with a capped max_tokens and succeeds, with no failure note', async () => {
+      reply = enforcing(PROMPT, ok);
+      const msg = await ask('sess-cap');
+      expect(sent).toEqual([32_000, CAPPED]);
+      expect(msg.content[0]).toMatchObject({ type: 'text', text: 'OK' });
+      expect(msg.usage.input_tokens).toBe(PROMPT);
+      expect(takeGatewayFailureNote('sess-cap')).toBeNull();
+    });
+
+    it('a streamed request is retried the same way', async () => {
+      reply = enforcing(PROMPT, sse);
+      const stream = await clientFor(['qwen'], 'sess-cap-stream').messages.create({ model: 'qwen', max_tokens: 32_000, stream: true, messages: [{ role: 'user', content: bigPrompt }] });
+      const text: string[] = [];
+      for await (const e of stream) if (e.type === 'content_block_delta' && e.delta.type === 'text_delta') text.push(e.delta.text);
+      expect(sent).toEqual([32_000, CAPPED]);
+      expect(text.join('')).toBe('OK');
+      expect(takeGatewayFailureNote('sess-cap-stream')).toBeNull();
+    });
+
+    it('the learned window caps the next request up front, with no rejected call', async () => {
+      reply = enforcing(PROMPT, ok);
+      await ask(null);
+      sent = [];
+      await ask(null);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]! + PROMPT).toBeLessThanOrEqual(WINDOW);
+      expect(sent[0]!).toBeGreaterThan(CAPPED - 500);
+    });
+
+    it('a request already inside the room is sent as asked, never raised', async () => {
+      reply = enforcing(PROMPT, ok);
+      await ask(null);
+      sent = [];
+      await ask(null, bigPrompt, 2_048);
+      expect(sent).toEqual([2_048]);
+    });
+
+    it('a prompt clearly over a known window fails with a specific error and no provider call', async () => {
+      reply = enforcing(PROMPT, ok);
+      await ask(null);
+      sent = [];
+      const error = await ask('sess-over', 'x'.repeat(800_000)).catch((e: unknown) => e);
+      expect(sent).toEqual([]);
+      expect(error).toBeInstanceOf(Anthropic.BadRequestError);
+      expect((error as Error).message).toContain('131,072');
+      expect(takeGatewayFailure('sess-over')).toMatchObject({
+        code: 'context_window_exceeded',
+        message: expect.stringMatching(/larger context window/i),
+      });
+    });
+
+    it('a prompt the endpoint counts over its window is not retried and gets the specific error', async () => {
+      reply = enforcing(140_000, ok);
+      const error = await ask('sess-over-reported').catch((e: unknown) => e);
+      expect(sent).toEqual([32_000]);
+      expect(error).toBeInstanceOf(Anthropic.BadRequestError);
+      expect((error as Error).message).toContain('140,000');
+      expect(takeGatewayFailure('sess-over-reported')?.code).toBe('context_window_exceeded');
+    });
+
+    it('a retry also rejected for its context window gets the specific error and stops at two calls', async () => {
+      reply = (body) => { sent.push(body.max_tokens as number); return rejection(PROMPT, body.max_tokens as number); };
+      const error = await ask('sess-twice').catch((e: unknown) => e);
+      expect(sent).toEqual([32_000, CAPPED]);
+      expect(error).toBeInstanceOf(Anthropic.BadRequestError);
+      expect(takeGatewayFailure('sess-twice')).toMatchObject({
+        code: 'context_window_exceeded',
+        message: expect.stringMatching(/larger context window/i),
+      });
+    });
+
+    it('a retry rejected for another reason surfaces that reason, uncoded', async () => {
+      reply = (body) => {
+        sent.push(body.max_tokens as number);
+        return sent.length === 1 ? rejection(PROMPT, 32_000) : new Response('{"error":{"message":"model is loading"}}', { status: 400 });
+      };
+      await ask('sess-retry-other').catch(() => {});
+      expect(sent).toEqual([32_000, CAPPED]);
+      const note = takeGatewayFailure('sess-retry-other');
+      expect(note?.message).toContain('model is loading');
+      expect(note?.code).toBeNull();
+    });
+
+    it('a long upstream reason stays bounded and still shows that it was cut', async () => {
+      reply = () => new Response(`{"error":{"message":"${'y'.repeat(900)}"}}`, { status: 400 });
+      await ask('sess-long', 'hi').catch(() => {});
+      const note = takeGatewayFailure('sess-long');
+      expect(note?.message.length).toBeLessThan(360);
+      expect(note?.message.endsWith('…')).toBe(true);
+    });
+
+    it('with no known window the request is unchanged and another 400 is not retried', async () => {
+      reply = (body) => { sent.push(body.max_tokens as number); return new Response('{"error":{"message":"temperature out of range"}}', { status: 400 }); };
+      const error = await ask('sess-other-400').catch((e: unknown) => e);
+      expect(sent).toEqual([32_000]);
+      expect(error).toBeInstanceOf(Anthropic.BadRequestError);
+      const note = takeGatewayFailure('sess-other-400');
+      expect(note?.message).toContain('temperature out of range');
+      expect(note?.code).toBeNull();
+    });
+
+    it('with no known window a successful request carries the caller\'s max_tokens unchanged', async () => {
+      reply = (body) => { sent.push(body.max_tokens as number); return ok(); };
+      await ask(null, 'hi');
+      expect(sent).toEqual([32_000]);
+    });
   });
 });

@@ -72,7 +72,41 @@ const providerLeg = (o: Partial<ProviderLegRow> = {}): ProviderLegRow => ({
   connectionIsActive: true,
   connectionLastSyncAt: '2026-09-15T11:50:00.000Z',
   connectionSyncIntervalMinutes: 30,
+  verifiedBootableAt: null,
+  verifiedBootable: null,
+  verifiedBootableFailedChecks: null,
   ...o,
+});
+
+describe('verified-bootable fields', () => {
+  it('toBreezeHealthRow sets all three verified-bootable fields to null', () => {
+    const row = toBreezeHealthRow(breezeLeg(), { now: NOW });
+    expect(row.verifiedBootableAt).toBeNull();
+    expect(row.verifiedBootable).toBeNull();
+    expect(row.verifiedBootableFailedChecks).toBeNull();
+  });
+
+  it('toProviderHealthRow carries verified-bootable fields with an ISO timestamp', () => {
+    const row = toProviderHealthRow(
+      providerLeg({
+        provider: 'axcient',
+        verifiedBootableAt: new Date('2026-11-05T03:12:00.000Z'),
+        verifiedBootable: false,
+        verifiedBootableFailedChecks: ['system_boot'],
+      }),
+      { now: NOW, labels: 'vendor' },
+    );
+    expect(row.verifiedBootableAt).toBe('2026-11-05T03:12:00.000Z');
+    expect(row.verifiedBootable).toBe(false);
+    expect(row.verifiedBootableFailedChecks).toEqual(['system_boot']);
+  });
+
+  it('toProviderHealthRow leaves the fields null for a provider without the evidence', () => {
+    const row = toProviderHealthRow(providerLeg({ provider: 'cove' }), { now: NOW, labels: 'vendor' });
+    expect(row.verifiedBootableAt).toBeNull();
+    expect(row.verifiedBootable).toBeNull();
+    expect(row.verifiedBootableFailedChecks).toBeNull();
+  });
 });
 
 describe('invertBackupJobStatus', () => {
@@ -255,6 +289,19 @@ describe('toProviderHealthRow', () => {
 
   it('marks an m365 account with its own accountType', () => {
     expect(toProviderHealthRow(providerLeg({ accountType: 'm365' }), { now: NOW, labels: 'vendor' }).accountType).toBe('m365');
+  });
+
+  it('preserves gws account type and excludes linked and unlinked SaaS rows from endpoint counts', () => {
+    const rows = [null, DEVICE].map(breezeDeviceId => toProviderHealthRow(
+      providerLeg({ provider: 'dropsuite', accountType: 'gws', breezeDeviceId, dataSources: ['gws_drive'] }),
+      { now: NOW, labels: 'vendor' },
+    ));
+    expect(rows.map(row => row.accountType)).toEqual(['gws', 'gws']);
+    const summary = foldBackupHealthSummary(rows);
+    expect(summary.endpoints).toEqual({ total: 0, covered: 0, uncovered: 0 });
+    expect(summary.providerOnly).toBe(0);
+    expect(summary.m365Accounts).toBe(2);
+    expect(summary.byStatus.completed).toBe(2);
   });
 
   it('forces health unknown and covered false when the sync is stale, and says so', () => {

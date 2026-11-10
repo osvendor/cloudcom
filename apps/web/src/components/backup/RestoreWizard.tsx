@@ -17,6 +17,7 @@ import {
 import { cn } from '@/lib/utils';
 import { formatDateTime } from '@/lib/dateTimeFormat';
 import { formatNumber } from '@/lib/i18n/format';
+import { formatBytes } from './backupDashboardHelpers';
 import { ConfirmDialog } from '../shared/ConfirmDialog';
 import { fetchWithAuth, useAuthStore } from '../../stores/auth';
 import AlphaBadge from '../shared/AlphaBadge';
@@ -25,6 +26,8 @@ import { showToast } from '../shared/Toast';
 import { useTranslation } from 'react-i18next';
 import { asList } from '@/lib/asList';
 import { ActionError, handleActionError, runAction } from '@/lib/runAction';
+import SnapshotIndexNotice from './SnapshotIndexNotice';
+import { indexNoticeKind, parseSnapshotIndexView, useSnapshotIndexState } from './snapshotIndexState';
 import {
   isUnattestedRestoreStepUp,
   suppressUnattestedRestoreStepUpToast,
@@ -104,18 +107,6 @@ function browseUrl(snapshotId: string, dir: string, cursor?: string | null): str
 
 type DirPage = { items: SnapshotTreeItem[]; nextCursor: string | null };
 
-function formatBytes(bytes?: number | null): string {
-  if (!Number.isFinite(bytes) || !bytes || bytes <= 0) return '--';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let value = bytes;
-  let unitIndex = 0;
-  while (value >= 1024 && unitIndex < units.length - 1) {
-    value /= 1024;
-    unitIndex += 1;
-  }
-  const precision = value >= 100 ? 0 : value >= 10 ? 1 : 2;
-  return `${formatNumber(value, { minimumFractionDigits: precision, maximumFractionDigits: precision })} ${units[unitIndex]}`;
-}
 
 function isActiveRestoreStatus(status: string | null | undefined): boolean {
   return ['pending', 'running'].includes(`${status ?? ''}`.toLowerCase());
@@ -286,6 +277,18 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
   }, [deviceGroups, deviceKey, pickedSnapshotId]);
   const snapshotId = selectedSnapshot?.id ?? '';
 
+  // #11026: while the file list is being built nothing is cached that is worth
+  // keeping, so its arrival starts the listing again from the root.
+  const { view: indexView, reportView: reportIndexView, retry: retryIndex, retrying: retryingIndex } = useSnapshotIndexState({
+    snapshotId,
+    onReady: () => {
+      browseEpoch.current += 1;
+      setDirs({});
+      setBrowseDir(ROOT_DIR);
+      void loadDir(ROOT_DIR);
+    },
+  });
+
   useEffect(() => {
     if (!snapshotId) return;
     if (lastSnapshotId.current && lastSnapshotId.current !== snapshotId) {
@@ -313,6 +316,7 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
           nextCursor: typeof payload?.nextCursor === 'string' ? payload.nextCursor : null,
         },
       }));
+      if (dir === ROOT_DIR && !cursor) reportIndexView(parseSnapshotIndexView(payload));
     } catch (err) {
       if (epoch === browseEpoch.current) {
         setError(err instanceof Error ? err.message : 'Failed to load snapshot contents');
@@ -320,7 +324,7 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
     } finally {
       if (epoch === browseEpoch.current) setFilesLoading(false);
     }
-  }, [snapshotId]);
+  }, [snapshotId, reportIndexView]);
 
   useEffect(() => {
     browseEpoch.current += 1;
@@ -691,7 +695,11 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
                   </div>
                   {currentItems.length === 0 ? (
                     <div className="rounded-md border border-dashed bg-muted/30 p-4 text-sm text-muted-foreground">
-                      {filesLoading ? 'Loading snapshot contents...' : 'No files available for this snapshot.'}
+                      {filesLoading
+                        ? 'Loading snapshot contents...'
+                        : indexNoticeKind(indexView)
+                          ? <SnapshotIndexNotice view={indexView} retrying={retryingIndex} onRetry={() => void retryIndex()} />
+                          : 'No files available for this snapshot.'}
                     </div>
                   ) : (
                     currentItems.map((item) => (
@@ -985,7 +993,7 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
                   </div>
                   <div className="rounded-md border bg-muted/20 p-4">
                     <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{t('restoreWizard.restoredSize')}</p>
-                    <p className="mt-2 text-sm font-semibold text-foreground">{formatBytes(latestKnownRestore.restoredSize)}</p>
+                    <p className="mt-2 text-sm font-semibold text-foreground">{formatBytes(latestKnownRestore.restoredSize, '--')}</p>
                   </div>
                 </div>
 
@@ -1089,7 +1097,7 @@ export default function RestoreWizard({ initialSnapshotId, initialSelectedPaths 
                       </div>
                       <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
                         <span>{t('restoreWizard.files2')} {job.restoredFiles ?? '--'}</span>
-                        <span>{t('restoreWizard.size')} {formatBytes(job.restoredSize)}</span>
+                        <span>{t('restoreWizard.size')} {formatBytes(job.restoredSize, '--')}</span>
                       </div>
                       {job.errorSummary ? (
                         <p className="mt-2 line-clamp-2 text-xs text-destructive">{job.errorSummary}</p>

@@ -356,6 +356,7 @@
     "tabs": {
       "compliance": "Compliance",
       "patches": "Patches",
+      "vendorUpdates": "Vendor updates",
       "jobs": "Jobs",
       "updateRings": "Update Rings"
     },
@@ -417,8 +418,10 @@
       "createTitle": "Create update ring"
     },
     "truncatedNotice": "Showing {{shown}} of {{total}} patches. The filters here only narrow what's already loaded, so the rest can't be reached from this view — use the patches API to work through the full catalog.",
+    "emptyRingSeverityNotice": "No devices in this ring yet. Device-reported severity appears once devices are assigned, so most patches read Unrated until then.",
     "shiftedNotice": "Showing {{shown}} of {{total}} patches — the catalog changed while it was loading. Reload to see the rest.",
     "ringDelete": {
+      "messageNone": "No policies use this ring. Its approval rules and schedule settings will be deleted and cannot be restored.",
       "title": "Delete {{name}}?",
       "messageOne": "1 policy will stop scheduled patching until you pick another ring.",
       "messageMany": "{{count}} policies will stop scheduled patching until you pick another ring.",
@@ -483,6 +486,13 @@
     "rebootRequired": "Required",
     "rebootDone": "Completed",
     "rebootNotRequired": "—",
+    "skipReasons": {
+      "no_approved_patches": "Skipped: none of the pending updates on this device are approved.",
+      "ring_deleted": "Cancelled before dispatch: the update ring was deleted.",
+      "ring_disabled": "Cancelled before dispatch: the update ring was disabled.",
+      "ring_unavailable": "Skipped: the update ring was deleted or disabled before this device was dispatched.",
+      "all_managed_by_vendor_updates": "Skipped: every pending update on this device is managed by Vendor updates, so no approval is needed."
+    },
     "errors": {
       "load": "Failed to load patch job"
     }
@@ -642,7 +652,11 @@
     "noMatches": "No matches.",
     "orEnterAPackageIDManually": "Or enter a package ID manually",
     "removeRuleFor": "Remove rule for {{application}}",
-    "scopeNote": "These rules apply to every device whose configuration policy links this ring."
+    "scopeNote": "These rules apply to every device whose configuration policy links this ring.",
+    "linuxPackage": "Linux package",
+    "appPackage": "App package",
+    "manualRuleType": "Rule type",
+    "linuxPinHint": "Enter the full version from the patch list, including any epoch (e.g. 5:24.0.7-1)."
   },
   "patchDetails": {
     "unknown": "Unknown",
@@ -662,5 +676,38 @@
       "hold_one": "{{count}}-day hold",
       "hold_other": "{{count}}-day hold"
     }
+  },
+  "vendorUpdates": {
+    "description": "Each maker's own update tool, kept running on a schedule by a configuration policy. Devices no such policy reaches show as Not managed.",
+    "loadError": "Could not load vendor updates.",
+    "retry": "Try again",
+    "pickOrganization": "Select an organization to see its vendor updates.",
+    "loading": "Loading vendor updates",
+    "empty": "No devices match this filter.",
+    "vendorFilter": "Vendor",
+    "allVendors": "All vendors",
+    "state": {
+      "upToDate": "Up to date",
+      "overdue": "Overdue",
+      "failing": "Failing",
+      "notSupported": "Not supported",
+      "notManaged": "Not managed",
+      "waitingForReboot": "Waiting for restart",
+      "rebootOverdue": "Restart overdue"
+    },
+    "columns": {
+      "device": "Device",
+      "organization": "Organization",
+      "site": "Site",
+      "vendor": "Vendor",
+      "state": "State",
+      "lastRun": "Last run",
+      "lastSuccess": "Last success"
+    },
+    "never": "Never",
+    "scheduleNotHandedBack": "Breeze could not hand the vendor tool's schedule back",
+    "range": "{{from}}–{{to}} of {{total}}",
+    "previous": "Previous",
+    "next": "Next"
   }
 }
