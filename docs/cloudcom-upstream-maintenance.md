@@ -1223,3 +1223,11 @@ retaining existing executable validation, eight-second deadlines and admission.
 ### Compose workload knob parity — 2026-11-10
 
 The production shared API/worker environment and development API now pass through DB_PREPARED_POLICY_READS (default false), MONITOR_WORKER_CONCURRENCY (2), and METRIC_ROLLUP_WORKER_CONCURRENCY (1). These match the existing consumers and .env.example; previously Compose silently ignored operator overrides. No concurrency or prepared-read default is increased.
+
+### Native release baseline follow-up
+
+Native components 0.128.5 were promoted separately after canary acceptance. Future candidate builds now use 0.128.5 as the native baseline instead of 0.125.5. The upstream baseline and fork version remain unchanged; this metadata update does not rebuild or redistribute binaries.
+
+The deployed server release remains bound to source `848055c33e5e99879560ab1230923c380810ba70`. Its original signed images-only inventory, source archive, and older native pairing describe that release at build time and remain unchanged. The separately signed native release and promotion evidence record the later native activation.
+
+When a subsequent server-only release advances the fork version, retain `binariesVersion: 0.128.5` until another native release is explicitly validated and promoted. Generate new source/build evidence for that server release; do not rewrite historical signatures or relabel existing images.
