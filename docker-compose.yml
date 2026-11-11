@@ -32,6 +32,11 @@ x-api-env: &api-env
   DATABASE_URL_APP: ${DATABASE_URL_APP:-}
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
   BREEZE_APP_DB_PASSWORD: ${BREEZE_APP_DB_PASSWORD:-}
+  # Opt-in prepared policy reads apply to both API and worker database clients.
+  DB_PREPARED_POLICY_READS: ${DB_PREPARED_POLICY_READS:-false}
+  # Preserve the bounded worker defaults documented in .env.example.
+  MONITOR_WORKER_CONCURRENCY: ${MONITOR_WORKER_CONCURRENCY:-2}
+  METRIC_ROLLUP_WORKER_CONCURRENCY: ${METRIC_ROLLUP_WORKER_CONCURRENCY:-1}
   # Pool-health watchdog (#3214). Threaded because deploy/environment.mdx
   # documents these as working knobs, and an unmapped var set in .env is
   # silently inert — the IS_HOSTED / #570 failure mode. All optional: an

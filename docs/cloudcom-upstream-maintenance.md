@@ -1219,3 +1219,7 @@ and native calls across 25 thread retirements. Ordinary race coverage retains
 session and concurrency checks; there is no blanket skip or dependency change.
 Managed RustDesk capability/ID/key probes now use the shared procspawn boundary,
 retaining existing executable validation, eight-second deadlines and admission.
+
+### Compose workload knob parity — 2026-11-10
+
+The production shared API/worker environment and development API now pass through DB_PREPARED_POLICY_READS (default false), MONITOR_WORKER_CONCURRENCY (2), and METRIC_ROLLUP_WORKER_CONCURRENCY (1). These match the existing consumers and .env.example; previously Compose silently ignored operator overrides. No concurrency or prepared-read default is increased.

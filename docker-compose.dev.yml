@@ -82,6 +82,9 @@ services:
     restart: unless-stopped
     environment:
       NODE_ENV: development
+      DB_PREPARED_POLICY_READS: ${DB_PREPARED_POLICY_READS:-false}
+      MONITOR_WORKER_CONCURRENCY: ${MONITOR_WORKER_CONCURRENCY:-2}
+      METRIC_ROLLUP_WORKER_CONCURRENCY: ${METRIC_ROLLUP_WORKER_CONCURRENCY:-1}
       DATABASE_URL: postgresql://breeze:breeze@postgres:5432/breeze
       # Discrete vars, not a hand-built REDIS_URL: resolveRedisUrl()
       # (apps/api/src/services/redis.ts) assembles the URL and
