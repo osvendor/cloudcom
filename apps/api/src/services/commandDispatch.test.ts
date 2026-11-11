@@ -335,7 +335,7 @@ describe('command dispatch helpers', () => {
     expect(rejectWhere).toHaveBeenCalledTimes(1);
     expect(vi.mocked(notInArray)).toHaveBeenCalledWith(
       'deviceCommands.type',
-      ['peripheral_policy_sync_v2', 'agent_rollback_v1', 'pam_apply_v2', 'pam_cleanup_v2', 'pam_reconcile_v2', 'pam_request_notify'],
+      ['peripheral_policy_sync_v2', 'agent_rollback_v1', 'pam_apply_v2', 'pam_reconcile_v2', 'pam_request_notify'],
     );
   });
 
@@ -373,7 +373,7 @@ describe('command dispatch helpers', () => {
 
     expect(vi.mocked(notInArray)).toHaveBeenCalledWith(
       'deviceCommands.type',
-      ['pam_apply_v2', 'pam_cleanup_v2', 'pam_reconcile_v2', 'pam_request_notify'],
+      ['pam_apply_v2', 'pam_reconcile_v2', 'pam_request_notify'],
     );
   });
 
@@ -386,8 +386,8 @@ describe('command dispatch helpers', () => {
     });
     expect(vi.mocked(notInArray)).toHaveBeenCalledWith('deviceCommands.type',
       resetVersion === 1
-        ? ['pam_apply_v2', 'pam_cleanup_v2', 'pam_request_notify']
-        : ['pam_apply_v2', 'pam_cleanup_v2', 'pam_reconcile_v2', 'pam_request_notify']);
+        ? ['pam_apply_v2', 'pam_request_notify']
+        : ['pam_apply_v2', 'pam_reconcile_v2', 'pam_request_notify']);
   });
 
   // #8928 — the user-outcome notice is claimable only by agents that report

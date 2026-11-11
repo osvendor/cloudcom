@@ -15,10 +15,10 @@ import { useEffect, useRef, useCallback, useState } from 'react';
 import { invoke } from '../../platform';
 import { type ConnectionParams } from '../lib/protocol';
 import { exchangeDesktopConnectCode, exchangeVncConnectCode } from '../lib/api';
-import { scaleVideoCoords, isWebRTCSupported, AgentSessionError, SessionEndedError, SESSION_ENDED_DEFAULT_MESSAGE, type AuthenticatedConnectionParams } from '../lib/webrtc';
+import { scaleVideoCoords, isWebRTCSupported, announceViewerReconnect, AgentSessionError, RelayRequiredError, SessionEndedError, SESSION_ENDED_DEFAULT_MESSAGE, type AuthenticatedConnectionParams } from '../lib/webrtc';
+import { errorCardFor, parseSessionEndingMessage, serverEndReasonText, sessionEndedCardMessage, sessionEndingText, type ErrorCardKind } from '../lib/sessionEnd';
 import {
   startRevocationLeaseRenewal,
-  LEASE_REVOKED_MESSAGE,
   LEASE_LOST_MESSAGE,
 } from '../lib/revocationLease';
 import { connectWebRTC as connectWebRTCTransport, type WebRTCSessionWrapper } from '../lib/transports/webrtc';
@@ -54,6 +54,7 @@ import {
   mouseButtonName,
   shouldForwardKeyRepeat,
   chordRouting,
+  modifiersReleasedByKeyPress,
   viewerShortcut,
   isPasteChord,
   isCopyChord,
@@ -61,6 +62,7 @@ import {
 import { isServiceModeRefusal, serviceModeRefusalMessage } from '../lib/serviceModeRefusal';
 import { shouldAutoHandoffToVnc, shouldAutoHandoffToWebRTC } from '../lib/autoHandoff';
 import { startFrameCounter } from '../lib/frameCounter';
+import { mediaFocusRing, videoHasFrame } from '../lib/mediaFocusRing';
 import { createStatsReporter } from '../lib/statsReporter';
 import { suppressedByViewOnly } from '../lib/viewOnly';
 import {
@@ -124,23 +126,20 @@ const INPUT_CAPABILITIES_WAIT_MS = 500;
 // How long a paste-failure notice stays in the toolbar.
 const PASTE_NOTICE_TTL_MS = 8_000;
 
-// Shown when the server rejects (re)connection because the session has ended
-// (HTTP 401 'Session ended', Finding #5). The viewer holds a single-session
-// token and cannot create a new session, so this is a terminal state — the
-// operator must relaunch from the dashboard.
-const SESSION_ENDED_MESSAGE =
-  'This remote session has ended. Relaunch it from the Breeze dashboard.';
-
+// The server rejected (re)connection because the session has ended (HTTP 401
+// 'Session ended', Finding #5). The viewer holds a single-session token and
+// cannot create a new session, so this is a terminal state — the operator must
+// relaunch from the dashboard (enterSessionEnded adds that hint).
+//
 // #5300: a SessionEndedError carries a real server-provided reason (e.g. the
-// no-video watchdog's swallowed capture error) exactly when the caller found
-// one via fetchSessionEndedReason — SessionEndedError otherwise defaults to
-// SESSION_ENDED_DEFAULT_MESSAGE. Keep the relaunch call-to-action either way;
-// only the diagnostic clause changes.
-function sessionEndedDisplayMessage(err: SessionEndedError): string {
+// no-video watchdog's swallowed capture error, or a `revoked:<reason>` code)
+// exactly when the caller found one via fetchSessionEndedReason —
+// SessionEndedError otherwise defaults to SESSION_ENDED_DEFAULT_MESSAGE.
+function sessionEndedReasonText(err: SessionEndedError): string {
   if (err.message && err.message !== SESSION_ENDED_DEFAULT_MESSAGE) {
-    return `${err.message} Relaunch it from the Breeze dashboard.`;
+    return serverEndReasonText(err.message);
   }
-  return SESSION_ENDED_MESSAGE;
+  return SESSION_ENDED_DEFAULT_MESSAGE;
 }
 
 // Shown when the WebSocket upgrade was refused before it completed. The
@@ -321,6 +320,12 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
   const keyNameMode = keyNameModeFor(remoteOs);
   const [connectedAt, setConnectedAt] = useState<Date | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  // #10421: an ended session is terminal (no Retry); any other error is not.
+  // Only enterSessionEnded sets 'session_ended'; leaving 'error' resets it.
+  const [errorKind, setErrorKind] = useState<ErrorCardKind>('error');
+  useEffect(() => {
+    if (status !== 'error') setErrorKind('error');
+  }, [status]);
   // #6818: the consent notice belongs to one connect attempt. Any status
   // change (connected, error, a reconnect attempt) ends that attempt.
   useEffect(() => {
@@ -347,6 +352,10 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
   // Neutral confirmations (screenshot copied/saved); the notices above are errors.
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
   const [inputFocused, setInputFocused] = useState(false);
+  // #10424: the focus ring waits for a frame; an empty media element is a
+  // 300x150 box, so a ring on it is a stray box mid-screen while connecting.
+  const [videoFrameReady, setVideoFrameReady] = useState(false);
+  const [canvasFrameReady, setCanvasFrameReady] = useState(false);
   const [cursorStreamActive, setCursorStreamActive] = useState(false);
   const [monitors, setMonitors] = useState<Array<{ index: number; name: string; width: number; height: number; isPrimary: boolean }>>([]);
   const [activeMonitor, setActiveMonitor] = useState(0);
@@ -942,6 +951,21 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
     setReconnectSecondsLeft(0);
   }, []);
 
+  // #10421: the session is over for good — the agent said so on the control
+  // channel (idle timeout, max length, revoked lease) or the server 401'd a
+  // (re)connect. Stop the reconnect loop, suppress every auto-reconnect
+  // trigger, and show the reason on a card that offers Close, not Retry.
+  const enterSessionEnded = useCallback((reasonText: string) => {
+    userDisconnectRef.current = true;
+    stopReconnect();
+    setErrorKind('session_ended');
+    setStatus('error');
+    setConnectedAt(null);
+    const msg = sessionEndedCardMessage(reasonText);
+    setErrorMessage(msg);
+    onError(msg);
+  }, [stopReconnect, onError]);
+
   // releaseAllKeys is defined after sendInputFn; use ref to break TDZ
   const releaseAllKeysRef = useRef<() => void>(() => {});
 
@@ -992,9 +1016,20 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
     wsCleanupRef.current = null;
     const oldRtc = webrtcRef.current;
     webrtcRef.current = null;
-    oldRtc?.close();
 
     reconnectInFlightRef.current = true;
+    if (oldRtc) {
+      // #10542: mark the reconnect with the API before closing the old peer.
+      // The close makes the agent report a peer drop at once; with the mark in
+      // place the API holds that report for this reconnect's offer instead of
+      // ending the session under it. Bounded and best effort.
+      await announceViewerReconnect(auth);
+    }
+    oldRtc?.close();
+    if (cancelledRef.current || userDisconnectRef.current) {
+      reconnectInFlightRef.current = false;
+      return;
+    }
     const recordedTransport = transportRef.current;
     // No transport recorded — the drop beat the first successful connect. Default
     // to WebRTC, except on a WebView that has none: there WebSocket is the only
@@ -1061,13 +1096,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
       // operator knows to relaunch from the dashboard instead of seeing an
       // opaque error or the loop hammering the dead endpoint (Finding #5, C2).
       if (err instanceof SessionEndedError) {
-        userDisconnectRef.current = true; // suppress further auto-reconnect triggers
-        stopReconnect();
-        setStatus('error');
-        setConnectedAt(null);
-        const msg = sessionEndedDisplayMessage(err);
-        setErrorMessage(msg);
-        onError(msg);
+        enterSessionEnded(sessionEndedReasonText(err));
         reconnectInFlightRef.current = false;
         return;
       }
@@ -1084,7 +1113,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
     } finally {
       reconnectInFlightRef.current = false;
     }
-  }, [connectWebRTC, connectWebSocket, connectVncTransport, stopReconnect, remoteOs]);
+  }, [connectWebRTC, connectWebSocket, connectVncTransport, stopReconnect, enterSessionEnded, remoteOs]);
 
   const startReconnect = useCallback(() => {
     if (!authRef.current || userDisconnectRef.current) return;
@@ -1252,13 +1281,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
         // already ended/revoked — show the terminal message and don't let the
         // reconnect loop spin on a dead sessionId (Finding #5, C2).
         if (err instanceof SessionEndedError) {
-          userDisconnectRef.current = true;
-          stopReconnect();
-          setStatus('error');
-          const msg = sessionEndedDisplayMessage(err);
-          setErrorMessage(msg);
-          setConnectedAt(null);
-          onError(msg);
+          enterSessionEnded(sessionEndedReasonText(err));
           return;
         }
         const msg = err instanceof Error ? err.message : 'Connection failed';
@@ -1327,7 +1350,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
 	        });
 	      }
 	    };
-	  }, [connectWebRTC, connectWebSocket, connectVncTransport, onError, params, stopReconnect]);
+	  }, [connectWebRTC, connectWebSocket, connectVncTransport, onError, params, stopReconnect, enterSessionEnded]);
 
   // Mark a window as "session active" only when fully connected.
   // Pass session_id so Rust can detect duplicate deep links for the same session.
@@ -1381,17 +1404,14 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
 
     const endSession = (message: string) => {
       userDisconnectRef.current = true; // no auto-reconnect onto a dead session
-      stopReconnect();
       webrtcAttemptsRef.current.invalidate();
       const prevRtc = webrtcRef.current;
       webrtcRef.current = null;
       prevRtc?.close();
       wsCleanupRef.current?.();
       wsCleanupRef.current = null;
-      setStatus('error');
-      setConnectedAt(null);
-      setErrorMessage(message);
-      onError(message);
+      // Terminal: Retry would only replay the revoked session (#10421).
+      enterSessionEnded(message);
     };
 
     return startRevocationLeaseRenewal(
@@ -1401,12 +1421,12 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
         accessToken: auth.accessToken,
       },
       {
-        onRevoked: () => endSession(LEASE_REVOKED_MESSAGE),
+        onRevoked: (reason) => endSession(sessionEndingText({ reason: 'revoked', detail: reason })),
         onLost: () => endSession(LEASE_LOST_MESSAGE),
       },
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status, params.mode, stopReconnect, onError]);
+  }, [status, params.mode, enterSessionEnded]);
 
   // Count WebRTC video frames for the FPS readout. See lib/frameCounter.ts
   // for the rVFC-with-watchdog-fallback strategy: some WebViews (notably
@@ -1543,6 +1563,14 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
               blockLocalInputTimerRef.current = null;
             }
             setBlockLocalInput(state => applyBlockLocalInputResult(state, result));
+            break;
+          }
+          // #10421: the agent is about to stop this session on purpose. Go
+          // terminal now, so the peer drop that follows is not mistaken for a
+          // network blip and fed to the reconnect loop.
+          case 'session_ending': {
+            const notice = parseSessionEndingMessage(msg);
+            if (notice) enterSessionEnded(sessionEndingText(notice));
             break;
           }
           case 'input_capabilities':
@@ -1746,6 +1774,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
         ctx.drawImage(bitmap, 0, 0);
         bitmap.close();
         frameCountRef.current++;
+        setCanvasFrameReady(true);
       }
     } finally {
       jpegDecodeInFlightRef.current = false;
@@ -1910,6 +1939,43 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
     };
   }, [getInputSender, reliableInput]);
   releaseAllKeysRef.current = releaseAllKeys;
+
+  // "Release stuck keys" (toolbar and shortcut). releaseAllKeys only covers
+  // what this viewer believes is held, and its agent-side reset is sequenced
+  // input only; a key the bookkeeping lost stays down (#9595). An agent that
+  // takes release_held_input releases everything it holds and clears OS
+  // modifier state, so the viewer just forgets its own: key_ups sent on
+  // `input` could land after the release on `control` as stray key-ups.
+  const handleReleaseStuckKeys = useCallback(() => {
+    const control = transportRef.current === 'webrtc' ? webrtcRef.current?.controlChannel : undefined;
+    if (viewOnlyRef.current || !inputCapabilitiesRef.current.snapshot().releaseHeldOnRequest
+      || !control || control.readyState !== 'open') {
+      releaseAllKeys();
+      // releaseAllKeys strands its key_ups when the input channel is down;
+      // say so rather than reporting a release that has not happened.
+      setInputNotice(getInputSender()
+        ? 'Released the keys and mouse buttons this viewer was holding on the remote.'
+        : 'Releases queued: they are sent when the input channel reconnects.');
+      return;
+    }
+    // Send first, forget second: a send that throws (the channel closing
+    // between the readyState check and here) must not leave this viewer
+    // believing nothing is held while the remote still holds keys.
+    try {
+      control.send(JSON.stringify({ type: 'release_held_input' }));
+    } catch (err) {
+      console.warn('Release stuck keys request failed:', err);
+      releaseAllKeys();
+      setInputNotice('Could not reach the remote; released the keys this viewer was holding.');
+      return;
+    }
+    pressedKeysRef.current.clear();
+    heldKeyNameByCodeRef.current.clear();
+    heldCodeByKeyRef.current.clear();
+    pressedButtonsRef.current.clear();
+    // Fire-and-forget: the agent sends no ack, so this reports the request.
+    setInputNotice('Asked the remote to release every held key, mouse button and modifier.');
+  }, [releaseAllKeys, getInputSender]);
 
   // A new session's channel may open with releases still stranded from the
   // last one; send them as soon as it can carry them rather than waiting for
@@ -2228,12 +2294,15 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
 
   // ── Input: keyboard handlers ───────────────────────────────────────
 
-  // key_press presses its modifiers around the key and then releases them, so
-  // a modifier we had sent as key_down is no longer down on the remote.
-  // Forget it, or the next chord would take the 'held' route and lose it
-  // (Shift+A arriving as a lowercase a).
+  // An older agent's key_press presses its modifiers around the key and then
+  // releases them, so a modifier we had sent as key_down is no longer down on
+  // the remote. Forget it, or the next chord would take the 'held' route and
+  // lose it (Shift+A arriving as a lowercase a). A current agent leaves held
+  // modifiers down, and forgetting them would strand them (#9595).
   const forgetModifiersReleasedByKeyPress = useCallback((modifiers: string[]) => {
-    for (const m of modifiers) pressedKeysRef.current.delete(m);
+    for (const m of modifiersReleasedByKeyPress(modifiers, inputCapabilitiesRef.current.snapshot().releasesHeldInput)) {
+      pressedKeysRef.current.delete(m);
+    }
   }, []);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -2313,11 +2382,13 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
       // The prefix modifiers already went down on the remote as key_downs.
       // Release them first, or paste-as-keystrokes would type into a held
       // Ctrl+Alt+Shift and fire shortcuts there.
+      if (shortcut === 'release-keys') {
+        handleReleaseStuckKeys();
+        return;
+      }
       releaseAllKeys();
       if (shortcut === 'paste-keystrokes') {
         handlePasteAsKeystrokes();
-      } else if (shortcut === 'release-keys') {
-        setInputNotice('Released all keys and mouse buttons on the remote.');
       } else {
         toggleDocumentFullscreen();
       }
@@ -2416,7 +2487,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
     if (ne.code) heldKeyNameByCodeRef.current.set(ne.code, key);
     if (keyFields.code) heldCodeByKeyRef.current.set(key, keyFields.code);
     sendInputFn({ type: 'key_down', key, capsLock, ...keyFields });
-  }, [sendInputFn, handlePasteAsKeystrokes, releaseAllKeys, forgetModifiersReleasedByKeyPress, remapCmdCtrl, keyNameMode, remoteOs, reliableInput, transport]);
+  }, [sendInputFn, handlePasteAsKeystrokes, releaseAllKeys, handleReleaseStuckKeys, forgetModifiersReleasedByKeyPress, remapCmdCtrl, keyNameMode, remoteOs, reliableInput, transport]);
 
   const handleKeyUp = useCallback((e: React.KeyboardEvent) => {
     e.preventDefault();
@@ -2536,6 +2607,13 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
       if (!ok) throw new Error('WebRTC connection failed');
       setActiveSessionId(sessionId);
     } catch (err) {
+      if (err instanceof RelayRequiredError) {
+        setStatus('error');
+        setConnectedAt(null);
+        setErrorMessage(err.message);
+        onError(err.message);
+        return;
+      }
       // Try to reconnect to the previous session so the viewer isn't dead
       const prevId = activeSessionId ?? undefined;
       try {
@@ -2546,7 +2624,14 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
           setErrorMessage(`Failed to switch to ${label} and could not restore previous session`);
           startReconnectRef.current();
         }
-      } catch {
+      } catch (err) {
+        if (err instanceof RelayRequiredError) {
+          setStatus('error');
+          setConnectedAt(null);
+          setErrorMessage(err.message);
+          onError(err.message);
+          return;
+        }
         setErrorMessage(`Failed to switch to ${label} and could not restore previous session`);
         startReconnectRef.current();
       }
@@ -2845,6 +2930,8 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
   // click on the toolbar silently goes nowhere.
   const focusRing = inputFocused ? 'ring-1 ring-inset ring-accent-soft/60' : '';
 
+  const errorCard = errorCardFor(errorKind);
+
   useEffect(() => {
     if (!closing) return;
     userDisconnectRef.current = true;
@@ -2893,7 +2980,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
           setRemapCmdCtrl(value);
           rememberDevicePrefs({ remapCmdCtrl: value });
         }}
-        onReleaseAllKeys={releaseAllKeys}
+        onReleaseAllKeys={handleReleaseStuckKeys}
         onShowRemoteCursorChange={setShowRemoteCursor}
         onConfigChange={handleConfigChange}
         onBitrateChange={handleBitrateChange}
@@ -2942,8 +3029,11 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
             autoPlay
             playsInline
             muted
-            className={`${mediaClassName(viewScaling)} outline-hidden ${focusRing} ${transport !== 'webrtc' ? 'hidden' : ''}`}
+            className={`${mediaClassName(viewScaling)} outline-hidden ${mediaFocusRing(focusRing, videoFrameReady)} ${transport !== 'webrtc' ? 'hidden' : ''}`}
             style={{ cursor: cursorStreamActive && showRemoteCursor ? 'none' : 'default' }}
+            onLoadedMetadata={(e) => setVideoFrameReady(videoHasFrame(e.currentTarget))}
+            onResize={(e) => setVideoFrameReady(videoHasFrame(e.currentTarget))}
+            onEmptied={() => setVideoFrameReady(false)}
             {...interactionProps}
           />
 
@@ -2963,7 +3053,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
           <canvas
             ref={canvasRef}
             tabIndex={0}
-            className={`${mediaClassName(viewScaling)} outline-hidden cursor-default ${focusRing} ${transport !== 'websocket' ? 'hidden' : ''}`}
+            className={`${mediaClassName(viewScaling)} outline-hidden cursor-default ${mediaFocusRing(focusRing, canvasFrameReady)} ${transport !== 'websocket' ? 'hidden' : ''}`}
             {...interactionProps}
           />
         </div>
@@ -3107,13 +3197,14 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
         {status === 'error' && (
           <div className="absolute inset-0 flex items-center justify-center bg-gray-900/80">
             <div className="text-center">
-              <p className="text-red-400 mb-2">Connection Error</p>
-              {errorMessage && <p className="text-gray-400 text-sm mb-4">{errorMessage}</p>}
+              <p className={errorCard.showRetry ? 'text-red-400 mb-2' : 'text-gray-200 font-medium mb-2'}>{errorCard.title}</p>
+              {errorMessage && <p className="text-gray-400 text-sm mb-4 max-w-md">{errorMessage}</p>}
               <div className="flex items-center justify-center gap-2">
                 {/* A refused handshake is recoverable: retrying re-enters the
                     connect path, which always mints a brand new one-time
-                    ticket rather than replaying the rejected URL. */}
-                <button
+                    ticket rather than replaying the rejected URL. An ended
+                    session is not (#10421): the token cannot reconnect it. */}
+                {errorCard.showRetry && <button
                   onClick={() => {
                     setErrorMessage(null);
                     userDisconnectRef.current = false;
@@ -3122,7 +3213,7 @@ export default function DesktopViewer({ params, onDisconnect, onError, closing =
                   className="px-4 py-2 bg-accent hover:bg-accent-hover rounded text-white"
                 >
                   Retry
-                </button>
+                </button>}
                 <button
                   onClick={onDisconnect}
                   className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded text-white"

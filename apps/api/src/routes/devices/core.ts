@@ -694,6 +694,9 @@ export async function rewriteDeviceSiteDenormalizedTables(
 const CORE_DEVICE_CASCADE_DELETE_TABLES = [
   // A permanent device purge removes session children before their grants.
   // Organization moves must not reparent customer identities or their history.
+  // Staff native authority/history stays source-owned on org moves; the immutable
+  // target FK blocks reparenting. On purge, delete this child before its target.
+  'staff_native_sessions',
   'portal_native_admissions', 'portal_native_targets',
   'portal_remote_sessions', 'portal_remote_assignments',
   'topology_node_bindings',

@@ -160,6 +160,10 @@ function allSchemaTables(): PgTable<any>[] {
 }
 
 describe('device hard-delete table coverage contract', () => {
+  it('purges staff native sessions before their immutable native targets', () => {
+    expect(deviceCascadeDeleteTables.indexOf('staff_native_sessions')).toBeGreaterThanOrEqual(0);
+    expect(deviceCascadeDeleteTables.indexOf('staff_native_sessions')).toBeLessThan(deviceCascadeDeleteTables.indexOf('portal_native_targets'));
+  });
   it('every table with a device_id FK to devices.id is in exactly one of cascade/detach/linked sets', () => {
     const cascadeSet = new Set<string>(deviceCascadeDeleteTables);
     const detachSet = new Set<string>(DEVICE_DETACH_DEVICE_ID_TABLES);

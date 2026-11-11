@@ -112,8 +112,8 @@ export function applyBrowserClipboard(content) {
     e.preventDefault();`;
   replace(keyHook, keyReplacement);
   if (modernClipboard) {
-    replace('}, [sendInputFn, handlePasteAsKeystrokes, releaseAllKeys, forgetModifiersReleasedByKeyPress, remapCmdCtrl, keyNameMode, remoteOs, reliableInput]);',
-      '}, [sendInputFn, handlePasteAsKeystrokes, releaseAllKeys, forgetModifiersReleasedByKeyPress, remapCmdCtrl, keyNameMode, remoteOs, reliableInput, transport]);');
+    replace('}, [sendInputFn, handlePasteAsKeystrokes, releaseAllKeys, handleReleaseStuckKeys, forgetModifiersReleasedByKeyPress, remapCmdCtrl, keyNameMode, remoteOs, reliableInput]);',
+      '}, [sendInputFn, handlePasteAsKeystrokes, releaseAllKeys, handleReleaseStuckKeys, forgetModifiersReleasedByKeyPress, remapCmdCtrl, keyNameMode, remoteOs, reliableInput, transport]);');
   } else {
     replace('}, [sendInputFn, handlePasteAsKeystrokes, remapCmdCtrl]);', '}, [sendInputFn, handlePasteAsKeystrokes, remapCmdCtrl, transport, remoteOs]);');
   }

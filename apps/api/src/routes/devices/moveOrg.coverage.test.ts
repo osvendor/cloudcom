@@ -37,6 +37,8 @@ import { TICKET_ORG_DENORMALIZED_TABLES } from '../../services/ticketOrgMoveLock
 const INTENTIONALLY_NO_ORG_ID: ReadonlySet<string> = new Set([
   // Customer grants/history remain source-owned; their composite tenant FKs
   // and immutable grant identity prevent organization moves while they exist.
+  // Staff native sessions also retain source ownership through the immutable target FK.
+  'staff_native_sessions',
   'portal_native_admissions',
   'portal_native_targets',
   'portal_remote_sessions',

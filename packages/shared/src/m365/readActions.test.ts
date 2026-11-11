@@ -216,7 +216,7 @@ describe('m365 sync action contracts', () => {
     }).success).toBe(true);
   });
 
-  it('keeps all fourteen interactive branches, each still .strict()', () => {
+  it('keeps all fifteen interactive branches, each still .strict()', () => {
     // The interactive branches move wholesale from m365ReadActionSchema into
     // INTERACTIVE_BRANCHES. A branch dropped in that cut, or a `.strict()` lost
     // to a retype, is invisible to every other assertion here: the id arrays are
@@ -226,9 +226,9 @@ describe('m365 sync action contracts', () => {
       shape: { type: { value: string } };
     }[]).map((branch) => branch.shape.type.value);
 
-    expect(branchIds).toHaveLength(21);
+    expect(branchIds).toHaveLength(22);
     expect(branchIds.filter((id) => !isM365SyncActionId(id)))
-      .toEqual([...M365_INTERACTIVE_READ_ACTION_IDS]);   // all fourteen, in order
+      .toEqual([...M365_INTERACTIVE_READ_ACTION_IDS]);   // all fifteen, including the fork mailbox read, in order
     expect(branchIds.filter((id) => isM365SyncActionId(id)))
       .toEqual([...M365_SYNC_ACTION_IDS]);
 

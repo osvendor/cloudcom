@@ -5,8 +5,8 @@ set -euo pipefail
 
 project="cloudcom-portal-remote-ci-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}-$$"
 project="${project//[^a-zA-Z0-9_-]/-}"
-export BREEZE_TEST_PG_PORT=127.0.0.1:55434
-export BREEZE_TEST_REDIS_PORT=127.0.0.1:56381
+export BREEZE_TEST_PG_PORT=55434
+export BREEZE_TEST_REDIS_PORT=56381
 export BREEZE_TEST_PG_CONTAINER="${project}-postgres"
 export BREEZE_TEST_REDIS_CONTAINER="${project}-redis"
 export BREEZE_TEST_NETWORK="${project}-network"

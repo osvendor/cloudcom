@@ -1184,3 +1184,7 @@ covered 103 tests. Ten files passed initially; the split suite required its
 legacy native-viewer assertion to select `viewerMode="native"` explicitly.
 Its focused rerun passed all 23 tests. Added regressions cover explicit managed
 menu success, 403/503 refusal, and the `preferBuiltIn` menu/label combination.
+
+### v0.128 browser-viewer reconciliation
+
+The browser clipboard transform preserves the upstream `handleReleaseStuckKeys` callback dependency. Regenerate browser modules with `node scripts/cloudcom/sync-browser-viewer.mjs` after intake; the sync and binding gates must pass. This intake refreshes reconnect/ICE trickle, session-end diagnostics, focus-ring and input-release dependencies while retaining browser clipboard, credential insertion and close/revocation behavior. The generated browser directory already routes to the dedicated sync/binding and behavioral UI gates; this does not allow unrelated source paths.

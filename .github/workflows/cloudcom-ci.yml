@@ -152,8 +152,8 @@ jobs:
       - name: Prove UniFi sync organization lock ordering
         if: needs.delta.outputs.unifi_sync_lock == 'true'
         env:
-          BREEZE_TEST_PG_PORT: 127.0.0.1:55434
-          BREEZE_TEST_REDIS_PORT: 127.0.0.1:56381
+          BREEZE_TEST_PG_PORT: 55434
+          BREEZE_TEST_REDIS_PORT: 56381
           BREEZE_TEST_PG_CONTAINER: cloudcom-unifi-ci-postgres
           BREEZE_TEST_REDIS_CONTAINER: cloudcom-unifi-ci-redis
           BREEZE_TEST_NETWORK: cloudcom-unifi-ci-network
