@@ -243,14 +243,42 @@ jobs:
         if: runner.environment == 'self-hosted'
         run: pkg-config --exists libpcap
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        id: go
         with:
           go-version-file: agent/go.mod
-          cache-dependency-path: agent/go.sum
-      - working-directory: agent
+          cache: false
+      - name: Locate native Go caches
+        id: go-cache-paths
+        working-directory: agent
+        run: |
+          echo "build=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "modules=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+      - name: Restore native compilation and module caches
+        id: go-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ${{ steps.go-cache-paths.outputs.build }}
+            ${{ steps.go-cache-paths.outputs.modules }}
+          key: cloudcom-go-v1-${{ runner.os }}-${{ runner.arch }}-${{ runner.environment }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('agent/go.mod', 'agent/go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            cloudcom-go-v1-${{ runner.os }}-${{ runner.arch }}-${{ runner.environment }}-${{ steps.go.outputs.go-version }}-${{ hashFiles('agent/go.mod', 'agent/go.sum') }}-
+      - id: native-tests
+        working-directory: agent
         run: go test -p 1 -race ./...
       - name: Verify real OpenH264 encoding and thread lifecycle
         working-directory: agent
         run: CGO_ENABLED=0 go test -p 1 -tags=openh264integration -count=1 ./internal/remote/desktop
+      # Failed tests still leave useful compilation output. Saving it must not
+      # change their outcome or bypass any validation on subsequent runs.
+      - name: Save native caches after completed tests
+        if: ${{ !cancelled() && steps.go-cache.outcome == 'success' && steps.go-cache.outputs.cache-hit != 'true' && (steps.native-tests.outcome == 'success' || steps.native-tests.outcome == 'failure') }}
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ${{ steps.go-cache-paths.outputs.build }}
+            ${{ steps.go-cache-paths.outputs.modules }}
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
 
   complete:
     name: CloudCom checks
