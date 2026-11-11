@@ -137,6 +137,11 @@ test('routes the enumerated customer portal remote surface to focused real-DB co
   const configuration = classify(['docker-compose.yml']);
   assert.equal(configuration.portalRemote, true);
   assert.equal(configuration.infra, true);
+  const developmentConfiguration = classify(['docker-compose.dev.yml']);
+  assert.equal(developmentConfiguration.api, true);
+  assert.equal(developmentConfiguration.portalRemote, true);
+  assert.equal(developmentConfiguration.infra, true);
+  assert.deepEqual(developmentConfiguration.unsupported, []);
   assert.deepEqual(classify(['apps/api/src/routes/portal/reports.ts']).unsupported, ['apps/api/src/routes/portal/reports.ts']);
 });
 
