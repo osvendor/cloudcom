@@ -366,6 +366,11 @@ describe('workerEntrypointClosure contract (#4086 Task 5)', () => {
     /** socket-owner entries that stay pinned even though their closure is clean. */
     const KEEP_SOCKET_OWNER: ReadonlyArray<{ name: string; reason: string }> = [
       {
+        name: 'cloudCommandM365SnapshotWorker',
+        reason: 'Cloud Command uses API-private certificate/key mounts and the Exchange Unix socket ' +
+          '(CLOUDCOM_EXCHANGE_SOCKET_PATH); the global worker has neither mount. DB leases deduplicate API replicas.',
+      },
+      {
         name: 'aiTranscriptSweeper',
         reason:
           "#9050: sweeps disk-local AI transcript files under the api container's CLAUDE_CONFIG_DIR; " +

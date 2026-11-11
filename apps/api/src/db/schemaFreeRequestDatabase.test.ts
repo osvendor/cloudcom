@@ -60,7 +60,10 @@ const transport = vi.hoisted(() => {
 
 vi.mock('postgres', () => ({ default: vi.fn(() => transport.pool) }));
 vi.mock('../services/sentry', () => ({ captureMessage: vi.fn() }));
-vi.mock('./wedgedBackends', () => ({ requestWedgedBackendReclaim: vi.fn(() => null) }));
+vi.mock('./wedgedBackends', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./wedgedBackends')>(),
+  requestWedgedBackendReclaim: vi.fn(() => null),
+}));
 
 const originalEnv = { ...process.env };
 const ORG_A = '11111111-1111-1111-1111-111111111111';

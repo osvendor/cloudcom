@@ -2,6 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+const reviewedImpacts = JSON.parse(readFileSync(new URL('../cloudcom-reviewed-impacts.json', import.meta.url), 'utf8'));
+const reviewedPaths = new Set(Object.values(reviewedImpacts.groups).flatMap(group => group.paths));
+
 const baselinePath = new URL('../cloudcom-baseline.json', import.meta.url);
 const docsPath = /^(?:docs\/|apps\/docs\/|scripts\/docs-review\/|README(?:\.[^/]+)?$|AGENTS\.md$|[^/]+\.mdx?$)/u;
 const supported = [
@@ -325,6 +328,11 @@ export function classify(paths) {
     }
     if (infraPaths.has(path) || path.startsWith('.github/workflows/') || path.startsWith('.github/cloudcom-') || path.startsWith('.github/scripts/cloudcom-') || path.startsWith('scripts/cloudcom/')) {
       result.infra = true;
+      continue;
+    }
+    if (reviewedPaths.has(path)) {
+      // Exact reviewed paths only. CI runs the selected manifest group's real gates.
+      result.api = true;
       continue;
     }
     const category = supported.find(([, pattern]) => pattern.test(path))?.[0];

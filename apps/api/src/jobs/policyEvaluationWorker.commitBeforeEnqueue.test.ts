@@ -191,7 +191,7 @@ describe('policy evaluation capacity admission', () => {
     expect(moveToDelayed).not.toHaveBeenCalled();
     expect(scanConfigMock).not.toHaveBeenCalled();
     capacity.available = true;
-    await expect(captured.processor!(CONFIG_SCAN_JOB)).resolves.toEqual({ rulesScanned: 1, devicesEvaluated: 1 });
+    await expect(captured.processor!(CONFIG_SCAN_JOB)).resolves.toEqual({ rulesScanned: 1, devicesEvaluated: 1, devicesFailed: 1, ruleSetsFailed: 2 });
   });
 
   it('propagates a failed delay instead of claiming the work was safely deferred', async () => {

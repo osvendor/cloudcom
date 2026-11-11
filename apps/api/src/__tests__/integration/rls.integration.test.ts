@@ -126,8 +126,6 @@ vi.mock('drizzle-orm/postgres-js', () => {
 // Now import the real db module (it will use the mocked postgres + drizzle)
 // ---------------------------------------------------------------------------
 import { withDbAccessContext, type DbAccessContext } from '../../db';
-import { PgDialect } from 'drizzle-orm/pg-core';
-import type { SQL } from 'drizzle-orm';
 
 // ---------------------------------------------------------------------------
 // The session GUCs withDbAccessContext must stamp on EVERY context entry.

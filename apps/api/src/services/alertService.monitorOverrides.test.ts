@@ -59,7 +59,7 @@ vi.mock('drizzle-orm', () => ({
   desc: (col: unknown) => ({ op: 'desc', col }),
 }));
 
-vi.mock('../db', () => ({ db: dbMock }));
+vi.mock('../db', () => ({ db: dbMock, withSystemDbAccessContext: (fn: () => unknown) => fn() }));
 
 vi.mock('../db/schema', () => ({
   alerts: { id: 'alerts.id' },
