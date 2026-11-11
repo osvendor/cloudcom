@@ -228,6 +228,7 @@ const infraPaths = new Set([
   'apps/web/public/scripts/SHA256SUMS',
   '.github/workflows/cloudcom-candidate.yml',
   'scripts/release/cloudcom-candidate-workflow.test.mjs',
+  'scripts/release/inspect-candidate-archive.py', 'scripts/release/inspect-candidate-archive.test.mjs',
   'scripts/cloudcom/exchange-worker-release.mjs',
   'scripts/cloudcom/exchange-worker-release.test.mjs',
   'deploy/cloudcom-exchange-worker/compose.overlay.candidate.yml',

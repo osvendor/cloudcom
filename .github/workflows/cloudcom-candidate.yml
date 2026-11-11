@@ -108,10 +108,25 @@ jobs:
             exchange-worker) ;;
             *) echo "::error::Unknown component $COMPONENT"; exit 1 ;;
           esac
-          docker build --pull --platform linux/amd64 --label "org.opencontainers.image.revision=$SOURCE_COMMIT" --file "$DOCKERFILE" --tag "$image" "${args[@]}" .
+          docker build --pull --platform linux/amd64 --label "org.opencontainers.image.revision=$SOURCE_COMMIT" --label "org.opencontainers.image.version=$BUILD_VERSION" --file "$DOCKERFILE" --tag "$image" "${args[@]}" .
           docker save "$image" | gzip -1 > "${COMPONENT}.tar.gz"
           sha256sum "${COMPONENT}.tar.gz" > SHA256SUMS
-          IMAGE="$image" SOURCE="$SOURCE_COMMIT" COMPONENT="$COMPONENT" node -e "const fs=require('fs'); const image=JSON.parse(require('child_process').execFileSync('docker',['image','inspect',process.env.IMAGE],{encoding:'utf8'}))[0]; fs.writeFileSync('metadata.json', JSON.stringify({component:process.env.COMPONENT, sourceCommit:process.env.SOURCE, baselineTag:process.env.BASELINE_TAG, imageId:image.Id, repoTags:image.RepoTags, created:image.Created}, null, 2)+'\\n');"
+          docker image inspect "$image" > image-inspect.json
+          python3 scripts/release/inspect-candidate-archive.py "${COMPONENT}.tar.gz" "$SOURCE_COMMIT" "$BUILD_VERSION" "$(docker image inspect --format '{{.Id}}' "$image")" oci-provenance.json
+          IMAGE="$image" SOURCE="$SOURCE_COMMIT" COMPONENT="$COMPONENT" node <<'NODE'
+          const fs = require('node:fs');
+          const image = JSON.parse(fs.readFileSync('image-inspect.json', 'utf8'))[0];
+          const metadata = {
+            component: process.env.COMPONENT,
+            sourceCommit: process.env.SOURCE,
+            baselineTag: process.env.BASELINE_TAG,
+            version: process.env.BUILD_VERSION,
+            imageId: image.Id,
+            repoTags: image.RepoTags,
+            created: image.Created,
+          };
+          fs.writeFileSync('metadata.json', JSON.stringify(metadata, null, 2) + '\n');
+          NODE
       - name: Upload candidate image archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -120,5 +135,7 @@ jobs:
             ${{ matrix.component }}.tar.gz
             SHA256SUMS
             metadata.json
+            image-inspect.json
+            oci-provenance.json
           retention-days: 7
           compression-level: 0

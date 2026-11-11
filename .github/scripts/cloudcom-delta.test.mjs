@@ -144,6 +144,8 @@ test('routes the intake guard and installer checksum through infrastructure chec
   for (const path of [
     'scripts/release/require-upstream-intake.mjs',
     'scripts/release/require-upstream-intake.test.mjs',
+    'scripts/release/inspect-candidate-archive.py',
+    'scripts/release/inspect-candidate-archive.test.mjs',
     'apps/web/public/scripts/SHA256SUMS',
   ]) {
     const result = classify([path]);

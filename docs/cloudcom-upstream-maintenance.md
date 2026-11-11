@@ -1188,3 +1188,34 @@ menu success, 403/503 refusal, and the `preferBuiltIn` menu/label combination.
 ### v0.128 browser-viewer reconciliation
 
 The browser clipboard transform preserves the upstream `handleReleaseStuckKeys` callback dependency. Regenerate browser modules with `node scripts/cloudcom/sync-browser-viewer.mjs` after intake; the sync and binding gates must pass. This intake refreshes reconnect/ICE trickle, session-end diagnostics, focus-ring and input-release dependencies while retaining browser clipboard, credential insertion and close/revocation behavior. The generated browser directory already routes to the dedicated sync/binding and behavioral UI gates; this does not allow unrelated source paths.
+
+## Candidate archive provenance (v0.128 intake follow-up)
+
+Candidate images now carry both the exact source revision and the fork build
+version as OCI labels. The workflow exports Docker inspection plus an
+independently derived `oci-provenance.json`: a streaming archive reader verifies
+blob checksums, manifest/config linkage, Linux amd64 platform, revision/version
+labels, filesystem layer identities and the Docker image ID's relationship to
+the manifest or config digest. An unexplained image ID or non-OCI archive fails
+preparation. This evidence supplements archive SHA256SUMS; it does not sign or
+promote images, establish runtime acceptance, or change native payloads.
+
+The focused archive tests cover both Docker identity forms, blob corruption and
+source/version/identity mismatches and run in CloudCom CI. Preserve this gate
+when changing the candidate Docker exporter or runner image store.
+
+### v0.128 native validation boundaries
+
+Session, ICE and lease race tests inject codec startup instead of downloading and
+loading native code asynchronously. Linux CGO-enabled tests reproduced a native
+crosscall1/threadentry SIGSEGV when purego loading overlapped locked-thread
+retirement, resembling golang/go#80723; the exact runtime defect is unconfirmed.
+The CGO-disabled control passes and matches the Windows release build mode.
+Production's public constructor still preloads the codec asynchronously, and
+Windows capture-thread retirement is unchanged. Mandatory separate
+`CGO_ENABLED=0 go test -tags=openh264integration ./internal/remote/desktop`
+coverage verifies the public startup path, verified real codec, encoded H264 frame
+and native calls across 25 thread retirements. Ordinary race coverage retains
+session and concurrency checks; there is no blanket skip or dependency change.
+Managed RustDesk capability/ID/key probes now use the shared procspawn boundary,
+retaining existing executable validation, eight-second deadlines and admission.
