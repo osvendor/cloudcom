@@ -102,7 +102,20 @@ func TestChatReplyNonceDedupedWhileSentButRetryableAfterFailedPost(t *testing.T)
 	}, "failed result")
 	rec.setOutcome(200, nil)
 	sendReply(t, h, assist.session, testConvID, testNonce2, "retry me")
-	eventually(t, func() bool { return len(rec.snapshot()) == 3 }, "retry posted again")
+	// The sink records the request before finishChatReply appends the local
+	// transcript. Wait for this nonce's sent acknowledgement, emitted only
+	// after the append, rather than racing the worker after observing its POST.
+	eventually(t, func() bool {
+		for _, r := range resultsOf(t, assist) {
+			if r.ClientNonce == testNonce2 && r.Status == ipc.ChatReplySent {
+				return true
+			}
+		}
+		return false
+	}, "retried reply committed and acknowledged")
+	if n := len(rec.snapshot()); n != 3 {
+		t.Fatalf("posted %d events, want first, failed attempt, and retry", n)
+	}
 	snap, _ := h.endpointChatStore().snapshot(testConvID)
 	fromUser := 0
 	for _, m := range snap.Messages {
